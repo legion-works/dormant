@@ -164,7 +164,8 @@ impl HaPassthroughController {
         service: &str,
         body: &serde_json::Value,
     ) -> Result<(), CmdFailure> {
-        let url = format!("{}/api/services/{}/{}", self.base_url, domain, service);
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/api/services/{domain}/{service}");
 
         let response = self
             .client
@@ -221,10 +222,16 @@ impl DisplayController for HaPassthroughController {
     }
 
     async fn is_available(&self) -> bool {
-        let url = format!("{}/api/", self.base_url);
-        // Use a short per-request timeout for availability checks.
-        let short_client = Self::build_client(Duration::from_secs(2));
-        match short_client.get(&url).bearer_auth(&self.token).send().await {
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/api/");
+        match self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(2))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+        {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
@@ -330,7 +337,7 @@ fn truncate_body(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use dormant_core::error::E_DISPLAY_IO;
-    use wiremock::matchers::{bearer_token, header, method, path};
+    use wiremock::matchers::{bearer_token, body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── Service string parsing ──────────────────────────────────────────────
@@ -437,12 +444,41 @@ flag = false
             .and(path("/api/services/remote/send_command"))
             .and(bearer_token("test-token"))
             .and(header("content-type", "application/json"))
+            .and(body_json(serde_json::json!({"key": "value"})))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock)
             .await;
 
         let ctrl = test_controller(&mock);
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blank_with_trailing_slash_base_url() {
+        // Trailing slash on base_url must be trimmed so the path doesn't
+        // become `//api/services/...`.
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/services/remote/send_command"))
+            .and(bearer_token("test-token"))
+            .and(body_json(serde_json::json!({"key": "value"})))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ctrl = HaPassthroughController::new(
+            format!("{}/", mock.uri()), // trailing slash
+            "test-token".into(),
+            "remote.send_command",
+            Some(toml::from_str("key = \"value\"").unwrap()),
+            "remote.wake",
+            None,
+            vec![BlankMode::PowerOff],
+        )
+        .unwrap();
         ctrl.blank(BlankMode::PowerOff).await.unwrap();
     }
 

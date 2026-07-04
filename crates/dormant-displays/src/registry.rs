@@ -72,8 +72,11 @@ pub fn build_controllers(
     for name in &cfg.controllers {
         match name.as_str() {
             "ddcci" => {
+                // Normalize empty matcher to None so the controller auto-selects
+                // the single detected display instead of trying to match "".
+                let matcher = cfg.ddc_display.clone().filter(|s| !s.is_empty());
                 chain.push(Box::new(DdcciController::new(
-                    cfg.ddc_display.clone(),
+                    matcher,
                     cfg.restore_brightness,
                 )));
             }

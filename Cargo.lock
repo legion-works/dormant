@@ -665,10 +665,16 @@ dependencies = [
  "comfy-table",
  "dormant-core",
  "dormant-displays",
+ "dormant-sensors",
+ "futures-util",
  "humantime",
+ "rumqttc",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-serial",
+ "tokio-tungstenite",
+ "tokio-util",
 ]
 
 [[package]]

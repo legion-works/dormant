@@ -227,7 +227,7 @@ enum Phase {
 
 /// An action produced by the protocol state machine.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Action {
+pub enum Action {
     /// Send this text frame to the server.
     SendText(String),
     /// Emit this presence event to the daemon.
@@ -243,7 +243,7 @@ pub(crate) enum Action {
 /// Fully testable without a socket — feed it JSON strings via
 /// [`handle_message`](Self::handle_message) and inspect the returned
 /// [`Action`]s.
-pub(crate) struct HaProtocol {
+pub struct HaProtocol {
     /// Current protocol phase.
     phase: Phase,
     /// Next message ID to use for outgoing commands.
@@ -264,7 +264,7 @@ pub(crate) struct HaProtocol {
 impl HaProtocol {
     /// Create a new protocol state machine.
     #[must_use]
-    pub(crate) fn new(token: String, entities: Vec<(SensorId, String)>) -> Self {
+    pub fn new(token: String, entities: Vec<(SensorId, String)>) -> Self {
         let subscribed_entities: Vec<String> = entities.iter().map(|(_, e)| e.clone()).collect();
         Self {
             phase: Phase::AwaitingAuthRequired,
@@ -281,7 +281,7 @@ impl HaProtocol {
     /// actions.
     ///
     /// The caller must execute each action in order.
-    pub(crate) fn handle_message(&mut self, raw: &str) -> Vec<Action> {
+    pub fn handle_message(&mut self, raw: &str) -> Vec<Action> {
         // Parse the JSON envelope.
         let value: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,

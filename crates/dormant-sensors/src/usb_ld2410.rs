@@ -60,7 +60,7 @@ const FRAME_SIZE: usize = 19;
 /// by scanning for the header sequence `F4 F3 F2 F1` and discarding bytes
 /// before it.  The internal buffer is capped at [`MAX_BUF_SIZE`].
 #[derive(Debug, Default)]
-pub(crate) struct FrameParser {
+pub struct FrameParser {
     /// Byte accumulator.
     buf: Vec<u8>,
 }
@@ -70,7 +70,7 @@ pub(crate) struct FrameParser {
 /// Currently only `target_state` is extracted; distance/energy fields are
 /// reserved for future use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Ld2410Frame {
+pub struct Ld2410Frame {
     /// Target state byte: `0x00` none, `0x01` moving, `0x02` stationary,
     /// `0x03` both.
     pub target_state: u8,
@@ -79,7 +79,7 @@ pub(crate) struct Ld2410Frame {
 impl FrameParser {
     /// Create a new empty parser.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
@@ -89,7 +89,7 @@ impl FrameParser {
     /// valid header are silently discarded.  If the internal buffer exceeds
     /// [`MAX_BUF_SIZE`] after a push, the oldest bytes are trimmed to keep it
     /// within bounds.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<Ld2410Frame> {
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<Ld2410Frame> {
         self.buf.extend_from_slice(bytes);
 
         // Cap the buffer.

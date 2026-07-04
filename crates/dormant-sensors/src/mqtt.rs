@@ -350,7 +350,7 @@ impl SensorSource for MqttSource {
 /// 3. Non-bool string values `"ON"`, `"OFF"`, `"true"`, `"false"` (`Zigbee2MQTT`
 ///    variants) are also accepted.
 #[must_use]
-pub(crate) fn parse_payload(cfg: &MqttSensorCfg, payload: &[u8]) -> Option<SensorState> {
+pub fn parse_payload(cfg: &MqttSensorCfg, payload: &[u8]) -> Option<SensorState> {
     // Literal payload match.
     if let Some(on) = &cfg.payload_on {
         let trimmed = String::from_utf8_lossy(payload).trim().to_string();

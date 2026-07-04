@@ -8,6 +8,7 @@
 
 mod client;
 mod cmd_blank;
+mod cmd_doctor;
 mod cmd_pause;
 mod cmd_status;
 mod cmd_validate;
@@ -90,6 +91,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose hardware and connectivity.
+    Doctor {
+        /// Path to the config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Path to the credentials file.
+        #[arg(long)]
+        credentials: Option<PathBuf>,
+
+        #[command(subcommand)]
+        subcommand: Option<cmd_doctor::DoctorSubcommand>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -129,6 +143,18 @@ fn main() -> ExitCode {
             cmd_validate::run(&args)
         }
         Command::Watch { json } => cmd_watch::run(&socket_path, json),
+        Command::Doctor {
+            config,
+            credentials,
+            subcommand,
+        } => {
+            let args = cmd_doctor::DoctorArgs {
+                config,
+                credentials,
+                subcommand,
+            };
+            cmd_doctor::run(&args)
+        }
     };
 
     match result {

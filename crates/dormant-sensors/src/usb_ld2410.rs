@@ -123,6 +123,16 @@ impl FrameParser {
 
             // Read intra-frame length (LE u16).
             let data_len = u16::from_le_bytes([self.buf[4], self.buf[5]]) as usize;
+
+            // Bounds-check: data_len must be at least 3 to hold type + 0xAA
+            // marker + target state byte.  A corrupt/short length would make
+            // the field indices (6, 8) read into the tail or beyond.
+            if data_len < 3 {
+                // Corrupt frame — discard first byte and rescan.
+                self.buf.drain(..1);
+                continue;
+            }
+
             let total_len = 4 + 2 + data_len + 4; // header + length + data + tail
 
             if self.buf.len() < total_len {
@@ -131,10 +141,9 @@ impl FrameParser {
             }
 
             // Validate tail F8 F7 F6 F5.
+            // Invariant: total_len guarantees tail_start + 4 ≤ buf.len().
             let tail_start = 4 + 2 + data_len;
-            if tail_start + 4 <= self.buf.len()
-                && self.buf[tail_start..tail_start + 4] == [0xF8, 0xF7, 0xF6, 0xF5]
-            {
+            if self.buf[tail_start..tail_start + 4] == [0xF8, 0xF7, 0xF6, 0xF5] {
                 // Valid frame — extract target state.
                 // data[0] = frame type, data[1] = 0xAA, data[2] = target state
                 let frame_type = self.buf[6];
@@ -495,6 +504,48 @@ mod tests {
         let frames = parser.push(&data);
         assert_eq!(frames.len(), 1, "only the normal frame should decode");
         assert_eq!(frames[0].target_state, 0x03);
+    }
+
+    // ── short_frame_dropped ────────────────────────────────────────────────
+
+    #[test]
+    fn short_frame_dropped() {
+        // data_len = 0, 1, 2 — all too short to hold type + marker + state.
+        for short_len in 0u16..=2 {
+            let mut buf = vec![0xF4, 0xF3, 0xF2, 0xF1];
+            buf.extend_from_slice(&short_len.to_le_bytes());
+            // Fill the declared data section with padding (no tail).
+            buf.extend(std::iter::repeat_n(0x00, short_len as usize));
+            // Append a valid frame after to verify resync works.
+            buf.extend_from_slice(&make_frame(0x01));
+
+            let mut parser = FrameParser::new();
+            let frames = parser.push(&buf);
+            assert_eq!(
+                frames.len(),
+                1,
+                "data_len={short_len}: short frame should be dropped, valid frame after should decode"
+            );
+            assert_eq!(frames[0].target_state, 0x01);
+        }
+    }
+
+    #[test]
+    fn short_frame_no_panic() {
+        // Fuzz-ish: data_len 0..=2 with no tail and no following frame.
+        // Parser must not panic and must return no frames.
+        for short_len in 0u16..=2 {
+            let mut buf = vec![0xF4, 0xF3, 0xF2, 0xF1];
+            buf.extend_from_slice(&short_len.to_le_bytes());
+            buf.extend(std::iter::repeat_n(0x00, short_len as usize));
+
+            let mut parser = FrameParser::new();
+            let frames = parser.push(&buf);
+            assert!(
+                frames.is_empty(),
+                "data_len={short_len}: no frames expected"
+            );
+        }
     }
 
     // ── unplugged_emits_unavailable ────────────────────────────────────────

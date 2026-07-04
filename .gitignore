@@ -1,0 +1,10 @@
+# opencode per-project runtime state (specs/plans stay local, not tracked)
+.opencode/
+
+# Rust (once scaffolded)
+/target/
+Cargo.lock.orig
+
+# editor / OS noise
+*.swp
+.DS_Store

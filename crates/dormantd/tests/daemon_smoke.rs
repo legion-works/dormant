@@ -304,8 +304,14 @@ async fn reload_rejected_keeps_old() {
 
 // ── 5: removed display gets a verified wake ─────────────────────────────────────
 
-fn two_display_config(m1: &Path, m2: &Path, wake2: &str, keep_mon2: bool) -> String {
-    let mon2_block = if keep_mon2 {
+fn two_display_config(
+    m1: &Path,
+    m2: &Path,
+    wake2: &str,
+    include_display: bool,
+    include_in_rule: bool,
+) -> String {
+    let mon2_block = if include_display {
         format!(
             r#"
 [displays.mon2]
@@ -321,7 +327,7 @@ modes = ["power_off"]
     } else {
         String::new()
     };
-    let displays = if keep_mon2 {
+    let displays = if include_in_rule {
         r#"["mon1", "mon2"]"#
     } else {
         r#"["mon1"]"#
@@ -371,7 +377,7 @@ async fn removed_display_verified_wake() {
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
-        &two_display_config(&m1, &m2, &wake2, true),
+        &two_display_config(&m1, &m2, &wake2, true, true),
     );
     let creds_path = dir.path().join("credentials.toml");
 
@@ -396,8 +402,13 @@ async fn removed_display_verified_wake() {
         "both displays should blank before reload"
     );
 
-    // Drop mon2 and reload; it must be woken before teardown completes.
-    fs::write(&cfg_path, two_display_config(&m1, &m2, &wake2, false)).unwrap();
+    // Drop mon2 and reload; it must be woken after teardown via its old
+    // executor before the reload can succeed.
+    fs::write(
+        &cfg_path,
+        two_display_config(&m1, &m2, &wake2, false, false),
+    )
+    .unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -423,7 +434,7 @@ async fn removed_display_wake_failure_aborts() {
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
-        &two_display_config(&m1, &m2, "false", true),
+        &two_display_config(&m1, &m2, "false", true, true),
     );
     let creds_path = dir.path().join("credentials.toml");
 
@@ -447,7 +458,11 @@ async fn removed_display_wake_failure_aborts() {
         "both displays should blank before reload"
     );
 
-    fs::write(&cfg_path, two_display_config(&m1, &m2, "false", false)).unwrap();
+    fs::write(
+        &cfg_path,
+        two_display_config(&m1, &m2, "false", false, false),
+    )
+    .unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
@@ -473,6 +488,109 @@ async fn removed_display_wake_failure_aborts() {
     assert!(
         snap.pending_reload.is_some(),
         "pending_reload should be set after an aborted reload"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── Retained dark display gets a defensive wake on reload ──────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_defensive_wake_retained() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "150ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app");
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "display should blank before reload"
+    );
+    assert_eq!(count(&marker, 'W'), 0, "no wake before reload");
+
+    // Reload while the display stays rule-controlled: the rebuilt machine
+    // restarts Active, so the still-dark panel must get a defensive wake.
+    fs::write(&cfg_path, one_display_config(&marker, "150ms")).unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+    assert!(
+        wait_for(|| count(&marker, 'W') >= 1, Duration::from_secs(3)).await,
+        "retained dark display must receive a defensive wake"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── Display dropped from rules but kept in [displays] is treated as removed ─────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ruleless_display_verified_wake() {
+    let dir = TempDir::new().unwrap();
+    let m1 = dir.path().join("mon1");
+    let m2 = dir.path().join("mon2");
+    let wake2 = format!("printf W >> '{}'", m2.display());
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &two_display_config(&m1, &m2, &wake2, true, true),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app");
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(
+            || count(&m1, 'B') >= 1 && count(&m2, 'B') >= 1,
+            Duration::from_secs(3)
+        )
+        .await,
+        "both displays should blank before reload"
+    );
+
+    // Keep mon2 in [displays] but drop it from every rule — it becomes inert
+    // (no executor in the new generation), so it must be treated as removed
+    // and woken via its OLD executor before the reload succeeds.
+    fs::write(&cfg_path, two_display_config(&m1, &m2, &wake2, true, false)).unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+    assert!(
+        wait_for(|| count(&m2, 'W') >= 1, Duration::from_secs(3)).await,
+        "rule-less dropped display must get a verified wake via its old executor, mon2={:?}",
+        read(&m2)
     );
 
     shutdown(handle, join).await;

@@ -410,14 +410,16 @@ impl Runner {
             }
         };
 
-        let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.cfg);
-        let retained_dark = retained_dark_displays(snapshot.as_ref(), &new_assembly.cfg);
+        let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
+        let retained_dark =
+            retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
 
         teardown(&mut self.generation).await;
 
-        // Verified physical wake of REMOVED displays that were dark, via their
-        // old executors. A failure aborts the reload and restores the old
-        // config in place (with pending_reload set).
+        // Verified physical wake of REMOVED displays (no executor in the new
+        // generation) that were dark — via their OLD executor, after teardown.
+        // A failure aborts the reload and restores the old config in place
+        // (with pending_reload set).
         for display_id in removed {
             if let Some(exec) = self.generation.display_executors.get(&display_id) {
                 if let Err(e) = exec.wake().await {
@@ -961,33 +963,42 @@ fn phase_is_dark(phase: &str) -> bool {
     matches!(phase, "blanked" | "blanking" | "waking")
 }
 
-/// Displays that the new config drops and that were dark — these get a verified
-/// physical wake before teardown completes.
-fn removed_dark_displays(snapshot: Option<&StateSnapshot>, new_cfg: &Config) -> Vec<DisplayId> {
+/// Displays that were dark and have **no executor** in the newly assembled
+/// generation (dropped from `[displays]` *or* left in `[displays]` but removed
+/// from every rule, which makes them inert) — these get a verified physical
+/// wake via their OLD executor before the new generation starts.
+fn removed_dark_displays(
+    snapshot: Option<&StateSnapshot>,
+    new_executors: &HashMap<DisplayId, Arc<DisplayExecutor>>,
+) -> Vec<DisplayId> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
-    let new_displays: HashSet<&str> = new_cfg.displays.keys().map(String::as_str).collect();
+    let present: HashSet<&str> = new_executors.keys().map(|d| d.0.as_str()).collect();
     snapshot
         .displays
         .iter()
-        .filter(|(id, d)| !new_displays.contains(id.as_str()) && phase_is_dark(&d.phase))
+        .filter(|(id, d)| !present.contains(id.as_str()) && phase_is_dark(&d.phase))
         .map(|(id, _)| DisplayId(id.clone()))
         .collect()
 }
 
-/// Displays the new config retains that were dark — these get a defensive
-/// physical wake after the new generation is spawned (state machines restart
-/// `Active`, so a dark panel would otherwise linger until the next edge).
-fn retained_dark_displays(snapshot: Option<&StateSnapshot>, new_cfg: &Config) -> Vec<DisplayId> {
+/// Displays that were dark and **do have an executor** in the newly assembled
+/// generation — these get a defensive physical wake after the new generation
+/// spawns (state machines restart `Active`, so a dark panel would otherwise
+/// linger until the next edge).
+fn retained_dark_displays(
+    snapshot: Option<&StateSnapshot>,
+    new_executors: &HashMap<DisplayId, Arc<DisplayExecutor>>,
+) -> Vec<DisplayId> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
-    let new_displays: HashSet<&str> = new_cfg.displays.keys().map(String::as_str).collect();
+    let present: HashSet<&str> = new_executors.keys().map(|d| d.0.as_str()).collect();
     snapshot
         .displays
         .iter()
-        .filter(|(id, d)| new_displays.contains(id.as_str()) && phase_is_dark(&d.phase))
+        .filter(|(id, d)| present.contains(id.as_str()) && phase_is_dark(&d.phase))
         .map(|(id, _)| DisplayId(id.clone()))
         .collect()
 }

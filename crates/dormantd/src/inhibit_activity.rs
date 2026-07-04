@@ -76,36 +76,83 @@ fn configured_unit(unit: IdleTimeUnit) -> Option<ResolvedUnit> {
     }
 }
 
-/// Decide the unit from two consecutive raw samples taken `poll` apart while
-/// the user is (presumably) idle: a still-idle session accumulates roughly
-/// `poll` of idle time between polls, so the delta lands near the poll
-/// interval expressed in whichever unit the service uses.
-///
-/// Returns `None` when the samples are inconclusive (e.g. the user was active
-/// and idle reset to ~0).
-fn decide_unit(prev_raw: u64, curr_raw: u64, poll: Duration) -> Option<ResolvedUnit> {
-    let delta = curr_raw.saturating_sub(prev_raw);
-    if delta == 0 {
-        return None;
-    }
+/// Number of corroborating idle-growth samples required before locking the
+/// unit under `auto`. Guards against a single active-user jitter delta
+/// (e.g. 10→13) that happens to land near the poll interval in one unit.
+const CORROBORATION: u32 = 2;
+
+/// Classify a single inter-poll delta: it must fall within ±25% of the poll
+/// interval in **exactly one** unit interpretation. Deltas matching both or
+/// neither (tiny jitter, huge jumps) are inconclusive.
+fn classify_delta(delta: u64, poll: Duration) -> Option<ResolvedUnit> {
     let ms = u64::try_from(poll.as_millis()).unwrap_or(u64::MAX);
     let secs = poll.as_secs();
-    if near(delta, ms) {
-        Some(ResolvedUnit::Ms)
-    } else if secs > 0 && near(delta, secs) {
-        Some(ResolvedUnit::Secs)
-    } else {
-        None
+    let ms_match = within_25(delta, ms);
+    let secs_match = secs > 0 && within_25(delta, secs);
+    match (ms_match, secs_match) {
+        (true, false) => Some(ResolvedUnit::Ms),
+        (false, true) => Some(ResolvedUnit::Secs),
+        _ => None,
     }
 }
 
-/// Whether `a` is within `[b/2, 3b/2]` (a ≈ b, tolerant).
-fn near(a: u64, b: u64) -> bool {
+/// Whether `a` is within `[0.75·b, 1.25·b]` (i.e. `4a ∈ [3b, 5b]`).
+fn within_25(a: u64, b: u64) -> bool {
     if b == 0 {
         return false;
     }
-    let two_a = a.saturating_mul(2);
-    two_a >= b && two_a <= b.saturating_mul(3)
+    let four_a = a.saturating_mul(4);
+    four_a >= b.saturating_mul(3) && four_a <= b.saturating_mul(5)
+}
+
+/// Detects (or is told) the idle-value unit. Under `auto` it requires
+/// [`CORROBORATION`] consecutive samples agreeing on the same unit before
+/// locking; a conflicting or inconclusive sample resets the streak. Until a
+/// unit is locked the caller keeps the inhibitor inactive.
+#[derive(Debug)]
+struct UnitDetector {
+    poll: Duration,
+    prev_raw: Option<u64>,
+    streak: Option<(ResolvedUnit, u32)>,
+    locked: Option<ResolvedUnit>,
+}
+
+impl UnitDetector {
+    fn new(poll: Duration, forced: Option<ResolvedUnit>) -> Self {
+        Self {
+            poll,
+            prev_raw: None,
+            streak: None,
+            locked: forced,
+        }
+    }
+
+    /// Feed a raw sample; returns the locked unit once determined.
+    fn observe(&mut self, raw: u64) -> Option<ResolvedUnit> {
+        if let Some(u) = self.locked {
+            return Some(u);
+        }
+        let candidate = self
+            .prev_raw
+            .map(|prev| raw.saturating_sub(prev))
+            .and_then(|delta| classify_delta(delta, self.poll));
+        self.prev_raw = Some(raw);
+
+        match candidate {
+            Some(unit) => {
+                let count = match self.streak {
+                    Some((u, n)) if u == unit => n + 1,
+                    _ => 1,
+                };
+                self.streak = Some((unit, count));
+                if count >= CORROBORATION {
+                    self.locked = Some(unit);
+                }
+            }
+            None => self.streak = None,
+        }
+        self.locked
+    }
 }
 
 /// Spawn the activity-inhibitor poller.
@@ -149,8 +196,7 @@ async fn run(
 ) {
     let mut conn: Option<zbus::Connection> = None;
     let mut last_sent: HashMap<RuleId, bool> = HashMap::new();
-    let mut resolved: Option<ResolvedUnit> = configured_unit(unit);
-    let mut prev_raw: Option<u64> = None;
+    let mut detector = UnitDetector::new(poll_interval, configured_unit(unit));
     let mut warned_offline = false;
     let mut warned_undetermined = false;
 
@@ -189,17 +235,11 @@ async fn run(
                     interp_s = raw,
                 );
 
-                if resolved.is_none() {
-                    if let Some(prev) = prev_raw {
-                        resolved = decide_unit(prev, raw, poll_interval);
-                        if let Some(u) = resolved {
-                            tracing::info!(event = "idle_unit_determined", unit = ?u);
-                        }
+                let was_locked = detector.locked.is_some();
+                if let Some(unit) = detector.observe(raw) {
+                    if !was_locked {
+                        tracing::info!(event = "idle_unit_determined", unit = ?unit);
                     }
-                    prev_raw = Some(raw);
-                }
-
-                if let Some(unit) = resolved {
                     let idle = Duration::from_millis(unit.to_ms(raw));
                     for r in &rules {
                         let inhibited = idle < r.idle_threshold;
@@ -303,33 +343,61 @@ async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedUnit, decide_unit, near};
+    use super::{ResolvedUnit, UnitDetector, classify_delta, within_25};
     use std::time::Duration;
 
-    #[test]
-    fn detects_milliseconds_from_delta() {
-        // Poll 5s apart, idle grew ~5000 → milliseconds.
-        let u = decide_unit(1_000, 6_000, Duration::from_secs(5));
-        assert_eq!(u, Some(ResolvedUnit::Ms));
+    const POLL: Duration = Duration::from_secs(5);
+
+    fn detect(samples: &[u64]) -> Option<ResolvedUnit> {
+        let mut d = UnitDetector::new(POLL, None);
+        let mut last = None;
+        for &s in samples {
+            last = d.observe(s);
+        }
+        last
     }
 
     #[test]
-    fn detects_seconds_from_delta() {
-        // Poll 5s apart, idle grew ~5 → seconds.
-        let u = decide_unit(1, 6, Duration::from_secs(5));
-        assert_eq!(u, Some(ResolvedUnit::Secs));
+    fn active_user_jitter_stays_undetermined() {
+        // 10→13 @5s: delta 3 is near neither 5000 (ms) nor 5 (s).
+        assert_eq!(classify_delta(3, POLL), None);
+        assert_eq!(detect(&[10, 13]), None);
     }
 
     #[test]
-    fn inconclusive_when_idle_reset() {
-        // User was active — idle stayed ~0.
-        assert_eq!(decide_unit(0, 0, Duration::from_secs(5)), None);
+    fn locks_milliseconds_after_two_corroborating_samples() {
+        // Two idle-growth deltas of ~5000.
+        assert_eq!(detect(&[0, 5_000, 10_000]), Some(ResolvedUnit::Ms));
     }
 
     #[test]
-    fn inconclusive_when_delta_matches_neither() {
-        // Delta 100 is neither ≈5000 (ms) nor ≈5 (s).
-        assert_eq!(decide_unit(0, 100, Duration::from_secs(5)), None);
+    fn locks_seconds_after_two_corroborating_samples() {
+        // Two idle-growth deltas of ~5.
+        assert_eq!(detect(&[0, 5, 10]), Some(ResolvedUnit::Secs));
+    }
+
+    #[test]
+    fn conflicting_streak_resets_and_does_not_lock() {
+        // delta 5000 (ms) then delta 5 (s) — conflicting single samples.
+        assert_eq!(detect(&[0, 5_000, 5_005]), None);
+    }
+
+    #[test]
+    fn single_sample_never_locks() {
+        assert_eq!(detect(&[0, 5_000]), None);
+    }
+
+    #[test]
+    fn forced_unit_locks_immediately() {
+        let mut d = UnitDetector::new(POLL, Some(ResolvedUnit::Ms));
+        assert_eq!(d.observe(42), Some(ResolvedUnit::Ms));
+    }
+
+    #[test]
+    fn classify_delta_picks_exactly_one_unit() {
+        assert_eq!(classify_delta(5_000, POLL), Some(ResolvedUnit::Ms));
+        assert_eq!(classify_delta(5, POLL), Some(ResolvedUnit::Secs));
+        assert_eq!(classify_delta(100, POLL), None);
     }
 
     #[test]
@@ -339,12 +407,12 @@ mod tests {
     }
 
     #[test]
-    fn near_tolerates_half_to_one_and_a_half() {
-        assert!(near(5000, 5000));
-        assert!(near(2500, 5000));
-        assert!(near(7500, 5000));
-        assert!(!near(1000, 5000));
-        assert!(!near(9000, 5000));
-        assert!(!near(5, 0));
+    fn within_25_bounds() {
+        assert!(within_25(5000, 5000));
+        assert!(within_25(3750, 5000));
+        assert!(within_25(6250, 5000));
+        assert!(!within_25(3000, 5000));
+        assert!(!within_25(7000, 5000));
+        assert!(!within_25(5, 0));
     }
 }

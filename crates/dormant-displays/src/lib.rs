@@ -13,4 +13,5 @@
 
 pub mod command;
 pub mod executor;
+pub mod ha_passthrough;
 pub mod registry;

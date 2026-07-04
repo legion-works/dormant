@@ -615,6 +615,7 @@ fn validate_rule(
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+    use crate::config::DaemonConfig;
     use crate::config::Strictness;
     use crate::config::schema::ZoneConfig;
     use crate::types::BlankMode;
@@ -1042,11 +1043,44 @@ stale_timeout = "5m"
 
     #[test]
     fn capability_union_kwin_dpms_ddcci_power_off_passes() {
-        let cfg = valid_full_config();
-        // main_monitor has controllers ["kwin-dpms", "ddcci"] + blank_mode power_off.
-        // kwin-dpms supports PowerOff, ddcci supports BrightnessZero + PowerOff.
-        // Union contains PowerOff → should pass.
-        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        // kwin-dpms has NO modes, ddcci has PowerOff.
+        // Per-controller check would fail on kwin-dpms; union must succeed.
+        let caps: HashMap<String, Vec<BlankMode>> = HashMap::from([
+            ("kwin-dpms".into(), vec![]),
+            ("ddcci".into(), vec![BlankMode::PowerOff]),
+        ]);
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([(
+                "main".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into(), "ddcci".into()],
+                    blank_mode: BlankMode::PowerOff,
+                    degraded_mode: None,
+                    output: None,
+                    ddc_display: None,
+                    host: None,
+                    wol_mac: None,
+                    blank_command: None,
+                    wake_command: None,
+                    modes: None,
+                    ha_url: None,
+                    blank_service: None,
+                    blank_data: None,
+                    wake_service: None,
+                    wake_data: None,
+                    command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
+                    restore_brightness: 80,
+                    treat_unreachable_as_blanked: true,
+                },
+            )]),
+            rules: IndexMap::new(),
+        };
+        let creds = Credentials::default();
+        let errors = validate(&cfg, &caps, &creds);
         assert!(
             !errors.iter().any(|e| e.what == "unsupported blank mode"),
             "expected no unsupported blank mode errors for union, got {:?}",

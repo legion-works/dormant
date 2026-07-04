@@ -178,6 +178,14 @@ dependencies = [
 [[package]]
 name = "dormant-displays"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dormant-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "dormant-sensors"

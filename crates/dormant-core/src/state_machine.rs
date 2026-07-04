@@ -282,7 +282,7 @@ impl DisplayStateMachine {
     #[must_use]
     #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     pub fn step(&mut self, input: Input, now: Tick) -> Vec<Effect> {
-        match (&self.phase, input) {
+        let result = match (&self.phase, input) {
             // ── Active ──────────────────────────────────────────────────────
             // Zone becomes absent → start grace countdown (pre-frozen if
             // inhibitor or pause is already active).
@@ -349,8 +349,18 @@ impl DisplayStateMachine {
             (Phase::Grace { until }, Input::Tick) => {
                 let until = *until;
 
-                // Pause auto-resume fires first.
+                // Pause auto-resume fires first.  If it unfreezes the
+                // countdown, the recomputed until + schedule is
+                // authoritative — return immediately so expiry-eval runs
+                // on its own tick, never against the stale `until`.
+                let was_frozen = self.grace_frozen_remaining.is_some();
                 let mut effects = self.maybe_auto_resume(now);
+                if was_frozen && self.grace_frozen_remaining.is_none() {
+                    // Auto-resume just unfroze the grace — new until has
+                    // been computed and scheduled.  Return; the
+                    // rescheduled tick will evaluate expiry correctly.
+                    return effects;
+                }
 
                 // If the countdown is frozen, the tick is ignored.
                 if self.grace_frozen_remaining.is_some() {
@@ -458,16 +468,12 @@ impl DisplayStateMachine {
                 }])
             }
             // ForceWake during Grace: abort countdown, go active.
-            // Operator override — does NOT chain into Grace even if zone is
-            // absent (the sensor will re-trigger on its own edge).
+            // Routes through enter_active so an absent zone immediately
+            // re-enters Grace (display gets grace_period of screen time,
+            // then normal rules resume).
             (Phase::Grace { .. }, Input::ForceWake) => {
                 self.grace_frozen_remaining = None;
-                self.phase = Phase::Active;
-                vec![Effect::LogTransition {
-                    from: "grace",
-                    to: "active",
-                    cause: "force_wake",
-                }]
+                self.enter_active(now, "force_wake")
             }
 
             // ── Blanking ────────────────────────────────────────────────────
@@ -687,7 +693,18 @@ impl DisplayStateMachine {
             // ForceWake in Waking: restart the wake attempt with a fresh
             // generation.
             (Phase::Waking, Input::ForceWake) => self.issue_wake(vec![], now),
-        }
+        };
+
+        // Invariant: frozen-Grace state is never observable from a
+        // non-Grace phase (Must 2).
+        debug_assert!(
+            matches!(self.phase, Phase::Grace { .. }) || self.grace_frozen_remaining.is_none(),
+            "grace_frozen_remaining ({:?}) must be None outside Grace phase ({:?})",
+            self.grace_frozen_remaining,
+            self.phase_name()
+        );
+
+        result
     }
 
     /// Return the current phase.
@@ -762,6 +779,9 @@ impl DisplayStateMachine {
     /// All transitions to Active MUST route through this helper so the deferred-
     /// zone-clear chain is never missed.
     fn enter_active(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
+        // Clear any stale frozen-Grace state (Must 2: frozen state must be
+        // impossible to observe from any non-Grace phase).
+        self.grace_frozen_remaining = None;
         let from = self.phase_name();
         self.phase = Phase::Active;
         let mut effects = vec![Effect::LogTransition {
@@ -796,6 +816,9 @@ impl DisplayStateMachine {
             let sentinel = Tick(now.0 + self.timings.grace_period);
             self.phase = Phase::Grace { until: sentinel };
         } else {
+            // Live countdown — defensive clear of any stale frozen state
+            // from a prior Grace period.
+            self.grace_frozen_remaining = None;
             let until = Tick(now.0 + self.timings.grace_period);
             self.phase = Phase::Grace { until };
             effects.push(Effect::ScheduleTickAt(until));
@@ -1174,9 +1197,13 @@ mod tests {
         assert!(matches!(sm.phase(), Phase::Grace { .. }));
         assert!(effects.is_empty());
 
-        // But wake path is unaffected: ForceWake in Grace goes to Active.
+        // But wake path is unaffected: ForceWake in Grace goes to Active,
+        // then chains into Grace because zone is still absent (Should).
         let _effects = sm.step(Input::ForceWake, t(600));
-        assert!(matches!(sm.phase(), Phase::Active));
+        assert!(
+            matches!(sm.phase(), Phase::Grace { .. }),
+            "ForceWake in Grace with absent zone should re-chain to Grace"
+        );
     }
 
     #[test]
@@ -1710,6 +1737,140 @@ mod tests {
         assert!(
             has_tick,
             "Must 4: uninhibitor must schedule the unfrozen grace tick"
+        );
+    }
+
+    /// Must 1 (round 2): pause auto-resume must not use the stale deadline.
+    /// Seq: Grace until t500 → Pause{until:t800}@t100 freezes (remaining 400)
+    /// → Tick@t800 unfreezes → must NOT issue blank on the stale t500
+    /// deadline; blank must fire at ~t1200 on the rescheduled tick.
+    #[test]
+    fn pause_auto_resume_does_not_use_stale_deadline() {
+        let t0 = t(0);
+        let mut sm = DisplayStateMachine::new(
+            SmTimings {
+                grace_period: Duration::from_millis(500),
+                min_blank_time: Duration::from_secs(10),
+                min_wake_time: Duration::from_secs(0),
+                startup_holdoff: Duration::from_secs(0),
+                wake_retry_interval: Duration::from_millis(100),
+            },
+            BlankMode::PowerOff,
+            t0,
+        );
+
+        // Enter Grace at t0 (until=t500).
+        let _effects = sm.step(Input::ZonePresent(false), t0);
+        assert!(matches!(sm.phase(), Phase::Grace { .. }));
+
+        // Pause at t100 with deadline t800 → freezes countdown.
+        let t_pause = Tick(t0.0 + Duration::from_millis(100));
+        sm.step(
+            Input::Pause {
+                until: Some(Tick(t0.0 + Duration::from_millis(800))),
+            },
+            t_pause,
+        );
+
+        // Tick at t800 — auto-resume unfreezes. Must NOT issue blank.
+        let t800 = Tick(t0.0 + Duration::from_millis(800));
+        let effects = sm.step(Input::Tick, t800);
+
+        // No IssueBlank (stale deadline check).
+        let has_blank = effects
+            .iter()
+            .any(|e| matches!(e, Effect::IssueBlank { .. }));
+        assert!(
+            !has_blank,
+            "Must 1: stale deadline must not trigger IssueBlank"
+        );
+
+        // Phase should still be Grace (unfrozen with new until).
+        assert!(
+            matches!(sm.phase(), Phase::Grace { .. }),
+            "Must 1: should still be in Grace after unfreeze"
+        );
+
+        // The rescheduled tick (~t1200 = t800 + 400 remaining) should fire
+        // and produce a blank.
+        let reschedule = get_schedule_tick(&effects);
+        let effects = sm.step(Input::Tick, reschedule);
+        let has_blank = effects
+            .iter()
+            .any(|e| matches!(e, Effect::IssueBlank { .. }));
+        assert!(has_blank, "Must 1: blank must fire on the rescheduled tick");
+    }
+
+    /// Must 2 (round 2): frozen-Grace state cleared on presence exit.
+    /// Seq: Grace → freeze → ZonePresent(true) → Active (frozen leaked)
+    /// → inhibitor clears → later ZonePresent(false) → second Grace must
+    /// blank normally at its expiry (not frozen-ignored).
+    #[test]
+    fn frozen_grace_state_cleared_on_presence_exit() {
+        let t0 = t(0);
+        let mut sm = DisplayStateMachine::new(
+            SmTimings {
+                grace_period: Duration::from_millis(300),
+                min_blank_time: Duration::from_secs(10),
+                min_wake_time: Duration::from_secs(0),
+                startup_holdoff: Duration::from_secs(0),
+                wake_retry_interval: Duration::from_millis(100),
+            },
+            BlankMode::PowerOff,
+            t0,
+        );
+
+        // Enter Grace, then freeze via inhibitor.
+        let _effects = sm.step(Input::ZonePresent(false), t0);
+        assert!(matches!(sm.phase(), Phase::Grace { .. }));
+        let t1 = Tick(t0.0 + Duration::from_millis(50));
+        sm.step(Input::InhibitorChanged(true), t1);
+
+        // Presence returns — exits Grace.  frozen_remaining must be cleared.
+        let t2 = Tick(t0.0 + Duration::from_millis(100));
+        sm.step(Input::ZonePresent(true), t2);
+        assert!(matches!(sm.phase(), Phase::Active));
+
+        // Inhibitor clears (no-op for Grace since we're in Active).
+        let t3 = Tick(t0.0 + Duration::from_millis(150));
+        sm.step(Input::InhibitorChanged(false), t3);
+
+        // Zone clears again — second Grace must be live, not frozen.
+        let t4 = Tick(t0.0 + Duration::from_millis(200));
+        let effects = sm.step(Input::ZonePresent(false), t4);
+        let grace_tick2 = get_schedule_tick(&effects);
+
+        // Tick at expiry — must blank (not frozen-ignored).
+        let _effects = sm.step(Input::Tick, grace_tick2);
+        assert!(
+            matches!(sm.phase(), Phase::Blanking),
+            "Must 2: second Grace must blank at expiry, got {:?}",
+            sm.phase()
+        );
+    }
+
+    /// Should (concurred): `ForceWake` in Grace re-chains when zone absent.
+    #[test]
+    fn force_wake_in_grace_rechains_when_zone_absent() {
+        let t0 = t(0);
+        let mut sm = sm(500);
+
+        // Zone absent → Grace.
+        sm.step(Input::ZonePresent(false), t0);
+        assert!(matches!(sm.phase(), Phase::Grace { .. }));
+
+        // ForceWake → Active → immediately Grace (zone still absent).
+        let effects = sm.step(Input::ForceWake, t(200));
+        assert!(
+            matches!(sm.phase(), Phase::Grace { .. }),
+            "ForceWake in Grace with absent zone should re-chain to Grace"
+        );
+        let has_tick = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(
+            has_tick,
+            "re-chained Grace must own its exit driver via ScheduleTickAt"
         );
     }
 

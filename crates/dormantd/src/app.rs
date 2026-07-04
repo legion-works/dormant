@@ -168,6 +168,7 @@ pub struct App {
     creds_path: PathBuf,
     strictness: Strictness,
     source_builder: SourceBuilder,
+    disable_ipc: bool,
 }
 
 impl App {
@@ -193,6 +194,7 @@ impl App {
             creds_path,
             strictness,
             source_builder,
+            disable_ipc: false,
         })
     }
 
@@ -217,7 +219,15 @@ impl App {
             creds_path,
             strictness,
             source_builder: Arc::new(factory),
+            disable_ipc: false,
         })
+    }
+
+    /// Disable the IPC server (for tests that don't need it).
+    #[must_use]
+    pub fn disable_ipc(mut self) -> Self {
+        self.disable_ipc = true;
+        self
     }
 
     fn validate_or_bail(
@@ -259,6 +269,7 @@ impl App {
         let root = CancellationToken::new();
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
+        let socket_path = crate::ipc::resolve_socket_path(cfg.daemon.socket_path.as_deref());
         let assembly = assemble_static(cfg, creds, &self.source_builder)
             .await
             .context("assemble initial runtime")?;
@@ -298,12 +309,28 @@ impl App {
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
 
+        // ── IPC server (optional, disabled for tests) ──────────────────────
+        let ipc_handle = if self.disable_ipc {
+            None
+        } else {
+            Some(
+                crate::ipc::spawn(
+                    &socket_path,
+                    front_ctl_tx.clone(),
+                    reload_trigger_tx.clone(),
+                    root.clone(),
+                )
+                .context("spawn IPC server")?,
+            )
+        };
+
         let handle = AppHandle {
             ctl_tx: front_ctl_tx,
             events_tx: front_events_tx,
             reload_tx,
             reload_trigger: reload_trigger_tx,
             root,
+            _ipc_handle: ipc_handle,
         };
 
         Ok((handle, join))
@@ -333,6 +360,7 @@ pub struct AppHandle {
     reload_tx: broadcast::Sender<ReloadOutcome>,
     reload_trigger: mpsc::Sender<()>,
     root: CancellationToken,
+    _ipc_handle: Option<JoinHandle<()>>,
 }
 
 impl AppHandle {

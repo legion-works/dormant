@@ -6,5 +6,6 @@
 
 pub mod app;
 pub mod inhibit_activity;
+pub mod ipc;
 pub mod logging;
 pub mod reload;

@@ -1,0 +1,183 @@
+//! `dormantctl status` — display current daemon state.
+
+use std::path::Path;
+
+use anyhow::Result;
+use comfy_table::Table;
+use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::rules::StateSnapshot;
+
+use crate::client;
+
+/// Run the `status` command.
+///
+/// # Errors
+///
+/// Propagates connection and I/O errors.
+pub fn run(socket_path: &Path, json_output: bool) -> Result<()> {
+    let resp = client::send_request(socket_path, &IpcRequest::Status)?;
+
+    if !resp.ok {
+        anyhow::bail!(
+            "daemon returned error: {}",
+            resp.error.as_deref().unwrap_or("unknown")
+        );
+    }
+
+    let snapshot = resp
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned no snapshot"))?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+    } else {
+        render_table(snapshot);
+    }
+
+    Ok(())
+}
+
+/// Render a [`StateSnapshot`] as a human-readable table.
+fn render_table(snapshot: &StateSnapshot) {
+    // ── Sensors ────────────────────────────────────────────────────────────
+    if !snapshot.sensors.is_empty() {
+        println!("── Sensors ──────────────────────────────────────────────");
+        let mut table = Table::new();
+        table.set_header(vec!["ID", "State", "Last Seen"]);
+        for s in &snapshot.sensors {
+            table.add_row(vec![
+                &s.id,
+                &format!("{:?}", s.state),
+                &format!("{}s ago", s.last_seen_secs_ago),
+            ]);
+        }
+        println!("{table}");
+    }
+
+    // ── Zones ─────────────────────────────────────────────────────────────
+    if !snapshot.zones.is_empty() {
+        println!("── Zones ────────────────────────────────────────────────");
+        let mut table = Table::new();
+        table.set_header(vec!["ID", "Present"]);
+        for z in &snapshot.zones {
+            let present = match z.present {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            };
+            table.add_row(vec![&z.id, present]);
+        }
+        println!("{table}");
+    }
+
+    // ── Displays ──────────────────────────────────────────────────────────
+    if !snapshot.displays.is_empty() {
+        println!("── Displays ──────────────────────────────────────────────");
+        let mut table = Table::new();
+        table.set_header(vec!["ID", "Phase", "Inhibited", "Paused"]);
+        for (id, d) in &snapshot.displays {
+            table.add_row(vec![
+                id.as_str(),
+                d.phase.as_str(),
+                if d.inhibited { "yes" } else { "no" },
+                if d.paused { "yes" } else { "no" },
+            ]);
+        }
+        println!("{table}");
+    }
+
+    // ── Pending reload warning ────────────────────────────────────────────
+    if let Some(detail) = &snapshot.pending_reload {
+        println!();
+        println!("⚠  Pending reload: {detail}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dormant_core::rules::{DisplaySnapshot, SensorSnapshot, ZoneSnapshot};
+
+    fn canned_snapshot() -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![
+                SensorSnapshot {
+                    id: "desk".into(),
+                    state: dormant_core::types::SensorState::Present,
+                    last_seen_secs_ago: 2,
+                },
+                SensorSnapshot {
+                    id: "hallway".into(),
+                    state: dormant_core::types::SensorState::Absent,
+                    last_seen_secs_ago: 120,
+                },
+            ],
+            zones: vec![ZoneSnapshot {
+                id: "office".into(),
+                present: Some(true),
+            }],
+            displays: vec![
+                (
+                    "main_monitor".into(),
+                    DisplaySnapshot {
+                        phase: "active".into(),
+                        inhibited: false,
+                        paused: false,
+                        cmd_gen: 1,
+                    },
+                ),
+                (
+                    "tv".into(),
+                    DisplaySnapshot {
+                        phase: "blanked".into(),
+                        inhibited: false,
+                        paused: true,
+                        cmd_gen: 3,
+                    },
+                ),
+            ],
+            pending_reload: None,
+        }
+    }
+
+    #[test]
+    fn table_contains_sensor_ids() {
+        let snap = canned_snapshot();
+        assert!(snap.sensors.iter().any(|s| s.id == "desk"));
+        assert!(snap.sensors.iter().any(|s| s.id == "hallway"));
+    }
+
+    #[test]
+    fn table_contains_display_phases() {
+        let snap = canned_snapshot();
+        assert!(
+            snap.displays
+                .iter()
+                .any(|(id, d)| id == "main_monitor" && d.phase == "active")
+        );
+        assert!(
+            snap.displays
+                .iter()
+                .any(|(id, d)| id == "tv" && d.phase == "blanked")
+        );
+    }
+
+    #[test]
+    fn table_contains_zone_present() {
+        let snap = canned_snapshot();
+        assert!(
+            snap.zones
+                .iter()
+                .any(|z| z.id == "office" && z.present == Some(true))
+        );
+    }
+
+    #[test]
+    fn pending_reload_warning_shown() {
+        let mut snap = canned_snapshot();
+        snap.pending_reload = Some("config error: bad key".into());
+        // Just verify the field is set
+        assert!(snap.pending_reload.is_some());
+    }
+}

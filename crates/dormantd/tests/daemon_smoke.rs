@@ -131,7 +131,8 @@ async fn smoke_blank_and_wake() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
     let ok = wait_for(
@@ -199,7 +200,8 @@ async fn reload_swap() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 
@@ -251,7 +253,8 @@ async fn reload_rejected_keeps_old() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 
@@ -388,7 +391,8 @@ async fn removed_display_verified_wake() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 
@@ -513,7 +517,8 @@ async fn reload_defensive_wake_retained() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 
@@ -563,7 +568,8 @@ async fn ruleless_display_verified_wake() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 

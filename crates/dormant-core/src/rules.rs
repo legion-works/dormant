@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -93,7 +93,7 @@ pub enum ControlMsg {
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
-#[derive(Clone, Serialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum DaemonEvent {
     /// A sensor's state changed.
@@ -133,7 +133,7 @@ pub enum DaemonEvent {
 }
 
 /// A sensor as seen by a [`StateSnapshot`].
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SensorSnapshot {
     /// The sensor id (as a string for JSON readability).
     pub id: String,
@@ -144,7 +144,7 @@ pub struct SensorSnapshot {
 }
 
 /// A zone as seen by a [`StateSnapshot`].
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ZoneSnapshot {
     /// The zone id.
     pub id: String,
@@ -153,7 +153,7 @@ pub struct ZoneSnapshot {
 }
 
 /// A display as seen by a [`StateSnapshot`].
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DisplaySnapshot {
     /// Literal phase name (`"active"`, `"grace"`, `"blanking"`, `"blanked"`,
     /// `"waking"`).
@@ -168,7 +168,7 @@ pub struct DisplaySnapshot {
 }
 
 /// A point-in-time view of engine state, returned by [`ControlMsg::Snapshot`].
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StateSnapshot {
     /// All sensors in the engine's inventory.
     pub sensors: Vec<SensorSnapshot>,

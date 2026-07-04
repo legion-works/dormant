@@ -8,3 +8,14 @@ repository.workspace = true
 [[bin]]
 name = "dormantctl"
 path = "src/main.rs"
+
+[dependencies]
+dormant-core = { path = "../dormant-core" }
+dormant-displays = { path = "../dormant-displays" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+humantime = "2"
+comfy-table = "7"

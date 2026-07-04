@@ -10,11 +10,12 @@ use indexmap::IndexMap;
 
 use crate::ha_ws::HaWsSource;
 use crate::mqtt::MqttSource;
+use crate::usb_ld2410::UsbLd2410Source;
 
 /// All recognised sensor `type` strings.
 ///
 /// Used by `dormantctl doctor` and config validation to enumerate known types.
-pub const SOURCE_TYPES: &[&str] = &["mqtt", "ha"];
+pub const SOURCE_TYPES: &[&str] = &["mqtt", "ha", "usb-ld2410"];
 
 /// Build all sensor sources from the configuration map and credentials.
 ///
@@ -32,6 +33,7 @@ pub fn build(
 ) -> Result<Vec<Box<dyn SensorSource>>, DormantError> {
     // Group MQTT sensors by broker_url.
     let mut by_broker: IndexMap<String, Vec<(SensorId, MqttSensorCfg)>> = IndexMap::new();
+    let mut usb_sources: Vec<Box<dyn SensorSource>> = Vec::new();
 
     // Group HA sensors by url.
     let mut by_ha_url: IndexMap<String, Vec<(SensorId, String)>> = IndexMap::new();
@@ -52,8 +54,10 @@ pub fn build(
                     .or_default()
                     .push((id, cfg.entity.clone()));
             }
-            SensorConfig::UsbLd2410(_) => {
-                // Handled by a future task.
+            SensorConfig::UsbLd2410(cfg) => {
+                let id = SensorId(name.clone());
+                usb_sources
+                    .push(Box::new(UsbLd2410Source::new(id, cfg.clone())) as Box<dyn SensorSource>);
             }
         }
     }
@@ -78,6 +82,9 @@ pub fn build(
             sources.push(Box::new(HaWsSource::new(url, token.clone(), entities)));
         }
     }
+
+    // USB serial sources (one per sensor).
+    sources.extend(usb_sources);
 
     Ok(sources)
 }
@@ -142,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn build_ignores_non_mqtt_configs() {
+    fn build_handles_mqtt_and_usb_configs() {
         use dormant_core::config::schema::{HaSensorCfg, UsbLd2410Cfg};
 
         let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
@@ -172,14 +179,12 @@ mod tests {
         );
 
         let sources = build(&sensors, &creds_with_token()).unwrap();
-        // MQTT (1) + HA (1) = 2 sources now that HA is handled.
-        assert_eq!(sources.len(), 2, "MQTT + HA sources are built");
-        assert!(sources.iter().any(|s| s.source_id() == "tcp://broker:1883"));
-        assert!(
-            sources
-                .iter()
-                .any(|s| s.source_id() == "ws://ha.local:8123/api/websocket")
-        );
+        // MQTT (1) + HA (1) + USB (1) = 3 sources.
+        assert_eq!(sources.len(), 3, "MQTT + HA + USB sources are built");
+        let ids: Vec<&str> = sources.iter().map(|s| s.source_id()).collect();
+        assert!(ids.contains(&"tcp://broker:1883"));
+        assert!(ids.contains(&"ws://ha.local:8123/api/websocket"));
+        assert!(ids.contains(&"usb_sensor"));
     }
 
     #[test]
@@ -190,8 +195,9 @@ mod tests {
     }
 
     #[test]
-    fn source_types_contains_mqtt() {
+    fn source_types_contains_known_types() {
         assert!(SOURCE_TYPES.contains(&"mqtt"));
+        assert!(SOURCE_TYPES.contains(&"usb-ld2410"));
     }
 
     #[test]

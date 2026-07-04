@@ -5,3 +5,4 @@ pub mod backoff;
 pub mod ha_ws;
 pub mod mqtt;
 pub mod registry;
+pub mod usb_ld2410;

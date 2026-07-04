@@ -1,6 +1,6 @@
 # Configuration
 
-dormant configuration is a TOML file. Every key has a documented default. Unknown keys are rejected at startup (strict mode) or warned about (warn mode — default).
+dormant configuration is a TOML file. Optional keys list their defaults here; required keys are marked required. Unknown keys are rejected at startup (strict mode) or warned about (warn mode — default).
 
 ## Schema version
 
@@ -228,9 +228,17 @@ controllers = ["ddcci"]
 blank_mode = "power_off"
 
 [displays.living_tv]
-controllers = ["samsung-tizen"]
+controllers = ["ha-passthrough"]
 blank_mode = "screen_off_audio_on"
-host = "192.168.1.50"
+ha_url = "http://ha.local:8123"
+blank_service = "media_player.turn_off"
+blank_data = { entity_id = "media_player.living_tv" }
+wake_service = "media_player.turn_on"
+wake_data = { entity_id = "media_player.living_tv" }
+modes = ["screen_off_audio_on"]
+# Note: samsung-tizen (native WebSocket KEY_PICTURE_OFF) will replace this
+# once hardware verification completes — ha-passthrough via the HA Samsung
+# integration is the recommended path today.
 
 [displays.kitchen_display]
 controllers = ["command"]

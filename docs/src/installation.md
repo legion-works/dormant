@@ -12,11 +12,12 @@
 ```bash
 git clone https://github.com/icetea/dormant.git
 cd dormant
-cargo install --path crates/dormantd
-cargo install --path crates/dormantctl
+cargo build --release
+install -Dm755 target/release/dormantd ~/.local/bin/dormantd
+install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 ```
 
-Binaries land in `~/.cargo/bin/`. Add this to your `PATH` if it is not already there.
+Binaries land in `~/.local/bin/` — make sure this is on your `PATH`.
 
 ## From release (planned)
 

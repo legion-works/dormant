@@ -9,10 +9,11 @@
 dormantctl doctor
 
 # Per-component checks
-dormantctl doctor sensor desk
-dormantctl doctor display main
-dormantctl doctor zone office
-dormantctl doctor config
+dormantctl doctor mqtt      # probe MQTT sensors
+dormantctl doctor ha        # probe HA WebSocket sensors
+dormantctl doctor usb --port /dev/ttyUSB0  # probe USB LD2410
+dormantctl doctor ddcci     # probe DDC/CI displays
+dormantctl doctor config    # validate configuration
 ```
 
 Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a controller reports its last known state is stale). Failures indicate something needs fixing.
@@ -27,7 +28,7 @@ Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a co
 | `E_ZONE_UNKNOWN_MEMBER` | Zone references a sensor or zone that does not exist | Check the member name. Sensor IDs must match `[sensors.<id>]`. Zone references must use `"zone:<id>"` syntax. |
 | `E_CREDS_PERMS` | Credentials file has incorrect permissions | `chmod 600 ~/.config/dormant/credentials.toml` |
 | `E_CREDS_MISSING` | Required credential is missing | The config references a credential (e.g., HA token) but the credentials file does not contain it. |
-| `E_MODE_UNSUPPORTED` | Display controller does not support the configured blank mode | Run `dormantctl doctor display <id>` to see supported modes. Choose a different mode or add a fallback chain. |
+| `E_MODE_UNSUPPORTED` | Display controller does not support the configured blank mode | Run `dormantctl doctor ddcci` to see supported modes. Choose a different mode or add a fallback chain. |
 | `E_BLANK_FAILED` | Blank command failed | Check the controller's logs. For DDC/CI: is `/dev/i2c-*` accessible? For command: does the shell command work when run manually? |
 | `E_WAKE_FAILED` | Wake command failed | Same checks as blank. Verify the wake command works standalone. Check the `wake_retries` count. |
 | `E_RELOAD_WAKE_FAILED` | Defensive wake on config reload failed | A display was physically blanked before reload; the wake attempt to restore it failed. Check the controller and increase `wake_retries`. |

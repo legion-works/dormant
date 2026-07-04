@@ -28,10 +28,10 @@ Run these before committing. All must pass. They mirror CI exactly.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+cargo test --workspace --all-features
 cargo build --workspace
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 ```
 
@@ -51,7 +51,7 @@ Use `dormant-sensors/src/mqtt.rs` as the reference implementation. Steps:
 
 1. **Config variant** — add a new variant to `SensorConfig` in `dormant-core/src/config/schema.rs` with the `type` tag string (e.g., `#[serde(rename = "my-sensor")]`). Inline the common fields (`kind`, `hold_time`, `stale_timeout`).
 2. **Module** — create `dormant-sensors/src/my_sensor.rs`. Implement the `SensorSource` trait from `dormant-core/src/traits.rs`.
-3. **Registry entry** — add a match arm to the `build_sensor` function in `dormant-sensors/src/registry.rs` that constructs your source from its config.
+3. **Registry entry** — add a match arm to the `build` function in `dormant-sensors/src/registry.rs` that constructs your source from its config.
 4. **Known-key tree** — add your config keys to the known-key tree in `dormant-core/src/config/mod.rs` so unknown-key detection doesn't reject them.
 5. **Validation** — add validation rules in `dormant-core/src/config/validate.rs` (required fields, invalid combinations).
 6. **Tests + fixtures** — add a `#[cfg(test)] mod tests` block and a fixture config under `dormant-core/tests/fixtures/config/` that exercises your sensor variant.
@@ -61,7 +61,7 @@ Use `dormant-sensors/src/mqtt.rs` as the reference implementation. Steps:
 Use `dormant-displays/src/command.rs` as the reference implementation. Steps:
 
 1. **Module** — create `dormant-displays/src/my_controller.rs`. Implement the `DisplayController` trait (`name()`, `supported_modes()`, `probe()`, `is_available()`, `blank()`, `wake()`).
-2. **Registry entry** — add a match arm to `build_controller` in `dormant-displays/src/registry.rs`.
+2. **Registry entry** — add a match arm to `build_controllers` in `dormant-displays/src/registry.rs`.
 3. **Config fields** — add any new fields needed in `DisplayConfig` (schema.rs), with serde defaults.
 4. **Rules for `supported_modes()`** — return only modes you have verified work. Do not claim support for a mode that you have not tested on real hardware. A controller that falsely claims `power_off` support can leave a screen on — the worst failure mode.
 5. **Fail-safe wake contract** — `wake()` must be idempotent (safe to call on an already-awake display). Wakes must retry internally or escalate to the executor's chain. Never silently give up — a screen that won't wake is a hard failure.

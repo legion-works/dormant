@@ -27,7 +27,7 @@ If your sensor publishes a different field, set `field` (e.g., `field = "/presen
 ### Doctor check
 
 ```bash
-dormantctl doctor sensor desk
+dormantctl doctor mqtt
 ```
 
 Verifies: broker reachability, topic subscription, payload parsing (last received value). If the check fails, verify the broker URL, topic spelling, and network connectivity.
@@ -55,7 +55,7 @@ Any binary sensor entity works: door sensors, motion sensors, mmWave presence se
 ### Doctor check
 
 ```bash
-dormantctl doctor sensor couch
+dormantctl doctor ha
 ```
 
 Verifies: WebSocket connection, authentication, entity subscription, last known state. If authentication fails (`E_HA_AUTH`), check the token and credentials file permissions. If the entity is unknown, verify the entity ID spelling and that the entity exists in HA.
@@ -82,7 +82,7 @@ sudo usermod -a -G dialout $USER
 ### Doctor check
 
 ```bash
-dormantctl doctor sensor radar
+dormantctl doctor usb --port /dev/ttyUSB0
 ```
 
 Verifies: serial port accessibility, baud rate negotiation, frame parsing, last reported state (moving/stationary targets, distance). If the port is not found (`E_SENSOR_IO`), check the device path (`ls /dev/ttyUSB*`) and group membership.

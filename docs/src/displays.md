@@ -60,10 +60,10 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 Not all monitors support DDC/CI power-off (`D6 01`). Run `dormantctl doctor` to probe your monitor's VCP capabilities:
 
 ```bash
-dormantctl doctor display main
+dormantctl doctor ddcci
 ```
 
-If `power_off` is unsupported, try `screen_off_audio_on` or `brightness_zero` as alternatives.
+If `power_off` is unsupported, `brightness_zero` is always available as a fallback (DDC/CI unconditionally supports brightness control). `screen_off_audio_on` is not a DDC/CI mode — use a different controller for that.
 
 ### `ha-passthrough` — Home Assistant passthrough
 
@@ -117,7 +117,7 @@ Every controller must satisfy three invariants for `wake()`:
 ## Doctor check
 
 ```bash
-dormantctl doctor display <id>
+dormantctl doctor ddcci
 ```
 
 Verifies: controller reachability, supported modes vs configured mode, last known state, and performs a dry-run capability probe (does not blank the display).

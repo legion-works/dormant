@@ -46,8 +46,9 @@ OLED panels degrade with static content. The effectiveness of each blank mode va
 ```bash
 git clone https://github.com/icetea/dormant.git
 cd dormant
-cargo install --path crates/dormantd
-cargo install --path crates/dormantctl
+cargo build --release
+install -Dm755 target/release/dormantd ~/.local/bin/dormantd
+install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 ```
 
 ### Minimal config

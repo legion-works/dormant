@@ -8,3 +8,21 @@ repository.workspace = true
 [[bin]]
 name = "dormantd"
 path = "src/main.rs"
+
+[dependencies]
+dormant-core = { path = "../dormant-core" }
+dormant-sensors = { path = "../dormant-sensors" }
+dormant-displays = { path = "../dormant-displays" }
+clap = { workspace = true }
+notify = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+dormant-core = { path = "../dormant-core", features = ["test-fakes"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt", "rt-multi-thread", "time"] }
+tempfile = { workspace = true }

@@ -75,6 +75,17 @@ pub enum ControlMsg {
     Snapshot(oneshot::Sender<StateSnapshot>),
     /// Subscribe to [`DaemonEvent`]s from this point forward.
     SubscribeEvents(oneshot::Sender<broadcast::Receiver<DaemonEvent>>),
+    /// Set the user-activity inhibitor state for a rule (or every rule).
+    ///
+    /// Routes [`Input::InhibitorChanged`] to the target rule's displays,
+    /// mirroring the [`ControlMsg::Pause`] fan-out. The daemon's activity
+    /// inhibitor publishes rule-level inhibition through this message.
+    SetInhibited {
+        /// Target rule (`None` → all rules).
+        rule: Option<RuleId>,
+        /// Whether the inhibitor is now engaged.
+        inhibited: bool,
+    },
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
@@ -608,6 +619,26 @@ impl RulesEngine {
             ControlMsg::SubscribeEvents(tx) => {
                 let _ = tx.send(self.event_tx.subscribe());
             }
+            ControlMsg::SetInhibited { rule, inhibited } => {
+                self.handle_set_inhibited(rule.as_ref(), inhibited);
+            }
+        }
+    }
+
+    /// Route an inhibitor state change to a rule's displays (or every display
+    /// when `rule` is `None`), mirroring [`Self::handle_pause`]'s fan-out.
+    fn handle_set_inhibited(&mut self, rule: Option<&RuleId>, inhibited: bool) {
+        let targets: Vec<DisplayId> = match rule {
+            Some(r) => self.rule_displays.get(r).cloned().unwrap_or_default(),
+            None => self
+                .cfg
+                .displays
+                .iter()
+                .map(|d| d.display.clone())
+                .collect(),
+        };
+        for d in targets {
+            self.step_one(&d, Input::InhibitorChanged(inhibited));
         }
     }
 

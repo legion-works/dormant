@@ -1,0 +1,103 @@
+# Example dormant configuration.
+#
+# Install to $XDG_CONFIG_HOME/dormant/config.toml (usually
+# ~/.config/dormant/config.toml) or /etc/dormant/config.toml, and keep secrets
+# in a sibling credentials.toml (mode 0600).
+#
+# Validate before running:
+#   dormantd --validate-only --config examples/config.toml \
+#            --credentials examples/credentials.toml
+#
+# This example uses only the controllers registered today (command, ddcci,
+# ha-passthrough) and the sensor types available today (mqtt, ha, usb-ld2410).
+# Native kwin-dpms and samsung-tizen controllers land in later tasks; until
+# then a shell `command` controller or `ha-passthrough` covers those displays.
+
+config_version = 1
+
+[daemon]
+startup_holdoff = "20s"
+stale_sensor_timeout = "5m"
+log_level = "info"
+socket_path = "/run/user/1000/dormant.sock"
+
+# ── Sensors ────────────────────────────────────────────────────────────────────
+
+# Desk occupancy over MQTT (e.g. an ESPresense / mmWave node publishing JSON).
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "dormant/desk/occupancy"
+field = "/occupancy"
+
+# Couch presence via Home Assistant (requires ha_token in credentials.toml).
+[sensors.couch]
+type = "ha"
+url = "ws://homeassistant.local:8123/api/websocket"
+entity = "binary_sensor.couch_presence"
+
+# Hallway radar over USB — motion, with a hold time so brief pulses persist.
+[sensors.hallway]
+type = "usb-ld2410"
+port = "/dev/ttyUSB0"
+kind = "motion"
+hold_time = "30s"
+
+# ── Zones ──────────────────────────────────────────────────────────────────────
+
+# The office is occupied if either the desk sensor or the hallway radar fires.
+[zones.office]
+mode = "any"
+members = ["desk", "hallway"]
+
+# The living room follows the couch sensor alone.
+[zones.living_room]
+mode = "any"
+members = ["couch"]
+
+# ── Displays ───────────────────────────────────────────────────────────────────
+
+# Main monitor: DDC/CI brightness-to-zero, falling back to a shell command if
+# the panel's DDC channel is flaky.
+[displays.main_monitor]
+controllers = ["ddcci", "command"]
+blank_mode = "brightness_zero"
+degraded_mode = "power_off"
+ddc_display = "DP-1"
+blank_command = "ddcutil --display 1 setvcp 10 0"
+wake_command = "ddcutil --display 1 setvcp 10 80"
+modes = ["brightness_zero", "power_off"]
+command_timeout = "8s"
+
+# TV driven through Home Assistant service calls.
+[displays.tv]
+controllers = ["ha-passthrough"]
+blank_mode = "power_off"
+ha_url = "http://homeassistant.local:8123"
+blank_service = "media_player.turn_off"
+blank_data = { entity_id = "media_player.living_room_tv" }
+wake_service = "media_player.turn_on"
+wake_data = { entity_id = "media_player.living_room_tv" }
+modes = ["power_off"]
+
+# ── Rules ──────────────────────────────────────────────────────────────────────
+
+# Blank the main monitor when the office empties; respect user activity so the
+# screen never blanks while you are actively typing.
+[rules.desk]
+zone = "office"
+displays = ["main_monitor"]
+grace_period = "45s"
+min_wake_time = "10s"
+inhibitors = ["user-activity"]
+activity_idle_threshold = "2m"
+activity_poll_interval = "5s"
+
+# Turn the TV off shortly after the living room clears.
+[rules.living_room]
+zone = "living_room"
+displays = ["tv"]
+grace_period = "2m"
+wake_retries = 2
+wake_retry_backoff = "2s"
+wake_retry_interval = "60s"

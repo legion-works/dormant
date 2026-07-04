@@ -1,0 +1,15 @@
+[Unit]
+Description=dormant — proximity-driven display blanking daemon
+Documentation=https://github.com/icetea/dormant
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dormantd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

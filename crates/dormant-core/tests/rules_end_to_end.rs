@@ -1064,3 +1064,85 @@ async fn pause_does_not_lose_zone_edges() {
         let _ = harness.source_handle.await;
     }
 }
+
+// ── SetInhibited: activity inhibitor freezes and releases grace ────────────────
+
+#[tokio::test(start_paused = true)]
+async fn set_inhibited_freezes_grace_until_released() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Present@0, Absent@10s → grace runs until ~70s.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    // Let the Absent land and grace start, then engage the inhibitor before
+    // grace would expire.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: None,
+            inhibited: true,
+        })
+        .await
+        .expect("ctl open");
+
+    // Well past the original grace deadline — frozen grace must not blank.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    assert!(
+        !sink
+            .log()
+            .iter()
+            .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+        "inhibitor must freeze grace: no blank while inhibited"
+    );
+
+    // Release the inhibitor — grace resumes and the blank fires.
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: None,
+            inhibited: false,
+        })
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        sink.log()
+            .iter()
+            .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+        "blank must fire once the inhibitor is released"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}

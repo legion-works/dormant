@@ -2,7 +2,19 @@
 //!
 //! The actual rebuild lives in the app's run loop (`Runner::reload`); this
 //! module only sets up the filesystem watcher that pokes the run loop when the
-//! config file changes. SIGHUP is wired directly in the run loop.
+//! config file changes. SIGHUP is wired directly in the run loop, and rapid
+//! change bursts are coalesced by a debounce window (`daemon.reload_debounce`).
+//!
+//! ## Reload semantics (v1)
+//!
+//! A reload validates and assembles the **new** config first; an invalid
+//! config only flags `pending_reload` on the live engine (no teardown). A
+//! valid config triggers a restart-in-place. Because the rebuilt state
+//! machines start `Active`, retained displays that were physically dark before
+//! the reload receive a **defensive physical wake** (`reload_defensive_wake`)
+//! so an occupied room is never left dark waiting for the next sensor edge.
+//! This is a sanctioned v1 limitation: it can cause a brief wake-flash on a
+//! display that should have stayed blanked; the next absent edge re-blanks it.
 //!
 //! We watch the config file's **parent directory** (not the file inode)
 //! because editors and `install(1)` frequently replace the file via

@@ -104,6 +104,15 @@ pub struct DaemonConfig {
 
     /// Path to the Unix-domain socket for `dormantctl` communication.
     pub socket_path: Option<PathBuf>,
+
+    /// How to interpret the raw value returned by the screensaver `DBus`
+    /// `GetSessionIdleTime` method (`"auto"` | `"ms"` | `"s"`).
+    #[serde(default)]
+    pub idle_time_unit: IdleTimeUnit,
+
+    /// Debounce window coalescing rapid config-file changes into one reload.
+    #[serde(default = "default_reload_debounce", with = "humantime_serde")]
+    pub reload_debounce: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -113,8 +122,28 @@ impl Default for DaemonConfig {
             stale_sensor_timeout: defaults::STALE_SENSOR_TIMEOUT,
             log_level: defaults::LOG_LEVEL.into(),
             socket_path: None,
+            idle_time_unit: IdleTimeUnit::default(),
+            reload_debounce: defaults::RELOAD_DEBOUNCE,
         }
     }
+}
+
+/// How to interpret the raw idle value returned by the screensaver `DBus`
+/// `GetSessionIdleTime` method. Implementations disagree: the freedesktop
+/// `ScreenSaver` XML contract says seconds, while current KDE `kscreenlocker`
+/// (backed by `KIdleTime`) returns milliseconds. `Auto` detects the unit at
+/// runtime from the delta between two polls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleTimeUnit {
+    /// Detect the unit at runtime from consecutive-poll deltas.
+    #[default]
+    Auto,
+    /// The raw value is milliseconds.
+    Ms,
+    /// The raw value is seconds.
+    #[serde(rename = "s")]
+    Secs,
 }
 
 // ── SensorKind ──────────────────────────────────────────────────────────────────
@@ -527,6 +556,9 @@ fn default_startup_holdoff() -> Duration {
 }
 fn default_stale_sensor_timeout() -> Duration {
     defaults::STALE_SENSOR_TIMEOUT
+}
+fn default_reload_debounce() -> Duration {
+    defaults::RELOAD_DEBOUNCE
 }
 fn default_log_level() -> String {
     defaults::LOG_LEVEL.into()

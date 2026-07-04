@@ -1146,3 +1146,58 @@ async fn set_inhibited_freezes_grace_until_released() {
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;
 }
+
+// ── SetPendingReload: runtime pending-reload flag ──────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn set_pending_reload_surfaces_in_snapshot() {
+    let display = DisplayId("mon".into());
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display, sink);
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    assert!(
+        request_snapshot(&harness.ctl_tx)
+            .await
+            .pending_reload
+            .is_none()
+    );
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetPendingReload(Some("bad edit".into())))
+        .await
+        .expect("ctl open");
+    let snap = request_snapshot(&harness.ctl_tx).await;
+    assert_eq!(snap.pending_reload.as_deref(), Some("bad edit"));
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetPendingReload(None))
+        .await
+        .expect("ctl open");
+    assert!(
+        request_snapshot(&harness.ctl_tx)
+            .await
+            .pending_reload
+            .is_none()
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}

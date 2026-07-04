@@ -287,7 +287,13 @@ async fn reload_rejected_keeps_old() {
         "pending_reload should be set after a rejected reload"
     );
 
-    // Old behavior persists: the rebuilt-old generation blanks again.
+    // Old behavior persists: the untouched generation was never torn down, so
+    // it still blanks. Drive a wake+blank cycle through the injected-events
+    // seam to prove the live engine keeps working.
+    let events = handle.events_sender();
+    events.send(ev("desk", SensorState::Present)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    events.send(ev("desk", SensorState::Absent)).await.unwrap();
     assert!(
         wait_for(|| count(&marker, 'B') > before, Duration::from_secs(3)).await,
         "old config should keep blanking after a rejected reload"

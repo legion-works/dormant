@@ -59,6 +59,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "stale_sensor_timeout",
             "log_level",
             "socket_path",
+            "idle_time_unit",
+            "reload_debounce",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────

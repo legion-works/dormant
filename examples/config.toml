@@ -4,9 +4,15 @@
 # ~/.config/dormant/config.toml) or /etc/dormant/config.toml, and keep secrets
 # in a sibling credentials.toml (mode 0600).
 #
-# Validate before running:
+# Validate before running. Credentials must be mode 0600, so copy the example
+# out and tighten it first (a file tracked in git can't carry 0600 reliably):
+#   cp examples/credentials.toml /tmp/creds.toml && chmod 600 /tmp/creds.toml
 #   dormantd --validate-only --config examples/config.toml \
-#            --credentials examples/credentials.toml
+#            --credentials /tmp/creds.toml
+#
+# --validate-only also tolerates a missing credentials file (it falls back to
+# empty credentials and reports any resulting "missing credential" errors), so
+# a bare `dormantd --validate-only --config examples/config.toml` still runs.
 #
 # This example uses only the controllers registered today (command, ddcci,
 # ha-passthrough) and the sensor types available today (mqtt, ha, usb-ld2410).

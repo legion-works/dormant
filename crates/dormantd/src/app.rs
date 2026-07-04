@@ -15,25 +15,30 @@
 //! back to `degraded_mode` (with a `display_mode_degraded` warning) or fail
 //! startup with `E_MODE_UNSUPPORTED`.
 //!
-//! ## Hot reload (restart-in-place)
+//! ## Hot reload (validate-first, restart-in-place)
 //!
-//! [`RulesEngine`] is not reconfigurable in place, so reload snapshots the
-//! running engine, tears it down, and rebuilds a fresh generation from the new
-//! config. Displays removed by the new config that were blanked get a
-//! *verified* wake (a direct `wake()` on the old executor, awaited) before
-//! teardown completes; if that wake fails the reload is aborted, the old
-//! config is kept, and `pending_reload` is set. A rejected reload (invalid new
-//! config or failed removed-display wake) restarts the *old* config in place
-//! with `pending_reload` populated so operators see it in a snapshot.
+//! Reload validates and assembles the **new** config *before* touching the
+//! running engine. An invalid or un-assemblable config only flags
+//! `pending_reload` on the live engine (via [`ControlMsg::SetPendingReload`])
+//! and leaves it running — no teardown, no churn on a bad edit. A valid config
+//! triggers a restart-in-place: snapshot, tear down, rebuild a fresh
+//! generation.
 //!
-//! ### Restore limitation (M1)
+//! Displays *removed* by the new config that were dark get a *verified* wake
+//! (a direct awaited `wake()` on the old executor) before the new generation
+//! starts; if that wake fails the reload is aborted, the old config is
+//! restarted in place, and `pending_reload` is set. Displays *retained* by the
+//! new config that were dark get a *defensive* physical wake after the new
+//! generation spawns (`reload_defensive_wake`).
+//!
+//! ### Restore limitation (v1)
 //!
 //! `dormant-core` exposes no seam to inject a restored [`DisplayStateMachine`]
 //! phase into a running [`RulesEngine`] (machines are private and always start
-//! `Active`). Reload therefore replays only the *scheduling* effects a
-//! restored phase would emit (via [`RulesEngine::apply_restore_effects`]);
-//! displays otherwise restart `Active` and re-converge from live sensor state.
-//! The safety-critical removed-display verified-wake path is fully implemented.
+//! `Active`). Reload replays only the *scheduling* effects a restored phase
+//! would emit (via [`RulesEngine::apply_restore_effects`]); the defensive wake
+//! (above) covers the physically-dark-but-Active gap. Removed-display verified
+//! wake is fully implemented.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -320,8 +325,8 @@ impl App {
 
 // ── AppHandle ──────────────────────────────────────────────────────────────────
 
-/// A control handle for a running [`App`]. Kept by the daemon for IPC
-/// (Task 17) and used by tests to drive and observe the engine.
+/// A control handle for a running [`App`]. Consumed by the IPC control surface
+/// and used by tests to drive and observe the engine.
 pub struct AppHandle {
     ctl_tx: mpsc::Sender<ControlMsg>,
     events_tx: mpsc::Sender<PresenceEvent>,
@@ -389,48 +394,80 @@ impl Runner {
         let old_ctl = self.engine_ctl.borrow().clone();
         let snapshot = request_snapshot(&old_ctl).await;
 
-        match self.load_and_assemble().await {
-            Ok(new_assembly) => {
-                let removed = removed_blanked_displays(snapshot.as_ref(), &new_assembly.cfg);
-                teardown(&mut self.generation).await;
-
-                for display_id in removed {
-                    if let Some(exec) = self.generation.display_executors.get(&display_id) {
-                        if let Err(e) = exec.wake().await {
-                            let detail =
-                                format!("removed display '{display_id}' failed verified wake: {e}");
-                            tracing::error!(event = "config_reload_rejected", detail = %detail);
-                            self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
-                            let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
-                            return;
-                        }
-                        tracing::info!(
-                            event = "reload_removed_display_woken",
-                            display = %display_id,
-                        );
-                    }
-                }
-
-                match spawn_generation(&self.root, new_assembly, snapshot.as_ref(), None) {
-                    Ok(spawn) => {
-                        self.install_generation(spawn);
-                        tracing::info!(event = "config_reloaded");
-                        let _ = self.reload_tx.send(ReloadOutcome::Reloaded);
-                    }
-                    Err(e) => {
-                        let detail = format!("rebuild from new config failed: {e}");
-                        tracing::error!(event = "config_reload_rejected", detail = %detail);
-                        self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
-                        let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
-                    }
-                }
-            }
+        // Validate + assemble the NEW config BEFORE touching the running
+        // generation. An invalid or un-assemblable config only flags
+        // pending_reload on the live engine and leaves it running — no
+        // teardown, no phase loss, no churn on a bad edit.
+        let new_assembly = match self.load_and_assemble().await {
+            Ok(assembly) => assembly,
             Err(detail) => {
                 tracing::error!(event = "config_reload_rejected", detail = %detail);
-                teardown(&mut self.generation).await;
+                let _ = old_ctl
+                    .send(ControlMsg::SetPendingReload(Some(detail.clone())))
+                    .await;
+                let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
+                return;
+            }
+        };
+
+        let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.cfg);
+        let retained_dark = retained_dark_displays(snapshot.as_ref(), &new_assembly.cfg);
+
+        teardown(&mut self.generation).await;
+
+        // Verified physical wake of REMOVED displays that were dark, via their
+        // old executors. A failure aborts the reload and restores the old
+        // config in place (with pending_reload set).
+        for display_id in removed {
+            if let Some(exec) = self.generation.display_executors.get(&display_id) {
+                if let Err(e) = exec.wake().await {
+                    let detail =
+                        format!("removed display '{display_id}' failed verified wake: {e}");
+                    tracing::error!(event = "config_reload_rejected", detail = %detail);
+                    self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
+                    let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
+                    return;
+                }
+                tracing::info!(event = "reload_removed_display_woken", display = %display_id);
+            }
+        }
+
+        match spawn_generation(&self.root, new_assembly, snapshot.as_ref(), None) {
+            Ok(spawn) => {
+                self.install_generation(spawn);
+                self.defensive_wake(retained_dark);
+                tracing::info!(event = "config_reloaded");
+                let _ = self.reload_tx.send(ReloadOutcome::Reloaded);
+            }
+            Err(e) => {
+                let detail = format!("rebuild from new config failed: {e}");
+                tracing::error!(event = "config_reload_rejected", detail = %detail);
                 self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
                 let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
             }
+        }
+    }
+
+    /// Issue a defensive physical wake to RETAINED displays that were dark
+    /// before the reload. The rebuilt state machines start `Active`, so a
+    /// physically-blanked display in an occupied room would otherwise stay
+    /// dark until the next sensor edge. Accept the brief wake-flash (v1
+    /// limitation, documented in `reload.rs`).
+    fn defensive_wake(&self, displays: Vec<DisplayId>) {
+        for display_id in displays {
+            let Some(exec) = self.generation.display_executors.get(&display_id).cloned() else {
+                continue;
+            };
+            tokio::spawn(async move {
+                match exec.wake().await {
+                    Ok(()) => {
+                        tracing::info!(event = "reload_defensive_wake", display = %display_id, ok = true);
+                    }
+                    Err(e) => {
+                        tracing::warn!(event = "reload_defensive_wake", display = %display_id, ok = false, error = %e);
+                    }
+                }
+            });
         }
     }
 
@@ -507,14 +544,20 @@ async fn run_loop(
             }
             () = wait_signal(sighup.as_mut()) => {
                 tracing::info!(event = "reload_signal", signal = "SIGHUP");
+                let window = runner.generation.cfg.daemon.reload_debounce;
+                debounce(&mut watcher, window).await;
                 runner.reload().await;
             }
             Some(()) = watcher.rx.recv() => {
                 tracing::info!(event = "reload_trigger", source = "watcher");
+                let window = runner.generation.cfg.daemon.reload_debounce;
+                debounce(&mut watcher, window).await;
                 runner.reload().await;
             }
             Some(()) = reload_trigger.recv() => {
                 tracing::info!(event = "reload_trigger", source = "ipc");
+                let window = runner.generation.cfg.daemon.reload_debounce;
+                debounce(&mut watcher, window).await;
                 runner.reload().await;
             }
         }
@@ -522,6 +565,25 @@ async fn run_loop(
 
     teardown(&mut runner.generation).await;
     tracing::info!(event = "daemon_stopped");
+}
+
+/// Drain further watcher events for `window` before acting, coalescing the
+/// write-then-rename bursts editors produce into one reload.
+async fn debounce(watcher: &mut reload::ConfigWatcher, window: Duration) {
+    if window.is_zero() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => break,
+            msg = watcher.rx.recv() => {
+                if msg.is_none() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Await a signal, or never resolve if the signal stream is absent.
@@ -557,11 +619,19 @@ struct GenSpawn {
     events_tx: mpsc::Sender<PresenceEvent>,
 }
 
-/// Cancel a generation and await its engine (bounded).
+/// Cancel a generation and await its engine (bounded), force-aborting the
+/// engine task if it overruns the grace window.
 async fn teardown(generation: &mut Generation) {
     generation.token.cancel();
     if let Some(handle) = generation.engine_handle.take() {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let abort = handle.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .is_err()
+        {
+            abort.abort();
+            tracing::warn!(event = "engine_abort_forced");
+        }
     }
 }
 
@@ -829,8 +899,14 @@ fn spawn_generation(
     let poll = assembly
         .activity_poll
         .unwrap_or_else(|| Duration::from_secs(5));
-    let _inhibitor =
-        inhibit_activity::spawn(assembly.activity_rules, poll, ctl_tx.clone(), token.clone());
+    let idle_unit = assembly.cfg.daemon.idle_time_unit;
+    let _inhibitor = inhibit_activity::spawn(
+        assembly.activity_rules,
+        poll,
+        idle_unit,
+        ctl_tx.clone(),
+        token.clone(),
+    );
 
     let generation = Generation {
         token,
@@ -879,9 +955,15 @@ fn apply_restore(
     }
 }
 
-/// Displays that the new config drops and that were blanked/blanking — these
-/// get a verified wake before teardown completes.
-fn removed_blanked_displays(snapshot: Option<&StateSnapshot>, new_cfg: &Config) -> Vec<DisplayId> {
+/// A display phase that means the panel is physically off (or on its way off /
+/// coming back): the daemon must not silently leave it dark across a reload.
+fn phase_is_dark(phase: &str) -> bool {
+    matches!(phase, "blanked" | "blanking" | "waking")
+}
+
+/// Displays that the new config drops and that were dark — these get a verified
+/// physical wake before teardown completes.
+fn removed_dark_displays(snapshot: Option<&StateSnapshot>, new_cfg: &Config) -> Vec<DisplayId> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
@@ -889,10 +971,23 @@ fn removed_blanked_displays(snapshot: Option<&StateSnapshot>, new_cfg: &Config) 
     snapshot
         .displays
         .iter()
-        .filter(|(id, d)| {
-            !new_displays.contains(id.as_str())
-                && matches!(d.phase.as_str(), "blanked" | "blanking")
-        })
+        .filter(|(id, d)| !new_displays.contains(id.as_str()) && phase_is_dark(&d.phase))
+        .map(|(id, _)| DisplayId(id.clone()))
+        .collect()
+}
+
+/// Displays the new config retains that were dark — these get a defensive
+/// physical wake after the new generation is spawned (state machines restart
+/// `Active`, so a dark panel would otherwise linger until the next edge).
+fn retained_dark_displays(snapshot: Option<&StateSnapshot>, new_cfg: &Config) -> Vec<DisplayId> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let new_displays: HashSet<&str> = new_cfg.displays.keys().map(String::as_str).collect();
+    snapshot
+        .displays
+        .iter()
+        .filter(|(id, d)| new_displays.contains(id.as_str()) && phase_is_dark(&d.phase))
         .map(|(id, _)| DisplayId(id.clone()))
         .collect()
 }

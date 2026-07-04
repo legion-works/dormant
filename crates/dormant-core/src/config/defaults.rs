@@ -17,6 +17,10 @@ pub const STARTUP_HOLDOFF: Duration = Duration::from_secs(30);
 /// [`UnavailablePolicy`]: crate::zone::UnavailablePolicy
 pub const STALE_SENSOR_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Debounce window that coalesces rapid config-file changes into a single
+/// reload (editors often write-then-rename, producing several events).
+pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// How long a zone must stay present or absent before a rule acts (debounce).
 pub const GRACE_PERIOD: Duration = Duration::from_secs(60);
 

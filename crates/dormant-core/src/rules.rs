@@ -86,6 +86,10 @@ pub enum ControlMsg {
         /// Whether the inhibitor is now engaged.
         inhibited: bool,
     },
+    /// Set or clear the pending-reload indicator at runtime (operator feedback
+    /// in [`StateSnapshot`]s). Lets the daemon flag a rejected reload without
+    /// tearing down the running engine.
+    SetPendingReload(Option<String>),
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
@@ -622,6 +626,7 @@ impl RulesEngine {
             ControlMsg::SetInhibited { rule, inhibited } => {
                 self.handle_set_inhibited(rule.as_ref(), inhibited);
             }
+            ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
         }
     }
 

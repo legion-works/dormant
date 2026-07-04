@@ -6,15 +6,28 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
 humantime-serde.workspace = true
 indexmap.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dormant-core = { path = ".", features = ["test-fakes"] }
 proptest.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+test-fakes = []
 
 [lib]
+
+[[test]]
+name = "rules_end_to_end"
+required-features = ["test-fakes"]

@@ -509,10 +509,10 @@ impl DisplayStateMachine {
             // BlankResult with matching generation: process.
             (Phase::Blanking, Input::BlankResult { r#gen, result }) => {
                 if Some(r#gen) != self.last_blank_gen {
-                    // Stale generation — ignore.
-                    return vec![];
-                }
-                if result.is_ok() {
+                    // Stale generation — ignore, but still fall through to
+                    // the end-of-step invariant check below.
+                    vec![]
+                } else if result.is_ok() {
                     self.last_blank = Some(now);
                     if self.pending_wake {
                         self.pending_wake = false;
@@ -665,10 +665,10 @@ impl DisplayStateMachine {
             // WakeResult with matching generation: process.
             (Phase::Waking, Input::WakeResult { r#gen, result }) => {
                 if Some(r#gen) != self.last_wake_gen {
-                    // Stale generation — ignore.
-                    return vec![];
-                }
-                if result.is_ok() {
+                    // Stale generation — ignore, but still fall through to
+                    // the end-of-step invariant check below.
+                    vec![]
+                } else if result.is_ok() {
                     self.last_wake = Some(now);
                     self.enter_active(now, "wake_completed")
                 } else {

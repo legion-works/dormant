@@ -9,7 +9,9 @@ use std::fmt;
 // ── Newtype IDs ───────────────────────────────────────────────────────────────
 
 /// Identifier for a presence sensor.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct SensorId(pub String);
 
@@ -20,7 +22,9 @@ impl fmt::Display for SensorId {
 }
 
 /// Identifier for a display.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct DisplayId(pub String);
 
@@ -42,7 +46,9 @@ impl fmt::Display for ZoneId {
 }
 
 /// Identifier for a rule.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct RuleId(pub String);
 
@@ -93,9 +99,15 @@ pub struct Tick(pub std::time::Instant);
 
 impl Tick {
     /// Create a `Tick` representing the current monotonic instant.
+    ///
+    /// Under the hood this delegates to [`tokio::time::Instant::now`] so that
+    /// paused-time tests (`#[tokio::test(start_paused = true)]`) see the
+    /// virtual clock — without that delegation the engine's grace countdown
+    /// and stale-sensor sweeper would march against wall-clock time and the
+    /// tests could not advance minutes in milliseconds.
     #[must_use]
     pub fn now() -> Self {
-        Self(std::time::Instant::now())
+        Self(tokio::time::Instant::now().into_std())
     }
 }
 

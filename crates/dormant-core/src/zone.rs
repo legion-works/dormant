@@ -255,6 +255,11 @@ impl ZoneEngine {
     pub fn sensor_states(&self) -> &HashMap<SensorId, (SensorState, Timestamp)> {
         &self.sensor_states
     }
+
+    /// Iterate over all known zone ids (in evaluation order).
+    pub fn known_zone_ids(&self) -> impl Iterator<Item = &ZoneId> {
+        self.eval_order.iter()
+    }
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────────

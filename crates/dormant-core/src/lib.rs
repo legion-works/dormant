@@ -3,6 +3,11 @@
 
 pub mod config;
 pub mod error;
+pub mod rules;
 pub mod state_machine;
+pub mod traits;
 pub mod types;
 pub mod zone;
+
+#[cfg(feature = "test-fakes")]
+pub mod fakes;

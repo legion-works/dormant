@@ -3,13 +3,16 @@
 //! Connects to the daemon's Unix domain socket, sends a single JSON
 //! [`IpcRequest`], and reads the response (or event stream).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::DaemonEvent;
+
+/// Maximum line length for IPC frames (1 MB).  Must match the server's limit.
+const MAX_LINE_BYTES: usize = 1_048_576;
 
 /// Connect to the daemon's socket and send one request, returning the
 /// response.
@@ -65,9 +68,25 @@ impl Iterator for EventStream {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let mut line = String::new();
-            match self.reader.read_line(&mut line) {
+            // Cap the line buffer so a malicious or broken server cannot
+            // cause unbounded memory growth.
+            let mut reader = self
+                .reader
+                .by_ref()
+                .take(u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX) + 1);
+            match reader.read_line(&mut line) {
                 Ok(0) => return None, // EOF
-                Ok(_) => {
+                Ok(n) => {
+                    if n > MAX_LINE_BYTES {
+                        // Drain the rest of the oversized line.
+                        let _ = std::io::copy(
+                            &mut self.reader.by_ref().take(u64::MAX),
+                            &mut std::io::sink(),
+                        );
+                        return Some(Err(anyhow::anyhow!(
+                            "event line exceeds maximum length of {MAX_LINE_BYTES} bytes"
+                        )));
+                    }
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         return Some(serde_json::from_str(trimmed).context("parse daemon event"));

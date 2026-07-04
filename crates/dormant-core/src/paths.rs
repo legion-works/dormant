@@ -2,21 +2,34 @@
 //!
 //! Single implementation of the default-config and default-socket chains so
 //! that daemon and CLI agree on where to look.
+//!
+//! Internal `_from` functions accept explicit env values for testability;
+//! public functions read the environment once and delegate.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// Return the list of candidate config paths, in priority order.
 ///
 /// 1. `$XDG_CONFIG_HOME/dormant/config.toml` (if `XDG_CONFIG_HOME` is set)
-/// 2. `$HOME/.config/dormant/config.toml` (if HOME is set)
+/// 2. `$HOME/.config/dormant/config.toml` (if `HOME` is set)
 /// 3. `/etc/dormant/config.toml`
 #[must_use]
 pub fn default_config_candidates() -> Vec<PathBuf> {
+    config_candidates_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Internal: build candidate list from explicit env values (test seam).
+#[must_use]
+fn config_candidates_from(xdg: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(xdg) = xdg {
         candidates.push(PathBuf::from(xdg).join("dormant").join("config.toml"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         candidates.push(
             PathBuf::from(home)
                 .join(".config")
@@ -53,8 +66,14 @@ pub fn resolve_config_path(explicit: Option<&std::path::Path>) -> Result<PathBuf
 /// 2. `/run/dormant/dormant.sock`
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let mut p = PathBuf::from(runtime_dir);
+    socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// Internal: build socket path from explicit env value (test seam).
+#[must_use]
+fn socket_path_from(runtime_dir: Option<OsString>) -> PathBuf {
+    if let Some(dir) = runtime_dir {
+        let mut p = PathBuf::from(dir);
         p.push("dormant.sock");
         return p;
     }
@@ -81,129 +100,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_candidates_includes_xdg_when_set() {
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: test-only env manipulation, single-threaded test.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/home/user/xdg");
-        }
-        let candidates = default_config_candidates();
-        assert!(
-            candidates
-                .iter()
-                .any(|p| p.to_string_lossy().contains("/home/user/xdg"))
+    fn config_candidates_includes_xdg_when_set() {
+        let candidates = config_candidates_from(
+            Some(OsString::from("/home/user/xdg")),
+            Some(OsString::from("/home/user")),
         );
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("XDG_CONFIG_HOME", v);
-            },
-            None => unsafe {
-                std::env::remove_var("XDG_CONFIG_HOME");
-            },
-        }
+        assert!(candidates[0].to_string_lossy().contains("/home/user/xdg"));
+        assert!(candidates[1].to_string_lossy().contains("/home/user"));
+        assert_eq!(candidates[2], PathBuf::from("/etc/dormant/config.toml"));
     }
 
     #[test]
-    fn default_config_candidates_includes_home_when_xdg_unset() {
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: test-only env manipulation.
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            std::env::set_var("HOME", "/home/user");
-        }
-        let candidates = default_config_candidates();
-        assert!(
-            candidates
-                .iter()
-                .any(|p| p.to_string_lossy().contains("/home/user"))
-        );
-        match prev_xdg {
-            Some(v) => unsafe {
-                std::env::set_var("XDG_CONFIG_HOME", v);
-            },
-            None => unsafe {
-                std::env::remove_var("XDG_CONFIG_HOME");
-            },
-        }
-        match prev_home {
-            Some(v) => unsafe {
-                std::env::set_var("HOME", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
+    fn config_candidates_includes_home_when_xdg_unset() {
+        let candidates = config_candidates_from(None, Some(OsString::from("/home/user")));
+        assert!(candidates[0].to_string_lossy().contains("/home/user"));
+        assert_eq!(candidates[1], PathBuf::from("/etc/dormant/config.toml"));
     }
 
     #[test]
-    fn xdg_set_but_missing_falls_back_to_home() {
-        // When XDG_CONFIG_HOME is set but the file doesn't exist,
-        // resolve_config_path should still try HOME and /etc.
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-        // SAFETY: test-only env manipulation.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/nonexistent-xdg");
-            std::env::set_var("HOME", "/nonexistent-home");
-        }
-        // Neither exists, so it should error
-        let result = resolve_config_path(None);
-        assert!(result.is_err());
-        match prev_xdg {
-            Some(v) => unsafe {
-                std::env::set_var("XDG_CONFIG_HOME", v);
-            },
-            None => unsafe {
-                std::env::remove_var("XDG_CONFIG_HOME");
-            },
-        }
-        match prev_home {
-            Some(v) => unsafe {
-                std::env::set_var("HOME", v);
-            },
-            None => unsafe {
-                std::env::remove_var("HOME");
-            },
-        }
+    fn config_candidates_no_home_no_xdg() {
+        let candidates = config_candidates_from(None, None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], PathBuf::from("/etc/dormant/config.toml"));
     }
 
     #[test]
-    fn default_socket_path_xdg() {
-        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: test-only env manipulation.
-        unsafe {
-            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
-        }
-        let p = default_socket_path();
+    fn socket_path_from_xdg() {
+        let p = socket_path_from(Some(OsString::from("/run/user/1000")));
         assert_eq!(p, PathBuf::from("/run/user/1000/dormant.sock"));
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("XDG_RUNTIME_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("XDG_RUNTIME_DIR");
-            },
-        }
     }
 
     #[test]
-    fn default_socket_path_fallback() {
-        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: test-only env manipulation.
-        unsafe {
-            std::env::remove_var("XDG_RUNTIME_DIR");
-        }
-        let p = default_socket_path();
+    fn socket_path_from_fallback() {
+        let p = socket_path_from(None);
         assert_eq!(p, PathBuf::from("/run/dormant/dormant.sock"));
-        match prev {
-            Some(v) => unsafe {
-                std::env::set_var("XDG_RUNTIME_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("XDG_RUNTIME_DIR");
-            },
-        }
     }
 
     #[test]

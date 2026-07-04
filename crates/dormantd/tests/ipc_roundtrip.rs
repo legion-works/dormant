@@ -181,6 +181,30 @@ async fn pause_sends_control_msg() {
 }
 
 #[tokio::test]
+async fn pause_u64_max_overflow_returns_error() {
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
+
+    let resp = send_request(
+        &socket_path,
+        &IpcRequest::Pause {
+            rule: None,
+            duration_s: Some(u64::MAX),
+        },
+    )
+    .await;
+
+    assert!(!resp.ok, "u64::MAX should overflow");
+    assert_eq!(
+        resp.error.as_deref(),
+        Some("duration overflow"),
+        "error should mention overflow, got: {:?}",
+        resp.error
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn blank_unknown_display_returns_error() {
     let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
 
@@ -285,6 +309,82 @@ async fn bad_json_line_returns_error_and_connection_stays_usable() {
     // Verify a subsequent connection still works
     let resp2 = send_request(&socket_path, &IpcRequest::Status).await;
     assert!(resp2.ok, "connection should still be usable after bad JSON");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn line_at_max_length_accepted() {
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
+
+    // Build a JSON request that is exactly at the max line length.
+    // We send a Status request (small) padded with whitespace to MAX.
+    let base = br#"{"req":"status"}"#;
+    let max = 1_048_576;
+    let mut line = Vec::with_capacity(max + 1);
+    line.extend_from_slice(base);
+    line.resize(max, b' ');
+    line.push(b'\n');
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = tokio::io::split(stream);
+    writer.write_all(&line).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut reader = BufReader::new(reader);
+    let mut response_line = String::new();
+    tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+        .await
+        .expect("timeout reading response")
+        .unwrap();
+    let resp: IpcResponse = serde_json::from_str(response_line.trim()).unwrap();
+    // The server trims whitespace, so the padded line should parse as status.
+    assert!(resp.ok, "max-length line should be accepted");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn line_exceeding_max_rejected() {
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
+
+    // Build a line that exceeds MAX by 100 bytes.
+    let base = br#"{"req":"status"}"#;
+    let max = 1_048_576;
+    let oversized = max + 100;
+    let mut line = Vec::with_capacity(oversized + 1);
+    line.extend_from_slice(base);
+    line.resize(oversized, b' ');
+    line.push(b'\n');
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let (reader, mut writer) = tokio::io::split(stream);
+    writer.write_all(&line).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut reader = BufReader::new(reader);
+    let mut response_line = String::new();
+    let read_result =
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response_line)).await;
+
+    // The server may close the connection after an oversized line (bail in
+    // handle_connection logs and returns).  Either an error response or EOF
+    // is acceptable — what matters is that the oversized line is rejected.
+    match read_result {
+        Ok(Ok(0)) => {
+            // EOF — server closed connection, which is fine.
+        }
+        Ok(Ok(_)) => {
+            let resp: IpcResponse = serde_json::from_str(response_line.trim()).unwrap();
+            assert!(!resp.ok, "oversized line should be rejected");
+            assert!(
+                resp.error.as_deref().unwrap().contains("line exceeds"),
+                "error should mention line exceeds: {:?}",
+                resp.error
+            );
+        }
+        other => panic!("unexpected read result: {other:?}"),
+    }
 
     cancel.cancel();
 }

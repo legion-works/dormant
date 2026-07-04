@@ -1,0 +1,10 @@
+[package]
+name = "dormantd"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dormantd"
+path = "src/main.rs"

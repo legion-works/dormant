@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/dormant-core", "crates/dormant-sensors", "crates/dormant-displays", "crates/dormantd", "crates/dormantctl"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/icetea/dormant"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+humantime-serde = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+zbus = "5"
+indexmap = { version = "2", features = ["serde"] }
+tokio-stream = "0.1"

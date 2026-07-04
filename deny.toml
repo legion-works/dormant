@@ -1,0 +1,28 @@
+[graph]
+# cargo-deny v2 schema — graph section is required but can be minimal
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+]
+unlicensed = "deny"
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[advisories]
+vulnerability = "deny"
+unsound = "deny"
+unmaintained = "warn"
+notice = "warn"
+yanked = "deny"
+ignore = []

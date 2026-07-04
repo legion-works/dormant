@@ -58,7 +58,7 @@ const FRAME_SIZE: usize = 19;
 ///
 /// Accumulates bytes and yields complete frames.  On garbage input it resyncs
 /// by scanning for the header sequence `F4 F3 F2 F1` and discarding bytes
-/// before it.  The internal buffer is capped at [`MAX_BUF_SIZE`].
+/// before it.  The internal buffer is capped at `MAX_BUF_SIZE`.
 #[derive(Debug, Default)]
 pub struct FrameParser {
     /// Byte accumulator.
@@ -87,7 +87,7 @@ impl FrameParser {
     ///
     /// Returns a vector of decoded frames in order.  Garbage bytes before a
     /// valid header are silently discarded.  If the internal buffer exceeds
-    /// [`MAX_BUF_SIZE`] after a push, the oldest bytes are trimmed to keep it
+    /// `MAX_BUF_SIZE` after a push, the oldest bytes are trimmed to keep it
     /// within bounds.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Ld2410Frame> {
         self.buf.extend_from_slice(bytes);

@@ -23,7 +23,22 @@ use dormant_displays::vcp_ops::{RealVcp, VcpOps};
 use dormant_sensors::ha_ws::{Action, HaProtocol};
 use dormant_sensors::mqtt::parse_payload;
 use dormant_sensors::usb_ld2410::FrameParser;
+use futures_util::{SinkExt, StreamExt};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
+use tokio_tungstenite::tungstenite::Message;
+
+// ── DoctorOutcome ───────────────────────────────────────────────────────────────
+
+/// The outcome of a `doctor` invocation: exit code + optional message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DoctorOutcome {
+    /// All probes passed or were skipped.
+    AllOk,
+    /// At least one probe failed.
+    SomeFailed,
+    /// The subcommand is not yet supported (exit 3).
+    NotSupported(String),
+}
 
 // ── ProbeResult ─────────────────────────────────────────────────────────────────
 
@@ -116,7 +131,7 @@ pub enum DoctorSubcommand {
     Ha,
     /// Validate configuration.
     Config,
-    /// Probe KWin DPMS (not yet supported).
+    /// Probe `KWin` DPMS (not yet supported).
     Kwin,
     /// Probe Samsung Tizen display (not yet supported).
     Samsung,
@@ -129,90 +144,110 @@ pub enum DoctorSubcommand {
 /// # Errors
 ///
 /// Propagates I/O and config-loading errors.
-pub fn run(args: &DoctorArgs) -> Result<()> {
+pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(args))
 }
 
-async fn run_async(args: &DoctorArgs) -> Result<()> {
+async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
             let results = vec![probe_ddcci().await];
             print_table(&results);
-            exit_code(&results);
+            Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Usb { port, baud }) => {
             let results = vec![probe_usb(port, *baud).await];
             print_table(&results);
-            exit_code(&results);
+            Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Mqtt) => {
             let (cfg, _creds) = load_config_and_creds(args)?;
             let results = probe_mqtt_all(&cfg).await;
             print_table(&results);
-            exit_code(&results);
+            Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Ha) => {
             let (cfg, creds) = load_config_and_creds(args)?;
             let results = probe_ha_all(&cfg, &creds).await;
             print_table(&results);
-            exit_code(&results);
+            Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Config) => {
             let results = probe_config(args);
             print_table(&results);
-            exit_code(&results);
+            Ok(outcome(&results))
         }
-        Some(DoctorSubcommand::Kwin) => {
-            eprintln!(
-                "not yet supported: requires the kwin-dpms controller (pending hardware verification milestone)"
-            );
-            std::process::exit(3);
-        }
-        Some(DoctorSubcommand::Samsung) => {
-            eprintln!(
-                "not yet supported: requires the samsung-tizen controller (pending hardware verification milestone)"
-            );
-            std::process::exit(3);
-        }
+        Some(DoctorSubcommand::Kwin) => Ok(DoctorOutcome::NotSupported("kwin-dpms".into())),
+        Some(DoctorSubcommand::Samsung) => Ok(DoctorOutcome::NotSupported("samsung-tizen".into())),
         None => {
             // Bare doctor: run everything applicable.
             let (cfg, creds) = load_config_and_creds(args)?;
             let mut results = Vec::new();
 
             // Config probe first.
-            results.push(probe_config_inner(&cfg, &creds));
+            let config_result = probe_config_inner(&cfg, &creds);
+            let config_ok = config_result.status != ProbeStatus::Fail;
+            results.push(config_result);
 
-            // Per-sensor probes.
+            // Collect sensor probes.
+            let mut sensor_futs: Vec<
+                std::pin::Pin<Box<dyn futures_util::Future<Output = ProbeResult>>>,
+            > = Vec::new();
             for (id, sensor_cfg) in &cfg.sensors {
+                if !config_ok {
+                    // Skip dependent probes when config is invalid.
+                    let name = match sensor_cfg {
+                        SensorConfig::Mqtt(_) => format!("mqtt {id}"),
+                        SensorConfig::Ha(_) => format!("ha {id}"),
+                        SensorConfig::UsbLd2410(usb_cfg) => format!("usb {}", usb_cfg.port),
+                    };
+                    results.push(ProbeResult::skip(name, "config invalid — fix config first"));
+                    continue;
+                }
                 match sensor_cfg {
                     SensorConfig::Mqtt(mqtt_cfg) => {
-                        results.push(probe_mqtt_one(id, mqtt_cfg).await);
+                        let id = id.clone();
+                        let cfg = mqtt_cfg.clone();
+                        sensor_futs.push(Box::pin(async move { probe_mqtt_one(&id, &cfg).await }));
                     }
                     SensorConfig::Ha(ha_cfg) => {
-                        results.push(probe_ha_one(id, ha_cfg, &creds).await);
+                        let id = id.clone();
+                        let cfg = ha_cfg.clone();
+                        let creds = creds.clone();
+                        sensor_futs.push(Box::pin(
+                            async move { probe_ha_one(&id, &cfg, &creds).await },
+                        ));
                     }
                     SensorConfig::UsbLd2410(usb_cfg) => {
-                        results.push(probe_usb(&usb_cfg.port, usb_cfg.baud).await);
+                        let port = usb_cfg.port.clone();
+                        let baud = usb_cfg.baud;
+                        sensor_futs.push(Box::pin(async move { probe_usb(&port, baud).await }));
                     }
                 }
             }
 
-            // DDC/CI probe if any display uses ddcci.
-            let has_ddcci = cfg
-                .displays
-                .values()
-                .any(|d| d.controllers.iter().any(|c| c == "ddcci"));
-            if has_ddcci {
-                results.push(probe_ddcci().await);
+            // Run sensor probes in parallel.
+            if !sensor_futs.is_empty() {
+                let sensor_results = futures_util::future::join_all(sensor_futs).await;
+                results.extend(sensor_results);
+            }
+
+            // DDC/CI probe if any display uses ddcci (serial after sensors).
+            if config_ok {
+                let has_ddcci = cfg
+                    .displays
+                    .values()
+                    .any(|d| d.controllers.iter().any(|c| c == "ddcci"));
+                if has_ddcci {
+                    results.push(probe_ddcci().await);
+                }
             }
 
             print_table(&results);
-            exit_code(&results);
+            Ok(outcome(&results))
         }
     }
-
-    Ok(())
 }
 
 // ── Config loading ──────────────────────────────────────────────────────────────
@@ -248,7 +283,7 @@ fn probe_config_inner(cfg: &dormant_core::config::Config, creds: &Credentials) -
     } else {
         let detail: String = errors
             .iter()
-            .map(|e| e.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join("; ");
         ProbeResult::fail("config", detail)
@@ -273,11 +308,14 @@ async fn probe_ddcci() -> ProbeResult {
         let brightness = ops.get_vcp(ident, 0x10).await;
         let d6 = ops.get_vcp(ident, 0xD6).await;
 
-        let mut line = format!("  {}: brightness=", ident);
+        let mut line = format!("  {ident}: brightness=");
         match brightness {
-            Ok(v) => line.push_str(&format!("{v}")),
+            Ok(v) => {
+                line.push_str(&v.to_string());
+            }
             Err(e) => {
-                line.push_str(&format!("ERR({e})"));
+                use std::fmt::Write;
+                let _ = write!(line, "ERR({e})");
                 all_ok = false;
             }
         }
@@ -350,11 +388,18 @@ async fn probe_usb(port: &str, baud: u32) -> ProbeResult {
         }
     }
 
+    if total_frames == 0 {
+        return ProbeResult::fail(
+            format!("usb {port}"),
+            "port opened but no LD2410 frames decoded (wrong port? wrong baud?)".to_string(),
+        );
+    }
+
     let state_str = match last_state {
         Some(SensorState::Present) => "present",
         Some(SensorState::Absent) => "absent",
         Some(SensorState::Unavailable) => "unavailable",
-        None => "unknown (no frames decoded)",
+        None => "unknown",
     };
 
     ProbeResult::pass(
@@ -399,6 +444,7 @@ async fn probe_mqtt_one(id: &str, cfg: &MqttSensorCfg) -> ProbeResult {
     // Wait up to 10s for a retained/live message.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut found: Option<SensorState> = None;
+    let mut broker_connected = false;
 
     while tokio::time::Instant::now() < deadline {
         let timeout = deadline - tokio::time::Instant::now();
@@ -413,7 +459,7 @@ async fn probe_mqtt_one(id: &str, cfg: &MqttSensorCfg) -> ProbeResult {
                 }
             }
             Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))) => {
-                // Connected — continue waiting for a publish.
+                broker_connected = true;
             }
             Ok(Ok(_)) => {} // Ignore other packets.
             Ok(Err(e)) => {
@@ -434,13 +480,22 @@ async fn probe_mqtt_one(id: &str, cfg: &MqttSensorCfg) -> ProbeResult {
             };
             ProbeResult::pass(name, format!("topic '{}' reports {state_str}", cfg.topic))
         }
-        None => ProbeResult::fail(
-            name,
-            format!(
-                "no message on '{}' (topic idle — is the device publishing?)",
-                cfg.topic
-            ),
-        ),
+        None => {
+            if broker_connected {
+                ProbeResult::skip(
+                    name,
+                    format!(
+                        "no message in 10s on '{}' — on-change sensors are quiet when state is stable; not a failure",
+                        cfg.topic,
+                    ),
+                )
+            } else {
+                ProbeResult::fail(
+                    name,
+                    "broker connection failed (no CONNACK received)".to_string(),
+                )
+            }
+        }
     }
 }
 
@@ -495,9 +550,6 @@ async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credentials) -> Probe
     let (mut write, read) = ws_stream.split();
     let mut protocol = HaProtocol::new(token, vec![(SensorId(id.into()), cfg.entity.clone())]);
 
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-
     let mut read = read;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut found_state: Option<SensorState> = None;
@@ -524,22 +576,17 @@ async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credentials) -> Probe
                             found_state = Some(event.state);
                         }
                         Action::Fatal(reason) => {
-                            if reason.contains(E_HA_AUTH) {
-                                auth_failure = Some(reason);
-                            } else {
-                                auth_failure = Some(reason);
-                            }
+                            auth_failure = Some(reason);
                         }
                         Action::Nothing => {}
                     }
                 }
             }
-            Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Ok(Message::Close(_))) | None) => break,
             Ok(Some(Ok(_))) => {} // ping/pong/binary — ignore
             Ok(Some(Err(e))) => {
                 return ProbeResult::fail(name, format!("WebSocket error: {e}"));
             }
-            Ok(None) => break,
             Err(_elapsed) => break, // timeout
         }
 
@@ -594,17 +641,18 @@ fn print_table(results: &[ProbeResult]) {
     println!("{table}");
 }
 
-/// Exit with code 0 if all Pass/Skip, 1 if any Fail.
-fn exit_code(results: &[ProbeResult]) {
+/// Determine the overall outcome from probe results.
+fn outcome(results: &[ProbeResult]) -> DoctorOutcome {
     if results.iter().any(|r| r.status == ProbeStatus::Fail) {
-        std::process::exit(1);
+        DoctorOutcome::SomeFailed
+    } else {
+        DoctorOutcome::AllOk
     }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
 
@@ -701,7 +749,7 @@ mod tests {
     // ── HA probe: protocol-driven tests ─────────────────────────────────────
 
     /// Test that the HA probe's message-handling path works with canned
-    /// messages (same pattern as HaProtocol tests).
+    /// messages (same pattern as `HaProtocol` tests).
     #[test]
     fn ha_probe_protocol_auth_flow() {
         let mut proto = HaProtocol::new(
@@ -807,18 +855,23 @@ mod tests {
         assert_eq!(frames[0].target_state, 0x00);
     }
 
-    // ── exit_code logic ─────────────────────────────────────────────────────
+    // ── DoctorOutcome ───────────────────────────────────────────────────────
 
     #[test]
-    fn exit_code_all_pass_returns_0() {
-        // This just tests the logic — we can't actually call exit() in tests.
-        let results = vec![ProbeResult::pass("a", ""), ProbeResult::skip("b", "")];
-        assert!(!results.iter().any(|r| r.status == ProbeStatus::Fail));
+    fn outcome_all_pass_returns_all_ok() {
+        let results = [ProbeResult::pass("a", ""), ProbeResult::skip("b", "")];
+        assert_eq!(outcome(&results), DoctorOutcome::AllOk);
     }
 
     #[test]
-    fn exit_code_any_fail_returns_1() {
-        let results = vec![ProbeResult::pass("a", ""), ProbeResult::fail("b", "broken")];
-        assert!(results.iter().any(|r| r.status == ProbeStatus::Fail));
+    fn outcome_any_fail_returns_some_failed() {
+        let results = [ProbeResult::pass("a", ""), ProbeResult::fail("b", "broken")];
+        assert_eq!(outcome(&results), DoctorOutcome::SomeFailed);
+    }
+
+    #[test]
+    fn outcome_all_skip_returns_all_ok() {
+        let results = [ProbeResult::skip("a", "no config")];
+        assert_eq!(outcome(&results), DoctorOutcome::AllOk);
     }
 }

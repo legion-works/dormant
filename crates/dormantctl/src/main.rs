@@ -153,7 +153,23 @@ fn main() -> ExitCode {
                 credentials,
                 subcommand,
             };
-            cmd_doctor::run(&args)
+            match cmd_doctor::run(&args) {
+                Ok(outcome) => match outcome {
+                    cmd_doctor::DoctorOutcome::AllOk => Ok(()),
+                    cmd_doctor::DoctorOutcome::SomeFailed => {
+                        // Error is already printed as the table; signal exit 1.
+                        Err(anyhow::anyhow!("some probes failed"))
+                    }
+                    cmd_doctor::DoctorOutcome::NotSupported(controller) => {
+                        eprintln!(
+                            "not yet supported: requires the {controller} controller \
+                             (pending hardware verification milestone)"
+                        );
+                        return ExitCode::from(3);
+                    }
+                },
+                Err(e) => Err(e),
+            }
         }
     };
 

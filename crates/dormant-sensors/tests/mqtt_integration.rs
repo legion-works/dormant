@@ -2,6 +2,9 @@
 //!
 //! Requires a running MQTT broker on `127.0.0.1:1883`.  Set
 //! `DORMANT_TEST_MQTT=1` to run (the test is `#[ignore]`d by default).
+//!
+//! Belt+braces: both `#[ignore]` and an early-return env check guard against
+//! accidental CI runs without a broker.
 
 use std::time::Duration;
 
@@ -17,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 #[ignore = "requires broker: DORMANT_TEST_MQTT=1"]
 #[tokio::test]
 async fn mqtt_round_trip_publishes_presence_event() {
+    // Belt+braces: env check alongside #[ignore] so a direct `cargo test` run
+    // without the env var still skips gracefully.
     if std::env::var("DORMANT_TEST_MQTT").as_deref() != Ok("1") {
         eprintln!("skipping mqtt integration test (DORMANT_TEST_MQTT != 1)");
         return;

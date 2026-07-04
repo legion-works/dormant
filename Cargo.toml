@@ -35,3 +35,8 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 notify = "7"
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

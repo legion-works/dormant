@@ -1,0 +1,39 @@
+name: Feature Request
+description: Propose a new feature or enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are welcome. Describe the use case clearly — the *why* matters more than the *how*.
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What problem does this solve? Describe your setup (room layout, sensor types, display models) and what you want dormant to do.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How would this work from the user's perspective? Example config snippets help.
+      render: toml
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds have you tried? Why don't they work well enough?
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Does this affect the core logic, sensors, displays, CLI, or docs?
+      multiple: true
+      options:
+        - Core (config, zones, rules, state machine)
+        - Sensors (MQTT, HA, USB-LD2410)
+        - Displays (DDC/CI, command, HA passthrough, KWin, Samsung)
+        - CLI (dormantctl)
+        - Daemon (dormantd)
+        - Documentation

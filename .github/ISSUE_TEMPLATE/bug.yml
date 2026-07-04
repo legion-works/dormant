@@ -1,0 +1,79 @@
+name: Bug Report
+description: File a bug report
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Include as much detail as you can.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps that trigger the bug.
+      placeholder: |
+        1. Start dormantd with config ...
+        2. Leave the room for N minutes
+        3. Return and observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: dormantctl status output
+      description: Paste the output of `dormantctl status` while the bug is present.
+      render: text
+  - type: textarea
+    id: doctor
+    attributes:
+      label: dormantctl doctor output
+      description: Paste the output of `dormantctl doctor` for the relevant sensor and display.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Paste your dormant TOML config (sanitize credentials).
+      render: toml
+      placeholder: |
+        config_version = 1
+        [sensors.desk]
+        type = "mqtt"
+        ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Include daemon logs showing the bug (set `log_level = "debug"` for more detail).
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: dormant version
+      description: Output of `dormantctl --version` or `dormantd --version`.
+      placeholder: "dormant 0.1.0"
+  - type: input
+    id: os
+    attributes:
+      label: OS and desktop environment
+      description: e.g. "Ubuntu 24.04, KDE Plasma 6.3, Wayland"
+      placeholder: "Ubuntu 24.04, KDE Plasma 6.3, Wayland"
+  - type: dropdown
+    id: display
+    attributes:
+      label: Display type
+      options:
+        - OLED PC monitor
+        - OLED TV
+        - LCD PC monitor
+        - LCD TV
+        - Other

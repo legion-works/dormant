@@ -26,3 +26,4 @@ indexmap = { version = "2", features = ["serde"] }
 tokio-stream = "0.1"
 proptest = "1"
 rumqttc = "0.24"
+tokio-serial = "5"

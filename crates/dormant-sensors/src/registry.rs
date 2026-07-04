@@ -9,11 +9,12 @@ use dormant_core::types::SensorId;
 use indexmap::IndexMap;
 
 use crate::mqtt::MqttSource;
+use crate::usb_ld2410::UsbLd2410Source;
 
 /// All recognised sensor `type` strings.
 ///
 /// Used by `dormantctl doctor` and config validation to enumerate known types.
-pub const SOURCE_TYPES: &[&str] = &["mqtt"];
+pub const SOURCE_TYPES: &[&str] = &["mqtt", "usb-ld2410"];
 
 /// Build all sensor sources from the configuration map.
 ///
@@ -30,23 +31,31 @@ pub fn build(
 ) -> Result<Vec<Box<dyn SensorSource>>, dormant_core::error::DormantError> {
     // Group MQTT sensors by broker_url.
     let mut by_broker: IndexMap<String, Vec<(SensorId, MqttSensorCfg)>> = IndexMap::new();
+    let mut sources: Vec<Box<dyn SensorSource>> = Vec::new();
 
     for (name, config) in sensors {
-        if let SensorConfig::Mqtt(cfg) = config {
-            let id = SensorId(name.clone());
-            by_broker
-                .entry(cfg.broker_url.clone())
-                .or_default()
-                .push((id, cfg.clone()));
+        match config {
+            SensorConfig::Mqtt(cfg) => {
+                let id = SensorId(name.clone());
+                by_broker
+                    .entry(cfg.broker_url.clone())
+                    .or_default()
+                    .push((id, cfg.clone()));
+            }
+            SensorConfig::UsbLd2410(cfg) => {
+                let id = SensorId(name.clone());
+                sources.push(Box::new(UsbLd2410Source::new(id, cfg.clone())));
+            }
+            SensorConfig::Ha(_) => {
+                // Handled by Task 9 — silently ignored for now.
+            }
         }
     }
 
-    let sources: Vec<Box<dyn SensorSource>> = by_broker
-        .into_iter()
-        .map(|(broker_url, sensors)| {
-            Box::new(MqttSource::new(broker_url, sensors)) as Box<dyn SensorSource>
-        })
-        .collect();
+    // Convert MQTT groups into sources.
+    for (broker_url, sensors) in by_broker {
+        sources.push(Box::new(MqttSource::new(broker_url, sensors)));
+    }
 
     Ok(sources)
 }
@@ -98,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn build_ignores_non_mqtt_configs() {
+    fn build_handles_mqtt_and_usb_configs() {
         use dormant_core::config::schema::{HaSensorCfg, UsbLd2410Cfg};
 
         let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
@@ -128,8 +137,11 @@ mod tests {
         );
 
         let sources = build(&sensors).unwrap();
-        assert_eq!(sources.len(), 1, "only MQTT sources are built");
-        assert_eq!(sources[0].source_id(), "tcp://broker:1883");
+        // MQTT groups by broker → 1 source; USB is 1 source.
+        assert_eq!(sources.len(), 2, "expected MQTT + USB sources");
+        let ids: Vec<&str> = sources.iter().map(|s| s.source_id()).collect();
+        assert!(ids.contains(&"tcp://broker:1883"));
+        assert!(ids.contains(&"usb_sensor"));
     }
 
     #[test]
@@ -140,7 +152,8 @@ mod tests {
     }
 
     #[test]
-    fn source_types_contains_mqtt() {
+    fn source_types_contains_known_types() {
         assert!(SOURCE_TYPES.contains(&"mqtt"));
+        assert!(SOURCE_TYPES.contains(&"usb-ld2410"));
     }
 }

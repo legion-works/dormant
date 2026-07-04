@@ -3,3 +3,4 @@
 
 pub mod mqtt;
 pub mod registry;
+pub mod usb_ld2410;

@@ -7,8 +7,25 @@
 //! Both blank and wake invocations are wrapped in
 //! [`tokio::time::timeout`] using `DisplayConfig::command_timeout` so that a
 //! hung command cannot wedge the executor's bounded retry burst.
+//!
+//! ## Why a concurrent stderr drain
+//!
+//! The OS pipe buffer for a child's stderr is finite (~64 KiB on Linux). A
+//! command that writes more than that without anyone reading the read end
+//! blocks on `write(2)`, which means `child.wait()` never observes the exit
+//! and the executor's timeout fires for an otherwise-successful command. We
+//! drain stderr on a separate task while the main task awaits `child.wait()`
+//! — the kernel pipe stays below capacity, the child exits promptly, and the
+//! drain task observes EOF and returns. The drain task bounds its in-memory
+//! buffer to the last 4 KiB so a 1 GiB flood cannot OOM the daemon.
+//!
+//! On timeout, the child is killed explicitly via `start_kill()` (not just
+//! `kill_on_drop`) so the failure surface is identical whether or not the
+//! `Command` value is dropped promptly by the caller.
 
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,6 +37,11 @@ use dormant_core::types::{BlankMode, CmdFailure};
 /// non-zero exit. Capped so a chatty failing command does not bloat log lines
 /// or IPC payloads.
 const STDERR_TAIL: usize = 200;
+
+/// Cap on the in-memory stderr buffer kept by the drain task. Keeps memory
+/// bounded even if the command floods stderr with hundreds of MiB. The drain
+/// drops the *prefix* so the diagnostic at the tail survives.
+const STDERR_DRAIN_CAP: usize = 4096;
 
 /// Display controller that executes arbitrary shell commands for blank and wake.
 ///
@@ -50,7 +72,9 @@ impl CommandController {
         }
     }
 
-    /// Run `command` via `sh -c`, honoring `timeout`.
+    /// Run `command` via `sh -c`, honoring `timeout` and draining stderr
+    /// concurrently so a verbose failure doesn't deadlock on the OS pipe
+    /// buffer.
     async fn run_shell(&self, command: &str) -> Result<(), CmdFailure> {
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
@@ -65,48 +89,91 @@ impl CommandController {
                 error: format!("{E_DISPLAY_IO}: spawn failed: {e}"),
             })?;
 
-        let stderr_tail: String;
-        let exit_status: std::io::Result<std::process::ExitStatus>;
+        // Pull stderr out so the drain task owns it; the main task keeps the
+        // Child for wait/kill. If we couldn't get the pipe (e.g. spawn
+        // configured stderr differently), proceed without a drain — the
+        // existing single-thread drain path would also block on overflow.
+        let stderr = child.stderr.take();
 
-        match tokio::time::timeout(self.timeout, child.wait()).await {
+        let stderr_buf: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let drain_handle = stderr.map(|mut stderr_pipe| {
+            let buf = Arc::clone(&stderr_buf);
+            tokio::spawn(async move {
+                let mut local: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut stderr_pipe, &mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            local.extend_from_slice(&chunk[..n]);
+                            // Bound the buffer to the last STDERR_DRAIN_CAP
+                            // bytes — the tail is what carries the diagnostic.
+                            if local.len() > STDERR_DRAIN_CAP {
+                                let drop = local.len() - STDERR_DRAIN_CAP;
+                                local.drain(..drop);
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut g) = buf.lock() {
+                    *g = local;
+                }
+            })
+        });
+
+        let wait_outcome = tokio::time::timeout(self.timeout, child.wait()).await;
+
+        match wait_outcome {
             Ok(Ok(status)) => {
-                exit_status = Ok(status);
-                stderr_tail = read_stderr_tail(&mut child).await;
+                // Drain task will hit EOF on its next read; await it so the
+                // buffer is populated before we slice the tail.
+                if let Some(h) = drain_handle {
+                    let _ = h.await;
+                }
+                let stderr_bytes = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                let stderr_tail = truncate_utf8(&stderr_bytes, STDERR_TAIL);
+
+                if status.success() {
+                    Ok(())
+                } else {
+                    let detail = match status.code() {
+                        Some(c) => format!("exit code {c}; stderr: {stderr_tail}"),
+                        None => format!("terminated by signal; stderr: {stderr_tail}"),
+                    };
+                    Err(CmdFailure {
+                        controller: Self::NAME.to_string(),
+                        error: format!("{E_DISPLAY_IO}: {detail}"),
+                    })
+                }
             }
             Ok(Err(io)) => {
-                return Err(CmdFailure {
+                if let Some(h) = drain_handle {
+                    h.abort();
+                }
+                Err(CmdFailure {
                     controller: Self::NAME.to_string(),
                     error: format!("{E_DISPLAY_IO}: wait failed: {io}"),
-                });
+                })
             }
             Err(_elapsed) => {
-                // kill_on_drop(true) ensures the child is reaped when the
-                // Command value is dropped; no explicit kill needed.
-                return Err(CmdFailure {
+                // Timeout — kill the child explicitly (not via kill_on_drop
+                // alone) so the wait surface is uniform regardless of whether
+                // the Command value is dropped promptly.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if let Some(h) = drain_handle {
+                    // Killing the child closes its stderr fd; the drain task
+                    // will then see EOF and exit. Give it a chance to finish
+                    // so we don't leak the task.
+                    let _ = h.await;
+                }
+                Err(CmdFailure {
                     controller: Self::NAME.to_string(),
                     error: format!("{E_DISPLAY_IO}: timeout after {:?}", self.timeout),
-                });
+                })
             }
         }
-
-        let status = exit_status.map_err(|e| CmdFailure {
-            controller: Self::NAME.to_string(),
-            error: format!("{E_DISPLAY_IO}: wait failed: {e}"),
-        })?;
-
-        if status.success() {
-            return Ok(());
-        }
-
-        let code = status.code();
-        let detail = match code {
-            Some(c) => format!("exit code {c}; stderr: {stderr_tail}"),
-            None => format!("terminated by signal; stderr: {stderr_tail}"),
-        };
-        Err(CmdFailure {
-            controller: Self::NAME.to_string(),
-            error: format!("{E_DISPLAY_IO}: {detail}"),
-        })
     }
 }
 
@@ -147,15 +214,6 @@ impl DisplayController for CommandController {
     async fn wake(&self) -> Result<(), CmdFailure> {
         self.run_shell(&self.wake_command).await
     }
-}
-
-async fn read_stderr_tail(child: &mut tokio::process::Child) -> String {
-    let Some(mut stderr) = child.stderr.take() else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
-    truncate_utf8(&buf, STDERR_TAIL)
 }
 
 /// Keep the last `max` *characters* (best-effort) of `bytes` as valid UTF-8.
@@ -238,7 +296,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(2),
-            "blank should be bounded by timeout (~200ms), took {elapsed:?}"
+            "blank should be bounded by timeout (~200ms), took {elapsed:?}",
         );
         assert!(err.error.starts_with(E_DISPLAY_IO));
         assert!(err.error.contains("timeout"));
@@ -283,6 +341,60 @@ mod tests {
             stderr_chunk.len() <= STDERR_TAIL,
             "stderr chunk should be <= {STDERR_TAIL} chars, got {}",
             stderr_chunk.len()
+        );
+    }
+
+    /// Must 1 — stderr pipe deadlock. A flood of >pipe-buffer bytes to stderr
+    /// without concurrent draining used to wedge `child.wait()` and trip the
+    /// timeout for an otherwise-successful command. With the concurrent drain
+    /// this must complete well under the timeout.
+    #[tokio::test]
+    async fn stderr_flood_exit0_is_ok() {
+        let c = CommandController::new(
+            "yes X | head -c 200000 >&2; exit 0".into(),
+            "true".into(),
+            vec![BlankMode::PowerOff],
+            Duration::from_secs(3),
+        );
+        let start = std::time::Instant::now();
+        let result = c.blank(BlankMode::PowerOff).await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "exit-0 command should succeed despite 200 KiB stderr flood; err={result:?}",
+        );
+        // The OS pipe buffer is ~64 KiB; without draining this would block
+        // for the full 3s timeout. We allow generous headroom for CI jitter
+        // but assert well under the timeout.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should complete well before the 3s timeout; took {elapsed:?}",
+        );
+    }
+
+    /// Must 1 — non-zero exit after a stderr flood must still surface the
+    /// diagnostic that mattered (a marker printed AFTER the flood).
+    #[tokio::test]
+    async fn stderr_flood_nonzero_keeps_tail() {
+        let c = CommandController::new(
+            "yes X | head -c 200000 >&2; echo MARKER >&2; exit 3".into(),
+            "true".into(),
+            vec![BlankMode::PowerOff],
+            Duration::from_secs(3),
+        );
+        let start = std::time::Instant::now();
+        let err = c.blank(BlankMode::PowerOff).await.unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should complete well before the 3s timeout; took {elapsed:?}",
+        );
+        assert!(err.error.starts_with(E_DISPLAY_IO));
+        assert!(err.error.contains("exit code 3"));
+        assert!(
+            err.error.contains("MARKER"),
+            "post-flood diagnostic should survive the 200-char tail cap: {}",
+            err.error
         );
     }
 }

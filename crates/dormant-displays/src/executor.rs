@@ -47,11 +47,20 @@
 //!
 //! A [`CancellationToken`] is held in a `Mutex<Option<…>>`. Entering either
 //! `blank()` or `wake()` swaps in a fresh token and cancels the previous
-//! one, so the *between-round* sleep of an in-flight wake can be interrupted
-//! the instant a blank arrives. The controller calls themselves are not
-//! cancelled — they're short (each command has its own timeout) and we want
-//! them to surface a clean `CmdFailure` so the state machine's
-//! `cmd_gen` stale-detection can discard the late result.
+//! one, so:
+//!
+//! - the *between-round* sleep of an in-flight wake can be interrupted the
+//!   instant a blank arrives (`tokio::select!` on the token vs. sleep);
+//! - a fresh blank arriving *during* a round can skip the next controller
+//!   in the chain — `is_cancelled()` is checked before each `wake()` call
+//!   and an Err is returned immediately. The controller calls themselves
+//!   are not cancelled mid-flight (they're short, each has its own
+//!   timeout), so they surface a clean `CmdFailure` that the state
+//!   machine's `cmd_gen` stale-detection discards.
+//!
+//! An empty controller chain short-circuits `wake()` to an immediate
+//! `"none-eligible"` Err — the inter-round backoff must never fire when
+//! there is no chain to iterate.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -230,6 +239,18 @@ impl CommandSink for DisplayExecutor {
 
     async fn wake(&self) -> Result<(), CmdFailure> {
         let supersede_token = self.rotate_supersede();
+
+        // Empty-chain short-circuit: never enter the retry loop (and its
+        // inter-round sleeps) when there is nothing to iterate. A display
+        // misconfigured with no controllers should fail immediately, not
+        // burn through N×backoff virtual time first.
+        if self.chain.is_empty() {
+            return Err(CmdFailure {
+                controller: "none-eligible".to_string(),
+                error: format!("{E_WAKE_FAILED}: empty controller chain"),
+            });
+        }
+
         let total_rounds = self
             .retry
             .wake_retries
@@ -238,6 +259,16 @@ impl CommandSink for DisplayExecutor {
 
         for round in 0..total_rounds {
             for controller in &self.chain {
+                // Mid-round supersede: a blank arriving between controller
+                // calls aborts the rest of the chain (and the burst) without
+                // waiting for the next inter-round sleep. The token was
+                // swapped-and-cancelled by the blank's `rotate_supersede()`.
+                if supersede_token.is_cancelled() {
+                    return Err(CmdFailure {
+                        controller: "superseded".to_string(),
+                        error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                    });
+                }
                 if !controller.is_available().await {
                     continue;
                 }
@@ -315,6 +346,12 @@ mod tests {
         blank_results: VecDeque<Result<(), CmdFailure>>,
         wake_results: VecDeque<Result<(), CmdFailure>>,
         log: Vec<(String, &'static str)>,
+        /// Optional delay applied at the START of `blank()` (after logging)
+        /// — used by mid-round supersede tests so a controller "occupies"
+        /// the burst for a measurable amount of virtual time.
+        blank_delay: Duration,
+        /// Same as `blank_delay` but for `wake()`.
+        wake_delay: Duration,
     }
 
     impl FakeController {
@@ -339,6 +376,15 @@ mod tests {
 
         fn push_wake_result(&self, r: Result<(), CmdFailure>) {
             self.inner.lock().unwrap().wake_results.push_back(r);
+        }
+
+        #[allow(dead_code)] // not all tests exercise the blank path with a delay
+        fn set_blank_delay(&self, d: Duration) {
+            self.inner.lock().unwrap().blank_delay = d;
+        }
+
+        fn set_wake_delay(&self, d: Duration) {
+            self.inner.lock().unwrap().wake_delay = d;
         }
 
         fn count_op(&self, op: &'static str) -> usize {
@@ -369,14 +415,30 @@ mod tests {
         }
 
         async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            // Log first, then read+clear the delay under the lock so we
+            // don't hold the lock across an await.
+            let delay = {
+                let mut g = self.inner.lock().unwrap();
+                g.log.push((self.name.to_string(), "blank"));
+                g.blank_delay
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let mut g = self.inner.lock().unwrap();
-            g.log.push((self.name.to_string(), "blank"));
             g.blank_results.pop_front().unwrap_or(Ok(()))
         }
 
         async fn wake(&self) -> Result<(), CmdFailure> {
+            let delay = {
+                let mut g = self.inner.lock().unwrap();
+                g.log.push((self.name.to_string(), "wake"));
+                g.wake_delay
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let mut g = self.inner.lock().unwrap();
-            g.log.push((self.name.to_string(), "wake"));
             g.wake_results.pop_front().unwrap_or(Ok(()))
         }
     }
@@ -634,5 +696,125 @@ mod tests {
         assert_eq!(results[0].0, "A");
         assert_eq!(results[1].0, "B");
         assert!(results.iter().all(|(_, r)| r.is_ok()));
+    }
+
+    // ── Should 2 — mid-round supersede ────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn supersede_cancels_wake_mid_round_before_second_controller() {
+        // A's wake takes 100ms virtual then errors; B's wake would succeed
+        // if reached. Without the mid-round supersede check, A would run,
+        // then B would run (and return Ok) — but the spec says a blank that
+        // arrives during the round must short-circuit the burst.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        a.set_wake_delay(Duration::from_millis(100));
+        a.push_wake_result(Err(err("A")));
+        // B would succeed if reached — no script needed (default Ok).
+
+        let retry = RetrySettings {
+            wake_retries: 0,
+            wake_retry_backoff: Duration::from_secs(60),
+        };
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], retry);
+
+        let exec_for_wake = Arc::clone(&exec);
+        let wake_task = tokio::spawn(async move { exec_for_wake.wake().await });
+
+        // Yield repeatedly to let the wake task reach A.wake's sleep. The
+        // current-thread runtime parks wake on its 100ms virtual sleep;
+        // each yield_now gives wake another chance to progress until it
+        // parks again.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // Blank arrives mid-round — must cancel wake's token. A is
+        // currently parked; B has not yet been called.
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        let result = wake_task.await.unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.controller, "superseded");
+        assert!(err.error.contains("superseded by blank"));
+
+        assert_eq!(a.count_op("wake"), 1, "A's wake ran once (was in-flight)");
+        assert_eq!(
+            b.count_op("wake"),
+            0,
+            "B was skipped by mid-round supersede"
+        );
+    }
+
+    // ── Should 3 — backoff doubles per round ──────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_backoff_doubles_per_round() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let c = FakeController::new("C", vec![BlankMode::PowerOff]);
+        // 4 rounds × 3 controllers = 12 calls. All fail.
+        for _ in 0..12 {
+            a.push_wake_result(Err(err("A")));
+            b.push_wake_result(Err(err("B")));
+            c.push_wake_result(Err(err("C")));
+        }
+
+        let base = Duration::from_millis(50);
+        let retry = RetrySettings {
+            wake_retries: 3,
+            wake_retry_backoff: base,
+        };
+        let (exec, _) = executor_with(vec![a.clone(), b.clone(), c.clone()], retry);
+
+        let start = tokio::time::Instant::now();
+        let res = exec.wake().await;
+        let elapsed = start.elapsed();
+
+        let err = res.unwrap_err();
+        assert_eq!(err.controller, "exhausted");
+
+        // 4 rounds × 3 controllers = 12 wake calls.
+        assert_eq!(a.count_op("wake"), 4);
+        assert_eq!(b.count_op("wake"), 4);
+        assert_eq!(c.count_op("wake"), 4);
+
+        // Backoff doublings between rounds 0→1, 1→2, 2→3: 1+2+4 = 7×base.
+        // This assertion distinguishes 2^round from (round+1) (the latter
+        // would yield 1+2+3 = 6×base) and from a constant (4×base).
+        assert_eq!(
+            elapsed,
+            base * 7,
+            "backoff must double per round: 1+2+4 = 7×base",
+        );
+    }
+
+    // ── Should 4 — empty-chain wake short-circuits ─────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_empty_chain_errs_without_sleeping() {
+        // Empty chain + a huge wake_retry_backoff: if the executor entered
+        // its retry loop and slept even once, this test would burn real
+        // time or virtual time. The short-circuit guarantees zero.
+        let (exec, _) = executor_with(
+            vec![],
+            RetrySettings {
+                wake_retries: 3,
+                wake_retry_backoff: Duration::from_secs(3600),
+            },
+        );
+
+        let start = tokio::time::Instant::now();
+        let res = exec.wake().await;
+        let elapsed = start.elapsed();
+
+        let err = res.unwrap_err();
+        assert_eq!(err.controller, "none-eligible");
+        assert!(err.error.starts_with(E_WAKE_FAILED));
+        assert_eq!(
+            elapsed,
+            Duration::ZERO,
+            "empty-chain wake must not enter the retry loop",
+        );
     }
 }

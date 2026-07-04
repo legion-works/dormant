@@ -54,7 +54,9 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
 ///   `cfg.controllers` is unknown to [`CONTROLLER_TYPES`].
 /// - [`DormantError::ConfigInvalid`] if a `command` entry is missing
 ///   `blank_command`, `wake_command`, or `modes` (the error names the
-///   display so the operator can locate it in their TOML).
+///   display so the operator can locate it in their TOML). An *empty*
+///   `modes = []` is treated the same as a missing `modes` — an empty
+///   capability set can never blank any mode.
 pub fn build_controllers(
     display_name: &str,
     cfg: &DisplayConfig,
@@ -73,10 +75,17 @@ pub fn build_controllers(
                     .wake_command
                     .as_ref()
                     .ok_or_else(|| config_invalid_cmd(display_name, "missing 'wake_command'"))?;
+                // Treat `modes = Some(vec![])` the same as `modes = None`:
+                // an empty capability set can never blank any mode, so the
+                // configuration is structurally broken. The dormant-core
+                // `validate_display` produces a "blank-incapable display"
+                // ValidationError for the same condition; we surface it here
+                // as a hard ConfigInvalid so the daemon refuses to start.
                 let modes = cfg
                     .modes
                     .as_ref()
-                    .ok_or_else(|| config_invalid_cmd(display_name, "missing 'modes'"))?;
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| config_invalid_cmd(display_name, "missing or empty 'modes'"))?;
 
                 chain.push(Box::new(CommandController::new(
                     blank_command.clone(),
@@ -220,11 +229,31 @@ mod tests {
         let creds = Credentials::default();
         match build_controllers("tv-corner", &cfg, &creds) {
             Err(DormantError::ConfigInvalid { detail }) => {
-                assert!(detail.contains("missing 'modes'"));
+                assert!(detail.contains("missing or empty 'modes'"));
                 assert!(detail.contains("display 'tv-corner'"));
             }
             Err(other) => panic!("expected ConfigInvalid, got {other:?}"),
             Ok(_) => panic!("expected Err for missing modes"),
+        }
+    }
+
+    #[test]
+    fn build_command_empty_modes_fails() {
+        // Should 5 — `modes = Some(vec![])` is structurally the same as
+        // missing: an empty capability set can never blank any mode.
+        let mut cfg = command_cfg();
+        cfg.modes = Some(vec![]);
+        let creds = Credentials::default();
+        match build_controllers("tv-corner", &cfg, &creds) {
+            Err(DormantError::ConfigInvalid { detail }) => {
+                assert!(
+                    detail.contains("missing or empty 'modes'"),
+                    "error must mention empty modes: {detail}"
+                );
+                assert!(detail.contains("display 'tv-corner'"));
+            }
+            Err(other) => panic!("expected ConfigInvalid, got {other:?}"),
+            Ok(_) => panic!("expected Err for empty modes"),
         }
     }
 

@@ -409,7 +409,11 @@ fn validate_display(
             Some(caps) => {
                 if controller == "command" || controller == "ha-passthrough" {
                     // For command / ha-passthrough, the display's `modes` list
-                    // IS the capability set.
+                    // IS the capability set. An empty list contributes nothing
+                    // (treated the same as `None` — the registry-builder
+                    // refuses such configs outright, but validate is the
+                    // authoritative layer for cross-cutting issues and must
+                    // also flag the symptom).
                     if let Some(modes) = &dc.modes {
                         union_caps.extend(modes.iter().copied());
                     }
@@ -430,33 +434,43 @@ fn validate_display(
         });
     }
 
-    // If all controllers are unknown, skip further mode checks.
-    if union_caps.is_empty() && !unknown_controllers.is_empty() {
-        return;
-    }
-
-    // Check blank_mode against the union.
-    if !union_caps.is_empty() && !union_caps.contains(&dc.blank_mode) {
+    // If the union is empty (no controller — known or otherwise — contributes
+    // any mode), the display cannot blank any mode. Surface this as a single
+    // operator-facing error rather than also pointing at `blank_mode` and
+    // `degraded_mode` as "unsupported" — those would always fail and would
+    // duplicate the root cause. Unknown controllers are still reported
+    // individually above; this error is the *capability* verdict.
+    if union_caps.is_empty() {
         errors.push(ValidationError {
-            what: "unsupported blank mode".into(),
+            what: "blank-incapable display".into(),
             detail: format!(
-                "display '{display_id}' blank_mode '{:?}' is not supported by any controller",
-                dc.blank_mode
+                "display '{display_id}' has no supported blank modes \
+                 (controller chain produces an empty capability set)"
             ),
         });
-    }
+    } else {
+        // Check blank_mode against the union.
+        if !union_caps.contains(&dc.blank_mode) {
+            errors.push(ValidationError {
+                what: "unsupported blank mode".into(),
+                detail: format!(
+                    "display '{display_id}' blank_mode '{:?}' is not supported by any controller",
+                    dc.blank_mode
+                ),
+            });
+        }
 
-    // Check degraded_mode against the union.
-    if let Some(dm) = &dc.degraded_mode
-        && !union_caps.is_empty()
-        && !union_caps.contains(dm)
-    {
-        errors.push(ValidationError {
-            what: "unsupported degraded mode".into(),
-            detail: format!(
-                "display '{display_id}' degraded_mode '{dm:?}' is not supported by any controller"
-            ),
-        });
+        // Check degraded_mode against the union.
+        if let Some(dm) = &dc.degraded_mode
+            && !union_caps.contains(dm)
+        {
+            errors.push(ValidationError {
+                what: "unsupported degraded mode".into(),
+                detail: format!(
+                    "display '{display_id}' degraded_mode '{dm:?}' is not supported by any controller"
+                ),
+            });
+        }
     }
 
     // Per-controller required field checks (still per-controller).
@@ -508,11 +522,14 @@ fn validate_display(
                         ),
                     });
                 }
-                if dc.modes.is_none() {
+                // An empty `modes` list is treated as missing — a config-validity
+                // concern, not a missing-field one, so the registry builder
+                // and the per-controller check agree on the wording.
+                if dc.modes.as_ref().is_none_or(Vec::is_empty) {
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{display_id}' uses ha-passthrough but has no 'modes' field"
+                            "display '{display_id}' uses ha-passthrough but has no 'modes' (or modes is empty)"
                         ),
                     });
                 }
@@ -542,11 +559,11 @@ fn validate_display(
                         ),
                     });
                 }
-                if dc.modes.is_none() {
+                if dc.modes.as_ref().is_none_or(Vec::is_empty) {
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{display_id}' uses command but has no 'modes' field"
+                            "display '{display_id}' uses command but has no 'modes' (or modes is empty)"
                         ),
                     });
                 }
@@ -1085,6 +1102,68 @@ stale_timeout = "5m"
             !errors.iter().any(|e| e.what == "unsupported blank mode"),
             "expected no unsupported blank mode errors for union, got {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn empty_modes_display_fails_validation() {
+        // Should 5 — `modes = []` on a `command` controller yields an empty
+        // union; validate_display must produce a "blank-incapable display"
+        // ValidationError (the operator-facing symptom) alongside the
+        // per-controller "missing or empty 'modes'" check.
+        let caps = test_capabilities();
+        let creds = test_creds();
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([(
+                "blankless".into(),
+                DisplayConfig {
+                    controllers: vec!["command".into()],
+                    blank_mode: BlankMode::PowerOff,
+                    degraded_mode: None,
+                    output: None,
+                    ddc_display: None,
+                    host: None,
+                    wol_mac: None,
+                    blank_command: Some("true".into()),
+                    wake_command: Some("true".into()),
+                    // The empty-list case — the fix's primary target.
+                    modes: Some(vec![]),
+                    ha_url: None,
+                    blank_service: None,
+                    blank_data: None,
+                    wake_service: None,
+                    wake_data: None,
+                    command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
+                    restore_brightness: 80,
+                    treat_unreachable_as_blanked: true,
+                },
+            )]),
+            rules: IndexMap::new(),
+        };
+
+        let errors = validate(&cfg, &caps, &creds);
+        assert!(
+            errors.iter().any(|e| e.what == "blank-incapable display"),
+            "expected 'blank-incapable display' error, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "missing field" && e.detail.contains("modes")),
+            "expected per-controller missing/empty modes error, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+        // No "unsupported blank mode" error — the new branch short-circuits
+        // that path when the union is empty (a duplicate root-cause noise).
+        assert!(
+            !errors.iter().any(|e| e.what == "unsupported blank mode"),
+            "should not also flag blank_mode when the root cause is an empty union: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
     }
 

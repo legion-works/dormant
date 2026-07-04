@@ -225,6 +225,10 @@ impl DisplayStateMachine {
     ///
     /// `cmd_gen` carries over to avoid generation reuse.  Runtime-only state
     /// (overlays, pending flags, zone level, frozen grace) is reset.
+    ///
+    /// Returns `(Self, Vec<Effect>)` with any initial scheduling effects the
+    /// restored phase requires: a `ScheduleTickAt` for Waking or Grace, so
+    /// the machine owns its own exit driver from the moment it is restored.
     #[must_use]
     pub fn restore(
         timings: SmTimings,
@@ -232,9 +236,9 @@ impl DisplayStateMachine {
         phase: Phase,
         cmd_gen: u64,
         now: Tick,
-    ) -> Self {
-        Self {
-            phase,
+    ) -> (Self, Vec<Effect>) {
+        let mut sm = Self {
+            phase: Phase::Active, // placeholder, overwritten below
             overlays: Overlays::default(),
             cmd_gen,
             last_blank_gen: None,
@@ -248,7 +252,27 @@ impl DisplayStateMachine {
             pending_reblank: false,
             zone_present: None,
             grace_frozen_remaining: None,
-        }
+        };
+
+        let effects = match phase {
+            Phase::Waking => {
+                sm.phase = Phase::Waking;
+                vec![Effect::ScheduleTickAt(Tick(
+                    now.0 + sm.timings.wake_retry_interval,
+                ))]
+            }
+            Phase::Grace { until } => {
+                sm.phase = Phase::Grace { until };
+                // Overlays are reset — not frozen — so schedule the tick.
+                vec![Effect::ScheduleTickAt(until)]
+            }
+            other => {
+                sm.phase = other;
+                vec![]
+            }
+        };
+
+        (sm, effects)
     }
 
     /// Feed an input event and return zero or more effects to execute.
@@ -260,22 +284,14 @@ impl DisplayStateMachine {
     pub fn step(&mut self, input: Input, now: Tick) -> Vec<Effect> {
         match (&self.phase, input) {
             // ── Active ──────────────────────────────────────────────────────
-            // Zone becomes absent → start grace countdown.
+            // Zone becomes absent → start grace countdown (pre-frozen if
+            // inhibitor or pause is already active).
             (Phase::Active, Input::ZonePresent(present)) => {
                 self.zone_present = Some(present);
                 if present {
                     vec![]
                 } else {
-                    let until = Tick(now.0 + self.timings.grace_period);
-                    self.phase = Phase::Grace { until };
-                    vec![
-                        Effect::LogTransition {
-                            from: "active",
-                            to: "grace",
-                            cause: "zone_clear",
-                        },
-                        Effect::ScheduleTickAt(until),
-                    ]
+                    self.enter_grace(now, "zone_clear")
                 }
             }
             // Tick in Active: only serves pause auto-resume.
@@ -323,12 +339,7 @@ impl DisplayStateMachine {
             (Phase::Grace { .. }, Input::ZonePresent(present)) => {
                 self.zone_present = Some(present);
                 if present {
-                    self.phase = Phase::Active;
-                    vec![Effect::LogTransition {
-                        from: "grace",
-                        to: "active",
-                        cause: "presence_during_grace",
-                    }]
+                    self.enter_active(now, "presence_during_grace")
                 } else {
                     // Re-assertion of absence; no change.
                     vec![]
@@ -346,15 +357,21 @@ impl DisplayStateMachine {
                     return effects;
                 }
 
+                // Belt-and-braces: if an overlay arrived after Grace entry
+                // (e.g. restore path), freeze the countdown now.
+                if self.overlays.inhibited || self.overlays.paused.is_some() {
+                    self.freeze_grace(until.0, now.0);
+                    return effects;
+                }
+
                 // Not yet expired.
                 if now < until {
                     return effects;
                 }
 
-                // Check blank gates: inhibitor, pause, startup holdoff, min-wake dwell.
-                if self.overlays.inhibited || self.overlays.paused.is_some() {
-                    return effects;
-                }
+                // Check blank gates: startup holdoff, min-wake dwell.
+                // (inhibitor/pause already handled above — they trigger
+                // freeze, not a simple gate check.)
 
                 let mut blocked = false;
                 let mut reschedule_at = now.0;
@@ -441,6 +458,8 @@ impl DisplayStateMachine {
                 }])
             }
             // ForceWake during Grace: abort countdown, go active.
+            // Operator override — does NOT chain into Grace even if zone is
+            // absent (the sensor will re-trigger on its own edge).
             (Phase::Grace { .. }, Input::ForceWake) => {
                 self.grace_frozen_remaining = None;
                 self.phase = Phase::Active;
@@ -491,11 +510,14 @@ impl DisplayStateMachine {
                     self.last_blank = Some(now);
                     if self.pending_wake {
                         self.pending_wake = false;
-                        self.issue_wake(vec![Effect::LogTransition {
-                            from: "blanking",
-                            to: "waking",
-                            cause: "presence_during_blank",
-                        }])
+                        self.issue_wake(
+                            vec![Effect::LogTransition {
+                                from: "blanking",
+                                to: "waking",
+                                cause: "presence_during_blank",
+                            }],
+                            now,
+                        )
                     } else {
                         self.phase = Phase::Blanked;
                         vec![Effect::LogTransition {
@@ -505,16 +527,17 @@ impl DisplayStateMachine {
                         }]
                     }
                 } else {
-                    // Blank failed: return to Active.  If zone is still
-                    // absent the next step will immediately re-enter Grace
-                    // (natural retry pacing at grace-period cadence).
+                    // Blank failed.
                     self.pending_wake = false;
-                    self.phase = Phase::Active;
-                    vec![Effect::LogTransition {
-                        from: "blanking",
-                        to: "active",
-                        cause: "blank_failed",
-                    }]
+                    if self.zone_present == Some(false) {
+                        // Zone is still absent — re-enter Grace directly so
+                        // the retry chain has a driver.  No external edge
+                        // required.
+                        self.enter_grace(now, "blank_failed_regrace")
+                    } else {
+                        // Presence returned in the meantime — go Active.
+                        self.enter_active(now, "blank_failed")
+                    }
                 }
             }
             // Stale wake result — ignored.
@@ -536,11 +559,14 @@ impl DisplayStateMachine {
             (Phase::Blanked, Input::ZonePresent(present)) => {
                 self.zone_present = Some(present);
                 if present {
-                    self.issue_wake(vec![Effect::LogTransition {
-                        from: "blanked",
-                        to: "waking",
-                        cause: "presence_detected",
-                    }])
+                    self.issue_wake(
+                        vec![Effect::LogTransition {
+                            from: "blanked",
+                            to: "waking",
+                            cause: "presence_detected",
+                        }],
+                        now,
+                    )
                 } else {
                     vec![]
                 }
@@ -579,11 +605,14 @@ impl DisplayStateMachine {
                 vec![]
             }
             // ForceWake in Blanked: wake immediately.
-            (Phase::Blanked, Input::ForceWake) => self.issue_wake(vec![Effect::LogTransition {
-                from: "blanked",
-                to: "waking",
-                cause: "force_wake",
-            }]),
+            (Phase::Blanked, Input::ForceWake) => self.issue_wake(
+                vec![Effect::LogTransition {
+                    from: "blanked",
+                    to: "waking",
+                    cause: "force_wake",
+                }],
+                now,
+            ),
 
             // ── Waking ──────────────────────────────────────────────────────
             // Zone level is recorded but wake completes first.
@@ -599,10 +628,9 @@ impl DisplayStateMachine {
                     to: "waking",
                     cause: "wake_retry_scheduled",
                 });
-                effects.append(&mut self.issue_wake(vec![]));
-                effects.push(Effect::ScheduleTickAt(Tick(
-                    now.0 + self.timings.wake_retry_interval,
-                )));
+                effects.append(&mut self.issue_wake(vec![], now));
+                // issue_wake already schedules the next retry tick — no
+                // extra ScheduleTickAt needed here.
                 effects
             }
             // Inhibitor in Waking: recorded but does not gate wake.
@@ -636,34 +664,18 @@ impl DisplayStateMachine {
                 }
                 if result.is_ok() {
                     self.last_wake = Some(now);
-                    self.phase = Phase::Active;
+                    self.enter_active(now, "wake_completed")
+                } else {
+                    // Wake failed: immediately re-issue with fresh gen (the
+                    // executor's own burst already backed off) and schedule
+                    // the next retry tick.
                     let mut effects = vec![Effect::LogTransition {
                         from: "waking",
-                        to: "active",
-                        cause: "wake_completed",
+                        to: "waking",
+                        cause: "wake_retry",
                     }];
-                    // If zone is known absent, immediately begin grace.
-                    if self.zone_present == Some(false) {
-                        let until = Tick(now.0 + self.timings.grace_period);
-                        self.phase = Phase::Grace { until };
-                        effects.push(Effect::LogTransition {
-                            from: "active",
-                            to: "grace",
-                            cause: "deferred_zone_clear",
-                        });
-                        effects.push(Effect::ScheduleTickAt(until));
-                    }
+                    effects.append(&mut self.issue_wake(vec![], now));
                     effects
-                } else {
-                    // Wake failed; stay in Waking and schedule retry.
-                    vec![
-                        Effect::LogTransition {
-                            from: "waking",
-                            to: "waking",
-                            cause: "wake_retry_scheduled",
-                        },
-                        Effect::ScheduleTickAt(Tick(now.0 + self.timings.wake_retry_interval)),
-                    ]
                 }
             }
             // ForceBlank in Waking: cancel the wake loop, blank immediately.
@@ -674,7 +686,7 @@ impl DisplayStateMachine {
             }]),
             // ForceWake in Waking: restart the wake attempt with a fresh
             // generation.
-            (Phase::Waking, Input::ForceWake) => self.issue_wake(vec![]),
+            (Phase::Waking, Input::ForceWake) => self.issue_wake(vec![], now),
         }
     }
 
@@ -746,6 +758,51 @@ impl DisplayStateMachine {
         vec![]
     }
 
+    /// Enter Active, then immediately chain into Grace if zone is known absent.
+    /// All transitions to Active MUST route through this helper so the deferred-
+    /// zone-clear chain is never missed.
+    fn enter_active(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
+        let from = self.phase_name();
+        self.phase = Phase::Active;
+        let mut effects = vec![Effect::LogTransition {
+            from,
+            to: "active",
+            cause,
+        }];
+        // If zone is known absent, immediately begin grace.
+        if self.zone_present == Some(false) {
+            effects.append(&mut self.enter_grace(now, "deferred_zone_clear"));
+        }
+        effects
+    }
+
+    /// Enter Grace, pre-freezing if any overlay is already active.
+    /// Emits `ScheduleTickAt` only when the countdown is live (not frozen).
+    fn enter_grace(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
+        let from = self.phase_name();
+        let mut effects = vec![Effect::LogTransition {
+            from,
+            to: "grace",
+            cause,
+        }];
+
+        let frozen = self.overlays.inhibited || self.overlays.paused.is_some();
+        if frozen {
+            // Pre-freeze: capture the full grace period as remaining.
+            // The countdown will unfreeze when all overlays clear.
+            self.grace_frozen_remaining = Some(self.timings.grace_period);
+            // Sentinel `until` — frozen gates ignore Tick so its value is
+            // harmless; the real `until` is set on unfreeze.
+            let sentinel = Tick(now.0 + self.timings.grace_period);
+            self.phase = Phase::Grace { until: sentinel };
+        } else {
+            let until = Tick(now.0 + self.timings.grace_period);
+            self.phase = Phase::Grace { until };
+            effects.push(Effect::ScheduleTickAt(until));
+        }
+        effects
+    }
+
     /// Bump the command generation and emit an `IssueBlank` effect, setting the
     /// phase to `Blanking`.  `prefix` effects (e.g. `LogTransition`) are placed
     /// before the `IssueBlank`.
@@ -763,14 +820,20 @@ impl DisplayStateMachine {
     }
 
     /// Bump the command generation and emit an `IssueWake` effect, setting the
-    /// phase to `Waking`.  `prefix` effects are placed before the `IssueWake`.
-    fn issue_wake(&mut self, prefix: Vec<Effect>) -> Vec<Effect> {
+    /// phase to `Waking`.  Every entry into Waking also schedules the retry
+    /// driver — the machine owns its own exit.
+    /// `prefix` effects (e.g. `LogTransition`) are placed before the
+    /// `IssueWake`; the `ScheduleTickAt` tail comes last.
+    fn issue_wake(&mut self, prefix: Vec<Effect>, now: Tick) -> Vec<Effect> {
         self.cmd_gen = self.cmd_gen.wrapping_add(1);
         let r#gen = self.cmd_gen;
         self.last_wake_gen = Some(r#gen);
         self.phase = Phase::Waking;
         let mut effects = prefix;
         effects.push(Effect::IssueWake { r#gen });
+        effects.push(Effect::ScheduleTickAt(Tick(
+            now.0 + self.timings.wake_retry_interval,
+        )));
         effects
     }
 }
@@ -1185,7 +1248,7 @@ mod tests {
         assert_issue_wake(&effects, 2); // gen1 was blank, gen2 is wake
         let wake_gen = 2;
 
-        // Wake fails.
+        // Wake fails — immediately re-issues gen3 (Must 2).
         let effects = sm.step(
             Input::WakeResult {
                 r#gen: wake_gen,
@@ -1197,12 +1260,13 @@ mod tests {
             t(150),
         );
         assert!(matches!(sm.phase(), Phase::Waking));
+        assert_issue_wake(&effects, 3); // immediate re-issue
         let retry_at = get_schedule_tick(&effects);
 
-        // Tick fires — re-issues wake with next gen.
+        // Tick fires — re-issues wake with gen4.
         let effects = sm.step(Input::Tick, retry_at);
         assert!(matches!(sm.phase(), Phase::Waking));
-        assert_issue_wake(&effects, 3);
+        assert_issue_wake(&effects, 4);
     }
 
     #[test]
@@ -1350,7 +1414,51 @@ mod tests {
         assert!(matches!(sm.phase(), Phase::Blanking));
         let blank_gen = 1;
 
-        // Blank fails → back to Active.
+        // Blank fails — zone is absent, so re-enters Grace directly (Must 3).
+        let later = Tick(grace_tick.0 + Duration::from_millis(100));
+        let effects = sm.step(
+            Input::BlankResult {
+                r#gen: blank_gen,
+                result: Err(crate::types::CmdFailure {
+                    controller: "test".into(),
+                    error: "fail".into(),
+                }),
+            },
+            later,
+        );
+        assert!(
+            matches!(sm.phase(), Phase::Grace { .. }),
+            "expected Grace (zone absent), got {:?}",
+            sm.phase()
+        );
+        let has_regrace = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::LogTransition {
+                    cause: "blank_failed_regrace",
+                    ..
+                }
+            )
+        });
+        assert!(has_regrace, "expected blank_failed_regrace transition");
+    }
+
+    /// Must 3 alternate: blank fails while presence returned → Active.
+    #[test]
+    fn blank_result_err_goes_active_when_present() {
+        let t0 = t(0);
+        let mut sm = sm(500);
+
+        // Start blanking, but presence returns.
+        let effects = sm.step(Input::ZonePresent(false), t0);
+        let grace_tick = get_schedule_tick(&effects);
+        let _effects = sm.step(Input::Tick, grace_tick); // → Blanking
+        sm.step(
+            Input::ZonePresent(true),
+            Tick(grace_tick.0 + Duration::from_millis(50)),
+        );
+
+        let blank_gen = 1;
         let later = Tick(grace_tick.0 + Duration::from_millis(100));
         let effects = sm.step(
             Input::BlankResult {
@@ -1364,10 +1472,10 @@ mod tests {
         );
         assert!(
             matches!(sm.phase(), Phase::Active),
-            "expected Active, got {:?}",
+            "expected Active (presence returned), got {:?}",
             sm.phase()
         );
-        let has_failed = effects.iter().any(|e| {
+        let has_bf = effects.iter().any(|e| {
             matches!(
                 e,
                 Effect::LogTransition {
@@ -1376,7 +1484,7 @@ mod tests {
                 }
             )
         });
-        assert!(has_failed, "expected blank_failed transition");
+        assert!(has_bf, "expected blank_failed transition");
     }
 
     #[test]
@@ -1406,7 +1514,7 @@ mod tests {
 
     #[test]
     fn restore_carries_over_cmd_gen_and_phase() {
-        let sm = DisplayStateMachine::restore(
+        let (sm, _effects) = DisplayStateMachine::restore(
             timings(500),
             BlankMode::ScreenOffAudioOn,
             Phase::Blanked,
@@ -1420,6 +1528,191 @@ mod tests {
         assert!(sm.overlays().paused.is_none());
     }
 
+    #[test]
+    fn restore_into_waking_emits_schedule_tick() {
+        let (_sm, effects) =
+            DisplayStateMachine::restore(timings(500), BlankMode::PowerOff, Phase::Waking, 7, t(0));
+        // Restoring into Waking must own its exit driver.
+        let has_schedule = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(has_schedule, "restore into Waking must emit ScheduleTickAt");
+    }
+
+    #[test]
+    fn restore_into_grace_emits_schedule_tick() {
+        let (_sm, effects) = DisplayStateMachine::restore(
+            timings(500),
+            BlankMode::PowerOff,
+            Phase::Grace { until: t(500) },
+            0,
+            t(0),
+        );
+        // Restoring into Grace (not frozen — overlays are reset) must own its
+        // exit driver.
+        let has_schedule = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(has_schedule, "restore into Grace must emit ScheduleTickAt");
+    }
+
+    // ── Must-breaking-sequence unit tests ─────────────────────────────────
+
+    /// Must 1: every entry into Waking schedules the retry driver.
+    /// Breaking sequence: `ForceBlank` → `ZonePresent(true)` during `Blanking` →
+    /// `BlankResult{Ok}` → `Waking` via `pending_wake`. `IssueWake` MUST be
+    /// accompanied by `ScheduleTickAt`.
+    #[test]
+    fn must1_waking_entry_schedules_retry_driver() {
+        let t0 = t(0);
+        let mut sm = sm(500);
+
+        // ForceBlank from Active.
+        let effects = sm.step(Input::ForceBlank, t0);
+        let blank_gen = sm.cmd_gen();
+        assert_issue_blank(&effects, blank_gen);
+
+        // Presence arrives during blanking.
+        let t1 = Tick(t0.0 + Duration::from_millis(50));
+        sm.step(Input::ZonePresent(true), t1);
+
+        // BlankResult Ok → Waking via pending_wake.
+        let t2 = Tick(t0.0 + Duration::from_millis(100));
+        let effects = sm.step(
+            Input::BlankResult {
+                r#gen: blank_gen,
+                result: Ok(()),
+            },
+            t2,
+        );
+        assert!(matches!(sm.phase(), Phase::Waking));
+        // The effects batch MUST contain both IssueWake and ScheduleTickAt.
+        let has_wake = effects
+            .iter()
+            .any(|e| matches!(e, Effect::IssueWake { .. }));
+        let has_tick = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(has_wake, "Must 1: Waking entry must emit IssueWake");
+        assert!(
+            has_tick,
+            "Must 1: Waking entry must own its exit driver via ScheduleTickAt"
+        );
+    }
+
+    /// Must 2: `WakeResult(Err)` immediately re-issues `IssueWake` + `ScheduleTickAt`.
+    #[test]
+    fn must2_wake_fail_immediately_reissues() {
+        let t0 = t(0);
+        let mut sm = sm(500);
+
+        // Drive to Blanked, then wake.
+        drive_blank(&mut sm, t0, true);
+        let _effects = sm.step(Input::ZonePresent(true), t(100));
+        let wake_gen = sm.cmd_gen();
+
+        // Wake fails → must emit IssueWake with fresh gen + ScheduleTickAt.
+        let effects = sm.step(
+            Input::WakeResult {
+                r#gen: wake_gen,
+                result: Err(crate::types::CmdFailure {
+                    controller: "test".into(),
+                    error: "fail".into(),
+                }),
+            },
+            t(150),
+        );
+        assert!(matches!(sm.phase(), Phase::Waking));
+        let has_wake = effects
+            .iter()
+            .any(|e| matches!(e, Effect::IssueWake { .. }));
+        let has_tick = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(
+            has_wake,
+            "Must 2: WakeResult(Err) must re-issue IssueWake immediately"
+        );
+        assert!(
+            has_tick,
+            "Must 2: WakeResult(Err) must schedule retry tick immediately"
+        );
+    }
+
+    /// Must 3: BlankResult(Err) with absent zone re-enters Grace directly.
+    #[test]
+    fn must3_blank_fail_absent_zone_regraces() {
+        let t0 = t(0);
+        let mut sm = sm(500);
+
+        // Enter Blanking.
+        let effects = sm.step(Input::ZonePresent(false), t0);
+        let grace_tick = get_schedule_tick(&effects);
+        sm.step(Input::Tick, grace_tick);
+        assert!(matches!(sm.phase(), Phase::Blanking));
+
+        // Blank fails, zone is absent → must enter Grace with ScheduleTickAt.
+        let later = Tick(grace_tick.0 + Duration::from_millis(100));
+        let effects = sm.step(
+            Input::BlankResult {
+                r#gen: 1,
+                result: Err(crate::types::CmdFailure {
+                    controller: "test".into(),
+                    error: "fail".into(),
+                }),
+            },
+            later,
+        );
+        assert!(
+            matches!(sm.phase(), Phase::Grace { .. }),
+            "Must 3: blank fail + absent zone must regrace"
+        );
+        let has_tick = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(
+            has_tick,
+            "Must 3: blank-fail regrace must own its exit driver via ScheduleTickAt"
+        );
+    }
+
+    /// Must 4: inhibitor active BEFORE Grace entry → pre-frozen countdown.
+    #[test]
+    fn must4_inhibitor_before_grace_prefreezes() {
+        let t0 = t(0);
+        let mut sm = sm(500);
+
+        // Activate inhibitor first.
+        sm.step(Input::InhibitorChanged(true), t0);
+        assert!(sm.overlays().inhibited);
+
+        // Zone clears → Grace should be pre-frozen (no ScheduleTickAt).
+        let effects = sm.step(Input::ZonePresent(false), t(100));
+        assert!(matches!(sm.phase(), Phase::Grace { .. }));
+        let has_tick = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(
+            !has_tick,
+            "Must 4: pre-frozen Grace must NOT emit ScheduleTickAt"
+        );
+
+        // Tick past grace — ignored (frozen).
+        let effects = sm.step(Input::Tick, t(700));
+        assert!(matches!(sm.phase(), Phase::Grace { .. }));
+        assert!(effects.is_empty());
+
+        // Inhibitor deactivates — unfreezes with full grace period.
+        let effects = sm.step(Input::InhibitorChanged(false), t(800));
+        let has_tick = effects
+            .iter()
+            .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+        assert!(
+            has_tick,
+            "Must 4: uninhibitor must schedule the unfrozen grace tick"
+        );
+    }
+
     // ── Proptest: liveness & safety ─────────────────────────────────────────
 
     mod proptest_helpers {
@@ -1428,12 +1721,9 @@ mod tests {
 
         /// Generate an arbitrary `Input` given the current `cmd_gen` for
         /// plausible result generations.
-        pub fn arb_input(cmd_gen: u64) -> impl Strategy<Value = Input> {
-            let gen_range = if cmd_gen == 0 {
-                (0u64..=1u64).boxed()
-            } else {
-                (0u64..=cmd_gen + 1).boxed()
-            };
+        pub fn arb_input(_cmd_gen: u64) -> impl Strategy<Value = Input> {
+            // Wide range so stale and future gens both occur.
+            let gen_range = (0u64..=4u64).boxed();
 
             prop_oneof![
                 // ZonePresent
@@ -1644,6 +1934,20 @@ mod tests {
                 // Step must never panic.
                 let effects = sm.step(input.clone(), now);
                 track_issued(&effects, &mut issued);
+
+                // Property: every effects batch containing IssueWake MUST also
+                // contain ScheduleTickAt (the machine owns its exit driver).
+                let has_wake = effects.iter().any(|e| matches!(e, Effect::IssueWake { .. }));
+                if has_wake {
+                    let has_tick = effects
+                        .iter()
+                        .any(|e| matches!(e, Effect::ScheduleTickAt(_)));
+                    prop_assert!(
+                        has_tick,
+                        "IssueWake batch missing ScheduleTickAt at step {}",
+                        offset_ms
+                    );
+                }
             }
 
             // LIVENESS: after feeding presence + driving deterministically,
@@ -1655,6 +1959,106 @@ mod tests {
             prop_assert!(
                 matches!(sm.phase(), Phase::Active),
                 "machine stuck in {:?} after recovery drive; now={recovery_now:?}",
+                sm.phase()
+            );
+        }
+
+        #[test]
+        fn lost_wake_result_recovers_via_ticks(
+            steps in proptest::collection::vec(
+                (arb_input(0), 1u64..600u64),
+                1..200,
+            ),
+        ) {
+            let mut sm = sm(500);
+
+            // Replay random steps.
+            for (input, offset_ms) in &steps {
+                let now = Tick(
+                    std::time::Instant::now()
+                        .checked_add(Duration::from_millis(*offset_ms))
+                        .unwrap(),
+                );
+                let _ = sm.step(input.clone(), now);
+            }
+
+            // Resolve any in-flight command left over from random steps, so
+            // we start the tick-only drive in a clean state.
+            if matches!(sm.phase(), Phase::Blanking) {
+                let r#gen = sm.cmd_gen();
+                let _ = sm.step(
+                    Input::BlankResult {
+                        r#gen,
+                        result: Ok(()),
+                    },
+                    Tick(std::time::Instant::now()),
+                );
+            }
+            if matches!(sm.phase(), Phase::Waking) {
+                let r#gen = sm.cmd_gen();
+                let _ = sm.step(
+                    Input::WakeResult {
+                        r#gen,
+                        result: Ok(()),
+                    },
+                    Tick(std::time::Instant::now()),
+                );
+            }
+
+            // Feed presence to try to wake.
+            let base = std::time::Instant::now()
+                .checked_add(Duration::from_secs(1))
+                .unwrap();
+            let mut now = Tick(base);
+            let _ = sm.step(Input::ZonePresent(true), now);
+
+            // Drive only with Ticks at each ScheduleTickAt for up to 10
+            // rounds — never deliver WakeResults.  The machine must keep
+            // emitting IssueWake (liveness under lost results).
+            for _round in 0..10 {
+                let effects = sm.step(Input::Tick, now);
+
+                // Collect scheduled ticks.
+                let schedules: Vec<Tick> = effects
+                    .iter()
+                    .filter_map(|e| {
+                        if let Effect::ScheduleTickAt(t) = e {
+                            Some(*t)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                // If the machine is Waking, ticks MUST produce IssueWake.
+                if matches!(sm.phase(), Phase::Waking) {
+                    let has_wake = effects.iter().any(|e| matches!(e, Effect::IssueWake { .. }));
+                    prop_assert!(
+                        has_wake,
+                        "Waking + Tick must emit IssueWake (lost-result liveness)"
+                    );
+                }
+
+                if schedules.is_empty() {
+                    break;
+                }
+                now = schedules[0];
+            }
+
+            // Now deliver ONE WakeResult with the current gen → must reach Active.
+            if matches!(sm.phase(), Phase::Waking) {
+                let r#gen = sm.cmd_gen();
+                let _ = sm.step(
+                    Input::WakeResult {
+                        r#gen,
+                        result: Ok(()),
+                    },
+                    now,
+                );
+            }
+            prop_assert!(
+                matches!(sm.phase(), Phase::Active),
+                "machine stuck in {:?} after WakeResult Ok",
                 sm.phase()
             );
         }

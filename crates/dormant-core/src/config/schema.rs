@@ -216,9 +216,11 @@ pub struct MqttSensorCfg {
     pub kind: SensorKind,
 
     /// Per-sensor hold-time override.
+    #[serde(default, with = "humantime_serde::option")]
     pub hold_time: Option<Duration>,
 
     /// Per-sensor stale-timeout override.
+    #[serde(default, with = "humantime_serde::option")]
     pub stale_timeout: Option<Duration>,
 }
 
@@ -237,9 +239,11 @@ pub struct HaSensorCfg {
     pub kind: SensorKind,
 
     /// Per-sensor hold-time override.
+    #[serde(default, with = "humantime_serde::option")]
     pub hold_time: Option<Duration>,
 
     /// Per-sensor stale-timeout override.
+    #[serde(default, with = "humantime_serde::option")]
     pub stale_timeout: Option<Duration>,
 }
 
@@ -259,9 +263,11 @@ pub struct UsbLd2410Cfg {
     pub kind: SensorKind,
 
     /// Per-sensor hold-time override.
+    #[serde(default, with = "humantime_serde::option")]
     pub hold_time: Option<Duration>,
 
     /// Per-sensor stale-timeout override.
+    #[serde(default, with = "humantime_serde::option")]
     pub stale_timeout: Option<Duration>,
 }
 
@@ -309,23 +315,19 @@ impl ZoneConfig {
             "all" => FusionMode::All,
             "quorum" => {
                 let n = self.quorum.ok_or_else(|| DormantError::ConfigInvalid {
-                    detail: format!("zone '{}': mode 'quorum' requires the 'quorum' key", id),
+                    detail: format!("zone '{id}': mode 'quorum' requires the 'quorum' key"),
                 })?;
                 FusionMode::Quorum(n)
             }
             "weighted" => {
                 let threshold = self.threshold.ok_or_else(|| DormantError::ConfigInvalid {
-                    detail: format!(
-                        "zone '{}': mode 'weighted' requires the 'threshold' key",
-                        id
-                    ),
+                    detail: format!("zone '{id}': mode 'weighted' requires the 'threshold' key"),
                 })?;
                 // Sanity checks on threshold.
                 if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
                     return Err(DormantError::ConfigInvalid {
                         detail: format!(
-                            "zone '{}': weighted threshold must be 0.0..=1.0, got {}",
-                            id, threshold
+                            "zone '{id}': weighted threshold must be 0.0..=1.0, got {threshold}"
                         ),
                     });
                 }
@@ -334,8 +336,7 @@ impl ZoneConfig {
             other => {
                 return Err(DormantError::ConfigInvalid {
                     detail: format!(
-                        "zone '{}': unknown fusion mode '{}' (expected any|all|quorum|weighted)",
-                        id, other
+                        "zone '{id}': unknown fusion mode '{other}' (expected any|all|quorum|weighted)"
                     ),
                 });
             }
@@ -345,18 +346,12 @@ impl ZoneConfig {
         // set with non-weighted mode.
         if self.quorum.is_some() && self.mode != "quorum" {
             return Err(DormantError::ConfigInvalid {
-                detail: format!(
-                    "zone '{}': 'quorum' key is only valid with mode 'quorum'",
-                    id
-                ),
+                detail: format!("zone '{id}': 'quorum' key is only valid with mode 'quorum'"),
             });
         }
         if self.threshold.is_some() && self.mode != "weighted" {
             return Err(DormantError::ConfigInvalid {
-                detail: format!(
-                    "zone '{}': 'threshold' key is only valid with mode 'weighted'",
-                    id
-                ),
+                detail: format!("zone '{id}': 'threshold' key is only valid with mode 'weighted'"),
             });
         }
 
@@ -378,7 +373,7 @@ fn parse_member(raw: &str) -> Result<ZoneMember, DormantError> {
     if let Some(zone_id) = raw.strip_prefix("zone:") {
         if zone_id.is_empty() {
             return Err(DormantError::ConfigInvalid {
-                detail: format!("zone member '{}': empty zone reference", raw),
+                detail: format!("zone member '{raw}': empty zone reference"),
             });
         }
         Ok(ZoneMember::Zone(ZoneId(zone_id.into())))
@@ -406,7 +401,7 @@ pub struct DisplayConfig {
     /// Fallback blank mode if the primary is unsupported (best-effort).
     pub degraded_mode: Option<BlankMode>,
 
-    /// KWin output name (e.g. `"DP-1"`).
+    /// `KWin` output name (e.g. `"DP-1"`).
     pub output: Option<String>,
 
     /// DDC/CI display identifier.
@@ -641,7 +636,7 @@ mod tests {
         let media = &cfg.zones["media"];
         assert_eq!(media.mode, "weighted");
         assert!((media.threshold.unwrap() - 0.6).abs() < f32::EPSILON);
-        assert_eq!(media.weights["couch"], 2.0);
+        assert!((media.weights["couch"] - 2.0).abs() < f32::EPSILON);
 
         let nested = &cfg.zones["nested"];
         assert_eq!(nested.members, vec!["zone:office", "radar"]);
@@ -794,7 +789,7 @@ mod tests {
     fn zone_config_empty_sensor_ref_is_error() {
         let zc = ZoneConfig {
             mode: "any".into(),
-            members: vec!["".into()],
+            members: vec![String::new()],
             quorum: None,
             threshold: None,
             weights: IndexMap::new(),

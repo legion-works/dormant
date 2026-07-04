@@ -141,6 +141,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
 
 /// Walk the TOML value tree and collect every key that doesn't match the known
 /// key set.
+#[must_use]
 pub fn collect_unknown_keys(value: &toml::Value) -> Vec<UnknownKey> {
     let mut results = Vec::new();
     walk_toml(value, "", &mut results);
@@ -149,9 +150,8 @@ pub fn collect_unknown_keys(value: &toml::Value) -> Vec<UnknownKey> {
 
 /// Recursively walk a TOML value, reporting unknown keys.
 fn walk_toml(value: &toml::Value, path: &str, results: &mut Vec<UnknownKey>) {
-    let table = match value {
-        toml::Value::Table(t) => t,
-        _ => return,
+    let toml::Value::Table(table) = value else {
+        return;
     };
 
     // Determine the allowed-key set for this level.
@@ -184,7 +184,10 @@ fn walk_toml(value: &toml::Value, path: &str, results: &mut Vec<UnknownKey>) {
         }
 
         // Recurse into sub-tables (but not arrays or scalar values).
-        if val.is_table() {
+        // Skip passthrough data fields (blank_data, wake_data) — their
+        // children are arbitrary TOML that should not be checked against the
+        // known-key set.
+        if val.is_table() && !is_passthrough_data_key(key) {
             walk_toml(val, &key_path, results);
         }
     }
@@ -217,13 +220,24 @@ fn known_keys_for_path(path: &str) -> &'static [&'static str] {
 }
 
 /// Is this path at a collection level where keys are dynamic ids?
+/// Is this path at a collection level where keys are dynamic ids?
+///
+/// The root path (`""`) is NOT a collection level — root keys must be checked
+/// against the top-level known set.  Only `sensors`, `zones`, `displays`, and
+/// `rules` have dynamic child keys.
 fn is_collection_level(path: &str) -> bool {
-    path.is_empty() || path == "sensors" || path == "zones" || path == "displays" || path == "rules"
+    path == "sensors" || path == "zones" || path == "displays" || path == "rules"
 }
 
 /// Is this path at a weights sub-table where keys are dynamic member ids?
 fn is_weights_level(path: &str) -> bool {
     path.ends_with(".weights")
+}
+
+/// Is this a passthrough data key whose children are arbitrary TOML that
+/// should not be checked against the known-key set?
+fn is_passthrough_data_key(key: &str) -> bool {
+    key == "blank_data" || key == "wake_data"
 }
 
 /// Is this one level deeper than an empty allowed set? (deep nesting of unknown
@@ -246,6 +260,8 @@ const VALID_INHIBITORS: &[&str] = &["user-activity", "manual-pause"];
 /// the display's `modes` list serves as its capability set.
 ///
 /// `creds` is the loaded credentials file (or an empty default).
+#[must_use]
+#[allow(clippy::implicit_hasher)] // the concrete hasher type is fine for a config API
 pub fn validate(
     cfg: &Config,
     capabilities: &HashMap<String, Vec<BlankMode>>,
@@ -255,8 +271,8 @@ pub fn validate(
 
     // Build the sensor inventory from config keys.
     let sensor_inventory: Vec<SensorId> = cfg.sensors.keys().map(|k| SensorId(k.clone())).collect();
-    let sensor_set: HashSet<&str> = cfg.sensors.keys().map(|s| s.as_str()).collect();
-    let zone_names: HashSet<&str> = cfg.zones.keys().map(|s| s.as_str()).collect();
+    let sensor_set: HashSet<&str> = cfg.sensors.keys().map(String::as_str).collect();
+    let zone_names: HashSet<&str> = cfg.zones.keys().map(String::as_str).collect();
 
     // ── Zone validation ─────────────────────────────────────────────────
     validate_zones(
@@ -295,7 +311,7 @@ fn validate_zones(
         if zc.members.is_empty() {
             errors.push(ValidationError {
                 what: "empty zone".into(),
-                detail: format!("zone '{}' has no members", zone_id),
+                detail: format!("zone '{zone_id}' has no members"),
             });
             // Skip member resolution — can't validate further.
             continue;
@@ -309,8 +325,7 @@ fn validate_zones(
                     errors.push(ValidationError {
                         what: "unknown zone reference".into(),
                         detail: format!(
-                            "zone '{}' references unknown nested zone '{}'",
-                            zone_id, zone_ref
+                            "zone '{zone_id}' references unknown nested zone '{zone_ref}'"
                         ),
                     });
                     member_ok = false;
@@ -318,7 +333,7 @@ fn validate_zones(
             } else if !sensor_set.contains(raw.as_str()) {
                 errors.push(ValidationError {
                     what: "unknown sensor reference".into(),
-                    detail: format!("zone '{}' references unknown sensor '{}'", zone_id, raw),
+                    detail: format!("zone '{zone_id}' references unknown sensor '{raw}'"),
                 });
                 member_ok = false;
             }
@@ -366,7 +381,9 @@ fn validate_zones(
     }
 }
 
-/// Validate a single display: controllers, modes, per-controller required fields.
+/// Validate a single display: controllers, modes (against union), per-controller
+/// required fields.
+#[allow(clippy::too_many_lines)] // per-controller field checks add bulk; extracting helpers would scatter the logic
 fn validate_display(
     display_id: &str,
     dc: &DisplayConfig,
@@ -378,74 +395,79 @@ fn validate_display(
     if dc.controllers.is_empty() {
         errors.push(ValidationError {
             what: "no controllers".into(),
-            detail: format!("display '{}' has no controllers", display_id),
+            detail: format!("display '{display_id}' has no controllers"),
         });
         return;
     }
 
+    // Build the union of supported modes across all controllers.
+    let mut union_caps: HashSet<BlankMode> = HashSet::new();
+    let mut unknown_controllers: Vec<&str> = Vec::new();
+
     for controller in &dc.controllers {
-        // Check controller exists in capabilities.
-        let caps = capabilities.get(controller.as_str());
-
-        // Determine effective capabilities for this controller.
-        let effective_caps: Vec<BlankMode> = match caps {
-            Some(c) => c.clone(),
-            None => {
-                errors.push(ValidationError {
-                    what: "unknown controller".into(),
-                    detail: format!(
-                        "display '{}' uses unknown controller '{}'",
-                        display_id, controller
-                    ),
-                });
-                continue;
+        match capabilities.get(controller.as_str()) {
+            Some(caps) => {
+                if controller == "command" || controller == "ha-passthrough" {
+                    // For command / ha-passthrough, the display's `modes` list
+                    // IS the capability set.
+                    if let Some(modes) = &dc.modes {
+                        union_caps.extend(modes.iter().copied());
+                    }
+                } else {
+                    union_caps.extend(caps.iter().copied());
+                }
             }
-        };
-
-        // For command / ha-passthrough, the display's `modes` list IS the
-        // capability set.
-        let mode_caps: HashSet<BlankMode> =
-            if controller == "command" || controller == "ha-passthrough" {
-                dc.modes
-                    .as_ref()
-                    .map_or_else(HashSet::new, |m| m.iter().copied().collect())
-            } else {
-                effective_caps.iter().copied().collect()
-            };
-
-        // Check blank_mode is supported.
-        if !mode_caps.contains(&dc.blank_mode) {
-            errors.push(ValidationError {
-                what: "unsupported blank mode".into(),
-                detail: format!(
-                    "display '{}' blank_mode '{:?}' is not supported by controller '{}'",
-                    display_id, dc.blank_mode, controller
-                ),
-            });
+            None => {
+                unknown_controllers.push(controller);
+            }
         }
+    }
 
-        // Check degraded_mode if set.
-        if let Some(dm) = &dc.degraded_mode
-            && !mode_caps.contains(dm)
-        {
-            errors.push(ValidationError {
-                what: "unsupported degraded mode".into(),
-                detail: format!(
-                    "display '{}' degraded_mode '{:?}' is not supported by controller '{}'",
-                    display_id, dm, controller
-                ),
-            });
-        }
+    for controller in &unknown_controllers {
+        errors.push(ValidationError {
+            what: "unknown controller".into(),
+            detail: format!("display '{display_id}' uses unknown controller '{controller}'"),
+        });
+    }
 
-        // Per-controller required field checks.
+    // If all controllers are unknown, skip further mode checks.
+    if union_caps.is_empty() && !unknown_controllers.is_empty() {
+        return;
+    }
+
+    // Check blank_mode against the union.
+    if !union_caps.is_empty() && !union_caps.contains(&dc.blank_mode) {
+        errors.push(ValidationError {
+            what: "unsupported blank mode".into(),
+            detail: format!(
+                "display '{display_id}' blank_mode '{:?}' is not supported by any controller",
+                dc.blank_mode
+            ),
+        });
+    }
+
+    // Check degraded_mode against the union.
+    if let Some(dm) = &dc.degraded_mode
+        && !union_caps.is_empty()
+        && !union_caps.contains(dm)
+    {
+        errors.push(ValidationError {
+            what: "unsupported degraded mode".into(),
+            detail: format!(
+                "display '{display_id}' degraded_mode '{dm:?}' is not supported by any controller"
+            ),
+        });
+    }
+
+    // Per-controller required field checks (still per-controller).
+    for controller in &dc.controllers {
         match controller.as_str() {
             "samsung-tizen" => {
                 if dc.host.is_none() {
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses samsung-tizen but has no 'host' field",
-                            display_id
+                            "display '{display_id}' uses samsung-tizen but has no 'host' field"
                         ),
                     });
                 }
@@ -456,8 +478,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing credential".into(),
                         detail: format!(
-                            "display '{}' (host '{}') needs a samsung token in credentials",
-                            display_id, host
+                            "display '{display_id}' (host '{host}') needs a samsung token in credentials"
                         ),
                     });
                 }
@@ -467,8 +488,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses ha-passthrough but has no 'ha_url' field",
-                            display_id
+                            "display '{display_id}' uses ha-passthrough but has no 'ha_url' field"
                         ),
                     });
                 }
@@ -476,8 +496,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses ha-passthrough but has no 'blank_service' field",
-                            display_id
+                            "display '{display_id}' uses ha-passthrough but has no 'blank_service' field"
                         ),
                     });
                 }
@@ -485,8 +504,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses ha-passthrough but has no 'wake_service' field",
-                            display_id
+                            "display '{display_id}' uses ha-passthrough but has no 'wake_service' field"
                         ),
                     });
                 }
@@ -494,8 +512,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses ha-passthrough but has no 'modes' field",
-                            display_id
+                            "display '{display_id}' uses ha-passthrough but has no 'modes' field"
                         ),
                     });
                 }
@@ -503,8 +520,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing credential".into(),
                         detail: format!(
-                            "display '{}' uses ha-passthrough but no ha_token is configured",
-                            display_id
+                            "display '{display_id}' uses ha-passthrough but no ha_token is configured"
                         ),
                     });
                 }
@@ -514,8 +530,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses command but has no 'blank_command' field",
-                            display_id
+                            "display '{display_id}' uses command but has no 'blank_command' field"
                         ),
                     });
                 }
@@ -523,8 +538,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses command but has no 'wake_command' field",
-                            display_id
+                            "display '{display_id}' uses command but has no 'wake_command' field"
                         ),
                     });
                 }
@@ -532,8 +546,7 @@ fn validate_display(
                     errors.push(ValidationError {
                         what: "missing field".into(),
                         detail: format!(
-                            "display '{}' uses command but has no 'modes' field",
-                            display_id
+                            "display '{display_id}' uses command but has no 'modes' field"
                         ),
                     });
                 }
@@ -556,7 +569,7 @@ fn validate_rule(
     if !zone_names.contains(rc.zone.as_str()) {
         errors.push(ValidationError {
             what: "rule references unknown zone".into(),
-            detail: format!("rule '{}' references unknown zone '{}'", rule_id, rc.zone),
+            detail: format!("rule '{rule_id}' references unknown zone '{}'", rc.zone),
         });
     }
 
@@ -564,10 +577,7 @@ fn validate_rule(
         if !displays.contains_key(display.as_str()) {
             errors.push(ValidationError {
                 what: "rule references unknown display".into(),
-                detail: format!(
-                    "rule '{}' references unknown display '{}'",
-                    rule_id, display
-                ),
+                detail: format!("rule '{rule_id}' references unknown display '{display}'"),
             });
         }
     }
@@ -578,8 +588,7 @@ fn validate_rule(
             errors.push(ValidationError {
                 what: "unknown inhibitor".into(),
                 detail: format!(
-                    "rule '{}' uses unknown inhibitor '{}' (valid: {:?})",
-                    rule_id, inhibitor, VALID_INHIBITORS
+                    "rule '{rule_id}' uses unknown inhibitor '{inhibitor}' (valid: {VALID_INHIBITORS:?})"
                 ),
             });
         }
@@ -589,13 +598,13 @@ fn validate_rule(
     if rc.wake_retry_interval.as_secs() == 0 {
         errors.push(ValidationError {
             what: "invalid duration".into(),
-            detail: format!("rule '{}' wake_retry_interval must be > 0", rule_id),
+            detail: format!("rule '{rule_id}' wake_retry_interval must be > 0"),
         });
     }
     if rc.activity_poll_interval.as_secs() == 0 {
         errors.push(ValidationError {
             what: "invalid duration".into(),
-            detail: format!("rule '{}' activity_poll_interval must be > 0", rule_id),
+            detail: format!("rule '{rule_id}' activity_poll_interval must be > 0"),
         });
     }
 }
@@ -790,7 +799,7 @@ gracee_period = "60s"
         assert!(
             errors.is_empty(),
             "expected no errors, got: {:?}",
-            errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
     }
 
@@ -912,6 +921,135 @@ gracee_period = "60s"
         assert!(
             errors.iter().any(|e| e.what == "empty zone"),
             "expected empty zone error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn top_level_unknown_key_rejected() {
+        let toml_str = r"
+config_version = 1
+typo_top = true
+";
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(!unknown.is_empty());
+        assert!(
+            unknown.iter().any(|u| u.key_path == "typo_top"),
+            "expected typo_top to be flagged, got {:?}",
+            unknown
+        );
+    }
+
+    #[test]
+    fn passthrough_data_subkeys_not_flagged() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.tv]
+controllers = ["ha-passthrough"]
+blank_mode = "power_off"
+ha_url = "http://ha.local"
+blank_service = "switch.turn_off"
+wake_service = "switch.turn_on"
+modes = ["power_off"]
+
+[displays.tv.wake_data]
+entity_id = "switch.tv_power"
+brightness = 255
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(
+            unknown.is_empty(),
+            "expected no unknown keys for passthrough data, got {:?}",
+            unknown
+        );
+    }
+
+    #[test]
+    fn hold_time_humantime_parse() {
+        let toml_str = r#"
+config_version = 1
+
+[sensors.radar]
+type = "usb-ld2410"
+port = "/dev/ttyUSB0"
+hold_time = "5s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://mqtt.local:1883"
+topic = "sensors/desk"
+stale_timeout = "5m"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let crate::config::schema::SensorConfig::UsbLd2410(radar) = &cfg.sensors["radar"] else {
+            panic!("expected UsbLd2410")
+        };
+        assert_eq!(radar.hold_time, Some(std::time::Duration::from_secs(5)));
+
+        let crate::config::schema::SensorConfig::Mqtt(desk) = &cfg.sensors["desk"] else {
+            panic!("expected Mqtt")
+        };
+        assert_eq!(
+            desk.stale_timeout,
+            Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_mode_0700_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("dormant-test-creds-0700");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.toml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = crate::config::load_credentials(&path);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe permissions")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credentials_mode_0400_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("dormant-test-creds-0400");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.toml");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let result = crate::config::load_credentials(&path);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe permissions")
+        );
+    }
+
+    #[test]
+    fn capability_union_kwin_dpms_ddcci_power_off_passes() {
+        let cfg = valid_full_config();
+        // main_monitor has controllers ["kwin-dpms", "ddcci"] + blank_mode power_off.
+        // kwin-dpms supports PowerOff, ddcci supports BrightnessZero + PowerOff.
+        // Union contains PowerOff → should pass.
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.what == "unsupported blank mode"),
+            "expected no unsupported blank mode errors for union, got {:?}",
             errors
         );
     }

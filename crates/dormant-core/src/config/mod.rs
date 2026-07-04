@@ -114,8 +114,8 @@ pub fn load_credentials(path: &Path) -> Result<Credentials, DormantError> {
             detail: format!("cannot stat credentials file '{}': {e}", path.display()),
         })?;
         let mode = meta.permissions().mode();
-        // 0o600 = 0o100600; check that group/other have no bits set.
-        if mode & 0o077 != 0 {
+        // Require exact 0o600 (owner read+write, group/other nothing).
+        if mode & 0o777 != 0o600 {
             return Err(DormantError::CredsPerms {
                 path: path.display().to_string(),
             });

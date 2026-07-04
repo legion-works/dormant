@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::IpcRequest;
 
 use crate::client;
 
@@ -19,7 +19,7 @@ pub fn run_blank(socket_path: &Path, display: &str) -> Result<()> {
             display: display.to_string(),
         },
     )?;
-    handle_response(&resp)
+    client::check_response(&resp)
 }
 
 /// Run the `wake` command.
@@ -34,14 +34,5 @@ pub fn run_wake(socket_path: &Path, display: &str) -> Result<()> {
             display: display.to_string(),
         },
     )?;
-    handle_response(&resp)
-}
-
-fn handle_response(resp: &IpcResponse) -> Result<()> {
-    if resp.ok {
-        println!("ok");
-        Ok(())
-    } else {
-        anyhow::bail!("{}", resp.error.as_deref().unwrap_or("unknown error"))
-    }
+    client::check_response(&resp)
 }

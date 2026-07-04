@@ -18,6 +18,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::paths;
 
 /// dormantctl — control the dormant daemon.
 #[derive(Parser, Debug)]
@@ -93,44 +94,27 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let socket_path = resolve_socket(cli.socket.as_deref());
+    let socket_path = paths::resolve_socket_path(cli.socket.as_deref());
 
-    match cli.command {
-        Command::Status { json } => {
-            if let Err(e) = cmd_status::run(&socket_path, json) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+    let result = match cli.command {
+        Command::Status { json } => cmd_status::run(&socket_path, json),
         Command::Pause { duration, rule } => {
             let dur = duration.map(std::convert::Into::into);
-            if let Err(e) = cmd_pause::run_pause(&socket_path, dur, rule) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
+            cmd_pause::run_pause(&socket_path, dur, rule)
         }
-        Command::Resume { rule } => {
-            if let Err(e) = cmd_pause::run_resume(&socket_path, rule) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        Command::Blank { display } => {
-            if let Err(e) = cmd_blank::run_blank(&socket_path, &display) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        Command::Wake { display } => {
-            if let Err(e) = cmd_blank::run_wake(&socket_path, &display) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
+        Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
+        Command::Blank { display } => cmd_blank::run_blank(&socket_path, &display),
+        Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
         Command::Reload => match client::send_request(&socket_path, &IpcRequest::Reload) {
-            Ok(resp) if resp.ok => println!("ok"),
-            Ok(resp) => eprintln!("error: {}", resp.error.as_deref().unwrap_or("unknown")),
-            Err(e) => eprintln!("error: {e}"),
+            Ok(resp) if resp.ok => {
+                println!("ok");
+                Ok(())
+            }
+            Ok(resp) => Err(anyhow::anyhow!(
+                "{}",
+                resp.error.as_deref().unwrap_or("unknown")
+            )),
+            Err(e) => Err(e),
         },
         Command::Validate {
             config,
@@ -142,31 +126,22 @@ fn main() -> ExitCode {
                 credentials,
                 lenient_keys,
             };
-            if let Err(e) = cmd_validate::run(&args) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
+            cmd_validate::run(&args)
+        }
+        Command::Watch { json } => cmd_watch::run(&socket_path, json),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            eprintln!("error: {msg}");
+            // Connection-refused / daemon-not-running → exit 2.
+            if msg.contains("daemon not running") || msg.contains("Connection refused") {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
             }
         }
-        Command::Watch { json } => {
-            if let Err(e) = cmd_watch::run(&socket_path, json) {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
     }
-
-    ExitCode::SUCCESS
-}
-
-/// Resolve the socket path from an explicit arg or default chain.
-fn resolve_socket(explicit: Option<&std::path::Path>) -> PathBuf {
-    if let Some(p) = explicit {
-        return p.to_path_buf();
-    }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let mut p = PathBuf::from(runtime_dir);
-        p.push("dormant.sock");
-        return p;
-    }
-    PathBuf::from("/run/dormant/dormant.sock")
 }

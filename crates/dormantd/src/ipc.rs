@@ -12,35 +12,21 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::{ControlMsg, StateSnapshot};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Resolve the socket path from an optional config value.
-///
-/// Default chain:
-/// 1. `$XDG_RUNTIME_DIR/dormant.sock`
-/// 2. `/run/dormant/dormant.sock`
-#[must_use]
-pub fn resolve_socket_path(config_socket: Option<&std::path::Path>) -> std::path::PathBuf {
-    if let Some(p) = config_socket {
-        return p.to_path_buf();
-    }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        let mut p = std::path::PathBuf::from(runtime_dir);
-        p.push("dormant.sock");
-        return p;
-    }
-    std::path::PathBuf::from("/run/dormant/dormant.sock")
-}
+/// Maximum line length for IPC requests/responses (1 MB).
+const MAX_LINE_BYTES: usize = 1_048_576;
 
 /// Spawn the IPC server on a background task.
 ///
-/// Binds `socket_path`, sets permissions to `0o600`, and accepts connections
-/// in a loop until `cancel` is triggered.  Each connection is handled by a
-/// spawned per-connection task.
+/// Binds `socket_path` with `0o600` permissions (umask-guarded to avoid a
+/// race between `bind` and `set_permissions`), and accepts connections in a
+/// loop until `cancel` is triggered.  Each connection is handled by a spawned
+/// per-connection task.
 ///
 /// If the socket file already exists, attempts to connect to it first — if
 /// the connection succeeds the old daemon is alive and we error out; if it
@@ -50,15 +36,15 @@ pub fn resolve_socket_path(config_socket: Option<&std::path::Path>) -> std::path
 ///
 /// - Bind failure (address in use by a live daemon, permission denied, …).
 /// - Permission set failure.
+/// - Parent directory is group/world-writable or not owned by us.
 pub fn spawn(
     socket_path: &Path,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_trigger_tx: mpsc::Sender<()>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
-    // Stale-socket recovery: if the file exists, try connecting.  If the
-    // connection succeeds the old daemon is alive — bail.  If it fails
-    // (ENOENT / ECONNREFUSED / …) the socket is stale; unlink and proceed.
+    // Stale-socket recovery: connect-test before bind so we never silently
+    // replace a live daemon's socket.
     if socket_path.exists() {
         match std::os::unix::net::UnixStream::connect(socket_path) {
             Ok(_) => {
@@ -73,16 +59,52 @@ pub fn spawn(
         }
     }
 
-    // Ensure parent directory exists.
+    // Ensure parent directory exists with 0o700 permissions.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create socket parent directory '{}'", parent.display()))?;
+        // Refuse if group/world-writable or not owned by us.
+        let meta = std::fs::metadata(parent)
+            .with_context(|| format!("stat parent directory '{}'", parent.display()))?;
+        let mode = meta.permissions().mode();
+        // Check the write bits specifically (0o022 = group-write, 0o002 =
+        // world-write).  Read/execute for group/world is acceptable (e.g.
+        // /tmp with 0o1777 has the sticky bit but is world-writable — we
+        // still reject that; the daemon should use a private subdir).
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "socket parent directory '{}' has permissions {:#o}; \
+                 group/world-writable directories are not allowed",
+                parent.display(),
+                mode & 0o777,
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let uid = unsafe { libc::geteuid() };
+            if meta.uid() != uid {
+                anyhow::bail!(
+                    "socket parent directory '{}' is owned by uid {} but we are {}",
+                    parent.display(),
+                    meta.uid(),
+                    uid,
+                );
+            }
+        }
     }
 
+    // Use umask to ensure the socket is created 0o600 even before the
+    // explicit set_permissions call.  This is done once at a point where the
+    // daemon is not spawning other file-creating tasks concurrently (IPC
+    // spawns after engine assembly, in a single-threaded moment of the async
+    // context).  The post-bind set_permissions is kept as belt-and-braces.
+    let old_umask = unsafe { libc::umask(0o077) };
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("bind Unix socket '{}'", socket_path.display()))?;
+    unsafe { libc::umask(old_umask) };
 
-    // Set permissions to 0o600.
+    // Explicit 0o600 after bind (belt-and-braces — umask already narrowed).
     let metadata = std::fs::metadata(socket_path)
         .with_context(|| format!("stat socket '{}'", socket_path.display()))?;
     let mut perms = metadata.permissions();
@@ -134,17 +156,18 @@ async fn run(
 }
 
 /// Handle one client connection: read line-delimited JSON, dispatch, write
-/// responses.
+/// responses.  Lines are capped at [`MAX_LINE_BYTES`]; oversized lines get an
+/// error response and the connection stays usable.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_trigger_tx: mpsc::Sender<()>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     loop {
-        let line = match lines.next_line().await {
+        let line = match read_line_bounded(&mut reader).await {
             Ok(Some(l)) => l,
             Ok(None) => return, // clean disconnect
             Err(e) => {
@@ -218,9 +241,15 @@ async fn handle_pause(
     duration_s: Option<u64>,
 ) -> IpcResponse {
     let rule_id = rule.map(dormant_core::types::RuleId);
-    let until = duration_s.map(|s| {
-        dormant_core::types::Timestamp(std::time::SystemTime::now() + Duration::from_secs(s))
-    });
+    let until = match duration_s {
+        Some(s) => match std::time::SystemTime::now().checked_add(Duration::from_secs(s)) {
+            Some(t) => Some(dormant_core::types::Timestamp(t)),
+            None => {
+                return IpcResponse::error("duration overflow");
+            }
+        },
+        None => None,
+    };
     let msg = ControlMsg::Pause {
         rule: rule_id,
         until,
@@ -330,6 +359,39 @@ async fn validate_display_name(
     None
 }
 
+/// Read one line from the buffered reader, capping at [`MAX_LINE_BYTES`].
+///
+/// Returns `Ok(None)` on EOF, `Ok(Some(line))` on success, or an error if the
+/// line exceeds the cap.
+async fn read_line_bounded(
+    reader: &mut BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
+) -> Result<Option<String>> {
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        // Check if we already have a complete line in buf (from a prior read).
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..pos).collect();
+            let _ = buf.drain(..1); // remove the \n
+            let s =
+                String::from_utf8(line).map_err(|_| anyhow::anyhow!("invalid UTF-8 in request"))?;
+            return Ok(Some(s));
+        }
+
+        if buf.len() > MAX_LINE_BYTES {
+            anyhow::bail!("line exceeds maximum length of {MAX_LINE_BYTES} bytes");
+        }
+
+        if reader.read_buf(&mut buf).await? == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            let s =
+                String::from_utf8(buf).map_err(|_| anyhow::anyhow!("invalid UTF-8 in request"))?;
+            return Ok(Some(s));
+        }
+    }
+}
+
 /// Serialize a value as a JSON line and write it to the stream.
 async fn write_json<T: serde::Serialize>(
     writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
@@ -344,6 +406,9 @@ async fn write_line(
     writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
     line: &str,
 ) -> Result<()> {
+    if line.len() > MAX_LINE_BYTES {
+        anyhow::bail!("response line exceeds maximum length of {MAX_LINE_BYTES} bytes");
+    }
     let mut buf = line.as_bytes().to_vec();
     buf.push(b'\n');
     writer.write_all(&buf).await?;
@@ -355,23 +420,21 @@ async fn write_line(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn resolve_socket_path_from_config() {
-        let p = resolve_socket_path(Some(Path::new("/tmp/test.sock")));
+        let p =
+            dormant_core::paths::resolve_socket_path(Some(std::path::Path::new("/tmp/test.sock")));
         assert_eq!(p, std::path::PathBuf::from("/tmp/test.sock"));
     }
 
     #[test]
     fn resolve_socket_path_default_xdg() {
-        // Temporarily set XDG_RUNTIME_DIR
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: test-only env manipulation, single-threaded test.
         unsafe {
             std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         }
-        let p = resolve_socket_path(None);
+        let p = dormant_core::paths::resolve_socket_path(None);
         assert_eq!(p, std::path::PathBuf::from("/run/user/1000/dormant.sock"));
         match prev {
             Some(v) => unsafe {
@@ -390,7 +453,7 @@ mod tests {
         unsafe {
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
-        let p = resolve_socket_path(None);
+        let p = dormant_core::paths::resolve_socket_path(None);
         assert_eq!(p, std::path::PathBuf::from("/run/dormant/dormant.sock"));
         match prev {
             Some(v) => unsafe {

@@ -97,17 +97,19 @@ async fn send_request(socket_path: &Path, request: &IpcRequest) -> IpcResponse {
 }
 
 /// Create a tempdir with a socket path and spawn the IPC server.
+/// Returns `(dir, socket_path, ctl_tx, event_tx, record_rx, cancel)`.
 async fn setup_server() -> (
     tempfile::TempDir,
     std::path::PathBuf,
     mpsc::Sender<ControlMsg>,
+    broadcast::Sender<DaemonEvent>,
     mpsc::Receiver<ControlMsg>,
     CancellationToken,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("dormant.sock");
 
-    let (ctl_tx, _event_tx, record_rx) = spawn_fake_engine();
+    let (ctl_tx, event_tx, record_rx) = spawn_fake_engine();
     let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
     let cancel = CancellationToken::new();
 
@@ -117,14 +119,14 @@ async fn setup_server() -> (
     // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    (dir, socket_path, ctl_tx, record_rx, cancel)
+    (dir, socket_path, ctl_tx, event_tx, record_rx, cancel)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn status_roundtrip_parses_snapshot() {
-    let (_dir, socket_path, _ctl_tx, _record_rx, cancel) = setup_server().await;
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
 
     let resp = send_request(&socket_path, &IpcRequest::Status).await;
 
@@ -140,7 +142,7 @@ async fn status_roundtrip_parses_snapshot() {
 
 #[tokio::test]
 async fn pause_sends_control_msg() {
-    let (_dir, socket_path, _ctl_tx, mut record_rx, cancel) = setup_server().await;
+    let (_dir, socket_path, _ctl_tx, _event_tx, mut record_rx, cancel) = setup_server().await;
 
     let resp = send_request(
         &socket_path,
@@ -180,7 +182,7 @@ async fn pause_sends_control_msg() {
 
 #[tokio::test]
 async fn blank_unknown_display_returns_error() {
-    let (_dir, socket_path, _ctl_tx, _record_rx, cancel) = setup_server().await;
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
 
     let resp = send_request(
         &socket_path,
@@ -202,15 +204,7 @@ async fn blank_unknown_display_returns_error() {
 
 #[tokio::test]
 async fn events_streams_two_events_then_disconnect() {
-    let (_dir, socket_path, _ctl_tx, _record_rx, cancel) = setup_server().await;
-
-    // Send events on the broadcast channel
-    // We need to get the event_tx from the fake engine — but it's inside
-    // spawn_fake_engine.  For this test we use a simpler approach: connect
-    // to events, then send events through the engine's event_tx.
-    // Actually, the fake engine already has event_tx. Let's restructure.
-    // For now, just verify the events endpoint connects and returns something.
-    // We'll do a simpler test: connect, read a few lines, disconnect.
+    let (_dir, socket_path, _ctl_tx, event_tx, _record_rx, cancel) = setup_server().await;
 
     let stream = UnixStream::connect(&socket_path).await.unwrap();
     let (reader, mut writer) = tokio::io::split(stream);
@@ -220,19 +214,48 @@ async fn events_streams_two_events_then_disconnect() {
     writer.write_all(b"\n").await.unwrap();
     writer.flush().await.unwrap();
 
-    // The events stream should be alive — we can't easily inject events
-    // from here without the event_tx, but we can verify the connection
-    // stays open (no immediate error response).
-    // Drop the writer to disconnect cleanly.
-    drop(writer);
-    drop(reader);
+    // Give the server a moment to subscribe.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send two events through the broadcast channel.
+    let ev1 = DaemonEvent::ConfigReloaded;
+    let ev2 = DaemonEvent::SensorChanged {
+        sensor: dormant_core::types::SensorId("desk".into()),
+        state: dormant_core::types::SensorState::Present,
+    };
+    assert!(event_tx.send(ev1).is_ok());
+    assert!(event_tx.send(ev2).is_ok());
+
+    // Read both events from the stream with a timeout.
+    let mut reader = BufReader::new(reader);
+    let mut line1 = String::new();
+    tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line1))
+        .await
+        .expect("timeout reading event1")
+        .unwrap();
+    let event1: DaemonEvent = serde_json::from_str(line1.trim()).unwrap();
+    assert!(matches!(event1, DaemonEvent::ConfigReloaded));
+
+    let mut line2 = String::new();
+    tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line2))
+        .await
+        .expect("timeout reading event2")
+        .unwrap();
+    let event2: DaemonEvent = serde_json::from_str(line2.trim()).unwrap();
+    match event2 {
+        DaemonEvent::SensorChanged { sensor, state } => {
+            assert_eq!(sensor.0, "desk");
+            assert_eq!(state, dormant_core::types::SensorState::Present);
+        }
+        _ => panic!("expected SensorChanged"),
+    }
 
     cancel.cancel();
 }
 
 #[tokio::test]
 async fn bad_json_line_returns_error_and_connection_stays_usable() {
-    let (_dir, socket_path, _ctl_tx, _record_rx, cancel) = setup_server().await;
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
 
     // Use a fresh connection for each request.
     let resp = send_request(&socket_path, &IpcRequest::Status).await;
@@ -246,7 +269,10 @@ async fn bad_json_line_returns_error_and_connection_stays_usable() {
         writer.flush().await.unwrap();
         let mut reader = BufReader::new(reader);
         let mut response_line = String::new();
-        reader.read_line(&mut response_line).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut response_line))
+            .await
+            .expect("timeout reading bad-json response")
+            .unwrap();
         let resp: IpcResponse = serde_json::from_str(response_line.trim()).unwrap();
         assert!(!resp.ok);
         assert!(

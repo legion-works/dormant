@@ -269,7 +269,8 @@ impl App {
         let root = CancellationToken::new();
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
-        let socket_path = crate::ipc::resolve_socket_path(cfg.daemon.socket_path.as_deref());
+        let socket_path =
+            dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
         let assembly = assemble_static(cfg, creds, &self.source_builder)
             .await
             .context("assemble initial runtime")?;

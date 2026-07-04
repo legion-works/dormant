@@ -4,6 +4,7 @@
 pub mod config;
 pub mod error;
 pub mod ipc_proto;
+pub mod paths;
 pub mod rules;
 pub mod state_machine;
 pub mod traits;

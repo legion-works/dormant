@@ -680,6 +680,7 @@ dependencies = [
  "dormant-core",
  "dormant-displays",
  "dormant-sensors",
+ "libc",
  "notify",
  "serde",
  "serde_json",

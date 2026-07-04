@@ -3,11 +3,12 @@
 //! Wires configuration → sensors → zones → rules → displays, with post-probe
 //! display validation, hot config reload, and a user-activity inhibitor.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 use dormant_core::config::{Strictness, load_config};
+use dormant_core::paths;
 use dormantd::app::{self, App};
 use dormantd::logging;
 
@@ -46,17 +47,17 @@ fn main() -> ExitCode {
         Strictness::Strict
     };
 
-    let Some(config_path) = cli.config.clone().or_else(default_config_path) else {
-        eprintln!(
-            "no config file found; pass --config or create \
-             $XDG_CONFIG_HOME/dormant/config.toml or /etc/dormant/config.toml"
-        );
-        return ExitCode::from(2);
+    let config_path = match paths::resolve_config_path(cli.config.as_deref()) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
     };
     let creds_path = cli
         .credentials
         .clone()
-        .unwrap_or_else(|| sibling_credentials(&config_path));
+        .unwrap_or_else(|| paths::sibling_credentials(&config_path));
 
     let level = peek_log_level(&config_path, strictness);
     if let Err(e) = logging::init(&level, cli.log_json) {
@@ -100,33 +101,8 @@ fn main() -> ExitCode {
     })
 }
 
-/// First existing default config path, XDG before `/etc`.
-fn default_config_path() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        candidates.push(PathBuf::from(xdg).join("dormant").join("config.toml"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join(".config")
-                .join("dormant")
-                .join("config.toml"),
-        );
-    }
-    candidates.push(PathBuf::from("/etc/dormant/config.toml"));
-    candidates.into_iter().find(|p| p.exists())
-}
-
-/// `credentials.toml` in the same directory as the config file.
-fn sibling_credentials(config_path: &Path) -> PathBuf {
-    config_path.parent().map_or_else(
-        || PathBuf::from("credentials.toml"),
-        |dir| dir.join("credentials.toml"),
-    )
-}
-
 /// Best-effort read of `daemon.log_level` before logging is initialised.
-fn peek_log_level(config_path: &Path, strictness: Strictness) -> String {
+fn peek_log_level(config_path: &std::path::Path, strictness: Strictness) -> String {
     load_config(config_path, strictness)
         .map_or_else(|_| "info".to_string(), |(cfg, _)| cfg.daemon.log_level)
 }

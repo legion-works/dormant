@@ -63,18 +63,34 @@ impl Iterator for EventStream {
     type Item = Result<DaemonEvent>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => None, // EOF
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return self.next();
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => return None, // EOF
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        return Some(serde_json::from_str(trimmed).context("parse daemon event"));
+                    }
+                    // Empty line — continue reading.
                 }
-                Some(serde_json::from_str(trimmed).context("parse daemon event"))
+                Err(e) => return Some(Err(e.into())),
             }
-            Err(e) => Some(Err(e.into())),
         }
+    }
+}
+
+/// Check an [`IpcResponse`] for success, printing "ok" or returning an error.
+///
+/// # Errors
+///
+/// Returns an error with the daemon's error message if `resp.ok` is false.
+pub fn check_response(resp: &IpcResponse) -> Result<()> {
+    if resp.ok {
+        println!("ok");
+        Ok(())
+    } else {
+        anyhow::bail!("{}", resp.error.as_deref().unwrap_or("unknown error"))
     }
 }
 

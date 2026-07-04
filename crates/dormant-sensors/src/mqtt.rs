@@ -164,7 +164,7 @@ impl MqttSource {
         let (host, port) = parse_broker_url(broker_url);
         let mut mqttopts = MqttOptions::new(client_id, host, port);
         mqttopts.set_clean_session(true);
-        let cap = topics.len() * 2 + CAP_HEADROOM;
+        let cap = topics.len() + CAP_HEADROOM;
         let (client, eventloop) = AsyncClient::new(mqttopts, cap);
         for topic in topics {
             if let Err(e) = client.subscribe(topic, QoS::AtLeastOnce).await {
@@ -820,8 +820,8 @@ mod tests {
         assert!(source.topic_map.contains_key("sensors/desk/availability"));
     }
 
-    #[test]
-    fn emit_unavailable_all_deduplicates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn emit_unavailable_all_deduplicates() {
         // Two sensors on the same topic — emit_unavailable_all should produce
         // exactly 2 events (not 4, since each sensor appears in both the
         // sensor topic and availability topic entries).
@@ -833,22 +833,23 @@ mod tests {
             ],
         );
 
-        let (_tx, _rx) = mpsc::channel::<PresenceEvent>(16);
+        let (tx, mut rx) = mpsc::channel(8);
+        source.emit_unavailable_all(&tx).await;
+        drop(tx);
 
-        // We can't easily call emit_unavailable_all in a sync test because
-        // it's async.  Instead verify the topic map structure.
-        // Each sensor appears under its sensor topic AND availability topic.
-        // With 2 sensors, that's 4 entries in the topic map values.
-        let total_bindings: usize = source.topic_map.values().map(Vec::len).sum();
-        assert_eq!(total_bindings, 4, "2 sensors × 2 topics each");
-
-        // But the unique sensor id count should be 2.
-        let mut seen = HashSet::new();
-        for bindings in source.topic_map.values() {
-            for b in bindings {
-                seen.insert(b.id.0.as_str());
-            }
+        let mut events: Vec<PresenceEvent> = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
         }
-        assert_eq!(seen.len(), 2);
+
+        assert_eq!(events.len(), 2, "exactly 2 events, one per sensor");
+        let mut ids: HashSet<&str> = HashSet::new();
+        for event in &events {
+            assert_eq!(event.state, SensorState::Unavailable);
+            ids.insert(event.sensor_id.0.as_str());
+        }
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("a"));
+        assert!(ids.contains("b"));
     }
 }

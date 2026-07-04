@@ -30,6 +30,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backoff;
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 /// Minimum reconnect backoff for transient errors.
@@ -70,13 +72,8 @@ impl HaWsSource {
 
     /// Emit [`SensorState::Unavailable`] for every owned sensor.
     async fn emit_unavailable_all(&self, tx: &mpsc::Sender<PresenceEvent>) {
-        let now = Timestamp::now();
-        for (sensor_id, _) in &self.entities {
-            let event = PresenceEvent::new(sensor_id.clone(), SensorState::Unavailable, now);
-            if tx.send(event).await.is_err() {
-                return;
-            }
-        }
+        let ids: Vec<SensorId> = self.entities.iter().map(|(id, _)| id.clone()).collect();
+        backoff::emit_unavailable_all(&ids, tx).await;
     }
 }
 
@@ -114,7 +111,8 @@ impl SensorSource for HaWsSource {
                         outage_reported = true;
                     }
                     sleep(backoff).await;
-                    backoff = next_backoff(backoff);
+                    backoff =
+                        backoff::next_backoff(backoff, BACKOFF_MIN, BACKOFF_MAX, JITTER_FRACTION);
                     continue;
                 }
             };
@@ -207,7 +205,7 @@ impl SensorSource for HaWsSource {
                 sleep(AUTH_BACKOFF).await;
             } else {
                 sleep(backoff).await;
-                backoff = next_backoff(backoff);
+                backoff = backoff::next_backoff(backoff, BACKOFF_MIN, BACKOFF_MAX, JITTER_FRACTION);
             }
             outage_reported = false;
         }
@@ -258,6 +256,9 @@ pub(crate) struct HaProtocol {
     subscribed_entities: Vec<String>,
     /// Entities we've warned about (unknown entities, one warning each).
     warned_entities: HashSet<String>,
+    /// (`entity_id`, `state_string`) pairs we've warned about for unrecognised
+    /// states — one warning per unique combination.
+    warned_states: HashSet<(String, String)>,
 }
 
 impl HaProtocol {
@@ -272,6 +273,7 @@ impl HaProtocol {
             entities,
             subscribed_entities,
             warned_entities: HashSet::new(),
+            warned_states: HashSet::new(),
         }
     }
 
@@ -402,27 +404,32 @@ impl HaProtocol {
     }
 
     /// Map an entity state value to actions.
+    ///
+    /// Fans out to ALL sensor ids that share this `entity_id` (not just the
+    /// first match), so that two sensors watching the same entity both
+    /// receive the event.
     fn process_entity_state(
         &mut self,
         entity_id: &str,
         state_value: &serde_json::Value,
         actions: &mut Vec<Action>,
     ) {
-        // Find the SensorId for this entity.
-        let Some(sensor_id) = self
+        // Collect ALL sensor ids for this entity.
+        let sensor_ids: Vec<SensorId> = self
             .entities
             .iter()
-            .find(|(_, e)| e == entity_id)
-            .map(|(id, _)| id)
-        else {
+            .filter(|(_, e)| e == entity_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if sensor_ids.is_empty() {
             if self.warned_entities.insert(entity_id.to_string()) {
                 warn!("ha-ws: received state for unknown entity '{entity_id}' (first occurrence)");
             } else {
                 debug!("ha-ws: received state for unknown entity '{entity_id}' (suppressed)");
             }
             return;
-        };
-        let sensor_id = sensor_id.clone();
+        }
 
         // Extract the "s" (state) field.
         let Some(state_str) = state_value.get("s").and_then(|v| v.as_str()) else {
@@ -435,46 +442,28 @@ impl HaProtocol {
             "off" => SensorState::Absent,
             "unavailable" | "unknown" => SensorState::Unavailable,
             other => {
-                warn!(
-                    "ha-ws: entity '{entity_id}' has unrecognised state '{other}' (first occurrence)"
-                );
+                let key = (entity_id.to_string(), other.to_string());
+                if self.warned_states.insert(key) {
+                    warn!(
+                        "ha-ws: entity '{entity_id}' has unrecognised state '{other}' (first occurrence)"
+                    );
+                } else {
+                    debug!(
+                        "ha-ws: entity '{entity_id}' has unrecognised state '{other}' (suppressed)"
+                    );
+                }
                 return;
             }
         };
 
-        actions.push(Action::Emit(PresenceEvent::new(
-            sensor_id,
-            state,
-            Timestamp::now(),
-        )));
+        for sensor_id in sensor_ids {
+            actions.push(Action::Emit(PresenceEvent::new(
+                sensor_id,
+                state,
+                Timestamp::now(),
+            )));
+        }
     }
-}
-
-// ── Backoff helpers ───────────────────────────────────────────────────────────
-
-/// Compute the next backoff duration with capped exponential growth and ±20%
-/// jitter.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn next_backoff(current: Duration) -> Duration {
-    let next = current.mul_f64(2.0).min(BACKOFF_MAX);
-    if JITTER_FRACTION <= 0.0 {
-        return next.max(BACKOFF_MIN).min(BACKOFF_MAX);
-    }
-    let jitter_range_ms = next.mul_f64(JITTER_FRACTION).as_millis();
-    if jitter_range_ms == 0 {
-        return next.max(BACKOFF_MIN).min(BACKOFF_MAX);
-    }
-    let offset_ms = ((fastrand::f64() * 2.0 - 1.0) * jitter_range_ms as f64) as i64;
-    let result = if offset_ms >= 0 {
-        next.saturating_add(Duration::from_millis(offset_ms as u64))
-    } else {
-        next.saturating_sub(Duration::from_millis((-offset_ms) as u64))
-    };
-    result.max(BACKOFF_MIN).min(BACKOFF_MAX)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -739,6 +728,75 @@ mod tests {
             r#"{"id":1,"type":"event","event":{"a":{"binary_sensor.test_motion":{"s":"bogus"}}}}"#,
         );
         assert!(actions.is_empty(), "expected no actions for unknown state");
+    }
+
+    #[test]
+    fn change_event_without_s_key_ignored() {
+        let mut proto = make_protocol();
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        // A "c" change with "+" object that has no "s" field → ignored.
+        let actions = proto.handle_message(
+            r#"{"id":1,"type":"event","event":{"c":{"binary_sensor.test_motion":{"+":{"t":"123"}}}}}"#,
+        );
+        assert!(
+            actions.is_empty(),
+            "expected no actions when 's' field is missing"
+        );
+    }
+
+    #[test]
+    fn two_sensors_same_entity_both_receive() {
+        let mut proto = HaProtocol::new(
+            "tok".into(),
+            vec![
+                (SensorId("motion_a".into()), "binary_sensor.shared".into()),
+                (SensorId("motion_b".into()), "binary_sensor.shared".into()),
+            ],
+        );
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        let actions = proto.handle_message(
+            r#"{"id":1,"type":"event","event":{"a":{"binary_sensor.shared":{"s":"on"}}}}"#,
+        );
+        assert_eq!(actions.len(), 2, "both sensors should receive the event");
+
+        let mut sensor_ids: Vec<&str> = actions
+            .iter()
+            .map(|a| match a {
+                Action::Emit(e) => e.sensor_id.0.as_str(),
+                _ => panic!("expected Emit"),
+            })
+            .collect();
+        sensor_ids.sort_unstable();
+        assert_eq!(sensor_ids, vec!["motion_a", "motion_b"]);
+    }
+
+    #[test]
+    fn unknown_state_dedup_warns_once() {
+        let mut proto = make_protocol();
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        // First occurrence of "bogus" state → no actions.
+        let actions = proto.handle_message(
+            r#"{"id":1,"type":"event","event":{"a":{"binary_sensor.test_motion":{"s":"bogus"}}}}"#,
+        );
+        assert!(actions.is_empty(), "expected no actions for unknown state");
+
+        // Second occurrence of same "bogus" state → also no actions (dedup).
+        let actions = proto.handle_message(
+            r#"{"id":2,"type":"event","event":{"a":{"binary_sensor.test_motion":{"s":"bogus"}}}}"#,
+        );
+        assert!(
+            actions.is_empty(),
+            "expected no actions for repeated unknown state"
+        );
     }
 
     // ── Edge cases ─────────────────────────────────────────────────────────

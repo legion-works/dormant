@@ -65,16 +65,18 @@ pub fn build(
         sources.push(Box::new(MqttSource::new(broker_url, sensors)) as Box<dyn SensorSource>);
     }
 
-    // HA WebSocket sources.
-    let token = creds
-        .ha_token
-        .as_ref()
-        .ok_or_else(|| DormantError::CredsMissing {
-            what: "ha_token".into(),
-        })?;
+    // HA WebSocket sources — only require token when HA sensors exist.
+    if !by_ha_url.is_empty() {
+        let token = creds
+            .ha_token
+            .as_ref()
+            .ok_or_else(|| DormantError::CredsMissing {
+                what: "ha_token".into(),
+            })?;
 
-    for (url, entities) in by_ha_url {
-        sources.push(Box::new(HaWsSource::new(url, token.clone(), entities)));
+        for (url, entities) in by_ha_url {
+            sources.push(Box::new(HaWsSource::new(url, token.clone(), entities)));
+        }
     }
 
     Ok(sources)
@@ -244,6 +246,48 @@ mod tests {
             }
             Ok(_) => panic!("expected Err for missing ha_token"),
         }
+    }
+
+    #[test]
+    fn build_two_ha_sensors_same_url_one_source() {
+        use dormant_core::config::schema::HaSensorCfg;
+
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert(
+            "motion".into(),
+            SensorConfig::Ha(HaSensorCfg {
+                url: "ws://ha.local:8123/api/websocket".into(),
+                entity: "binary_sensor.motion".into(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        sensors.insert(
+            "door".into(),
+            SensorConfig::Ha(HaSensorCfg {
+                url: "ws://ha.local:8123/api/websocket".into(),
+                entity: "binary_sensor.door".into(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+
+        let sources = build(&sensors, &creds_with_token()).unwrap();
+        assert_eq!(sources.len(), 1, "same URL → one source");
+        assert_eq!(sources[0].source_id(), "ws://ha.local:8123/api/websocket");
+    }
+
+    #[test]
+    fn build_mqtt_only_without_token_succeeds() {
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert("desk".into(), mqtt_cfg("tcp://broker:1883", "sensors/desk"));
+
+        // No HA sensors → no token required.
+        let sources = build(&sensors, &creds_no_token()).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id(), "tcp://broker:1883");
     }
 
     #[test]

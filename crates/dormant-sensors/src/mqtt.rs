@@ -34,6 +34,8 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backoff;
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 /// Minimum reconnect backoff.
@@ -91,14 +93,8 @@ impl MqttSource {
 
     /// Emit [`SensorState::Unavailable`] for every owned sensor.
     async fn emit_unavailable_all(&self, tx: &mpsc::Sender<PresenceEvent>) {
-        let now = Timestamp::now();
-        for (sensor_id, _) in &self.sensors {
-            let event = PresenceEvent::new(sensor_id.clone(), SensorState::Unavailable, now);
-            if tx.send(event).await.is_err() {
-                // Receiver dropped — we are shutting down.
-                return;
-            }
-        }
+        let ids: Vec<SensorId> = self.sensors.iter().map(|(id, _)| id.clone()).collect();
+        backoff::emit_unavailable_all(&ids, tx).await;
     }
 
     /// Create a fresh MQTT connection, subscribe to all topics, and return
@@ -250,7 +246,7 @@ impl SensorSource for MqttSource {
                                 outage_reported = true;
                             }
                             sleep(backoff).await;
-                            backoff = next_backoff(backoff);
+                            backoff = backoff::next_backoff(backoff, BACKOFF_MIN, BACKOFF_MAX, JITTER_FRACTION);
                             // Reconnect: drop old pair, create new.
                             let new_pair = Self::connect(
                                 &self.broker_url, &client_id, &topics,
@@ -368,31 +364,7 @@ pub fn availability_topic(topic: &str) -> String {
 
 // ── Backoff helpers ───────────────────────────────────────────────────────────
 
-/// Compute the next backoff duration with capped exponential growth and ±20%
-/// jitter.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn next_backoff(current: Duration) -> Duration {
-    let next = current.mul_f64(2.0).min(BACKOFF_MAX);
-    if JITTER_FRACTION <= 0.0 {
-        return next.max(BACKOFF_MIN).min(BACKOFF_MAX);
-    }
-    // Jitter: ±20% of the next backoff value.
-    let jitter_range_ms = next.mul_f64(JITTER_FRACTION).as_millis();
-    if jitter_range_ms == 0 {
-        return next.max(BACKOFF_MIN).min(BACKOFF_MAX);
-    }
-    let offset_ms = ((fastrand::f64() * 2.0 - 1.0) * jitter_range_ms as f64) as i64;
-    let result = if offset_ms >= 0 {
-        next.saturating_add(Duration::from_millis(offset_ms as u64))
-    } else {
-        next.saturating_sub(Duration::from_millis((-offset_ms) as u64))
-    };
-    result.max(BACKOFF_MIN).min(BACKOFF_MAX)
-}
+// `next_backoff` lives in `crate::backoff` — shared with `ha_ws`.
 
 /// Parse a broker URL into (host, port).
 ///
@@ -418,7 +390,6 @@ fn parse_broker_url(url: &str) -> (&str, u16) {
 mod tests {
     use super::*;
     use dormant_core::config::schema::SensorKind;
-    use std::time::Duration;
 
     // ── Fixture helpers ────────────────────────────────────────────────────
 
@@ -560,30 +531,7 @@ mod tests {
 
     // ── Backoff ────────────────────────────────────────────────────────────
 
-    #[test]
-    fn backoff_stays_within_bounds() {
-        let mut b = BACKOFF_MIN;
-        for _ in 0..20 {
-            b = next_backoff(b);
-            assert!(
-                b >= BACKOFF_MIN && b <= BACKOFF_MAX,
-                "backoff {b:?} out of bounds [{BACKOFF_MIN:?}, {BACKOFF_MAX:?}]",
-            );
-        }
-    }
-
-    #[test]
-    fn backoff_eventually_caps() {
-        let mut b = BACKOFF_MIN;
-        for _ in 0..10 {
-            b = next_backoff(b);
-        }
-        // After enough doublings it should be at or near the cap.
-        assert!(
-            b >= Duration::from_secs(20),
-            "backoff {b:?} should be near cap"
-        );
-    }
+    // Backoff tests live in `crate::backoff::tests` — shared with `ha_ws`.
 
     // ── MqttSource construction ────────────────────────────────────────────
 

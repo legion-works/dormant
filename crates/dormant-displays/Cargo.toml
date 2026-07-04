@@ -15,6 +15,10 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 ddc-hi = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "time", "macros", "rt"] }
+wiremock = "0.6"

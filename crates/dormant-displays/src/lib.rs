@@ -14,5 +14,6 @@
 pub mod command;
 pub mod ddcci;
 pub mod executor;
+pub mod ha_passthrough;
 pub mod registry;
 pub(crate) mod vcp_ops;

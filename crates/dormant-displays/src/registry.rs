@@ -23,12 +23,13 @@ use dormant_core::types::BlankMode;
 
 use crate::command::CommandController;
 use crate::ddcci::DdcciController;
+use crate::ha_passthrough::HaPassthroughController;
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
 ///
 /// Tasks 12-15 append additional entries (`KWin` DPMS, DDC/CI, Samsung Tizen,
 /// LG webOS, HA passthrough, …) as their modules land.
-pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci"];
+pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough"];
 
 /// Static candidate modes per controller type.
 ///
@@ -48,6 +49,7 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
         "ddcci".to_string(),
         vec![BlankMode::BrightnessZero, BlankMode::PowerOff],
     );
+    m.insert("ha-passthrough".to_string(), Vec::new());
     m
 }
 
@@ -65,7 +67,7 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
 pub fn build_controllers(
     display_name: &str,
     cfg: &DisplayConfig,
-    _creds: &Credentials,
+    creds: &Credentials,
 ) -> Result<Vec<Box<dyn DisplayController>>, DormantError> {
     let mut chain: Vec<Box<dyn DisplayController>> = Vec::with_capacity(cfg.controllers.len());
 
@@ -107,6 +109,44 @@ pub fn build_controllers(
                     modes.clone(),
                     cfg.command_timeout,
                 )));
+            }
+            "ha-passthrough" => {
+                let ha_url = cfg
+                    .ha_url
+                    .as_ref()
+                    .ok_or_else(|| config_invalid_cmd(display_name, "missing 'ha_url'"))?;
+                let blank_service = cfg
+                    .blank_service
+                    .as_ref()
+                    .ok_or_else(|| config_invalid_cmd(display_name, "missing 'blank_service'"))?;
+                let wake_service = cfg
+                    .wake_service
+                    .as_ref()
+                    .ok_or_else(|| config_invalid_cmd(display_name, "missing 'wake_service'"))?;
+                let modes = cfg
+                    .modes
+                    .as_ref()
+                    .filter(|m| !m.is_empty())
+                    .ok_or_else(|| config_invalid_cmd(display_name, "missing or empty 'modes'"))?;
+                let token = creds
+                    .ha_token
+                    .as_ref()
+                    .ok_or_else(|| DormantError::CredsMissing {
+                        what: format!(
+                            "display '{display_name}': ha-passthrough requires 'ha_token' \
+                             in credentials file"
+                        ),
+                    })?;
+
+                chain.push(Box::new(HaPassthroughController::new(
+                    ha_url.clone(),
+                    token.clone(),
+                    blank_service.as_str(),
+                    cfg.blank_data.clone(),
+                    wake_service.as_str(),
+                    cfg.wake_data.clone(),
+                    modes.clone(),
+                )?));
             }
             other => {
                 return Err(DormantError::ConfigInvalid {

@@ -1,0 +1,82 @@
+# Full valid configuration exercising all sensor types, zone modes, display
+# controllers, and rules for integration-test coverage.
+
+config_version = 1
+
+[daemon]
+# startup_holdoff and stale_sensor_timeout omitted — use defaults (30s, 5m).
+log_level = "info"
+
+# ── Sensors ──────────────────────────────────────────────────────────────────────
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://mqtt.local:1883"
+topic = "sensors/desk"
+# field defaults to "/occupancy"
+
+[sensors.couch]
+type = "ha"
+url = "ws://ha.local:8123/api/websocket"
+entity = "binary_sensor.couch_presence"
+kind = "motion"
+
+[sensors.radar]
+type = "usb-ld2410"
+port = "/dev/ttyUSB0"
+# baud defaults to 256000
+
+# ── Zones ────────────────────────────────────────────────────────────────────────
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+# unavailable_policy defaults to "present"
+
+[zones.media]
+mode = "weighted"
+members = ["couch", "radar"]
+threshold = 0.6
+
+[zones.media.weights]
+couch = 2.0
+radar = 1.0
+
+[zones.nested]
+mode = "any"
+members = ["zone:office", "radar"]
+
+# ── Displays ─────────────────────────────────────────────────────────────────────
+
+[displays.main_monitor]
+controllers = ["kwin-dpms", "ddcci"]
+blank_mode = "power_off"
+output = "DP-1"
+# restore_brightness defaults to 80
+
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "screen_off_audio_on"
+host = "192.168.1.50"
+
+[displays.escape]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "/usr/bin/xset dpms force off"
+wake_command = "/usr/bin/xset dpms force on"
+modes = ["power_off"]
+# command_timeout defaults to 10s
+
+# ── Rules ────────────────────────────────────────────────────────────────────────
+
+[rules.office_blank]
+zone = "office"
+displays = ["main_monitor"]
+# grace_period defaults to 60s
+
+[rules.media_blank]
+zone = "media"
+displays = ["tv", "escape"]
+grace_period = "30s"
+min_blank_time = "10s"
+wake_retries = 5

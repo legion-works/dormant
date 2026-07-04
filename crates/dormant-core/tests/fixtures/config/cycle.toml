@@ -1,0 +1,10 @@
+# Zone cycle: a depends on b, b depends on a.
+config_version = 1
+
+[zones.a]
+mode = "any"
+members = ["zone:b"]
+
+[zones.b]
+mode = "any"
+members = ["zone:a"]

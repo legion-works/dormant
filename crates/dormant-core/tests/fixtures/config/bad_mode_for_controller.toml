@@ -1,0 +1,6 @@
+# Display requesting screen_off_audio_on with kwin-dpms (doesn't support it).
+config_version = 1
+
+[displays.main]
+controllers = ["kwin-dpms"]
+blank_mode = "screen_off_audio_on"

@@ -1,0 +1,7 @@
+# Valid config with a typo in a rule key to test unknown-key detection.
+config_version = 1
+
+[rules.office]
+zone = "office"
+displays = ["main_monitor"]
+gracee_period = "60s"

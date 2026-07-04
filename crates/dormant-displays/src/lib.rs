@@ -12,5 +12,6 @@
 #![warn(missing_docs)]
 
 pub mod command;
+pub mod ddcci;
 pub mod executor;
 pub mod registry;

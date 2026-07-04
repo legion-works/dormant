@@ -22,12 +22,13 @@ use dormant_core::traits::DisplayController;
 use dormant_core::types::BlankMode;
 
 use crate::command::CommandController;
+use crate::ddcci::DdcciController;
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
 ///
 /// Tasks 12-15 append additional entries (`KWin` DPMS, DDC/CI, Samsung Tizen,
 /// LG webOS, HA passthrough, …) as their modules land.
-pub const CONTROLLER_TYPES: &[&str] = &["command"];
+pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci"];
 
 /// Static candidate modes per controller type.
 ///
@@ -43,6 +44,10 @@ pub const CONTROLLER_TYPES: &[&str] = &["command"];
 pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
     let mut m: HashMap<String, Vec<BlankMode>> = HashMap::new();
     m.insert("command".to_string(), Vec::new());
+    m.insert(
+        "ddcci".to_string(),
+        vec![BlankMode::BrightnessZero, BlankMode::PowerOff],
+    );
     m
 }
 
@@ -66,6 +71,12 @@ pub fn build_controllers(
 
     for name in &cfg.controllers {
         match name.as_str() {
+            "ddcci" => {
+                chain.push(Box::new(DdcciController::new(
+                    cfg.ddc_display.clone(),
+                    cfg.restore_brightness,
+                )));
+            }
             "command" => {
                 let blank_command = cfg
                     .blank_command

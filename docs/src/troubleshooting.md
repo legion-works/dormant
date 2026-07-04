@@ -11,7 +11,7 @@ dormantctl doctor
 # Per-component checks
 dormantctl doctor mqtt      # probe MQTT sensors
 dormantctl doctor ha        # probe HA WebSocket sensors
-dormantctl doctor usb --port /dev/ttyUSB0  # probe USB LD2410
+dormantctl doctor usb /dev/ttyUSB0  # probe USB LD2410
 dormantctl doctor ddcci     # probe DDC/CI displays
 dormantctl doctor config    # validate configuration
 ```

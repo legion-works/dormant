@@ -33,6 +33,7 @@ cargo test --workspace --all-features
 cargo build --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
+mdbook build docs     # if mdbook installed
 ```
 
 CI also enforces `taplo fmt --check`, `typos`, and `cargo audit`. Run `cargo deny check` locally; the others run automatically on PRs.

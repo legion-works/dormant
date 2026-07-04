@@ -21,7 +21,7 @@ Set `modes` to declare which blank modes your commands support. dormant cannot a
 
 ### `ddcci` — DDC/CI (monitor control)
 
-Controls PC monitors via DDC/CI over I2C (`/dev/i2c-*`). Supports VCP power (`0xD6`), input source, screen-off, and brightness commands.
+Controls PC monitors via DDC/CI over I2C (`/dev/i2c-*`). Always supports brightness-zero; supports power-off when the monitor exposes VCP `0xD6`.
 
 ```toml
 [displays.main]

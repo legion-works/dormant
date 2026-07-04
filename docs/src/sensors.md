@@ -82,7 +82,7 @@ sudo usermod -a -G dialout $USER
 ### Doctor check
 
 ```bash
-dormantctl doctor usb --port /dev/ttyUSB0
+dormantctl doctor usb /dev/ttyUSB0
 ```
 
 Verifies: serial port accessibility, baud rate negotiation, frame parsing, last reported state (moving/stationary targets, distance). If the port is not found (`E_SENSOR_IO`), check the device path (`ls /dev/ttyUSB*`) and group membership.

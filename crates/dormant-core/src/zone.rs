@@ -22,6 +22,9 @@ pub enum FusionMode {
     /// Every member is present.
     All,
     /// At least `n` members are present.
+    ///
+    /// `Quorum(0)` is always present (trivially satisfied).
+    /// `Quorum(n)` where `n` exceeds the member count is never present.
     Quorum(u32),
     /// Weighted sum of present members divided by total weight >= `threshold`.
     Weighted {
@@ -143,6 +146,30 @@ impl ZoneEngine {
                                 member: zid.to_string(),
                             });
                         }
+                    }
+                }
+            }
+        }
+
+        // Validate weighted-mode config (NaN, out-of-range threshold, non-finite/negative weights).
+        for spec in spec_map.values() {
+            if let FusionMode::Weighted { threshold } = &spec.mode {
+                if !threshold.is_finite() || !(0.0..=1.0).contains(threshold) {
+                    return Err(DormantError::ConfigInvalid {
+                        detail: format!(
+                            "zone '{}': weighted threshold must be finite and in 0.0..=1.0, got {}",
+                            spec.id, threshold
+                        ),
+                    });
+                }
+                for (key, weight) in &spec.weights {
+                    if !weight.is_finite() || *weight < 0.0 {
+                        return Err(DormantError::ConfigInvalid {
+                            detail: format!(
+                                "zone '{}': weight for '{}' must be finite and >= 0.0, got {}",
+                                spec.id, key, weight
+                            ),
+                        });
                     }
                 }
             }
@@ -872,5 +899,293 @@ mod tests {
         let changes = engine.apply(&event("a", SensorState::Present));
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].cause, sid("a"));
+    }
+
+    // ── Must: NaN / out-of-range weighted config rejection ──────────────────
+
+    #[test]
+    fn weighted_nan_threshold_rejected_at_construction() {
+        let inventory = [sid("a")];
+        let result = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted {
+                    threshold: f32::NAN,
+                },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("E_CONFIG_INVALID")
+        );
+    }
+
+    #[test]
+    fn weighted_nan_weight_rejected_at_construction() {
+        let inventory = [sid("a")];
+        let result = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 0.5 },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: [("a".into(), f32::NAN)].into(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("E_CONFIG_INVALID")
+        );
+    }
+
+    #[test]
+    fn weighted_negative_weight_rejected() {
+        let inventory = [sid("a")];
+        let result = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 0.5 },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: [("a".into(), -1.0)].into(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("E_CONFIG_INVALID")
+        );
+    }
+
+    #[test]
+    fn weighted_threshold_above_one_rejected() {
+        let inventory = [sid("a")];
+        let result = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 1.5 },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("E_CONFIG_INVALID")
+        );
+    }
+
+    #[test]
+    fn weighted_infinite_threshold_rejected() {
+        let inventory = [sid("a")];
+        let result = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted {
+                    threshold: f32::INFINITY,
+                },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("E_CONFIG_INVALID")
+        );
+    }
+
+    #[test]
+    fn weighted_infinite_weight_rejected() {
+        let inventory = [sid("a")];
+        let result = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 0.5 },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: [("a".into(), f32::INFINITY)].into(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .starts_with("E_CONFIG_INVALID")
+        );
+    }
+
+    // ── Should: weighted edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn weighted_exact_threshold_equality_is_present() {
+        let inventory = [sid("a")];
+        let mut engine = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 0.5 },
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: HashMap::new(), // a defaults to 1.0
+                unavailable_policy: UnavailablePolicy::Absent,
+            }],
+            &inventory,
+        )
+        .unwrap();
+
+        // a present → 1.0/1.0 = 1.0 >= 0.5 → present.
+        engine.apply(&event("a", SensorState::Present));
+        assert!(engine.is_present(&zid("z")).unwrap());
+    }
+
+    #[test]
+    fn weighted_threshold_zero_always_present_with_any_member() {
+        let inventory = [sid("a"), sid("b")];
+        let engine = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 0.0 },
+                members: vec![ZoneMember::Sensor(sid("a")), ZoneMember::Sensor(sid("b"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Absent,
+            }],
+            &inventory,
+        )
+        .unwrap();
+
+        // Both absent → 0.0/2.0 = 0.0 >= 0.0 → present (trivially satisfied).
+        assert!(engine.is_present(&zid("z")).unwrap());
+    }
+
+    #[test]
+    fn weighted_threshold_one_requires_all() {
+        let inventory = [sid("a"), sid("b")];
+        let mut engine = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Weighted { threshold: 1.0 },
+                members: vec![ZoneMember::Sensor(sid("a")), ZoneMember::Sensor(sid("b"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Absent,
+            }],
+            &inventory,
+        )
+        .unwrap();
+
+        // Both absent → 0.0 < 1.0 → absent.
+        assert!(!engine.is_present(&zid("z")).unwrap());
+
+        // One present → 0.5 < 1.0 → absent.
+        engine.apply(&event("a", SensorState::Present));
+        assert!(!engine.is_present(&zid("z")).unwrap());
+
+        // Both present → 1.0 >= 1.0 → present.
+        engine.apply(&event("b", SensorState::Present));
+        assert!(engine.is_present(&zid("z")).unwrap());
+    }
+
+    // ── Should: quorum edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn quorum_zero_is_always_present() {
+        let inventory = [sid("a")];
+        let engine = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Quorum(0),
+                members: vec![ZoneMember::Sensor(sid("a"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Absent,
+            }],
+            &inventory,
+        )
+        .unwrap();
+
+        // Sensor absent, but quorum(0) is trivially satisfied.
+        assert!(engine.is_present(&zid("z")).unwrap());
+    }
+
+    #[test]
+    fn quorum_exceeding_member_count_never_present() {
+        let inventory = [sid("a"), sid("b")];
+        let engine = ZoneEngine::new(
+            vec![ZoneSpec {
+                id: zid("z"),
+                mode: FusionMode::Quorum(10),
+                members: vec![ZoneMember::Sensor(sid("a")), ZoneMember::Sensor(sid("b"))],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            }],
+            &inventory,
+        )
+        .unwrap();
+
+        // Both present (fail-safe), but 2 < 10.
+        assert!(!engine.is_present(&zid("z")).unwrap());
+    }
+
+    // ── Should: diamond graph ───────────────────────────────────────────────
+
+    #[test]
+    fn diamond_zone_graph_is_accepted() {
+        // a → b, a → c, b → d, c → d  (diamond: no cycle)
+        let inventory = [sid("s1")];
+        let engine = ZoneEngine::new(
+            vec![
+                ZoneSpec {
+                    id: zid("d"),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Zone(zid("b")), ZoneMember::Zone(zid("c"))],
+                    weights: HashMap::new(),
+                    unavailable_policy: UnavailablePolicy::Present,
+                },
+                ZoneSpec {
+                    id: zid("b"),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Zone(zid("a"))],
+                    weights: HashMap::new(),
+                    unavailable_policy: UnavailablePolicy::Present,
+                },
+                ZoneSpec {
+                    id: zid("c"),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Zone(zid("a"))],
+                    weights: HashMap::new(),
+                    unavailable_policy: UnavailablePolicy::Present,
+                },
+                ZoneSpec {
+                    id: zid("a"),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(sid("s1"))],
+                    weights: HashMap::new(),
+                    unavailable_policy: UnavailablePolicy::Present,
+                },
+            ],
+            &inventory,
+        );
+        assert!(engine.is_ok());
     }
 }

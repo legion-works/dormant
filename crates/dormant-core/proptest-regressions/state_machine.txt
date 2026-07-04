@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9b24d626da84fa67aa3c0ca075cae885984b5377186ad397c1094fa09c6a8672 # shrinks to steps = [(ZonePresent(false), 1), (ZonePresent(false), 1), (ForceBlank, 1)]

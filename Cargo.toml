@@ -24,3 +24,4 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 zbus = "5"
 indexmap = { version = "2", features = ["serde"] }
 tokio-stream = "0.1"
+proptest = "1"

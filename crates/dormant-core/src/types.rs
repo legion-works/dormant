@@ -216,6 +216,28 @@ mod tests {
     }
 
     #[test]
+    fn sensor_state_absent_serde_pin() {
+        let json = serde_json::to_string(&SensorState::Absent).unwrap();
+        assert_eq!(json, "\"absent\"");
+    }
+
+    #[test]
+    fn presence_event_field_names_serde_pin() {
+        let ev = PresenceEvent {
+            sensor_id: SensorId("test".into()),
+            state: SensorState::Present,
+            confidence: 0.8,
+            at: Timestamp(std::time::SystemTime::UNIX_EPOCH),
+        };
+        let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
+        let map = v.as_object().unwrap();
+        assert!(map.contains_key("sensor_id"), "missing sensor_id");
+        assert!(map.contains_key("state"), "missing state");
+        assert!(map.contains_key("confidence"), "missing confidence");
+        assert!(map.contains_key("at"), "missing at");
+    }
+
+    #[test]
     fn sensor_id_transparent_serde() {
         let id = SensorId("ld2410-usb".into());
         let json = serde_json::to_string(&id).unwrap();

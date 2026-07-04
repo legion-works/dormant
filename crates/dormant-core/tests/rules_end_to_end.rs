@@ -99,9 +99,10 @@ fn sensor_cfg(
 /// Spawn the engine and a fake sensor source; return handles for the test to
 /// drive the scenario and assert.
 struct Harness {
-    /// Kept alive so the source-side sender isn't dropped mid-scenario; tests
-    /// interact via [`Harness::ctl_tx`] (and the engine / source handles).
-    _events_tx: mpsc::Sender<PresenceEvent>,
+    /// Kept alive so the source-side sender isn't dropped mid-scenario.
+    /// Some tests (e.g. `pause_does_not_lose_zone_edges` Part B) also push
+    /// events into the channel directly to drive specific edges.
+    events_tx: mpsc::Sender<PresenceEvent>,
     ctl_tx: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
     engine_handle: tokio::task::JoinHandle<()>,
@@ -134,7 +135,7 @@ fn spawn_engine(
         tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
 
     Harness {
-        _events_tx: events_tx,
+        events_tx,
         ctl_tx,
         cancel,
         engine_handle,
@@ -656,4 +657,410 @@ async fn force_blank_and_snapshot() {
     harness.cancel.cancel();
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn motion_sensor_hold_time_stretches_pulse_multiple() {
+    let sensor = SensorId("couch".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("couch", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "couch",
+            SensorKind::Motion,
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(60),
+        )],
+    };
+
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(1),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(2),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(3),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx = sub_rx.await.expect("subscribe reply");
+
+    // Wait until 31s. The first timer was at 30s. It should NOT release the zone.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while let Ok(ev) = events_rx.try_recv() {
+        if let DaemonEvent::ZoneChanged { present: false, .. } = ev {
+            panic!(
+                "motion hold must NOT release the zone before 33s (first timer fired at 30s and incorrectly released it!)"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_double_application_bug() {
+    let sensor = SensorId("couch".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("couch", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "couch",
+            SensorKind::Motion,
+            None,
+            Duration::from_secs(60),
+        )],
+    };
+
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    // Pause at t=5s (while present)
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    harness
+        .ctl_tx
+        .send(ControlMsg::Pause {
+            rule: Some(RuleId("r1".into())),
+            until: None,
+        })
+        .await
+        .unwrap();
+
+    // At t=10s, sensor becomes absent. But rule is paused, so fan_zone_change_to_displays skips it!
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Resume at t=20s
+    harness
+        .ctl_tx
+        .send(ControlMsg::Resume {
+            rule: Some(RuleId("r1".into())),
+        })
+        .await
+        .unwrap();
+
+    // Wait for grace period (60s) + 5s
+    tokio::time::sleep(Duration::from_secs(65)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_at = log
+        .iter()
+        .find_map(|(t, c)| matches!(c, SinkCmd::Blank(_)).then_some(*t));
+
+    assert!(
+        blank_at.is_some(),
+        "Display should have blanked after resume + grace period, but it didn't because the absent event was skipped!"
+    );
+}
+
+// ── 8: hold_rearm_extends_stretch (regression for Must 1) ────────────────────
+
+/// Regression for the re-arm / stale-timer bug: each `Present` pushes a new
+/// `HoldExpiry` timer, but the wheel is a min-heap so the *first* timer
+/// (from the original `Present@0`) fires before the re-armed one
+/// (from `Present@20`). With the old code the stale timer would disarm and
+/// replay the held `Absent` at t=30, releasing the zone 20 seconds early.
+#[tokio::test(start_paused = true)]
+async fn hold_rearm_extends_stretch() {
+    let sensor = SensorId("couch".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("couch", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "couch",
+            SensorKind::Motion,
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Present@0  → arms hold to t=30, pending_absent cleared.
+    // Absent@1   → swallowed, pending_absent=Some(Absent@1).
+    // Present@20 → re-arms hold to t=50, clears pending_absent.
+    // Absent@21  → swallowed, pending_absent=Some(Absent@21).
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(1),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(19),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(1),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx = sub_rx.await.expect("subscribe reply");
+
+    // Before t=50: drain any events, panic on a release. The stale t=30
+    // timer is the failure mode this test guards against.
+    tokio::time::sleep(Duration::from_secs(49)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while let Ok(ev) = events_rx.try_recv() {
+        if let DaemonEvent::ZoneChanged { present: false, .. } = ev {
+            panic!("re-arm must extend the hold: stale t=30 timer released the zone early");
+        }
+    }
+
+    // After t=50 + grace (60s) → blank fires.
+    tokio::time::sleep(Duration::from_secs(70)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let log = sink.log();
+    let blank_at = log
+        .iter()
+        .find_map(|(t, c)| matches!(c, SinkCmd::Blank(_)).then_some(*t));
+    let blank_at = blank_at.expect("expected blank after re-arm-extended hold + grace");
+    assert!(
+        blank_at.abs_diff(Duration::from_secs(110)) <= Duration::from_secs(2),
+        "blank at {blank_at:?}, expected ~110s (t=50 hold expiry + 60s grace)"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── 9: pause_does_not_lose_zone_edges (regression for Must 2) ────────────────
+
+/// Regression for the paused-rule zone-edge drop: the state machine
+/// already freezes the blank path on its overlay (and leaves wake
+/// unaffected), so the engine must keep feeding it `ZonePresent` edges
+/// while paused. This test exercises both halves of the symmetry:
+///
+/// Part A — pause → Absent during pause → Resume → blank after grace,
+///          without any further sensor event (the held `Absent` edge is
+///          what drives the blank).
+/// Part B — blanked+paused → Present during pause → instant wake
+///          (wake path is never gated by pause).
+#[allow(clippy::too_many_lines)] // two-part scenario (Absent-during-pause + Blanked+paused-wake)
+#[tokio::test(start_paused = true)]
+async fn pause_does_not_lose_zone_edges() {
+    // ── Part A: pause-then-absent → blank after resume ─────────────────────
+    {
+        let sensor = SensorId("desk".into());
+        let display = DisplayId("mon".into());
+
+        let zones = zone_with_sensor("desk", "office");
+        let sink = Arc::new(RecordingSink::new());
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        execs.insert(display.clone(), sink.clone());
+
+        let cfg = RulesEngineConfig {
+            rules: vec![rule_cfg("r1", "office", &["mon"])],
+            displays: vec![display_cfg("mon")],
+            sensors: vec![sensor_cfg(
+                "desk",
+                SensorKind::Presence,
+                None,
+                Duration::from_secs(3600),
+            )],
+        };
+
+        // Present@0 then Absent@10.
+        let script = vec![
+            (
+                Duration::from_secs(0),
+                PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+            ),
+            (
+                Duration::from_secs(10),
+                PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+            ),
+        ];
+
+        let harness = spawn_engine(cfg, zones, execs, script);
+
+        // Pause at t=5s.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        harness
+            .ctl_tx
+            .send(ControlMsg::Pause {
+                rule: None,
+                until: None,
+            })
+            .await
+            .expect("ctl open");
+
+        // Absent@10s arrives during the pause — engine must still step the
+        // machine with ZonePresent(false), which freezes grace with
+        // remaining 60s. Without the fix the rule is skipped and the
+        // machine never sees the edge, so the post-resume grace has no
+        // pending edge to drive.
+
+        // Resume at t=80s. Grace is unfrozen with 60s remaining → expires
+        // at t=140s.
+        tokio::time::sleep(Duration::from_secs(75)).await;
+        harness
+            .ctl_tx
+            .send(ControlMsg::Resume { rule: None })
+            .await
+            .expect("ctl open");
+
+        // Past t=140s → blank.
+        tokio::time::sleep(Duration::from_secs(70)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let log = sink.log();
+        let blank_at = log
+            .iter()
+            .find_map(|(t, c)| matches!(c, SinkCmd::Blank(_)).then_some(*t));
+        let blank_at = blank_at.expect(
+            "blank must fire after resume (the held Absent edge drove the grace countdown)",
+        );
+        assert!(
+            blank_at.abs_diff(Duration::from_secs(140)) <= Duration::from_secs(2),
+            "blank at {blank_at:?}, expected ~140s (resume + remaining grace)"
+        );
+
+        harness.cancel.cancel();
+        let _ = harness.engine_handle.await;
+        let _ = harness.source_handle.await;
+    }
+
+    // ── Part B: blanked+paused → Present during pause → instant wake ────
+    {
+        let sensor = SensorId("desk".into());
+        let display = DisplayId("mon".into());
+
+        let zones = zone_with_sensor("desk", "office");
+        let sink = Arc::new(RecordingSink::new());
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        execs.insert(display.clone(), sink.clone());
+
+        let cfg = RulesEngineConfig {
+            rules: vec![rule_cfg("r1", "office", &["mon"])],
+            displays: vec![display_cfg("mon")],
+            sensors: vec![sensor_cfg(
+                "desk",
+                SensorKind::Presence,
+                None,
+                Duration::from_secs(3600),
+            )],
+        };
+
+        // Absent@0s, then Present after the blank has fired.
+        let script = vec![(
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        )];
+
+        let harness = spawn_engine(cfg, zones, execs, script);
+
+        // Wait for blank to fire (grace 60s, blank at ~70s).
+        tokio::time::sleep(Duration::from_secs(80)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            sink.log()
+                .iter()
+                .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+            "blank should have fired before pause"
+        );
+
+        // Pause while blanked.
+        harness
+            .ctl_tx
+            .send(ControlMsg::Pause {
+                rule: None,
+                until: None,
+            })
+            .await
+            .expect("ctl open");
+
+        // Send Present during the pause.
+        harness
+            .events_tx
+            .send(PresenceEvent::new(
+                sensor.clone(),
+                SensorState::Present,
+                Timestamp::now(),
+            ))
+            .await
+            .expect("events open");
+
+        // Wake should fire immediately — no grace wait, pause never gates
+        // the wake path.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let log = sink.log();
+        let wake_at = log
+            .iter()
+            .rev()
+            .find_map(|(t, c)| matches!(c, SinkCmd::Wake).then_some(*t));
+        let wake_at = wake_at.expect("wake must fire instantly on Present during pause");
+        // The first Wake is the 0s Absent's eventual wake… actually no,
+        // Absent@0s → blank. The wake we expect is from the Present sent
+        // during pause. There shouldn't be any earlier wake (display
+        // started Active, absent → grace → blanked, no wake before now).
+        assert!(
+            wake_at.abs_diff(Duration::from_secs(81)) <= Duration::from_secs(2),
+            "wake at {wake_at:?}, expected ~81s (pause + Present during pause)"
+        );
+
+        harness.cancel.cancel();
+        let _ = harness.engine_handle.await;
+        let _ = harness.source_handle.await;
+    }
 }

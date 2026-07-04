@@ -296,9 +296,9 @@ pub struct RulesEngine {
     /// Timer wheel — min-heap on `(Tick, entry)`.
     timers: BinaryHeap<Reverse<(Tick, TimerEntry)>>,
     /// Internal results mpsc — spawned dispatch tasks write here.
-    results_rx: mpsc::Receiver<InternalResult>,
+    results_rx: mpsc::UnboundedReceiver<InternalResult>,
     /// Internal results mpsc — cloned into each spawned dispatch task.
-    results_tx: mpsc::Sender<InternalResult>,
+    results_tx: mpsc::UnboundedSender<InternalResult>,
     /// Broadcast bus for [`DaemonEvent`]s.
     event_tx: broadcast::Sender<DaemonEvent>,
     /// Pending reload detail (operator feedback in snapshots).
@@ -371,7 +371,7 @@ impl RulesEngine {
             }
         }
 
-        let (results_tx, results_rx) = mpsc::channel(64);
+        let (results_tx, results_rx) = mpsc::unbounded_channel();
         let (event_tx, _) = broadcast::channel(256);
 
         Ok(Self {
@@ -565,6 +565,12 @@ impl RulesEngine {
 
     /// Drive every display machine bound to a rule on this zone through one
     /// `step(Input::ZonePresent(change.present))`.
+    ///
+    /// Paused rules are NOT skipped here — the state machine owns the
+    /// pause semantics on its overlays (freeze blank path, leave wake
+    /// unaffected, track the zone level so an un-paused machine is never
+    /// surprised by a missed edge). `paused_rules` is kept as bookkeeping
+    /// for `Resume` routing and snapshot reporting only.
     fn fan_zone_change_to_displays(&mut self, zone: &ZoneId, present: bool) {
         // Snapshot the rule ids so the immutable borrow on `self.zone_rules`
         // ends before we step machines mutably.
@@ -574,9 +580,6 @@ impl RulesEngine {
         };
         let now = Tick::now();
         for rule_id in rule_ids {
-            if self.paused_rules.contains(&rule_id) {
-                continue;
-            }
             let displays: Vec<DisplayId> = match self.rule_displays.get(&rule_id) {
                 Some(ds) => ds.clone(),
                 None => continue,
@@ -794,7 +797,7 @@ impl RulesEngine {
                         }
                     }
                     TimerEntry::HoldExpiry(sensor_id) => {
-                        self.fire_hold_expiry(&sensor_id);
+                        self.fire_hold_expiry(&sensor_id, deadline);
                     }
                 }
             } else {
@@ -804,15 +807,26 @@ impl RulesEngine {
         let _ = now; // accepted parameter for symmetry
     }
 
-    fn fire_hold_expiry(&mut self, sensor_id: &SensorId) {
-        let pending = match self.holds.get_mut(sensor_id) {
-            Some(h) => h.pending_absent.take(),
-            None => None,
+    fn fire_hold_expiry(&mut self, sensor_id: &SensorId, now: Tick) {
+        // Drop the entry if the hold was re-armed past this deadline (a
+        // second Present pushed a later `armed_until` and a later timer).
+        let Some(hold) = self.holds.get_mut(sensor_id) else {
+            return;
         };
-        // Always disarm.
-        if let Some(h) = self.holds.get_mut(sensor_id) {
-            h.armed_until = None;
+        // Disarmed by an Unavailable event (or never armed) — nothing to
+        // do, and any stray pending_absent should be discarded.
+        let Some(armed_until) = hold.armed_until else {
+            hold.pending_absent = None;
+            return;
+        };
+        if now < armed_until {
+            // Stale timer — a newer Present re-armed the hold past this
+            // deadline. Drop without acting; the newer timer will fire
+            // when its own deadline elapses.
+            return;
         }
+        let pending = hold.pending_absent.take();
+        hold.armed_until = None;
         if let Some(ev) = pending {
             self.handle_presence_event(ev);
         }
@@ -866,13 +880,11 @@ impl RulesEngine {
                     let tx = self.results_tx.clone();
                     tokio::spawn(async move {
                         let result = sink.blank(mode).await;
-                        let _ = tx
-                            .send(InternalResult::Blank {
-                                display,
-                                r#gen,
-                                result,
-                            })
-                            .await;
+                        let _ = tx.send(InternalResult::Blank {
+                            display,
+                            r#gen,
+                            result,
+                        });
                     });
                 }
             }
@@ -883,13 +895,11 @@ impl RulesEngine {
                     let tx = self.results_tx.clone();
                     tokio::spawn(async move {
                         let result = sink.wake().await;
-                        let _ = tx
-                            .send(InternalResult::Wake {
-                                display,
-                                r#gen,
-                                result,
-                            })
-                            .await;
+                        let _ = tx.send(InternalResult::Wake {
+                            display,
+                            r#gen,
+                            result,
+                        });
                     });
                 }
             }

@@ -1,0 +1,5 @@
+[
+  {"type": "auth_required"},
+  {"type": "auth_ok"},
+  {"id": 1, "type": "result", "success": true}
+]

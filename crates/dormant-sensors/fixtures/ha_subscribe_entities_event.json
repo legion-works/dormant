@@ -1,0 +1,18 @@
+{
+  "id": 1,
+  "type": "event",
+  "event": {
+    "a": {
+      "binary_sensor.test_motion": {
+        "s": "on"
+      }
+    },
+    "c": {
+      "binary_sensor.test_motion": {
+        "+": {
+          "s": "off"
+        }
+      }
+    }
+  }
+}

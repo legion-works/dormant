@@ -10,12 +10,14 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use dormant_core::rules::{ControlMsg, StateSnapshot};
 use tokio::sync::oneshot;
 
 use crate::WebState;
+use crate::assets;
 use crate::error::WebError;
 use crate::routes::{command, config, doctor, events};
 use crate::security::security_guard;
@@ -25,22 +27,30 @@ use crate::security::security_guard;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the axum [`Router`] on the given state, mounting all HTTP routes
-/// behind the Host/Origin security guard.
+/// behind the Host/Origin security guard.  API routes are nested under
+/// `/api`; all other paths are served by the SPA fallback (embedded
+/// `webui/dist`).
 pub(crate) fn build_router(state: WebState) -> Router {
-    let router = Router::new()
-        .route("/api/state", get(get_state))
-        .route("/api/config", get(config::get_config))
-        .route("/api/blank", post(command::post_blank))
-        .route("/api/wake", post(command::post_wake))
-        .route("/api/pause", post(command::post_pause))
-        .route("/api/resume", post(command::post_resume))
-        .route("/api/reload", post(command::post_reload))
-        .route("/api/doctor", post(doctor::post_doctor))
-        .route("/api/events", get(events::ws_events))
+    let api = Router::new()
+        .route("/state", get(get_state))
+        .route("/config", get(config::get_config))
+        .route("/blank", post(command::post_blank))
+        .route("/wake", post(command::post_wake))
+        .route("/pause", post(command::post_pause))
+        .route("/resume", post(command::post_resume))
+        .route("/reload", post(command::post_reload))
+        .route("/doctor", post(doctor::post_doctor))
+        .route("/events", get(events::ws_events))
+        // API miss → 404, never the SPA fallback.
+        .fallback(api_not_found)
         .with_state(state.clone());
 
-    // Security guard on ALL routes.
-    router.layer(from_fn_with_state(state, security_guard))
+    Router::new()
+        .nest("/api", api)
+        .fallback(assets::spa_fallback)
+        // Security guard on ALL routes, including the SPA fallback.
+        .layer(from_fn_with_state(state.clone(), security_guard))
+        .with_state(state)
 }
 
 /// Bind, report the resolved address via `addr_tx`, and serve until the
@@ -64,6 +74,12 @@ pub(crate) async fn serve_and_report(
         .await?;
 
     Ok(())
+}
+
+/// API fallback — return 404 for unmatched `/api/*` paths so they are
+/// never served the SPA `index.html`.
+async fn api_not_found() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "not found")
 }
 
 /// `GET /api/state` — send a [`ControlMsg::Snapshot`] through the

@@ -3,6 +3,9 @@
 //! Every request passes through the Host check unconditionally (anti
 //! DNS-rebind).  State-changing methods (`POST`) additionally require
 //! `Content-Type: application/json` and a same-origin disposition.
+//! WebSocket upgrade requests (`GET` with `Upgrade: websocket`) also
+//! pass the same-origin Origin check to prevent Cross-Site WebSocket
+//! Hijacking (CSWSH).
 //!
 //! ## Design invariants
 //!
@@ -20,10 +23,9 @@ use axum::response::{IntoResponse, Response};
 
 use crate::WebState;
 
-/// Allowed loopback host values (Hard-coded — the configured bind is always
-/// loopback unless `web_allow_nonloopback` is explicitly set, in which case
-/// the daemon has already warned at startup).
-const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+/// Allowed loopback host values.  Both bracketed and bare IPv6 forms are
+/// included because the Host header may carry either (`[::1]` or `[::1]:8080`).
+const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 
 /// Reject any request whose `Host` header is not in the allow-list.
 ///
@@ -40,8 +42,9 @@ pub(crate) async fn security_guard(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|h| {
             let host_lower = h.to_lowercase();
-            let host_only = host_lower.split(':').next().unwrap_or(&host_lower);
-            ALLOWED_HOSTS.contains(&host_only) || host_only == state.inner.web_bind.ip().to_string()
+            let host_only = extract_host_without_port(&host_lower);
+            ALLOWED_HOSTS.contains(&host_only.as_str())
+                || host_only == state.inner.web_bind.ip().to_string()
         });
 
     if !host_ok {
@@ -76,7 +79,31 @@ pub(crate) async fn security_guard(
         }
     }
 
+    // ── WebSocket upgrade security: Origin check (CSWSH) ──────────────────
+    if is_websocket_upgrade(&headers) {
+        let origin_ok = is_same_origin(&headers);
+        if !origin_ok {
+            tracing::warn!(event = "web_reject_origin", reason = "cswsh_ws_upgrade");
+            let body = serde_json::json!({ "error": "web_reject_origin" });
+            return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
+        }
+    }
+
     next.run(request).await
+}
+
+/// Detect a WebSocket upgrade request by checking for the presence of both
+/// `Upgrade: websocket` and `Connection: upgrade` headers.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let has_upgrade = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let has_connection = headers
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_lowercase().contains("upgrade"));
+    has_upgrade && has_connection
 }
 
 /// Returns `true` when the request's Origin / `Sec-Fetch-Site` headers
@@ -114,12 +141,38 @@ fn is_loopback_origin(origin: &str) -> bool {
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
         .unwrap_or(origin);
-    let host = after_scheme.split(':').next().unwrap_or(after_scheme);
-    let ip: Result<IpAddr, _> = host.parse();
+    let host = extract_host_without_port(after_scheme);
+    // Check if it looks like a bracketed IPv6 address.
+    let host_clean = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&host);
+    let ip: Result<IpAddr, _> = host_clean.parse();
     if let Ok(ip) = ip {
         return ip.is_loopback();
     }
-    host == "localhost"
+    host_clean == "localhost"
+}
+
+/// Extract the host portion from `host[:port]`, correctly handling
+/// bracketed IPv6 addresses like `[::1]:8080`.
+fn extract_host_without_port(host: &str) -> String {
+    // Bracket notation: `[::1]:8080` → strip brackets first, port after `]`.
+    if let Some(bracket_end) = host.find(']') {
+        // Keep the IPv6 address without brackets: just `::1`.
+        let ipv6 = &host[1..bracket_end];
+        return ipv6.to_string();
+    }
+    // Plain host:port — split on last ':'.
+    if let Some(last_colon) = host.rfind(':') {
+        let candidate = &host[..last_colon];
+        // IPv6 addresses without brackets contain multiple ':' — if the part
+        // before the last colon looks like an IP, parse the whole thing.
+        if candidate.parse::<IpAddr>().is_ok() {
+            return candidate.to_string();
+        }
+    }
+    host.to_string()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
@@ -243,6 +296,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // ── IPv6 Host tests (SHOULD-1) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn accepts_ipv6_loopback_bracketed_host() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/state")
+            .header("Host", "[::1]:8080")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn accepts_ipv6_loopback_bare_host() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/state")
+            .header("Host", "[::1]")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // ── POST Content-Type tests ────────────────────────────────────────────
 
     #[tokio::test]
@@ -320,5 +407,51 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── WebSocket upgrade Origin tests (SEC-1) ────────────────────────────
+
+    #[tokio::test]
+    async fn rejects_cross_origin_websocket_upgrade() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        // GET with WS upgrade headers + cross-origin Origin → 403.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/state")
+            .header("Host", "127.0.0.1")
+            .header("Upgrade", "websocket")
+            .header("Connection", "upgrade")
+            .header("Origin", "https://evil.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-origin WS upgrade should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_same_origin_websocket_upgrade() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        // GET with WS upgrade headers + no Origin (non-browser or same-origin) → passes guard.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/state")
+            .header("Host", "127.0.0.1")
+            .header("Upgrade", "websocket")
+            .header("Connection", "upgrade")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        // Should NOT be 403 from the security guard (may be 200 or 426 from handler).
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

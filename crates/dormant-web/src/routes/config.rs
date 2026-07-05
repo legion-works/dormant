@@ -3,13 +3,17 @@
 //! Returns the last-applied `Config` from the live watch together with the
 //! on-disk raw TOML re-read at request time and its validation result.
 //! Inline secrets (URL userinfo) are redacted in both `inventory` and
-//! `raw_toml` before serving.
+//! `raw_toml` before serving.  The response also includes the backend-side
+//! display→zone→rule reverse-lookup (computed from `Config.rules`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use dormant_core::config::schema::{Config, MqttSensorCfg, SensorConfig};
+use dormant_core::config::schema::{
+    Config, DisplayConfig, HaSensorCfg, MqttSensorCfg, SensorConfig,
+};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_credentials, validate,
 };
@@ -51,6 +55,13 @@ impl From<&ValidationError> for SerializableValidationError {
     }
 }
 
+/// Per-display rule + zone mapping (reverse-lookup from `Config.rules`).
+#[derive(Serialize, Debug)]
+pub(crate) struct DisplayRuleInfo {
+    pub(crate) rule: String,
+    pub(crate) zone: String,
+}
+
 /// Response shape for `GET /api/config` (spec §4.1).
 #[derive(Serialize, Debug)]
 pub(crate) struct ConfigResponse {
@@ -60,6 +71,8 @@ pub(crate) struct ConfigResponse {
     pub(crate) raw_toml: String,
     pub(crate) inventory: Config,
     pub(crate) validation: ConfigValidation,
+    /// Per-display → {rule, zone} reverse-lookup (spec §7 — backend-owned).
+    pub(crate) display_rules: HashMap<String, DisplayRuleInfo>,
 }
 
 #[derive(Serialize, Debug)]
@@ -77,20 +90,62 @@ pub(crate) async fn get_config(
     let config_path = &state.inner.config_path;
     let config_rx = state.inner.config_rx.borrow().clone();
 
-    // Read raw TOML from disk.
-    let raw_on_disk = std::fs::read_to_string(config_path)
-        .map_err(|e| WebError::ConfigReadError(format!("cannot read config file: {e}")))?;
-
-    // Re-validate the on-disk file.
-    let creds_path = config_path.with_extension("creds.toml");
-    let (warnings, errors, load_error) = match load_config(config_path, Strictness::Warn) {
-        Ok((cfg, warns)) => {
-            let creds = load_credentials(&creds_path).unwrap_or_default();
-            let errs = validate(&cfg, &capabilities(), &creds);
-            (warns, errs, None)
+    // Read raw TOML from disk.  Mirrors `validate_only`: an I/O or parse
+    // failure is not a 500 — it is a load_error in the normal body.
+    let raw_on_disk = match std::fs::read_to_string(config_path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            let inventory = Arc::unwrap_or_clone(config_rx);
+            let display_rules = build_display_rules(&inventory);
+            return Ok(Json(ConfigResponse {
+                path: config_path.display().to_string(),
+                config_version: inventory.config_version,
+                source: "on_disk",
+                raw_toml: String::new(),
+                inventory,
+                validation: ConfigValidation {
+                    ok: false,
+                    warnings: vec![],
+                    errors: vec![],
+                    load_error: Some(format!("cannot read config file: {e}")),
+                },
+                display_rules,
+            }));
         }
-        Err(e) => (vec![], vec![], Some(e.to_string())),
     };
+
+    // Re-validate the on-disk file.  Creds load failure is also surfaced as
+    // load_error (mirrors `validate_only`'s treatment).
+    let creds_path = config_path.with_extension("creds.toml");
+    let (warnings, errors, load_error, _on_disk_cfg) =
+        match load_config(config_path, Strictness::Warn) {
+            Ok((cfg, warns)) => {
+                let creds = match load_credentials(&creds_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let inventory = Arc::unwrap_or_clone(config_rx);
+                        let display_rules = build_display_rules(&cfg);
+                        return Ok(Json(ConfigResponse {
+                            path: config_path.display().to_string(),
+                            config_version: inventory.config_version,
+                            source: "on_disk",
+                            raw_toml: raw_on_disk.clone(),
+                            inventory,
+                            validation: ConfigValidation {
+                                ok: false,
+                                warnings: warns.iter().map(SerializableWarning::from).collect(),
+                                errors: vec![],
+                                load_error: Some(e.to_string()),
+                            },
+                            display_rules,
+                        }));
+                    }
+                };
+                let errs = validate(&cfg, &capabilities(), &creds);
+                (warns, errs, None, Some(cfg))
+            }
+            Err(e) => (vec![], vec![], Some(e.to_string()), None),
+        };
 
     let ok = load_error.is_none() && errors.is_empty();
 
@@ -110,9 +165,15 @@ pub(crate) async fn get_config(
         "on_disk"
     };
 
-    // Secret redaction: strip inline userinfo from broker_url fields in inventory.
+    // Secret redaction: strip inline userinfo from all URL-shaped string fields
+    // in inventory.
     let mut inventory = Arc::unwrap_or_clone(config_rx);
     redact_config_secrets(&mut inventory);
+
+    // Build display→zone→rule reverse-lookup from the last-applied inventory
+    // (the running config drives displays).  The `source` field tells the
+    // frontend whether the on-disk file differs.
+    let display_rules = build_display_rules(&inventory);
 
     // Secret redaction in raw TOML.
     let raw_toml = redact_raw_secrets(&raw_on_disk);
@@ -136,18 +197,59 @@ pub(crate) async fn get_config(
             errors: serializable_errors,
             load_error,
         },
+        display_rules,
     }))
+}
+
+// ── Display → zone → rule reverse-lookup (spec §7) ─────────────────────────
+
+/// Build a per-display mapping from `Config.rules`: for each display id,
+/// record which rule drives it and which zone that rule references.
+fn build_display_rules(cfg: &Config) -> HashMap<String, DisplayRuleInfo> {
+    let mut map = HashMap::new();
+    for (rule_id, rule_cfg) in &cfg.rules {
+        for display_id in &rule_cfg.displays {
+            map.entry(display_id.clone()).or_insert(DisplayRuleInfo {
+                rule: rule_id.clone(),
+                zone: rule_cfg.zone.clone(),
+            });
+        }
+    }
+    map
 }
 
 // ── Secret redaction ─────────────────────────────────────────────────────────
 
-/// Redact inline userinfo from every `broker_url` in a [`Config`].
+/// Redact inline userinfo from every URL-shaped string field across all sensor
+/// configs and display configs.
 fn redact_config_secrets(cfg: &mut Config) {
     for sensor in cfg.sensors.values_mut() {
-        if let SensorConfig::Mqtt(MqttSensorCfg { broker_url, .. }) = sensor {
-            *broker_url = redact_url(broker_url);
+        match sensor {
+            SensorConfig::Mqtt(MqttSensorCfg { broker_url, .. }) => {
+                *broker_url = redact_url(broker_url);
+            }
+            SensorConfig::Ha(HaSensorCfg { url, .. }) => {
+                *url = redact_url(url);
+            }
+            SensorConfig::UsbLd2410(_) => {
+                // No URL fields.
+            }
         }
     }
+    for display in cfg.displays.values_mut() {
+        redact_display_secrets(display);
+    }
+}
+
+/// Redact userinfo in URL-shaped fields of a [`DisplayConfig`].
+fn redact_display_secrets(dc: &mut DisplayConfig) {
+    if let Some(ref url) = dc.ha_url {
+        let redacted = redact_url(url);
+        if redacted != *url {
+            dc.ha_url = Some(redacted);
+        }
+    }
+    // host (IP/hostname) and wol_mac have no userinfo.
 }
 
 /// Redact inline userinfo in URL-shaped strings within raw TOML text.
@@ -194,6 +296,7 @@ fn redact_url(s: &str) -> String {
 mod tests {
     use super::*;
     use dormant_core::config::schema::{DaemonConfig, SensorConfig};
+    use dormant_core::types::BlankMode;
     use indexmap::IndexMap;
 
     /// Write a config file to a temp dir for tests.
@@ -236,6 +339,46 @@ mod tests {
         })
     }
 
+    // ── Display-rule reverse-lookup tests ──────────────────────────────────
+
+    #[test]
+    fn build_display_rules_maps_display_to_rule_and_zone() {
+        let mut rules = IndexMap::new();
+        rules.insert(
+            "living_room".into(),
+            dormant_core::config::schema::RuleConfig {
+                zone: "living_zone".into(),
+                displays: vec!["tv".into(), "monitor".into()],
+                grace_period: std::time::Duration::from_secs(5),
+                min_blank_time: std::time::Duration::from_secs(30),
+                min_wake_time: std::time::Duration::from_secs(30),
+                inhibitors: vec![],
+                activity_idle_threshold: std::time::Duration::from_secs(300),
+                activity_poll_interval: std::time::Duration::from_secs(30),
+                wake_retries: 3,
+                wake_retry_backoff: std::time::Duration::from_secs(2),
+                wake_retry_interval: std::time::Duration::from_secs(2),
+            },
+        );
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules,
+        };
+
+        let map = build_display_rules(&cfg);
+        assert_eq!(map.len(), 2);
+        let tv = map.get("tv").unwrap();
+        assert_eq!(tv.rule, "living_room");
+        assert_eq!(tv.zone, "living_zone");
+        let monitor = map.get("monitor").unwrap();
+        assert_eq!(monitor.rule, "living_room");
+        assert_eq!(monitor.zone, "living_zone");
+    }
+
     // ── Redaction unit tests ──────────────────────────────────────────────
 
     #[test]
@@ -275,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_config_secrets_redacts_broker_urls() {
+    fn redact_config_secrets_redacts_mqtt_broker_urls() {
         let mut cfg = Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
@@ -309,6 +452,89 @@ mod tests {
         assert!(
             !mqtt.broker_url.contains("u:p"),
             "secret should be redacted in broker_url"
+        );
+    }
+
+    #[test]
+    fn redact_config_secrets_redacts_ha_sensor_urls() {
+        let mut cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: {
+                let mut s = IndexMap::new();
+                s.insert(
+                    "living".into(),
+                    SensorConfig::Ha(HaSensorCfg {
+                        url: "ws://sekrettoken@ha.local:8123/api/websocket".into(),
+                        entity: "binary_sensor.motion".into(),
+                        kind: dormant_core::config::schema::SensorKind::default(),
+                        hold_time: None,
+                        stale_timeout: None,
+                    }),
+                );
+                s
+            },
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        };
+
+        redact_config_secrets(&mut cfg);
+
+        let SensorConfig::Ha(ha) = cfg.sensors.get("living").unwrap() else {
+            panic!("expected HA sensor");
+        };
+        assert!(
+            !ha.url.contains("sekrettoken"),
+            "HA sensor url should be redacted: {}",
+            ha.url
+        );
+    }
+
+    #[test]
+    fn redact_config_secrets_redacts_display_ha_url() {
+        let mut cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: {
+                let mut d = IndexMap::new();
+                d.insert(
+                    "tv".into(),
+                    DisplayConfig {
+                        controllers: vec!["ha-passthrough".into()],
+                        blank_mode: BlankMode::PowerOff,
+                        degraded_mode: None,
+                        output: None,
+                        ddc_display: None,
+                        host: None,
+                        wol_mac: None,
+                        blank_command: None,
+                        wake_command: None,
+                        modes: None,
+                        ha_url: Some("http://token@ha.local:8123".into()),
+                        blank_service: None,
+                        blank_data: None,
+                        wake_service: None,
+                        wake_data: None,
+                        command_timeout: std::time::Duration::from_secs(10),
+                        restore_brightness: 100,
+                        treat_unreachable_as_blanked: false,
+                    },
+                );
+                d
+            },
+            rules: IndexMap::default(),
+        };
+
+        redact_config_secrets(&mut cfg);
+
+        let dc = cfg.displays.get("tv").unwrap();
+        let ha_url = dc.ha_url.as_deref().unwrap_or("");
+        assert!(
+            !ha_url.contains("token"),
+            "display ha_url should be redacted: {ha_url}"
         );
     }
 
@@ -359,10 +585,11 @@ config_version = 1
         assert!(resp.validation.ok);
         assert!(resp.validation.errors.is_empty());
         assert!(resp.validation.load_error.is_none());
+        assert!(resp.display_rules.is_empty());
     }
 
     #[tokio::test]
-    async fn config_endpoint_redacts_broker_url_secret() {
+    async fn config_endpoint_redacts_mqtt_broker_url_secret() {
         let (_dir, path) = write_temp_config(
             r#"
 config_version = 1
@@ -374,7 +601,6 @@ topic = "dormant/desk"
 field = "/val"
 "#,
         );
-        // Build a matching config for the watch.
         let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
         sensors.insert(
             "desk".into(),
@@ -401,18 +627,132 @@ field = "/val"
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
 
-        // Check raw_toml has redacted userinfo.
         assert!(
             !resp.raw_toml.contains("u:p"),
             "raw_toml should not contain u:p: {}",
             resp.raw_toml
         );
 
-        // Check inventory has redacted broker_url.
         let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
         assert!(
             !inventory_json.contains("u:p"),
             "inventory should not contain u:p: {inventory_json}"
         );
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_redacts_ha_sensor_url_secret() {
+        let (_dir, path) = write_temp_config(
+            r#"
+config_version = 1
+
+[sensors.living]
+type = "ha"
+url = "ws://sekrettoken@ha.local:8123/api/websocket"
+entity = "binary_sensor.motion"
+"#,
+        );
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert(
+            "living".into(),
+            SensorConfig::Ha(HaSensorCfg {
+                url: "ws://sekrettoken@ha.local:8123/api/websocket".into(),
+                entity: "binary_sensor.motion".into(),
+                kind: dormant_core::config::schema::SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors,
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        };
+        let state = test_config_state(path, cfg);
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+
+        assert!(
+            !resp.raw_toml.contains("sekrettoken"),
+            "raw_toml should not contain secret: {}",
+            resp.raw_toml
+        );
+
+        let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
+        assert!(
+            !inventory_json.contains("sekrettoken"),
+            "inventory should not contain secret: {inventory_json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_includes_display_rules() {
+        // Test with rules in the inventory (watch).  The on-disk path is
+        // covered by the integration test + the build_display_rules unit test.
+        let (_dir, path) = write_temp_config(
+            r"
+config_version = 1
+",
+        );
+
+        let mut rules = IndexMap::new();
+        rules.insert(
+            "living_room".into(),
+            dormant_core::config::schema::RuleConfig {
+                zone: "living".into(),
+                displays: vec!["tv".into()],
+                grace_period: std::time::Duration::from_secs(5),
+                min_blank_time: std::time::Duration::from_secs(30),
+                min_wake_time: std::time::Duration::from_secs(30),
+                inhibitors: vec![],
+                activity_idle_threshold: std::time::Duration::from_secs(300),
+                activity_poll_interval: std::time::Duration::from_secs(30),
+                wake_retries: 3,
+                wake_retry_backoff: std::time::Duration::from_secs(2),
+                wake_retry_interval: std::time::Duration::from_secs(2),
+            },
+        );
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules,
+        };
+        let state = test_config_state(path, cfg);
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+
+        let tv = resp
+            .display_rules
+            .get("tv")
+            .expect("display_rules should include tv");
+        assert_eq!(tv.rule, "living_room");
+        assert_eq!(tv.zone, "living");
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_returns_load_error_on_unreadable_file() {
+        let path = std::path::PathBuf::from("/nonexistent/config.toml");
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        };
+        let state = test_config_state(path, cfg);
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+
+        // Should return 200 with load_error, NOT a 500.
+        assert!(!resp.validation.ok);
+        assert!(resp.validation.load_error.is_some());
     }
 }

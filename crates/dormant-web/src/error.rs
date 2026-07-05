@@ -20,7 +20,8 @@ pub(crate) enum WebError {
     UnknownDisplay(String),
     /// Config reload trigger channel is closed.
     ReloadUnavailable,
-    /// Config file could not be read for the raw view.
+    /// Config file could not be read for the raw view (future: legacy compat).
+    #[allow(dead_code)]
     ConfigReadError(String),
     /// The doctor service panicked or is unavailable (future: health-aware).
     #[allow(dead_code)]

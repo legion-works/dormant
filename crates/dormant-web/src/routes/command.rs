@@ -82,16 +82,22 @@ pub(crate) async fn post_wake(
 }
 
 /// `POST /api/pause` — pause blanking for one or all rules.
+/// Duration overflow is rejected with 400 (mirroring `ipc.rs:270-275`).
 pub(crate) async fn post_pause(
     State(state): State<WebState>,
     Json(body): Json<PauseBody>,
 ) -> Result<Json<serde_json::Value>, WebError> {
-    let until = body.duration_s.map(|secs| {
-        let future = std::time::SystemTime::now()
-            .checked_add(std::time::Duration::from_secs(secs))
-            .unwrap_or(std::time::SystemTime::now());
-        Timestamp(future)
-    });
+    let until = match body.duration_s {
+        Some(secs) => {
+            match std::time::SystemTime::now().checked_add(std::time::Duration::from_secs(secs)) {
+                Some(t) => Some(Timestamp(t)),
+                None => {
+                    return Err(WebError::BadRequest("duration overflow".into()));
+                }
+            }
+        }
+        None => None,
+    };
 
     let msg = ControlMsg::Pause {
         rule: body.rule.map(RuleId),
@@ -174,17 +180,82 @@ async fn validate_display_exists(
     }
 }
 
+// ── Module-private helpers exposed for router-level tests ────────────────────
+
+/// Build a minimal axum [`Router`] with all command routes mounted, suitable
+/// for HTTP-level tests via `oneshot`.
+#[cfg(test)]
+fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
+    use crate::state::WebStateInner;
+    use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
+    use indexmap::IndexMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (reload_trigger_tx, mut reload_trigger_rx) = mpsc::channel::<()>(8);
+    let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
+    let config = Arc::new(Config {
+        config_version: 1,
+        daemon: DaemonConfig::default(),
+        sensors: IndexMap::default(),
+        zones: IndexMap::default(),
+        displays: IndexMap::default(),
+        rules: IndexMap::default(),
+    });
+    let creds = Arc::new(Credentials::default());
+    let (config_tx, config_rx) = watch::channel(config);
+    let (creds_tx, creds_rx) = watch::channel(creds);
+
+    std::mem::forget(reload_tx);
+    std::mem::forget(config_tx);
+    std::mem::forget(creds_tx);
+
+    let doctor =
+        dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
+    let state = WebState::new(WebStateInner {
+        ctl_tx,
+        reload_trigger: reload_trigger_tx,
+        reload_rx,
+        config_rx,
+        creds_rx,
+        config_path: std::path::PathBuf::from("/dev/null"),
+        doctor,
+        web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+        cancel,
+    });
+
+    // Keep the reload trigger receiver alive in a spawned task so the
+    // sender never errors.
+    tokio::spawn(async move {
+        let _ = reload_trigger_rx.recv().await;
+    });
+
+    axum::Router::new()
+        .route("/api/blank", axum::routing::post(post_blank))
+        .route("/api/wake", axum::routing::post(post_wake))
+        .route("/api/pause", axum::routing::post(post_pause))
+        .route("/api/resume", axum::routing::post(post_resume))
+        .route("/api/reload", axum::routing::post(post_reload))
+        .with_state(state)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::sync::watch;
+    use tower::util::ServiceExt;
 
     /// Build a fake engine that responds to `ControlMsg::Snapshot` and records
     /// the LAST non-snapshot `ControlMsg` it received.
@@ -288,7 +359,6 @@ mod tests {
         .await;
         assert!(result.is_ok(), "blank should succeed: {:?}", result.err());
 
-        // Yield so the fake engine task processes queued messages.
         tokio::task::yield_now().await;
 
         let msg = last_msg.lock().unwrap().take();
@@ -316,6 +386,23 @@ mod tests {
             Err(WebError::UnknownDisplay(name)) => assert_eq!(name, "bogus"),
             other => panic!("expected UnknownDisplay, got {other:?}"),
         }
+    }
+
+    /// Router-level test: unknown display → HTTP 404 status.
+    #[tokio::test]
+    async fn unknown_display_returns_http_404() {
+        let snap = snapshot_with_displays(&["main"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let router = command_test_router(ctl_tx);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/blank")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"display":"bogus"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -391,6 +478,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_duration_overflow_returns_400() {
+        let snap = snapshot_with_displays(&[]);
+        let (ctl_tx, _last_msg) = spawn_fake_engine(snap);
+        let state = test_web_state(ctl_tx);
+
+        // u64::MAX seconds will overflow SystemTime.
+        let result = post_pause(
+            State(state),
+            Json(PauseBody {
+                rule: Some("test".into()),
+                duration_s: Some(u64::MAX),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(WebError::BadRequest(msg)) => assert!(
+                msg.contains("overflow"),
+                "expected overflow message, got: {msg}"
+            ),
+            other => panic!("expected BadRequest(overflow), got {other:?}"),
+        }
+    }
+
+    /// Router-level test: overflow → HTTP 400 status.
+    #[tokio::test]
+    async fn pause_overflow_returns_http_400() {
+        let snap = snapshot_with_displays(&[]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let router = command_test_router(ctl_tx);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pause")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"rule":"test","duration_s":18446744073709551615}"#,
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn resume_sends_control_msg() {
         let snap = snapshot_with_displays(&[]);
         let (ctl_tx, last_msg) = spawn_fake_engine(snap);
@@ -413,5 +544,68 @@ mod tests {
                 if rule.as_ref().map(|r| r.0.as_str()) == Some("living_room")),
             "expected Resume with rule=living_room, got {msg:?}"
         );
+    }
+
+    // ── Reload tests ──────────────────────────────────────────────────────
+
+    /// Router-level test: `POST /api/reload` triggers the `reload_trigger`.
+    #[tokio::test]
+    async fn reload_triggers_reload_sender() {
+        let snap = snapshot_with_displays(&[]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+
+        // Build a custom state with a reload_trigger that can be observed.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (reload_trigger_tx, mut reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
+        let config = Arc::new(Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        });
+        let creds = Arc::new(Credentials::default());
+        let (config_tx, config_rx) = watch::channel(config);
+        let (creds_tx, creds_rx) = watch::channel(creds);
+
+        std::mem::forget(reload_tx);
+        std::mem::forget(config_tx);
+        std::mem::forget(creds_tx);
+
+        let doctor =
+            dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
+        let state = WebState::new(crate::state::WebStateInner {
+            ctl_tx: ctl_tx.clone(),
+            reload_trigger: reload_trigger_tx,
+            reload_rx,
+            config_rx,
+            creds_rx,
+            config_path: std::path::PathBuf::from("/dev/null"),
+            doctor,
+            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            cancel,
+        });
+
+        let router = axum::Router::new()
+            .route("/api/reload", axum::routing::post(post_reload))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/reload")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The reload trigger should have received the signal.
+        let triggered = tokio::time::timeout(Duration::from_millis(100), reload_trigger_rx.recv())
+            .await
+            .is_ok();
+        assert!(triggered, "reload trigger should have been signalled");
     }
 }

@@ -9,7 +9,6 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "ISC",
-  "Zlib",
   "CC0-1.0",
   "MPL-2.0",
   "CDLA-Permissive-2.0",
@@ -35,4 +34,8 @@ ignore = [
   # MCCS capability database shipped in the crate, not user/network input);
   # dormant's own config format is TOML
   "RUSTSEC-2018-0005",
+  # quick-xml DOS vulns — wayland-scanner v0.31 pins quick-xml ^0.39; these are
+  # build-time codegen only (proc-macro), no runtime parse of untrusted XML
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
 ]

@@ -12,4 +12,8 @@ ignore = [
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0104",
   "RUSTSEC-2018-0005",
+  # quick-xml DOS vulns — wayland-scanner v0.31 pins quick-xml ^0.39; these are
+  # build-time codegen only (proc-macro), no runtime parse of untrusted XML
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
 ]

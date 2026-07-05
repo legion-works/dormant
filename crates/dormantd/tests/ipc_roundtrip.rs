@@ -45,6 +45,7 @@ fn spawn_fake_engine() -> (
                     inhibited: false,
                     paused: false,
                     cmd_gen: 1,
+                    controllers: vec![],
                 },
             ),
             (
@@ -54,6 +55,7 @@ fn spawn_fake_engine() -> (
                     inhibited: false,
                     paused: false,
                     cmd_gen: 3,
+                    controllers: vec![],
                 },
             ),
         ],

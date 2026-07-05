@@ -125,6 +125,7 @@ mod tests {
                         inhibited: false,
                         paused: false,
                         cmd_gen: 1,
+                        controllers: vec![],
                     },
                 ),
                 (
@@ -134,6 +135,7 @@ mod tests {
                         inhibited: false,
                         paused: true,
                         cmd_gen: 3,
+                        controllers: vec![],
                     },
                 ),
             ],

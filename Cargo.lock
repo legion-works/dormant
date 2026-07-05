@@ -760,11 +760,13 @@ dependencies = [
  "dormant-displays",
  "dormant-sensors",
  "futures-util",
+ "indexmap",
  "rumqttc",
  "serde_json",
  "tokio",
  "tokio-serial",
  "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
@@ -819,7 +821,9 @@ dependencies = [
  "clap",
  "dormant-core",
  "dormant-displays",
+ "dormant-doctor",
  "dormant-sensors",
+ "indexmap",
  "libc",
  "notify",
  "rustix 1.1.4",

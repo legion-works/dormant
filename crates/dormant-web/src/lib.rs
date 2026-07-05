@@ -15,6 +15,8 @@
 //! compiled and the daemon binary is byte-identical to M1.
 
 mod error;
+mod routes;
+mod security;
 mod server;
 mod state;
 
@@ -128,6 +130,10 @@ mod tests {
             creds_rx,
             config_path: PathBuf::from("/dev/null"),
             doctor,
+            web_bind: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                8080,
+            ),
             cancel: cancel.clone(),
         });
 

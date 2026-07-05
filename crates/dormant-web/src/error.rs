@@ -16,18 +16,55 @@ pub(crate) enum WebError {
     SnapshotTimeout,
     /// The snapshot oneshot was cancelled before a reply arrived.
     SnapshotCancelled,
+    /// Unknown display name in a blank/wake command.
+    UnknownDisplay(String),
+    /// Config reload trigger channel is closed.
+    ReloadUnavailable,
+    /// Config file could not be read for the raw view.
+    ConfigReadError(String),
+    /// The doctor service panicked or is unavailable (future: health-aware).
+    #[allow(dead_code)]
+    DoctorUnavailable,
+    /// Invalid request body (missing fields, wrong shape).  (future:
+    /// stricter validation on command bodies.)
+    #[allow(dead_code)]
+    BadRequest(String),
 }
 
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
-        let (status, event) = match self {
-            WebError::EngineUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable"),
-            WebError::SnapshotTimeout => (StatusCode::GATEWAY_TIMEOUT, "snapshot_timeout"),
-            WebError::SnapshotCancelled => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "snapshot_cancelled")
+        let (status, event, detail) = match self {
+            WebError::EngineUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", None)
             }
+            WebError::SnapshotTimeout => (StatusCode::GATEWAY_TIMEOUT, "snapshot_timeout", None),
+            WebError::SnapshotCancelled => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot_cancelled",
+                None,
+            ),
+            WebError::UnknownDisplay(name) => (
+                StatusCode::NOT_FOUND,
+                "unknown_display",
+                Some(format!("unknown display '{name}'")),
+            ),
+            WebError::ReloadUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "reload_unavailable", None)
+            }
+            WebError::ConfigReadError(detail) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_read_error",
+                Some(detail),
+            ),
+            WebError::DoctorUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "doctor_unavailable", None)
+            }
+            WebError::BadRequest(detail) => (StatusCode::BAD_REQUEST, "bad_request", Some(detail)),
         };
-        let body = serde_json::json!({ "error": event });
+        let mut body = serde_json::json!({ "error": event });
+        if let Some(d) = detail {
+            body["detail"] = serde_json::Value::String(d);
+        }
         (status, axum::Json(body)).into_response()
     }
 }

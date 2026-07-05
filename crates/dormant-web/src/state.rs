@@ -6,6 +6,7 @@
 //! `dormant-doctor`-owned type — no `dormantd`-local type, so there is
 //! no dependency cycle.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -54,6 +55,11 @@ pub struct WebStateInner {
     /// Shared, coalesced [`DoctorService`] — same instance the IPC server
     /// uses.
     pub doctor: DoctorService,
+
+    /// The socket address the web server is bound to.  Used by the
+    /// security middleware to validate the Host header against the
+    /// configured bind address.
+    pub web_bind: SocketAddr,
 
     /// Signalled by the daemon on shutdown; the web listener uses this for
     /// graceful shutdown.

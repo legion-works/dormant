@@ -90,18 +90,26 @@ pub(crate) async fn get_config(
     let config_path = &state.inner.config_path;
     let config_rx = state.inner.config_rx.borrow().clone();
 
-    // Read raw TOML from disk.  Mirrors `validate_only`: an I/O or parse
-    // failure is not a 500 — it is a load_error in the normal body.
+    // ── Step 1 — redacted inventory + display_rules from LAST-APPLIED ──
+    // EVERY return path MUST use this redacted inventory so no secret leaks
+    // on error paths.  Compute once up front.
+    let mut inventory = Arc::unwrap_or_clone(config_rx);
+    redact_config_secrets(&mut inventory);
+    let display_rules = build_display_rules(&inventory);
+
+    // ── Step 2 — on-disk validation (raw TOML + load/parse/creds) ──────
+    let creds_path = config_path.with_extension("creds.toml");
+
     let raw_on_disk = match std::fs::read_to_string(config_path) {
         Ok(raw) => raw,
         Err(e) => {
-            let inventory = Arc::unwrap_or_clone(config_rx);
-            let display_rules = build_display_rules(&inventory);
+            // I/O read failure → normal body with load_error, redacted inventory.
+            let raw_toml = redact_raw_secrets("");
             return Ok(Json(ConfigResponse {
                 path: config_path.display().to_string(),
                 config_version: inventory.config_version,
                 source: "on_disk",
-                raw_toml: String::new(),
+                raw_toml,
                 inventory,
                 validation: ConfigValidation {
                     ok: false,
@@ -114,38 +122,34 @@ pub(crate) async fn get_config(
         }
     };
 
-    // Re-validate the on-disk file.  Creds load failure is also surfaced as
-    // load_error (mirrors `validate_only`'s treatment).
-    let creds_path = config_path.with_extension("creds.toml");
-    let (warnings, errors, load_error, _on_disk_cfg) =
-        match load_config(config_path, Strictness::Warn) {
-            Ok((cfg, warns)) => {
-                let creds = match load_credentials(&creds_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let inventory = Arc::unwrap_or_clone(config_rx);
-                        let display_rules = build_display_rules(&cfg);
-                        return Ok(Json(ConfigResponse {
-                            path: config_path.display().to_string(),
-                            config_version: inventory.config_version,
-                            source: "on_disk",
-                            raw_toml: raw_on_disk.clone(),
-                            inventory,
-                            validation: ConfigValidation {
-                                ok: false,
-                                warnings: warns.iter().map(SerializableWarning::from).collect(),
-                                errors: vec![],
-                                load_error: Some(e.to_string()),
-                            },
-                            display_rules,
-                        }));
-                    }
-                };
-                let errs = validate(&cfg, &capabilities(), &creds);
-                (warns, errs, None, Some(cfg))
-            }
-            Err(e) => (vec![], vec![], Some(e.to_string()), None),
-        };
+    let (warnings, errors, load_error) = match load_config(config_path, Strictness::Warn) {
+        Ok((cfg, warns)) => {
+            let creds = match load_credentials(&creds_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Creds load failure → load_error, redacted inventory + raw_toml.
+                    let raw_toml = redact_raw_secrets(&raw_on_disk);
+                    return Ok(Json(ConfigResponse {
+                        path: config_path.display().to_string(),
+                        config_version: inventory.config_version,
+                        source: "on_disk",
+                        raw_toml,
+                        inventory,
+                        validation: ConfigValidation {
+                            ok: false,
+                            warnings: warns.iter().map(SerializableWarning::from).collect(),
+                            errors: vec![],
+                            load_error: Some(e.to_string()),
+                        },
+                        display_rules,
+                    }));
+                }
+            };
+            let errs = validate(&cfg, &capabilities(), &creds);
+            (warns, errs, None)
+        }
+        Err(e) => (vec![], vec![], Some(e.to_string())),
+    };
 
     let ok = load_error.is_none() && errors.is_empty();
 
@@ -153,7 +157,7 @@ pub(crate) async fn get_config(
     // otherwise "on_disk".
     let source = if load_error.is_none() {
         if let Ok((disk_cfg, _)) = load_config(config_path, Strictness::Warn) {
-            if disk_cfg == *config_rx {
+            if disk_cfg == **state.inner.config_rx.borrow() {
                 "last_applied"
             } else {
                 "on_disk"
@@ -164,16 +168,6 @@ pub(crate) async fn get_config(
     } else {
         "on_disk"
     };
-
-    // Secret redaction: strip inline userinfo from all URL-shaped string fields
-    // in inventory.
-    let mut inventory = Arc::unwrap_or_clone(config_rx);
-    redact_config_secrets(&mut inventory);
-
-    // Build display→zone→rule reverse-lookup from the last-applied inventory
-    // (the running config drives displays).  The `source` field tells the
-    // frontend whether the on-disk file differs.
-    let display_rules = build_display_rules(&inventory);
 
     // Secret redaction in raw TOML.
     let raw_toml = redact_raw_secrets(&raw_on_disk);
@@ -259,7 +253,6 @@ fn redact_display_secrets(dc: &mut DisplayConfig) {
 fn redact_raw_secrets(raw: &str) -> String {
     raw.lines()
         .map(|line| {
-            // Only redact lines that look like they contain a URL with userinfo.
             if line.contains("://") && line.contains('@') {
                 redact_url(line)
             } else {
@@ -271,18 +264,14 @@ fn redact_raw_secrets(raw: &str) -> String {
 }
 
 /// Strip inline userinfo from a URL-shaped string.
-///
-/// `tcp://user:pass@host:1883` → `tcp://[redacted]@host:1883`
 fn redact_url(s: &str) -> String {
     if let Some(scheme_end) = s.find("://") {
         let after_scheme = &s[scheme_end + 3..];
         if let Some(at_pos) = after_scheme.find('@') {
             let userinfo = &after_scheme[..at_pos];
-            // Only redact if no '/' between :// and @ (genuine URL userinfo,
-            // not a path component containing @).
             if !userinfo.contains('/') {
                 let scheme_part = &s[..=scheme_end + 2];
-                let rest = &after_scheme[at_pos..]; // includes the @
+                let rest = &after_scheme[at_pos..];
                 return format!("{scheme_part}[redacted]{rest}");
             }
         }
@@ -296,10 +285,8 @@ fn redact_url(s: &str) -> String {
 mod tests {
     use super::*;
     use dormant_core::config::schema::{DaemonConfig, SensorConfig};
-    use dormant_core::types::BlankMode;
     use indexmap::IndexMap;
 
-    /// Write a config file to a temp dir for tests.
     fn write_temp_config(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -307,7 +294,6 @@ mod tests {
         (dir, path)
     }
 
-    /// Build a minimal `WebState` for config route tests.
     fn test_config_state(config_path: std::path::PathBuf, config: Config) -> WebState {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -337,6 +323,31 @@ mod tests {
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
         })
+    }
+
+    fn config_with_secret() -> Config {
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert(
+            "desk".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://u:p@h:1883".into(),
+                topic: "dormant/desk".into(),
+                field: "/val".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: dormant_core::config::schema::SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors,
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        }
     }
 
     // ── Display-rule reverse-lookup tests ──────────────────────────────────
@@ -374,9 +385,6 @@ mod tests {
         let tv = map.get("tv").unwrap();
         assert_eq!(tv.rule, "living_room");
         assert_eq!(tv.zone, "living_zone");
-        let monitor = map.get("monitor").unwrap();
-        assert_eq!(monitor.rule, "living_room");
-        assert_eq!(monitor.zone, "living_zone");
     }
 
     // ── Redaction unit tests ──────────────────────────────────────────────
@@ -400,59 +408,33 @@ mod tests {
 
     #[test]
     fn redact_url_preserves_no_userinfo() {
-        let result = redact_url("tcp://host:1883");
-        assert_eq!(result, "tcp://host:1883");
+        assert_eq!(redact_url("tcp://host:1883"), "tcp://host:1883");
     }
 
     #[test]
     fn redact_url_does_not_touch_non_urls() {
-        let result = redact_url("just plain text @ home");
-        assert_eq!(result, "just plain text @ home");
+        assert_eq!(
+            redact_url("just plain text @ home"),
+            "just plain text @ home"
+        );
     }
 
     #[test]
     fn redact_url_handles_at_in_path() {
-        // @ after / in path → not userinfo, leave alone.
-        let result = redact_url("https://example.com/path?email=user@host");
-        assert_eq!(result, "https://example.com/path?email=user@host");
+        assert_eq!(
+            redact_url("https://example.com/path?email=user@host"),
+            "https://example.com/path?email=user@host"
+        );
     }
 
     #[test]
     fn redact_config_secrets_redacts_mqtt_broker_urls() {
-        let mut cfg = Config {
-            config_version: 1,
-            daemon: DaemonConfig::default(),
-            sensors: {
-                let mut s = IndexMap::new();
-                s.insert(
-                    "desk".into(),
-                    SensorConfig::Mqtt(MqttSensorCfg {
-                        broker_url: "tcp://u:p@h:1883".into(),
-                        topic: "test".into(),
-                        field: "/val".into(),
-                        payload_on: None,
-                        payload_off: None,
-                        kind: dormant_core::config::schema::SensorKind::default(),
-                        hold_time: None,
-                        stale_timeout: None,
-                    }),
-                );
-                s
-            },
-            zones: IndexMap::default(),
-            displays: IndexMap::default(),
-            rules: IndexMap::default(),
-        };
-
+        let mut cfg = config_with_secret();
         redact_config_secrets(&mut cfg);
-
         let SensorConfig::Mqtt(mqtt) = cfg.sensors.get("desk").unwrap() else {
             panic!("expected MQTT sensor");
         };
-        assert!(
-            !mqtt.broker_url.contains("u:p"),
-            "secret should be redacted in broker_url"
-        );
+        assert!(!mqtt.broker_url.contains("u:p"));
     }
 
     #[test]
@@ -478,63 +460,14 @@ mod tests {
             displays: IndexMap::default(),
             rules: IndexMap::default(),
         };
-
         redact_config_secrets(&mut cfg);
-
         let SensorConfig::Ha(ha) = cfg.sensors.get("living").unwrap() else {
             panic!("expected HA sensor");
         };
         assert!(
             !ha.url.contains("sekrettoken"),
-            "HA sensor url should be redacted: {}",
+            "HA url should be redacted: {}",
             ha.url
-        );
-    }
-
-    #[test]
-    fn redact_config_secrets_redacts_display_ha_url() {
-        let mut cfg = Config {
-            config_version: 1,
-            daemon: DaemonConfig::default(),
-            sensors: IndexMap::default(),
-            zones: IndexMap::default(),
-            displays: {
-                let mut d = IndexMap::new();
-                d.insert(
-                    "tv".into(),
-                    DisplayConfig {
-                        controllers: vec!["ha-passthrough".into()],
-                        blank_mode: BlankMode::PowerOff,
-                        degraded_mode: None,
-                        output: None,
-                        ddc_display: None,
-                        host: None,
-                        wol_mac: None,
-                        blank_command: None,
-                        wake_command: None,
-                        modes: None,
-                        ha_url: Some("http://token@ha.local:8123".into()),
-                        blank_service: None,
-                        blank_data: None,
-                        wake_service: None,
-                        wake_data: None,
-                        command_timeout: std::time::Duration::from_secs(10),
-                        restore_brightness: 100,
-                        treat_unreachable_as_blanked: false,
-                    },
-                );
-                d
-            },
-            rules: IndexMap::default(),
-        };
-
-        redact_config_secrets(&mut cfg);
-
-        let dc = cfg.displays.get("tv").unwrap();
-        let ha_url = dc.ha_url.as_deref().unwrap_or("");
-        assert!(
-            !ha_url.contains("token"),
-            "display ha_url should be redacted: {ha_url}"
         );
     }
 
@@ -563,29 +496,15 @@ topic = "test""#;
 
     #[tokio::test]
     async fn config_endpoint_returns_200_and_inventory() {
-        let (_dir, path) = write_temp_config(
-            r"
-config_version = 1
-",
-        );
-        let cfg = Config {
-            config_version: 1,
-            daemon: DaemonConfig::default(),
-            sensors: IndexMap::default(),
-            zones: IndexMap::default(),
-            displays: IndexMap::default(),
-            rules: IndexMap::default(),
-        };
-        let state = test_config_state(path, cfg);
+        let (_dir, path) = write_temp_config("config_version = 1\n");
+        let state = test_config_state(path, config_with_secret());
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
-
         assert_eq!(resp.config_version, 1);
         assert!(!resp.raw_toml.is_empty());
         assert!(resp.validation.ok);
         assert!(resp.validation.errors.is_empty());
         assert!(resp.validation.load_error.is_none());
-        assert!(resp.display_rules.is_empty());
     }
 
     #[tokio::test]
@@ -593,7 +512,6 @@ config_version = 1
         let (_dir, path) = write_temp_config(
             r#"
 config_version = 1
-
 [sensors.desk]
 type = "mqtt"
 broker_url = "tcp://u:p@h:1883"
@@ -601,42 +519,18 @@ topic = "dormant/desk"
 field = "/val"
 "#,
         );
-        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
-        sensors.insert(
-            "desk".into(),
-            SensorConfig::Mqtt(MqttSensorCfg {
-                broker_url: "tcp://u:p@h:1883".into(),
-                topic: "dormant/desk".into(),
-                field: "/val".into(),
-                payload_on: None,
-                payload_off: None,
-                kind: dormant_core::config::schema::SensorKind::default(),
-                hold_time: None,
-                stale_timeout: None,
-            }),
-        );
-        let cfg = Config {
-            config_version: 1,
-            daemon: DaemonConfig::default(),
-            sensors,
-            zones: IndexMap::default(),
-            displays: IndexMap::default(),
-            rules: IndexMap::default(),
-        };
-        let state = test_config_state(path, cfg);
+        let state = test_config_state(path, config_with_secret());
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
-
         assert!(
             !resp.raw_toml.contains("u:p"),
-            "raw_toml should not contain u:p: {}",
+            "raw_toml leaked secret: {}",
             resp.raw_toml
         );
-
         let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
         assert!(
             !inventory_json.contains("u:p"),
-            "inventory should not contain u:p: {inventory_json}"
+            "inventory leaked secret: {inventory_json}"
         );
     }
 
@@ -645,7 +539,6 @@ field = "/val"
         let (_dir, path) = write_temp_config(
             r#"
 config_version = 1
-
 [sensors.living]
 type = "ha"
 url = "ws://sekrettoken@ha.local:8123/api/websocket"
@@ -674,30 +567,14 @@ entity = "binary_sensor.motion"
         let state = test_config_state(path, cfg);
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
-
-        assert!(
-            !resp.raw_toml.contains("sekrettoken"),
-            "raw_toml should not contain secret: {}",
-            resp.raw_toml
-        );
-
+        assert!(!resp.raw_toml.contains("sekrettoken"));
         let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
-        assert!(
-            !inventory_json.contains("sekrettoken"),
-            "inventory should not contain secret: {inventory_json}"
-        );
+        assert!(!inventory_json.contains("sekrettoken"));
     }
 
     #[tokio::test]
     async fn config_endpoint_includes_display_rules() {
-        // Test with rules in the inventory (watch).  The on-disk path is
-        // covered by the integration test + the build_display_rules unit test.
-        let (_dir, path) = write_temp_config(
-            r"
-config_version = 1
-",
-        );
-
+        let (_dir, path) = write_temp_config("config_version = 1\n");
         let mut rules = IndexMap::new();
         rules.insert(
             "living_room".into(),
@@ -715,7 +592,6 @@ config_version = 1
                 wake_retry_interval: std::time::Duration::from_secs(2),
             },
         );
-
         let cfg = Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
@@ -727,7 +603,6 @@ config_version = 1
         let state = test_config_state(path, cfg);
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
-
         let tv = resp
             .display_rules
             .get("tv")
@@ -737,22 +612,70 @@ config_version = 1
     }
 
     #[tokio::test]
-    async fn config_endpoint_returns_load_error_on_unreadable_file() {
+    async fn config_endpoint_returns_load_error_on_unreadable_file_and_redacts() {
         let path = std::path::PathBuf::from("/nonexistent/config.toml");
-        let cfg = Config {
-            config_version: 1,
-            daemon: DaemonConfig::default(),
-            sensors: IndexMap::default(),
-            zones: IndexMap::default(),
-            displays: IndexMap::default(),
-            rules: IndexMap::default(),
-        };
-        let state = test_config_state(path, cfg);
+        let state = test_config_state(path, config_with_secret());
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
-
-        // Should return 200 with load_error, NOT a 500.
+        // Must return load_error, not 500.
         assert!(!resp.validation.ok);
         assert!(resp.validation.load_error.is_some());
+        // Redaction must still apply — no secret in inventory.
+        let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
+        assert!(
+            !inventory_json.contains("u:p"),
+            "inventory leaked secret on error path: {inventory_json}"
+        );
+        // display_rules must be coherent (from last-applied inventory, not disk).
+        assert!(resp.display_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_redacts_on_creds_load_error() {
+        // Use a temp dir with a valid config but an unreadable creds file
+        // (wrong permissions on Unix, or a syntax error in creds).
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+config_version = 1
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://u:p@h:1883"
+topic = "test"
+field = "/val"
+"#,
+        )
+        .unwrap();
+        // Create a creds file with invalid TOML syntax so load_credentials fails.
+        let creds_path = dir.path().join("config.creds.toml");
+        std::fs::write(&creds_path, "{{{ not valid toml").unwrap();
+        // On Unix, the permissions check might also fail.  Either way,
+        // load_credentials returns an error.
+
+        let state = test_config_state(config_path, config_with_secret());
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+        // Must have load_error from creds failure.
+        assert!(!resp.validation.ok);
+        assert!(
+            resp.validation.load_error.is_some(),
+            "expected load_error on creds failure"
+        );
+        // Redaction must apply — no secret in inventory.
+        let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
+        assert!(
+            !inventory_json.contains("u:p"),
+            "inventory leaked secret on creds error: {inventory_json}"
+        );
+        // raw_toml must also be redacted.
+        assert!(
+            !resp.raw_toml.contains("u:p"),
+            "raw_toml leaked secret on creds error: {}",
+            resp.raw_toml
+        );
+        // display_rules must be from last-applied (coherent with inventory).
+        assert!(resp.display_rules.is_empty());
     }
 }

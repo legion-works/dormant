@@ -1,57 +1,48 @@
 /**
- * Regression test: wire-literal enums match the Rust serde renames exactly.
+ * Regression test: wire-literal enum arrays in types.ts are the single
+ * source of truth, and they match the Rust serde variants exactly.
  *
- * These string arrays are the authoritative TS-side mirror of the Rust
- * serde enum variants.  If the Rust side adds/renames/removes a variant,
- * this test MUST fail — it is the single guard against silent
- * deserialization breakage.
- *
- * Rust sources (single source of truth):
- *   crates/dormant-core/src/types.rs     — SensorState, BlankMode
- *   crates/dormant-core/src/rules.rs     — DaemonEvent, ControllerRole
- *   crates/dormant-core/src/doctor.rs    — CheckStatus
- *   crates/dormant-core/src/zone.rs      — UnavailablePolicy
+ * If a future types.ts edit accidentally changes an array away from the
+ * Rust strings, this test FAILS — it is the drift guard.
  */
 import { describe, it, expect } from "vitest";
+import {
+  SENSOR_STATES,
+  BLANK_MODES,
+  CONTROLLER_ROLES,
+  CHECK_STATUSES,
+  UNAVAILABLE_POLICIES,
+  DAEMON_EVENT_TAGS,
+} from "../api/types";
 
-describe("wire-literal enum values", () => {
+describe("enum arrays match Rust serde wire strings", () => {
   it("SensorState — serde(rename_all = 'lowercase')", () => {
-    const variants: string[] = ["present", "absent", "unavailable"];
-    expect(variants).toHaveLength(3);
+    expect(SENSOR_STATES).toEqual(["present", "absent", "unavailable"]);
   });
 
   it("BlankMode — serde(rename_all = 'snake_case')", () => {
-    const variants: string[] = [
-      "power_off",
-      "screen_off_audio_on",
-      "brightness_zero",
-    ];
-    expect(variants).toHaveLength(3);
+    expect(BLANK_MODES).toEqual(["power_off", "screen_off_audio_on", "brightness_zero"]);
   });
 
   it("ControllerRole — serde(rename_all = 'snake_case')", () => {
-    const variants: string[] = ["primary", "fallback"];
-    expect(variants).toHaveLength(2);
+    expect(CONTROLLER_ROLES).toEqual(["primary", "fallback"]);
   });
 
   it("CheckStatus — serde(rename_all = 'snake_case')", () => {
-    const variants: string[] = ["ok", "fail", "skip", "not_supported"];
-    expect(variants).toHaveLength(4);
+    expect(CHECK_STATUSES).toEqual(["ok", "fail", "skip", "not_supported"]);
   });
 
   it("UnavailablePolicy — serde(rename_all = 'lowercase')", () => {
-    const variants: string[] = ["present", "absent"];
-    expect(variants).toHaveLength(2);
+    expect(UNAVAILABLE_POLICIES).toEqual(["present", "absent"]);
   });
 
   it("DaemonEvent variant tags — serde(tag = 'event', rename_all = 'snake_case')", () => {
-    const tags: string[] = [
+    expect(DAEMON_EVENT_TAGS).toEqual([
       "sensor_changed",
       "zone_changed",
       "display_phase",
       "config_reloaded",
       "wake_retry",
-    ];
-    expect(tags).toHaveLength(5);
+    ]);
   });
 });

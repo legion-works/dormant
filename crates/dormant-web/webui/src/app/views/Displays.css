@@ -1,0 +1,215 @@
+/* Displays view — per-display detail cards.
+   All colors use DS tokens; no hardcoded hex/rgba. */
+
+.displays {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: dmRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.displays-loading,
+.displays-error {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: var(--space-6);
+}
+
+.displays-error {
+  color: var(--danger);
+}
+
+/* ── Display card ── */
+
+.display-card {
+  padding: 20px 22px;
+}
+
+.display-card__body {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+/* ── Preview mini-screen ── */
+
+.display-preview {
+  flex-shrink: 0;
+  width: 98px;
+  height: 62px;
+  border-radius: 10px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.display-preview--alive {
+  background: var(--success-muted);
+  border-color: color-mix(in oklab, var(--success) 30%, transparent);
+}
+
+.display-preview__glyph {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--text-faint);
+}
+
+.display-preview--alive .display-preview__glyph {
+  color: var(--success);
+}
+
+/* ── Details ── */
+
+.display-card__details {
+  flex: 1;
+  min-width: 0;
+}
+
+.display-card__title-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-wrap: wrap;
+}
+
+.display-card__id {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+/* ── Metric grid ── */
+
+.display-card__metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 26px;
+  margin-top: 15px;
+}
+
+.display-metric__label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.display-metric__value {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-body);
+  margin-top: 5px;
+}
+
+/* ── Controller chain ── */
+
+.display-card__controllers {
+  margin-top: 16px;
+}
+
+.display-card__controllers-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 8px;
+}
+
+.display-card__controllers-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ── Action error ── */
+
+.display-card__action-error {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--danger);
+  background: var(--danger-muted);
+  border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+
+/* ── Action buttons ── */
+
+.display-card__actions {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 132px;
+}
+
+.display-action {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  padding: 9px 0;
+  cursor: pointer;
+  text-align: center;
+  border: 1px solid var(--border);
+  background: var(--bg-sunken);
+  color: var(--text-body);
+  transition: border-color var(--dur-fast) var(--ease),
+              background-color var(--dur-fast) var(--ease);
+}
+.display-action:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.display-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.display-action--blank {
+  color: var(--text-strong);
+  background: var(--bg-sunken);
+}
+.display-action--blank:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+.display-action--wake {
+  color: var(--success);
+  background: var(--success-muted);
+  border-color: color-mix(in oklab, var(--success) 40%, transparent);
+}
+.display-action--wake:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--success) 20%, transparent);
+}
+
+.display-action--pause {
+  color: var(--text-muted);
+}
+
+.display-action--resume {
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
+}
+.display-action--resume:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent-warm) 20%, transparent);
+}
+
+/* ── Keyframes ── */
+
+@keyframes dmRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .displays { animation: none; }
+}

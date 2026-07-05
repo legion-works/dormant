@@ -1,0 +1,83 @@
+/* StatusChip — maps DS semantic tokens via modifier classes.
+   All colors use CSS custom properties; no hardcoded hex/rgba. */
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: var(--radius-pill);
+  color: var(--chip-color);
+  background-color: var(--chip-bg);
+  white-space: nowrap;
+}
+
+.status-chip__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background-color: var(--chip-color);
+}
+
+/* ── Green: present / active / waking / ok ── */
+.status-chip--success {
+  --chip-bg: var(--success-muted);
+  --chip-color: var(--success);
+}
+.status-chip--success .status-chip__dot {
+  box-shadow: 0 0 5px var(--success);
+}
+
+/* ── Blue: absent / blanked ── */
+.status-chip--blue {
+  --chip-bg: color-mix(in oklab, var(--blue-400) 13%, transparent);
+  --chip-color: var(--blue-400);
+}
+.status-chip--blue .status-chip__dot {
+  box-shadow: 0 0 5px var(--blue-400);
+}
+
+/* ── Yellow: grace / blanking / unavailable ── */
+.status-chip--warning {
+  --chip-bg: var(--warning-muted);
+  --chip-color: var(--warning);
+}
+.status-chip--warning .status-chip__dot {
+  box-shadow: 0 0 5px var(--warning);
+}
+
+/* ── Amber: paused ── */
+.status-chip--amber {
+  --chip-bg: var(--accent-warm-muted);
+  --chip-color: var(--accent-warm);
+}
+.status-chip--amber .status-chip__dot {
+  box-shadow: 0 0 5px var(--accent-warm);
+}
+
+/* ── Purple: inhibited ── */
+.status-chip--purple {
+  --chip-bg: color-mix(in oklab, var(--purple-400) 14%, transparent);
+  --chip-color: var(--purple-400);
+}
+.status-chip--purple .status-chip__dot {
+  box-shadow: 0 0 5px var(--purple-400);
+}
+
+/* ── Red: fail / wake_retry ── */
+.status-chip--danger {
+  --chip-bg: var(--danger-muted);
+  --chip-color: var(--danger);
+}
+.status-chip--danger .status-chip__dot {
+  box-shadow: 0 0 5px var(--danger);
+}
+
+/* ── Muted fallback for unknown states ── */
+.status-chip--muted {
+  --chip-bg: var(--bg-sunken);
+  --chip-color: var(--text-faint);
+}

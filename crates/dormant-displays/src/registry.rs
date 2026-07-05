@@ -113,7 +113,10 @@ pub fn build_controllers(
             }
             #[cfg(target_os = "linux")]
             "kwin-dpms" => {
-                chain.push(Box::new(KwinDpmsController::new(cfg.output.clone())));
+                chain.push(Box::new(KwinDpmsController::new(
+                    cfg.output.clone(),
+                    cfg.command_timeout,
+                )));
             }
             "command" => {
                 let blank_command = cfg

@@ -1,0 +1,15 @@
+# cargo-audit configuration — ignores for transitive-dep vulns that cannot
+# be fixed via `cargo update` (pinned by parent crates).  The deny.toml
+# holds the matching ignores for `cargo deny check`.
+#
+# rustls-webpki vulns: rumqttc v0.24 pins 0.102.x; fix requires rumqttc upgrade
+# serde_yaml recursion: ddc-hi pins 0.7.x via mccs-db (parses bundled MCCS
+#   capability database, not user/network input)
+[advisories]
+ignore = [
+  "RUSTSEC-2026-0049",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
+  "RUSTSEC-2018-0005",
+]

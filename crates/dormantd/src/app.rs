@@ -552,53 +552,99 @@ impl Runner {
 
 /// The run loop: reload triggers (watcher / SIGHUP / IPC) and shutdown
 /// signals, then a bounded graceful teardown.
+///
+/// Uses platform-specific signals:
+/// - Unix: SIGHUP (reload), SIGTERM (shutdown), SIGINT (shutdown)
+/// - Non-Unix: Ctrl+C only (reload via watcher/IPC)
 async fn run_loop(
     mut runner: Runner,
     mut watcher: reload::ConfigWatcher,
     mut reload_trigger: mpsc::Receiver<()>,
 ) {
-    use tokio::signal::unix::{SignalKind, signal};
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sighup = signal(SignalKind::hangup()).ok();
-    let mut sigterm = signal(SignalKind::terminate()).ok();
-    let mut sigint = signal(SignalKind::interrupt()).ok();
+        let mut sighup = signal(SignalKind::hangup()).ok();
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        let mut sigint = signal(SignalKind::interrupt()).ok();
 
-    loop {
-        tokio::select! {
-            () = runner.root.cancelled() => break,
-            () = wait_signal(sigterm.as_mut()) => {
-                tracing::info!(event = "shutdown_signal", signal = "SIGTERM");
-                runner.root.cancel();
-                break;
+        loop {
+            tokio::select! {
+                () = runner.root.cancelled() => break,
+                () = wait_unix_signal(sigterm.as_mut()) => {
+                    tracing::info!(event = "shutdown_signal", signal = "SIGTERM");
+                    runner.root.cancel();
+                    break;
+                }
+                () = wait_unix_signal(sigint.as_mut()) => {
+                    tracing::info!(event = "shutdown_signal", signal = "SIGINT");
+                    runner.root.cancel();
+                    break;
+                }
+                () = wait_unix_signal(sighup.as_mut()) => {
+                    tracing::info!(event = "reload_signal", signal = "SIGHUP");
+                    let window = runner.generation.cfg.daemon.reload_debounce;
+                    debounce(&mut watcher, window).await;
+                    runner.reload().await;
+                }
+                Some(()) = watcher.rx.recv() => {
+                    tracing::info!(event = "reload_trigger", source = "watcher");
+                    let window = runner.generation.cfg.daemon.reload_debounce;
+                    debounce(&mut watcher, window).await;
+                    runner.reload().await;
+                }
+                Some(()) = reload_trigger.recv() => {
+                    tracing::info!(event = "reload_trigger", source = "ipc");
+                    let window = runner.generation.cfg.daemon.reload_debounce;
+                    debounce(&mut watcher, window).await;
+                    runner.reload().await;
+                }
             }
-            () = wait_signal(sigint.as_mut()) => {
-                tracing::info!(event = "shutdown_signal", signal = "SIGINT");
-                runner.root.cancel();
-                break;
-            }
-            () = wait_signal(sighup.as_mut()) => {
-                tracing::info!(event = "reload_signal", signal = "SIGHUP");
-                let window = runner.generation.cfg.daemon.reload_debounce;
-                debounce(&mut watcher, window).await;
-                runner.reload().await;
-            }
-            Some(()) = watcher.rx.recv() => {
-                tracing::info!(event = "reload_trigger", source = "watcher");
-                let window = runner.generation.cfg.daemon.reload_debounce;
-                debounce(&mut watcher, window).await;
-                runner.reload().await;
-            }
-            Some(()) = reload_trigger.recv() => {
-                tracing::info!(event = "reload_trigger", source = "ipc");
-                let window = runner.generation.cfg.daemon.reload_debounce;
-                debounce(&mut watcher, window).await;
-                runner.reload().await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut ctrl_c = tokio::signal::ctrl_c();
+
+        loop {
+            tokio::select! {
+                () = runner.root.cancelled() => break,
+                _ = &mut ctrl_c => {
+                    tracing::info!(event = "shutdown_signal", signal = "Ctrl+C");
+                    runner.root.cancel();
+                    break;
+                }
+                Some(()) = watcher.rx.recv() => {
+                    tracing::info!(event = "reload_trigger", source = "watcher");
+                    let window = runner.generation.cfg.daemon.reload_debounce;
+                    debounce(&mut watcher, window).await;
+                    runner.reload().await;
+                }
+                Some(()) = reload_trigger.recv() => {
+                    tracing::info!(event = "reload_trigger", source = "ipc");
+                    let window = runner.generation.cfg.daemon.reload_debounce;
+                    debounce(&mut watcher, window).await;
+                    runner.reload().await;
+                }
             }
         }
     }
 
     teardown(&mut runner.generation).await;
     tracing::info!(event = "daemon_stopped");
+}
+
+/// Await a unix signal, or never resolve if the signal stream is absent.
+#[cfg(unix)]
+async fn wait_unix_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Drain further watcher events for `window` before acting, coalescing the
@@ -617,16 +663,6 @@ async fn debounce(watcher: &mut reload::ConfigWatcher, window: Duration) {
                 }
             }
         }
-    }
-}
-
-/// Await a signal, or never resolve if the signal stream is absent.
-async fn wait_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
-    match sig {
-        Some(s) => {
-            s.recv().await;
-        }
-        None => std::future::pending::<()>().await,
     }
 }
 

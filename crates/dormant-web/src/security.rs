@@ -155,23 +155,25 @@ fn is_loopback_origin(origin: &str) -> bool {
 }
 
 /// Extract the host portion from `host[:port]`, correctly handling
-/// bracketed IPv6 addresses like `[::1]:8080`.
+/// bracketed IPv6 addresses like `[::1]:8080`, plain `localhost:8080`,
+/// and bare IPv6 `::1`.
 fn extract_host_without_port(host: &str) -> String {
-    // Bracket notation: `[::1]:8080` → strip brackets first, port after `]`.
-    if let Some(bracket_end) = host.find(']') {
-        // Keep the IPv6 address without brackets: just `::1`.
-        let ipv6 = &host[1..bracket_end];
-        return ipv6.to_string();
-    }
-    // Plain host:port — split on last ':'.
-    if let Some(last_colon) = host.rfind(':') {
-        let candidate = &host[..last_colon];
-        // IPv6 addresses without brackets contain multiple ':' — if the part
-        // before the last colon looks like an IP, parse the whole thing.
-        if candidate.parse::<IpAddr>().is_ok() {
-            return candidate.to_string();
+    // Bracket notation: `[::1]:8080` or `[::1]` → take inside brackets.
+    #[allow(clippy::collapsible_if)]
+    if host.starts_with('[') {
+        if let Some(bracket_end) = host.find(']') {
+            return host[1..bracket_end].to_string();
         }
     }
+    // Count colons to distinguish `host:port` (1 colon) from bare IPv6 (2+).
+    let colon_count = host.chars().filter(|&c| c == ':').count();
+    if colon_count == 1 {
+        // Single colon → hostname:port, strip the port.
+        if let Some(colon_pos) = host.find(':') {
+            return host[..colon_pos].to_string();
+        }
+    }
+    // 0 colons (plain hostname) or 2+ colons (bare IPv6) → keep as-is.
     host.to_string()
 }
 
@@ -330,6 +332,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn accepts_localhost_with_port() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/state")
+            .header("Host", "localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn accepts_ipv4_with_port() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/state")
+            .header("Host", "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // ── POST Content-Type tests ────────────────────────────────────────────
 
     #[tokio::test]
@@ -389,6 +423,25 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn allows_post_with_loopback_origin_with_port() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let router = build_test_router(state);
+
+        // Origin: http://localhost:8080 should be allowed (same-origin loopback with port).
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/blank")
+            .header("Host", "localhost:8080")
+            .header("Content-Type", "application/json")
+            .header("Origin", "http://localhost:8080")
+            .body(Body::from(r#"{"display":"main"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

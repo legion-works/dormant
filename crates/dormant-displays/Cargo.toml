@@ -20,7 +20,10 @@ toml = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 base64 = "0.22"
-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "tls12",
+] }
 rcgen = { version = "0.14", features = ["pem", "ring"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

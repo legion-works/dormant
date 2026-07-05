@@ -33,11 +33,11 @@ Each crate follows the convention: one module per concept, one file per sensor/c
                                                     ▼
                   ┌──────────────┐
                   │  Executor    │──▶ Controller chain (fallback)
-                  │  (retry,     │      ├── kwin-dpms (M1 forthcoming, fallback, audio-unsafe)
+                  │  (retry,     │      ├── kwin-dpms (fallback, audio-unsafe)
                   │   escalation)│      ├── ddcci
                   └──────────────┘      ├── command
                                         ├── ha-passthrough
-                                        └── samsung-tizen (M1 forthcoming)
+                                        └── samsung-tizen
 ```
 
 1. **Sensors** produce `PresenceEvent` values (occupied / vacant) and push them to the zone engine.

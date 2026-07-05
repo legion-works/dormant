@@ -14,6 +14,7 @@
 //! `web-ui` Cargo feature.  When the feature is off, zero web code is
 //! compiled and the daemon binary is byte-identical to M1.
 
+mod assets;
 mod error;
 mod routes;
 mod security;

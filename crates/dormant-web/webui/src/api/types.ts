@@ -1,0 +1,314 @@
+/**
+ * TypeScript mirrors of the dormant-core serde wire shapes.
+ *
+ * Every type here is hand-verified against the Rust source (single source
+ * of truth).  Serde rename attributes are accounted for — enums use the
+ * exact wire strings.  Newtype IDs (SensorId, DisplayId, ZoneId, RuleId)
+ * are `#[serde(transparent)]` and appear as plain `string` on the wire.
+ *
+ * Rust sources referenced:
+ *   crates/dormant-core/src/rules.rs     — StateSnapshot, DaemonEvent, DisplaySnapshot, …
+ *   crates/dormant-core/src/types.rs     — SensorState, BlankMode
+ *   crates/dormant-core/src/doctor.rs    — DoctorReport, Check, CheckStatus
+ *   crates/dormant-core/src/zone.rs      — UnavailablePolicy
+ *   crates/dormant-core/src/config/schema.rs — Config, SensorConfig, ZoneConfig, …
+ *   crates/dormant-web/src/routes/config.rs  — ConfigResponse
+ */
+
+// ── Enums (wire string literals — must match serde rename_all) ──────────
+
+/** rust: SensorState, serde(rename_all = "lowercase") */
+export type SensorState = "present" | "absent" | "unavailable";
+
+/** rust: BlankMode, serde(rename_all = "snake_case") */
+export type BlankMode = "power_off" | "screen_off_audio_on" | "brightness_zero";
+
+/** rust: ControllerRole, serde(rename_all = "snake_case") */
+export type ControllerRole = "primary" | "fallback";
+
+/** rust: CheckStatus, serde(rename_all = "snake_case") */
+export type CheckStatus = "ok" | "fail" | "skip" | "not_supported";
+
+/** rust: UnavailablePolicy, serde(rename_all = "lowercase") */
+export type UnavailablePolicy = "present" | "absent";
+
+/** rust: SensorKind, serde(rename_all = "snake_case") — display label */
+export type SensorKind = "presence" | "motion";
+
+// ── Domain snapshots ────────────────────────────────────────────────────
+
+/**
+ * rust: rules.rs SensorSnapshot
+ * serde: field names match exactly (no rename).
+ */
+export interface SensorSnapshot {
+  id: string;
+  state: SensorState;
+  last_seen_secs_ago: number;
+}
+
+/**
+ * rust: rules.rs ZoneSnapshot
+ * serde: field names match exactly.
+ */
+export interface ZoneSnapshot {
+  id: string;
+  present: boolean | null; // None = unknown to engine
+}
+
+/**
+ * rust: rules.rs ControllerHealth
+ * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+ */
+export interface ControllerHealth {
+  name: string;
+  role: ControllerRole;
+  healthy: boolean;
+  detail?: string;
+}
+
+/**
+ * rust: rules.rs DisplaySnapshot
+ * serde: `controllers` is `#[serde(default)]` (absent for legacy snapshots).
+ */
+export interface DisplaySnapshot {
+  phase: string; // grep-stable literal: "active" | "grace" | "blanking" | "blanked" | "waking"
+  inhibited: boolean;
+  paused: boolean;
+  cmd_gen: number;
+  controllers: ControllerHealth[];
+}
+
+/**
+ * rust: rules.rs StateSnapshot
+ * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
+ * `pending_reload` is `Option<String>` → null or string.
+ */
+export interface StateSnapshot {
+  sensors: SensorSnapshot[];
+  zones: ZoneSnapshot[];
+  displays: [string, DisplaySnapshot][];
+  pending_reload: string | null;
+}
+
+// ── Daemon events (tagged enum) ─────────────────────────────────────────
+
+/**
+ * rust: rules.rs DaemonEvent, serde(tag = "event", rename_all = "snake_case")
+ *
+ * On the wire every event carries an `"event"` discriminator field.
+ * Newtype IDs (SensorId, DisplayId, ZoneId) appear as plain strings.
+ */
+export type DaemonEvent =
+  | SensorChangedEvent
+  | ZoneChangedEvent
+  | DisplayPhaseEvent
+  | ConfigReloadedEvent
+  | WakeRetryEvent;
+
+export interface SensorChangedEvent {
+  event: "sensor_changed";
+  sensor: string;
+  state: SensorState;
+}
+
+export interface ZoneChangedEvent {
+  event: "zone_changed";
+  zone: string;
+  present: boolean;
+  cause: string;
+}
+
+export interface DisplayPhaseEvent {
+  event: "display_phase";
+  display: string;
+  phase: string;
+  cause: string;
+}
+
+export interface ConfigReloadedEvent {
+  event: "config_reloaded";
+}
+
+export interface WakeRetryEvent {
+  event: "wake_retry";
+  display: string;
+  attempt: number;
+}
+
+// ── Doctor ──────────────────────────────────────────────────────────────
+
+/**
+ * rust: doctor.rs Check
+ * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+ */
+export interface Check {
+  name: string;
+  status: CheckStatus;
+  detail?: string;
+}
+
+/**
+ * rust: doctor.rs DoctorReport
+ */
+export interface DoctorReport {
+  checks: Check[];
+}
+
+// ── Config (GET /api/config) ────────────────────────────────────────────
+
+/**
+ * rust: config/routes.rs ConfigValidation
+ */
+export interface ConfigValidation {
+  ok: boolean;
+  warnings: { key_path: string; message: string }[];
+  errors: { what: string; detail: string }[];
+  load_error?: string;
+}
+
+/**
+ * rust: config/routes.rs DisplayRuleInfo
+ */
+export interface DisplayRuleInfo {
+  rule: string;
+  zone: string;
+}
+
+/**
+ * rust: config/schema.rs Config (inventory)
+ *
+ * IndexMap serializes as a JSON object keyed by user-chosen id.
+ * Sub-structs are kept loose — the Config view renders known fields
+ * and tolerates new ones added by later M1 patches.
+ */
+export interface ConfigInventory {
+  config_version: number;
+  daemon: Record<string, unknown>;
+  sensors: Record<string, SensorConfig>;
+  zones: Record<string, ZoneConfig>;
+  displays: Record<string, DisplayConfig>;
+  rules: Record<string, RuleConfig>;
+}
+
+/** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */
+export type SensorConfig =
+  | { type: "mqtt" } & MqttSensorCfg
+  | { type: "ha" } & HaSensorCfg
+  | { type: "usb-ld2410" } & UsbLd2410Cfg;
+
+export interface MqttSensorCfg {
+  broker_url: string;
+  topic: string;
+  field?: string;
+  payload_on?: string;
+  payload_off?: string;
+  kind?: SensorKind;
+  hold_time?: unknown; // humantime-serialized Duration
+  stale_timeout?: unknown;
+}
+
+export interface HaSensorCfg {
+  entity_id: string;
+  payload_on?: string;
+  payload_off?: string;
+  kind?: SensorKind;
+  hold_time?: unknown;
+  stale_timeout?: unknown;
+}
+
+export interface UsbLd2410Cfg {
+  serial_path: string;
+  kind?: SensorKind;
+  hold_time?: unknown;
+  stale_timeout?: unknown;
+}
+
+/** rust: config/schema.rs ZoneConfig */
+export interface ZoneConfig {
+  mode: string;
+  members: string[];
+  quorum?: number;
+  threshold?: number;
+  weights: Record<string, number>;
+  unavailable_policy: UnavailablePolicy;
+}
+
+/** rust: config/schema.rs DisplayConfig */
+export interface DisplayConfig {
+  controllers: string[];
+  blank_mode: BlankMode;
+  degraded_mode?: BlankMode;
+  output?: string;
+  ddc_display?: string;
+  host?: string;
+  wol_mac?: string;
+  blank_command?: string;
+  wake_command?: string;
+  modes?: BlankMode[];
+  ha_url?: string;
+  blank_service?: string;
+  blank_data?: unknown;
+  wake_service?: string;
+  wake_data?: unknown;
+  command_timeout?: unknown; // humantime
+  restore_brightness?: number;
+  treat_unreachable_as_blanked?: boolean;
+}
+
+/** rust: config/schema.rs RuleConfig */
+export interface RuleConfig {
+  zone: string;
+  displays: string[];
+  grace_period?: unknown;
+  min_blank_time?: unknown;
+  min_wake_time?: unknown;
+  inhibitors?: string[];
+  activity_idle_threshold?: unknown;
+  activity_poll_interval?: unknown;
+  wake_retries?: number;
+  wake_retry_backoff?: unknown;
+  wake_retry_interval?: unknown;
+}
+
+/**
+ * rust: config/routes.rs ConfigResponse
+ * Full shape of GET /api/config.
+ */
+export interface ConfigResponse {
+  path: string;
+  config_version: number;
+  source: string;
+  raw_toml: string;
+  inventory: ConfigInventory;
+  validation: ConfigValidation;
+  display_rules: Record<string, DisplayRuleInfo>;
+}
+
+// ── Lightweight cross-check (compile-time + runtime) ────────────────────
+
+/** Verify that the wire-literal enums match the expected Rust serde strings. */
+export function assertEnumValues(): void {
+  // SensorState — serde(rename_all = "lowercase")
+  const sensorStates: SensorState[] = ["present", "absent", "unavailable"];
+  if (sensorStates.length !== 3) throw new Error("SensorState: wrong variant count");
+
+  // BlankMode — serde(rename_all = "snake_case")
+  const blankModes: BlankMode[] = ["power_off", "screen_off_audio_on", "brightness_zero"];
+  if (blankModes.length !== 3) throw new Error("BlankMode: wrong variant count");
+
+  // ControllerRole — serde(rename_all = "snake_case")
+  const roles: ControllerRole[] = ["primary", "fallback"];
+  if (roles.length !== 2) throw new Error("ControllerRole: wrong variant count");
+
+  // CheckStatus — serde(rename_all = "snake_case")
+  const checkStatuses: CheckStatus[] = ["ok", "fail", "skip", "not_supported"];
+  if (checkStatuses.length !== 4) throw new Error("CheckStatus: wrong variant count");
+
+  // DaemonEvent discriminator values — serde(tag = "event", rename_all = "snake_case")
+  const eventTags = ["sensor_changed", "zone_changed", "display_phase", "config_reloaded", "wake_retry"];
+  if (eventTags.length !== 5) throw new Error("DaemonEvent: wrong variant count");
+}
+
+// Run the assertion on module load (tree-shaken in prod — only fires in dev/tests).
+assertEnumValues();

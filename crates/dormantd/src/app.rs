@@ -72,15 +72,7 @@ use crate::reload;
 type SourceBuilder =
     Arc<dyn Fn(&Config, &Credentials) -> Result<Vec<Box<dyn SensorSource>>> + Send + Sync>;
 
-/// Outcome of a reload attempt, published on the daemon-level reload bus.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReloadOutcome {
-    /// The new config was applied.
-    Reloaded,
-    /// The reload was rejected; the old config remains active. Carries a
-    /// human-readable detail.
-    Rejected(String),
-}
+pub use dormant_core::reload::ReloadOutcome;
 
 // ── ValidationReport (for --validate-only) ─────────────────────────────────────
 
@@ -271,6 +263,13 @@ impl App {
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
         let socket_path =
             dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
+
+        // Clone before cfg/creds are moved into assemble_static.
+        let cfg_clone = cfg.clone();
+        let creds_clone = creds.clone();
+        let started_web_port = cfg.daemon.web_port;
+        let started_web_bind = cfg.daemon.web_bind;
+
         let assembly = assemble_static(cfg, creds, &self.source_builder)
             .await
             .context("assemble initial runtime")?;
@@ -293,11 +292,22 @@ impl App {
         let (reload_tx, _) = broadcast::channel(16);
         let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
 
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
+        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
+
+        if cfg_clone.daemon.web_allow_nonloopback {
+            tracing::warn!(
+                event = "web_nonloopback_enabled",
+                bind = %cfg_clone.daemon.web_bind,
+                "web UI bound off-loopback + UNAUTHENTICATED — doctor/reload/command endpoints are LAN-reachable"
+            );
+        }
+
         let watcher =
             reload::config_watcher(&self.config_path).context("install config file watcher")?;
 
         let runner = Runner {
-            config_path: self.config_path,
+            config_path: self.config_path.clone(),
             creds_path: self.creds_path,
             strictness: self.strictness,
             source_builder: self.source_builder,
@@ -305,7 +315,11 @@ impl App {
             engine_ctl: engine_ctl_tx,
             engine_events: engine_events_tx,
             reload_tx: reload_tx.clone(),
+            config_tx,
+            creds_tx,
             generation: spawn.generation,
+            started_web_port,
+            started_web_bind,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -334,6 +348,9 @@ impl App {
             reload_tx,
             reload_trigger: reload_trigger_tx,
             root,
+            config_rx,
+            creds_rx,
+            config_path: self.config_path.clone(),
             _ipc_handle: ipc_handle,
         };
 
@@ -364,6 +381,9 @@ pub struct AppHandle {
     reload_tx: broadcast::Sender<ReloadOutcome>,
     reload_trigger: mpsc::Sender<()>,
     root: CancellationToken,
+    config_rx: watch::Receiver<Arc<Config>>,
+    creds_rx: watch::Receiver<Arc<Credentials>>,
+    config_path: PathBuf,
     _ipc_handle: Option<JoinHandle<()>>,
 }
 
@@ -397,6 +417,24 @@ impl AppHandle {
     pub fn shutdown(&self) {
         self.root.cancel();
     }
+
+    /// Subscribe to live config updates (M2 web UI config view seam).
+    #[must_use]
+    pub fn config_watch(&self) -> watch::Receiver<Arc<Config>> {
+        self.config_rx.clone()
+    }
+
+    /// Subscribe to live credential updates (M2 web UI config view seam).
+    #[must_use]
+    pub fn creds_watch(&self) -> watch::Receiver<Arc<Credentials>> {
+        self.creds_rx.clone()
+    }
+
+    /// The resolved config path (for M2 web UI `WebState`).
+    #[must_use]
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
 }
 
 // ── Runner (owns the run loop + reload) ────────────────────────────────────────
@@ -410,7 +448,13 @@ struct Runner {
     engine_ctl: watch::Sender<mpsc::Sender<ControlMsg>>,
     engine_events: watch::Sender<mpsc::Sender<PresenceEvent>>,
     reload_tx: broadcast::Sender<ReloadOutcome>,
+    config_tx: watch::Sender<Arc<Config>>,
+    creds_tx: watch::Sender<Arc<Credentials>>,
     generation: Generation,
+    /// Port the web UI was started with (for reload change-detection).
+    started_web_port: Option<u16>,
+    /// Bind address the web UI was started with (for reload change-detection).
+    started_web_bind: std::net::IpAddr,
 }
 
 impl Runner {
@@ -446,6 +490,21 @@ impl Runner {
         let retained_dark =
             retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
 
+        // Capture the new config for watch updates + bind change detection
+        // BEFORE new_assembly is consumed by spawn_generation.
+        let new_cfg = new_assembly.cfg.clone();
+        let new_creds = new_assembly.creds.clone();
+
+        // Reload does not rebind a web listener — flag port/bind changes.
+        if new_cfg.daemon.web_port != self.started_web_port
+            || new_cfg.daemon.web_bind != self.started_web_bind
+        {
+            tracing::info!(
+                event = "web_bind_change_ignored",
+                "web_bind/web_port change requires a daemon restart; keeping the current listener"
+            );
+        }
+
         teardown(&mut self.generation).await;
 
         // Verified physical wake of REMOVED displays (no executor in the new
@@ -470,6 +529,8 @@ impl Runner {
             Ok(spawn) => {
                 self.install_generation(spawn);
                 self.defensive_wake(retained_dark);
+                self.config_tx.send_replace(Arc::new(new_cfg));
+                self.creds_tx.send_replace(Arc::new(new_creds));
                 tracing::info!(event = "config_reloaded");
                 let _ = self.reload_tx.send(ReloadOutcome::Reloaded);
             }

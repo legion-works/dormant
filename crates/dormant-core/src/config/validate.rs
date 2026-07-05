@@ -62,6 +62,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "idle_time_unit",
             "idle_source",
             "reload_debounce",
+            "web_port",
+            "web_bind",
+            "web_allow_nonloopback",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────
@@ -294,6 +297,17 @@ pub fn validate(
     // ── Rule validation ──────────────────────────────────────────────────
     for (rule_id, rc) in &cfg.rules {
         validate_rule(rule_id, rc, &zone_names, &cfg.displays, &mut errors);
+    }
+
+    // ── Cross-field web-UI validation ───────────────────────────────────
+    if !cfg.daemon.web_bind.is_loopback() && !cfg.daemon.web_allow_nonloopback {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "web_bind {} is non-loopback; set web_allow_nonloopback = true to allow (widens unauthenticated surface)",
+                cfg.daemon.web_bind
+            ),
+        });
     }
 
     errors
@@ -1168,6 +1182,74 @@ stale_timeout = "5m"
             "should not also flag blank_mode when the root cause is an empty union: {:?}",
             errors.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
+    }
+
+    // ── Web-UI config keys ──────────────────────────────────────────────────
+
+    #[test]
+    fn web_keys_known_in_strict_mode() {
+        let dir = std::env::temp_dir().join("dormant-test-web-keys-known");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("web_keys.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n[daemon]\nweb_port = 8080\nweb_bind = \"127.0.0.1\"\nweb_allow_nonloopback = false\n",
+        )
+        .unwrap();
+        assert!(
+            crate::config::load_config(&path, Strictness::Strict).is_ok(),
+            "web_* keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn nonloopback_bind_rejected_without_override() {
+        let dir = std::env::temp_dir().join("dormant-test-nonloopback-reject");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonloopback.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n[daemon]\nweb_port = 8080\nweb_bind = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        // The non-loopback check runs in validate(), not in load_config(),
+        // so the parse succeeds — the test verifies the validate gate.
+        // In practice, App::build runs validate() which catches this.
+        let (cfg, _) = result.unwrap();
+        let errors = super::validate(
+            &cfg,
+            &std::collections::HashMap::new(),
+            &Credentials::default(),
+        );
+        let joined = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("web_allow_nonloopback"),
+            "expected error mentioning web_allow_nonloopback, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn nonloopback_bind_allowed_with_override() {
+        let dir = std::env::temp_dir().join("dormant-test-nonloopback-allow");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nonloopback_allow.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n[daemon]\nweb_port = 8080\nweb_bind = \"0.0.0.0\"\nweb_allow_nonloopback = true\n",
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = super::validate(
+            &cfg,
+            &std::collections::HashMap::new(),
+            &Credentials::default(),
+        );
+        assert!(errors.is_empty());
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

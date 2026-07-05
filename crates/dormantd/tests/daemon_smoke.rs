@@ -601,3 +601,88 @@ async fn ruleless_display_verified_wake() {
 
     shutdown(handle, join).await;
 }
+
+// ── 8: config_watch updates on successful reload only ─────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_watch_updates_on_successful_reload_only() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    let mut config_watch = handle.config_watch();
+    let initial_holdoff = config_watch.borrow().daemon.startup_holdoff;
+    assert_eq!(initial_holdoff, Duration::from_secs(0));
+
+    // Wait for the initial blank so the run loop has fully settled.
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "first blank should occur"
+    );
+
+    // Write a valid config with a different startup_holdoff and reload.
+    let modified = one_display_config(&marker, "400ms")
+        .replace("startup_holdoff = \"0s\"", "startup_holdoff = \"5s\"");
+    fs::write(&cfg_path, &modified).unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    // The watch should deliver the updated config.
+    let changed = tokio::time::timeout(Duration::from_secs(2), config_watch.changed())
+        .await
+        .expect("watch changed in time");
+    assert!(
+        changed.is_ok(),
+        "config watch must reflect successful reload"
+    );
+    assert_eq!(
+        config_watch.borrow().daemon.startup_holdoff,
+        Duration::from_secs(5)
+    );
+
+    // Now trigger a rejected reload — the watch must NOT change.
+    fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
+    }
+
+    // The watch should NOT have changed after a rejected reload.
+    // Because watch::changed() would hang if no update is sent, we use
+    // a short timeout to confirm no update arrives.
+    let no_change = tokio::time::timeout(Duration::from_millis(300), config_watch.changed()).await;
+    assert!(
+        no_change.is_err(),
+        "config watch must NOT update after a rejected reload"
+    );
+
+    shutdown(handle, join).await;
+}

@@ -33,11 +33,11 @@ Each crate follows the convention: one module per concept, one file per sensor/c
                                                     ▼
                   ┌──────────────┐
                   │  Executor    │──▶ Controller chain (fallback)
-                  │  (retry,     │      ├── kwin-dpms (planned)
+                  │  (retry,     │      ├── kwin-dpms (fallback, audio-unsafe)
                   │   escalation)│      ├── ddcci
                   └──────────────┘      ├── command
                                         ├── ha-passthrough
-                                        └── samsung-tizen (planned)
+                                        └── samsung-tizen
 ```
 
 1. **Sensors** produce `PresenceEvent` values (occupied / vacant) and push them to the zone engine.
@@ -65,3 +65,27 @@ Every log event name and error code is a literal string at the definition site �
 - **Log events:** grep for `event = "..."` in the source. Key events include `sensor_event`, `zone_transition`, `rule_blank`, `rule_wake`, `wake_failed`, `reload_complete`, `reload_defensive_wake`.
 
 Config keys follow the TOML path: `daemon.log_level`, `sensors.<id>.type`, `zones.<id>.mode`, `displays.<id>.controllers`, `rules.<id>.zone`, etc. — all resolved in `dormant-core/src/config/mod.rs`.
+
+## Audio-safe blanking
+
+DPMS-based blanking (including `kwin-dpms`) disables the DRM/KMS output,
+which tears down the associated ALSA audio sink — audio dies along with the
+picture. This is architectural, not a config setting.
+
+Two display controllers blank without touching the output, preserving audio:
+
+- **`ddcci`** — VCP `0xD6` sends a "display power off" command over I2C.
+  The monitor blanks its panel internally; the OS output and ALSA device
+  remain active. Only works on DDC/CI-capable monitors that support D6.
+- **`samsung-tizen`** — `KEY_PICTURE_OFF` blanks the TV panel over WebSocket.
+  The TV continues rendering audio; the HDMI output remains active.
+
+Per-display strategy:
+- DDC/CI monitor → `ddcci` power_off (audio-safe, verified on AOC AG326UZD)
+- Samsung Tizen TV → `samsung-tizen` picture-off (audio-safe, verified on S90D)
+- Outputs with no DDC/CI and no audio → `kwin-dpms` is acceptable (no audio to kill)
+- Outputs with audio but no DDC/CI → Tizen passthrough or `command` with an
+  audio-safe external command; otherwise live with the audio loss
+
+See `docs/research/2026-07-05-kwin-dpms-verification.md` and
+`docs/research/2026-07-05-s90d-verification.md` for the hardware spike data.

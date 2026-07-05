@@ -83,9 +83,12 @@ modes = ["power_off"]
 
 The `ha_token` goes in the credentials file, not in the main config.
 
-### `kwin-dpms` — KWin DPMS (planned, M1 spike)
+### `kwin-dpms` — KWin DPMS (fallback, audio-unsafe)
 
-Controls KDE KWin outputs via DBus DPMS. Awaiting hardware verification.
+Controls KDE KWin outputs via `kscreen-doctor --dpms`. Per-output DPMS works on
+Plasma 6.7.2+ (Wayland). **Audio-unsafe:** DPMS disables the DRM/KMS output,
+which destroys the ALSA audio device for that output. Use only for displays
+with no audio sink and no DDC/CI.
 
 ```toml
 [displays.desk]
@@ -94,17 +97,27 @@ blank_mode = "power_off"
 output = "DP-1"
 ```
 
-### `samsung-tizen` — Samsung Tizen TV (planned, M1 spike)
+See `docs/research/2026-07-05-kwin-dpms-verification.md` for the spike data.
 
-Controls Samsung Tizen (OLED) TVs via the `KEY_PICTURE_OFF` remote key over WebSocket. The token goes in the credentials file:
+### `samsung-tizen` — Samsung Tizen TV
+
+Controls Samsung Tizen (OLED) TVs via `KEY_PICTURE_OFF` remote key over
+WebSocket. **Audio-safe:** blanks the panel while audio continues. Verified on
+S90D (QA65S90DAKXXA). Requires a persistent socket with keepalive — the TV
+silently drops idle connections. Use REST `/api/v2/` PowerState for real panel
+state, not socket liveness. Two standby depths exist (warm network-standby /
+deep standby); see the spike doc for the wake matrix.
+
+The token goes in the credentials file:
 
 ```toml
 [credentials]
 [samsung]
-"192.168.1.50" = "eyJ..."
+"192.0.2.7" = "eyJ..."
 ```
 
-Awaiting hardware verification on an S90C.
+See `docs/research/2026-07-05-s90d-verification.md` for the full spike data
+including wake matrix, latency measurements, and socket survival findings.
 
 ## Fail-safe wake contract
 
@@ -121,3 +134,30 @@ dormantctl doctor ddcci
 ```
 
 Verifies: controller reachability, supported modes vs configured mode, last known state, and performs a dry-run capability probe (does not blank the display).
+
+## Audio-safe blanking
+
+DPMS-based controllers (`kwin-dpms`, `command` with `xset dpms`) disable the
+DRM/KMS output, which destroys the ALSA audio device for that output. Audio
+stops when the display blanks. This is how the kernel DRM pipeline works — it
+is not configurable.
+
+Two controllers blank without touching the output, preserving audio:
+
+| Controller | Mechanism | Audio-safe because |
+|---|---|---|
+| `ddcci` | VCP `0xD6` (monitor-internal command over I2C) | Panel blanks internally; OS output stays active |
+| `samsung-tizen` | `KEY_PICTURE_OFF` (TV-internal command over WebSocket) | TV blanks panel; HDMI output stays active |
+
+**Per-display strategy:**
+
+1. If the display has DDC/CI and supports VCP D6 → use `ddcci` power_off.
+2. If the display is a Samsung Tizen TV → use `samsung-tizen` picture-off.
+3. If the display has no DDC/CI and no audio → `kwin-dpms` is fine.
+4. If the display has audio but neither DDC/CI nor Tizen → use a `command`
+   controller with an audio-safe external command (e.g. a TV-specific IR
+   blaster or HA automation), or accept the audio loss.
+
+Run `dormantctl doctor` to probe DDC/CI VCP D6 support. For Tizen TVs, the
+doctor check verifies WebSocket reachability, token validity, and REST
+PowerState.

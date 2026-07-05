@@ -1,0 +1,73 @@
+# Reference config — verify component options against your ESPHome version.
+#
+# HLK-LD2410C 24GHz mmWave presence sensor on ESP32-H2 with native Zigbee.
+# Publishes occupancy as a Zigbee binary_input cluster; Zigbee2MQTT
+# auto-recognizes it. dormant consumes the resulting MQTT topic via its
+# MQTT sensor source.
+#
+# Requirements: ESPHome ≥ 2026.5.0 (native Zigbee landed in this release,
+# ESP-IDF only). ESP32-H2 is a Zigbee/Thread-only chip — no WiFi hardware.
+#
+# Wiring (5 pins, JST 1.25mm on sensor side):
+#   Sensor VCC → board 5V
+#   Sensor GND → board GND
+#   Sensor TX  → board RX (GPIO4 below)
+#   Sensor RX  → board TX (GPIO5 below)
+#   Sensor OUT → unused (GPIO OUT pin, high when motion detected)
+#
+# Notes:
+#   - Pairs into your existing Zigbee2MQTT coordinator.
+#   - No OTA over Zigbee — reflash over USB for config changes.
+#   - Re-pair after config changes (Zigbee network parameters may shift).
+
+substitutions:
+  device_name: ld2410c-desk-zigbee
+  friendly_name: "Desk Presence (Zigbee)"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: "2026.5.0"
+
+esp32:
+  board: esp32-h2-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+# Native Zigbee — replaces wifi/mqtt. Pairs into your existing Z2M coordinator.
+# No WiFi block needed; the H2 has no WiFi hardware.
+zigbee:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+uart:
+  tx_pin: GPIO5
+  rx_pin: GPIO4
+  baud_rate: 256000
+
+ld2410:
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      name: "${friendly_name} Occupancy"
+    has_moving_target:
+      name: "${friendly_name} Moving"
+    has_still_target:
+      name: "${friendly_name} Still"
+
+sensor:
+  - platform: ld2410
+    moving_energy:
+      name: "${friendly_name} Moving Energy"
+    still_energy:
+      name: "${friendly_name} Still Energy"

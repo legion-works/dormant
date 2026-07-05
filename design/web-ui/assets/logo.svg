@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 48" width="240" height="48" font-family="&#39;IBM Plex Sans&#39;, system-ui, sans-serif">
+  <circle cx="24" cy="24" r="18.5" fill="oklch(0.80 0.15 155)"></circle>
+  <circle cx="32" cy="18.5" r="15.5" fill="#0b0d0e"></circle>
+  <circle cx="16.5" cy="28.5" r="2.5" fill="oklch(0.80 0.15 155)"></circle>
+  <text x="56" y="33" fill="#e7eae8" font-size="30" font-weight="700" letter-spacing="-0.6">dormant</text>
+</svg>

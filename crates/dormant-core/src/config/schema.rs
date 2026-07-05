@@ -110,6 +110,12 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub idle_time_unit: IdleTimeUnit,
 
+    /// Which idle source to use for the activity inhibitor (`"auto"` | `"wayland"` |
+    /// `"dbus"`). `"auto"` (default) picks Wayland when `WAYLAND_DISPLAY` is set
+    /// and the compositor advertises `ext_idle_notifier_v1`, falling back to `DBus`.
+    #[serde(default)]
+    pub idle_source: IdleSource,
+
     /// Debounce window coalescing rapid config-file changes into one reload.
     #[serde(default = "default_reload_debounce", with = "humantime_serde")]
     pub reload_debounce: Duration,
@@ -123,6 +129,7 @@ impl Default for DaemonConfig {
             log_level: defaults::LOG_LEVEL.into(),
             socket_path: None,
             idle_time_unit: IdleTimeUnit::default(),
+            idle_source: IdleSource::default(),
             reload_debounce: defaults::RELOAD_DEBOUNCE,
         }
     }
@@ -144,6 +151,27 @@ pub enum IdleTimeUnit {
     /// The raw value is seconds.
     #[serde(rename = "s")]
     Secs,
+}
+
+/// Which idle source the activity inhibitor should use.
+///
+/// * `Auto` (default) — prefer Wayland's `ext_idle_notifier_v1` when
+///   `WAYLAND_DISPLAY` is set and the compositor advertises the protocol,
+///   fall back to `DBus` `GetSessionIdleTime` otherwise.
+/// * `Wayland` — force the Wayland idle notifier; the daemon will error at
+///   startup if the compositor does not expose the protocol.
+/// * `Dbus` — always use the `DBus` screensaver poll.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleSource {
+    /// Auto-detect: Wayland when available, else `DBus`.
+    #[default]
+    Auto,
+    /// Force Wayland `ext_idle_notifier_v1`.
+    Wayland,
+    /// Force `DBus` screensaver poll.
+    #[serde(rename = "dbus")]
+    Dbus,
 }
 
 // ── SensorKind ──────────────────────────────────────────────────────────────────

@@ -970,9 +970,11 @@ fn spawn_generation(
         .activity_poll
         .unwrap_or_else(|| Duration::from_secs(5));
     let idle_unit = assembly.cfg.daemon.idle_time_unit;
+    let idle_source = assembly.cfg.daemon.idle_source;
     let _inhibitor = inhibit_activity::spawn(
         assembly.activity_rules,
         poll,
+        idle_source,
         idle_unit,
         ctl_tx.clone(),
         token.clone(),

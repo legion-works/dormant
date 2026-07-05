@@ -54,6 +54,10 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// 80 is a sane daytime default that doesn't require per-display tuning.
 pub const RESTORE_BRIGHTNESS: u8 = 80;
 
+/// Which idle source to use for the activity inhibitor (`"auto"` | `"wayland"` |
+/// `"dbus"`). `"auto"` prefers Wayland when available, falling back to `DBus`.
+pub const IDLE_SOURCE: &str = "auto";
+
 /// Default log level for the daemon.
 pub const LOG_LEVEL: &str = "info";
 

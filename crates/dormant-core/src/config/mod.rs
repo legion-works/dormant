@@ -20,8 +20,8 @@ pub mod schema;
 pub mod validate;
 
 pub use schema::{
-    Config, Credentials, DaemonConfig, DisplayConfig, IdleTimeUnit, RuleConfig, SensorConfig,
-    SensorKind, Strictness, ValidationError, Warning, ZoneConfig,
+    Config, Credentials, DaemonConfig, DisplayConfig, IdleSource, IdleTimeUnit, RuleConfig,
+    SensorConfig, SensorKind, Strictness, ValidationError, Warning, ZoneConfig,
 };
 pub use validate::validate;
 

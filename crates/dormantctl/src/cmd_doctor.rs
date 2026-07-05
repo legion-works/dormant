@@ -19,7 +19,9 @@ use dormant_core::error::E_HA_AUTH;
 use dormant_core::paths;
 use dormant_core::types::{SensorId, SensorState};
 use dormant_displays::registry::capabilities;
-use dormant_displays::vcp_ops::{RealVcp, VcpOps};
+#[cfg(target_os = "linux")]
+use dormant_displays::vcp_ops::RealVcp;
+use dormant_displays::vcp_ops::VcpOps;
 use dormant_sensors::ha_ws::{Action, HaProtocol};
 use dormant_sensors::mqtt::parse_payload;
 use dormant_sensors::usb_ld2410::FrameParser;
@@ -152,9 +154,16 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
-            let results = vec![probe_ddcci().await];
-            print_table(&results);
-            Ok(outcome(&results))
+            #[cfg(target_os = "linux")]
+            {
+                let results = vec![probe_ddcci().await];
+                print_table(&results);
+                Ok(outcome(&results))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Ok(DoctorOutcome::NotSupported("ddcci".into()))
+            }
         }
         Some(DoctorSubcommand::Usb { port, baud }) => {
             let results = vec![probe_usb(port, *baud).await];
@@ -234,6 +243,7 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             }
 
             // DDC/CI probe if any display uses ddcci (serial after sensors).
+            #[cfg(target_os = "linux")]
             if config_ok {
                 let has_ddcci = cfg
                     .displays
@@ -292,6 +302,7 @@ fn probe_config_inner(cfg: &dormant_core::config::Config, creds: &Credentials) -
 
 // ── Probe: DDC/CI ───────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 async fn probe_ddcci() -> ProbeResult {
     let ops = RealVcp;
     let displays = ops.list_displays().await;

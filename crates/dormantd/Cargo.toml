@@ -27,7 +27,13 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }
-tokio = { workspace = true, features = ["test-util", "macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = [
+  "test-util",
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "time",
+] }
 tempfile = { workspace = true }
 
 [package.metadata.dist]

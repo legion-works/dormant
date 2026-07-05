@@ -1,2 +1,10 @@
 [default]
-extend-ignore-re = []
+extend-ignore-re = [
+  # hass-rs / hass-ws are project names (Home Assistant libraries)
+  "hass-rs",
+  "hass-ws",
+  # Mosquitto is a proper name (Eclipse Mosquitto MQTT broker)
+  "(?i)Mosquitto",
+  # ESPresense is a proper name (ESP32 presence detection project)
+  "ESPresense",
+]

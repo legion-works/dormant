@@ -22,7 +22,9 @@ use dormant_core::error::{DormantError, E_DISPLAY_IO};
 use dormant_core::traits::DisplayController;
 use dormant_core::types::{BlankMode, CmdFailure};
 
-use crate::vcp_ops::{RealVcp, VcpOps};
+#[cfg(target_os = "linux")]
+use crate::vcp_ops::RealVcp;
+use crate::vcp_ops::VcpOps;
 
 // ── VCP code constants ─────────────────────────────────────────────────────────
 
@@ -77,6 +79,9 @@ pub struct DdcciController {
 
 impl DdcciController {
     /// Build a new `DdcciController` with real DDC/CI hardware access.
+    ///
+    /// Only available on Linux — DDC/CI requires platform I²C support.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn new(matcher: Option<String>, restore_brightness: u8) -> Self {
         Self {

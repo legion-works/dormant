@@ -22,6 +22,7 @@ use dormant_core::traits::DisplayController;
 use dormant_core::types::BlankMode;
 
 use crate::command::CommandController;
+#[cfg(target_os = "linux")]
 use crate::ddcci::DdcciController;
 use crate::ha_passthrough::HaPassthroughController;
 
@@ -73,6 +74,7 @@ pub fn build_controllers(
 
     for name in &cfg.controllers {
         match name.as_str() {
+            #[cfg(target_os = "linux")]
             "ddcci" => {
                 // Normalize empty matcher to None so the controller auto-selects
                 // the single detected display instead of trying to match "".

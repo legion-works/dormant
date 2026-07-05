@@ -14,10 +14,12 @@ tokio-util = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-ddc-hi = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ddc-hi = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "time", "macros", "rt"] }

@@ -17,6 +17,7 @@
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
 use ddc_hi::Ddc;
 
 /// Information about a detected display returned by [`VcpOps::list_displays`].
@@ -60,8 +61,12 @@ pub trait VcpOps: Send + Sync {
 
 /// Real DDC/CI operations backed by ddc-hi, with every call wrapped in
 /// [`tokio::task::spawn_blocking`].
+///
+/// Only available on Linux — DDC/CI I²C access requires platform support.
+#[cfg(target_os = "linux")]
 pub struct RealVcp;
 
+#[cfg(target_os = "linux")]
 impl RealVcp {
     /// Enumerate synchronously (called inside `spawn_blocking`).
     fn enumerate_displays() -> Vec<(String, ddc_hi::Display)> {
@@ -84,6 +89,7 @@ impl RealVcp {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[async_trait]
 impl VcpOps for RealVcp {
     async fn list_displays(&self) -> Vec<VcpDisplayInfo> {

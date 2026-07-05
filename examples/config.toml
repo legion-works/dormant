@@ -29,7 +29,7 @@ socket_path = "/run/user/1000/dormant.sock"
 
 # ── Sensors ────────────────────────────────────────────────────────────────────
 
-# Desk occupancy over MQTT (e.g. an ESPresense / mmWave node publishing JSON).
+# Desk occupancy over MQTT (e.g. an ESPresence / mmWave node publishing JSON).
 [sensors.desk]
 type = "mqtt"
 broker_url = "tcp://localhost:1883"

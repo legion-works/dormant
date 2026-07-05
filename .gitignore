@@ -11,3 +11,5 @@ Cargo.lock.orig
 
 # parallel-agent worktrees
 .worktrees/
+# Generated mdbook output
+/docs/book/

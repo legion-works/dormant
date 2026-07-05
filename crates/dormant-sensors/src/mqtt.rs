@@ -210,12 +210,9 @@ impl MqttSource {
                 }
                 None => {
                     if warned.insert(topic.to_string()) {
-                        warn!(
-                            "mqtt: unparseable payload on '{}' (first occurrence)",
-                            topic,
-                        );
+                        warn!("mqtt: unparsable payload on '{}' (first occurrence)", topic,);
                     } else {
-                        debug!("mqtt: unparseable payload on '{}' (suppressed)", topic);
+                        debug!("mqtt: unparsable payload on '{}' (suppressed)", topic);
                     }
                 }
             }

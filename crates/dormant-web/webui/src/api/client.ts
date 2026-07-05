@@ -13,8 +13,6 @@
  */
 import type { StateSnapshot, ConfigResponse, DoctorReport } from "./types";
 
-// ── Shared helpers ──────────────────────────────────────────────────────
-
 const BASE = "/api";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -31,8 +29,6 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-// ── Read endpoints ──────────────────────────────────────────────────────
-
 export function getState(): Promise<StateSnapshot> {
   return request<StateSnapshot>("/state");
 }
@@ -40,8 +36,6 @@ export function getState(): Promise<StateSnapshot> {
 export function getConfig(): Promise<ConfigResponse> {
   return request<ConfigResponse>("/config");
 }
-
-// ── Write endpoints ─────────────────────────────────────────────────────
 
 /** POST /api/blank — force-blank a display by id. */
 export function postBlank(display: string): Promise<void> {

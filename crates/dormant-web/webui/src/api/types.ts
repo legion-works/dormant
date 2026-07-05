@@ -1,7 +1,7 @@
 /**
  * TypeScript mirrors of the dormant-core serde wire shapes.
  *
- * Every type here is hand-verified against the Rust source (single source
+ * Every type is hand-verified against the Rust source (single source
  * of truth).  Serde rename attributes are accounted for — enums use the
  * exact wire strings.  Newtype IDs (SensorId, DisplayId, ZoneId, RuleId)
  * are `#[serde(transparent)]` and appear as plain `string` on the wire.
@@ -15,27 +15,44 @@
  *   crates/dormant-web/src/routes/config.rs  — ConfigResponse
  */
 
-// ── Enums (wire string literals — must match serde rename_all) ──────────
+// ── Enums — runtime `as const` arrays ARE the single source; types are
+//    derived from them so the drift-guard test can assert exact strings.
 
 /** rust: SensorState, serde(rename_all = "lowercase") */
-export type SensorState = "present" | "absent" | "unavailable";
+export const SENSOR_STATES = ["present", "absent", "unavailable"] as const;
+export type SensorState = (typeof SENSOR_STATES)[number];
 
 /** rust: BlankMode, serde(rename_all = "snake_case") */
-export type BlankMode = "power_off" | "screen_off_audio_on" | "brightness_zero";
+export const BLANK_MODES = ["power_off", "screen_off_audio_on", "brightness_zero"] as const;
+export type BlankMode = (typeof BLANK_MODES)[number];
 
 /** rust: ControllerRole, serde(rename_all = "snake_case") */
-export type ControllerRole = "primary" | "fallback";
+export const CONTROLLER_ROLES = ["primary", "fallback"] as const;
+export type ControllerRole = (typeof CONTROLLER_ROLES)[number];
 
 /** rust: CheckStatus, serde(rename_all = "snake_case") */
-export type CheckStatus = "ok" | "fail" | "skip" | "not_supported";
+export const CHECK_STATUSES = ["ok", "fail", "skip", "not_supported"] as const;
+export type CheckStatus = (typeof CHECK_STATUSES)[number];
 
 /** rust: UnavailablePolicy, serde(rename_all = "lowercase") */
-export type UnavailablePolicy = "present" | "absent";
+export const UNAVAILABLE_POLICIES = ["present", "absent"] as const;
+export type UnavailablePolicy = (typeof UNAVAILABLE_POLICIES)[number];
 
-/** rust: SensorKind, serde(rename_all = "snake_case") — display label */
+/** rust: SensorKind, serde(rename_all = "snake_case") */
 export type SensorKind = "presence" | "motion";
 
-// ── Domain snapshots ────────────────────────────────────────────────────
+/**
+ * DaemonEvent discriminator tags.
+ * rust: rules.rs DaemonEvent, serde(tag = "event", rename_all = "snake_case")
+ */
+export const DAEMON_EVENT_TAGS = [
+  "sensor_changed",
+  "zone_changed",
+  "display_phase",
+  "config_reloaded",
+  "wake_retry",
+] as const;
+export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
 /**
  * rust: rules.rs SensorSnapshot
@@ -91,8 +108,6 @@ export interface StateSnapshot {
   pending_reload: string | null;
 }
 
-// ── Daemon events (tagged enum) ─────────────────────────────────────────
-
 /**
  * rust: rules.rs DaemonEvent, serde(tag = "event", rename_all = "snake_case")
  *
@@ -136,8 +151,6 @@ export interface WakeRetryEvent {
   attempt: number;
 }
 
-// ── Doctor ──────────────────────────────────────────────────────────────
-
 /**
  * rust: doctor.rs Check
  * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
@@ -148,14 +161,10 @@ export interface Check {
   detail?: string;
 }
 
-/**
- * rust: doctor.rs DoctorReport
- */
+/** rust: doctor.rs DoctorReport */
 export interface DoctorReport {
   checks: Check[];
 }
-
-// ── Config (GET /api/config) ────────────────────────────────────────────
 
 /**
  * rust: config/routes.rs ConfigValidation
@@ -167,9 +176,7 @@ export interface ConfigValidation {
   load_error?: string;
 }
 
-/**
- * rust: config/routes.rs DisplayRuleInfo
- */
+/** rust: config/routes.rs DisplayRuleInfo */
 export interface DisplayRuleInfo {
   rule: string;
   zone: string;
@@ -197,6 +204,7 @@ export type SensorConfig =
   | { type: "ha" } & HaSensorCfg
   | { type: "usb-ld2410" } & UsbLd2410Cfg;
 
+/** rust: config/schema.rs MqttSensorCfg */
 export interface MqttSensorCfg {
   broker_url: string;
   topic: string;
@@ -204,22 +212,20 @@ export interface MqttSensorCfg {
   payload_on?: string;
   payload_off?: string;
   kind?: SensorKind;
-  hold_time?: unknown; // humantime-serialized Duration
+  hold_time?: unknown;
   stale_timeout?: unknown;
 }
 
-/** rust: config/schema.rs HaSensorCfg (field names: url, entity) */
+/** rust: config/schema.rs HaSensorCfg (fields: url, entity, kind, hold_time, stale_timeout) */
 export interface HaSensorCfg {
   url: string;
   entity: string;
-  payload_on?: string;
-  payload_off?: string;
   kind?: SensorKind;
   hold_time?: unknown;
   stale_timeout?: unknown;
 }
 
-/** rust: config/schema.rs UsbLd2410Cfg (field names: port, baud) */
+/** rust: config/schema.rs UsbLd2410Cfg (fields: port, baud, kind, hold_time, stale_timeout) */
 export interface UsbLd2410Cfg {
   port: string;
   baud?: number;
@@ -255,7 +261,7 @@ export interface DisplayConfig {
   blank_data?: unknown;
   wake_service?: string;
   wake_data?: unknown;
-  command_timeout?: unknown; // humantime
+  command_timeout?: unknown;
   restore_brightness?: number;
   treat_unreachable_as_blanked?: boolean;
 }

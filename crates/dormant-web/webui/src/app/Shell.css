@@ -9,7 +9,6 @@
   font-family: var(--font-ui);
 }
 
-/* ── Sidebar (244px) ──────────────────────────────────────────── */
 .sidebar {
   width: 244px;
   min-width: 244px;
@@ -147,7 +146,6 @@
   color: var(--text-muted);
 }
 
-/* ── Main column ───────────────────────────────────────────────── */
 .main {
   flex: 1;
   display: flex;
@@ -236,7 +234,6 @@
   padding: 22px 26px 40px;
 }
 
-/* ── Respect reduced-motion ──────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   .nav-item,
   .topbar-reload {

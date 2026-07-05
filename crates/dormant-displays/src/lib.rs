@@ -16,4 +16,5 @@ pub mod ddcci;
 pub mod executor;
 pub mod ha_passthrough;
 pub mod registry;
+pub mod samsung_tizen;
 pub mod vcp_ops;

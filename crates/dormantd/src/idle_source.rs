@@ -441,11 +441,12 @@ fn check_wayland_available() -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
 
-    // A single blocking dispatch processes the initial registry events.
-    event_queue.blocking_dispatch(&mut AvailState::default())?;
+    // Roundtrip to ensure all initial globals (including ext_idle_notifier_v1)
+    // have been received before we check availability.
+    let mut probe_state = AvailState::default();
+    event_queue.roundtrip(&mut probe_state)?;
 
-    // After dispatch, check if ext_idle_notifier_v1 was advertised.
-    Ok(AvailState::default().idle_notifier)
+    Ok(probe_state.idle_notifier)
 }
 
 // ── WlState + Dispatch impls (Linux-only) ──────────────────────────────────────
@@ -580,7 +581,6 @@ impl IdleSource for WaylandIdleNotifier {
 /// The blocking thread is verified live on hardware (Wayland compositor); the
 /// async fail-safe wiring (cancel, channel-close→inactive) is testable in CI.
 #[cfg(target_os = "linux")]
-#[allow(unused_assignments)] // warned_offline true → return means value is never read; reconnect loop would use it
 #[allow(clippy::too_many_lines)] // the blocking closure + async orchestration is co-located intentionally
 async fn wayland_run(
     rules: Vec<ActivityRule>,
@@ -591,147 +591,150 @@ async fn wayland_run(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
-
     let timeout = timeout_ms;
     let mut warned_offline = false;
 
-    // Cancel flag shared with the blocking thread so it can interrupt polling.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-
-    let cancel_flag_clone = Arc::clone(&cancel_flag);
-    let wl_handle = tokio::task::spawn_blocking::<_, Result<(), String>>(move || {
-        use rustix::event::{PollFd, PollFlags, poll};
-        use rustix::time::Timespec;
-        use wayland_client::{Connection, globals::registry_queue_init, protocol::wl_seat};
-        use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
-
-        let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
-
-        let (globals, mut event_queue) =
-            registry_queue_init::<WlState>(&conn).map_err(|e| format!("wayland registry: {e}"))?;
-        let qh = event_queue.handle();
-
-        // Bind the wake seat — used only as a parameter to get_idle_notification.
-        let seat: wl_seat::WlSeat = globals
-            .bind(&qh, 1..=7, ())
-            .map_err(|e| format!("bind wl_seat: {e}"))?;
-
-        // Bind the idle notifier.
-        let notifier: ExtIdleNotifierV1 = globals
-            .bind(&qh, 1..=1, ())
-            .map_err(|e| format!("bind ext_idle_notifier_v1: {e}"))?;
-
-        // Create the idle notification with our timeout.
-        notifier.get_idle_notification(timeout, &seat, &qh, ());
-
-        // Roundtrip to ensure the notification request was sent.
-        let mut state = WlState {
-            idled_sender: Some(ev_tx),
-        };
-        event_queue
-            .roundtrip(&mut state)
-            .map_err(|e| format!("wayland roundtrip: {e}"))?;
-
-        // Polling-based event loop — interruptible via cancel_flag.
-        loop {
-            // Dispatch any events buffered from previous reads or other threads.
-            event_queue
-                .dispatch_pending(&mut state)
-                .map_err(|e| format!("dispatch_pending: {e}"))?;
-
-            // Flush outgoing requests.
-            event_queue.flush().map_err(|e| format!("flush: {e}"))?;
-
-            // Prepare to read from the Wayland socket.
-            let read_guard = event_queue
-                .prepare_read()
-                .ok_or_else(|| "prepare_read returned None — queue already reading".to_string())?;
-
-            let fd = read_guard.connection_fd();
-            let mut pollfds = [PollFd::new(&fd, PollFlags::IN)];
-
-            let poll_timeout = Timespec {
-                tv_sec: 0,
-                tv_nsec: 200_000_000, // 200 ms
-            };
-            match poll(&mut pollfds, Some(&poll_timeout)) {
-                // Timeout or interrupted — check cancel flag, loop.
-                Ok(0) | Err(rustix::io::Errno::INTR) => {
-                    drop(read_guard);
-                    if cancel_flag_clone.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    drop(read_guard);
-                    return Err(format!("poll error: {e}"));
-                }
-                Ok(_) => {
-                    // Socket readable — ingest events.
-                    read_guard.read().map_err(|e| format!("read_events: {e}"))?;
-                }
-            }
-
-            // Dispatch the newly-read events.
-            event_queue
-                .dispatch_pending(&mut state)
-                .map_err(|e| format!("dispatch_pending(2): {e}"))?;
-
-            if cancel_flag_clone.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-        }
-    });
-
-    // Main loop: wait for Wayland events or cancellation.
+    // Outer reconnect loop: if the Wayland connection drops, wait and reconnect
+    // rather than letting the inhibitor task exit (MUST 3 fix).
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                cancel_flag.store(true, Ordering::Relaxed);
-                wl_handle.abort();
-                return;
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+
+        // Cancel flag shared with the blocking thread so it can interrupt polling.
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let cancel_flag_clone = Arc::clone(&cancel_flag);
+        let wl_handle = tokio::task::spawn_blocking::<_, Result<(), String>>(move || {
+            use rustix::event::{PollFd, PollFlags, poll};
+            use rustix::time::Timespec;
+            use wayland_client::{Connection, globals::registry_queue_init, protocol::wl_seat};
+            use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
+
+            let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
+
+            let (globals, mut event_queue) = registry_queue_init::<WlState>(&conn)
+                .map_err(|e| format!("wayland registry: {e}"))?;
+            let qh = event_queue.handle();
+
+            // Bind the wake seat — used only as a parameter to get_idle_notification.
+            let seat: wl_seat::WlSeat = globals
+                .bind(&qh, 1..=7, ())
+                .map_err(|e| format!("bind wl_seat: {e}"))?;
+
+            // Bind the idle notifier.
+            let notifier: ExtIdleNotifierV1 = globals
+                .bind(&qh, 1..=1, ())
+                .map_err(|e| format!("bind ext_idle_notifier_v1: {e}"))?;
+
+            // Create the idle notification with our timeout.
+            notifier.get_idle_notification(timeout, &seat, &qh, ());
+
+            // Roundtrip to ensure the notification request was sent.
+            let mut state = WlState {
+                idled_sender: Some(ev_tx),
+            };
+            event_queue
+                .roundtrip(&mut state)
+                .map_err(|e| format!("wayland roundtrip: {e}"))?;
+
+            // Polling-based event loop — interruptible via cancel_flag.
+            loop {
+                // Dispatch any events buffered from previous reads or other threads.
+                event_queue
+                    .dispatch_pending(&mut state)
+                    .map_err(|e| format!("dispatch_pending: {e}"))?;
+
+                // Flush outgoing requests.
+                event_queue.flush().map_err(|e| format!("flush: {e}"))?;
+
+                // Prepare to read from the Wayland socket.
+                let read_guard = event_queue.prepare_read().ok_or_else(|| {
+                    "prepare_read returned None — queue already reading".to_string()
+                })?;
+
+                let fd = read_guard.connection_fd();
+                let mut pollfds = [PollFd::new(&fd, PollFlags::IN)];
+
+                let poll_timeout = Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 200_000_000, // 200 ms
+                };
+                match poll(&mut pollfds, Some(&poll_timeout)) {
+                    // Timeout or interrupted — check cancel flag, loop.
+                    Ok(0) | Err(rustix::io::Errno::INTR) => {
+                        drop(read_guard);
+                        if cancel_flag_clone.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        drop(read_guard);
+                        return Err(format!("poll error: {e}"));
+                    }
+                    Ok(_) => {
+                        // Socket readable — ingest events.
+                        read_guard.read().map_err(|e| format!("read_events: {e}"))?;
+                    }
+                }
+
+                // Dispatch the newly-read events.
+                event_queue
+                    .dispatch_pending(&mut state)
+                    .map_err(|e| format!("dispatch_pending(2): {e}"))?;
+
+                if cancel_flag_clone.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
             }
-            event = ev_rx.recv() => {
-                if let Some(idled) = event {
-                    // idled = true → user is idle (inactive, not inhibited)
-                    // idled = false → user resumed (active, inhibited)
-                    for r in &rules {
-                        let inhibited = !idled;
-                        let _ = ctl.try_send(ControlMsg::SetInhibited {
-                            rule: Some(r.rule.clone()),
-                            inhibited,
-                        });
-                    }
-                    if warned_offline {
-                        tracing::info!(event = "wayland_idle_reconnected");
-                        warned_offline = false;
-                    }
-                } else {
-                    // Channel closed — Wayland thread exited.
-                    if !warned_offline {
-                        tracing::warn!(
-                            event = "wayland_idle_disconnected",
-                            "Wayland idle source disconnected; treating user as inactive",
-                        );
-                        warned_offline = true;
-                    }
-                    // Treat as inactive (fail-toward-blanking).
-                    for r in &rules {
-                        let _ = ctl.try_send(ControlMsg::SetInhibited {
-                            rule: Some(r.rule.clone()),
-                            inhibited: false,
-                        });
-                    }
-                    // Reconnect after a delay.
-                    tokio::select! {
-                        () = cancel.cancelled() => return,
-                        () = tokio::time::sleep(DBUS_RECONNECT_INTERVAL) => {},
-                    }
-                    // Reconnect: re-spawn the blocking task (outer loop re-enters spawn).
+        });
+
+        // Inner loop: wait for Wayland events or cancellation within one connection.
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    cancel_flag.store(true, Ordering::Relaxed);
+                    wl_handle.abort();
                     return;
+                }
+                event = ev_rx.recv() => {
+                    if let Some(idled) = event {
+                        // idled = true → user is idle (inactive, not inhibited)
+                        // idled = false → user resumed (active, inhibited)
+                        for r in &rules {
+                            let inhibited = !idled;
+                            let _ = ctl.try_send(ControlMsg::SetInhibited {
+                                rule: Some(r.rule.clone()),
+                                inhibited,
+                            });
+                        }
+                        if warned_offline {
+                            tracing::info!(event = "wayland_idle_reconnected");
+                            warned_offline = false;
+                        }
+                    } else {
+                        // Channel closed — Wayland thread exited.
+                        if !warned_offline {
+                            tracing::warn!(
+                                event = "wayland_idle_disconnected",
+                                "Wayland idle source disconnected; treating user as inactive",
+                            );
+                            warned_offline = true;
+                        }
+                        // Treat as inactive (fail-toward-blanking).
+                        for r in &rules {
+                            let _ = ctl.try_send(ControlMsg::SetInhibited {
+                                rule: Some(r.rule.clone()),
+                                inhibited: false,
+                            });
+                        }
+                        // Reconnect after a delay, then respawn via the outer loop.
+                        tokio::select! {
+                            () = cancel.cancelled() => return,
+                            () = tokio::time::sleep(DBUS_RECONNECT_INTERVAL) => {},
+                        }
+                        break;
+                    }
                 }
             }
         }

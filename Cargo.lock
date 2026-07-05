@@ -753,6 +753,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dormant-doctor"
+version = "0.0.0"
+dependencies = [
+ "dormant-core",
+ "dormant-displays",
+ "dormant-sensors",
+ "futures-util",
+ "rumqttc",
+ "serde_json",
+ "tokio",
+ "tokio-serial",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "dormant-sensors"
 version = "0.0.0"
 dependencies = [
@@ -782,6 +797,7 @@ dependencies = [
  "comfy-table",
  "dormant-core",
  "dormant-displays",
+ "dormant-doctor",
  "dormant-sensors",
  "futures-util",
  "humantime",

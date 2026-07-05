@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #0b0d0e; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #23282b; border-radius: 6px; border: 2px solid #0b0d0e; }
+  ::-webkit-scrollbar-thumb:hover { background: #2f3538; }
+  @keyframes dm-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @keyframes dm-ring { 0% { transform: scale(0.8); opacity: 0.7; } 100% { transform: scale(2.4); opacity: 0; } }
+  @keyframes dm-fade { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+</style>
+</helmet>
+<div style="display:grid; grid-template-columns: 236px 1fr; height:100vh; width:100%; background:#0b0d0e; color:#e7eae8; font-family:'IBM Plex Sans',system-ui,sans-serif; font-size:14px; line-height:1.5; overflow:hidden;">
+
+  <aside style="display:flex; flex-direction:column; background:#0e1113; border-right:1px solid rgba(255,255,255,0.07); min-height:0;">
+    <div style="display:flex; align-items:center; gap:11px; padding:19px 20px 17px; border-bottom:1px solid rgba(255,255,255,0.07);">
+      <svg width="26" height="26" viewBox="0 0 32 32" style="flex:none;">
+        <circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle>
+        <circle cx="21.5" cy="12.5" r="10.5" fill="#0e1113"></circle>
+        <circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle>
+      </svg>
+      <div style="display:flex; flex-direction:column; line-height:1.1;">
+        <span style="font-weight:700; letter-spacing:-0.01em; font-size:16px;">dormant</span>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#59615c; letter-spacing:0.02em; margin-top:2px;">v0.1.0 · pre-alpha</span>
+      </div>
+    </div>
+
+    <nav style="display:flex; flex-direction:column; gap:2px; padding:12px 12px;">
+      <sc-for list="{{ nav }}" as="n" hint-placeholder-count="5">
+        <button onClick="{{ n.go }}" style="{{ n.style }}" style-hover="background:rgba(255,255,255,0.05);">
+          <span style="display:flex; width:17px; justify-content:center; color:{{ n.icColor }};">{{ n.icon }}</span>
+          <span>{{ n.label }}</span>
+          <sc-if value="{{ n.badge }}" hint-placeholder-val="">
+            <span style="margin-left:auto; font-family:'IBM Plex Mono',monospace; font-size:10.5px; background:{{ n.badgeBg }}; color:{{ n.badgeColor }}; padding:1px 6px; border-radius:20px;">{{ n.badge }}</span>
+          </sc-if>
+        </button>
+      </sc-for>
+    </nav>
+
+    <div style="margin-top:auto; padding:14px 16px; border-top:1px solid rgba(255,255,255,0.07); display:flex; flex-direction:column; gap:9px;">
+      <div style="display:flex; align-items:center; gap:9px;">
+        <span style="position:relative; width:8px; height:8px; flex:none;">
+          <span style="position:absolute; inset:0; border-radius:50%; background:oklch(0.80 0.15 155); animation:dm-ring 2.4s ease-out infinite;"></span>
+          <span style="position:absolute; inset:0; border-radius:50%; background:oklch(0.80 0.15 155);"></span>
+        </span>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#c8cdc9;">dormantd running</span>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#59615c; line-height:1.7;">
+        pid {{ daemon.pid }} · up {{ daemon.uptime }}<br>{{ daemon.socket }}
+      </div>
+    </div>
+  </aside>
+
+  <main style="display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden;">
+    <header style="display:flex; align-items:center; gap:16px; padding:0 26px; height:60px; border-bottom:1px solid rgba(255,255,255,0.07); flex:none;">
+      <div style="display:flex; flex-direction:column; line-height:1.2;">
+        <h1 style="margin:0; font-size:15.5px; font-weight:600; letter-spacing:-0.01em;">{{ tabTitle }}</h1>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#59615c;">{{ tabSub }}</span>
+      </div>
+      <div style="margin-left:auto; display:flex; align-items:center; gap:10px;">
+        <div style="display:flex; align-items:center; gap:7px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#8a938e; padding:6px 11px; border:1px solid rgba(255,255,255,0.07); border-radius:7px;">
+          <span style="color:#59615c;">cfg</span>{{ daemon.config }}
+        </div>
+        <div style="display:flex; align-items:center; gap:7px; font-family:'IBM Plex Mono',monospace; font-size:12px; color:#c8cdc9; padding:6px 11px; background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:7px;">
+          <span style="width:6px; height:6px; border-radius:50%; background:oklch(0.80 0.15 155);"></span>{{ clock }}
+        </div>
+        <button onClick="{{ reload }}" style="display:flex; align-items:center; gap:7px; font-family:'IBM Plex Sans',sans-serif; font-size:12.5px; font-weight:500; color:#cfe9d8; background:oklch(0.80 0.15 155 / 0.13); border:1px solid oklch(0.80 0.15 155 / 0.35); border-radius:7px; padding:7px 13px; cursor:pointer;" style-hover="background:oklch(0.80 0.15 155 / 0.22);">
+          <span style="font-family:'IBM Plex Mono',monospace;">↻</span> Reload config
+        </button>
+      </div>
+    </header>
+
+    <sc-if value="{{ pendingReload }}" hint-placeholder-val="">
+      <div style="display:flex; align-items:center; gap:10px; margin:16px 26px 0; padding:11px 15px; background:oklch(0.82 0.13 78 / 0.10); border:1px solid oklch(0.82 0.13 78 / 0.35); border-radius:9px; font-size:13px; color:#e8d8b0; animation:dm-fade 0.3s ease;">
+        <span style="font-family:'IBM Plex Mono',monospace; color:oklch(0.82 0.13 78);">⚠</span>
+        Config reload pending — {{ pendingReload }}
+      </div>
+    </sc-if>
+
+    <div style="flex:1; overflow-y:auto; padding:22px 26px 40px; min-height:0;">
+
+      <!-- DASHBOARD -->
+      <sc-if value="{{ showDashboard }}" hint-placeholder-val="{{ true }}">
+        <div data-screen-label="Dashboard">
+          <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:22px;">
+            <sc-for list="{{ stats }}" as="s" hint-placeholder-count="4">
+              <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; padding:16px 17px;">
+                <div style="display:flex; align-items:center; gap:8px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; text-transform:uppercase; letter-spacing:0.06em;">
+                  <span style="width:6px; height:6px; border-radius:50%; background:{{ s.dot }};"></span>{{ s.label }}
+                </div>
+                <div style="font-size:27px; font-weight:600; letter-spacing:-0.02em; margin-top:11px; line-height:1;">{{ s.value }}</div>
+                <div style="font-size:12px; color:#8a938e; margin-top:7px;">{{ s.sub }}</div>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px; margin:4px 0 13px;">
+            <h2 style="margin:0; font-size:12px; font-weight:600; font-family:'IBM Plex Mono',monospace; text-transform:uppercase; letter-spacing:0.08em; color:#8a938e;">Signal flow</h2>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#59615c;">sensors → zones → displays</span>
+            <div style="flex:1; height:1px; background:rgba(255,255,255,0.06);"></div>
+          </div>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; align-items:start;">
+            <!-- sensors col -->
+            <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+              <div style="padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; text-transform:uppercase; letter-spacing:0.06em;">Sensors</div>
+              <sc-for list="{{ sensors }}" as="s" hint-placeholder-count="4">
+                <div style="display:flex; align-items:center; gap:11px; padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <span style="position:relative; width:9px; height:9px; flex:none;">
+                    <span style="{{ s.pulse }}"></span>
+                    <span style="position:absolute; inset:0; border-radius:50%; background:{{ s.color }};"></span>
+                  </span>
+                  <div style="min-width:0; flex:1;">
+                    <div style="font-weight:500; font-size:13px;">{{ s.id }}</div>
+                    <div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#59615c;">{{ s.typeLabel }}</div>
+                  </div>
+                  <div style="text-align:right;">
+                    <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:{{ s.color }};">{{ s.stateLabel }}</div>
+                    <div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#59615c;">{{ s.lastSeen }}</div>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+            <!-- zones col -->
+            <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+              <div style="padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; text-transform:uppercase; letter-spacing:0.06em;">Zones</div>
+              <sc-for list="{{ zones }}" as="z" hint-placeholder-count="2">
+                <div style="padding:13px 15px; border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <div style="display:flex; align-items:center; gap:9px;">
+                    <span style="width:9px; height:9px; border-radius:50%; background:{{ z.color }}; flex:none;"></span>
+                    <span style="font-weight:500; font-size:13px;">{{ z.id }}</span>
+                    <span style="margin-left:auto; font-family:'IBM Plex Mono',monospace; font-size:11px; color:{{ z.color }};">{{ z.stateLabel }}</span>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:6px; margin-top:9px; padding-left:18px; flex-wrap:wrap;">
+                    <span style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; background:#191d1f; padding:2px 7px; border-radius:5px;">{{ z.modeLabel }}</span>
+                    <span style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#8a938e;">{{ z.membersLabel }}</span>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+            <!-- displays col -->
+            <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+              <div style="padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; text-transform:uppercase; letter-spacing:0.06em;">Displays</div>
+              <sc-for list="{{ displays }}" as="d" hint-placeholder-count="3">
+                <div style="padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <div style="display:flex; align-items:center; gap:9px;">
+                    <span style="font-weight:500; font-size:13px;">{{ d.id }}</span>
+                    <span style="margin-left:auto; display:inline-flex; align-items:center; gap:6px; font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:{{ d.phaseColor }}; background:{{ d.phaseBg }}; padding:2px 8px; border-radius:20px;"><span style="width:5px; height:5px; border-radius:50%; background:{{ d.phaseColor }};"></span>{{ d.phaseLabel }}</span>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:7px; margin-top:9px;">
+                    <button onClick="{{ d.blank }}" style="flex:1; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#c8cdc9; background:#191d1f; border:1px solid rgba(255,255,255,0.09); border-radius:6px; padding:6px 0; cursor:pointer;" style-hover="border-color:rgba(255,255,255,0.2);">blank</button>
+                    <button onClick="{{ d.wake }}" style="flex:1; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#c8cdc9; background:#191d1f; border:1px solid rgba(255,255,255,0.09); border-radius:6px; padding:6px 0; cursor:pointer;" style-hover="border-color:rgba(255,255,255,0.2);">wake</button>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:10px; margin:26px 0 13px;">
+            <h2 style="margin:0; font-size:12px; font-weight:600; font-family:'IBM Plex Mono',monospace; text-transform:uppercase; letter-spacing:0.08em; color:#8a938e;">Recent activity</h2>
+            <div style="flex:1; height:1px; background:rgba(255,255,255,0.06);"></div>
+            <button onClick="{{ goEvents }}" style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; background:none; border:none; cursor:pointer;" style-hover="color:#e7eae8;">view all →</button>
+          </div>
+          <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+            <sc-for list="{{ recentEvents }}" as="e" hint-placeholder-count="5">
+              <div style="display:flex; align-items:center; gap:14px; padding:9px 15px; border-bottom:1px solid rgba(255,255,255,0.04); font-family:'IBM Plex Mono',monospace; font-size:12px;">
+                <span style="color:#59615c; flex:none;">{{ e.time }}</span>
+                <span style="flex:none; color:{{ e.color }}; background:{{ e.bg }}; padding:1px 7px; border-radius:5px; font-size:10.5px; min-width:96px; text-align:center;">{{ e.type }}</span>
+                <span style="color:#c8cdc9;">{{ e.text }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- DISPLAYS -->
+      <sc-if value="{{ showDisplays }}" hint-placeholder-val="">
+        <div data-screen-label="Displays" style="display:flex; flex-direction:column; gap:14px;">
+          <sc-for list="{{ displays }}" as="d" hint-placeholder-count="3">
+            <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:12px; padding:20px 22px;">
+              <div style="display:flex; align-items:flex-start; gap:16px;">
+                <div style="flex:none; width:96px; height:60px; border-radius:8px; background:{{ d.screenBg }}; border:1px solid {{ d.screenBorder }}; display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden;">
+                  <span style="font-family:'IBM Plex Mono',monospace; font-size:9.5px; color:{{ d.phaseColor }};">{{ d.screenGlyph }}</span>
+                </div>
+                <div style="flex:1; min-width:0;">
+                  <div style="display:flex; align-items:center; gap:11px;">
+                    <span style="font-size:16px; font-weight:600;">{{ d.id }}</span>
+                    <span style="display:inline-flex; align-items:center; gap:6px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:{{ d.phaseColor }}; background:{{ d.phaseBg }}; padding:2px 9px; border-radius:20px;"><span style="width:5px; height:5px; border-radius:50%; background:{{ d.phaseColor }};"></span>{{ d.phaseLabel }}</span>
+                    <sc-if value="{{ d.paused }}" hint-placeholder-val="">
+                      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:oklch(0.82 0.13 78); background:oklch(0.82 0.13 78 / 0.12); padding:2px 9px; border-radius:20px;">paused</span>
+                    </sc-if>
+                    <sc-if value="{{ d.inhibited }}" hint-placeholder-val="">
+                      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:oklch(0.74 0.09 240); background:oklch(0.74 0.09 240 / 0.12); padding:2px 9px; border-radius:20px;">inhibited</span>
+                    </sc-if>
+                  </div>
+                  <div style="display:grid; grid-template-columns:repeat(4,auto); gap:26px; margin-top:15px; width:fit-content;">
+                    <div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; text-transform:uppercase; letter-spacing:0.06em;">Blank mode</div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:#c8cdc9; margin-top:5px;">{{ d.blankMode }}</div>
+                    </div>
+                    <div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; text-transform:uppercase; letter-spacing:0.06em;">Driven by zone</div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:#c8cdc9; margin-top:5px;">{{ d.zone }}</div>
+                    </div>
+                    <div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; text-transform:uppercase; letter-spacing:0.06em;">Rule</div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:#c8cdc9; margin-top:5px;">{{ d.rule }}</div>
+                    </div>
+                    <div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; text-transform:uppercase; letter-spacing:0.06em;">Cmd gen</div>
+                      <div style="font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:#c8cdc9; margin-top:5px;">{{ d.cmdGen }}</div>
+                    </div>
+                  </div>
+                  <div style="margin-top:15px;">
+                    <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:8px;">Controller chain (fallback order)</div>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                      <sc-for list="{{ d.controllers }}" as="c" hint-placeholder-count="2">
+                        <span style="display:inline-flex; align-items:center; gap:7px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:{{ c.color }}; background:#191d1f; border:1px solid {{ c.border }}; padding:5px 10px; border-radius:7px;">
+                          <span style="width:6px; height:6px; border-radius:50%; background:{{ c.dot }};"></span>{{ c.name }}<span style="color:#59615c; font-size:10px;">{{ c.status }}</span>
+                        </span>
+                      </sc-for>
+                    </div>
+                  </div>
+                </div>
+                <div style="flex:none; display:flex; flex-direction:column; gap:8px; width:130px;">
+                  <button onClick="{{ d.blank }}" style="font-family:'IBM Plex Sans',sans-serif; font-size:12.5px; font-weight:500; color:#e7eae8; background:#191d1f; border:1px solid rgba(255,255,255,0.12); border-radius:7px; padding:9px 0; cursor:pointer;" style-hover="border-color:rgba(255,255,255,0.25);">Force blank</button>
+                  <button onClick="{{ d.wake }}" style="font-family:'IBM Plex Sans',sans-serif; font-size:12.5px; font-weight:500; color:#cfe9d8; background:oklch(0.80 0.15 155 / 0.13); border:1px solid oklch(0.80 0.15 155 / 0.35); border-radius:7px; padding:9px 0; cursor:pointer;" style-hover="background:oklch(0.80 0.15 155 / 0.22);">Force wake</button>
+                  <button onClick="{{ d.togglePause }}" style="{{ d.pauseStyle }}" style-hover="border-color:rgba(255,255,255,0.25);">{{ d.pauseLabel }}</button>
+                </div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <!-- EVENTS -->
+      <sc-if value="{{ showEvents }}" hint-placeholder-val="">
+        <div data-screen-label="Events">
+          <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px;">
+            <div style="display:flex; align-items:center; gap:8px; font-family:'IBM Plex Mono',monospace; font-size:12px; color:#c8cdc9;">
+              <span style="width:7px; height:7px; border-radius:50%; background:oklch(0.80 0.15 155); animation:dm-pulse 1.6s ease infinite;"></span>live · subscribed to daemon event stream
+            </div>
+            <span style="margin-left:auto; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#59615c;">{{ eventCount }} events</span>
+          </div>
+          <div style="background:#0e1113; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+            <sc-for list="{{ events }}" as="e" hint-placeholder-count="9">
+              <div style="display:grid; grid-template-columns:82px 118px 1fr; align-items:center; gap:14px; padding:9px 16px; border-bottom:1px solid rgba(255,255,255,0.04); font-family:'IBM Plex Mono',monospace; font-size:12px;">
+                <span style="color:#59615c;">{{ e.time }}</span>
+                <span style="color:{{ e.color }}; background:{{ e.bg }}; padding:2px 8px; border-radius:5px; font-size:10.5px; text-align:center;">{{ e.type }}</span>
+                <span style="color:#c8cdc9;">{{ e.text }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- CONFIG -->
+      <sc-if value="{{ showConfig }}" hint-placeholder-val="">
+        <div data-screen-label="Config" style="display:grid; grid-template-columns: 1.1fr 0.9fr; gap:16px; align-items:start;">
+          <div style="background:#0e1113; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+            <div style="display:flex; align-items:center; gap:9px; padding:11px 16px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#8a938e;">
+              <span style="color:#59615c;">📄</span>~/.config/dormant/config.toml
+              <span style="margin-left:auto; color:oklch(0.80 0.15 155); font-size:11px;">✓ valid · v1</span>
+            </div>
+            <div style="padding:15px 18px; font-family:'IBM Plex Mono',monospace; font-size:12px; line-height:1.85; color:#c8cdc9;">
+              <sc-for list="{{ configLines }}" as="l" hint-placeholder-count="20">
+                <div style="white-space:pre; min-height:1.85em;"><span style="color:#59615c;">{{ l.pre }}</span><span style="color:oklch(0.74 0.09 240);">{{ l.key }}</span><span style="color:#8a938e;">{{ l.eq }}</span><span style="color:{{ l.valColor }};">{{ l.val }}</span><span style="color:#59615c;">{{ l.comment }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:14px;">
+            <div style="background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; padding:16px 18px;">
+              <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:13px;">Parsed inventory</div>
+              <sc-for list="{{ configSummary }}" as="c" hint-placeholder-count="4">
+                <div style="display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8a938e; width:90px;">{{ c.k }}</span>
+                  <span style="font-size:13px; color:#e7eae8;">{{ c.v }}</span>
+                  <span style="margin-left:auto; font-family:'IBM Plex Mono',monospace; font-size:11px; color:oklch(0.80 0.15 155);">{{ c.n }}</span>
+                </div>
+              </sc-for>
+            </div>
+            <div style="background:oklch(0.80 0.15 155 / 0.06); border:1px solid oklch(0.80 0.15 155 / 0.25); border-radius:11px; padding:15px 18px; display:flex; gap:12px; align-items:flex-start;">
+              <span style="font-family:'IBM Plex Mono',monospace; color:oklch(0.80 0.15 155);">✓</span>
+              <div style="font-size:12.5px; color:#b8d8c4; line-height:1.6;">Configuration parsed with no unknown keys. All zone members resolve to defined sensors; all rule displays are defined. Reload is safe.</div>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- DOCTOR -->
+      <sc-if value="{{ showDoctor }}" hint-placeholder-val="">
+        <div data-screen-label="Doctor">
+          <div style="display:flex; gap:12px; margin-bottom:16px;">
+            <sc-for list="{{ doctorSummary }}" as="d" hint-placeholder-count="3">
+              <div style="flex:1; background:#131618; border:1px solid rgba(255,255,255,0.07); border-radius:11px; padding:15px 17px;">
+                <div style="font-size:26px; font-weight:600; color:{{ d.color }}; line-height:1;">{{ d.count }}</div>
+                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8a938e; text-transform:uppercase; letter-spacing:0.06em; margin-top:8px;">{{ d.label }}</div>
+              </div>
+            </sc-for>
+          </div>
+          <div style="background:#0e1113; border:1px solid rgba(255,255,255,0.07); border-radius:11px; overflow:hidden;">
+            <sc-for list="{{ doctorChecks }}" as="c" hint-placeholder-count="7">
+              <div style="display:flex; align-items:flex-start; gap:13px; padding:13px 17px; border-bottom:1px solid rgba(255,255,255,0.04);">
+                <span style="flex:none; width:20px; height:20px; border-radius:50%; background:{{ c.iconBg }}; color:{{ c.color }}; display:flex; align-items:center; justify-content:center; font-family:'IBM Plex Mono',monospace; font-size:11px; margin-top:1px;">{{ c.icon }}</span>
+                <div style="flex:1; min-width:0;">
+                  <div style="font-size:13.5px; font-weight:500; color:#e7eae8;">{{ c.title }}</div>
+                  <div style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#8a938e; margin-top:3px;">{{ c.detail }}</div>
+                </div>
+                <span style="flex:none; font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:{{ c.color }}; background:{{ c.iconBg }}; padding:2px 9px; border-radius:20px; text-transform:uppercase; letter-spacing:0.04em;">{{ c.tag }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+    </div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = {
+    tab: 'dashboard',
+    clock: '',
+    pendingReload: null,
+    sensors: [
+      { id: 'desk',  type: 'mqtt',       state: 'present',     age: 3,   conf: 1.0  },
+      { id: 'radar', type: 'usb_ld2410', state: 'present',     age: 1,   conf: 0.94 },
+      { id: 'couch', type: 'ha_ws',      state: 'absent',      age: 48,  conf: 1.0  },
+      { id: 'hall',  type: 'motion',     state: 'unavailable', age: 372, conf: 0.0  },
+    ],
+    zones: [
+      { id: 'office',      mode: 'any',    members: ['desk','radar'], present: true  },
+      { id: 'living-room', mode: 'quorum', members: ['couch','hall'], present: false },
+    ],
+    displays: [
+      { id: 'main',   phase: 'active',  blankMode: 'power_off',           zone: 'office',      rule: 'office_blank', cmdGen: 41, paused: false, inhibited: false,
+        controllers: [ { name: 'ddcci', ok: true } ] },
+      { id: 'tv',     phase: 'blanked', blankMode: 'screen_off_audio_on', zone: 'living-room', rule: 'tv_blank',     cmdGen: 88, paused: false, inhibited: false,
+        controllers: [ { name: 'ha-passthrough', ok: true } ] },
+      { id: 'studio', phase: 'grace',   blankMode: 'power_off',           zone: 'office',      rule: 'office_blank', cmdGen: 12, paused: true,  inhibited: true,
+        controllers: [ { name: 'kwin-dpms', ok: false }, { name: 'ddcci', ok: true } ] },
+    ],
+    events: [
+      { time: '14:22:41', type: 'zone_change',    text: "zone 'office' → occupied (cause: radar)" },
+      { time: '14:22:41', type: 'display_phase',  text: "main: blanked → waking → active" },
+      { time: '14:21:08', type: 'sensor_change',  text: "radar → present (conf 0.94)" },
+      { time: '14:18:52', type: 'display_phase',  text: "tv: active → grace" },
+      { time: '14:16:52', type: 'display_phase',  text: "tv: grace → blanking → blanked" },
+      { time: '14:16:31', type: 'zone_change',    text: "zone 'living-room' → vacant (cause: couch)" },
+      { time: '14:12:07', type: 'wake_retry',     text: "studio: kwin-dpms wake failed, retry 1/3 → ddcci" },
+      { time: '14:11:55', type: 'sensor_change',  text: "hall → unavailable (stale 372s > 60s)" },
+      { time: '14:03:20', type: 'config_reload',  text: "config reloaded — 4 sensors, 2 zones, 3 displays" },
+    ],
+  };
+
+  // ── palette ──
+  C = {
+    green: 'oklch(0.80 0.15 155)', amber: 'oklch(0.82 0.13 78)',
+    blue: 'oklch(0.74 0.09 240)', red: 'oklch(0.68 0.19 25)',
+    muted: '#8a938e', faint: '#59615c',
+  };
+
+  componentDidMount() {
+    this._tick();
+    this._t = setInterval(() => {
+      this.setState(s => ({
+        clock: new Date().toLocaleTimeString('en-GB'),
+        sensors: s.sensors.map(x => ({ ...x, age: x.age + 1 })),
+      }));
+    }, 1000);
+  }
+  componentWillUnmount() { clearInterval(this._t); }
+  _tick() { this.setState({ clock: new Date().toLocaleTimeString('en-GB') }); }
+
+  _now() { return new Date().toLocaleTimeString('en-GB'); }
+  _log(type, text) {
+    this.setState(s => ({ events: [{ time: this._now(), type, text }, ...s.events].slice(0, 40) }));
+  }
+
+  forceBlank(id) {
+    this.setState(s => ({ displays: s.displays.map(d => d.id === id ? { ...d, phase: 'blanked', cmdGen: d.cmdGen + 1 } : d) }));
+    this._log('display_phase', `${id}: force-blank → blanked (operator)`);
+  }
+  forceWake(id) {
+    this.setState(s => ({ displays: s.displays.map(d => d.id === id ? { ...d, phase: 'active', cmdGen: d.cmdGen + 1 } : d) }));
+    this._log('display_phase', `${id}: force-wake → active (operator)`);
+  }
+  togglePause(id) {
+    let np = false;
+    this.setState(s => ({ displays: s.displays.map(d => { if (d.id === id) { np = !d.paused; return { ...d, paused: np }; } return d; }) }));
+    setTimeout(() => this._log(np ? 'pause' : 'resume', `${id}: rule ${np ? 'paused' : 'resumed'} (operator)`), 0);
+  }
+  reload() {
+    this.setState({ pendingReload: 'validating new config…' });
+    this._log('config_reload', 'reload requested via web ui');
+    setTimeout(() => { this.setState({ pendingReload: null }); this._log('config_reload', 'config reloaded — no changes to apply'); }, 2200);
+  }
+
+  _sensorColor(st) { return st === 'present' ? this.C.green : st === 'absent' ? this.C.blue : this.C.amber; }
+  _sensorLabel(st) { return st === 'present' ? 'present' : st === 'absent' ? 'absent' : 'unavailable'; }
+  _typeLabel(t) { return ({ mqtt: 'MQTT', usb_ld2410: 'LD2410 radar', ha_ws: 'HA WebSocket', motion: 'motion' })[t] || t; }
+  _ago(a) { return a < 60 ? `${a}s ago` : a < 3600 ? `${Math.floor(a/60)}m ago` : `${Math.floor(a/3600)}h ago`; }
+  _phase(p) {
+    const m = {
+      active:   { l: 'active',   c: this.C.green },
+      grace:    { l: 'grace',    c: this.C.amber },
+      blanking: { l: 'blanking', c: this.C.amber },
+      blanked:  { l: 'blanked',  c: this.C.blue  },
+      waking:   { l: 'waking',   c: this.C.green },
+    };
+    return m[p] || m.active;
+  }
+  _bg(c, a) { return c.replace(')', ` / ${a})`); }
+  _evStyle(t) {
+    const m = {
+      zone_change:   this.C.green, sensor_change: this.C.blue, display_phase: '#c8cdc9',
+      wake_retry:    this.C.red,   config_reload: this.C.amber, pause: this.C.amber, resume: this.C.green,
+    };
+    const c = m[t] || '#c8cdc9';
+    return { color: c, bg: this._bg(c === '#c8cdc9' ? 'oklch(0.7 0 0)' : c, 0.13) };
+  }
+
+  renderVals() {
+    const C = this.C, tab = this.state.tab;
+    const go = t => () => this.setState({ tab: t });
+
+    const navDefs = [
+      { id: 'dashboard', label: 'Dashboard', icon: '▦' },
+      { id: 'displays',  label: 'Displays',  icon: '▤', badge: '3' },
+      { id: 'events',    label: 'Events',    icon: '≣', badge: 'live' },
+      { id: 'config',    label: 'Config',    icon: '{ }' },
+      { id: 'doctor',    label: 'Doctor',    icon: '✚' },
+    ];
+    const nav = navDefs.map(n => {
+      const active = n.id === tab;
+      return {
+        ...n, go: go(n.id),
+        icColor: active ? C.green : C.muted,
+        style: `display:flex; align-items:center; gap:11px; width:100%; text-align:left; font-family:'IBM Plex Sans',sans-serif; font-size:13.5px; font-weight:${active ? 600 : 400}; color:${active ? '#e7eae8' : '#a6ada8'}; background:${active ? 'rgba(255,255,255,0.06)' : 'transparent'}; border:none; border-radius:8px; padding:9px 12px; cursor:pointer;`,
+        badge: n.badge || '',
+        badgeBg: n.badge === 'live' ? this._bg(C.green, 0.14) : '#191d1f',
+        badgeColor: n.badge === 'live' ? C.green : C.muted,
+      };
+    });
+
+    const sensors = this.state.sensors.map(s => {
+      const col = this._sensorColor(s.state);
+      return {
+        id: s.id, typeLabel: this._typeLabel(s.type), color: col,
+        stateLabel: this._sensorLabel(s.state), lastSeen: this._ago(s.age),
+        pulse: s.state === 'present'
+          ? `position:absolute; inset:0; border-radius:50%; background:${col}; animation:dm-ring 2.4s ease-out infinite;`
+          : 'display:none;',
+      };
+    });
+
+    const zones = this.state.zones.map(z => {
+      const col = z.present ? C.green : C.blue;
+      const modeMap = { any: 'ANY', all: 'ALL', quorum: 'QUORUM≥2', weighted: 'WEIGHTED' };
+      return {
+        id: z.id, color: col, stateLabel: z.present ? 'occupied' : 'vacant',
+        modeLabel: modeMap[z.mode] || z.mode.toUpperCase(),
+        membersLabel: z.members.join(' · '),
+      };
+    });
+
+    const displays = this.state.displays.map(d => {
+      const ph = this._phase(d.phase);
+      const glyphs = { active: '● ON', grace: '◐ grace', blanking: '◑ …', blanked: '○ OFF', waking: '◔ wake' };
+      const screenOn = d.phase === 'active' || d.phase === 'waking';
+      return {
+        id: d.id, phaseLabel: ph.l, phaseColor: ph.c, phaseBg: this._bg(ph.c, 0.13),
+        blankMode: d.blankMode, zone: d.zone, rule: d.rule, cmdGen: d.cmdGen,
+        paused: d.paused, inhibited: d.inhibited,
+        screenGlyph: glyphs[d.phase] || '●',
+        screenBg: screenOn ? this._bg(C.green, 0.08) : '#0a0c0d',
+        screenBorder: screenOn ? this._bg(C.green, 0.3) : 'rgba(255,255,255,0.08)',
+        controllers: d.controllers.map((c, i) => ({
+          name: c.name,
+          status: i === 0 ? 'primary' : 'fallback',
+          color: c.ok ? '#c8cdc9' : C.amber,
+          dot: c.ok ? C.green : C.amber,
+          border: c.ok ? 'rgba(255,255,255,0.09)' : this._bg(C.amber, 0.35),
+        })),
+        blank: () => this.forceBlank(d.id),
+        wake: () => this.forceWake(d.id),
+        togglePause: () => this.togglePause(d.id),
+        pauseLabel: d.paused ? 'Resume rule' : 'Pause rule',
+        pauseStyle: `font-family:'IBM Plex Sans',sans-serif; font-size:12.5px; font-weight:500; color:${d.paused ? '#e8d8b0' : '#a6ada8'}; background:${d.paused ? this._bg(C.amber, 0.12) : '#191d1f'}; border:1px solid ${d.paused ? this._bg(C.amber, 0.35) : 'rgba(255,255,255,0.12)'}; border-radius:7px; padding:9px 0; cursor:pointer;`,
+      };
+    });
+
+    const events = this.state.events.map(e => {
+      const st = this._evStyle(e.type);
+      return { time: e.time, type: e.type, text: e.text, color: st.color, bg: st.bg };
+    });
+
+    const sOnline = this.state.sensors.filter(s => s.state !== 'unavailable').length;
+    const zOcc = this.state.zones.filter(z => z.present).length;
+    const dBlanked = this.state.displays.filter(d => d.phase === 'blanked').length;
+    const dActive = this.state.displays.filter(d => d.phase === 'active').length;
+
+    const stats = [
+      { label: 'Displays', value: `${this.state.displays.length}`, sub: `${dActive} active · ${dBlanked} blanked`, dot: C.green },
+      { label: 'Sensors',  value: `${sOnline}/${this.state.sensors.length}`, sub: `${this.state.sensors.length - sOnline} unavailable`, dot: sOnline === this.state.sensors.length ? C.green : C.amber },
+      { label: 'Zones',    value: `${zOcc}/${this.state.zones.length}`, sub: `${zOcc} occupied · ${this.state.zones.length - zOcc} vacant`, dot: C.blue },
+      { label: 'OLED guard', value: 'Active', sub: 'protecting on vacancy', dot: C.green },
+    ];
+
+    const GRN = C.green, NUM = C.amber;
+    const L = {
+      c: (t) => ({ pre: t, key: '', eq: '', val: '', valColor: GRN, comment: '' }),
+      s: (t) => ({ pre: t, key: '', eq: '', val: '', valColor: GRN, comment: '' }),
+      kv: (k, v, col) => ({ pre: '', key: k, eq: ' = ', val: v, valColor: col || GRN, comment: '' }),
+      blank: () => ({ pre: ' ', key: '', eq: '', val: '', valColor: GRN, comment: '' }),
+    };
+    const configLines = [
+      L.c('# config schema version'),
+      L.kv('config_version', '1', NUM),
+      L.blank(),
+      L.s('[sensors.desk]'),
+      L.kv('type', '"mqtt"'),
+      L.kv('broker_url', '"tcp://localhost:1883"'),
+      L.kv('topic', '"zigbee2mqtt/desk-sensor"'),
+      L.blank(),
+      L.s('[sensors.radar]'),
+      L.kv('type', '"usb_ld2410"'),
+      L.kv('device', '"/dev/ttyUSB0"'),
+      L.blank(),
+      L.s('[zones.office]'),
+      L.kv('mode', '"any"'),
+      L.kv('members', '["desk", "radar"]'),
+      L.blank(),
+      L.s('[displays.main]'),
+      L.kv('controllers', '["ddcci"]'),
+      L.kv('blank_mode', '"power_off"'),
+      L.kv('grace_s', '120', NUM),
+      L.blank(),
+      L.s('[rules.office_blank]'),
+      L.kv('zone', '"office"'),
+      L.kv('displays', '["main"]'),
+    ];
+    const configSummary = [
+      { k: 'sensors',  v: 'desk, radar, couch, hall', n: '4' },
+      { k: 'zones',    v: 'office, living-room',       n: '2' },
+      { k: 'displays', v: 'main, tv, studio',          n: '3' },
+      { k: 'rules',    v: 'office_blank, tv_blank',    n: '2' },
+    ];
+
+    const dc = (title, detail, status) => {
+      const m = { pass: C.green, warn: C.amber, fail: C.red };
+      const ic = { pass: '✓', warn: '!', fail: '✕' };
+      return { title, detail, tag: status, color: m[status], iconBg: this._bg(m[status], 0.13), icon: ic[status] };
+    };
+    const doctorChecks = [
+      dc('Config valid', 'config_version = 1 · no unknown keys · all references resolve', 'pass'),
+      dc('IPC socket reachable', '$XDG_RUNTIME_DIR/dormant.sock · responds to status', 'pass'),
+      dc('Credentials file permissions', 'credentials.toml is 0600 (owner-only)', 'pass'),
+      dc('DDC/CI device present', '/dev/i2c-3 · VCP 0xD6 power supported', 'pass'),
+      dc('MQTT broker connection', 'tcp://localhost:1883 · connected, 1 topic subscribed', 'pass'),
+      dc("Sensor 'hall' stale", 'no event for 372s (stale_timeout 60s) — treated as present (fail-safe)', 'warn'),
+      dc('KWin DPMS controller', 'M1 spike — org.kde.KWin DPMS interface not yet wired', 'fail'),
+    ];
+    const doctorSummary = [
+      { count: doctorChecks.filter(c => c.tag === 'pass').length, label: 'passing', color: C.green },
+      { count: doctorChecks.filter(c => c.tag === 'warn').length, label: 'warnings', color: C.amber },
+      { count: doctorChecks.filter(c => c.tag === 'fail').length, label: 'failing', color: C.red },
+    ];
+
+    const titles = {
+      dashboard: ['Dashboard', 'live presence-to-display state'],
+      displays:  ['Displays', 'per-display control & controller chains'],
+      events:    ['Events', 'daemon event stream'],
+      config:    ['Config', 'loaded configuration & validation'],
+      doctor:    ['Doctor', 'environment & integration diagnostics'],
+    };
+
+    return {
+      nav, sensors, zones, displays, events, stats, configSummary, configLines, doctorChecks, doctorSummary,
+      recentEvents: events.slice(0, 5),
+      eventCount: this.state.events.length,
+      clock: this.state.clock,
+      pendingReload: this.state.pendingReload,
+      reload: () => this.reload(),
+      goEvents: go('events'),
+      tabTitle: (titles[tab] || titles.dashboard)[0],
+      tabSub: (titles[tab] || titles.dashboard)[1],
+      showDashboard: tab === 'dashboard', showDisplays: tab === 'displays',
+      showEvents: tab === 'events', showConfig: tab === 'config', showDoctor: tab === 'doctor',
+      daemon: { pid: '48213', uptime: '6h 12m', socket: '$XDG_RUNTIME_DIR/dormant.sock', config: '~/.config/dormant/config.toml' },
+    };
+  }
+}
+</script>
+</body>
+</html>

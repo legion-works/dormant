@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:#0b0d0e; }
+  .lbl { font-family:'IBM Plex Mono',monospace; font-size:11px; color:#59615c; text-transform:uppercase; letter-spacing:0.08em; }
+  .card { background:#0e1113; border:1px solid rgba(255,255,255,0.08); border-radius:14px; }
+</style>
+</helmet>
+<div style="background:#0b0d0e; color:#e7eae8; font-family:'IBM Plex Sans',system-ui,sans-serif; padding:44px; display:flex; flex-direction:column; gap:34px; width:1320px;">
+
+  <!-- header -->
+  <div style="display:flex; align-items:center; gap:14px;">
+    <svg width="30" height="30" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#0b0d0e"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle></svg>
+    <div style="line-height:1.15;">
+      <div style="font-size:20px; font-weight:700; letter-spacing:-0.01em;">dormant · brand & assets</div>
+      <div class="lbl" style="margin-top:3px;">logo · favicon · icon set · hero · social card</div>
+    </div>
+  </div>
+
+  <!-- LOGO LOCKUPS -->
+  <div>
+    <div class="lbl" style="margin-bottom:12px;">Logo lockup</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="card" style="padding:44px; display:flex; align-items:center; gap:16px; justify-content:center;">
+        <svg width="46" height="46" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#0e1113"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle></svg>
+        <div style="line-height:1.05;">
+          <div style="font-size:34px; font-weight:700; letter-spacing:-0.02em;">dormant</div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8a938e; letter-spacing:0.02em; margin-top:4px;">OLED presence guard</div>
+        </div>
+      </div>
+      <div style="background:#f5f6f3; border:1px solid rgba(0,0,0,0.08); border-radius:14px; padding:44px; display:flex; align-items:center; gap:16px; justify-content:center;">
+        <svg width="46" height="46" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.62 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#f5f6f3"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.62 0.15 155)"></circle></svg>
+        <div style="line-height:1.05;">
+          <div style="font-size:34px; font-weight:700; letter-spacing:-0.02em; color:#14171a;">dormant</div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#5a625e; letter-spacing:0.02em; margin-top:4px;">OLED presence guard</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MARK / FAVICON -->
+  <div>
+    <div class="lbl" style="margin-bottom:12px;">Mark & favicon — moon crescent + presence dot</div>
+    <div class="card" style="padding:32px; display:flex; align-items:center; gap:40px; flex-wrap:wrap;">
+      <div style="display:flex; align-items:center; gap:24px;">
+        <div style="width:96px; height:96px; border-radius:22px; background:oklch(0.80 0.15 155); display:flex; align-items:center; justify-content:center;">
+          <svg width="60" height="60" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="#0b1a10"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="11" cy="19" r="1.7" fill="#0b1a10"></circle></svg>
+        </div>
+        <div class="lbl" style="text-transform:none; font-size:11px; color:#8a938e; line-height:1.7;">app icon<br>512×512 · r22</div>
+      </div>
+      <div style="width:1px; height:80px; background:rgba(255,255,255,0.08);"></div>
+      <div style="display:flex; align-items:flex-end; gap:26px;">
+        <div style="text-align:center;"><svg width="48" height="48" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#0e1113"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle></svg><div class="lbl" style="margin-top:8px;">48</div></div>
+        <div style="text-align:center;"><svg width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#0e1113"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle></svg><div class="lbl" style="margin-top:8px;">32</div></div>
+        <div style="text-align:center;"><svg width="16" height="16" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="22" cy="12" r="11" fill="#0e1113"></circle></svg><div class="lbl" style="margin-top:8px;">16</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PALETTE + TYPE -->
+  <div style="display:grid; grid-template-columns:1.3fr 1fr; gap:16px;">
+    <div>
+      <div class="lbl" style="margin-bottom:12px;">Palette</div>
+      <div class="card" style="padding:20px; display:grid; grid-template-columns:repeat(3,1fr); gap:14px;">
+        <sc-for list="{{ swatches }}" as="s" hint-placeholder-count="6">
+          <div>
+            <div style="height:52px; border-radius:9px; background:{{ s.hex }}; border:1px solid rgba(255,255,255,0.08);"></div>
+            <div style="font-family:'IBM Plex Sans',sans-serif; font-size:12px; font-weight:500; margin-top:8px;">{{ s.name }}</div>
+            <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#59615c; margin-top:2px;">{{ s.hex }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+    <div>
+      <div class="lbl" style="margin-bottom:12px;">Typography</div>
+      <div class="card" style="padding:22px;">
+        <div style="font-size:26px; font-weight:600; letter-spacing:-0.01em;">IBM Plex Sans</div>
+        <div style="font-size:12px; color:#8a938e; margin-top:2px;">400 · 500 · 600 · 700 — UI & headings</div>
+        <div style="height:1px; background:rgba(255,255,255,0.08); margin:16px 0;"></div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:22px; font-weight:500;">IBM Plex Mono</div>
+        <div style="font-size:12px; color:#8a938e; margin-top:2px;">data, ids, config, event log</div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:13px; color:#c8cdc9; margin-top:12px;">zone 'office' → occupied · 0.94</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ICON SET -->
+  <div>
+    <div class="lbl" style="margin-bottom:12px;">Icon set — sensors, displays, zones, blank modes</div>
+    <div class="card" style="padding:22px; display:grid; grid-template-columns:repeat(6,1fr); gap:16px;">
+      <sc-for list="{{ icons }}" as="i" hint-placeholder-count="12">
+        <div style="display:flex; flex-direction:column; align-items:center; gap:10px;">
+          <div style="width:58px; height:58px; border-radius:13px; background:#131618; border:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:center;">
+            <div style="width:30px; height:30px;">{{ i.svg }}</div>
+          </div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#8a938e; text-align:center;">{{ i.name }}</div>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+
+  <!-- README HERO -->
+  <div>
+    <div class="lbl" style="margin-bottom:12px;">README hero banner · 1232×340</div>
+    <div style="width:1232px; height:340px; border-radius:16px; overflow:hidden; position:relative; background:radial-gradient(120% 140% at 82% 30%, #10201a 0%, #0b0d0e 55%); border:1px solid rgba(255,255,255,0.08);">
+      <div style="position:absolute; right:-60px; top:50%; transform:translateY(-50%); width:520px; height:520px;">
+        <div style="position:absolute; inset:0; border-radius:50%; border:1px solid oklch(0.80 0.15 155 / 0.10);"></div>
+        <div style="position:absolute; inset:80px; border-radius:50%; border:1px solid oklch(0.80 0.15 155 / 0.14);"></div>
+        <div style="position:absolute; inset:160px; border-radius:50%; border:1px solid oklch(0.80 0.15 155 / 0.20);"></div>
+        <div style="position:absolute; inset:225px; border-radius:50%; background:oklch(0.80 0.15 155 / 0.9); box-shadow:0 0 40px oklch(0.80 0.15 155 / 0.5);"></div>
+      </div>
+      <div style="position:absolute; left:56px; top:56px; right:400px;">
+        <div style="display:flex; align-items:center; gap:12px;">
+          <svg width="34" height="34" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#0b0d0e"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle></svg>
+          <span style="font-size:32px; font-weight:700; letter-spacing:-0.02em;">dormant</span>
+        </div>
+        <div style="font-size:24px; font-weight:600; letter-spacing:-0.01em; margin-top:26px; line-height:1.3; color:#eef1ee;">Blank OLED monitors & TVs when the<br>room is empty — wake them on return.</div>
+        <div style="font-size:14px; color:#8a938e; margin-top:14px; line-height:1.5;">Multi-sensor fusion · MQTT · Home Assistant · mmWave radar · DDC/CI · Rust daemon + CLI</div>
+        <div style="display:flex; gap:9px; margin-top:22px;">
+          <sc-for list="{{ heroChips }}" as="c" hint-placeholder-count="4">
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; white-space:nowrap; color:#b8d8c4; background:oklch(0.80 0.15 155 / 0.12); border:1px solid oklch(0.80 0.15 155 / 0.28); padding:5px 11px; border-radius:7px;">{{ c }}</span>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- OG CARD -->
+  <div>
+    <div class="lbl" style="margin-bottom:12px;">Social preview · GitHub OG image · 1200×630</div>
+    <div style="width:1200px; height:630px; border-radius:16px; overflow:hidden; position:relative; background:radial-gradient(100% 120% at 50% 0%, #101d18 0%, #0b0d0e 60%); border:1px solid rgba(255,255,255,0.08); display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center;">
+      <div style="position:absolute; top:-140px; left:50%; transform:translateX(-50%); width:560px; height:560px;">
+        <div style="position:absolute; inset:0; border-radius:50%; border:1px solid oklch(0.80 0.15 155 / 0.08);"></div>
+        <div style="position:absolute; inset:90px; border-radius:50%; border:1px solid oklch(0.80 0.15 155 / 0.12);"></div>
+        <div style="position:absolute; inset:180px; border-radius:50%; border:1px solid oklch(0.80 0.15 155 / 0.16);"></div>
+      </div>
+      <div style="display:flex; align-items:center; gap:18px; z-index:1;">
+        <svg width="64" height="64" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12.5" fill="oklch(0.80 0.15 155)"></circle><circle cx="21.5" cy="12.5" r="10.5" fill="#0c130f"></circle><circle cx="11" cy="19" r="1.7" fill="oklch(0.80 0.15 155)"></circle></svg>
+        <span style="font-size:66px; font-weight:700; letter-spacing:-0.03em;">dormant</span>
+      </div>
+      <div style="font-size:32px; font-weight:600; letter-spacing:-0.01em; margin-top:28px; z-index:1; color:#eef1ee; line-height:1.35;">Blank OLED displays when the room is empty.</div>
+      <div style="font-size:19px; color:#8a938e; margin-top:16px; z-index:1;">Presence-driven OLED protection · Rust daemon + CLI</div>
+      <div style="display:flex; gap:12px; margin-top:34px; z-index:1;">
+        <sc-for list="{{ ogChips }}" as="c" hint-placeholder-count="4">
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; white-space:nowrap; color:#b8d8c4; background:oklch(0.80 0.15 155 / 0.12); border:1px solid oklch(0.80 0.15 155 / 0.28); padding:8px 16px; border-radius:9px;">{{ c }}</span>
+        </sc-for>
+      </div>
+      <div style="position:absolute; bottom:40px; font-family:'IBM Plex Mono',monospace; font-size:15px; color:#59615c; z-index:1;">github.com/icetea/dormant · MIT OR Apache-2.0</div>
+    </div>
+  </div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  renderVals() {
+    const G = 'oklch(0.80 0.15 155)';
+    const svg = (inner, vb) => React.createElement('svg', {
+      width: '100%', height: '100%', viewBox: vb || '0 0 24 24', fill: 'none',
+      stroke: G, strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round',
+      dangerouslySetInnerHTML: { __html: inner },
+    });
+    const icons = [
+      { name: 'presence', svg: svg('<circle cx="12" cy="12" r="2.2" fill="'+G+'" stroke="none"/><path d="M6.5 6.5a8 8 0 0 0 0 11M17.5 6.5a8 8 0 0 1 0 11"/>') },
+      { name: 'mqtt', svg: svg('<circle cx="6" cy="18" r="2" fill="'+G+'" stroke="none"/><path d="M6 13a5 5 0 0 1 5 5M6 8.5a9.5 9.5 0 0 1 9.5 9.5"/>') },
+      { name: 'ha-ws', svg: svg('<circle cx="8" cy="8" r="2.6"/><circle cx="16" cy="16" r="2.6"/><path d="M9.9 9.9l4.2 4.2"/>') },
+      { name: 'ld2410', svg: svg('<circle cx="12" cy="17" r="1.8" fill="'+G+'" stroke="none"/><path d="M12 17 5 8M12 17l7-9"/><path d="M7 6a11 11 0 0 1 10 0"/>') },
+      { name: 'motion', svg: svg('<path d="M6 15c1.5-2 3-2 4.5 0M13.5 15c1.5-2 3-2 4.5 0M4 10c2.5-3.2 5-3.2 7.5 0M12.5 10c2.5-3.2 5-3.2 7.5 0"/>') },
+      { name: 'input-idle', svg: svg('<rect x="4" y="7" width="16" height="10" rx="2"/><path d="M8 11h.01M12 11h.01M16 11h.01M9 14h6"/>') },
+      { name: 'display', svg: svg('<rect x="3.5" y="5" width="17" height="11" rx="1.6"/><path d="M9 19h6M12 16v3"/>') },
+      { name: 'zone', svg: svg('<circle cx="12" cy="12" r="8" stroke-dasharray="2.6 2.8"/><circle cx="12" cy="12" r="2" fill="'+G+'" stroke="none"/>') },
+      { name: 'rule', svg: svg('<path d="M12 3.5 20.5 12 12 20.5 3.5 12z"/>') },
+      { name: 'power_off', svg: svg('<path d="M12 3.5v7"/><path d="M6.5 7.5a7.5 7.5 0 1 0 11 0"/>') },
+      { name: 'screen_off·audio', svg: svg('<rect x="3.5" y="6" width="11" height="8" rx="1.4"/><path d="M17.5 8.5c1.4 1.4 1.4 5.6 0 7M19.7 6.5c2.6 2.6 2.6 8.4 0 11"/>') },
+      { name: 'brightness_0', svg: svg('<circle cx="12" cy="12" r="5"/><path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2"/>') },
+    ];
+    const swatches = [
+      { name: 'base', hex: '#0b0d0e' },
+      { name: 'panel', hex: '#131618' },
+      { name: 'text', hex: '#e7eae8' },
+      { name: 'present · ok', hex: 'oklch(0.80 0.15 155)' },
+      { name: 'unavailable · warn', hex: 'oklch(0.82 0.13 78)' },
+      { name: 'absent · idle', hex: 'oklch(0.74 0.09 240)' },
+    ];
+    return {
+      icons, swatches,
+      heroChips: ['presence fusion', 'DDC/CI', 'Home Assistant', 'mmWave'],
+      ogChips: ['MQTT', 'HA WebSocket', 'LD2410 radar', 'DDC/CI'],
+    };
+  }
+}
+</script>
+</body>
+</html>

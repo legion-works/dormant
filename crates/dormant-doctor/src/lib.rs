@@ -9,9 +9,11 @@
 //! cycle.  This crate re-exports them and owns the probe logic.
 
 mod probes;
+mod service;
 mod types;
 
 pub use dormant_core::doctor::{Check, CheckStatus, DoctorReport};
+pub use service::DoctorService;
 pub use types::{ProbeResult, ProbeStatus};
 
 // Re-export probe functions the CLI dispatches per-subcommand.

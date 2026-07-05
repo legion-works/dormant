@@ -60,6 +60,7 @@ use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, Zone
 use dormant_core::zone::{ZoneEngine, ZoneSpec};
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry::{build_controllers, capabilities};
+use dormant_doctor::DoctorService;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -325,6 +326,16 @@ impl App {
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
 
         // ── IPC server (optional, disabled for tests; Unix-only) ──────────
+        // The doctor service is shared by the IPC server (for
+        // `IpcRequest::Doctor`) and the future web server (Task 5 for the
+        // `POST /api/doctor` route).  Construct it once here from the
+        // cloned config/creds watches + the front control channel so both
+        // surfaces see the SAME instance — the singleflight coalesce then
+        // dedupes a simultaneous CLI `dormantctl doctor` and a browser
+        // click on "Run Doctor".
+        let doctor_service =
+            DoctorService::new(front_ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
         #[cfg(unix)]
         let ipc_handle = if self.disable_ipc {
             None
@@ -334,6 +345,7 @@ impl App {
                     &socket_path,
                     front_ctl_tx.clone(),
                     reload_trigger_tx.clone(),
+                    doctor_service.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -351,6 +363,7 @@ impl App {
             config_rx,
             creds_rx,
             config_path: self.config_path.clone(),
+            doctor_service,
             _ipc_handle: ipc_handle,
         };
 
@@ -384,6 +397,7 @@ pub struct AppHandle {
     config_rx: watch::Receiver<Arc<Config>>,
     creds_rx: watch::Receiver<Arc<Credentials>>,
     config_path: PathBuf,
+    doctor_service: DoctorService,
     _ipc_handle: Option<JoinHandle<()>>,
 }
 
@@ -434,6 +448,14 @@ impl AppHandle {
     #[must_use]
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
+    }
+
+    /// The shared, coalesced [`DoctorService`] used by the IPC server and
+    /// the M2 web UI.  `Clone` (Arc-backed) so callers can hand a clone to
+    /// their own sub-systems without re-constructing one.
+    #[must_use]
+    pub fn doctor_service(&self) -> DoctorService {
+        self.doctor_service.clone()
     }
 }
 

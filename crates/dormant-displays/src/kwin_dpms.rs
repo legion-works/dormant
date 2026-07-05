@@ -51,12 +51,6 @@ use dormant_core::types::{BlankMode, CmdFailure};
 /// Binary name — literal anchor for PATH checks and error messages.
 const KSCREEN_DOCTOR: &str = "kscreen-doctor";
 
-/// Default timeout for `kscreen-doctor` invocations when the config
-/// does not set `command_timeout`.  Same default as
-/// [`dormant_core::config::defaults::COMMAND_TIMEOUT`].
-#[allow(dead_code)]
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Maximum stderr bytes surfaced in a `CmdFailure` on non-zero exit.
 const STDERR_TAIL: usize = 200;
 

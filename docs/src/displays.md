@@ -83,9 +83,8 @@ modes = ["power_off"]
 
 The `ha_token` goes in the credentials file, not in the main config.
 
-### `kwin-dpms` — KWin DPMS (M1 forthcoming, not yet in registry)
+### `kwin-dpms` — KWin DPMS
 
-**Not registered yet — the config key will not work until Task 12 lands.**
 Controls KDE KWin outputs via `kscreen-doctor --dpms`. Per-output DPMS works on
 Plasma 6.7.2+ (Wayland). **Audio-unsafe:** DPMS disables the DRM/KMS output,
 which destroys the ALSA audio device for that output. Use only for displays
@@ -100,9 +99,8 @@ output = "DP-1"
 
 See `docs/research/2026-07-05-kwin-dpms-verification.md` for the spike data.
 
-### `samsung-tizen` — Samsung Tizen TV (M1 forthcoming, not yet in registry)
+### `samsung-tizen` — Samsung Tizen TV
 
-**Not registered yet — the config key will not work until Task 14 lands.**
 Controls Samsung Tizen (OLED) TVs via `KEY_PICTURE_OFF` remote key over
 WebSocket. **Audio-safe:** blanks the panel while audio continues. Verified on
 S90D (QA65S90DAKXXA). Requires a persistent socket with keepalive — the TV

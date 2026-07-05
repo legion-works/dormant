@@ -258,6 +258,7 @@ impl App {
     /// Fails if the initial runtime cannot be assembled (controller build,
     /// post-probe validation, zone/engine construction) or the watcher cannot
     /// be installed.
+    #[allow(clippy::too_many_lines)]
     pub async fn start(self) -> Result<(AppHandle, JoinHandle<()>)> {
         let root = CancellationToken::new();
 
@@ -354,6 +355,43 @@ impl App {
         #[cfg(not(unix))]
         let ipc_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // ── Web UI spawn (non-critical — bind failure logs and continues) ──
+        // The web UI is an operator tool that must never take down the
+        // screen-wake daemon (fail-safe ethos, spec §8).  Item-level
+        // #[cfg] so the feature-off build never references dormant_web.
+        #[cfg(feature = "web-ui")]
+        let web_handle: Option<tokio::task::JoinHandle<()>> = {
+            if let Some(port) = cfg_clone.daemon.web_port {
+                let addr = std::net::SocketAddr::new(cfg_clone.daemon.web_bind, port);
+                let web_state = dormant_web::WebState::new(dormant_web::WebStateInner {
+                    ctl_tx: front_ctl_tx.clone(),
+                    reload_trigger: reload_trigger_tx.clone(),
+                    reload_rx: reload_tx.subscribe(),
+                    config_rx: config_rx.clone(),
+                    creds_rx: creds_rx.clone(),
+                    config_path: self.config_path.clone(),
+                    doctor: doctor_service.clone(),
+                    cancel: root.clone(),
+                });
+                match dormant_web::spawn(addr, web_state).await {
+                    Ok((handle, _addr)) => Some(handle),
+                    Err(e) => {
+                        tracing::error!(
+                            event = "web_bind_failed",
+                            %addr,
+                            error = %e,
+                            "web UI disabled; daemon continues"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "web-ui"))]
+        let web_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         let handle = AppHandle {
             ctl_tx: front_ctl_tx,
             events_tx: front_events_tx,
@@ -365,6 +403,7 @@ impl App {
             config_path: self.config_path.clone(),
             doctor_service,
             _ipc_handle: ipc_handle,
+            _web_handle: web_handle,
         };
 
         Ok((handle, join))
@@ -399,6 +438,7 @@ pub struct AppHandle {
     config_path: PathBuf,
     doctor_service: DoctorService,
     _ipc_handle: Option<JoinHandle<()>>,
+    _web_handle: Option<JoinHandle<()>>,
 }
 
 impl AppHandle {

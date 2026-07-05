@@ -25,6 +25,8 @@ use crate::command::CommandController;
 #[cfg(target_os = "linux")]
 use crate::ddcci::DdcciController;
 use crate::ha_passthrough::HaPassthroughController;
+#[cfg(target_os = "linux")]
+use crate::kwin_dpms::KwinDpmsController;
 use crate::samsung_tizen::SamsungTizenController;
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
@@ -37,7 +39,13 @@ use crate::samsung_tizen::SamsungTizenController;
 /// Tests: on Linux, `ddcci` must be present (test: `controller_types_contains_ddcci_on_linux`).
 /// Off-Linux, it must be absent so config validation rejects it deterministically.
 #[cfg(target_os = "linux")]
-pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough", "samsung-tizen"];
+pub const CONTROLLER_TYPES: &[&str] = &[
+    "command",
+    "ddcci",
+    "ha-passthrough",
+    "kwin-dpms",
+    "samsung-tizen",
+];
 #[cfg(not(target_os = "linux"))]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-tizen"];
 
@@ -62,6 +70,8 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
         "ddcci".to_string(),
         vec![BlankMode::BrightnessZero, BlankMode::PowerOff],
     );
+    #[cfg(target_os = "linux")]
+    m.insert("kwin-dpms".to_string(), vec![BlankMode::PowerOff]);
     m.insert("ha-passthrough".to_string(), Vec::new());
     m.insert(
         "samsung-tizen".to_string(),
@@ -99,6 +109,13 @@ pub fn build_controllers(
                 chain.push(Box::new(DdcciController::new(
                     matcher,
                     cfg.restore_brightness,
+                )));
+            }
+            #[cfg(target_os = "linux")]
+            "kwin-dpms" => {
+                chain.push(Box::new(KwinDpmsController::new(
+                    cfg.output.clone(),
+                    cfg.command_timeout,
                 )));
             }
             "command" => {
@@ -293,12 +310,12 @@ mod tests {
     #[test]
     fn build_unknown_controller_name_fails() {
         let mut cfg = command_cfg();
-        cfg.controllers = vec!["kwin-dpms".into()]; // not yet registered
+        cfg.controllers = vec!["lg-webos".into()]; // not yet registered (M3)
         let creds = Credentials::default();
         let res = build_controllers("main", &cfg, &creds);
         match res {
             Err(DormantError::ConfigInvalid { detail }) => {
-                assert!(detail.contains("unknown controller 'kwin-dpms'"));
+                assert!(detail.contains("unknown controller 'lg-webos'"));
                 assert!(detail.contains("display 'main'"));
             }
             Err(other) => panic!("expected ConfigInvalid, got {other:?}"),

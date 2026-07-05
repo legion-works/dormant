@@ -27,8 +27,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = { version = "0.31", features = ["system"] }
-wayland-protocols = { version = "0.32", features = ["staging", "client", "wayland-client"] }
-rustix = { version = "1", default-features = false, features = ["event", "std"] }
+wayland-protocols = { version = "0.32", features = [
+  "staging",
+  "client",
+  "wayland-client",
+] }
+rustix = { version = "1", default-features = false, features = [
+  "event",
+  "std",
+] }
 
 [dev-dependencies]
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }

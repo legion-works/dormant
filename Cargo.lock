@@ -698,6 +698,7 @@ dependencies = [
  "dormant-sensors",
  "libc",
  "notify",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

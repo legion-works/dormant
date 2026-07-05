@@ -854,6 +854,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "dormant-core",
+ "dormant-displays",
  "dormant-doctor",
  "futures-util",
  "indexmap",
@@ -861,8 +862,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http 0.5.2",
  "tracing",
 ]

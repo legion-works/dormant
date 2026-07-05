@@ -371,6 +371,7 @@ impl App {
                     creds_rx: creds_rx.clone(),
                     config_path: self.config_path.clone(),
                     doctor: doctor_service.clone(),
+                    web_bind: addr,
                     cancel: root.clone(),
                 });
                 match dormant_web::spawn(addr, web_state).await {

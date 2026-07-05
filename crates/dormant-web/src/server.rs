@@ -10,22 +10,37 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
-use axum::routing::get;
+use axum::middleware::from_fn_with_state;
+use axum::routing::{get, post};
 use dormant_core::rules::{ControlMsg, StateSnapshot};
 use tokio::sync::oneshot;
 
 use crate::WebState;
 use crate::error::WebError;
+use crate::routes::{command, config, doctor, events};
+use crate::security::security_guard;
 
 /// Duration the `/api/state` handler waits for a snapshot reply before
 /// returning 504.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the axum [`Router`] on the given state.
+/// Build the axum [`Router`] on the given state, mounting all HTTP routes
+/// behind the Host/Origin security guard.
 pub(crate) fn build_router(state: WebState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/api/state", get(get_state))
-        .with_state(state)
+        .route("/api/config", get(config::get_config))
+        .route("/api/blank", post(command::post_blank))
+        .route("/api/wake", post(command::post_wake))
+        .route("/api/pause", post(command::post_pause))
+        .route("/api/resume", post(command::post_resume))
+        .route("/api/reload", post(command::post_reload))
+        .route("/api/doctor", post(doctor::post_doctor))
+        .route("/api/events", get(events::ws_events))
+        .with_state(state.clone());
+
+    // Security guard on ALL routes.
+    router.layer(from_fn_with_state(state, security_guard))
 }
 
 /// Bind, report the resolved address via `addr_tx`, and serve until the

@@ -1,0 +1,357 @@
+/* Dashboard view — three-column signal flow + stat row.
+   All colors use DS tokens; no hardcoded hex/rgba. */
+
+.dashboard {
+  animation: dmRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.dash-loading,
+.dash-error {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: var(--space-6);
+}
+
+.dash-error {
+  color: var(--danger);
+}
+
+/* ── Stat row ── */
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.stat-card {
+  padding: 16px 18px;
+}
+
+.stat-card__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+.stat-card__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--stat-dot);
+  flex-shrink: 0;
+}
+
+.stat-card__value {
+  font-family: var(--font-display);
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-top: 12px;
+  line-height: 1;
+  color: var(--text-strong);
+}
+
+.stat-card__sub {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin-top: 8px;
+}
+
+/* ── Section header ── */
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin: 4px 0 14px;
+}
+
+.section-header__title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.section-header__caption {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.section-header__line {
+  flex: 1;
+  height: 1px;
+  background: color-mix(in oklab, var(--text-body) 12%, transparent);
+}
+
+.section-header__link {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--dur-fast) var(--ease);
+}
+.section-header__link:hover {
+  color: var(--accent);
+}
+
+/* ── Signal grid ── */
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 26px;
+}
+
+.column-header {
+  padding: 12px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 10%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+/* ── Sensor row ── */
+
+.sensor-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+}
+.sensor-row:last-child {
+  border-bottom: none;
+}
+
+.sensor-row__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.sensor-row__dot--present {
+  background: var(--success);
+  box-shadow: 0 0 8px var(--success);
+}
+.sensor-row__dot--absent {
+  background: var(--blue-400);
+  box-shadow: 0 0 5px var(--blue-400);
+}
+.sensor-row__dot--unavailable {
+  background: var(--warning);
+  box-shadow: 0 0 5px var(--warning);
+}
+
+.sensor-row__info {
+  min-width: 0;
+  flex: 1;
+}
+
+.sensor-row__id {
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.sensor-row__type {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.sensor-row__state {
+  text-align: right;
+}
+
+.sensor-row__state-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.sensor-row__state-label--present {
+  color: var(--success);
+}
+.sensor-row__state-label--absent {
+  color: var(--blue-400);
+}
+.sensor-row__state-label--unavailable {
+  color: var(--warning);
+}
+
+.sensor-row__age {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* ── Zone row in Dashboard ── */
+
+.dash-zone-row {
+  padding: 13px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+}
+.dash-zone-row:last-child {
+  border-bottom: none;
+}
+
+.dash-zone-row__top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.dash-zone-row__state {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.dash-zone-row__state--present { color: var(--success); }
+.dash-zone-row__state--absent { color: var(--blue-400); }
+.dash-zone-row__state--unavailable { color: var(--warning); }
+
+.dash-zone-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 9px;
+  padding-left: 18px;
+  flex-wrap: wrap;
+}
+
+.dash-zone-row__mode {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.04em;
+}
+
+.dash-zone-row__members {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+/* ── Display row in Dashboard ── */
+
+.dash-display-row {
+  padding: 12px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+}
+.dash-display-row:last-child {
+  border-bottom: none;
+}
+
+.dash-display-row__top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.dash-display-row__id {
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.dash-display-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.dash-btn {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-body);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 0;
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+.dash-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.dash-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.dash-btn--neutral {
+  color: var(--text-body);
+}
+
+/* ── Recent activity ── */
+
+.recent-row {
+  display: grid;
+  grid-template-columns: 82px 1fr;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.recent-row:last-child {
+  border-bottom: none;
+}
+
+.recent-row__time {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.recent-row__badge {
+  display: none; /* Hidden by default — show on non-Dashboard event views */
+}
+
+.recent-row__text {
+  color: var(--text-body);
+  grid-column: 2;
+}
+
+.recent-empty {
+  padding: 14px 15px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* ── Keyframes ── */
+
+@keyframes dmRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard { animation: none; }
+}

@@ -125,7 +125,16 @@ Bind to loopback by default; this is an unauthenticated local operator tool
 
 ## Screens / Views
 
-The app is a fixed two-pane layout: a **236px left sidebar** + a fluid **main
+> **Authority note:** this section describes **layout and structure**, which are
+> unchanged. Any specific color, font, or pixel value written inline below predates
+> the Legion Works reskin — for all **color / typography / spacing tokens, the
+> updated "Design Tokens" section and the `.dc.html` files are the source of
+> truth** (e.g. sidebar is now 244px not 236px; fonts are Space Grotesk / Geist /
+> JetBrains Mono, not IBM Plex; surfaces are Legion navy/glass, not `#0e1113`;
+> accent is dormant-green `#C3E88D` with cyan chrome). Read structure here; take
+> values from Design Tokens + the prototypes.
+
+The app is a fixed two-pane layout: a **244px left sidebar** + a fluid **main
 column**. Five views swap in the main column via sidebar nav. Everything is one
 page; nav sets an active tab (mirror it in the URL, e.g. `/dashboard`, `/displays`).
 
@@ -299,11 +308,15 @@ Two columns `1.1fr 0.9fr`, gap 16px, align-items:start.
   (mock effectively refreshes every 1s) to age "last seen" counters and keep the
   clock ticking. The green present-sensor dot has a continuous "sonar" ring
   animation. The "live" nav badge and Events header dot pulse.
-- **Animations (exact):**
-  - `dm-ring` (sonar) — 2.4s ease-out infinite: `scale(0.8) opacity .7` →
-    `scale(2.4) opacity 0`.
-  - `dm-pulse` — 1.6s ease infinite: opacity 1 → .35 → 1.
-  - `dm-fade` — 0.3s ease: opacity 0 / `translateY(-3px)` → 1 / none.
+- **Animations (exact) — quick, no bounce (Legion Works motion):**
+  - `dmDrift` — 34s ease-in-out infinite alternate: slow aurora background-position
+    drift (the DS `.lw-aurora--drift`).
+  - `dmLive` — 1.8s ease infinite: opacity 1 → 0.4 → 1, on the Events "live" dot only.
+  - `dmRise` — 0.36s ease-out: opacity 0 / `translateY(8px)` → 1 / none
+    (pending-reload banner; the DS `.lw-enter` entrance).
+  - present-sensor / daemon-running dots: **static** color + `box-shadow` glow — no
+    sonar loop (the DS avoids decorative infinite loops). Honor
+    `prefers-reduced-motion` (disable drift + pulse).
 - **Hover states:** listed per-component above (buttons brighten border or bg).
 - **Empty/error states (add for production):** show a clear "daemon unreachable"
   state if `GET /api/status` fails (the socket may be down); disable action
@@ -326,59 +339,98 @@ fetch on load and after `config_reloaded`. All mutations are POSTs that resolve 
 
 ## Design Tokens
 
-**Colors**
-- Base bg: `#0b0d0e`
-- Panel bg: `#131618`; deep panel/list bg: `#0e1113`; inset control bg: `#191d1f`
-- Preview off bg: `#0a0c0d`
-- Borders: `rgba(255,255,255,0.07)` (cards), `rgba(255,255,255,0.04)` (row
-  hairlines), `rgba(255,255,255,0.06)` (section rules), `rgba(255,255,255,0.09/0.12)`
-  (controls)
-- Text: primary `#e7eae8`; secondary `#c8cdc9`; muted `#8a938e`; faint `#59615c`;
-  soft nav `#a6ada8`
-- Accent green (present / ok / active): `oklch(0.80 0.15 155)` — light-bg variant
-  `oklch(0.62 0.15 155)`; green text tints `#cfe9d8` / `#b8d8c4` / `#e8d8b0`(amber)
-- Amber (unavailable / warn / grace): `oklch(0.82 0.13 78)`
-- Blue (absent / idle / blanked): `oklch(0.74 0.09 240)`
-- Red (fail / wake_retry): `oklch(0.68 0.19 25)`
-- Status-tint convention: use the status color at `/0.12`–`/0.14` alpha for the
-  matching soft background (via `oklch(... / a)`).
+> **This design follows the Legion Works design system** (Tokyo Night–grounded
+> Liquid Glass, the house style for IceTea / Legion fleet daemons — dormant is one
+> of them). In production, **link the Legion Works `styles.css` and consume its CSS
+> custom properties** (`--bg-base`, `--accent`, `--glass-*`, `--font-*`, `--radius-*`,
+> etc.) rather than hardcoding the hex values below. The values are listed so the UI
+> can be matched exactly and to make the dormant-specific choices explicit. **What
+> makes dormant distinct within the fleet:** its signature signal color is Tokyo
+> Night green `#C3E88D` (= present / awake / active), and it keeps its own
+> crescent-moon mark. Cyan `#86E1FC` is used only as Legion "system chrome" (reload
+> button, clock, live pulse, the small Legion mark) — the visual thread that says
+> "part of the Legion fleet."
 
-**Typography**
-- UI / headings: **IBM Plex Sans** (400/500/600/700)
-- Data, ids, config, event log, labels: **IBM Plex Mono** (400/500/600)
-- Both from Google Fonts. Key sizes: page title 15.5/600; stat value 27/600;
-  display id 16/600; body 13–14/400–500; labels 10–11 mono uppercase (ls 0.06em);
-  data 11–12.5 mono.
+**Colors** (Legion Works tokens; `var()` name in parens)
+- Base bg: `#16161E` (`--bg-base`); data/list surface: `#1a1b26`; raised panel:
+  `#222436` (`--bg-raised`); sunken: `#101018`
+- **Glass panels** (stat cards, columns, display cards, doctor/config summary):
+  fill `rgba(36,40,58,0.72)`, border `1px rgba(169,177,214,0.14)` (`--border`),
+  radius 14px (`--radius-lg`), shadow `0 18px 50px -12px rgba(0,0,0,0.62)`
+  (`--shadow-lg`). The DS's true Liquid Glass adds `backdrop-filter: blur(22px)
+  saturate(160%)` + a specular top edge — apply that in production over the
+  `.lw-aurora` field; the prototype uses the solid navy fill for capture/export
+  reliability (see Gotchas).
+- Sidebar: `rgba(16,16,24,0.5)` + backdrop blur; right border `--border`
+- Borders: `rgba(169,177,214,0.14)` (`--border`), `0.28` (`--border-strong`); row
+  hairlines `rgba(169,177,214,0.06)`; accent border = cyan @48% (`--border-accent`)
+- Text: strong `#c8d3f5` (`--text-strong`); body `#a9b1d6` (`--text-body`); muted
+  `#828bb8` (`--text-muted`); faint `#737aa2` (`--text-faint`); dim `#545c7e`
+- **dormant green** — present / active / waking / ok: `#C3E88D` (`--success`/
+  `--green-400`); light-mode crescent variant `#3aa06a`
+- Legion cyan — system chrome only (reload, clock, live pulse, links): `#86E1FC`
+  (`--accent`/`--cyan-400`)
+- Signal blue — absent / blanked: `#82AAFF` (`--blue-400`)
+- Warning yellow — grace / blanking / unavailable: `#FFC777` (`--warning`/`--amber-300`)
+- IceTea amber — paused (the one warm human touch): `#FF966C` (`--accent-warm`/`--amber-500`)
+- Geth purple — inhibited: `#C099FF` (`--purple-400`)
+- Danger red — fail / wake_retry: `#FF757F` (`--danger`/`--red-400`)
+- Status-tint convention: status color at `0.12`–`0.14` alpha for the matching soft
+  background; the DS provides `--success-muted` / `--warning-muted` / etc. for this.
+- A `[data-theme="nightowl"]` sibling and `[data-theme="light"]` (Tokyo Day) retint
+  everything — inherit them for free by using the DS variables.
 
-**Spacing / radius**
-- Content padding 22–26px; card padding 16–22px; grid gaps 12–16px.
-- Radii: cards 11–14px; buttons/chips 6–8px; pills 20px (fully round); status
-  circle 50%.
-- Sidebar width 236px; top bar height 60px; display action column 130px; display
-  preview 96×60.
+**Typography** (Legion Works families — Google Fonts; DS `var()` in parens)
+- Display / headings / wordmark / metrics: **Space Grotesk** (`--font-display`),
+  600, tight tracking (page title 18px, stat value 30px, display id 17px)
+- UI & body: **Geist** (`--font-ui`), 400/500 (buttons, nav, body 13–14px)
+- Machine-truth — ids, config, event log, timestamps, labels: **JetBrains Mono**
+  (`--font-mono`), 400/500. Eyebrows/labels are UPPERCASE, `letter-spacing 0.14em`
+  (`--tracking-caps`), 10.5–11px, muted.
 
-**Animation:** see Interactions (`dm-ring`, `dm-pulse`, `dm-fade`).
+**Spacing / radius / motion** (DS scale)
+- Content padding 22–26px; card padding 15–22px; grid gaps 12–16px.
+- Radii: cards/panels 14px (`--radius-lg`), large glass 20px (`--radius-xl`);
+  buttons/inputs 10px (`--radius-md`); chips/pills 999px (`--radius-pill`); small 6–8px.
+- Sidebar width 244px; top bar height 64px; display action column 132px; display
+  preview 98×62.
+- Motion: quick, **no bounce** — `--dur-fast 120ms` / `--dur-mid 200ms`, ease-out
+  `cubic-bezier(0.22,0.61,0.36,1)`. Ambient: a slow 34s aurora drift (`dmDrift`,
+  the DS `.lw-aurora--drift`) and a fade-rise entrance. The Events "live" dot has a
+  gentle 1.8s opacity pulse; present-sensor / running dots use a static color +
+  `box-shadow` glow (no sonar loop — the DS avoids decorative infinite loops).
+  Honor `prefers-reduced-motion` (the DS zeroes durations).
+
+**Background:** the whole app sits on the DS **aurora field** — `background-color:
+#16161E` + layered radial-gradient blooms (cyan top-left, blue top-right, one warm
+amber low-right, purple bottom). Glass panels float over it; never put glass over a
+flat solid. Dense data surfaces (event log, config viewer) use opaque `#1a1b26`
+(the DS says don't glass long data lists).
 
 ## Brand Assets
 
-The identity: a **crescent-moon mark** (dormant = asleep) with a small green
-**presence dot**, rendered as green `oklch(0.80 0.15 155)` on near-black. See
-`Brand Assets.dc.html` for the full board (logo lockups light/dark, favicon/app-icon
-sizes, palette, type specimen, a 12-icon system set, a 1232×340 README hero, and a
-1200×630 GitHub OG card).
+The identity bridges dormant's own meaning with the Legion fleet: a **crescent-moon
+mark** (dormant = asleep) in **dormant green `#C3E88D`** with a small **Legion-cyan
+`#86E1FC` presence node** — literally "dormant, part of Legion." Wordmark is **Space
+Grotesk** 600. See `Brand Assets.dc.html` for the full board (logo lockups
+dark/light, favicon/app-icon sizes, the Legion palette with dormant-green
+highlighted, Space Grotesk / Geist / JetBrains Mono specimens, a 12-icon set, a
+1232×340 README hero, and a 1200×630 GitHub OG card — `github.com/iceteaSA/dormant`).
 
 Ready-to-use vector files are in `assets/`:
-- `assets/mark.svg` — the crescent mark alone (transparent crescent via SVG mask;
-  drops on any background). Use for favicon/app-icon.
-- `assets/favicon.svg` — mark on a dark rounded-square tile.
-- `assets/logo.svg` — horizontal lockup (mark + "dormant" wordmark).
+- `assets/mark.svg` — crescent (green, transparent via SVG mask) + cyan node; drops
+  on any background. Favicon/app-icon source.
+- `assets/favicon.svg` — mark on a `#16161E` rounded-square tile.
+- `assets/logo.svg` — horizontal lockup (mark + Space Grotesk "dormant" wordmark).
+- `assets/legion-mark.svg` — the shared **Legion Works** consensus mark, used small
+  as the "part of the Legion fleet" tie-in (sidebar footer, OG credit).
 
-Icon set (recreate as inline SVG, 1.7px stroke, green, round caps/joins, built only
-from circles/arcs/rects/diamonds — no illustrative detail): presence, mqtt, ha-ws,
-ld2410, motion, input-idle, display, zone, rule, power_off, screen_off·audio,
-brightness_0. Definitions are in the `renderVals()` of `Brand Assets.dc.html`.
-
-If you adopt an icon library instead, keep it monoline and geometric to match.
+Icon set — recreate with **Lucide** (the DS icon system) or inline SVG in that style
+(1.75px stroke, dormant-green, round caps/joins, geometric — no illustrative
+detail): presence, mqtt, ha-ws, ld2410, motion, input-idle, display, zone, rule,
+power_off, screen_off·audio, brightness_0. Definitions are in `renderVals()` of
+`Brand Assets.dc.html`. Nav icons (dashboard/displays/events/config/doctor) are
+already Lucide-style in the dashboard.
 
 ## Files
 
@@ -386,7 +438,8 @@ In this bundle:
 - `Dormant Dashboard.dc.html` — the full dashboard prototype (all 5 views + live
   behavior). Primary reference.
 - `Brand Assets.dc.html` — brand & asset board.
-- `assets/mark.svg`, `assets/logo.svg`, `assets/favicon.svg` — production vectors.
+- `assets/mark.svg`, `assets/logo.svg`, `assets/favicon.svg` — dormant production
+  vectors; `assets/legion-mark.svg` — shared Legion Works fleet mark (tie-in).
 
 In the dormant repo (read these to wire the backend — do not re-model the data):
 - `crates/dormant-core/src/ipc_proto.rs` — `IpcRequest` / `IpcResponse`
@@ -402,9 +455,14 @@ In the dormant repo (read these to wire the backend — do not re-model the data
 ## Gotchas / notes for the implementer
 
 - **The prototype is inline-styled** (a constraint of the authoring format). In a
-  real codebase, lift the tokens above into your styling system (CSS vars / theme).
-- **oklch alpha:** the mock writes soft backgrounds as `oklch(L C H / a)`. Keep
-  them in oklch for hue-consistent tints, or convert to your color pipeline.
+  real codebase, **link Legion Works `styles.css` and use its CSS variables** —
+  don't hardcode the hex values. The tokens section maps each value to its `var()`.
+- **Liquid Glass vs. capture:** the prototype paints panels with a solid navy fill
+  (`rgba(36,40,58,0.72)`) instead of the DS's `backdrop-filter` glass, because
+  `backdrop-filter` inside a scrolling container is dropped by headless
+  screenshot/PDF/PPTX capture. In the real app (no capture constraint) use the DS
+  `.lw-glass` recipe (blur 22px + saturate 160% + specular top edge) over the
+  `.lw-aurora` field for the true look.
 - **Config code block:** render each TOML line as its own block element. A single
   `<pre>` populated from JSX/templated text can lose newlines — the prototype
   splits lines deliberately.

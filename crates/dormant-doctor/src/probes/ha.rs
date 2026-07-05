@@ -27,7 +27,7 @@ pub async fn probe_ha_all(
 }
 
 /// Probe a single HA sensor by connecting WebSocket and subscribing.
-pub async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credentials) -> ProbeResult {
+pub(crate) async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credentials) -> ProbeResult {
     let name = format!("ha {id}");
 
     let token = match &creds.ha_token {

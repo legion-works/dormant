@@ -22,7 +22,7 @@ pub async fn probe_mqtt_all(cfg: &dormant_core::config::Config) -> Vec<ProbeResu
 }
 
 /// Probe a single MQTT sensor by subscribing to its topic.
-pub async fn probe_mqtt_one(id: &str, cfg: &MqttSensorCfg) -> ProbeResult {
+pub(crate) async fn probe_mqtt_one(id: &str, cfg: &MqttSensorCfg) -> ProbeResult {
     let name = format!("mqtt {id}");
 
     // Parse broker URL.
@@ -99,7 +99,7 @@ pub async fn probe_mqtt_one(id: &str, cfg: &MqttSensorCfg) -> ProbeResult {
 
 /// Parse a broker URL into (host, port).
 #[must_use]
-pub fn parse_broker_url(url: &str) -> (&str, u16) {
+pub(crate) fn parse_broker_url(url: &str) -> (&str, u16) {
     let rest = url
         .strip_prefix("tcp://")
         .or_else(|| url.strip_prefix("mqtt://"))

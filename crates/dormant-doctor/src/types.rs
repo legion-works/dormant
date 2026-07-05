@@ -24,10 +24,13 @@ pub enum ProbeStatus {
     Fail,
     /// Probe was skipped (no applicable config).
     Skip,
+    /// The probe is not supported on this platform or in this release.
+    NotSupported,
 }
 
 impl ProbeResult {
     /// Create a passing probe result.
+    #[must_use]
     pub fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -37,6 +40,7 @@ impl ProbeResult {
     }
 
     /// Create a failing probe result.
+    #[must_use]
     pub fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -46,10 +50,21 @@ impl ProbeResult {
     }
 
     /// Create a skipped probe result.
+    #[must_use]
     pub fn skip(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             status: ProbeStatus::Skip,
+            detail: detail.into(),
+        }
+    }
+
+    /// Create a not-supported probe result.
+    #[must_use]
+    pub fn not_supported(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: ProbeStatus::NotSupported,
             detail: detail.into(),
         }
     }

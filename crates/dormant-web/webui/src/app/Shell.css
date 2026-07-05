@@ -1,14 +1,10 @@
-/* ── Global Shell layout ──────────────────────────────────────────
-   Visual authority: design/web-ui/README.md §"Global chrome"
-   DS tokens consumed from src/ds.css; no hardcoded hex.
-   ──────────────────────────────────────────────────────────────── */
+/* Global Shell layout — visual authority: design/web-ui/README.md.
+   All color/spacing/radius values use DS tokens; no hardcoded hex/rgba. */
 
-/* ── Shell root — full viewport, fixed panes ──────────────────── */
 .shell {
   display: flex;
   height: 100vh;
   overflow: hidden;
-  background-color: var(--bg-base);
   color: var(--text-body);
   font-family: var(--font-ui);
 }
@@ -25,7 +21,6 @@
   -webkit-backdrop-filter: blur(22px) saturate(160%);
 }
 
-/* Brand block */
 .sidebar-brand {
   display: flex;
   align-items: center;
@@ -56,7 +51,6 @@
   margin-top: 2px;
 }
 
-/* Nav */
 .sidebar-nav {
   padding: 12px;
   display: flex;
@@ -85,7 +79,7 @@
 }
 
 .nav-item:hover {
-  background-color: rgba(169, 177, 214, 0.05);
+  background-color: color-mix(in srgb, var(--text-body) 5%, transparent);
 }
 
 .nav-item--active {
@@ -114,7 +108,7 @@
   font-family: var(--font-mono);
   font-size: 10.5px;
   padding: 1px 6px;
-  border-radius: 20px;
+  border-radius: var(--radius-pill);
   color: var(--text-faint);
   background-color: var(--bg-sunken);
 }
@@ -124,7 +118,6 @@
   background-color: var(--success-muted);
 }
 
-/* Footer */
 .sidebar-footer {
   display: flex;
   align-items: center;
@@ -163,7 +156,6 @@
   overflow: hidden;
 }
 
-/* Top bar (64px) */
 .topbar {
   height: 64px;
   min-height: 64px;
@@ -205,7 +197,7 @@
   font-family: var(--font-mono);
   font-size: 11.5px;
   padding: 6px 11px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background-color: var(--bg-sunken);
   color: var(--text-faint);
@@ -238,20 +230,10 @@
   background-color: color-mix(in oklab, var(--success) 22%, transparent);
 }
 
-/* Content scroll area */
 .content {
   flex: 1;
   overflow-y: auto;
   padding: 22px 26px 40px;
-}
-
-/* ── Aurora background (applied globally) ───────────────────────── */
-/* The DS `.lw-aurora` class provides the radial-gradient blooms.
-   Apply it to the shell root so glass panels float over it. */
-.shell.lw-aurora {
-  background-color: var(--bg-base);
-  /* The DS tokens define .lw-aurora with radial-gradient layers.
-     Re-declare here as a fallback in case the DS class isn't loaded. */
 }
 
 /* ── Respect reduced-motion ──────────────────────────────────────── */

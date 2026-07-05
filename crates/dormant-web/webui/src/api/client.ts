@@ -1,18 +1,17 @@
 /**
  * Typed fetch wrappers for the dormant daemon HTTP API.
  *
- * Every endpoint returns JSON.  Errors surface as rejected Promises
- * with a descriptive message; callers handle them at the view level
- * (toast, disabled state, retry button).
- *
- * The Vite dev proxy routes /api → the daemon; in production the
- * same origin serves both the SPA and /api (axum + rust-embed).
+ * Route verification (server.rs + command.rs):
+ *   GET  /api/state   → StateSnapshot
+ *   GET  /api/config  → ConfigResponse
+ *   POST /api/blank   → JSON { display: "<id>" }
+ *   POST /api/wake    → JSON { display: "<id>" }
+ *   POST /api/pause   → JSON { rule?: string, duration_s?: number }
+ *   POST /api/resume  → JSON { rule?: string }
+ *   POST /api/reload  → no body
+ *   POST /api/doctor  → no body, returns DoctorReport
  */
-import type {
-  StateSnapshot,
-  ConfigResponse,
-  DoctorReport,
-} from "./types";
+import type { StateSnapshot, ConfigResponse, DoctorReport } from "./types";
 
 // ── Shared helpers ──────────────────────────────────────────────────────
 
@@ -20,7 +19,7 @@ const BASE = "/api";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + url, {
-    headers: { "Accept": "application/json" },
+    headers: { Accept: "application/json" },
     ...init,
   });
 
@@ -34,33 +33,35 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 // ── Read endpoints ──────────────────────────────────────────────────────
 
-/** GET /api/status — full engine snapshot (spec §4.1). */
 export function getState(): Promise<StateSnapshot> {
-  return request<StateSnapshot>("/status");
+  return request<StateSnapshot>("/state");
 }
 
-/** GET /api/config — parsed config inventory + raw TOML (spec §4.1). */
 export function getConfig(): Promise<ConfigResponse> {
   return request<ConfigResponse>("/config");
 }
 
 // ── Write endpoints ─────────────────────────────────────────────────────
 
-/** POST /api/displays/:display/blank — force-blank a display. */
+/** POST /api/blank — force-blank a display by id. */
 export function postBlank(display: string): Promise<void> {
-  return request<void>(`/displays/${encodeURIComponent(display)}/blank`, {
+  return request<void>("/blank", {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ display }),
   });
 }
 
-/** POST /api/displays/:display/wake — force-wake a display. */
+/** POST /api/wake — force-wake a display by id. */
 export function postWake(display: string): Promise<void> {
-  return request<void>(`/displays/${encodeURIComponent(display)}/wake`, {
+  return request<void>("/wake", {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ display }),
   });
 }
 
-/** POST /api/pause — pause rules (spec: `pause_all` + optional `rule` / `duration_s`). */
+/** POST /api/pause — pause blanking.  Omit `rule` to pause all rules. */
 export function postPause(opts?: {
   rule?: string;
   duration_s?: number | null;
@@ -69,33 +70,27 @@ export function postPause(opts?: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      ...(opts?.rule != null ? { rule: opts.rule } : { pause_all: true }),
+      ...(opts?.rule != null ? { rule: opts.rule } : {}),
       ...(opts?.duration_s !== undefined ? { duration_s: opts.duration_s } : {}),
     }),
   });
 }
 
-/** POST /api/resume — resume rules (spec: `resume_all` + optional `rule`). */
+/** POST /api/resume — resume blanking.  Omit `rule` to resume all rules. */
 export function postResume(opts?: { rule?: string }): Promise<void> {
   return request<void>("/resume", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(
-      opts?.rule != null ? { rule: opts.rule } : { resume_all: true },
-    ),
+    body: JSON.stringify(opts?.rule != null ? { rule: opts.rule } : {}),
   });
 }
 
 /** POST /api/reload — hot-reload the daemon config. */
 export function postReload(): Promise<void> {
-  return request<void>("/reload", {
-    method: "POST",
-  });
+  return request<void>("/reload", { method: "POST" });
 }
 
 /** POST /api/doctor — run the diagnosis probes. */
 export function runDoctor(): Promise<DoctorReport> {
-  return request<DoctorReport>("/doctor", {
-    method: "POST",
-  });
+  return request<DoctorReport>("/doctor", { method: "POST" });
 }

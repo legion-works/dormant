@@ -1,19 +1,3 @@
-/**
- * Global application shell — renders the fixed two-pane layout
- * (244px sidebar + 64px top bar) and routes the active view into
- * the content area via simple client-side hash routing.
- *
- * Design authority: design/web-ui/README.md §"Global chrome"
- * updated per the Legion Works reskin tokens.
- *
- * DS token usage:
- *   - Sidebar: `--bg-overlay`, `--border`
- *   - Top bar: height 64px, `--border` on bottom
- *   - Nav items: active → `--text-strong` + `--accent-muted` bg
- *   - dormant green = `--success`; Legion cyan = `--accent`
- *   - Fonts: `--font-display` (wordmark), `--font-ui` (nav/body), `--font-mono` (clock/version)
- *   - Pulsing connection dot uses --success + box-shadow (no infinite CSS loop).
- */
 import { useState, useEffect, useCallback } from "react";
 import Dashboard from "./views/Dashboard";
 import Displays from "./views/Displays";
@@ -21,8 +5,6 @@ import Events from "./views/Events";
 import Config from "./views/Config";
 import Doctor from "./views/Doctor";
 import "./Shell.css";
-
-// ── Type-safe view registry ─────────────────────────────────────────────
 
 const VIEWS = {
   dashboard: { label: "Dashboard", icon: "▦", Component: Dashboard },
@@ -36,8 +18,6 @@ type ViewKey = keyof typeof VIEWS;
 
 const VIEW_KEYS = Object.keys(VIEWS) as ViewKey[];
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
 function getViewFromHash(): ViewKey {
   const hash = window.location.hash.replace(/^#\/?/, "");
   return hash in VIEWS ? (hash as ViewKey) : "dashboard";
@@ -47,21 +27,17 @@ function formatClock(): string {
   return new Date().toLocaleTimeString("en-US", { hour12: false });
 }
 
-// ── Shell ───────────────────────────────────────────────────────────────
-
 export default function Shell() {
   const [activeView, setActiveView] = useState<ViewKey>(getViewFromHash);
   const [clock, setClock] = useState(formatClock);
-  const [connected, _setConnected] = useState(false); // TODO: wire to useEvents in Task 14
+  const [connected, _setConnected] = useState(false);
 
-  // Hash-based routing — keep URL in sync with nav clicks
   useEffect(() => {
     const onHashChange = () => setActiveView(getViewFromHash());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  // Live clock (1s tick)
   useEffect(() => {
     const id = setInterval(() => setClock(formatClock()), 1_000);
     return () => clearInterval(id);
@@ -73,17 +49,15 @@ export default function Shell() {
   }, []);
 
   const handleReload = useCallback(() => {
-    // Placeholder — wired to postReload() in a later task.
+    // Wired to postReload() when the useDaemon hook lands.
     console.log("Reload config requested (not yet wired)");
   }, []);
 
   const ActiveComponent = VIEWS[activeView].Component;
 
   return (
-    <div className="shell" data-theme="default">
-      {/* ── Sidebar ─────────────────────────────────────────────── */}
+    <div className="shell lw-aurora lw-aurora--drift" data-theme="default">
       <aside className="sidebar">
-        {/* Brand block */}
         <div className="sidebar-brand">
           <span className="brand-mark" aria-hidden="true">☽</span>
           <div>
@@ -92,7 +66,6 @@ export default function Shell() {
           </div>
         </div>
 
-        {/* Nav */}
         <nav className="sidebar-nav">
           {VIEW_KEYS.map((key) => {
             const v = VIEWS[key];
@@ -114,7 +87,6 @@ export default function Shell() {
           })}
         </nav>
 
-        {/* Footer — connection status */}
         <div className="sidebar-footer">
           <span className={`conn-dot${connected ? " conn-dot--live" : ""}`} />
           <span className="conn-label">
@@ -123,9 +95,7 @@ export default function Shell() {
         </div>
       </aside>
 
-      {/* ── Main column ────────────────────────────────────────── */}
       <main className="main">
-        {/* Top bar */}
         <header className="topbar">
           <div className="topbar-left">
             <h1 className="topbar-title">{VIEWS[activeView].label}</h1>
@@ -142,7 +112,6 @@ export default function Shell() {
           </div>
         </header>
 
-        {/* Content area */}
         <div className="content">
           <ActiveComponent />
         </div>

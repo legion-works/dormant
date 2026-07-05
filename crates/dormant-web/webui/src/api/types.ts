@@ -208,8 +208,10 @@ export interface MqttSensorCfg {
   stale_timeout?: unknown;
 }
 
+/** rust: config/schema.rs HaSensorCfg (field names: url, entity) */
 export interface HaSensorCfg {
-  entity_id: string;
+  url: string;
+  entity: string;
   payload_on?: string;
   payload_off?: string;
   kind?: SensorKind;
@@ -217,8 +219,10 @@ export interface HaSensorCfg {
   stale_timeout?: unknown;
 }
 
+/** rust: config/schema.rs UsbLd2410Cfg (field names: port, baud) */
 export interface UsbLd2410Cfg {
-  serial_path: string;
+  port: string;
+  baud?: number;
   kind?: SensorKind;
   hold_time?: unknown;
   stale_timeout?: unknown;
@@ -284,31 +288,3 @@ export interface ConfigResponse {
   validation: ConfigValidation;
   display_rules: Record<string, DisplayRuleInfo>;
 }
-
-// ── Lightweight cross-check (compile-time + runtime) ────────────────────
-
-/** Verify that the wire-literal enums match the expected Rust serde strings. */
-export function assertEnumValues(): void {
-  // SensorState — serde(rename_all = "lowercase")
-  const sensorStates: SensorState[] = ["present", "absent", "unavailable"];
-  if (sensorStates.length !== 3) throw new Error("SensorState: wrong variant count");
-
-  // BlankMode — serde(rename_all = "snake_case")
-  const blankModes: BlankMode[] = ["power_off", "screen_off_audio_on", "brightness_zero"];
-  if (blankModes.length !== 3) throw new Error("BlankMode: wrong variant count");
-
-  // ControllerRole — serde(rename_all = "snake_case")
-  const roles: ControllerRole[] = ["primary", "fallback"];
-  if (roles.length !== 2) throw new Error("ControllerRole: wrong variant count");
-
-  // CheckStatus — serde(rename_all = "snake_case")
-  const checkStatuses: CheckStatus[] = ["ok", "fail", "skip", "not_supported"];
-  if (checkStatuses.length !== 4) throw new Error("CheckStatus: wrong variant count");
-
-  // DaemonEvent discriminator values — serde(tag = "event", rename_all = "snake_case")
-  const eventTags = ["sensor_changed", "zone_changed", "display_phase", "config_reloaded", "wake_retry"];
-  if (eventTags.length !== 5) throw new Error("DaemonEvent: wrong variant count");
-}
-
-// Run the assertion on module load (tree-shaken in prod — only fires in dev/tests).
-assertEnumValues();

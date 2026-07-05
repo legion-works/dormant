@@ -606,7 +606,7 @@ async fn run_loop(
 
     #[cfg(not(unix))]
     {
-        let mut ctrl_c = tokio::signal::ctrl_c();
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
         loop {
             tokio::select! {

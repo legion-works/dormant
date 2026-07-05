@@ -21,6 +21,7 @@ use dormant_core::types::{SensorId, SensorState};
 use dormant_displays::registry::capabilities;
 #[cfg(target_os = "linux")]
 use dormant_displays::vcp_ops::RealVcp;
+#[cfg(target_os = "linux")]
 use dormant_displays::vcp_ops::VcpOps;
 use dormant_sensors::ha_ws::{Action, HaProtocol};
 use dormant_sensors::mqtt::parse_payload;

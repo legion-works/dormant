@@ -1,0 +1,90 @@
+# Reference config — verify component options against your ESPHome version.
+#
+# HLK-LD2410C 24GHz mmWave presence sensor on ESP32-C6 with WiFi + MQTT.
+# Publishes occupancy binary_sensors over MQTT; dormant consumes the
+# `has_target` topic via its MQTT sensor source.
+#
+# Wiring (5 pins, JST 1.25mm on sensor side):
+#   Sensor VCC → board 5V
+#   Sensor GND → board GND
+#   Sensor TX  → board RX (GPIO4 below)
+#   Sensor RX  → board TX (GPIO5 below)
+#   Sensor OUT → unused (GPIO OUT pin, high when motion detected)
+
+substitutions:
+  device_name: ld2410c-desk
+  friendly_name: "Desk Presence"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: "2025.12.0"
+
+esp32:
+  board: esp32-c6-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: ${device_name}-fallback
+    password: !secret fallback_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+mqtt:
+  broker: !secret mqtt_broker
+  port: !secret mqtt_port
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: true
+  birth_message:
+    topic: ${device_name}/status
+    payload: online
+  will_message:
+    topic: ${device_name}/status
+    payload: offline
+
+uart:
+  tx_pin: GPIO5
+  rx_pin: GPIO4
+  baud_rate: 256000
+
+ld2410:
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      name: "${friendly_name} Occupancy"
+      device_class: occupancy
+    has_moving_target:
+      name: "${friendly_name} Moving"
+      device_class: motion
+    has_still_target:
+      name: "${friendly_name} Still"
+      device_class: occupancy
+
+sensor:
+  - platform: ld2410
+    moving_energy:
+      name: "${friendly_name} Moving Energy"
+    still_energy:
+      name: "${friendly_name} Still Energy"
+    moving_distance:
+      name: "${friendly_name} Moving Distance"
+    still_distance:
+      name: "${friendly_name} Still Distance"

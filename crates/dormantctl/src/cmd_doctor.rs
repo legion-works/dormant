@@ -13,7 +13,7 @@ use clap::Parser;
 use comfy_table::Color;
 use comfy_table::ContentArrangement;
 use comfy_table::{Cell, Row, Table};
-use dormant_core::config::schema::{Credentials, SensorConfig};
+use dormant_core::config::schema::Credentials;
 use dormant_core::config::{Strictness, load_config, load_credentials};
 use dormant_core::paths;
 use dormant_doctor::{ProbeResult, ProbeStatus};
@@ -84,13 +84,12 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
     rt.block_on(run_async(args))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
             #[cfg(target_os = "linux")]
             {
-                let results = vec![dormant_doctor::probes::ddcci::probe_ddcci().await];
+                let results = vec![dormant_doctor::probe_ddcci().await];
                 print_table(&results);
                 Ok(outcome(&results))
             }
@@ -100,19 +99,19 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             }
         }
         Some(DoctorSubcommand::Usb { port, baud }) => {
-            let results = vec![dormant_doctor::probes::usb::probe_usb(port, *baud).await];
+            let results = vec![dormant_doctor::probe_usb(port, *baud).await];
             print_table(&results);
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Mqtt) => {
             let (cfg, _creds) = load_config_and_creds(args)?;
-            let results = dormant_doctor::probes::mqtt::probe_mqtt_all(&cfg).await;
+            let results = dormant_doctor::probe_mqtt_all(&cfg).await;
             print_table(&results);
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Ha) => {
             let (cfg, creds) = load_config_and_creds(args)?;
-            let results = dormant_doctor::probes::ha::probe_ha_all(&cfg, &creds).await;
+            let results = dormant_doctor::probe_ha_all(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
         }
@@ -124,85 +123,9 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
         Some(DoctorSubcommand::Kwin) => Ok(DoctorOutcome::NotSupported("kwin-dpms".into())),
         Some(DoctorSubcommand::Samsung) => Ok(DoctorOutcome::NotSupported("samsung-tizen".into())),
         None => {
-            // Bare doctor: run everything applicable.
+            // Bare doctor: delegate to the single-source orchestration.
             let (cfg, creds) = load_config_and_creds(args)?;
-            let mut results = Vec::new();
-
-            // Config probe first.
-            let config_result = dormant_doctor::probes::config::probe_config_inner(&cfg, &creds);
-            let config_ok = config_result.status != ProbeStatus::Fail;
-            results.push(config_result);
-
-            // Collect sensor probes.
-            let mut sensor_futs: Vec<
-                std::pin::Pin<Box<dyn futures_util::Future<Output = ProbeResult>>>,
-            > = Vec::new();
-            for (id, sensor_cfg) in &cfg.sensors {
-                if !config_ok {
-                    // Skip dependent probes when config is invalid.
-                    let name = match sensor_cfg {
-                        SensorConfig::Mqtt(_) => format!("mqtt {id}"),
-                        SensorConfig::Ha(_) => format!("ha {id}"),
-                        SensorConfig::UsbLd2410(usb_cfg) => format!("usb {}", usb_cfg.port),
-                    };
-                    results.push(ProbeResult::skip(name, "config invalid — fix config first"));
-                    continue;
-                }
-                match sensor_cfg {
-                    SensorConfig::Mqtt(mqtt_cfg) => {
-                        let id = id.clone();
-                        let cfg = mqtt_cfg.clone();
-                        sensor_futs.push(Box::pin(async move {
-                            dormant_doctor::probes::mqtt::probe_mqtt_one(&id, &cfg).await
-                        }));
-                    }
-                    SensorConfig::Ha(ha_cfg) => {
-                        let id = id.clone();
-                        let cfg = ha_cfg.clone();
-                        let creds = creds.clone();
-                        sensor_futs.push(Box::pin(async move {
-                            dormant_doctor::probes::ha::probe_ha_one(&id, &cfg, &creds).await
-                        }));
-                    }
-                    SensorConfig::UsbLd2410(usb_cfg) => {
-                        let port = usb_cfg.port.clone();
-                        let baud = usb_cfg.baud;
-                        sensor_futs.push(Box::pin(async move {
-                            dormant_doctor::probes::usb::probe_usb(&port, baud).await
-                        }));
-                    }
-                }
-            }
-
-            // Run sensor probes in parallel.
-            if !sensor_futs.is_empty() {
-                let sensor_results = futures_util::future::join_all(sensor_futs).await;
-                results.extend(sensor_results);
-            }
-
-            // DDC/CI probe if any display uses ddcci (serial after sensors).
-            #[cfg(target_os = "linux")]
-            if config_ok {
-                let has_ddcci = cfg
-                    .displays
-                    .values()
-                    .any(|d| d.controllers.iter().any(|c| c == "ddcci"));
-                if has_ddcci {
-                    results.push(dormant_doctor::probes::ddcci::probe_ddcci().await);
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            if cfg
-                .displays
-                .values()
-                .any(|d| d.controllers.iter().any(|c| c == "ddcci"))
-            {
-                results.push(ProbeResult::skip(
-                    "ddcci",
-                    "DDC/CI is only supported on Linux in this release",
-                ));
-            }
-
+            let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
         }
@@ -234,9 +157,7 @@ fn probe_config(args: &DoctorArgs) -> Vec<ProbeResult> {
         Ok(pair) => pair,
         Err(e) => return vec![ProbeResult::fail("config", format!("{e:#}"))],
     };
-    vec![dormant_doctor::probes::config::probe_config_inner(
-        &cfg, &creds,
-    )]
+    vec![dormant_doctor::probe_config_inner(&cfg, &creds)]
 }
 
 // ── Table printing ──────────────────────────────────────────────────────────────
@@ -253,6 +174,7 @@ fn print_table(results: &[ProbeResult]) {
             ProbeStatus::Pass => ("✓", Color::Green),
             ProbeStatus::Fail => ("✗", Color::Red),
             ProbeStatus::Skip => ("-", Color::Yellow),
+            ProbeStatus::NotSupported => ("N/A", Color::Yellow),
         };
         table.add_row(Row::from(vec![
             Cell::new(&r.name),
@@ -287,6 +209,7 @@ mod tests {
             ProbeResult::pass("test-pass", "all good"),
             ProbeResult::fail("test-fail", "something broke"),
             ProbeResult::skip("test-skip", "not applicable"),
+            ProbeResult::not_supported("test-na", "not on this platform"),
         ];
 
         // Print to string and check glyphs.
@@ -299,6 +222,7 @@ mod tests {
                 ProbeStatus::Pass => ("✓", Color::Green),
                 ProbeStatus::Fail => ("✗", Color::Red),
                 ProbeStatus::Skip => ("-", Color::Yellow),
+                ProbeStatus::NotSupported => ("N/A", Color::Yellow),
             };
             table.add_row(Row::from(vec![
                 Cell::new(&r.name),
@@ -322,13 +246,21 @@ mod tests {
             output.contains("test-skip"),
             "table should contain probe name"
         );
+        assert!(
+            output.contains("N/A"),
+            "table should contain NotSupported glyph"
+        );
     }
 
     // ── DoctorOutcome ───────────────────────────────────────────────────────
 
     #[test]
     fn outcome_all_pass_returns_all_ok() {
-        let results = [ProbeResult::pass("a", ""), ProbeResult::skip("b", "")];
+        let results = [
+            ProbeResult::pass("a", ""),
+            ProbeResult::skip("b", ""),
+            ProbeResult::not_supported("c", ""),
+        ];
         assert_eq!(outcome(&results), DoctorOutcome::AllOk);
     }
 

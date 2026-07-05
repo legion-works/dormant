@@ -8,19 +8,29 @@
 //! `dormant_core::doctor` so they are reachable from every crate without a
 //! cycle.  This crate re-exports them and owns the probe logic.
 
-pub mod probes;
+mod probes;
 mod types;
 
 pub use dormant_core::doctor::{Check, CheckStatus, DoctorReport};
 pub use types::{ProbeResult, ProbeStatus};
 
+// Re-export probe functions the CLI dispatches per-subcommand.
+pub use probes::config::probe_config_inner;
+#[cfg(target_os = "linux")]
+pub use probes::ddcci::probe_ddcci;
+pub use probes::ha::probe_ha_all;
+pub use probes::mqtt::probe_mqtt_all;
+pub use probes::usb::probe_usb;
+
 use dormant_core::config::Config;
 use dormant_core::config::schema::Credentials;
 
+// ── Boundary mapper ──────────────────────────────────────────────────────────────
+
 /// Map internal probe results into a `DoctorReport`.
 ///
-/// Pass → `Ok`, Fail → `Fail`, Skip → `Skip`.  Callers add `NotSupported`
-/// entries directly when building the report.
+/// Pass → `Ok`, Fail → `Fail`, Skip → `Skip`,
+/// `NotSupported` → `NotSupported`.
 #[must_use]
 pub fn to_report(results: &[ProbeResult]) -> DoctorReport {
     DoctorReport {
@@ -32,6 +42,7 @@ pub fn to_report(results: &[ProbeResult]) -> DoctorReport {
                     ProbeStatus::Pass => CheckStatus::Ok,
                     ProbeStatus::Fail => CheckStatus::Fail,
                     ProbeStatus::Skip => CheckStatus::Skip,
+                    ProbeStatus::NotSupported => CheckStatus::NotSupported,
                 },
                 detail: if r.detail.is_empty() {
                     None
@@ -43,12 +54,15 @@ pub fn to_report(results: &[ProbeResult]) -> DoctorReport {
     }
 }
 
+// ── Bare-doctor orchestration (single source of truth) ───────────────────────────
+
 /// Run all applicable offline probes against the given config and credentials.
 ///
 /// This is the "bare `dormantctl doctor`" path: validate config first, then
-/// probe every sensor + DDC/CI display in parallel.  Returns a `DoctorReport`
-/// suitable for IPC or CLI rendering.
-pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> DoctorReport {
+/// probe every sensor + DDC/CI display in parallel.  The CLI calls this and
+/// renders the returned results; the daemon path chains [`to_report`] for a
+/// `DoctorReport`.
+pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeResult> {
     let mut results = Vec::new();
 
     // Config probe first.
@@ -105,18 +119,27 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> DoctorRepor
     }
 
     // DDC/CI probe if any display uses ddcci (serial after sensors).
-    #[cfg(target_os = "linux")]
     if config_ok {
         let has_ddcci = cfg
             .displays
             .values()
             .any(|d| d.controllers.iter().any(|c| c == "ddcci"));
         if has_ddcci {
-            results.push(probes::ddcci::probe_ddcci().await);
+            #[cfg(target_os = "linux")]
+            {
+                results.push(probes::ddcci::probe_ddcci().await);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                results.push(ProbeResult::not_supported(
+                    "ddcci",
+                    "DDC/CI is only supported on Linux in this release",
+                ));
+            }
         }
     }
 
-    to_report(&results)
+    results
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
@@ -147,6 +170,12 @@ mod tests {
         assert_eq!(r.status, ProbeStatus::Skip);
     }
 
+    #[test]
+    fn probe_result_not_supported() {
+        let r = ProbeResult::not_supported("ddcci", "only on Linux");
+        assert_eq!(r.status, ProbeStatus::NotSupported);
+    }
+
     // ── to_report mapper ───────────────────────────────────────────────────
 
     #[test]
@@ -173,9 +202,31 @@ mod tests {
     }
 
     #[test]
+    fn to_report_maps_not_supported() {
+        let results = [ProbeResult::not_supported("a", "only on Linux")];
+        let report = to_report(&results);
+        assert_eq!(report.checks[0].status, CheckStatus::NotSupported);
+        assert_eq!(report.checks[0].detail.as_deref(), Some("only on Linux"));
+    }
+
+    #[test]
     fn to_report_empty_detail_becomes_none() {
         let results = [ProbeResult::pass("a", "")];
         let report = to_report(&results);
         assert_eq!(report.checks[0].detail, None);
+    }
+
+    #[test]
+    fn to_report_not_supported_serializes_snake_case() {
+        let report = to_report(&[ProbeResult::not_supported("ddcci", "only Linux")]);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("not_supported"),
+            "expected snake_case 'not_supported': {json}"
+        );
+        assert!(
+            json.contains("only Linux"),
+            "detail should be included: {json}"
+        );
     }
 }

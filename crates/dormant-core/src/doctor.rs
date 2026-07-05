@@ -1,8 +1,8 @@
 //! Doctor report types for the probe system.
 //!
 //! Wire-ready report types used by the doctor CLI, the daemon IPC, and the web
-//! UI.  Defined in `dormant-core` so every crate can reference them without a
-//! cycle (Task 4 needs `DoctorReport` in `IpcResponse`).
+//! UI.  These live in `dormant-core` so the daemon IPC layer and web UI can
+//! reference them without a core→doctor dependency cycle.
 //!
 //! The `dormant-doctor` crate re-exports these types; internal probe logic
 //! lives there.

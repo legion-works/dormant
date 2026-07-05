@@ -152,6 +152,32 @@ pub struct ZoneSnapshot {
     pub present: Option<bool>,
 }
 
+/// The role a controller plays in the ordered chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerRole {
+    /// First controller in the chain — the preferred target.
+    Primary,
+    /// Any controller after the first — tried when the primary (and preceding
+    /// fallbacks) fail.
+    Fallback,
+}
+
+/// Per-controller health, recorded from the LAST blank/wake attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerHealth {
+    /// Controller name literal (matches the config `type` key).
+    pub name: String,
+    /// Position in the chain.
+    pub role: ControllerRole,
+    /// Whether the last attempt succeeded.
+    pub healthy: bool,
+    /// Failure detail when `healthy` is false (`None` on success or before
+    /// first attempt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// A display as seen by a [`StateSnapshot`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DisplaySnapshot {
@@ -165,6 +191,11 @@ pub struct DisplaySnapshot {
     /// The display machine's command-generation counter (carry-over across
     /// reloads).
     pub cmd_gen: u64,
+    /// Per-controller health from the last blank/wake attempt.  Empty until
+    /// the first attempt or when deserializing legacy snapshots without this
+    /// field (serde back-compat).
+    #[serde(default)]
+    pub controllers: Vec<ControllerHealth>,
 }
 
 /// A point-in-time view of engine state, returned by [`ControlMsg::Snapshot`].
@@ -739,6 +770,11 @@ impl RulesEngine {
         let mut displays: Vec<(String, DisplaySnapshot)> = Vec::new();
         for dcfg in &self.cfg.displays {
             if let Some(m) = self.machines.get(&dcfg.display) {
+                let controllers = self
+                    .executors
+                    .get(&dcfg.display)
+                    .map(|exec| exec.controller_health())
+                    .unwrap_or_default();
                 displays.push((
                     dcfg.display.0.clone(),
                     DisplaySnapshot {
@@ -746,6 +782,7 @@ impl RulesEngine {
                         inhibited: m.overlays().inhibited,
                         paused: m.overlays().paused.is_some(),
                         cmd_gen: m.cmd_gen(),
+                        controllers,
                     },
                 ));
             }
@@ -974,4 +1011,40 @@ fn map_timestamp_to_tick(ts: Timestamp) -> Option<Tick> {
 
 fn to_tokio_instant(t: std::time::Instant) -> tokio::time::Instant {
     tokio::time::Instant::from_std(t)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_snapshot_deserializes_legacy_without_controllers() {
+        // Old daemon JSON has no "controllers" key; new binary must
+        // default it to empty (serde back-compat).
+        let legacy = r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0}"#;
+        let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.controllers.is_empty());
+    }
+
+    #[test]
+    fn controller_role_first_is_primary_rest_fallback() {
+        let h = [
+            ControllerHealth {
+                name: "ddcci".into(),
+                role: ControllerRole::Primary,
+                healthy: true,
+                detail: None,
+            },
+            ControllerHealth {
+                name: "kwin-dpms".into(),
+                role: ControllerRole::Fallback,
+                healthy: true,
+                detail: None,
+            },
+        ];
+        assert_eq!(h[0].role, ControllerRole::Primary);
+        assert_eq!(h[1].role, ControllerRole::Fallback);
+    }
 }

@@ -6,6 +6,7 @@ members = [
   "crates/dormant-displays",
   "crates/dormantd",
   "crates/dormantctl",
+  "crates/dormant-doctor",
 ]
 
 [workspace.package]

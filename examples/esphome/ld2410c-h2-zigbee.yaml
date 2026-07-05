@@ -41,14 +41,6 @@ logger:
 # No WiFi block needed; the H2 has no WiFi hardware.
 zigbee:
 
-api:
-  encryption:
-    key: !secret api_encryption_key
-
-ota:
-  - platform: esphome
-    password: !secret ota_password
-
 uart:
   tx_pin: GPIO5
   rx_pin: GPIO4

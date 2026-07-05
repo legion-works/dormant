@@ -60,6 +60,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "log_level",
             "socket_path",
             "idle_time_unit",
+            "idle_source",
             "reload_debounce",
         ],
     ),

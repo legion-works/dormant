@@ -310,7 +310,8 @@ impl App {
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
 
-        // ── IPC server (optional, disabled for tests) ──────────────────────
+        // ── IPC server (optional, disabled for tests; Unix-only) ──────────
+        #[cfg(unix)]
         let ipc_handle = if self.disable_ipc {
             None
         } else {
@@ -324,6 +325,8 @@ impl App {
                 .context("spawn IPC server")?,
             )
         };
+        #[cfg(not(unix))]
+        let ipc_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         let handle = AppHandle {
             ctl_tx: front_ctl_tx,

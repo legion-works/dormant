@@ -31,6 +31,8 @@ ignore = [
   "RUSTSEC-2026-0098",
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0104",
-  # serde_yaml recursion — ddc-hi pins 0.7.x via mccs-db; low severity, local config only
+  # serde_yaml recursion — ddc-hi pins 0.7.x via mccs-db (parses the bundled
+  # MCCS capability database shipped in the crate, not user/network input);
+  # dormant's own config format is TOML
   "RUSTSEC-2018-0005",
 ]

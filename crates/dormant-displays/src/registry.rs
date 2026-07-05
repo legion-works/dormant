@@ -28,9 +28,17 @@ use crate::ha_passthrough::HaPassthroughController;
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
 ///
-/// Tasks 12-15 append additional entries (`KWin` DPMS, DDC/CI, Samsung Tizen,
+/// Entries are platform-gated: `ddcci` (DDC/CI over I²C) is Linux-only.
+///
+/// Tasks 12-15 append additional entries (`KWin` DPMS, Samsung Tizen,
 /// LG webOS, HA passthrough, …) as their modules land.
+///
+/// Tests: on Linux, `ddcci` must be present (test: `controller_types_contains_ddcci_on_linux`).
+/// Off-Linux, it must be absent so config validation rejects it deterministically.
+#[cfg(target_os = "linux")]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough"];
+#[cfg(not(target_os = "linux"))]
+pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough"];
 
 /// Static candidate modes per controller type.
 ///
@@ -42,10 +50,13 @@ pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough"];
 /// `capabilities()` is the single grep-stable source for config-validate
 /// layer-1 checks (does the user's `blank_mode` / `degraded_mode` make sense
 /// for the controllers it asks for?).
+///
+/// `ddcci` is only listed on Linux (DDC/CI requires platform I²C support).
 #[must_use]
 pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
     let mut m: HashMap<String, Vec<BlankMode>> = HashMap::new();
     m.insert("command".to_string(), Vec::new());
+    #[cfg(target_os = "linux")]
     m.insert(
         "ddcci".to_string(),
         vec![BlankMode::BrightnessZero, BlankMode::PowerOff],
@@ -217,6 +228,28 @@ mod tests {
     #[test]
     fn controller_types_contains_command() {
         assert!(CONTROLLER_TYPES.contains(&"command"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn controller_types_contains_ddcci_on_linux() {
+        assert!(
+            CONTROLLER_TYPES.contains(&"ddcci"),
+            "ddcci must be registered on Linux"
+        );
+    }
+
+    // Off-Linux: ddcci is deliberately absent from CONTROLLER_TYPES so that
+    // config validation rejects `controllers = ["ddcci"]` deterministically
+    // with "unknown controller" rather than silently accepting it and failing
+    // later at controller build time.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn controller_types_excludes_ddcci_off_linux() {
+        assert!(
+            !CONTROLLER_TYPES.contains(&"ddcci"),
+            "ddcci must NOT be registered on non-Linux platforms"
+        );
     }
 
     #[test]

@@ -151,6 +151,7 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
     rt.block_on(run_async(args))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
@@ -252,6 +253,17 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
                 if has_ddcci {
                     results.push(probe_ddcci().await);
                 }
+            }
+            #[cfg(not(target_os = "linux"))]
+            if cfg
+                .displays
+                .values()
+                .any(|d| d.controllers.iter().any(|c| c == "ddcci"))
+            {
+                results.push(ProbeResult::skip(
+                    "ddcci",
+                    "DDC/CI is only supported on Linux in this release",
+                ));
             }
 
             print_table(&results);

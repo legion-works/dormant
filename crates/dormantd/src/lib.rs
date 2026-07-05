@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod inhibit_activity;
+#[cfg(unix)]
 pub mod ipc;
 pub mod logging;
 pub mod reload;

@@ -138,6 +138,21 @@ mod tests {
             Some("text/html"),
             "API miss must NOT return the SPA fallback (not text/html)"
         );
+
+        // Assert the body is the API-404 body, not the SPA index.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("should be able to read response body");
+        let body_str =
+            std::str::from_utf8(&body_bytes).expect("API 404 body should be valid UTF-8");
+        assert!(
+            !body_str.contains("PLACEHOLDER"),
+            "API 404 body must not contain the placeholder/index HTML"
+        );
+        assert!(
+            !body_str.contains("<html"),
+            "API 404 body must not contain <html (SPA index leaked into API miss)"
+        );
     }
 
     #[tokio::test]

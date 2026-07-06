@@ -140,7 +140,7 @@ pub enum DormantError {
         detail: String,
     },
 
-    /// A render stage ([`StageKind::RenderBlack`] or [`StageKind::RenderScreensaver`])
+    /// A render stage (`RenderBlack` or `RenderScreensaver`)
     /// is requested for a display that cannot use software rendering.
     #[error("E_RENDER_UNAVAILABLE: {detail}")]
     RenderUnavailable {

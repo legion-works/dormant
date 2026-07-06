@@ -8,7 +8,7 @@
 //! - **screensaver overlay**: last-resort idle surface, shown only when
 //!   the full ladder (controllers → black → screensaver) has been exhausted
 //!   and the display is still unblanked.  Not implemented in this backend
-//!   yet — see [`LayerShellRenderSink::show`].
+//!   yet — see `LayerShellRenderSink::show`.
 //!
 //! All Wayland I/O is [`target_os = "linux"`]-gated.  On non-Linux the crate
 //! is a no-op binary balloon — the engine's fall-through logic already
@@ -18,10 +18,10 @@
 //!
 //! | Module | Task | Purpose |
 //! |--------|------|---------|
-//! | [`latch`] | T7 | First-input-event latch (testable pure data) |
-//! | [`command`] | T6 | Cross-thread command / reply encoding |
-//! | [`stub`] | T6 | Non-Linux stub (cross-compile green) |
-//! | [`linux`] | T6+7 | Real Wayland layer-shell backend (`linux` only) |
+//! | `latch` | T7 | First-input-event latch (testable pure data) |
+//! | `command` | T6 | Cross-thread command / reply encoding |
+//! | `stub` | T6 | Non-Linux stub (cross-compile green) |
+//! | `linux` | T6+7 | Real Wayland layer-shell backend (`linux` only) |
 //!
 //! ## Thread model
 //!

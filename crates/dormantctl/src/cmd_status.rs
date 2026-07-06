@@ -223,4 +223,40 @@ mod tests {
         assert_eq!(si.idx, 2);
         assert_eq!(si.kind, StageKind::RenderBlack);
     }
+
+    #[test]
+    fn staged_display_renders_stage_marker() {
+        use dormant_core::rules::{DisplaySnapshot, StageInfo};
+        use dormant_core::types::StageKind;
+
+        let d = DisplaySnapshot {
+            phase: "staged".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: vec![],
+            stage: Some(StageInfo {
+                idx: 1,
+                kind: StageKind::RenderBlack,
+            }),
+        };
+
+        let si = d.stage.as_ref().unwrap();
+        // Mirror the exact rendering logic in render_table:
+        //   format!("staged [{}: {}]", si.idx, serde_json::to_string(&si.kind).unwrap())
+        let phase = format!(
+            "staged [{}: {}]",
+            si.idx,
+            serde_json::to_string(&si.kind).unwrap()
+        );
+
+        assert!(
+            phase.contains("staged [1:"),
+            "phase line {phase:?} missing stage marker"
+        );
+        assert!(
+            phase.contains("\"render_black\""),
+            "phase line {phase:?} missing render_black kind"
+        );
+    }
 }

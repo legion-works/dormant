@@ -1,10 +1,3 @@
-/**
- * Doctor view — daemon diagnostics runner.
- *
- * "Run" button triggers POST /api/doctor → renders DoctorReport.checks[].
- * Summary row shows passing / warnings / skipped / failing counts.
- * Each check renders a status icon circle + title + detail + StatusChip tag.
- */
 import { useState, useCallback, useRef } from "react";
 import { runDoctor } from "../../api/client";
 import type { DoctorReport, CheckStatus } from "../../api/types";

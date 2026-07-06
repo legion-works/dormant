@@ -187,4 +187,30 @@ describe("Config", () => {
 
     expect(screen.getByText("Validation errors")).toBeInTheDocument();
   });
+
+  it("renders pending-reload banner when state has pending_reload", async () => {
+    vi.mocked((await import("../api/client")).getState).mockResolvedValueOnce({
+      ...SAMPLE_STATE,
+      pending_reload: "validating new config…",
+    });
+
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Config reload pending — validating new config…/)).toBeInTheDocument();
+    });
+  });
+
+  it("renders source-mismatch banner when config source is not last_applied", async () => {
+    vi.mocked((await import("../api/client")).getConfig).mockResolvedValueOnce({
+      ...SAMPLE_CONFIG,
+      source: "on_disk",
+    });
+
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Config source: on_disk \(not yet applied\)/)).toBeInTheDocument();
+    });
+  });
 });

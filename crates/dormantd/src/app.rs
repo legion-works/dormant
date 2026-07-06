@@ -56,7 +56,7 @@ use dormant_core::rules::{
     SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
-use dormant_core::traits::{CommandSink, SensorSource};
+use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
 use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
 use dormant_core::zone::{ZoneEngine, ZoneSpec};
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
@@ -66,6 +66,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "render")]
+use dormant_render::LayerShellRenderSink;
+
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::reload;
 
@@ -73,6 +76,16 @@ use crate::reload;
 /// registry; tests inject a factory that returns scripted fakes.
 type SourceBuilder =
     Arc<dyn Fn(&Config, &Credentials) -> Result<Vec<Box<dyn SensorSource>>> + Send + Sync>;
+
+/// Builds render sinks for a display.  Production uses
+/// [`LayerShellRenderSink`]; tests inject a factory that returns
+/// [`RecordingRenderSink`](dormant_core::fakes::RecordingRenderSink).
+///
+/// The factory receives the display id and output connector name and
+/// returns `None` to skip the sink (fall-through path).
+#[cfg(feature = "render")]
+type RenderSinkBuilder =
+    Arc<dyn Fn(DisplayId, String) -> Option<Arc<dyn RenderSink>> + Send + Sync>;
 
 pub use dormant_core::reload::ReloadOutcome;
 
@@ -162,6 +175,8 @@ pub struct App {
     creds_path: PathBuf,
     strictness: Strictness,
     source_builder: SourceBuilder,
+    #[cfg(feature = "render")]
+    render_sink_builder: Option<RenderSinkBuilder>,
     disable_ipc: bool,
 }
 
@@ -188,6 +203,8 @@ impl App {
             creds_path,
             strictness,
             source_builder,
+            #[cfg(feature = "render")]
+            render_sink_builder: None,
             disable_ipc: false,
         })
     }
@@ -213,8 +230,26 @@ impl App {
             creds_path,
             strictness,
             source_builder: Arc::new(factory),
+            #[cfg(feature = "render")]
+            render_sink_builder: None,
             disable_ipc: false,
         })
+    }
+
+    /// Set an injected render-sink factory (test seam).
+    ///
+    /// When set, [`assemble_static`] calls this factory instead of
+    /// building [`LayerShellRenderSink`] directly.  The factory receives
+    /// the display id and output connector name; return `None` to skip
+    /// the sink (fall-through).
+    #[cfg(feature = "render")]
+    #[must_use]
+    pub fn with_render_sink_builder<F>(mut self, factory: F) -> Self
+    where
+        F: Fn(DisplayId, String) -> Option<Arc<dyn RenderSink>> + Send + Sync + 'static,
+    {
+        self.render_sink_builder = Some(Arc::new(factory));
+        self
     }
 
     /// Disable the IPC server (for tests that don't need it).
@@ -273,6 +308,16 @@ impl App {
         let started_web_port = cfg.daemon.web_port;
         let started_web_bind = cfg.daemon.web_bind;
 
+        #[cfg(feature = "render")]
+        let assembly = assemble_static(
+            cfg,
+            creds,
+            &self.source_builder,
+            self.render_sink_builder.as_ref(),
+        )
+        .await
+        .context("assemble initial runtime")?;
+        #[cfg(not(feature = "render"))]
         let assembly = assemble_static(cfg, creds, &self.source_builder)
             .await
             .context("assemble initial runtime")?;
@@ -314,6 +359,8 @@ impl App {
             creds_path: self.creds_path,
             strictness: self.strictness,
             source_builder: self.source_builder,
+            #[cfg(feature = "render")]
+            render_sink_builder: self.render_sink_builder,
             root: root.clone(),
             engine_ctl: engine_ctl_tx,
             engine_events: engine_events_tx,
@@ -507,6 +554,8 @@ struct Runner {
     creds_path: PathBuf,
     strictness: Strictness,
     source_builder: SourceBuilder,
+    #[cfg(feature = "render")]
+    render_sink_builder: Option<RenderSinkBuilder>,
     root: CancellationToken,
     engine_ctl: watch::Sender<mpsc::Sender<ControlMsg>>,
     engine_events: watch::Sender<mpsc::Sender<PresenceEvent>>,
@@ -642,9 +691,23 @@ impl Runner {
                 .collect::<Vec<_>>()
                 .join("; "));
         }
-        assemble_static(cfg, creds, &self.source_builder)
+        #[cfg(feature = "render")]
+        {
+            assemble_static(
+                cfg,
+                creds,
+                &self.source_builder,
+                self.render_sink_builder.as_ref(),
+            )
             .await
             .map_err(|e| e.to_string())
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            assemble_static(cfg, creds, &self.source_builder)
+                .await
+                .map_err(|e| e.to_string())
+        }
     }
 
     /// Restart the *old* config in place with `pending` populated. Reuses the
@@ -666,6 +729,12 @@ impl Runner {
             sources,
             activity_rules,
             activity_poll,
+            render_sinks: self.generation.render_sinks.clone(),
+            #[cfg(feature = "render")]
+            input_wake_rx: None, // rebuild_old clones the old sinks whose
+                                 // senders are orphaned — InputWake is
+                                 // silently dropped until the next
+                                 // successful reload re-builds fresh sinks
         };
         match spawn_generation(&self.root, assembly, snapshot, pending) {
             Ok(spawn) => self.install_generation(spawn),
@@ -803,6 +872,11 @@ struct Generation {
     zone_specs: Vec<ZoneSpec>,
     sensor_inventory: Vec<SensorId>,
     display_executors: HashMap<DisplayId, Arc<DisplayExecutor>>,
+    /// Per-display render sinks (layer-shell overlays).  Owned by the
+    /// generation so they drop on [`teardown`] — the old sinks' Wayland
+    /// surfaces are torn down when the generation is replaced, then the
+    /// new generation re-converges from live presence.
+    render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
 }
 
 /// A freshly spawned generation plus its inbound channel senders (for the
@@ -840,6 +914,12 @@ struct StaticAssembly {
     sources: Vec<Box<dyn SensorSource>>,
     activity_rules: Vec<ActivityRule>,
     activity_poll: Option<Duration>,
+    render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+    /// `InputWake` receiver from render surfaces.  Only populated when the
+    /// `render` feature is enabled; the drain task in [`spawn_generation`]
+    /// routes each item to [`ControlMsg::InputWake`].
+    #[cfg(feature = "render")]
+    input_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DisplayId>>,
 }
 
 /// Load config + credentials, logging any lenient-mode warnings.
@@ -864,12 +944,17 @@ async fn assemble_static(
     cfg: Config,
     creds: Credentials,
     source_builder: &SourceBuilder,
+    #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
 ) -> Result<StaticAssembly> {
     // First rule referencing each display drives its retry + timings.
     let display_rule = index_display_rules(&cfg);
 
     let mut display_runtime: Vec<DisplayRuntimeCfg> = Vec::new();
     let mut display_executors: HashMap<DisplayId, Arc<DisplayExecutor>> = HashMap::new();
+    #[allow(unused_mut)]
+    let mut render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    #[cfg(feature = "render")]
+    let (input_wake_tx, input_wake_rx) = tokio::sync::mpsc::unbounded_channel::<DisplayId>();
 
     for (name, dc) in &cfg.displays {
         let did = DisplayId(name.clone());
@@ -931,7 +1016,49 @@ async fn assemble_static(
             ladder: dc.normalized_ladder(),
             timings,
         });
-        display_executors.insert(did, Arc::new(executor));
+        display_executors.insert(did.clone(), Arc::new(executor));
+
+        // ── Render sink construction (feature-gated) ──
+        // Build a LayerShellRenderSink when the display's ladder contains a
+        // render stage.  Failures are non-fatal — the engine's empty-sink path
+        // synthesises RenderResult(Err) so the ladder falls through.
+        #[cfg(feature = "render")]
+        {
+            let ladder = dc.normalized_ladder();
+            if ladder.iter().any(|s| s.kind.is_render()) {
+                if let Some(output_name) = &dc.output {
+                    let sink: Option<Arc<dyn RenderSink>> =
+                        if let Some(builder) = render_sink_builder {
+                            (builder)(did.clone(), output_name.clone())
+                        } else {
+                            match LayerShellRenderSink::new(
+                                did.clone(),
+                                output_name.clone(),
+                                Some(&input_wake_tx),
+                            ) {
+                                Ok(sink) => Some(Arc::new(sink)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        event = "render_sink_build_failed",
+                                        display = %did,
+                                        error = %e,
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                    if let Some(sink) = sink {
+                        render_sinks.insert(did.clone(), sink);
+                    }
+                } else {
+                    tracing::warn!(
+                        event = "render_sink_missing_output",
+                        display = %did,
+                        "render stage configured but no output connector; skipping render sink"
+                    );
+                }
+            }
+        }
     }
 
     let built: HashSet<DisplayId> = display_runtime.iter().map(|d| d.display.clone()).collect();
@@ -992,6 +1119,9 @@ async fn assemble_static(
         sources,
         activity_rules,
         activity_poll,
+        render_sinks,
+        #[cfg(feature = "render")]
+        input_wake_rx: Some(input_wake_rx),
     })
 }
 
@@ -1071,7 +1201,7 @@ fn spawn_generation(
         assembly.engine_cfg.clone(),
         zone,
         executors,
-        HashMap::new(),
+        assembly.render_sinks.clone(),
         Arc::new(AlwaysOwned),
     )
     .context("build engine")?;
@@ -1087,6 +1217,17 @@ fn spawn_generation(
     let engine_handle = tokio::spawn(async move {
         engine.run(events_rx, ctl_rx, engine_token).await;
     });
+
+    // ── InputWake drain (feature-gated: render surfaces emit InputWake) ──
+    // Each LayerShellRenderSink pushes DisplayId through an unbounded
+    // channel on the first pointer/key event.  This task routes those
+    // DisplayIds to the engine as ControlMsg::InputWake so the state
+    // machine can react.  Scoped to the generation's cancellation token
+    // so it dies on reload alongside the engine.
+    #[cfg(feature = "render")]
+    if let Some(input_wake_rx) = assembly.input_wake_rx {
+        spawn_input_wake_drain(input_wake_rx, ctl_tx.clone(), token.clone());
+    }
 
     for source in assembly.sources {
         let stx = events_tx.clone();
@@ -1121,6 +1262,7 @@ fn spawn_generation(
         zone_specs: assembly.zone_specs,
         sensor_inventory: assembly.sensor_inventory,
         display_executors: assembly.display_executors,
+        render_sinks: assembly.render_sinks,
     };
 
     Ok(GenSpawn {
@@ -1161,6 +1303,12 @@ fn apply_restore(
 
 /// A display phase that means the panel is physically off (or on its way off /
 /// coming back): the daemon must not silently leave it dark across a reload.
+///
+/// Render phases (`staged`, `render_pending`) are intentionally excluded — the
+/// panel is physically ON during these phases (the render overlay covers it),
+/// so a controller wake would be a no-op or worse.  The render overlay is torn
+/// down by the old generation's [`teardown`] (which drops the [`RenderSink`]s),
+/// and the new generation re-converges from live presence.
 fn phase_is_dark(phase: &str) -> bool {
     matches!(phase, "blanked" | "blanking" | "waking")
 }
@@ -1254,5 +1402,69 @@ async fn forward_events(
                 None => break,
             },
         }
+    }
+}
+
+#[cfg(feature = "render")]
+fn spawn_input_wake_drain(
+    input_wake_rx: tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            () = cancel.cancelled() => {}
+            () = async {
+                let mut rx = input_wake_rx;
+                while let Some(display) = rx.recv().await {
+                    if ctl_tx.send(ControlMsg::InputWake(display)).await.is_err() {
+                        break; // engine channel closed — shutdown in progress
+                    }
+                }
+            } => {}
+        }
+    });
+}
+
+#[cfg(feature = "render")]
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    /// The drain task routes each `DisplayId` received on the unbounded
+    /// channel to the engine as `ControlMsg::InputWake`.  When the control
+    /// channel is closed (shutdown), the drain exits cleanly.
+    #[tokio::test]
+    async fn input_wake_drain_routes_display_id_to_input_wake() {
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(8);
+        let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+        let cancel = CancellationToken::new();
+
+        spawn_input_wake_drain(input_wake_rx, ctl_tx, cancel.clone());
+
+        // Push three displays through the wake channel.
+        input_wake_tx.send(DisplayId("dp-1".into())).unwrap();
+        input_wake_tx.send(DisplayId("hdmi-2".into())).unwrap();
+        input_wake_tx.send(DisplayId("dp-1".into())).unwrap();
+
+        // Read them back as ControlMsg::InputWake — drain order must match send order.
+        match ctl_rx.recv().await {
+            Some(ControlMsg::InputWake(d)) => assert_eq!(d.0, "dp-1"),
+            other => panic!("expected InputWake(dp-1), got {other:?}"),
+        }
+        match ctl_rx.recv().await {
+            Some(ControlMsg::InputWake(d)) => assert_eq!(d.0, "hdmi-2"),
+            other => panic!("expected InputWake(hdmi-2), got {other:?}"),
+        }
+        match ctl_rx.recv().await {
+            Some(ControlMsg::InputWake(d)) => assert_eq!(d.0, "dp-1"),
+            other => panic!("expected InputWake(dp-1), got {other:?}"),
+        }
+
+        // Cancel the drain and confirm the control channel is clean.
+        cancel.cancel();
+        // Drop the wake-side sender so the drain recv() returns None.
+        drop(input_wake_tx);
     }
 }

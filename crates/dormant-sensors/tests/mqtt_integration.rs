@@ -42,8 +42,11 @@ async fn mqtt_round_trip_publishes_presence_event() {
         stale_timeout: None,
     };
 
-    let source =
-        dormant_sensors::mqtt::MqttSource::new("127.0.0.1:1883".into(), vec![(sensor_id, cfg)]);
+    let source = dormant_sensors::mqtt::MqttSource::new(
+        "127.0.0.1:1883".into(),
+        vec![(sensor_id, cfg)],
+        None,
+    );
 
     let (tx, mut rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();

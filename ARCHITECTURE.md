@@ -6,11 +6,13 @@ Crate map, data flow, and where-to-find-it guide for the dormant codebase.
 
 | Crate | Purpose | Has binaries? |
 |---|---|---|
-| `dormant-core` | Domain types, traits, config schema/validation, zone fusion engine, rules engine, state machine, IPC protocol — pure logic, no I/O | No |
+| `dormant-core` | Domain types, traits, config schema/validation, zone fusion engine, rules engine, state machine, IPC protocol, reload types, doctor wire types (`DoctorReport`/`Check`/`CheckStatus`) — pure logic, no I/O | No |
 | `dormant-sensors` | Sensor sources: MQTT (`mqtt.rs`), Home Assistant WebSocket (`ha_ws.rs`), USB-serial LD2410 radar (`usb_ld2410.rs`), plus a shared backoff helper and a static registry | No |
 | `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), VCP operations (`vcp_ops.rs`), Home Assistant passthrough (`ha_passthrough.rs`), execution engine with fallback/retry (`executor.rs`), static registry | No |
-| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, reload handling, logging | **Yes** — `dormantd` |
-| `dormantctl` | CLI binary: `status`, `blank`, `wake`, `pause`, `validate`, `watch`, `doctor` subcommands | **Yes** — `dormantctl` |
+| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI; live coalesced `DoctorService` for the daemon + web UI. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
+| `dormant-web` | Loopback-only web dashboard: axum HTTP/WS bridge that reads live engine state and serves a SPA (`crates/dormant-web/webui/`). Optional dependency of `dormantd`, gated behind the `web-ui` Cargo feature — when off, zero web code is compiled | No |
+| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, reload handling, optional web UI spawn, logging | **Yes** — `dormantd` |
+| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `doctor` subcommands | **Yes** — `dormantctl` |
 
 Each crate follows the convention: one module per concept, one file per sensor/controller, explicit static registry with no proc-macro magic.
 
@@ -54,8 +56,10 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 | Add a config key | `dormant-core/src/config/schema.rs` (struct field + serde) + `dormant-core/src/config/defaults.rs` (default value) + `dormant-core/src/config/validate.rs` (validation rule) + `dormant-core/src/config/mod.rs` (known-key tree for unknown-key detection) |
 | Add an error code | `dormant-core/src/error.rs` (`pub const E_*` + variant in `DormantError`) |
 | Change timing defaults | `dormant-core/src/config/defaults.rs` (single source of truth) |
-| Add a doctor check | `dormantctl/src/cmd_doctor.rs` |
-| Add a CLI subcommand | `dormantctl/src/cmd_<name>.rs` + register in `dormantctl/src/main.rs` |
+| Add a doctor probe | `dormant-doctor/src/probes/<name>.rs` (new probe) + `dormant-doctor/src/probes/mod.rs` + `dormant-doctor/src/lib.rs` (re-export) + `dormantctl/src/cmd_doctor.rs` (CLI dispatch + subcommand) |
+| Wire doctor into the daemon | `dormantd/src/app.rs` (construct one `DoctorService` shared by IPC + web UI) + `dormant-doctor/src/service.rs` (coalesced singleflight logic) |
+| Add a web route | `dormant-web/src/routes/<name>.rs` (new module) + `dormant-web/src/routes/mod.rs` (mount) + `dormant-web/src/server.rs` (router) |
+| Add a CLI subcommand | `dormantctl/src/cmd_<name>.rs` (new file) + register variant + dispatch in `dormantctl/src/main.rs`. Short commands that share a handler (e.g. `pause`+`resume`, `blank`+`wake`) co-locate in one `cmd_*.rs` |
 
 ## Event and error-code grep anchors
 

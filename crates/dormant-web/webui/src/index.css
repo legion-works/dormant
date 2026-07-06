@@ -1,0 +1,28 @@
+/* Global resets + base styles.
+   DS tokens (colors, fonts, spacing) are loaded via src/ds.css. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui), system-ui, sans-serif;
+  color: var(--text-body);
+  background-color: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Remove default button styling (we style nav-item and topbar-reload explicitly) */
+button {
+  font-family: inherit;
+}

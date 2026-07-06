@@ -1,0 +1,36 @@
+/* dormant Web UI — Legion Works Design System wiring.
+   Consumes the DS token layer (CSS custom properties) and global
+   styles.
+
+   The design/_ds/ directory is a prebuild copy (npm run prebuild)
+   of design/web-ui/_ds/ from the repo root.  It is gitignored so
+   the source-of-truth DS files live in one place and are replicated
+   into webui/design/ at build time.  This lets Vite resolve the
+   @import chain normally without needing external fs allowances.
+
+   CONVENTION (handoff mandate): use the CSS custom properties below
+   throughout the app — never hardcode hex.  See design/web-ui/README.md
+   for the semantic mapping.
+
+   Key tokens:
+     --bg-base, --bg-sunken, --bg-raised, --bg-overlay
+     --text-strong, --text-body, --text-muted, --text-faint
+     --accent (Legion cyan #86E1FC), --accent-strong, --accent-muted
+     --accent-warm (IceTea amber #FF966C), --accent-warm-muted
+     --success (dormant green #C3E88D), --success-muted
+     --warning (yellow #FFC777), --warning-muted
+     --danger (red #FF757F), --danger-muted
+     --blue-400 (signal blue #82AAFF), --purple-400 (Geth purple #C099FF)
+     --border, --border-strong, --border-accent, --ring
+     --font-display (Space Grotesk), --font-ui (Geist), --font-mono (JetBrains Mono)
+     --radius-sm, --radius-md, --radius-lg, --radius-xl, --radius-pill
+     --shadow-sm, --shadow-md, --shadow-lg, --shadow-xl
+     --glow-cyan, --glow-amber
+     --dur-fast, --dur-mid, --ease
+     --tracking-caps, --tracking-tight, --tracking-loose
+   Also: .lw-glass, .lw-aurora, .lw-aurora--drift, .lw-enter (utility classes).
+
+   dormant-specific signal: present / awake / active = --success (#C3E88D).
+   Legion cyan = system chrome only (reload, clock, live pulse).
+*/
+@import url("../design/_ds/legion-works-design-system-0c4db072-51f8-49a7-8d0b-1e2ffd2d90cf/styles.css");

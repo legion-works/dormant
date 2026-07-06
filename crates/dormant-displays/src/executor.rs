@@ -68,6 +68,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_BLANK_FAILED, E_WAKE_FAILED};
+use dormant_core::rules::{ControllerHealth, ControllerRole};
 use dormant_core::traits::{CommandSink, DisplayController};
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
 use tokio_util::sync::CancellationToken;
@@ -110,6 +111,10 @@ pub struct DisplayExecutor {
     /// The current in-flight command's cancellation token. `None` between
     /// commands.
     supersede: Mutex<Option<CancellationToken>>,
+    /// Per-controller health from the last blank/wake attempt.  `Arc<Mutex<…>>`
+    /// so [`CommandSink::controller_health`] (sync, `&self`) can return a
+    /// snapshot even when spawned tasks are writing this field.
+    health: std::sync::Arc<std::sync::Mutex<Vec<ControllerHealth>>>,
 }
 
 impl DisplayExecutor {
@@ -127,6 +132,7 @@ impl DisplayExecutor {
             effective_mode,
             retry,
             supersede: Mutex::new(None),
+            health: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -157,8 +163,8 @@ impl DisplayExecutor {
 
     /// Union of every controller's `supported_modes()`.
     ///
-    /// Task 16 will validate that `DisplayConfig::blank_mode` (and the
-    /// degraded-mode fallback) are both members of this set.
+    /// Used to validate that a display config's `blank_mode` and
+    /// degraded-mode fallback are members of this set.
     #[must_use]
     pub fn effective_modes(&self) -> Vec<BlankMode> {
         let mut seen: HashSet<BlankMode> = HashSet::new();
@@ -200,18 +206,49 @@ impl CommandSink for DisplayExecutor {
 
         let mut last_controller = String::from("none-eligible");
         let mut eligible_count: usize = 0;
+        // One slot per chain position — updated in place so skipped
+        // controllers are never masked (Must 2b).
+        let mut health: Vec<ControllerHealth> = self
+            .chain
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ControllerHealth {
+                name: c.name().to_string(),
+                role: if i == 0 {
+                    ControllerRole::Primary
+                } else {
+                    ControllerRole::Fallback
+                },
+                healthy: false,
+                detail: None,
+            })
+            .collect();
 
-        for controller in &self.chain {
+        for (i, controller) in self.chain.iter().enumerate() {
             if !controller.is_available().await {
+                health[i].healthy = false;
+                health[i].detail = Some("controller unavailable".to_string());
                 continue;
             }
             if !controller.supported_modes().contains(&mode) {
+                health[i].healthy = false;
+                health[i].detail = Some("mode not supported".to_string());
                 continue;
             }
             eligible_count += 1;
             match controller.blank(mode).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    health[i].healthy = true;
+                    health[i].detail = None;
+                    *self
+                        .health
+                        .lock()
+                        .expect("DisplayExecutor health lock poisoned") = health;
+                    return Ok(());
+                }
                 Err(e) => {
+                    health[i].healthy = false;
+                    health[i].detail = Some(e.to_string());
                     tracing::warn!(
                         event = "blank_controller_failed",
                         display = %self.display,
@@ -231,6 +268,10 @@ impl CommandSink for DisplayExecutor {
             last_controller = %last_controller,
             "blank failed across the entire chain",
         );
+        *self
+            .health
+            .lock()
+            .expect("DisplayExecutor health lock poisoned") = health;
         Err(CmdFailure {
             controller: last_controller,
             error: format!("{E_BLANK_FAILED}: no controller succeeded (mode={mode:?})"),
@@ -257,27 +298,68 @@ impl CommandSink for DisplayExecutor {
             .checked_add(1)
             .expect("wake_retries overflow");
 
+        // One slot per chain position — updated in place across retries so
+        // the final Vec has exactly one row per controller (Must 2a).
+        let mut health: Vec<ControllerHealth> = self
+            .chain
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ControllerHealth {
+                name: c.name().to_string(),
+                role: if i == 0 {
+                    ControllerRole::Primary
+                } else {
+                    ControllerRole::Fallback
+                },
+                healthy: false,
+                detail: None,
+            })
+            .collect();
+
         for round in 0..total_rounds {
-            for controller in &self.chain {
+            for (i, controller) in self.chain.iter().enumerate() {
                 // Mid-round supersede: a blank arriving between controller
                 // calls aborts the rest of the chain (and the burst) without
                 // waiting for the next inter-round sleep. The token was
                 // swapped-and-cancelled by the blank's `rotate_supersede()`.
                 if supersede_token.is_cancelled() {
+                    // Do not update health on supersede — no real controller
+                    // attempt was made here.
                     return Err(CmdFailure {
                         controller: "superseded".to_string(),
                         error: format!("{E_WAKE_FAILED}: superseded by blank"),
                     });
                 }
                 if !controller.is_available().await {
+                    health[i].healthy = false;
+                    health[i].detail = Some("controller unavailable".to_string());
                     continue;
                 }
-                // Wake is mode-independent: any available controller is eligible
-                // to wake the display, regardless of which blank modes it
-                // supports.
+                // Wake is mode-independent: any available controller is
+                // eligible to wake the display, regardless of which blank
+                // modes it supports.
                 match controller.wake().await {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        // Must 1: a blank that superseded while this wake
+                        // call was in flight must NOT commit wake health and
+                        // must NOT return Ok — the blank is the last command.
+                        if supersede_token.is_cancelled() {
+                            return Err(CmdFailure {
+                                controller: "superseded".to_string(),
+                                error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                            });
+                        }
+                        health[i].healthy = true;
+                        health[i].detail = None;
+                        *self
+                            .health
+                            .lock()
+                            .expect("DisplayExecutor health lock poisoned") = health;
+                        return Ok(());
+                    }
                     Err(e) => {
+                        health[i].healthy = false;
+                        health[i].detail = Some(e.to_string());
                         tracing::warn!(
                             event = "wake_controller_failed",
                             display = %self.display,
@@ -312,10 +394,21 @@ impl CommandSink for DisplayExecutor {
             rounds = total_rounds,
             "wake burst exhausted",
         );
+        *self
+            .health
+            .lock()
+            .expect("DisplayExecutor health lock poisoned") = health;
         Err(CmdFailure {
             controller: "exhausted".to_string(),
             error: format!("{E_WAKE_FAILED}: burst exhausted after {total_rounds} rounds"),
         })
+    }
+
+    fn controller_health(&self) -> Vec<ControllerHealth> {
+        self.health
+            .lock()
+            .expect("DisplayExecutor health lock poisoned")
+            .clone()
     }
 }
 
@@ -816,5 +909,129 @@ mod tests {
             Duration::ZERO,
             "empty-chain wake must not enter the retry loop",
         );
+    }
+
+    // ── controller_health ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_records_each_controller_primary_fail_fallback_ok() {
+        let primary = FakeController::new("ddcci", vec![BlankMode::PowerOff]);
+        let fallback = FakeController::new("kwin-dpms", vec![BlankMode::PowerOff]);
+        // Primary fails, fallback succeeds.
+        primary.push_blank_result(Err(err("ddcci")));
+        let (exec, _) = executor_with(vec![primary.clone(), fallback.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        let health: Vec<ControllerHealth> = exec.controller_health();
+        assert_eq!(health.len(), 2, "both controllers recorded");
+        assert_eq!(health[0].name, "ddcci");
+        assert_eq!(health[0].role, ControllerRole::Primary);
+        assert!(!health[0].healthy, "primary failed");
+        assert!(health[0].detail.is_some(), "failure detail recorded");
+        assert_eq!(health[1].name, "kwin-dpms");
+        assert_eq!(health[1].role, ControllerRole::Fallback);
+        assert!(health[1].healthy, "fallback succeeded");
+    }
+
+    // ── Must-2a: one health slot per controller across wake retries ─────────
+
+    #[tokio::test(start_paused = true)]
+    async fn health_no_duplicate_rows_on_wake_retry() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // Both always fail — enough for 3 rounds × 2 controllers = 6 calls.
+        for _ in 0..6 {
+            a.push_wake_result(Err(err("A")));
+            b.push_wake_result(Err(err("B")));
+        }
+        let retry = RetrySettings {
+            wake_retries: 2,
+            wake_retry_backoff: Duration::from_millis(10),
+        };
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], retry);
+
+        let res = exec.wake().await;
+        assert!(res.is_err(), "wake burst exhausts");
+
+        let health = exec.controller_health();
+        assert_eq!(
+            health.len(),
+            2,
+            "exactly 2 slots — no duplicates per retry round"
+        );
+        assert_eq!(health[0].name, "A");
+        assert_eq!(health[1].name, "B");
+        assert!(!health[0].healthy);
+        assert!(!health[1].healthy);
+    }
+
+    // ── Must-2b: unavailable primary + successful fallback shows both ───────
+
+    #[tokio::test]
+    async fn health_shows_unavailable_primary_and_successful_fallback() {
+        let primary = FakeController::new("ddcci", vec![BlankMode::PowerOff]);
+        let fallback = FakeController::new("kwin-dpms", vec![BlankMode::PowerOff]);
+        primary.set_available(false);
+        let (exec, _) = executor_with(vec![primary.clone(), fallback.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        let health = exec.controller_health();
+        assert_eq!(health.len(), 2, "both controllers represented");
+        assert_eq!(health[0].name, "ddcci");
+        assert_eq!(health[0].role, ControllerRole::Primary);
+        assert!(!health[0].healthy, "primary unavailable");
+        assert!(
+            health[0]
+                .detail
+                .as_ref()
+                .is_some_and(|d| d.contains("unavailable")),
+            "detail explains unavailability"
+        );
+        assert_eq!(health[1].name, "kwin-dpms");
+        assert_eq!(health[1].role, ControllerRole::Fallback);
+        assert!(health[1].healthy, "fallback succeeded");
+    }
+
+    // ── Must 1: superseded wake success does NOT overwrite blank health ─────
+
+    #[tokio::test(start_paused = true)]
+    async fn superseded_wake_success_preserves_blank_health() {
+        // A delayed wake that would succeed, but gets superseded by a blank.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        // Wake will delay 100ms then succeed.
+        a.set_wake_delay(Duration::from_millis(100));
+        // Blank will succeed immediately on A.
+        a.push_blank_result(Ok(()));
+        let retry = RetrySettings {
+            wake_retries: 0,
+            wake_retry_backoff: Duration::from_secs(1),
+        };
+        let (exec, _) = executor_with(vec![a.clone()], retry);
+
+        // Start a delayed wake.
+        let exec_wake = Arc::clone(&exec);
+        let wake_task = tokio::spawn(async move { exec_wake.wake().await });
+
+        // Yield repeatedly until wake task reaches its 100ms sleep.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Issue blank — cancels wake's token, then blank succeeds.
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        // Wake task result: must be the superseded failure (Must 1).
+        let wake_result = wake_task.await.unwrap();
+        let err = wake_result.unwrap_err();
+        assert_eq!(err.controller, "superseded");
+        assert!(err.error.contains("superseded by blank"));
+
+        // Health must reflect the BLANK result, not the wake (Must 1).
+        let health = exec.controller_health();
+        assert_eq!(health.len(), 1);
+        assert!(health[0].healthy, "blank succeeded on A");
+        assert_eq!(health[0].detail, None);
     }
 }

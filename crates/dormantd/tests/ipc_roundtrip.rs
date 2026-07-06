@@ -4,16 +4,20 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::{
     ControlMsg, DaemonEvent, DisplaySnapshot, SensorSnapshot, StateSnapshot, ZoneSnapshot,
 };
 use dormant_core::types::{RuleId, SensorState};
+use dormant_doctor::DoctorService;
+use indexmap::IndexMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Spawn a fake engine control loop that responds to Snapshot with a canned
@@ -45,6 +49,7 @@ fn spawn_fake_engine() -> (
                     inhibited: false,
                     paused: false,
                     cmd_gen: 1,
+                    controllers: vec![],
                 },
             ),
             (
@@ -54,6 +59,7 @@ fn spawn_fake_engine() -> (
                     inhibited: false,
                     paused: false,
                     cmd_gen: 3,
+                    controllers: vec![],
                 },
             ),
         ],
@@ -96,6 +102,24 @@ async fn send_request(socket_path: &Path, request: &IpcRequest) -> IpcResponse {
     serde_json::from_str(response_line.trim()).unwrap()
 }
 
+/// Build a throwaway `DoctorService` for tests that don't exercise the
+/// doctor path.  The service is still constructed (so the IPC server
+/// signature is satisfied) and will not be invoked.
+fn fake_doctor(ctl_tx: mpsc::Sender<ControlMsg>) -> DoctorService {
+    let (config_tx, config_rx) = watch::channel(Arc::new(Config {
+        config_version: 1,
+        daemon: DaemonConfig::default(),
+        sensors: IndexMap::default(),
+        zones: IndexMap::default(),
+        displays: IndexMap::default(),
+        rules: IndexMap::default(),
+    }));
+    let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
+    drop(config_tx);
+    drop(creds_tx);
+    DoctorService::new(ctl_tx, config_rx, creds_rx)
+}
+
 /// Create a tempdir with a socket path and spawn the IPC server.
 /// Returns `(dir, socket_path, ctl_tx, event_tx, record_rx, cancel)`.
 async fn setup_server() -> (
@@ -112,9 +136,16 @@ async fn setup_server() -> (
     let (ctl_tx, event_tx, record_rx) = spawn_fake_engine();
     let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
     let cancel = CancellationToken::new();
+    let doctor = fake_doctor(ctl_tx.clone());
 
-    let _handle =
-        dormantd::ipc::spawn(&socket_path, ctl_tx.clone(), reload_tx, cancel.clone()).unwrap();
+    let _handle = dormantd::ipc::spawn(
+        &socket_path,
+        ctl_tx.clone(),
+        reload_tx,
+        doctor,
+        cancel.clone(),
+    )
+    .unwrap();
 
     // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -397,8 +428,10 @@ async fn socket_file_permissions_0600() {
     let (ctl_tx, _event_tx, _record_rx) = spawn_fake_engine();
     let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
     let cancel = CancellationToken::new();
+    let doctor = fake_doctor(ctl_tx.clone());
 
-    let _handle = dormantd::ipc::spawn(&socket_path, ctl_tx, reload_tx, cancel.clone()).unwrap();
+    let _handle =
+        dormantd::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel.clone()).unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -425,15 +458,65 @@ async fn stale_socket_replacement() {
     let (ctl_tx, _event_tx, _record_rx) = spawn_fake_engine();
     let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
     let cancel = CancellationToken::new();
+    let doctor = fake_doctor(ctl_tx.clone());
 
     // Should succeed — replaces the stale socket
-    let result = dormantd::ipc::spawn(&socket_path, ctl_tx, reload_tx, cancel.clone());
+    let result = dormantd::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel.clone());
     assert!(result.is_ok(), "should replace stale socket: {result:?}");
 
     // Verify the socket file exists and is connectable
     assert!(socket_path.exists(), "socket file should exist");
     let _ = std::os::unix::net::UnixStream::connect(&socket_path)
         .expect("should be able to connect to socket");
+
+    cancel.cancel();
+}
+
+/// `IpcRequest::Doctor` is intercepted before the engine path: the IPC
+/// server calls `DoctorService::run()` and returns a response carrying
+/// `doctor_report`.  The fake engine's `Snapshot` handler is the one that
+/// the doctor service hits; verify that the resulting response has
+/// `ok=true`, no `snapshot`, and a `doctor_report` present.
+#[tokio::test]
+async fn doctor_roundtrip_returns_report() {
+    let (_dir, socket_path, _ctl_tx, _event_tx, mut record_rx, cancel) = setup_server().await;
+
+    let resp = send_request(&socket_path, &IpcRequest::Doctor).await;
+
+    assert!(resp.ok, "doctor response should be ok: {resp:?}");
+    assert!(
+        resp.snapshot.is_none(),
+        "doctor should not carry a snapshot"
+    );
+    let report = resp
+        .doctor_report
+        .as_ref()
+        .expect("doctor response must include doctor_report");
+    // The fake snapshot has TWO displays (main_monitor + tv) with no
+    // controllers — each becomes a Skip "owned by daemon" check.
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "display main_monitor"
+                && c.status == dormant_core::doctor::CheckStatus::Skip),
+        "doctor report should include the owned-display skip for main_monitor: {report:?}"
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "display tv" && c.status == dormant_core::doctor::CheckStatus::Skip),
+        "doctor report should include the owned-display skip for tv: {report:?}"
+    );
+
+    // The engine's control channel saw the Snapshot request from the
+    // doctor service but should NOT have seen a forwarded
+    // `IpcRequest::Doctor` — Doctor is intercepted, not forwarded.
+    match tokio::time::timeout(Duration::from_millis(200), record_rx.recv()).await {
+        Ok(Some(ControlMsg::Snapshot(_)) | None) | Err(_) => { /* expected */ }
+        Ok(Some(other)) => panic!("unexpected forwarded control msg: {other:?}"),
+    }
 
     cancel.cancel();
 }

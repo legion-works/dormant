@@ -65,4 +65,8 @@ pub trait CommandSink: Send + Sync {
 
     /// Wake the display.
     async fn wake(&self) -> Result<(), CmdFailure>;
+
+    /// Per-controller health from the LAST blank/wake attempt (never
+    /// re-probes).  Empty until the first attempt.
+    fn controller_health(&self) -> Vec<crate::rules::ControllerHealth>;
 }

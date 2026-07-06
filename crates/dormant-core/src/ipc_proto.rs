@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::doctor::DoctorReport;
 use crate::rules::StateSnapshot;
 
 // ── IpcRequest ────────────────────────────────────────────────────────────────
@@ -46,6 +47,9 @@ pub enum IpcRequest {
     Events,
     /// Trigger a config reload.
     Reload,
+    /// Run the doctor: report live daemon health from owned state + active
+    /// network-service probes.  Replied via [`IpcResponse::doctor_report`].
+    Doctor,
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -61,6 +65,9 @@ pub struct IpcResponse {
     /// A [`StateSnapshot`] (present only for `Status` responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<StateSnapshot>,
+    /// A [`DoctorReport`] (present only for `Doctor` responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor_report: Option<DoctorReport>,
 }
 
 impl IpcResponse {
@@ -71,6 +78,7 @@ impl IpcResponse {
             ok: true,
             error: None,
             snapshot,
+            doctor_report: None,
         }
     }
 
@@ -81,6 +89,18 @@ impl IpcResponse {
             ok: false,
             error: Some(msg.into()),
             snapshot: None,
+            doctor_report: None,
+        }
+    }
+
+    /// Build a response carrying a doctor report.
+    #[must_use]
+    pub fn doctor(report: DoctorReport) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: Some(report),
         }
     }
 }
@@ -210,6 +230,15 @@ mod tests {
         assert!(matches!(back, IpcRequest::Reload));
     }
 
+    #[test]
+    fn request_doctor_serde() {
+        let req = IpcRequest::Doctor;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"doctor"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, IpcRequest::Doctor));
+    }
+
     // ── IpcResponse serde round-trips ──────────────────────────────────────
 
     #[test]
@@ -221,6 +250,7 @@ mod tests {
         assert!(back.ok);
         assert!(back.error.is_none());
         assert!(back.snapshot.is_none());
+        assert!(back.doctor_report.is_none());
     }
 
     #[test]
@@ -257,5 +287,46 @@ mod tests {
         let resp: IpcResponse = serde_json::from_str(json).unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.as_deref(), Some("bad request: parse error"));
+    }
+
+    #[test]
+    fn response_ok_no_doctor_report_stays_bare() {
+        // Adding the doctor_report field must NOT add a key when None — the
+        // existing `{"ok":true}` wire contract is preserved.
+        let resp = IpcResponse::ok(None);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"ok":true}"#);
+        assert!(!json.contains("doctor_report"));
+    }
+
+    #[test]
+    fn response_error_no_doctor_report_stays_bare() {
+        let resp = IpcResponse::error("engine not available");
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"ok":false,"error":"engine not available"}"#);
+        assert!(!json.contains("doctor_report"));
+    }
+
+    #[test]
+    fn response_doctor_serializes_report() {
+        let report = DoctorReport { checks: vec![] };
+        let resp = IpcResponse::doctor(report);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""doctor_report""#));
+        assert!(!json.contains(r#""snapshot""#));
+        let back: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert!(back.snapshot.is_none());
+        assert!(back.doctor_report.is_some());
+    }
+
+    #[test]
+    fn response_doctor_back_compat_old_daemon() {
+        // An OLD daemon reply (no doctor_report key) must still parse under
+        // the new client: the field is serde-default + skip_serializing_if.
+        let json = r#"{"ok":true,"snapshot":null}"#;
+        let resp: IpcResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.doctor_report.is_none());
     }
 }

@@ -997,11 +997,12 @@ wake_retry_interval = "1s"
     ) -> impl Fn(
         dormant_core::types::DisplayId,
         String,
+        Option<&tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
     ) -> Option<Arc<dyn dormant_core::traits::RenderSink>>
     + Send
     + Sync
     + 'static {
-        move |_did, _output| Some(Arc::new(sink.clone()))
+        move |_did, _output, _tx| Some(Arc::new(sink.clone()))
     }
 
     /// Assembles a config with a render ladder and verifies the
@@ -1185,6 +1186,251 @@ wake_retry_interval = "1s"
         assert!(
             teardown_ok,
             "expected teardown after presence in rebuilt generation, log: {full_log:?}"
+        );
+    }
+
+    /// After a rejected reload triggered by a removed-display wake failure,
+    /// the restored generation gets a fresh `InputWake` channel via
+    /// `build_render_sinks` → `rebuild_old`.  Sending a `DisplayId` through
+    /// the captured post-rollback sender reaches `ControlMsg::InputWake`
+    /// and the engine tears down the render overlay.
+    ///
+    /// Uses a two-display config where mon2 has `wake_command = "false"`
+    /// so its verified wake fails on removal, triggering `rebuild_old`.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_input_wake_routes_through_drain() {
+        use std::sync::Mutex;
+
+        let dir = TempDir::new().unwrap();
+        let m1 = dir.path().join("mon1");
+        let m2 = dir.path().join("mon2");
+
+        // Two-display render config.  mon2 has a failing wake command
+        // ("false") so its verified wake fails on removal, triggering
+        // rebuild_old.
+        let cfg_str = format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon1]
+controllers = ["command"]
+blank_command = "printf B >> '{m1}'"
+wake_command = "printf W >> '{m1}'"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "200ms" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-1"
+
+[displays.mon2]
+controllers = ["command"]
+blank_command = "printf B >> '{m2}'"
+wake_command = "false"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "20s" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-2"
+
+[rules.r]
+zone = "office"
+displays = ["mon1", "mon2"]
+grace_period = "300ms"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            m1 = m1.display(),
+            m2 = m2.display(),
+        );
+        let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+        let creds_path = dir.path().join("credentials.toml");
+
+        // Cell that the factory writes the LATEST captured sender into.
+        let captured: Arc<
+            Mutex<Option<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>>,
+        > = Arc::new(Mutex::new(None));
+        let cap_clone = captured.clone();
+
+        let fake_sink = RecordingRenderSink::new();
+        let fake_clone = fake_sink.clone();
+
+        let cap_factory = move |_did: dormant_core::types::DisplayId,
+                                _output: String,
+                                tx: Option<
+            &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+        >| {
+            if let Some(tx) = tx {
+                *cap_clone.lock().unwrap() = Some(tx.clone());
+            }
+            Some(Arc::new(fake_clone.clone()) as Arc<dyn dormant_core::traits::RenderSink>)
+        };
+
+        let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+        let app = App::build_with_sources(
+            cfg_path.clone(),
+            creds_path,
+            Strictness::Strict,
+            fake_factory("desk", script),
+        )
+        .expect("build app")
+        .with_render_sink_builder(cap_factory)
+        .disable_ipc();
+
+        let (handle, join) = app.start().await.expect("start app");
+        let mut reloads = handle.subscribe_reload();
+
+        // Both displays blank + render.
+        let show_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(
+                        cmd,
+                        dormant_core::fakes::RenderCmd::Show {
+                            kind: StageKind::RenderBlack,
+                            ..
+                        }
+                    )
+                })
+            },
+            Duration::from_secs(6),
+        )
+        .await;
+        assert!(show_ok, "expected show(RenderBlack) before rollback");
+
+        // Clear the sender captured during initial assembly.
+        *captured.lock().unwrap() = None;
+
+        // Reload: mon2 removed → verified wake fails → rebuild_old.
+        let cfg_single = format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon1]
+controllers = ["command"]
+blank_command = "printf B >> '{m1}'"
+wake_command = "printf W >> '{m1}'"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "200ms" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-1"
+
+[rules.r]
+zone = "office"
+displays = ["mon1"]
+grace_period = "300ms"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            m1 = m1.display(),
+        );
+        fs::write(&cfg_path, &cfg_single).unwrap();
+        assert!(handle.trigger_reload().await);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+            .await
+            .expect("reload outcome")
+            .expect("reload bus open");
+        match outcome {
+            ReloadOutcome::Rejected(detail) => {
+                assert!(
+                    detail.contains("mon2"),
+                    "reject detail must name un-wakeable display: {detail}"
+                );
+            }
+            ReloadOutcome::Reloaded => {
+                panic!("expected Rejected on mon2 wake failure, got Reloaded")
+            }
+        }
+
+        // rebuild_old ran → factory captured the POST-ROLLBACK sender.
+        let post_sender = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("factory must have captured sender during rebuild_old");
+
+        // Drive restored generation back to render, then inject InputWake.
+        let events = handle.events_sender();
+        let _ = events.send(ev("desk", SensorState::Present)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = events.send(ev("desk", SensorState::Absent)).await;
+
+        let re_show_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter()
+                    .filter(|(_dur, cmd)| {
+                        matches!(
+                            cmd,
+                            dormant_core::fakes::RenderCmd::Show {
+                                kind: StageKind::RenderBlack,
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+                    >= 2
+            },
+            Duration::from_secs(6),
+        )
+        .await;
+        assert!(
+            re_show_ok,
+            "expected second show(RenderBlack) after rollback and re-blank"
+        );
+
+        // HONEST TEST: send InputWake through captured post-rollback sender.
+        post_sender
+            .send(dormant_core::types::DisplayId("mon1".into()))
+            .unwrap();
+
+        let teardown_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(cmd, dormant_core::fakes::RenderCmd::Teardown { .. })
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let full_log = fake_sink.log();
+        shutdown(handle, join).await;
+
+        assert!(
+            teardown_ok,
+            "expected teardown after InputWake in rebuilt generation, log: {full_log:?}"
         );
     }
 }

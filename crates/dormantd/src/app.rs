@@ -81,11 +81,21 @@ type SourceBuilder =
 /// [`LayerShellRenderSink`]; tests inject a factory that returns
 /// [`RecordingRenderSink`](dormant_core::fakes::RecordingRenderSink).
 ///
-/// The factory receives the display id and output connector name and
-/// returns `None` to skip the sink (fall-through path).
+/// The factory receives the display id, output connector name, and
+/// an optional `UnboundedSender<DisplayId>` — the same sender
+/// passed to [`LayerShellRenderSink::new`] so test factories can
+/// capture it and simulate `InputWake` events.  Return `None` to skip
+/// the sink (fall-through path).
 #[cfg(feature = "render")]
-type RenderSinkBuilder =
-    Arc<dyn Fn(DisplayId, String) -> Option<Arc<dyn RenderSink>> + Send + Sync>;
+type RenderSinkBuilder = Arc<
+    dyn Fn(
+            DisplayId,
+            String,
+            Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+        ) -> Option<Arc<dyn RenderSink>>
+        + Send
+        + Sync,
+>;
 
 pub use dormant_core::reload::ReloadOutcome;
 
@@ -240,13 +250,21 @@ impl App {
     ///
     /// When set, [`assemble_static`] calls this factory instead of
     /// building [`LayerShellRenderSink`] directly.  The factory receives
-    /// the display id and output connector name; return `None` to skip
-    /// the sink (fall-through).
+    /// the display id, output connector name, and an optional
+    /// `UnboundedSender<DisplayId>` (the `InputWake` channel); return
+    /// `None` to skip the sink (fall-through).
     #[cfg(feature = "render")]
     #[must_use]
     pub fn with_render_sink_builder<F>(mut self, factory: F) -> Self
     where
-        F: Fn(DisplayId, String) -> Option<Arc<dyn RenderSink>> + Send + Sync + 'static,
+        F: Fn(
+                DisplayId,
+                String,
+                Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+            ) -> Option<Arc<dyn RenderSink>>
+            + Send
+            + Sync
+            + 'static,
     {
         self.render_sink_builder = Some(Arc::new(factory));
         self
@@ -1165,7 +1183,7 @@ fn build_render_sinks(
         }
         if let Some(output_name) = &dc.output {
             let sink: Option<Arc<dyn RenderSink>> = if let Some(builder) = render_sink_builder {
-                (builder)(did.clone(), output_name.clone())
+                (builder)(did.clone(), output_name.clone(), Some(&input_wake_tx))
             } else {
                 match LayerShellRenderSink::new(
                     did.clone(),
@@ -1563,8 +1581,9 @@ mod render_tests {
 
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder =
-            Arc::new(move |_did, _output| Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>));
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx| {
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
 
         let (sinks, input_wake_rx) = build_render_sinks(&cfg, Some(&factory));
 

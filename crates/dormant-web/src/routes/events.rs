@@ -18,24 +18,30 @@
 //! On successful reload a synthetic `config_reloaded` frame is sent so
 //! the frontend can re-fetch `/api/config`.
 //!
-//! ### Validation rejection — deferred-close state machine
+//! ### State machine — `Closed` is the teardown signal, period
 //!
-//! A normal [`ReloadOutcome::Rejected`] keeps the old generation alive, so
-//! the existing `ev_rx` is still valid and continues to deliver any
-//! backlogged or in-flight events.  Touching `ev_rx` on `Rejected`
-//! (draining its buffer or replacing it) would silently lose events, so
-//! the handler does NEITHER: it only arms `resubscribe_on_close` and
-//! returns to the select! loop.  The receiver stays in place and the
-//! stream stays lossless regardless of how many events buffered during
-//! the reject-subscribe round-trip on either side.
+//! The handler has exactly two stable states — `events = Some(ev_rx)`
+//! (streaming) and `events = None` (resubscribe failed; waiting for
+//! shutdown).  There is no flag tracking prior reload outcomes because
+//! every interleaving of `ReloadOutcome` and `ev_rx.recv()` resolves the
+//! same way:
 //!
-//! The only reason a `Rejected` outcome ever triggers a resubscribe is the
-//! rare teardown-rebuild path where `dormantd`'s `rebuild_old` actually
-//! drops the old broadcast before publishing `Rejected` — in that case
-//! the old `ev_rx` reports `Closed` shortly after `Rejected` was observed.
-//! The `Closed` branch then sees the flag and resubscribes into the new
-//! generation.  On a true normal reject, `Closed` never arrives and the
-//! flag is harmless.
+//! - A normal validation [`ReloadOutcome::Rejected`] NEVER closes
+//!   `ev_rx` (the old generation stays alive), so observing a
+//!   `Closed` on the event receiver is unambiguous evidence that the
+//!   generation was torn down.  `Rejected` therefore does nothing to
+//!   `ev_rx` and there is no state for a sticky flag to leak across
+//!   reload cycles.
+//! - `Reloaded` only emits the `config_reloaded` frame.  Resubscription
+//!   is driven by `Closed` on `ev_rx` (the canonical teardown
+//!   signal), so the handler never races a `Reloaded` arm against a
+//!   not-yet-installed new generation by issuing its own
+//!   `SubscribeEvents` at that moment.
+//! - `Closed` on `ev_rx` always resubscribes into whatever generation
+//!   the engine currently reports.  If the swap hasn't completed yet
+//!   the engine replies with a receiver on the closed broadcast and
+//!   we immediately try again — the engine's swap is bounded, so this
+//!   converges without hot-spinning.
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -83,15 +89,6 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
     let mut events: Option<broadcast::Receiver<DaemonEvent>> =
         Some(resubscribe_events(&ctl_tx).await?);
 
-    // When the daemon tears down the old generation, rebuilds, then
-    // publishes Rejected, the `select!` may see Rejected BEFORE the old
-    // broadcast's Closed lands on the event receiver.  This flag arms a
-    // deferred resubscribe: when Closed DOES arrive (on the next
-    // iteration), we resubscribe instead of going idle.  On a normal
-    // validation reject (old gen still alive) the flag is set but the
-    // receiver never closes → no-op, no event loss.
-    let mut resubscribe_on_close = false;
-
     loop {
         if let Some(ref mut ev_rx) = events {
             tokio::select! {
@@ -123,15 +120,15 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            if resubscribe_on_close {
-                                // A reload signal was seen earlier; the
-                                // teardown just caught up.  Subscribe to
-                                // the new generation.
-                                resubscribe_on_close = false;
-                                events = resubscribe_events(&ctl_tx).await.ok();
-                            } else {
-                                events = None;
-                            }
+                            // Unambiguous teardown: a normal Reject
+                            // never closes the broadcast, so any
+                            // `Closed` here means the active
+                            // generation was torn down.  Resubscribe
+                            // into the engine's current gen; if its
+                            // swap hasn't completed we'll get a
+                            // closed receiver back and immediately
+                            // try again — bounded by the engine swap.
+                            events = resubscribe_events(&ctl_tx).await.ok();
                         }
                     }
                 }
@@ -139,25 +136,22 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                 outcome = reload_rx.recv() => {
                     match outcome {
                         Ok(ReloadOutcome::Reloaded) => {
-                            resubscribe_on_close = false;
+                            // Only job is announcing the reload to the
+                            // frontend.  Resubscription is driven by
+                            // the `Closed` branch above so the handler
+                            // never issues `SubscribeEvents` against a
+                            // not-yet-installed generation (the
+                            // canonical teardown signal lands first).
                             let frame = serde_json::to_string(&DaemonEvent::ConfigReloaded)
                                 .unwrap_or_default();
                             let _ = tx.send(Message::Text(frame)).await;
-                            events = resubscribe_events(&ctl_tx).await.ok();
                         }
                         Ok(ReloadOutcome::Rejected(_)) => {
-                            // Normal validation reject: the old
-                            // generation is still alive.  Do NOT
-                            // touch `ev_rx` — draining or replacing
-                            // it loses any event buffered during the
-                            // reject-subscribe round-trip.  Arm the
-                            // deferred-close flag so the teardown
-                            // case (broadcast closes shortly after
-                            // Rejected is published) is handled by
-                            // the `Closed` branch; a true normal
-                            // reject never closes the receiver and
-                            // the flag is harmless.
-                            resubscribe_on_close = true;
+                            // Normal validation reject keeps the
+                            // receiver valid; nothing to do.  Any
+                            // subsequent teardown is signalled canonically
+                            // by `Closed` on `ev_rx` (not by anything
+                            // on the reload bus).
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             reload_rx = state.inner.reload_rx.resubscribe();
@@ -182,7 +176,6 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                 outcome = reload_rx.recv() => {
                     match outcome {
                         Ok(ReloadOutcome::Reloaded) => {
-                            resubscribe_on_close = false;
                             let frame = serde_json::to_string(&DaemonEvent::ConfigReloaded)
                                 .unwrap_or_default();
                             let _ = tx.send(Message::Text(frame)).await;
@@ -1025,6 +1018,191 @@ mod tests {
         let e3 = recv_json(&mut ws).await;
         assert_eq!(e3["event"], "zone_changed");
         assert_eq!(e3["zone"], "z3");
+
+        let _ = ws.close(None).await;
+    }
+
+    /// Interleaving E (reviewer's stale-flag regression): after a normal
+    /// validation reject the handler must NOT keep any sticky state that
+    /// could fire spuriously on a future reload.  The new scenario:
+    ///
+    /// 1. Subscribe.
+    /// 2. Receive a normal `Rejected` (gen1 alive).
+    /// 3. Daemon tears down gen1 (broadcast `Closed` arrives at the handler).
+    /// 4. `Reloaded` is published AFTER the old broadcast closes.
+    ///
+    /// The Reloaded arm in any sound design resubscribes into the new
+    /// generation.  A buggy design whose `Reloaded` arm calls
+    /// `resubscribe_events` *and* keeps a receiver-buffer from a prior
+    /// `Closed`-triggered resubscribe will DROP that buffer (and any
+    /// events queued in it) when the second resubscribe replaces it.
+    /// The engine sleeps 50 ms before responding to every
+    /// `SubscribeEvents` so the timing of
+    ///   gen2-event-sent → Reloaded-arm's-resubscribe-completes
+    /// is deterministic.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn stale_reject_flag_does_not_drop_new_gen_event() {
+        let cancel = CancellationToken::new();
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (gen1_tx, _gen1_rx) = broadcast::channel::<DaemonEvent>(64);
+        let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
+
+        let config = Arc::new(Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        });
+        let creds = Arc::new(Credentials::default());
+        let (config_tx, config_rx) = watch::channel(config);
+        let (creds_tx, creds_rx) = watch::channel(creds);
+        std::mem::forget(config_tx);
+        std::mem::forget(creds_tx);
+
+        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        std::mem::forget(reload_trigger_rx);
+
+        let doctor =
+            dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let state = WebState::new(crate::state::WebStateInner {
+            ctl_tx,
+            reload_trigger: reload_trigger_tx,
+            reload_rx,
+            config_rx,
+            creds_rx,
+            config_path: std::path::PathBuf::from("/dev/null"),
+            doctor,
+            web_bind: bind,
+            cancel: cancel.clone(),
+        });
+
+        let gen1_clone = gen1_tx.clone();
+        let gen2_clone = gen2_tx.clone();
+        let (drop_gen1_tx, mut drop_gen1_rx) = oneshot::channel::<()>();
+        let (resub_signal_tx, mut resub_signal_rx) = mpsc::channel::<()>(8);
+
+        tokio::spawn(async move {
+            // Every SubscribeEvents is delayed 50 ms before the engine
+            // responds, so the test window between
+            //   "first resubscribe completes" and
+            //   "Reloaded arm's resubscribe would complete"
+            // is wide enough to deterministically land a gen2 event in
+            // the WRONG receiver (the one Reloaded's resubscribe
+            // replaces) — exposing any "Reloaded drops the receiver
+            // from a prior Closed-branch resubscribe" bug.
+            let mut gen1: Option<broadcast::Sender<DaemonEvent>> = Some(gen1_clone);
+            loop {
+                if gen1.is_some() {
+                    tokio::select! {
+                        _ = &mut drop_gen1_rx => { gen1 = None; }
+                        msg = ctl_rx.recv() => {
+                            match msg {
+                                Some(ControlMsg::SubscribeEvents(tx)) => {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    if let Some(ref g1) = gen1 {
+                                        let _ = tx.send(g1.subscribe());
+                                    }
+                                    let _ = resub_signal_tx.try_send(());
+                                }
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                    }
+                } else {
+                    let msg = ctl_rx.recv().await;
+                    match msg {
+                        Some(ControlMsg::SubscribeEvents(tx)) => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let _ = tx.send(gen2_clone.subscribe());
+                            let _ = resub_signal_tx.try_send(());
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+        });
+
+        let app = Router::new()
+            .route("/api/events", get(ws_events))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { cancel.cancelled().await })
+                .await
+                .ok();
+        });
+
+        let url = format!("ws://{addr}/api/events");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Wait for the initial subscription to land.
+        let _ = resub_signal_rx.recv().await;
+
+        // Step 1: normal validation Reject — gen1 stays alive.  On the
+        // OLD sticky-flag code this would set `resubscribe_on_close =
+        // true`; on the new design it does nothing to the receiver.
+        let _ = reload_tx.send(ReloadOutcome::Rejected("validation".into()));
+
+        // Step 2: daemon tears down gen1 BEFORE publishing Reloaded.
+        let _ = drop_gen1_tx.send(());
+        drop(gen1_tx);
+        let _ = reload_tx.send(ReloadOutcome::Reloaded);
+
+        // Step 3: wait for the FIRST post-initial resubscribe to
+        // complete.  On the new design this is the only resubscribe
+        // (events stays = gen2 receiver).  On the OLD design a
+        // SECOND resubscribe from the Reloaded arm is still queued
+        // and will drop the receiver we just installed.
+        let _ = resub_signal_rx.recv().await;
+
+        // Sleep long enough for the handler to re-enter its select!,
+        // pick up Reloaded, and (on the OLD design) enter the second
+        // resubscribe's 50 ms await.  Without this sleep we race
+        // against the handler waking and may forward the event on the
+        // first receiver before the OLD design drops it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Step 4: a gen2 event.  On the new design it lands on the
+        // (only) gen2 receiver the handler holds; on the OLD design it
+        // lands in the buffer of the receiver Reloaded's resubscribe
+        // is about to replace, and is DROPPED.
+        let _ = gen2_tx.send(DaemonEvent::ZoneChanged {
+            zone: dormant_core::types::ZoneId("e-reload".to_string()),
+            present: true,
+            cause: dormant_core::types::SensorId("e".to_string()),
+        });
+
+        // Frame order is timing-dependent (which branch of the
+        // select! wins: the ev_rx that holds the gen2 event, or the
+        // queued Reloaded).  Collect both, regardless of order.
+        let mut got_config_reloaded = false;
+        let mut got_e_reload = false;
+        for _ in 0..2 {
+            let f = recv_json(&mut ws).await;
+            match f["event"].as_str() {
+                Some("config_reloaded") => got_config_reloaded = true,
+                Some("zone_changed") if f["zone"] == "e-reload" => got_e_reload = true,
+                other => panic!("unexpected frame: {other:?}, full={f}"),
+            }
+        }
+        assert!(
+            got_config_reloaded,
+            "missing config_reloaded frame after Reloaded"
+        );
+        assert!(
+            got_e_reload,
+            "missing e-reload zone_changed frame — Reloaded's second resubscribe dropped the buffered gen2 event"
+        );
 
         let _ = ws.close(None).await;
     }

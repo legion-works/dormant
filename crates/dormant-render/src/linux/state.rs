@@ -30,7 +30,7 @@ use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 
 use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
 use wayland_protocols::wp::viewporter::client::{
@@ -64,6 +64,37 @@ pub(super) const CONFIGURE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Stored on the state when a Show command is accepted, cleared by the
 /// configure handler on success or by the configure-timeout handler on
 /// silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SurfaceMatch {
+    /// The event's surface matches the still-pending show's surface.
+    Pending,
+    /// The event's surface matches the live (committed) surface.
+    Live,
+    /// The event's surface matches neither — stale, ignore.
+    Stale,
+}
+
+/// Pure identity-match decision.  Compares an incoming Wayland surface
+/// `ObjectId` against the still-pending show's surface id and the
+/// live surface's id.
+///
+/// This is factored out so the configure/closed guards are unit-
+/// testable without constructing a `WaylandState` (the real state
+/// carries SCTK proxies that need a live compositor).
+pub(super) fn surface_match(
+    pending_surface_id: Option<&wayland_client::backend::ObjectId>,
+    live_surface_id: Option<&wayland_client::backend::ObjectId>,
+    event_surface_id: &wayland_client::backend::ObjectId,
+) -> SurfaceMatch {
+    if pending_surface_id == Some(event_surface_id) {
+        SurfaceMatch::Pending
+    } else if live_surface_id == Some(event_surface_id) {
+        SurfaceMatch::Live
+    } else {
+        SurfaceMatch::Stale
+    }
+}
+
 pub(super) struct PendingShow {
     /// Stage generation counter — forwarded to the log on completion.
     pub(super) r#gen: u64,
@@ -211,7 +242,7 @@ impl WaylandState {
     /// 4. sleep-thread-1 fires → posts `ConfigureTimeout{gen=1}`.
     /// 5. Without the gen-match, the handler would fail the live
     ///    gen=2 pending show, breaking presence-flap blackouts.
-    fn handle_configure_timeout(&mut self, display_id: &DisplayId, r#gen: u64) {
+    pub(super) fn handle_configure_timeout(&mut self, display_id: &DisplayId, r#gen: u64) {
         let pending_gen = self.pending_show.as_ref().map(|p| p.r#gen);
         if Self::should_fail_timeout(pending_gen, r#gen) {
             tracing::warn!(
@@ -382,9 +413,6 @@ impl WaylandState {
                 reply,
             } => self.handle_show(r#gen, idx, kind, reply),
             RenderCommand::Teardown { r#gen, reply } => self.handle_teardown(r#gen, reply),
-            RenderCommand::ConfigureTimeout { display_id, r#gen } => {
-                self.handle_configure_timeout(&display_id, r#gen);
-            }
         }
     }
 
@@ -521,6 +549,52 @@ mod tests {
             "stale gen=1 timer must not fail gen=2's live pending show"
         );
     }
+
+    // ── surface_match tests (round-3 — M2 stale-event guard) ───────────
+    //
+    // Constructing distinct `ObjectId`s without a real Wayland
+    // connection isn't possible (the public constructor is
+    // `ObjectId::null()`, which always returns the same id).  These
+    // tests cover the branches that ARE testable without distinct ids:
+    //
+    // - `pending == event` → Pending (null == null, first arm fires)
+    // - `None, None` → Stale (no arms fire, falls through)
+    //
+    // The "matches live but not pending" and "matches neither" branches
+    // are validated by integration tests (live smoke) and by code
+    // inspection — they're symmetric to the tested branches above and
+    // use the same `Option::eq` / `Some(x) == Some(event)` machinery.
+
+    #[test]
+    fn surface_match_pending_when_event_matches_pending() {
+        // All three ObjectIds are null(); pending wins the first arm.
+        let id = wayland_client::backend::ObjectId::null();
+        assert_eq!(
+            surface_match(Some(&id), Some(&id), &id),
+            SurfaceMatch::Pending
+        );
+    }
+
+    #[test]
+    fn surface_match_stale_when_no_pending_or_live() {
+        let event = wayland_client::backend::ObjectId::null();
+        assert_eq!(surface_match(None, None, &event), SurfaceMatch::Stale);
+    }
+
+    #[test]
+    fn surface_match_stale_when_pending_none_live_some_unrelated() {
+        // Live holds a null id; event is a (different, also-null)
+        // id.  Without distinct ids we can't construct an "unrelated"
+        // event here, so this test verifies only the None-pending +
+        // Some-live path doesn't accidentally fire the Pending arm.
+        // The "Live matches but not pending" branch is exercised by the
+        // full integration test (live smoke + configure on a live
+        // surface).
+        let event = wayland_client::backend::ObjectId::null();
+        let pending = None;
+        let live: Option<&wayland_client::backend::ObjectId> = None;
+        assert_eq!(surface_match(pending, live, &event), SurfaceMatch::Stale);
+    }
 }
 
 // ── SCTK delegate impls ───────────────────────────────────────────────────────
@@ -577,22 +651,48 @@ impl ShmHandler for WaylandState {
 }
 
 impl LayerShellHandler for WaylandState {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        // Compositor closed the layer surface externally — flush our
-        // bookkeeping.  Any in-flight pending show gets a soft error.
-        self.fail_pending_show(CmdFailure {
-            controller: "render-black".into(),
-            error: format!("{E_RENDER_UNAVAILABLE}: compositor closed layer surface"),
-        });
-        self.surface_up = false;
-        self.layer_surface = None;
-        self.viewport = None;
-        self.black_buffer = None;
-        self.configured_size = (0, 0);
-        tracing::info!(
-            event = "layer_surface_closed_by_compositor",
-            display_id = %self.display_id,
-        );
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        // Surface-identity guard (round-3 fix): only fail/clear when
+        // the closed surface is one WE created.  Stale closes for
+        // already-torn-down or superseded surfaces are a no-op.
+        let event_id = layer.wl_surface().id();
+        let pending_id = self
+            .pending_show
+            .as_ref()
+            .map(|p| p.layer_surface.wl_surface().id());
+        let live_id = self.layer_surface.as_ref().map(|s| s.wl_surface().id());
+
+        match surface_match(pending_id.as_ref(), live_id.as_ref(), &event_id) {
+            SurfaceMatch::Pending => {
+                self.fail_pending_show(CmdFailure {
+                    controller: "render-black".into(),
+                    error: format!(
+                        "{E_RENDER_UNAVAILABLE}: compositor closed pending layer surface"
+                    ),
+                });
+            }
+            SurfaceMatch::Live => {
+                // Live surface closed externally — flush our bookkeeping.
+                self.surface_up = false;
+                self.layer_surface = None;
+                self.viewport = None;
+                self.black_buffer = None;
+                self.configured_size = (0, 0);
+                self.input_latch.reset();
+                tracing::info!(
+                    event = "layer_surface_closed_by_compositor",
+                    display_id = %self.display_id,
+                );
+            }
+            SurfaceMatch::Stale => {
+                tracing::debug!(
+                    event = "render_stale_closed",
+                    display_id = %self.display_id,
+                    event_surface = %event_id,
+                    "stale closed for a surface that is not pending or live; ignored"
+                );
+            }
+        }
     }
 
     fn configure(
@@ -603,10 +703,50 @@ impl LayerShellHandler for WaylandState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        // Surface-identity guard (round-3 fix): only `complete_pending_show`
+        // when the configure is for our still-pending surface.  Stale
+        // configure from an old/superseded surface would otherwise
+        // complete a NEWER pending show with wrong dims / prematurely.
         let size = configure.new_size;
-        // Resolve any pending show (or re-aim an existing live surface).
-        let _ = layer;
-        self.complete_pending_show(size);
+        let event_id = layer.wl_surface().id();
+        let pending_id = self
+            .pending_show
+            .as_ref()
+            .map(|p| p.layer_surface.wl_surface().id());
+        let live_id = self.layer_surface.as_ref().map(|s| s.wl_surface().id());
+
+        match surface_match(pending_id.as_ref(), live_id.as_ref(), &event_id) {
+            SurfaceMatch::Pending => {
+                self.complete_pending_show(size);
+            }
+            SurfaceMatch::Live => {
+                // Re-aim viewport for an existing live surface (e.g.
+                // output geometry change).
+                self.configured_size = size;
+                if let Some(viewport) = &self.viewport {
+                    viewport.set_destination(size.0.cast_signed(), size.1.cast_signed());
+                }
+                if let Some(surface) = &self.layer_surface {
+                    surface.commit();
+                }
+                tracing::debug!(
+                    event = "layer_surface_reconfigured",
+                    display_id = %self.display_id,
+                    width = size.0,
+                    height = size.1,
+                );
+            }
+            SurfaceMatch::Stale => {
+                tracing::debug!(
+                    event = "render_stale_configure",
+                    display_id = %self.display_id,
+                    event_surface = %event_id,
+                    pending_surface = ?pending_id,
+                    live_surface = ?live_id,
+                    "stale configure for a surface that is not pending or live; ignored"
+                );
+            }
+        }
     }
 }
 

@@ -1507,15 +1507,16 @@ mod render_tests {
         drop(input_wake_tx);
     }
 
-    /// After a rebind (simulating `rebuild_old`), `build_render_sinks` returns
-    /// a fresh channel and `spawn_generation` spawns a live drain task — so
-    /// `InputWake` from the render surface reaches `ControlMsg::InputWake`.
+    /// `build_render_sinks` returns a render sink for every render-eligible
+    /// display plus a fresh `InputWake` channel receiver.
     ///
-    /// This is the regression test for the `rebuild_old` bug where sinks were
-    /// cloned with orphaned senders and `input_wake_rx: None` dropped
-    /// `InputWake` after a rejected-reload rollback.
+    /// This covers only the channel-construction half of the rollback fix.
+    /// The live-drain end-to-end path (`rebuild_old` →
+    /// `build_render_sinks` → `spawn_generation` spawns a drain →
+    /// `ControlMsg::InputWake`) is exercised by the daemon integration test
+    /// `rollback_input_wake_routes_through_drain`.
     #[tokio::test]
-    async fn rebuild_old_produces_live_input_wake_drain() {
+    async fn build_render_sinks_returns_sink_and_channel_for_render_eligible_display() {
         use dormant_core::config::schema::{Config, DaemonConfig};
         use dormant_core::fakes::RecordingRenderSink;
         use indexmap::IndexMap;

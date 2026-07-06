@@ -1192,17 +1192,23 @@ wake_retry_interval = "1s"
     /// After a rejected reload triggered by a removed-display wake failure,
     /// the restored generation gets a fresh `InputWake` channel via
     /// `build_render_sinks` → `rebuild_old`.  Sending a `DisplayId` through
-    /// the captured post-rollback sender reaches `ControlMsg::InputWake`
-    /// and the engine tears down the render overlay.
+    /// the sender captured during that rollback build must travel the REAL
+    /// path — unbounded channel → the drain task spawned by
+    /// `spawn_generation` → `ControlMsg::InputWake` → engine → render
+    /// teardown — the exact wiring the orphaned-sender bug broke.
     ///
     /// Uses a two-display config where mon2 has `wake_command = "false"`
     /// so its verified wake fails on removal, triggering `rebuild_old`.
     ///
-    /// **Determinism**: after the rollback the engine is driven back to
-    /// render, then `ControlMsg::InputWake` is injected through the
-    /// control channel (bypassing the drain task, which is unit-tested
-    /// separately).  The engine must react by tearing down the render
-    /// overlay.
+    /// **Determinism**: the test factory appends every `InputWake` sender it
+    /// is handed to a capture Vec, in invocation order.  A single `fs::write`
+    /// wakes both `trigger_reload` and the config file watcher, and the run
+    /// loop services them serially, so one OR two reloads may run (a
+    /// `tokio::select!` race) — each rollback build appending 2 senders.  The
+    /// test drains the reload bus until it is quiet for longer than
+    /// `reload_debounce`, guaranteeing every reload has settled; the LAST
+    /// captured sender then belongs to the CURRENT generation's live drain.
+    /// No control-channel bypass — the send travels the real channel.
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rollback_input_wake_routes_through_drain() {
@@ -1265,7 +1271,25 @@ wake_retry_interval = "1s"
         let creds_path = dir.path().join("credentials.toml");
 
         let fake_sink = RecordingRenderSink::new();
-        let builder = recording_factory(fake_sink.clone());
+
+        // The factory records every `InputWake` sender it is handed, in
+        // invocation order, so the test can pick the sender belonging to the
+        // rollback channel (the LAST one — see the determinism note above).
+        let captured: Arc<
+            Mutex<Vec<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>>,
+        > = Arc::new(Mutex::new(Vec::new()));
+        let cap_for_factory = captured.clone();
+        let sink_for_factory = fake_sink.clone();
+        let builder = move |_did: dormant_core::types::DisplayId,
+                            _output: String,
+                            tx: Option<
+            &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+        >| {
+            if let Some(tx) = tx {
+                cap_for_factory.lock().unwrap().push(tx.clone());
+            }
+            Some(Arc::new(sink_for_factory.clone()) as Arc<dyn dormant_core::traits::RenderSink>)
+        };
 
         let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
         let app = App::build_with_sources(
@@ -1356,9 +1380,39 @@ wake_retry_interval = "1s"
             }
         }
 
-        // Drive restored generation back to render, then inject
-        // ControlMsg::InputWake through the control channel.
-        // The engine must react by tearing down the render overlay.
+        // A single `fs::write` wakes BOTH the explicit `trigger_reload` AND
+        // the config file watcher, and `run_loop` services reload triggers
+        // serially — so a SECOND (watcher-driven) reload can follow the
+        // first, tearing down the first rollback generation and orphaning
+        // its `InputWake` channel.  Whether that second reload happens is a
+        // `tokio::select!` race, so drain the reload bus until it goes quiet
+        // for longer than `reload_debounce` (500ms default): once no further
+        // outcome arrives, the LAST captured sender is guaranteed to belong
+        // to the CURRENT generation's live drain.  (Each reload that reaches
+        // `rebuild_old` appends 2 captures for the old 2-display config, so
+        // the count is 5 for one reload or 8 for two — both satisfy the
+        // "rollback ran" invariant below.)
+        while (tokio::time::timeout(Duration::from_millis(900), reloads.recv()).await).is_ok() {
+            // Another reload settled; keep draining until the bus is quiet.
+        }
+
+        // Sanity: the rollback build must have invoked the render-sink
+        // factory (2 initial + 1 rejected new-assembly + >=2 rollback).
+        let capture_count = captured.lock().unwrap().len();
+        assert!(
+            capture_count >= 5,
+            "expected >= 5 render-sink factory invocations \
+             (2 initial + 1 rejected + >=2 rollback), got {capture_count}"
+        );
+        let rollback_sender = captured
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("rollback build must have captured an InputWake sender");
+
+        // Drive the restored generation back to a render stage so a teardown
+        // is observable.
         let events = handle.events_sender();
         let _ = events.send(ev("desk", SensorState::Present)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1388,17 +1442,14 @@ wake_retry_interval = "1s"
             "expected second show(RenderBlack) after rollback and re-blank"
         );
 
-        // HONEST TEST: inject InputWake through the control channel.
-        // After rebuild_old the drain task is live and would route
-        // render-surface input events as ControlMsg::InputWake; we
-        // send that variant directly to verify the engine handles it.
-        handle
-            .control_sender()
-            .send(ControlMsg::InputWake(dormant_core::types::DisplayId(
-                "mon1".into(),
-            )))
-            .await
-            .unwrap();
+        // The real path: push a DisplayId through the rollback channel's
+        // sender.  It must reach the live drain (unbounded channel →
+        // spawn_input_wake_drain → ControlMsg::InputWake → engine).  A
+        // SendError here is the orphaned-sender bug — the rollback receiver
+        // would be dropped instead of held by a spawned drain.
+        rollback_sender
+            .send(dormant_core::types::DisplayId("mon1".into()))
+            .expect("rollback InputWake sender must be live (receiver held by the spawned drain)");
 
         let teardown_ok = wait_for(
             || {

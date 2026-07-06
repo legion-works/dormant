@@ -8,8 +8,6 @@
 //! 3. Wrap the `(Connection, EventQueue)` pair in a
 //!    [`calloop_wayland_source::WaylandSource`] and `insert` it into the
 //!    loop — the source drives the Wayland FD as a calloop event source,
-//!    so `dispatch_pending` fires whenever there's data to read (idle
-//!    threads still service input + configure events).
 //! 4. Insert the command channel as a second calloop source.  Show /
 //!    Teardown commands run inline from inside the channel callback;
 //!    configure completion / teardown completion land on the next
@@ -18,11 +16,30 @@
 //!    [`calloop::channel::Event::Closed`] (every `LayerShellRenderSink`
 //!    handle has dropped), tear down surfaces and exit.
 //!
+//! **Sender-lifetime proof (M4 — round-3 fix).**  The receiver thread
+//! MUST NOT hold any `Sender<RenderCommand>` clone across the loop's
+//! lifetime, otherwise [`calloop::channel::Event::Closed`] is
+//! unreachable.  Concretely:
+//!
+//! - `install_command_source` does not capture a `Sender`.
+//! - `run_loop` does not take a `Sender` parameter.
+//! - The configure-timeout timer is registered as a `calloop::timer::Timer`
+//!   source whose callback runs on the calloop thread and mutates
+//!   `state` directly — no `Sender` involved, no channel repost, no
+//!   sleep thread.  When the timer fires it `TimeoutAction::Drop`s
+//!   itself.
+//!
+//! Together: after every external `LayerShellRenderSink` handle
+//! drops, the only live senders are zero (no permanent clones, no
+//! in-flight timers because they run on the loop thread).  Closed
+//! fires, the loop exits, the OS thread exits.
+//!
 //! Configure-timeout: every Show arms a one-shot `calloop::timer::Timer`
-//! that, on fire, posts a [`RenderCommand::ConfigureTimeout`] back into
-//! the same command channel.  The handler fails the in-flight pending
-//! show with an `E_RENDER_UNAVAILABLE` error so a silent compositor
-//! can never wedge the thread or hang the async caller.
+//! that, on fire, directly calls
+//! [`crate::linux::state::WaylandState::handle_configure_timeout`].  The
+//! handler fails the in-flight pending show with an `E_RENDER_UNAVAILABLE`
+//! error (gen-guarded so a stale timer is a no-op) so a silent
+//! compositor can never wedge the thread or hang the async caller.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,9 +96,15 @@ pub(super) fn spawn_wayland_thread(
             let result = init(&did, &oname, iwt.as_ref());
             match result {
                 Ok((cmd_tx, event_loop, state, loop_handle)) => {
-                    let caller_tx = cmd_tx.clone();
-                    let _ = init_tx.send(Ok(caller_tx));
-                    run_loop(event_loop, state, loop_handle, cmd_tx);
+                    // Hand the sender to the async side.  The wayland
+                    // thread itself holds NO clone of `cmd_tx` — its
+                    // only path back to the channel is via the Timer
+                    // source's direct state mutation, which doesn't
+                    // touch the channel at all.  After every external
+                    // handle drops, the channel becomes empty →
+                    // `Event::Closed` fires → thread exits cleanly.
+                    let _ = init_tx.send(Ok(cmd_tx));
+                    run_loop(event_loop, state, loop_handle);
                 }
                 Err(e) => {
                     let _ = init_tx.send(Err(e));
@@ -215,38 +238,43 @@ fn init(
         }
     };
 
-    // Wire the command channel as the second calloop source.  The
-    // channel's `Sender` clone is captured by the closure so the
-    // configure-timeout timer can post `ConfigureTimeout` back into the
-    // same channel.  The wayland thread keeps one clone alive in the
-    // closure; we return the original to the caller.
+    // Wire the command channel as the second calloop source.  NO Sender
+    // is held by the closure — the only path back to the channel would
+    // be the configure-timeout timer, but that runs as a calloop Timer
+    // source on the loop thread with direct state mutation, no
+    // channel repost.  After every external handle drops, the channel
+    // becomes empty and `Event::Closed` fires.
     let (cmd_tx, cmd_rx) = channel::<RenderCommand>();
-    install_command_source(&loop_handle, cmd_rx, &cmd_tx);
+    install_command_source(&loop_handle, cmd_rx);
 
     Ok((cmd_tx, event_loop, state, loop_handle))
 }
 
-/// Install the command-channel source.  Captures a `Sender` clone so
-/// the per-Show configure-timeout timer can push a `ConfigureTimeout`
-/// command back into the same channel — every state mutation stays on
-/// the single state-mutating callback path.
+/// Install the command-channel source.  Captures ONLY a `LoopHandle`
+/// clone (not a `Sender`) — the configure-timeout timer uses the
+/// handle to register itself as a calloop Timer source that mutates
+/// state directly.  The closure itself holds zero Sender clones, so
+/// `Event::Closed` becomes reachable the moment every external
+/// `LayerShellRenderSink` handle drops.
 fn install_command_source(
     handle: &LoopHandle<'static, WaylandState>,
     rx: calloop::channel::Channel<RenderCommand>,
-    cmd_tx: &Sender<RenderCommand>,
 ) {
-    // The closure owns its own `Sender` clone — keeps the loop alive
-    // even after the caller (init) drops its `cmd_tx`.
-    let tx_inside = cmd_tx.clone();
+    // LoopHandle is Clone + 'static; clones share the loop's internal
+    // `Rc` so they don't keep the loop alive longer than the loop's
+    // owner.  Capturing a clone in the closure lets arm_configure_timer
+    // arm a Timer source from inside the channel callback.
+    let handle_for_timer = handle.clone();
     if let Err(e) = handle.insert_source(rx, move |event, &mut (), state: &mut WaylandState| {
         match event {
             ChannelEvent::Msg(cmd) => {
                 // Capture the show's gen BEFORE the Show is moved into
-                // handle_command — the configure-timeout timer posts
-                // ConfigureTimeout{gen} back into this channel, and the
-                // handler uses gen-match to decide stale vs real timeout.
+                // handle_command — the configure-timeout timer will
+                // check this gen against the pending show's gen (a
+                // stale timer is a no-op).
                 if let RenderCommand::Show { r#gen, .. } = &cmd {
-                    arm_configure_timer(state, &tx_inside, *r#gen);
+                    let display_id = state.display_id.clone();
+                    arm_configure_timer(&handle_for_timer, &display_id, *r#gen);
                 }
                 state.handle_command(cmd);
             }
@@ -269,62 +297,51 @@ fn install_command_source(
     }
 }
 
-/// Arm a one-shot `Timer` that pushes a `ConfigureTimeout` command
-/// back into the wayland thread's own command channel after
-/// [`CONFIGURE_TIMEOUT`].  When the timer fires the callback posts the
-/// command and the channel's own callback (which is on the single
-/// state-mutating path) gen-matches the timeout against the pending
-/// show — a stale timer (the show already succeeded OR a newer show
-/// superseded this one) is a no-op.
+/// Arm a one-shot `Timer` source on the calloop loop.  When the timer
+/// fires, its callback (on the calloop thread) directly invokes
+/// `state.handle_configure_timeout(&display_id, r#gen)` — NO channel
+/// repost, NO detached sleep thread, NO `Sender` clone involved.
 ///
-/// We deliberately arm a fresh timer per Show; if the compositor
-/// replies before the deadline the command resolves Ok and the timer
-/// fires into a stale-state guard (`pending_show` is `None`) that we
-/// ignore.  The calloop `EventSource` does not support cancellation in
-/// 0.14, but the stale-fire is harmless — it costs at most one
-/// dispatch tick.
-///
-/// `r#gen` is the generation counter of the *current* Show.  The
-/// timer embeds it in the posted `ConfigureTimeout{gen}` so the
-/// handler can distinguish stale from real.
-fn arm_configure_timer(state: &WaylandState, cmd_tx: &Sender<RenderCommand>, r#gen: u64) {
-    // Capture only what we need; nothing on `state` is aliased by the
-    // timer callback.
-    let display_id = state.display_id.clone();
-    let tx = cmd_tx.clone();
-
-    // We can't easily recover the `LoopHandle` here (it was moved into
-    // the run_loop closure), so the channel callback passes us a
-    // closure-borrowed `LoopHandle`.  See `install_command_source` for
-    // the wiring.
-    //
-    // Concrete workaround: spawn a tiny OS thread that sleeps for
-    // `CONFIGURE_TIMEOUT` then posts the command.  Slightly heavier
-    // than a calloop timer but keeps `state` free of cross-thread
-    // references (and avoids needing the LoopHandle inside the
-    // channel-source closure).
-    std::thread::Builder::new()
-        .name(format!("dormant-render-timer-{display_id}"))
-        .spawn(move || {
-            std::thread::sleep(CONFIGURE_TIMEOUT);
-            // Send the timeout back through the channel.  If the
-            // channel has closed (all senders dropped), the send
-            // errors out silently — the wayland thread is already
-            // exiting and there's no one to receive.
-            let _ = tx.send(RenderCommand::ConfigureTimeout { display_id, r#gen });
-        })
-        .expect("spawn configure-timer thread");
+/// The timer is dropped via [`TimeoutAction::Drop`] immediately after
+/// firing, so it consumes itself.  We deliberately arm a fresh timer
+/// per Show; if the compositor replies before the deadline the
+/// timeout's gen-guard makes it a no-op against the now-completed or
+/// now-superseded pending show.
+fn arm_configure_timer(
+    handle: &LoopHandle<'static, WaylandState>,
+    display_id: &DisplayId,
+    r#gen: u64,
+) {
+    let display_id = display_id.clone();
+    let timer = Timer::from_duration(CONFIGURE_TIMEOUT);
+    if let Err(e) = handle.insert_source(
+        timer,
+        move |_event, _meta: &mut (), state: &mut WaylandState| {
+            state.handle_configure_timeout(&display_id, r#gen);
+            TimeoutAction::Drop
+        },
+    ) {
+        // The loop is shut down or the timer source is somehow
+        // already installed — extremely rare.  We log and let the
+        // pending show hang (it'll get caught by a future timer or
+        // a subsequent configure/closed).
+        tracing::warn!(event = "configure_timer_insert_failed", error = %e);
+    }
 }
 
 /// Run the calloop dispatch forever.  Exits when `loop_should_exit`
 /// is set (every `LayerShellRenderSink` handle dropped → channel
 /// `Closed` event → flag flipped), the loop signals an unrecoverable
 /// error, or any source returns [`PostAction::Remove`].
+///
+/// `loop_handle` is held in scope but never used — kept in the
+/// signature as a documentary anchor for the loop's lifetime; the
+/// Timer source arming inside `install_command_source`'s closure
+/// captures its own clone.
 fn run_loop(
     mut event_loop: EventLoop<'static, WaylandState>,
     mut state: WaylandState,
     _loop_handle: LoopHandle<'static, WaylandState>,
-    _cmd_tx: Sender<RenderCommand>,
 ) {
     tracing::info!(
         event = "wayland_thread_started",

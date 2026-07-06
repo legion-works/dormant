@@ -8,7 +8,7 @@
 //! Kept as a pure data layer (no I/O, no Wayland types) so the encoding
 //! can be exercised from unit tests without spinning up a real compositor.
 
-use dormant_core::types::{CmdFailure, DisplayId, StageKind};
+use dormant_core::types::{CmdFailure, StageKind};
 
 /// A command sent from the async engine task to the dedicated Wayland
 /// thread via a [`calloop::channel`].
@@ -40,23 +40,6 @@ pub(crate) enum RenderCommand {
         /// flushed.
         reply: tokio::sync::oneshot::Sender<()>,
     },
-    /// Configure-timeout fired for a Show still waiting on its
-    /// compositor `configure` reply.  Self-resolves the pending show's
-    /// oneshot with an error.
-    ///
-    /// `r#gen` carries the generation counter of the Show the timer was
-    /// *armed for*.  The handler gen-matches this against the
-    /// currently-pending show's gen — a stale timer (fired after a
-    /// newer show superseded it) is a no-op, never a fallback.  See
-    /// [`crate::linux::state::WaylandState::should_fail_timeout`].
-    ConfigureTimeout {
-        /// Display id of the pending show — used to disambiguate if
-        /// multiple sinks share the thread (not the current shape, but
-        /// future-proof).
-        display_id: DisplayId,
-        /// Generation counter of the Show this timer was armed for.
-        r#gen: u64,
-    },
 }
 
 #[cfg(test)]
@@ -85,9 +68,7 @@ mod tests {
                 assert_eq!(kind, StageKind::RenderBlack);
                 let _ = reply.send(Ok(()));
             }
-            RenderCommand::Teardown { .. } | RenderCommand::ConfigureTimeout { .. } => {
-                panic!("expected Show variant")
-            }
+            RenderCommand::Teardown { .. } => panic!("expected Show variant"),
         }
         let r = tokio::runtime::Runtime::new()
             .unwrap()
@@ -108,9 +89,7 @@ mod tests {
                 assert_eq!(r#gen, 9);
                 let _ = reply.send(());
             }
-            RenderCommand::Show { .. } | RenderCommand::ConfigureTimeout { .. } => {
-                panic!("expected Teardown variant")
-            }
+            RenderCommand::Show { .. } => panic!("expected Teardown variant"),
         }
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -142,20 +121,5 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.controller, "render-black");
         assert!(err.error.starts_with("E_RENDER_UNAVAILABLE"));
-    }
-
-    #[test]
-    fn configure_timeout_carries_display_id_and_gen() {
-        let cmd = RenderCommand::ConfigureTimeout {
-            display_id: DisplayId("d-1".into()),
-            r#gen: 42,
-        };
-        match cmd {
-            RenderCommand::ConfigureTimeout { display_id, r#gen } => {
-                assert_eq!(display_id.to_string(), "d-1");
-                assert_eq!(r#gen, 42);
-            }
-            _ => panic!("expected ConfigureTimeout variant"),
-        }
     }
 }

@@ -30,8 +30,8 @@ use dormant_core::rules::{
 use dormant_core::state_machine::SmTimings;
 use dormant_core::traits::{CommandSink, SensorSource};
 use dormant_core::types::{
-    BlankMode, CmdFailure, DisplayId, PresenceEvent, RuleId, SensorId, SensorState, Timestamp,
-    ZoneId,
+    BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
+    StageKind, Timestamp, ZoneId,
 };
 use dormant_core::zone::{FusionMode, UnavailablePolicy, ZoneEngine, ZoneMember, ZoneSpec};
 
@@ -70,6 +70,10 @@ fn display_cfg(id: &str) -> DisplayRuntimeCfg {
     DisplayRuntimeCfg {
         display: DisplayId(id.into()),
         blank_mode: BlankMode::PowerOff,
+        ladder: vec![LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: None,
+        }],
         timings: timings_grace_60s(),
     }
 }
@@ -119,7 +123,8 @@ fn spawn_engine(
     let (ctl_tx, ctl_rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
 
-    let engine = RulesEngine::new(cfg, zones, executors).expect("valid engine config");
+    let engine =
+        RulesEngine::new(cfg, zones, executors, HashMap::new()).expect("valid engine config");
     let engine_cancel = cancel.clone();
     let engine_handle = tokio::spawn(async move {
         engine.run(events_rx, ctl_rx, engine_cancel).await;

@@ -42,10 +42,10 @@ use tokio_util::sync::CancellationToken;
 use crate::config::SensorKind;
 use crate::error::DormantError;
 use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
-use crate::traits::CommandSink;
+use crate::traits::{CommandSink, RenderSink};
 use crate::types::{
-    BlankMode, CmdFailure, DisplayId, PresenceEvent, RuleId, SensorId, SensorState, Tick,
-    Timestamp, ZoneId,
+    BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
+    Tick, Timestamp, ZoneId,
 };
 use crate::zone::ZoneEngine;
 
@@ -90,6 +90,9 @@ pub enum ControlMsg {
     /// in [`StateSnapshot`]s). Lets the daemon flag a rejected reload without
     /// tearing down the running engine.
     SetPendingReload(Option<String>),
+    /// Input-wake event from the render surface — route to the display
+    /// machine's [`Input::InputWake`].
+    InputWake(DisplayId),
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
@@ -218,8 +221,10 @@ pub struct StateSnapshot {
 pub struct DisplayRuntimeCfg {
     /// The display this config applies to.
     pub display: DisplayId,
-    /// The blank mode to issue on a successful blank.
+    /// The primary blank mode — the first controller stage's mode.
     pub blank_mode: BlankMode,
+    /// The display's escalation ladder.
+    pub ladder: Vec<LadderStage>,
     /// Timing parameters for the display's state machine.
     pub timings: SmTimings,
 }
@@ -270,6 +275,9 @@ pub struct RulesEngineConfig {
 enum TimerEntry {
     /// Drive [`DisplayStateMachine::step`] with [`Input::Tick`] at deadline.
     DisplayTick(DisplayId),
+    /// Drive [`DisplayStateMachine::step`] with [`Input::StageTick`] at
+    /// deadline, carrying the generation counter for stale-detection.
+    DisplayStageTick(DisplayId, u64),
     /// Hold-time expiry: synthesize the held Absent event for this sensor.
     HoldExpiry(SensorId),
 }
@@ -291,6 +299,15 @@ enum InternalResult {
         /// Display the command was issued for.
         display: DisplayId,
         /// Generation counter matching the `IssueWake` effect.
+        r#gen: u64,
+        /// Outcome.
+        result: Result<(), CmdFailure>,
+    },
+    /// Result of a render command issued earlier.
+    Render {
+        /// Display the command was issued for.
+        display: DisplayId,
+        /// Generation counter matching the `ShowRender` effect.
         r#gen: u64,
         /// Outcome.
         result: Result<(), CmdFailure>,
@@ -325,6 +342,9 @@ pub struct RulesEngine {
     machines: HashMap<DisplayId, DisplayStateMachine>,
     /// Per-display command executors (the I/O side).
     executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+    /// Per-display render sinks (the surface I/O side).  Empty when no render
+    /// backend is injected; render stages then fall through.
+    render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
     /// Rule → its displays.
     rule_displays: HashMap<RuleId, Vec<DisplayId>>,
     /// Zone → rules bound to it.
@@ -367,6 +387,7 @@ impl RulesEngine {
         cfg: RulesEngineConfig,
         zone_engine: ZoneEngine,
         executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+        render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
     ) -> Result<Self, DormantError> {
         let now = Tick::now();
 
@@ -375,7 +396,7 @@ impl RulesEngine {
         for dcfg in &cfg.displays {
             machines.insert(
                 dcfg.display.clone(),
-                DisplayStateMachine::new(dcfg.timings.clone(), dcfg.blank_mode, now),
+                DisplayStateMachine::new(dcfg.timings.clone(), dcfg.ladder.clone(), now),
             );
         }
 
@@ -425,6 +446,7 @@ impl RulesEngine {
             zone_engine,
             machines,
             executors,
+            render_sinks,
             rule_displays,
             zone_rules,
             paused_rules: HashSet::new(),
@@ -650,6 +672,7 @@ impl RulesEngine {
             ControlMsg::Resume { rule } => self.handle_resume(rule.as_ref()),
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
+            ControlMsg::InputWake(d) => self.step_one(&d, Input::InputWake),
             ControlMsg::Snapshot(tx) => self.send_snapshot(tx),
             ControlMsg::SubscribeEvents(tx) => {
                 let _ = tx.send(self.event_tx.subscribe());
@@ -834,6 +857,18 @@ impl RulesEngine {
                     });
                 }
             }
+            InternalResult::Render {
+                display,
+                r#gen,
+                result,
+            } => {
+                if let Some(machine) = self.machines.get_mut(&display) {
+                    let effects = machine.step(Input::RenderResult { r#gen, result }, now);
+                    for effect in effects {
+                        self.process_effect(&display, effect);
+                    }
+                }
+            }
         }
     }
 
@@ -864,6 +899,15 @@ impl RulesEngine {
                     TimerEntry::DisplayTick(display) => {
                         if let Some(machine) = self.machines.get_mut(&display) {
                             let effects = machine.step(Input::Tick, deadline);
+                            for effect in effects {
+                                self.process_effect(&display, effect);
+                            }
+                        }
+                    }
+                    TimerEntry::DisplayStageTick(display, stage_gen) => {
+                        if let Some(machine) = self.machines.get_mut(&display) {
+                            let effects =
+                                machine.step(Input::StageTick { r#gen: stage_gen }, deadline);
                             for effect in effects {
                                 self.process_effect(&display, effect);
                             }
@@ -979,6 +1023,51 @@ impl RulesEngine {
             Effect::ScheduleTickAt(tick) => {
                 self.timers
                     .push(Reverse((tick, TimerEntry::DisplayTick(display_id.clone()))));
+            }
+            Effect::ScheduleStageTickAt { r#gen, at } => {
+                self.timers.push(Reverse((
+                    at,
+                    TimerEntry::DisplayStageTick(display_id.clone(), r#gen),
+                )));
+            }
+            Effect::ShowRender { r#gen, idx, kind } => {
+                if let Some(sink) = self.render_sinks.get(display_id) {
+                    let sink = Arc::clone(sink);
+                    let display = display_id.clone();
+                    let tx = self.results_tx.clone();
+                    tokio::spawn(async move {
+                        let result = sink.show(r#gen, idx, kind).await;
+                        let _ = tx.send(InternalResult::Render {
+                            display,
+                            r#gen,
+                            result,
+                        });
+                    });
+                } else {
+                    // No render backend — render stage fails fall-through
+                    // so the machine never wedges in RenderPending.
+                    let display = display_id.clone();
+                    let tx = self.results_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(InternalResult::Render {
+                            display,
+                            r#gen,
+                            result: Err(CmdFailure {
+                                controller: "render-none".into(),
+                                error: "E_RENDER_UNAVAILABLE: no render backend".into(),
+                            }),
+                        });
+                    });
+                }
+            }
+            Effect::TeardownRender { r#gen } => {
+                if let Some(sink) = self.render_sinks.get(display_id) {
+                    let sink = Arc::clone(sink);
+                    tokio::spawn(async move {
+                        sink.teardown(r#gen).await;
+                    });
+                }
+                // No-op when no sink — teardown is idempotent.
             }
             Effect::LogTransition { from: _, to, cause } => {
                 tracing::info!(

@@ -940,3 +940,149 @@ async fn web_bind_change_ignored_on_reload() {
 
     shutdown(handle, join).await;
 }
+
+// ── 12: render sink wiring (feature-gated) ────────────────────────────────────
+
+#[cfg(feature = "render")]
+mod render_smoke {
+    use super::*;
+    use dormant_core::fakes::RecordingRenderSink;
+    use dormant_core::types::StageKind;
+    use std::sync::Arc;
+
+    fn render_ladder_config(marker: &Path, grace: &str) -> String {
+        format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_command = "printf B >> '{m}'"
+wake_command = "printf W >> '{m}'"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "200ms" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-1"
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            m = marker.display(),
+            g = grace,
+        )
+    }
+
+    /// A render sink factory that returns a shared [`RecordingRenderSink`]
+    /// so the test can inspect recorded commands after the engine runs.
+    fn recording_factory(
+        sink: RecordingRenderSink,
+    ) -> impl Fn(
+        dormant_core::types::DisplayId,
+        String,
+    ) -> Option<Arc<dyn dormant_core::traits::RenderSink>>
+    + Send
+    + Sync
+    + 'static {
+        move |_did, _output| Some(Arc::new(sink.clone()))
+    }
+
+    /// Assembles a config with a render ladder and verifies the
+    /// `RecordingRenderSink` is passed through to the engine.  This test
+    /// wires the full `assemble_static` → `spawn_generation` pipeline
+    /// with an injected render sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assembled_render_sink_reaches_engine() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("marker");
+        let cfg_str = render_ladder_config(&marker, "300ms");
+        let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+        let creds_path = dir.path().join("credentials.toml");
+
+        let fake_sink = RecordingRenderSink::new();
+        let builder = recording_factory(fake_sink.clone());
+
+        let script = vec![
+            (Duration::from_millis(0), ev("desk", SensorState::Present)),
+            (Duration::from_millis(200), ev("desk", SensorState::Absent)),
+        ];
+
+        let app = App::build_with_sources(
+            cfg_path,
+            creds_path,
+            Strictness::Strict,
+            fake_factory("desk", script),
+        )
+        .expect("build app")
+        .with_render_sink_builder(builder)
+        .disable_ipc();
+
+        let (handle, join) = app.start().await.expect("start app");
+
+        // The command controller blanks successfully with `printf B >> ...`,
+        // then the 200ms dwell expires and the machine escalates to
+        // RenderBlack — the fake sink should receive show(RenderBlack).
+        let ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(
+                        cmd,
+                        dormant_core::fakes::RenderCmd::Show {
+                            kind: StageKind::RenderBlack,
+                            ..
+                        }
+                    )
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        // Wake the display — the engine should tear down the render surface.
+        let events = handle.events_sender();
+        let _ = events.send(ev("desk", SensorState::Present)).await;
+
+        let woken = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(cmd, dormant_core::fakes::RenderCmd::Teardown { .. })
+                })
+                // Note: no wake marker expected — the panel is physically ON
+                // during a render overlay; teardown alone reveals it.
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let full_log = fake_sink.log();
+        shutdown(handle, join).await;
+
+        assert!(
+            ok,
+            "expected show(RenderBlack) in render sink, log: {full_log:?}"
+        );
+        assert!(
+            woken,
+            "expected teardown after presence restored, log: {full_log:?}"
+        );
+    }
+}

@@ -2113,6 +2113,47 @@ mod tests {
         drive_blank(&mut s, t(0), true);
         s.step(Input::ZonePresent(true), t(100));
         assert_eq!(s.phase_name(), "waking");
+
+        // Drive to RenderPending.
+        let mut s = sm_with_ladder(
+            500,
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            }],
+        );
+        s.step(Input::ZonePresent(false), t(0));
+        s.step(Input::Tick, t(550));
+        assert_eq!(s.phase_name(), "render_pending");
+
+        // Drive to Staged via RenderResult(Ok).
+        let mut s = sm_with_ladder(
+            500,
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            }],
+        );
+        s.step(Input::ZonePresent(false), t(0));
+        let effects = s.step(Input::Tick, t(550));
+        let r#gen = effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::ShowRender { r#gen, .. } = e {
+                    Some(*r#gen)
+                } else {
+                    None
+                }
+            })
+            .expect("expected ShowRender");
+        s.step(
+            Input::RenderResult {
+                r#gen,
+                result: Ok(()),
+            },
+            t(600),
+        );
+        assert_eq!(s.phase_name(), "staged");
     }
 
     #[test]
@@ -2972,6 +3013,9 @@ mod ladder_tests {
             sm.phase(),
             Phase::RenderPending { .. } | Phase::Staged { .. }
         ));
+        // zone_present=Some(false) after drive_to_staged, so enter_active
+        // chains into Grace.  Pin the exact outcome.
+        assert_eq!(sm.phase_name(), "grace");
     }
 
     #[test]
@@ -2995,6 +3039,7 @@ mod ladder_tests {
             sm.phase(),
             Phase::RenderPending { .. } | Phase::Staged { .. }
         ));
+        assert_eq!(sm.phase_name(), "grace");
     }
 
     #[test]
@@ -3012,11 +3057,8 @@ mod ladder_tests {
 
         let effects = sm.step(Input::StageTick { r#gen }, t(1600));
         assert!(
-            effects.is_empty()
-                || !effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::ShowRender { .. } | Effect::IssueBlank { .. })),
-            "stale stage-tick must be dropped"
+            effects.is_empty(),
+            "stale stage-tick must produce empty effects, got {effects:?}"
         );
     }
 
@@ -3034,21 +3076,24 @@ mod ladder_tests {
                 }
             })
             .expect("expected ShowRender");
+        assert_eq!(sm.phase_name(), "render_pending");
 
-        sm.step(Input::ZonePresent(true), t(800));
-        assert_eq!(sm.phase_name(), "active");
-
+        // Feed a gen-MISMATCHED RenderResult while still in RenderPending.
+        // This tests the RenderPending arm's gen-mismatch branch, NOT the
+        // Active-stage stale-drop arm.
         let effects = sm.step(
             Input::RenderResult {
-                r#gen,
+                r#gen: r#gen + 1, // mismatched — doesn't match pending_gen
                 result: Ok(()),
             },
-            t(900),
+            t(700),
         );
         assert!(
             effects.is_empty(),
             "stale RenderResult must be dropped, got {effects:?}"
         );
+        // Machine must still be in RenderPending — not advanced.
+        assert_eq!(sm.phase_name(), "render_pending");
     }
 
     #[test]
@@ -3213,20 +3258,31 @@ mod ladder_tests {
     #[test]
     fn inhibitor_freezes_stage_advance_wake_unaffected() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
-        let r#gen = drive_to_staged(&mut sm);
+        // drive_to_staged bumps stage_gen to 2 (enter_ladder_stage→1,
+        // RenderResult(Ok)→schedule_stage_tick→2).  Capture the post-bump
+        // gen so the StageTick gen-matches and the freeze is the only
+        // reason it gets dropped.
+        let _ = drive_to_staged(&mut sm);
+        let gen_now = sm.stage_gen; // 2
 
-        sm.step(Input::InhibitorChanged(true), t(700));
-        let fx = sm.step(Input::StageTick { r#gen }, t(800));
+        // Use Pause to freeze the dwell timer — it sets
+        // stage_dwell_frozen_remaining but does NOT set overlays.inhibited,
+        // so stage_advance_frozen() becomes the SOLE gate dropping StageTick.
+        sm.step(Input::Pause { until: None }, t(700));
+        assert!(sm.stage_advance_frozen(), "Pause must set the freeze flag");
+
+        let fx = sm.step(Input::StageTick { r#gen: gen_now }, t(800));
         assert!(
-            !fx.iter().any(|e| matches!(e, Effect::IssueBlank { .. })),
-            "stage tick must be dropped when inhibited"
+            fx.iter().all(|e| !matches!(e, Effect::IssueBlank { .. })),
+            "frozen stage must not advance, got {fx:?}"
         );
 
+        // Wake still works during pause (pause doesn't gate wake).
         let fx = sm.step(Input::ZonePresent(true), t(900));
         assert!(
             fx.iter()
                 .any(|e| matches!(e, Effect::TeardownRender { .. })),
-            "wake must work during inhibitor"
+            "wake must work during pause"
         );
         assert_eq!(sm.phase_name(), "active");
     }
@@ -3291,6 +3347,7 @@ mod ladder_tests {
             "wake from Staged must emit TeardownRender"
         );
 
+        // Wake from Blanked (terminal) — emits IssueWake.
         let mut sm = sm_with(vec![off_stage()]);
         let _ = drive_to_entry(&mut sm);
         feed_blank_ok(&mut sm);
@@ -3298,7 +3355,31 @@ mod ladder_tests {
         let fx = sm.step(Input::ZonePresent(true), t(900));
         assert!(
             fx.iter().any(|e| matches!(e, Effect::IssueWake { .. })),
-            "wake from Blanked must emit IssueWake"
+            "wake from Blanked (terminal) must emit IssueWake"
+        );
+
+        // Wake from Blanked (NON-terminal) — a controller stage WITH dwell.
+        // The stage-tick was scheduled, but ZonePresent must still wake via
+        // IssueWake (controller path), NOT TeardownRender (render path).
+        let mut sm = sm_with(vec![
+            controller_stage(BlankMode::PowerOff, Some(Duration::from_secs(300))),
+            off_stage(),
+        ]);
+        let _ = drive_to_entry(&mut sm);
+        feed_blank_ok(&mut sm);
+        // Stage-tick should have been scheduled (non-terminal).
+        assert!(sm.stage_gen > 0, "stage_gen must be bumped");
+        assert_eq!(sm.phase_name(), "blanked");
+        // Wake.
+        let fx = sm.step(Input::ZonePresent(true), t(950));
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::IssueWake { .. })),
+            "wake from Blanked (non-terminal) must emit IssueWake, got {fx:?}"
+        );
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "wake from Blanked must NOT emit TeardownRender (controller path)"
         );
     }
 

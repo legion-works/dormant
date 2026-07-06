@@ -3,7 +3,7 @@ import { render, waitFor, cleanup } from "@testing-library/react";
 import Shell from "../app/Shell";
 
 
-const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
+const { SAMPLE_STATE, ZERO_DISPLAY_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
   SAMPLE_STATE: {
     sensors: [
       { id: "s1", state: "present" as const, last_seen_secs_ago: 3 },
@@ -17,6 +17,12 @@ const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
         { phase: "active" as const, inhibited: false, paused: false, cmd_gen: 1, controllers: [] },
       ],
     ],
+    pending_reload: null,
+  },
+  ZERO_DISPLAY_STATE: {
+    sensors: [{ id: "s1", state: "present" as const, last_seen_secs_ago: 3 }],
+    zones: [{ id: "z1", present: true }],
+    displays: [],
     pending_reload: null,
   },
   SAMPLE_CONFIG: {
@@ -110,5 +116,18 @@ describe("Shell", () => {
     expect(badge).toBeInTheDocument();
     expect(badge?.textContent).toBe("live");
     expect(badge?.className).toContain("nav-badge--live");
+  });
+
+  it("shows '0' for the Displays badge when the loaded snapshot has zero displays", async () => {
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(ZERO_DISPLAY_STATE);
+
+    render(<Shell />);
+
+    await waitFor(() => {
+      const badge = document.querySelector(".nav-badge");
+      expect(badge).toBeInTheDocument();
+      expect(badge?.textContent).toBe("0");
+    });
   });
 });

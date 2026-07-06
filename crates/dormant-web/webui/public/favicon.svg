@@ -1,3 +1,10 @@
+<!-- Fills are DS brand palette values inlined literally:
+     #16161E (--neutral-0 / --bg-base),
+     #C3E88D (--green-400 / --success),
+     #86E1FC (--cyan-400 / --accent).
+     A favicon renders without a stylesheet context, so DS custom
+     properties can't resolve here — this is the one sanctioned place
+     for literal brand hex. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="dormant favicon">
   <defs>
     <mask id="dmC">

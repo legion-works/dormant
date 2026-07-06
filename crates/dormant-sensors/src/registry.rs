@@ -66,7 +66,10 @@ pub fn build(
 
     // MQTT sources.
     for (broker_url, sensors) in by_broker {
-        sources.push(Box::new(MqttSource::new(broker_url, sensors)) as Box<dyn SensorSource>);
+        let credential = creds.mqtt.get(&broker_url).cloned();
+        sources.push(
+            Box::new(MqttSource::new(broker_url, sensors, credential)) as Box<dyn SensorSource>
+        );
     }
 
     // HA WebSocket sources — only require token when HA sensors exist.
@@ -327,5 +330,44 @@ mod tests {
         let ids: Vec<&str> = sources.iter().map(|s| s.source_id()).collect();
         assert!(ids.contains(&"ws://ha1.local:8123/api/websocket"));
         assert!(ids.contains(&"ws://ha2.local:8123/api/websocket"));
+    }
+
+    #[test]
+    fn build_wires_mqtt_credential_by_broker_url() {
+        use dormant_core::config::schema::MqttCredential;
+
+        let broker = "mqtt://10.1.0.5:1883";
+        let creds = Credentials {
+            ha_token: None,
+            samsung: IndexMap::new(),
+            mqtt: IndexMap::from([(
+                broker.into(),
+                MqttCredential {
+                    username: "icetea".into(),
+                    password: "secret".into(),
+                },
+            )]),
+        };
+
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert("desk".into(), mqtt_cfg(broker, "sensors/desk"));
+
+        let sources = build(&sensors, &creds).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id(), broker);
+        // Credential wiring is verified via MqttSource::credential() in the
+        // mqtt module's own tests; this test confirms the build path works.
+    }
+
+    #[test]
+    fn build_no_mqtt_creds_yields_anonymous_source() {
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert("desk".into(), mqtt_cfg("mqtt://other:1883", "sensors/desk"));
+
+        let creds = Credentials::default();
+        let sources = build(&sensors, &creds).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id(), "mqtt://other:1883");
+        // No error, and the source exists — anonymous MQTT is valid.
     }
 }

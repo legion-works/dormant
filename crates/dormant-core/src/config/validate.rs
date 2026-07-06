@@ -824,6 +824,7 @@ gracee_period = "60s"
         Credentials {
             ha_token: Some("test-ha-token".into()),
             samsung: IndexMap::from([("192.168.1.50".into(), "test-samsung-token".into())]),
+            mqtt: IndexMap::new(),
         }
     }
 
@@ -912,6 +913,7 @@ gracee_period = "60s"
         let creds = Credentials {
             ha_token: Some("test-ha-token".into()),
             samsung: IndexMap::new(), // empty
+            mqtt: IndexMap::new(),
         };
         let errors = validate(&cfg, &test_capabilities(), &creds);
         assert!(
@@ -1055,6 +1057,54 @@ stale_timeout = "5m"
     }
 
     #[cfg(unix)]
+    #[test]
+    fn credentials_parses_mqtt_section() {
+        // TOML inline table syntax for [mqtt."<url>"] sections.
+        let dir = std::env::temp_dir().join("dormant-test-creds-mqtt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.toml");
+        let toml_content = r#"
+[mqtt."mqtt://10.1.0.5:1883"]
+username = "icetea"
+password = "test-pass"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let creds = crate::config::load_credentials(&path).unwrap();
+        let mqtt_cred = creds
+            .mqtt
+            .get("mqtt://10.1.0.5:1883")
+            .expect("mqtt creds not found");
+        assert_eq!(mqtt_cred.username, "icetea");
+        assert_eq!(mqtt_cred.password, "test-pass");
+    }
+
+    #[test]
+    fn credentials_no_mqtt_section_parses_empty_map() {
+        // Back-compat: existing creds files without [mqtt] parse fine.
+        let dir = std::env::temp_dir().join("dormant-test-creds-no-mqtt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("creds.toml");
+        std::fs::write(&path, "ha_token = \"abc\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let creds = crate::config::load_credentials(&path).unwrap();
+        assert_eq!(creds.ha_token.as_deref(), Some("abc"));
+        assert!(
+            creds.mqtt.is_empty(),
+            "mqtt map should be empty when absent"
+        );
+    }
+
     #[test]
     fn credentials_mode_0400_rejected() {
         use std::os::unix::fs::PermissionsExt;

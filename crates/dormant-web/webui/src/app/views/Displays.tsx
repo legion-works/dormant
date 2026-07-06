@@ -6,7 +6,7 @@
  *
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 190-248.
  */
-import { useDashboardData } from "../hooks/useDashboardData";
+import { useLiveState } from "../state";
 import { Card, StatusChip, HealthChip } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
 import { useCallback, useState } from "react";
@@ -185,7 +185,7 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
 
 
 export default function Displays() {
-  const { loading, error, snapshot, config, displayConfigs, displayRules } = useDashboardData();
+  const { loading, error, snapshot, config, displayConfigs, displayRules } = useLiveState();
 
   if (loading) {
     return <div className="displays-loading">Loading daemon state…</div>;

@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import Dashboard from "../app/views/Dashboard";
+import { LiveStateProvider } from "../app/state";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
@@ -67,6 +68,7 @@ const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
   },
 }));
 
+// Mock the API client and WS hook so LiveStateProvider can initialise.
 vi.mock("../api/client", () => ({
   getState: vi.fn().mockResolvedValue(SAMPLE_STATE),
   getConfig: vi.fn().mockResolvedValue(SAMPLE_CONFIG),
@@ -74,11 +76,15 @@ vi.mock("../api/client", () => ({
   postWake: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("../api/ws", () => ({
+  useEvents: vi.fn(() => ({ connected: false, close: vi.fn() })),
+}));
+
 afterEach(() => cleanup());
 
 describe("Dashboard", () => {
   it("renders the four stat cards after loading", async () => {
-    render(<Dashboard />);
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
       const labels = screen.getAllByText("Displays");
@@ -92,7 +98,7 @@ describe("Dashboard", () => {
   });
 
   it("renders sensor rows with correct state labels", async () => {
-    render(<Dashboard />);
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("desk-mmwave")).toBeInTheDocument();
@@ -107,7 +113,7 @@ describe("Dashboard", () => {
   });
 
   it("renders zone rows with mode and members", async () => {
-    render(<Dashboard />);
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("office")).toBeInTheDocument();
@@ -117,7 +123,7 @@ describe("Dashboard", () => {
   });
 
   it("renders display rows with blank/wake buttons and config metadata", async () => {
-    render(<Dashboard />);
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
@@ -132,7 +138,7 @@ describe("Dashboard", () => {
   });
 
   it("shows section headers", async () => {
-    render(<Dashboard />);
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("Signal flow")).toBeInTheDocument();

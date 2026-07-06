@@ -4,6 +4,8 @@ import Displays from "./views/Displays";
 import Events from "./views/Events";
 import Config from "./views/Config";
 import Doctor from "./views/Doctor";
+import { LiveStateProvider, useLiveState } from "./state";
+import { postReload } from "../api/client";
 import "./Shell.css";
 
 const VIEWS = {
@@ -27,10 +29,22 @@ function formatClock(): string {
   return new Date().toLocaleTimeString("en-US", { hour12: false });
 }
 
+/**
+ * Shell wrapper — injects the live-state provider so the inner Shell
+ * can read `connected` and all views can access the patched state.
+ */
 export default function Shell() {
+  return (
+    <LiveStateProvider>
+      <ShellInner />
+    </LiveStateProvider>
+  );
+}
+
+function ShellInner() {
   const [activeView, setActiveView] = useState<ViewKey>(getViewFromHash);
   const [clock, setClock] = useState(formatClock);
-  const [connected, _setConnected] = useState(false);
+  const { connected } = useLiveState();
 
   useEffect(() => {
     const onHashChange = () => setActiveView(getViewFromHash());
@@ -48,9 +62,13 @@ export default function Shell() {
     window.location.hash = `#/${key}`;
   }, []);
 
-  const handleReload = useCallback(() => {
-    // Wired to postReload() when the useDaemon hook lands.
-    console.log("Reload config requested (not yet wired)");
+  const handleReload = useCallback(async () => {
+    try {
+      await postReload();
+    } catch {
+      // The WS event stream surfaces the reload outcome.
+      console.log("Config reload failed or daemon unreachable.");
+    }
   }, []);
 
   const ActiveComponent = VIEWS[activeView].Component;

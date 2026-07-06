@@ -5,24 +5,10 @@
  * capped at MAX_EVENTS).  Each event is rendered per its variant with a
  * type-colored badge and a human-readable message.
  */
-import { useState, useCallback, useRef, useEffect } from "react";
-import { useEvents } from "../../api/ws";
+import { useEventLog } from "../state";
 import type { DaemonEvent } from "../../api/types";
 import { Card } from "../components";
 import "./Events.css";
-
-/** Render cap — oldest events drop off when exceeded. */
-const MAX_EVENTS = 100;
-
-interface StampedEvent {
-  /** ISO time string captured at arrival. */
-  time: string;
-  event: DaemonEvent;
-}
-
-function formatTimestamp(): string {
-  return new Date().toLocaleTimeString("en-GB", { hour12: false });
-}
 
 interface EventBadge {
   color: string;
@@ -66,45 +52,9 @@ function messageForEvent(ev: DaemonEvent): string {
 }
 
 export default function Events() {
-  const [events, setEvents] = useState<StampedEvent[]>([]);
-  const [lagged, setLagged] = useState(false);
-  const lagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const onMessage = useCallback((data: unknown) => {
-    const ev = data as DaemonEvent;
-
-    // The daemon may send {"event":"stream_lagged",...} — surface the banner
-    // for a few seconds.
-    if (ev && typeof ev === "object" && "event" in ev && (ev as { event: string }).event === "stream_lagged") {
-      setLagged(true);
-      if (lagTimerRef.current != null) clearTimeout(lagTimerRef.current);
-      lagTimerRef.current = setTimeout(() => setLagged(false), 5_000);
-      return;
-    }
-
-    if (ev && typeof ev === "object" && "event" in ev) {
-      setEvents((prev) => {
-        const next = [{ time: formatTimestamp(), event: ev }, ...prev];
-        return next.length > MAX_EVENTS ? next.slice(0, MAX_EVENTS) : next;
-      });
-    }
-  }, []);
-
-  const onConnect = useCallback(() => {
-    setLagged(false);
-    if (lagTimerRef.current != null) {
-      clearTimeout(lagTimerRef.current);
-      lagTimerRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (lagTimerRef.current != null) clearTimeout(lagTimerRef.current);
-    };
-  }, []);
-
-  const { connected } = useEvents({ onMessage, onConnect });
+  // Previously managed local event + lag state; now reads from the
+  // shared provider which owns the WS connection and event log.
+  const { events, connected, lagged } = useEventLog();
 
   const showBanner = !connected || lagged;
   const bannerText = lagged

@@ -241,8 +241,12 @@ fn install_command_source(
     if let Err(e) = handle.insert_source(rx, move |event, &mut (), state: &mut WaylandState| {
         match event {
             ChannelEvent::Msg(cmd) => {
-                if matches!(cmd, RenderCommand::Show { .. }) {
-                    arm_configure_timer(state, &tx_inside);
+                // Capture the show's gen BEFORE the Show is moved into
+                // handle_command — the configure-timeout timer posts
+                // ConfigureTimeout{gen} back into this channel, and the
+                // handler uses gen-match to decide stale vs real timeout.
+                if let RenderCommand::Show { r#gen, .. } = &cmd {
+                    arm_configure_timer(state, &tx_inside, *r#gen);
                 }
                 state.handle_command(cmd);
             }
@@ -263,14 +267,15 @@ fn install_command_source(
     }) {
         tracing::error!(event = "command_source_insert_failed", error = %e);
     }
-    let _ = cmd_tx;
 }
 
-/// Arm a one-shot `Timer` that pushes a `ConfigureTimeout` command back
-/// into the wayland thread's own command channel after
+/// Arm a one-shot `Timer` that pushes a `ConfigureTimeout` command
+/// back into the wayland thread's own command channel after
 /// [`CONFIGURE_TIMEOUT`].  When the timer fires the callback posts the
 /// command and the channel's own callback (which is on the single
-/// state-mutating path) fails any in-flight pending show.
+/// state-mutating path) gen-matches the timeout against the pending
+/// show — a stale timer (the show already succeeded OR a newer show
+/// superseded this one) is a no-op.
 ///
 /// We deliberately arm a fresh timer per Show; if the compositor
 /// replies before the deadline the command resolves Ok and the timer
@@ -278,7 +283,11 @@ fn install_command_source(
 /// ignore.  The calloop `EventSource` does not support cancellation in
 /// 0.14, but the stale-fire is harmless — it costs at most one
 /// dispatch tick.
-fn arm_configure_timer(state: &WaylandState, cmd_tx: &Sender<RenderCommand>) {
+///
+/// `r#gen` is the generation counter of the *current* Show.  The
+/// timer embeds it in the posted `ConfigureTimeout{gen}` so the
+/// handler can distinguish stale from real.
+fn arm_configure_timer(state: &WaylandState, cmd_tx: &Sender<RenderCommand>, r#gen: u64) {
     // Capture only what we need; nothing on `state` is aliased by the
     // timer callback.
     let display_id = state.display_id.clone();
@@ -302,7 +311,7 @@ fn arm_configure_timer(state: &WaylandState, cmd_tx: &Sender<RenderCommand>) {
             // channel has closed (all senders dropped), the send
             // errors out silently — the wayland thread is already
             // exiting and there's no one to receive.
-            let _ = tx.send(RenderCommand::ConfigureTimeout { display_id });
+            let _ = tx.send(RenderCommand::ConfigureTimeout { display_id, r#gen });
         })
         .expect("spawn configure-timer thread");
 }

@@ -834,4 +834,28 @@ mod tests {
         assert!(ids.contains("a"));
         assert!(ids.contains("b"));
     }
+
+    // ── Credential wiring ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_stores_credential_when_present() {
+        let cred = MqttCredential {
+            username: "alice".into(),
+            password: "s3cret".into(),
+        };
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(SensorId("s".into()), make_cfg("/occupancy"))],
+            Some(cred.clone()),
+        );
+        let wired = source.credential().expect("credential should be present");
+        assert_eq!(wired.username, "alice");
+        assert_eq!(wired.password, "s3cret");
+    }
+
+    #[test]
+    fn new_stores_none_when_no_credential() {
+        let source = MqttSource::new("tcp://localhost:1883".into(), vec![], None);
+        assert!(source.credential().is_none());
+    }
 }

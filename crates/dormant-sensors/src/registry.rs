@@ -355,8 +355,9 @@ mod tests {
         let sources = build(&sensors, &creds).unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source_id(), broker);
-        // Credential wiring is verified via MqttSource::credential() in the
-        // mqtt module's own tests; this test confirms the build path works.
+        // Credential threading through build() is validated by the
+        // `new_stores_credential_when_present` / `new_stores_none_when_no_credential`
+        // tests in mqtt.rs which use the credential() accessor directly.
     }
 
     #[test]

@@ -613,6 +613,11 @@ pub struct Credentials {
     pub samsung: IndexMap<String, String>,
 
     /// MQTT broker credentials indexed by broker URL.
+    ///
+    /// The key MUST be the **exact** `broker_url` string from the sensor's
+    /// [`MqttSensorCfg`].  A `mqtt://host` vs `tcp://host` mismatch, or any
+    /// trailing difference, silently misses the lookup — the sensor connects
+    /// anonymously and auth will fail.
     #[serde(default)]
     pub mqtt: IndexMap<String, MqttCredential>,
 }

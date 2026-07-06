@@ -77,9 +77,17 @@ fn render_table(snapshot: &StateSnapshot) {
         let mut table = Table::new();
         table.set_header(vec!["ID", "Phase", "Inhibited", "Paused"]);
         for (id, d) in &snapshot.displays {
+            let phase = match &d.stage {
+                Some(si) => format!(
+                    "staged [{}: {}]",
+                    si.idx,
+                    serde_json::to_string(&si.kind).unwrap()
+                ),
+                None => d.phase.clone(),
+            };
             table.add_row(vec![
                 id.as_str(),
-                d.phase.as_str(),
+                phase.as_str(),
                 if d.inhibited { "yes" } else { "no" },
                 if d.paused { "yes" } else { "no" },
             ]);
@@ -126,6 +134,7 @@ mod tests {
                         paused: false,
                         cmd_gen: 1,
                         controllers: vec![],
+                        stage: None,
                     },
                 ),
                 (
@@ -136,6 +145,7 @@ mod tests {
                         paused: true,
                         cmd_gen: 3,
                         controllers: vec![],
+                        stage: None,
                     },
                 ),
             ],
@@ -181,5 +191,36 @@ mod tests {
         snap.pending_reload = Some("config error: bad key".into());
         // Just verify the field is set
         assert!(snap.pending_reload.is_some());
+    }
+
+    #[test]
+    fn staged_display_snapshot_has_stage_info() {
+        use dormant_core::rules::StageInfo;
+        use dormant_core::types::StageKind;
+
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "staged".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 1,
+                    controllers: vec![],
+                    stage: Some(StageInfo {
+                        idx: 2,
+                        kind: StageKind::RenderBlack,
+                    }),
+                },
+            )],
+            pending_reload: None,
+        };
+
+        let d = &snap.displays[0].1;
+        let si = d.stage.as_ref().unwrap();
+        assert_eq!(si.idx, 2);
+        assert_eq!(si.kind, StageKind::RenderBlack);
     }
 }

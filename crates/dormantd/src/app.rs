@@ -50,6 +50,7 @@ use dormant_core::config::schema::{Config, Credentials, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_credentials, validate,
 };
+use dormant_core::ownership::AlwaysOwned;
 use dormant_core::rules::{
     ControlMsg, DisplayRuntimeCfg, RuleRuntimeCfg, RulesEngine, RulesEngineConfig,
     SensorRuntimeCfg, StateSnapshot,
@@ -1066,8 +1067,14 @@ fn spawn_generation(
         .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
         .collect();
 
-    let mut engine = RulesEngine::new(assembly.engine_cfg.clone(), zone, executors, HashMap::new())
-        .context("build engine")?;
+    let mut engine = RulesEngine::new(
+        assembly.engine_cfg.clone(),
+        zone,
+        executors,
+        HashMap::new(),
+        Arc::new(AlwaysOwned),
+    )
+    .context("build engine")?;
 
     if let Some(detail) = pending {
         engine.set_pending_reload(Some(detail));

@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::SensorKind;
 use crate::error::DormantError;
+use crate::ownership::OwnershipGate;
 use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
 use crate::traits::{CommandSink, RenderSink};
 use crate::types::{
@@ -345,6 +346,13 @@ pub struct RulesEngine {
     /// Per-display render sinks (the surface I/O side).  Empty when no render
     /// backend is injected; render stages then fall through.
     render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+    /// Ownership gate — consulted every time the engine interacts with a
+    /// display.  Feeds [`Input::OwnershipChanged`] to the state machine when
+    /// the gate's verdict differs from the last-fed value.
+    ownership: Arc<dyn OwnershipGate>,
+    /// Last ownership value fed per display — change-detection to avoid
+    /// redundant [`Input::OwnershipChanged`] edges every tick.
+    last_owned: HashMap<DisplayId, bool>,
     /// Rule → its displays.
     rule_displays: HashMap<RuleId, Vec<DisplayId>>,
     /// Zone → rules bound to it.
@@ -376,8 +384,8 @@ pub struct RulesEngine {
 }
 
 impl RulesEngine {
-    /// Construct an engine from its runtime config, zone engine, and command
-    /// executors.
+    /// Construct an engine from its runtime config, zone engine, command
+    /// executors, render sinks, and ownership gate.
     ///
     /// # Errors
     ///
@@ -388,6 +396,7 @@ impl RulesEngine {
         zone_engine: ZoneEngine,
         executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
         render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+        ownership: Arc<dyn OwnershipGate>,
     ) -> Result<Self, DormantError> {
         let now = Tick::now();
 
@@ -398,6 +407,17 @@ impl RulesEngine {
                 dcfg.display.clone(),
                 DisplayStateMachine::new(dcfg.timings.clone(), dcfg.ladder.clone(), now),
             );
+        }
+
+        // Seed ownership state into each machine so it starts with the
+        // correct gate verdict.  Machines default to `owned: true`; this
+        // initial feed brings them in sync with the gate before the first
+        // event.
+        let mut last_owned: HashMap<DisplayId, bool> = HashMap::new();
+        for (display_id, machine) in &mut machines {
+            let owns = ownership.owns(display_id);
+            let _ = machine.step(Input::OwnershipChanged(owns), now);
+            last_owned.insert(display_id.clone(), owns);
         }
 
         // Validate cross-references and build index structures.
@@ -447,6 +467,8 @@ impl RulesEngine {
             machines,
             executors,
             render_sinks,
+            ownership,
+            last_owned,
             rule_displays,
             zone_rules,
             paused_rules: HashSet::new(),
@@ -653,6 +675,12 @@ impl RulesEngine {
                 None => continue,
             };
             for display_id in displays {
+                // Feed ownership so the gate verdict is current before
+                // processing the presence edge.
+                let own_effects = self.feed_ownership(&display_id, now);
+                for effect in own_effects {
+                    self.process_effect(&display_id, effect);
+                }
                 let Some(machine) = self.machines.get_mut(&display_id) else {
                     continue;
                 };
@@ -747,15 +775,41 @@ impl RulesEngine {
     }
 
     /// Step a single display machine and process its effects.
+    ///
+    /// Feeds [`Input::OwnershipChanged`] before the requested input so the
+    /// machine's `owned` flag always reflects the gate's current verdict.
     fn step_one(&mut self, display: &DisplayId, input: Input) {
+        let now = Tick::now();
+        let own_effects = self.feed_ownership(display, now);
+        for effect in own_effects {
+            self.process_effect(display, effect);
+        }
         let Some(machine) = self.machines.get_mut(display) else {
             return;
         };
-        let now = Tick::now();
         let effects = machine.step(input, now);
         for effect in effects {
             self.process_effect(display, effect);
         }
+    }
+
+    /// Consult the [`OwnershipGate`] for `display` and, if the verdict
+    /// differs from the last-fed value, feed
+    /// [`Input::OwnershipChanged`] to the state machine.
+    ///
+    /// Returns any effects the machine produced (e.g. teardown-render on
+    /// ownership-yield).  When the gate returns the same value as last
+    /// time this is a no-op (returns `vec![]`).
+    fn feed_ownership(&mut self, display: &DisplayId, now: Tick) -> Vec<Effect> {
+        let owns = self.ownership.owns(display);
+        if self.last_owned.get(display) == Some(&owns) {
+            return vec![];
+        }
+        self.last_owned.insert(display.clone(), owns);
+        let Some(machine) = self.machines.get_mut(display) else {
+            return vec![];
+        };
+        machine.step(Input::OwnershipChanged(owns), now)
     }
 
     fn send_snapshot(&self, tx: oneshot::Sender<StateSnapshot>) {
@@ -897,6 +951,10 @@ impl RulesEngine {
                 let Reverse((deadline, timer_entry)) = self.timers.pop().expect("peeked");
                 match timer_entry {
                     TimerEntry::DisplayTick(display) => {
+                        let own_effects = self.feed_ownership(&display, deadline);
+                        for effect in own_effects {
+                            self.process_effect(&display, effect);
+                        }
                         if let Some(machine) = self.machines.get_mut(&display) {
                             let effects = machine.step(Input::Tick, deadline);
                             for effect in effects {
@@ -905,6 +963,10 @@ impl RulesEngine {
                         }
                     }
                     TimerEntry::DisplayStageTick(display, stage_gen) => {
+                        let own_effects = self.feed_ownership(&display, deadline);
+                        for effect in own_effects {
+                            self.process_effect(&display, effect);
+                        }
                         if let Some(machine) = self.machines.get_mut(&display) {
                             let effects =
                                 machine.step(Input::StageTick { r#gen: stage_gen }, deadline);

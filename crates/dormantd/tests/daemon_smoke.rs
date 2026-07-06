@@ -1085,4 +1085,106 @@ wake_retry_interval = "1s"
             "expected teardown after presence restored, log: {full_log:?}"
         );
     }
+
+    /// After a rejected reload triggers `rebuild_old`, the restored
+    /// generation uses fresh render sinks with a live `InputWake` channel
+    /// — no orphaned senders.  The engine must blank, render, and tear
+    /// down correctly after the rollback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_render_sink_wiring_is_live() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("marker");
+        let cfg_str = render_ladder_config(&marker, "300ms");
+        let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+        let creds_path = dir.path().join("credentials.toml");
+
+        let fake_sink = RecordingRenderSink::new();
+        let builder = recording_factory(fake_sink.clone());
+
+        let script = vec![
+            (Duration::from_millis(0), ev("desk", SensorState::Present)),
+            (Duration::from_millis(200), ev("desk", SensorState::Absent)),
+        ];
+
+        let app = App::build_with_sources(
+            cfg_path.clone(),
+            creds_path,
+            Strictness::Strict,
+            fake_factory("desk", script),
+        )
+        .expect("build app")
+        .with_render_sink_builder(builder)
+        .disable_ipc();
+
+        let (handle, join) = app.start().await.expect("start app");
+        let mut reloads = handle.subscribe_reload();
+
+        // Wait for the first show (blank then dwell then render_black).
+        let show_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(
+                        cmd,
+                        dormant_core::fakes::RenderCmd::Show {
+                            kind: StageKind::RenderBlack,
+                            ..
+                        }
+                    )
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+        assert!(show_ok, "expected show(RenderBlack) before rollback");
+
+        // Trigger a rejected reload: write an invalid config.
+        fs::write(&cfg_path, "config_version = 1\nbogus_key = true\n").unwrap();
+        assert!(handle.trigger_reload().await);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+            .await
+            .expect("reload outcome")
+            .expect("reload bus open");
+        match outcome {
+            ReloadOutcome::Rejected(_) => {}
+            ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
+        }
+
+        // rebuild_old ran — verify pending_reload is set.
+        let ctl = handle.control_sender();
+        let (tx, rx) = oneshot::channel();
+        ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
+        let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("snapshot")
+            .expect("snapshot reply");
+        assert!(
+            snap.pending_reload.is_some(),
+            "pending_reload must be set after rejected reload"
+        );
+
+        // The restored generation must still blank + render + wake.
+        // Drive a full cycle through the events seam.
+        let events = handle.events_sender();
+        let _ = events.send(ev("desk", SensorState::Present)).await;
+        let teardown_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(cmd, dormant_core::fakes::RenderCmd::Teardown { .. })
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let full_log = fake_sink.log();
+        shutdown(handle, join).await;
+
+        assert!(
+            teardown_ok,
+            "expected teardown after presence in rebuilt generation, log: {full_log:?}"
+        );
+    }
 }

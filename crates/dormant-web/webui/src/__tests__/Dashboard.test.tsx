@@ -9,7 +9,6 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import Dashboard from "../app/views/Dashboard";
 
-/* ── Hoisted fixture + mock ── */
 
 const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
   SAMPLE_STATE: {

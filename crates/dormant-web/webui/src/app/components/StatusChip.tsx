@@ -15,6 +15,7 @@
  *   fail | wake_retry                        → --danger (red)
  */
 import { statusLabel } from "./status";
+import "./StatusChip.css";
 
 export type StatusKind =
   | "present"

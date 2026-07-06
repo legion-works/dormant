@@ -45,6 +45,17 @@ Connects to an MQTT broker and subscribes to a topic.
 | `payload_on` | string | none | Override for the "on" payload value (default: JSON `true`) |
 | `payload_off` | string | none | Override for the "off" payload value (default: JSON `false`) |
 
+If your broker requires authentication, add a `[mqtt]` section to your credentials file:
+
+```toml
+# credentials.toml
+[mqtt."tcp://mqtt.local:1883"]
+username = "your-username"
+password = "your-password"
+```
+
+The key MUST match the sensor's `broker_url` **exactly** — a `mqtt://` vs `tcp://` mismatch or trailing difference causes a silent miss (anonymous connect → auth failure).
+
 Example:
 
 ```toml

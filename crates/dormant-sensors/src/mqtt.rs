@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dormant_core::config::schema::MqttSensorCfg;
+use dormant_core::config::schema::{MqttCredential, MqttSensorCfg};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
@@ -85,15 +85,22 @@ pub struct MqttSource {
     topic_map: TopicMap,
     /// Flat list of all topics to subscribe to.
     topics: Vec<String>,
+    /// Optional per-broker MQTT credentials (username + password).
+    credential: Option<MqttCredential>,
 }
 
 impl MqttSource {
-    /// Create a new `MqttSource` for the given broker and sensor list.
+    /// Create a new `MqttSource` for the given broker, sensor list, and
+    /// optional credentials.
     ///
     /// All sensors in `sensors` must share the same `broker_url` — callers
     /// (the registry) are responsible for grouping.
     #[must_use]
-    pub fn new(broker_url: String, sensors: Vec<(SensorId, MqttSensorCfg)>) -> Self {
+    pub fn new(
+        broker_url: String,
+        sensors: Vec<(SensorId, MqttSensorCfg)>,
+        credential: Option<MqttCredential>,
+    ) -> Self {
         let mut topic_map: TopicMap = HashMap::new();
         let mut topics: Vec<String> = Vec::with_capacity(sensors.len() * 2);
 
@@ -124,7 +131,15 @@ impl MqttSource {
             broker_url,
             topic_map,
             topics,
+            credential,
         }
+    }
+
+    /// Test-only access to the optional credential.
+    #[cfg(test)]
+    #[must_use]
+    pub fn credential(&self) -> Option<&MqttCredential> {
+        self.credential.as_ref()
     }
 
     /// Build a unique MQTT client ID: `dormant-<hostname>-<counter>`.
@@ -159,10 +174,14 @@ impl MqttSource {
         broker_url: &str,
         client_id: &str,
         topics: &[String],
+        credential: Option<&MqttCredential>,
     ) -> (AsyncClient, EventLoop) {
         let (host, port) = parse_broker_url(broker_url);
         let mut mqttopts = MqttOptions::new(client_id, host, port);
         mqttopts.set_clean_session(true);
+        if let Some(cred) = credential {
+            mqttopts.set_credentials(cred.username.clone(), cred.password.clone());
+        }
         let cap = topics.len() + CAP_HEADROOM;
         let (client, eventloop) = AsyncClient::new(mqttopts, cap);
         for topic in topics {
@@ -245,8 +264,13 @@ impl SensorSource for MqttSource {
 
         // We hold the current client+eventloop pair in these variables.
         // On reconnect we drop both and create a fresh pair.
-        let (mut client, mut eventloop) =
-            Self::connect(&self.broker_url, &client_id, &topics).await;
+        let (mut client, mut eventloop) = Self::connect(
+            &self.broker_url,
+            &client_id,
+            &topics,
+            self.credential.as_ref(),
+        )
+        .await;
 
         loop {
             tokio::select! {
@@ -318,7 +342,10 @@ impl SensorSource for MqttSource {
                             backoff = backoff::next_backoff(backoff, BACKOFF_MIN, BACKOFF_MAX, JITTER_FRACTION);
                             // Reconnect: drop old pair, create new.
                             let new_pair = Self::connect(
-                                &self.broker_url, &client_id, &topics,
+                                &self.broker_url,
+                                &client_id,
+                                &topics,
+                                self.credential.as_ref(),
                             ).await;
                             client = new_pair.0;
                             eventloop = new_pair.1;
@@ -651,6 +678,7 @@ mod tests {
                     },
                 ),
             ],
+            None,
         );
 
         let mut warned = HashSet::new();
@@ -699,6 +727,7 @@ mod tests {
                     },
                 ),
             ],
+            None,
         );
 
         let mut warned = HashSet::new();
@@ -715,6 +744,7 @@ mod tests {
         let source = MqttSource::new(
             "tcp://localhost:1883".into(),
             vec![(SensorId("test".into()), make_cfg("/occupancy"))],
+            None,
         );
 
         let mut warned = HashSet::new();
@@ -730,7 +760,7 @@ mod tests {
 
     #[test]
     fn dispatch_publish_unknown_topic_returns_empty() {
-        let source = MqttSource::new("tcp://localhost:1883".into(), vec![]);
+        let source = MqttSource::new("tcp://localhost:1883".into(), vec![], None);
         let mut warned = HashSet::new();
         let events = source.dispatch_publish("unknown/topic", b"data", &mut warned);
         assert!(events.is_empty());
@@ -743,6 +773,7 @@ mod tests {
         let source = MqttSource::new(
             "tcp://mqtt.local:1883".into(),
             vec![(SensorId("desk".into()), make_cfg("/occupancy"))],
+            None,
         );
         assert_eq!(source.source_id(), "tcp://mqtt.local:1883");
     }
@@ -764,6 +795,7 @@ mod tests {
                     stale_timeout: None,
                 },
             )],
+            None,
         );
         assert!(source.topic_map.contains_key("sensors/desk"));
         assert!(source.topic_map.contains_key("sensors/desk/availability"));
@@ -780,6 +812,7 @@ mod tests {
                 (SensorId("a".into()), make_cfg("/occupancy")),
                 (SensorId("b".into()), make_cfg("/occupancy")),
             ],
+            None,
         );
 
         let (tx, mut rx) = mpsc::channel(8);
@@ -800,5 +833,29 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("a"));
         assert!(ids.contains("b"));
+    }
+
+    // ── Credential wiring ──────────────────────────────────────────────────
+
+    #[test]
+    fn new_stores_credential_when_present() {
+        let cred = MqttCredential {
+            username: "alice".into(),
+            password: "s3cret".into(),
+        };
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(SensorId("s".into()), make_cfg("/occupancy"))],
+            Some(cred.clone()),
+        );
+        let wired = source.credential().expect("credential should be present");
+        assert_eq!(wired.username, "alice");
+        assert_eq!(wired.password, "s3cret");
+    }
+
+    #[test]
+    fn new_stores_none_when_no_credential() {
+        let source = MqttSource::new("tcp://localhost:1883".into(), vec![], None);
+        assert!(source.credential().is_none());
     }
 }

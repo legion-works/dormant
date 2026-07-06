@@ -123,8 +123,14 @@ fn spawn_engine(
     let (ctl_tx, ctl_rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
 
-    let engine =
-        RulesEngine::new(cfg, zones, executors, HashMap::new()).expect("valid engine config");
+    let engine = RulesEngine::new(
+        cfg,
+        zones,
+        executors,
+        HashMap::new(),
+        Arc::new(dormant_core::ownership::AlwaysOwned),
+    )
+    .expect("valid engine config");
     let engine_cancel = cancel.clone();
     let engine_handle = tokio::spawn(async move {
         engine.run(events_rx, ctl_rx, engine_cancel).await;
@@ -1200,6 +1206,163 @@ async fn set_pending_reload_surfaces_in_snapshot() {
             .await
             .pending_reload
             .is_none()
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Helper: spawn engine with a custom OwnershipGate ───────────────────────────
+
+fn spawn_engine_with_gate(
+    cfg: RulesEngineConfig,
+    zones: ZoneEngine,
+    executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+    script: Vec<(Duration, PresenceEvent)>,
+    gate: Arc<dyn dormant_core::ownership::OwnershipGate>,
+) -> Harness {
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let (ctl_tx, ctl_rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+
+    let engine =
+        RulesEngine::new(cfg, zones, executors, HashMap::new(), gate).expect("valid engine config");
+    let engine_cancel = cancel.clone();
+    let engine_handle = tokio::spawn(async move {
+        engine.run(events_rx, ctl_rx, engine_cancel).await;
+    });
+
+    let source = FakeSensorSource {
+        id: "fake".into(),
+        script,
+    };
+    let source_tx = events_tx.clone();
+    let source_cancel = cancel.clone();
+    let source_handle =
+        tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
+
+    Harness {
+        events_tx,
+        ctl_tx,
+        cancel,
+        engine_handle,
+        source_handle,
+    }
+}
+
+// ── Ownership gate: NeverOwns test double ────────────────────────────────────
+
+struct NeverOwns;
+
+impl dormant_core::ownership::OwnershipGate for NeverOwns {
+    fn owns(&self, _display: &DisplayId) -> bool {
+        false
+    }
+}
+
+// ── Test: NeverOwns blocks blanking ─────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn never_owns_blocks_blanking() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@0 → should drive grace → expiry, but NeverOwns gates entry.
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(cfg, zones, execs, script, Arc::new(NeverOwns));
+
+    // Wait past the grace period (60s) + blank time + settling.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    // NeverOwns must prevent any blank — the ownership gate says "not
+    // owned", so the machine's `owned` flag is false, which blocks
+    // entry at the grace-expiry gate (`!self.owned` check).
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert_eq!(
+        blank_count, 0,
+        "NeverOwns must block blanking — expected 0 blanks, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Test: AlwaysOwned lets it blank (control) ────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn always_owned_lets_it_blank() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@0 → grace expires → blank (AlwaysOwned always permits).
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(
+        cfg,
+        zones,
+        execs,
+        script,
+        Arc::new(dormant_core::ownership::AlwaysOwned),
+    );
+
+    // Wait past grace period + blank time.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert!(
+        blank_count >= 1,
+        "AlwaysOwned must permit blanking — expected >=1 blank, got {blank_count}: {log:?}"
     );
 
     harness.cancel.cancel();

@@ -244,11 +244,46 @@ export interface ZoneConfig {
   unavailable_policy: UnavailablePolicy;
 }
 
+/** rust: StageKind — flat serde tags (the kind field on a LadderStage) */
+export const STAGE_KINDS = [
+  "power_off",
+  "screen_off_audio_on",
+  "brightness_zero",
+  "render_black",
+  "render_screensaver",
+] as const;
+export type StageKind = (typeof STAGE_KINDS)[number];
+
+/** rust: config/schema.rs LadderStage */
+export interface LadderStage {
+  kind: StageKind;
+  dwell?: string;
+}
+
+/** rust: config/schema.rs ScreensaverSource */
+export interface ScreensaverSource {
+  path?: string;
+  urls?: string[];
+  recurse?: boolean;
+  shuffle?: boolean;
+  order?: string;
+  image_duration?: string;
+}
+
+/** rust: config/schema.rs ScreensaverConfig */
+export interface ScreensaverConfig {
+  trigger: string;
+  audio: boolean;
+  source: ScreensaverSource[];
+}
+
 /** rust: config/schema.rs DisplayConfig */
 export interface DisplayConfig {
   controllers: string[];
-  blank_mode: BlankMode;
+  blank_mode?: BlankMode;
   degraded_mode?: BlankMode;
+  ladder?: LadderStage[];
+  screensaver?: ScreensaverConfig;
   output?: string;
   ddc_display?: string;
   host?: string;

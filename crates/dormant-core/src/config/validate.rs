@@ -570,7 +570,7 @@ fn validate_display(
         // controller and must not be composed solely of remote controllers.
         if !dc.is_render_eligible() {
             errors.push(ValidationError {
-                what: "render unavailable".into(),
+                what: crate::error::E_RENDER_UNAVAILABLE.into(),
                 detail: format!(
                     "display '{display_id}' uses a render stage but has only remote \
                      controllers (render stages require a local output)"
@@ -582,7 +582,7 @@ fn validate_display(
         #[cfg(not(feature = "render"))]
         {
             errors.push(ValidationError {
-                what: "render unavailable".into(),
+                what: crate::error::E_RENDER_UNAVAILABLE.into(),
                 detail: format!(
                     "display '{display_id}' uses a render stage but dormant was built \
                      without the render feature"
@@ -595,7 +595,7 @@ fn validate_display(
             if stage.kind == StageKind::RenderScreensaver {
                 let Some(ss) = &dc.screensaver else {
                     errors.push(ValidationError {
-                        what: "missing screensaver config".into(),
+                        what: crate::error::E_SCREENSAVER_SOURCE.into(),
                         detail: format!(
                             "display '{display_id}' uses a RenderScreensaver stage \
                              but has no [displays.{display_id}.screensaver] section"
@@ -609,7 +609,7 @@ fn validate_display(
                     .any(|s| s.path.is_some() || !s.urls.is_empty());
                 if !has_source {
                     errors.push(ValidationError {
-                        what: "screensaver source missing".into(),
+                        what: crate::error::E_SCREENSAVER_SOURCE.into(),
                         detail: format!(
                             "display '{display_id}' screensaver has no source with \
                              a path or urls"
@@ -620,7 +620,7 @@ fn validate_display(
                 for (i, src) in ss.source.iter().enumerate() {
                     if src.path.is_some() && !src.urls.is_empty() {
                         errors.push(ValidationError {
-                            what: "screensaver source conflict".into(),
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
                             detail: format!(
                                 "display '{display_id}' screensaver source {i} sets both \
                                  path and urls — pick exactly one"
@@ -1658,9 +1658,9 @@ kind = "power_off"
         let caps = test_capabilities();
         let errors = validate(&cfg, &caps, &Credentials::default());
         assert!(
-            !errors.iter().any(|e| e.what.contains("render")),
-            "expected no render errors on ddcci, got: {:?}",
-            errors
+            errors.is_empty(),
+            "expected no errors on ddcci with render feature, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
     }
 
@@ -1691,9 +1691,11 @@ kind = "power_off"
         let errors = validate(&cfg, &caps, &Credentials::default());
         let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
         assert!(
-            errs.iter()
-                .any(|e| e.contains("render") && e.contains("without the render feature")),
-            "expected render-feature error, got: {:?}",
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_RENDER_UNAVAILABLE)
+                    && e.contains("without the render feature")
+            }),
+            "expected E_RENDER_UNAVAILABLE render-feature error, got: {:?}",
             errs
         );
     }
@@ -1732,9 +1734,10 @@ kind = "screen_off_audio_on"
         let errors = validate(&cfg, &caps, &creds);
         let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
         assert!(
-            errs.iter()
-                .any(|e| e.contains("render") && e.contains("remote")),
-            "expected render-on-remote error, got: {:?}",
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_RENDER_UNAVAILABLE) && e.contains("remote")
+            }),
+            "expected E_RENDER_UNAVAILABLE remote error, got: {:?}",
             errs
         );
     }
@@ -1823,6 +1826,68 @@ path = "/tmp/pics"
             errs.iter()
                 .any(|e| e.contains("not supported in this release")),
             "expected unsupported trigger error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_empty_source_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-empty-source");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty_source.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains(crate::error::E_SCREENSAVER_SOURCE)),
+            "expected E_SCREENSAVER_SOURCE for empty source, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_path_and_urls_conflict_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-path-urls");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conflict.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+urls = ["https://example.com/img.jpg"]
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("pick exactly one")
+            }),
+            "expected E_SCREENSAVER_SOURCE path-urls conflict error, got: {:?}",
             errs
         );
     }

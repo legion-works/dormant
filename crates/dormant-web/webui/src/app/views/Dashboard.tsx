@@ -8,7 +8,7 @@
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 99-188.
  */
 import { useNavigate } from "../nav";
-import { useDashboardData } from "../hooks/useDashboardData";
+import { useLiveState } from "../state";
 import { Card, StatusChip, statusLabel } from "../components";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";
@@ -184,7 +184,7 @@ function RecentRow({ ev }: { ev: RecentEvent }) {
 
 
 export default function Dashboard() {
-  const { loading, error, snapshot, config, sensorConfigs, zoneConfigs, displayConfigs } = useDashboardData();
+  const { loading, error, snapshot, config, sensorConfigs, zoneConfigs, displayConfigs } = useLiveState();
   const navigate = useNavigate();
 
   if (loading) {

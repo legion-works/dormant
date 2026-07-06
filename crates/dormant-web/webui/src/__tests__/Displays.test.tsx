@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import Displays from "../app/views/Displays";
+import { LiveStateProvider } from "../app/state";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
@@ -90,6 +91,10 @@ vi.mock("../api/client", () => ({
   postResume: mocks.postResume,
 }));
 
+vi.mock("../api/ws", () => ({
+  useEvents: vi.fn(() => ({ connected: false, close: vi.fn() })),
+}));
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -97,7 +102,7 @@ afterEach(() => {
 
 describe("Displays", () => {
   it("renders display cards with IDs and phases", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
@@ -109,7 +114,7 @@ describe("Displays", () => {
   });
 
   it("renders paused and inhibited chips", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("paused")).toBeInTheDocument();
@@ -117,7 +122,7 @@ describe("Displays", () => {
   });
 
   it("renders controller health chips", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
@@ -130,7 +135,7 @@ describe("Displays", () => {
   });
 
   it("renders metric fields", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
@@ -144,7 +149,7 @@ describe("Displays", () => {
   });
 
   it("renders zone and rule from display_rules reverse lookup", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
@@ -156,7 +161,7 @@ describe("Displays", () => {
   });
 
   it("calls postBlank/postWake/postPause/postResume with correct ids", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
@@ -188,7 +193,7 @@ describe("Displays", () => {
   });
 
   it("has Force wake and Pause/Resume buttons for each display", async () => {
-    render(<Displays />);
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("samsung-tv")).toBeInTheDocument();

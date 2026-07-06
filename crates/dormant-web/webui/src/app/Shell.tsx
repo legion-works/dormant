@@ -72,8 +72,7 @@ function ShellInner() {
     }
   }, []);
 
-  const displaysBadge =
-    snapshot ? (snapshot.displays.length > 0 ? String(snapshot.displays.length) : undefined) : undefined;
+  const displaysBadge = snapshot ? String(snapshot.displays.length) : undefined;
 
   const ActiveComponent = VIEWS[activeView].Component;
 

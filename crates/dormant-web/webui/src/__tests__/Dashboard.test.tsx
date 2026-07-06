@@ -9,6 +9,8 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import Dashboard from "../app/views/Dashboard";
 import { LiveStateProvider } from "../app/state";
+import { EventLogContext } from "../app/hooks/useLiveState";
+import type { StampedEvent } from "../app/hooks/useLiveState";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
@@ -147,5 +149,45 @@ describe("Dashboard", () => {
     expect(screen.getByText(/sensors → zones → displays/)).toBeInTheDocument();
     expect(screen.getByText("Recent activity")).toBeInTheDocument();
     expect(screen.getByText("view all →")).toBeInTheDocument();
+  });
+
+  it("shows empty state in recent activity when event log is empty", async () => {
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={{ events: [], connected: true, lagged: false }}>
+          <Dashboard />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("No recent events from the daemon.")).toBeInTheDocument();
+    });
+  });
+
+  it("renders recent activity from the event log", async () => {
+    const mockEvents: StampedEvent[] = [
+      {
+        time: "14:23:01",
+        event: {
+          event: "sensor_changed",
+          sensor: "desk-mmwave",
+          state: "present",
+        },
+      },
+    ];
+
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={{ events: mockEvents, connected: true, lagged: false }}>
+          <Dashboard />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("desk-mmwave → present")).toBeInTheDocument();
+    });
+    expect(screen.getByText("sensor")).toBeInTheDocument();
   });
 });

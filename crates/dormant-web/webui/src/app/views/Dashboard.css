@@ -327,13 +327,13 @@
 
 .recent-row {
   display: grid;
-  grid-template-columns: 82px 1fr;
+  grid-template-columns: 82px 118px 1fr;
   align-items: center;
   gap: 14px;
-  padding: 9px 15px;
+  padding: 9px 16px;
   border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--text-xs);
 }
 .recent-row:last-child {
   border-bottom: none;
@@ -341,16 +341,21 @@
 
 .recent-row__time {
   color: var(--text-faint);
-  flex-shrink: 0;
 }
 
 .recent-row__badge {
-  display: none; /* Hidden by default — show on non-Dashboard event views */
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  text-align: center;
+  letter-spacing: var(--tracking-wide);
 }
 
 .recent-row__text {
   color: var(--text-body);
-  grid-column: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .recent-empty {

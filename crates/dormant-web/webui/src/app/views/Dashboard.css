@@ -114,8 +114,8 @@
 
 .signal-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 14px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--gutter);
   align-items: start;
   margin-bottom: 26px;
 }

@@ -162,7 +162,7 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const { connected } = useEvents({ onMessage });
+  const { connected } = useEvents({ onMessage, onConnect: () => { void fetchAll(); } });
 
   const sensorConfigs: Record<string, SensorConfig> = {};
   const zoneConfigs: Record<string, ZoneConfig> = {};

@@ -10,10 +10,12 @@ import { useLiveState, useEventLog } from "../app/hooks/useLiveState";
 
 const { mocks, fixtures } = vi.hoisted(() => {
   let capturedOnMessage: ((data: unknown) => void) | null = null;
+  let capturedOnConnect: (() => void) | null = null;
 
   const useEventsImpl = vi.fn(
-    (opts: { onMessage: (data: unknown) => void }) => {
+    (opts: { onMessage: (data: unknown) => void; onConnect?: () => void }) => {
       capturedOnMessage = opts.onMessage;
+      if (opts.onConnect) capturedOnConnect = opts.onConnect;
       return { connected: true, close: vi.fn() };
     },
   );
@@ -63,6 +65,7 @@ const { mocks, fixtures } = vi.hoisted(() => {
     mocks: {
       useEventsImpl,
       get onMessage() { return capturedOnMessage; },
+      get onConnect() { return capturedOnConnect; },
     },
     fixtures: { state, config },
   };
@@ -256,5 +259,33 @@ describe("LiveStateProvider event-to-state patching", () => {
     await waitFor(() => {
       expect(vi.mocked(getConfig).mock.calls.length).toBeGreaterThan(callsBefore);
     });
+  });
+
+  it("onConnect triggers state+config refetch", async () => {
+    const { getState } = await import("../api/client");
+    const { getConfig } = await import("../api/client");
+
+    render(
+      <LiveStateProvider>
+        <SensorConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+    });
+
+    const stateCallsBefore = vi.mocked(getState).mock.calls.length;
+    const configCallsBefore = vi.mocked(getConfig).mock.calls.length;
+
+    // Simulate a WS reconnect — should trigger a full refetch.
+    act(() => {
+      mocks.onConnect?.();
+    });
+
+    await waitFor(() => {
+      expect(vi.mocked(getState).mock.calls.length).toBeGreaterThan(stateCallsBefore);
+    });
+    expect(vi.mocked(getConfig).mock.calls.length).toBeGreaterThan(configCallsBefore);
   });
 });

@@ -1,6 +1,3 @@
-/**
- * Events component test — live event log rendering.
- */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import Events from "../app/views/Events";

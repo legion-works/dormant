@@ -1,27 +1,11 @@
 /**
- * Live state — React context that fetches initial daemon data and
- * patches it in-memory from incoming WebSocket events.
+ * Live-state provider — fetches initial daemon data and patches it
+ * in-memory from incoming WebSocket events.
  *
- * A single `useEvents` subscription runs at the provider level so every
- * view reads from one connection.  Patch logic:
- *   sensor_changed → update that sensor's state
- *   zone_changed   → update that zone's presence
- *   display_phase  → update that display's phase
- *   config_reloaded → re-fetch /api/config
- *   wake_retry     → no state mutation (event-log only)
- *
- * The Events view consumes the event log via `useEventLog()`; the
- * Dashboard and Displays views consume the live snapshot + config maps
- * via `useLiveState()`.
+ * A single `useEvents` subscription runs here so every view reads from
+ * one connection.
  */
-import {
-  createContext,
-  useContext,
-  useState,
-  useEffect,
-  useCallback,
-  useRef,
-} from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useEvents } from "../api/ws";
 import { getState, getConfig } from "../api/client";
@@ -36,49 +20,18 @@ import type {
   DisplayRuleInfo,
   DisplaySnapshot,
 } from "../api/types";
-
-// ── Event log entry (after serialisation) ───────────────────────────────
+import {
+  LiveStateContext,
+  EventLogContext,
+} from "./hooks/useLiveState";
+import type { StampedEvent, LiveState, EventLogState } from "./hooks/useLiveState";
 
 const MAX_EVENTS = 100;
-
-export interface StampedEvent {
-  /** ISO time string captured at arrival. */
-  time: string;
-  event: DaemonEvent;
-}
-
-// ── Live-state shape ────────────────────────────────────────────────────
-
-export interface LiveState {
-  loading: boolean;
-  error: string | null;
-  snapshot: StateSnapshot | null;
-  config: ConfigResponse | null;
-  connected: boolean;
-  sensorConfigs: Record<string, SensorConfig>;
-  zoneConfigs: Record<string, ZoneConfig>;
-  displayConfigs: Record<string, DisplayConfig>;
-  displayRules: Record<string, DisplayRuleInfo>;
-  refresh: () => void;
-}
-
-const LiveStateContext = createContext<LiveState | null>(null);
-
-export interface EventLogState {
-  events: StampedEvent[];
-  connected: boolean;
-  lagged: boolean;
-}
-
-const EventLogContext = createContext<EventLogState | null>(null);
-
-// ── Helpers ─────────────────────────────────────────────────────────────
 
 function formatTimestamp(): string {
   return new Date().toLocaleTimeString("en-GB", { hour12: false });
 }
 
-/** Deep-clone a snapshot and patch one sensor's state in place. */
 function patchSensorState(
   snapshot: StateSnapshot,
   sensor: string,
@@ -90,7 +43,6 @@ function patchSensorState(
   return { ...snapshot, sensors };
 }
 
-/** Deep-clone a snapshot and patch one zone's presence in place. */
 function patchZonePresence(
   snapshot: StateSnapshot,
   zone: string,
@@ -102,7 +54,6 @@ function patchZonePresence(
   return { ...snapshot, zones };
 }
 
-/** Deep-clone a snapshot and patch one display's phase in place. */
 function patchDisplayPhase(
   snapshot: StateSnapshot,
   display: string,
@@ -115,8 +66,6 @@ function patchDisplayPhase(
   return { ...snapshot, displays };
 }
 
-// ── Provider ────────────────────────────────────────────────────────────
-
 export function LiveStateProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -126,9 +75,6 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
   const [lagged, setLagged] = useState(false);
   const lagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
-
-  // Keep callback refs so useEvents' onMessage closure stays stable.
-  const refreshRef = useRef<() => void>(() => {});
 
   const fetchAll = useCallback(async () => {
     setError(null);
@@ -149,9 +95,6 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     void fetchAll();
   }, [fetchAll]);
 
-  refreshRef.current = refresh;
-
-  // Fetch initial state on mount.
   useEffect(() => {
     mountedRef.current = true;
     void fetchAll();
@@ -161,8 +104,6 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     };
   }, [fetchAll]);
 
-  // Patch state from incoming DaemonEvents — callback identity is
-  // stable because we use refs for the setters.
   const onMessage = useCallback((data: unknown) => {
     const ev = data as
       | (DaemonEvent & { skipped?: number })
@@ -174,7 +115,6 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
       "event" in ev &&
       ev.event === "stream_lagged"
     ) {
-      // Surface the lag banner via the event-log context.
       setLagged(true);
       if (lagTimerRef.current != null) clearTimeout(lagTimerRef.current);
       lagTimerRef.current = setTimeout(() => setLagged(false), 5_000);
@@ -182,7 +122,6 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     }
 
     if (ev && typeof ev === "object" && "event" in ev) {
-      // Append to event log.
       setEvents((prev) => {
         const next = [
           { time: formatTimestamp(), event: ev as DaemonEvent },
@@ -193,7 +132,6 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
 
       const tag = (ev as { event: string }).event;
 
-      // Patch in-memory snapshot.
       setSnapshot((prev) => {
         if (!prev) return prev;
         switch (tag) {
@@ -214,23 +152,18 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
         }
       });
 
-      // Re-fetch config on reload so inventory + display_rules stay fresh.
       if (tag === "config_reloaded") {
         getConfig()
           .then((cfg) => {
             if (mountedRef.current) setConfig(cfg);
           })
-          .catch(() => {
-            // Config fetch may fail if the new config is invalid;
-            // the old config data stays visible.
-          });
+          .catch(() => {});
       }
     }
   }, []);
 
   const { connected } = useEvents({ onMessage });
 
-  // Build lookup maps from config inventory.
   const sensorConfigs: Record<string, SensorConfig> = {};
   const zoneConfigs: Record<string, ZoneConfig> = {};
   const displayConfigs: Record<string, DisplayConfig> = {};
@@ -266,24 +199,4 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
       </EventLogContext.Provider>
     </LiveStateContext.Provider>
   );
-}
-
-// ── Hooks ───────────────────────────────────────────────────────────────
-
-/** Read live state (for Dashboard, Displays). */
-export function useLiveState(): LiveState {
-  const ctx = useContext(LiveStateContext);
-  if (!ctx) {
-    throw new Error("useLiveState must be used within LiveStateProvider");
-  }
-  return ctx;
-}
-
-/** Read the event log (for Events view). */
-export function useEventLog(): EventLogState {
-  const ctx = useContext(EventLogContext);
-  if (!ctx) {
-    throw new Error("useEventLog must be used within LiveStateProvider");
-  }
-  return ctx;
 }

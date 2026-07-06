@@ -90,6 +90,18 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // Single-instance guard: acquire BEFORE the daemon starts touching
+        // physical displays. Held for the entire process lifetime (bound in
+        // this async block scope; released on process exit — the kernel also
+        // releases the flock on process death, so crash-safe).
+        let _lock = match dormantd::single_instance::acquire(&paths::default_lock_path()) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(event = "single_instance_lock_failed", error = %e);
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        };
         tracing::info!(event = "daemon_starting", config = %app.config_path().display());
         match app.run().await {
             Ok(()) => ExitCode::SUCCESS,

@@ -8,8 +8,9 @@
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 99-188.
  */
 import { useNavigate } from "../nav";
-import { useLiveState } from "../hooks/useLiveState";
+import { useLiveState, useEventLog } from "../hooks/useLiveState";
 import { Card, StatusChip, statusLabel } from "../components";
+import { badgeForEvent, messageForEvent } from "./eventFormat";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";
 import { useCallback, useState } from "react";
@@ -162,29 +163,9 @@ function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProp
 }
 
 
-interface RecentEvent {
-  time: string;
-  type: string;
-  color: string;
-  bg: string;
-  text: string;
-}
-
-function RecentRow({ ev }: { ev: RecentEvent }) {
-  return (
-    <div className="recent-row">
-      <span className="recent-row__time">{ev.time}</span>
-      <span className="recent-row__badge" style={{ color: ev.color, backgroundColor: ev.bg }}>
-        {ev.type}
-      </span>
-      <span className="recent-row__text">{ev.text}</span>
-    </div>
-  );
-}
-
-
 export default function Dashboard() {
   const { loading, error, snapshot, config, sensorConfigs, zoneConfigs, displayConfigs } = useLiveState();
+  const { events } = useEventLog();
   const navigate = useNavigate();
 
   if (loading) {
@@ -227,37 +208,7 @@ export default function Dashboard() {
     return t;
   };
 
-  // Recent events synthesized from latest state changes for the activity feed.
-  const recentEvents: RecentEvent[] = [];
-  for (const s of sensors) {
-    if (s.last_seen_secs_ago < 60) {
-      recentEvents.push({
-        time: `${s.last_seen_secs_ago}s ago`,
-        type: "sensor",
-        color: "var(--blue-400)",
-        bg: "color-mix(in oklab, var(--blue-400) 13%, transparent)",
-        text: `${s.id} → ${s.state}`,
-      });
-    }
-  }
-  for (const [, d] of displays) {
-    if (d.cmd_gen > 0) {
-      recentEvents.push({
-        time: "now",
-        type: "display",
-        color: "var(--text-faint)",
-        bg: "var(--bg-sunken)",
-        text: `display → ${d.phase} (gen ${d.cmd_gen})`,
-      });
-    }
-  }
-  // Cap and sort newest first.
-  recentEvents.sort((a, b) => {
-    if (a.time === "now" && b.time !== "now") return -1;
-    if (b.time === "now" && a.time !== "now") return 1;
-    return 0;
-  });
-  const recentSlice = recentEvents.slice(0, 5);
+  const recentSlice = events.slice(0, 6);
 
   return (
     <div className="dashboard">
@@ -338,7 +289,22 @@ export default function Dashboard() {
         {recentSlice.length === 0 ? (
           <div className="recent-empty">No recent events from the daemon.</div>
         ) : (
-          recentSlice.map((ev, i) => <RecentRow key={i} ev={ev} />)
+          recentSlice.map((se, i) => {
+            const badge = badgeForEvent(se.event);
+            const msg = messageForEvent(se.event);
+            return (
+              <div key={`${se.time}-${i}`} className="recent-row">
+                <span className="recent-row__time">{se.time}</span>
+                <span
+                  className="recent-row__badge"
+                  style={{ color: badge.color, backgroundColor: badge.bg }}
+                >
+                  {badge.label}
+                </span>
+                <span className="recent-row__text">{msg}</span>
+              </div>
+            );
+          })
         )}
       </Card>
     </div>

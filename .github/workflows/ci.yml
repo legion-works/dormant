@@ -20,7 +20,29 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  webui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/dormant-web/webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/dormant-web/webui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npx vitest run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: crates/dormant-web/webui/dist/
+
   clippy:
+    needs: webui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,14 +50,23 @@ jobs:
         with:
           components: clippy
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+      - uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: crates/dormant-web/webui/dist/
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
 
   test:
+    needs: webui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: crates/dormant-web/webui/dist/
       - run: cargo test --workspace --all-features
 
   portability:

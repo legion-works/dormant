@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -1363,6 +1364,150 @@ async fn always_owned_lets_it_blank() {
     assert!(
         blank_count >= 1,
         "AlwaysOwned must permit blanking — expected >=1 blank, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Ownership gate: FlipGate test double (dynamic, edge-sensitive) ───────────
+
+/// Gate backed by shared mutable state — starts `true`, flips externally.
+/// Exercises the run-loop `feed_ownership` path (the constructor seed sets
+/// `owned=true`, so only a mid-run flip can change the verdict).
+struct FlipGate(Arc<AtomicBool>);
+
+impl dormant_core::ownership::OwnershipGate for FlipGate {
+    fn owns(&self, _display: &DisplayId) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+// ── Test: flip gate during grace blocks blank (run-loop feed) ─────────────
+
+/// The gate starts `true` so the display enters Grace normally.  After
+/// the absent edge is processed but BEFORE the grace timer fires, the
+/// gate is flipped to `false`.  This proves the run-loop `feed_ownership`
+/// call in `fire_due_timers` actually consults the gate and feeds
+/// `OwnershipChanged(false)` — the constructor seed can't catch a
+/// post-construction flip.
+#[tokio::test(start_paused = true)]
+async fn flip_gate_during_grace_blocks_blank() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let flag = Arc::new(AtomicBool::new(true));
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@0 → enters Grace (owned=seed true → proceeds).
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(
+        cfg,
+        zones,
+        execs,
+        script,
+        Arc::new(FlipGate(Arc::clone(&flag))),
+    );
+
+    // Let the absent edge land and grace start (t=0 → t=30s).
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Flip the gate BEFORE the grace timer fires at ~60s.
+    flag.store(false, Ordering::Relaxed);
+
+    // Advance past the grace deadline (60s) + settling.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert_eq!(
+        blank_count, 0,
+        "gate flip during grace must block blank — expected 0 blanks, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Test: control — gate stays true, blank fires (paired control) ────────
+
+/// Same scenario as `flip_gate_during_grace_blocks_blank` but without
+/// the flip.  The gate stays `true` → the grace timer fires → the
+/// machine blanks normally.  This isolates the flip as the cause.
+#[tokio::test(start_paused = true)]
+async fn flip_gate_control_blank_fires_when_owned() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let flag = Arc::new(AtomicBool::new(true));
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(
+        cfg,
+        zones,
+        execs,
+        script,
+        Arc::new(FlipGate(Arc::clone(&flag))),
+    );
+
+    // Advance past the grace deadline (60s) + settling.  Gate stays
+    // `true` the whole time → blank fires normally.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert!(
+        blank_count >= 1,
+        "paired control must blank — expected >=1 blank, got {blank_count}: {log:?}"
     );
 
     harness.cancel.cancel();

@@ -927,6 +927,7 @@ async fn assemble_static(
         display_runtime.push(DisplayRuntimeCfg {
             display: did.clone(),
             blank_mode: chosen,
+            ladder: dc.normalized_ladder(),
             timings,
         });
         display_executors.insert(did, Arc::new(executor));
@@ -1065,8 +1066,8 @@ fn spawn_generation(
         .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
         .collect();
 
-    let mut engine =
-        RulesEngine::new(assembly.engine_cfg.clone(), zone, executors).context("build engine")?;
+    let mut engine = RulesEngine::new(assembly.engine_cfg.clone(), zone, executors, HashMap::new())
+        .context("build engine")?;
 
     if let Some(detail) = pending {
         engine.set_pending_reload(Some(detail));
@@ -1142,7 +1143,7 @@ fn apply_restore(
         };
         let (_sm, effects) = DisplayStateMachine::restore(
             dcfg.timings.clone(),
-            dcfg.blank_mode,
+            dcfg.ladder.clone(),
             phase,
             dsnap.cmd_gen,
             now,

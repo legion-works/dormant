@@ -10,23 +10,23 @@ The web UI is gated behind the Cargo feature `web-ui`:
 cargo build --release --features web-ui
 ```
 
-When the feature is enabled, these config keys become active under `[web]`:
+When the feature is enabled, these daemon config keys control the web server:
 
 | Key | Default | Description |
 |---|---|---|
-| `web_port` | `9100` | Listen port |
-| `web_bind` | `"127.0.0.1"` | Bind address — `127.0.0.1` or `0.0.0.0` |
-| `web_allow_nonloopback` | `false` | Require explicit opt-in before binding to a non-loopback address |
+| `daemon.web_port` | (unset) | TCP port. The web server only starts when this is set to a non-zero port number. |
+| `daemon.web_bind` | `"127.0.0.1"` | Bind address — `127.0.0.1` or `0.0.0.0` |
+| `daemon.web_allow_nonloopback` | `false` | Require explicit opt-in before binding to a non-loopback address |
 
 Example:
 
 ```toml
-[web]
+[daemon]
 web_port = 8080
 web_bind = "127.0.0.1"
 ```
 
-If the `web-ui` feature is not enabled, the `[web]` section is ignored and no HTTP server starts.
+If `daemon.web_port` is not set (the default), no HTTP server starts — even when the binary was compiled with the `web-ui` feature. The keys live under `[daemon]`, not a separate `[web]` section.
 
 ## Security posture
 
@@ -34,11 +34,11 @@ The web UI is **intended for single-user, loopback-only use**. There is no authe
 
 ### Loopback guard
 
-By default the server binds to `127.0.0.1` only. Setting `web_bind = "0.0.0.0"` (or any non-loopback address) is rejected at startup unless `web_allow_nonloopback = true`. The daemon logs a prominent warning when this override is active, because it makes the dashboard reachable from the local network without authentication — anyone on the LAN could issue blank/wake commands or change zone config.
+By default the server binds to `127.0.0.1` only. Setting `daemon.web_bind = "0.0.0.0"` (or any non-loopback address) is rejected at startup unless `daemon.web_allow_nonloopback = true`. The daemon logs a prominent warning when this override is active, because it makes the dashboard reachable from the local network without authentication — anyone on the LAN could issue blank/wake commands or change zone config.
 
-### CSRF / host guard
+### Host guard
 
-The server validates the `Host` header on every request. Requests with a `Host` that does not match the bound address are rejected with `421 Misdirected Request`. This blocks DNS-rebinding attacks even when bound to loopback only.
+The server validates the `Host` header on every request. Requests with a `Host` that does not match the configured bind address are rejected with `403 Forbidden` (the daemon logs a `web_reject_host` event). This blocks DNS-rebinding attacks even when bound to loopback only.
 
 ### No upstream exposure
 
@@ -50,20 +50,22 @@ The SPA has five views, selected from a left-hand navigation sidebar.
 
 ### Dashboard
 
-The landing page. Shows every zone: its occupancy state (occupied / vacant), the fused presence score, the displays linked to it, and the active blanking rules. Occupied zones are highlighted; vacant zones that are within a grace period show a countdown.
+The landing page. Shows a stat row (displays count with active/blanked split, sensor online/unavailable split, zone occupied/vacant split, OLED guard status), a three-column signal-flow grid (Sensors → Zones → Displays), and a recent-activity feed.
+
+Each sensor row shows its id, type label (MQTT / HA WebSocket / LD2410 radar), state (present/absent/unavailable), and last-seen age. Zone rows show occupancy (present/absent/unavailable), the fusion mode (ANY/ALL/QUORUM/WEIGHTED), and member sensor names. Display rows show phase chips, blank mode label, controller chain, and blank/wake action buttons.
 
 ### Displays
 
-A table of every configured display: name, type, current power state (on / standby / off), the controller chain in priority order, and the last command result (success / error with the failing controller). Each row includes a manual blank/wake toggle for testing.
+A per-display card list. Each card shows a screen preview glyph (ON / grace / … / OFF / wake), phase and paused/inhibited status chips, the blank mode label, the driving zone and rule, the command generation counter, and the controller chain rendered as HealthChips (each controller's health status with capability flags). Action buttons let the operator force-blank, force-wake, and pause or resume the governing rule.
 
 ### Events
 
-A scrolling, auto-pruning event log. Shows presence changes, display state transitions, rule evaluations, errors, and warnings. Each event is timestamped with the daemon's monotonic clock. The log is client-side only — it reflects what the daemon has emitted since the dashboard opened; reloading the page starts a fresh stream.
+A scrolling, auto-pruning event log. Shows presence changes, display phase transitions, wake retry attempts, and config reloads — each with a type-colored badge and a human-readable message. Events are timestamped with the browser's local clock at the moment the WebSocket message arrives (client-side arrival time, not the daemon's clock). The log is client-side only — it reflects what the daemon has emitted since the dashboard opened; reloading the page starts a fresh stream.
 
 ### Config
 
-A read-only dump of the running configuration: every section (`[sensors]`, `[zones]`, `[displays]`, `[rules]`, `[web]`) rendered as syntax-highlighted TOML. Useful for spot-checking which config file the daemon actually parsed.
+A two-column layout. The left column renders the running config file as syntax-highlighted TOML (keys, string values, numbers, comments, and section headers each colored distinctly). The right column shows a parsed inventory (sensor, zone, display, and rule counts with their names), validation issues (load errors, schema errors, and warnings) with detail messages, and a reload button for hot-reloading config from disk.
 
 ### Doctor
 
-Runs `dormantctl doctor` and renders the report inline. Shows sensor reachability, display DDC/CI capability detection, controller capability flags, and any configuration warnings. The doctor report is fetched via the daemon's HTTP API (the daemon spawns the CLI check internally).
+Runs `dormantctl doctor` checks on demand. The SPA calls `POST /api/doctor`, which invokes the shared `DoctorService` directly (the same service instance the daemon's IPC server uses — no subprocess is spawned). Results include a summary bar (passing / skipped / failing counts) and per-check rows with status chips and detail messages.

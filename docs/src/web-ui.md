@@ -14,7 +14,7 @@ When the feature is enabled, these daemon config keys control the web server:
 
 | Key | Default | Description |
 |---|---|---|
-| `daemon.web_port` | (unset) | TCP port. The web server only starts when this is set to a non-zero port number. |
+| `daemon.web_port` | (unset) | TCP port. Set to a port number to enable the web UI; unset (the default) leaves it disabled. |
 | `daemon.web_bind` | `"127.0.0.1"` | Bind address — `127.0.0.1` or `0.0.0.0` |
 | `daemon.web_allow_nonloopback` | `false` | Require explicit opt-in before binding to a non-loopback address |
 
@@ -56,7 +56,7 @@ Each sensor row shows its id, type label (MQTT / HA WebSocket / LD2410 radar), s
 
 ### Displays
 
-A per-display card list. Each card shows a screen preview glyph (ON / grace / … / OFF / wake), phase and paused/inhibited status chips, the blank mode label, the driving zone and rule, the command generation counter, and the controller chain rendered as HealthChips (each controller's health status with capability flags). Action buttons let the operator force-blank, force-wake, and pause or resume the governing rule.
+A per-display card list. Each card shows a screen preview glyph (ON / grace / … / OFF / wake), phase and paused/inhibited status chips, the blank mode label, the driving zone and rule, the command generation counter, and the controller chain rendered as HealthChips (each controller's name, role — primary/fallback — and health status). Action buttons let the operator force-blank, force-wake, and pause or resume the governing rule.
 
 ### Events
 
@@ -68,4 +68,4 @@ A two-column layout. The left column renders the running config file as syntax-h
 
 ### Doctor
 
-Runs `dormantctl doctor` checks on demand. The SPA calls `POST /api/doctor`, which invokes the shared `DoctorService` directly (the same service instance the daemon's IPC server uses — no subprocess is spawned). Results include a summary bar (passing / skipped / failing counts) and per-check rows with status chips and detail messages.
+Runs the same diagnostic checks as `dormantctl doctor` on demand. The SPA calls `POST /api/doctor`, which invokes the shared `DoctorService` directly (the same service instance the daemon's IPC server uses — no subprocess is spawned). Results include a summary bar (passing / skipped / failing counts) and per-check rows with status chips and detail messages.

@@ -8,7 +8,7 @@
 //! Kept as a pure data layer (no I/O, no Wayland types) so the encoding
 //! can be exercised from unit tests without spinning up a real compositor.
 
-use dormant_core::types::{CmdFailure, StageKind};
+use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 /// A command sent from the async engine task to the dedicated Wayland
 /// thread via a [`calloop::channel`].
@@ -40,6 +40,15 @@ pub(crate) enum RenderCommand {
         /// flushed.
         reply: tokio::sync::oneshot::Sender<()>,
     },
+    /// Configure-timeout fired for a Show still waiting on its
+    /// compositor `configure` reply.  Self-resolves the pending show's
+    /// oneshot with an error.
+    ConfigureTimeout {
+        /// Display id of the pending show — used to disambiguate if
+        /// multiple sinks share the thread (not the current shape, but
+        /// future-proof).
+        display_id: DisplayId,
+    },
 }
 
 #[cfg(test)]
@@ -68,7 +77,9 @@ mod tests {
                 assert_eq!(kind, StageKind::RenderBlack);
                 let _ = reply.send(Ok(()));
             }
-            RenderCommand::Teardown { .. } => panic!("expected Show variant"),
+            RenderCommand::Teardown { .. } | RenderCommand::ConfigureTimeout { .. } => {
+                panic!("expected Show variant")
+            }
         }
         let r = tokio::runtime::Runtime::new()
             .unwrap()
@@ -89,7 +100,9 @@ mod tests {
                 assert_eq!(r#gen, 9);
                 let _ = reply.send(());
             }
-            RenderCommand::Show { .. } => panic!("expected Teardown variant"),
+            RenderCommand::Show { .. } | RenderCommand::ConfigureTimeout { .. } => {
+                panic!("expected Teardown variant")
+            }
         }
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -121,5 +134,18 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.controller, "render-black");
         assert!(err.error.starts_with("E_RENDER_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn configure_timeout_carries_display_id() {
+        let cmd = RenderCommand::ConfigureTimeout {
+            display_id: DisplayId("d-1".into()),
+        };
+        match cmd {
+            RenderCommand::ConfigureTimeout { display_id } => {
+                assert_eq!(display_id.to_string(), "d-1");
+            }
+            _ => panic!("expected ConfigureTimeout variant"),
+        }
     }
 }

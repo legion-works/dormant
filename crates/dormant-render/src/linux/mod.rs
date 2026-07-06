@@ -1,11 +1,13 @@
 //! Wayland layer-shell [`RenderSink`] implementation.
 //!
-//! See module docs at the crate root for the thread model and overall
-//! design.  This file groups the per-display handle ([`LayerShellRenderSink`])
-//! and the dedicated Wayland thread that owns the connection and the
-//! layer surface.
+//! See the crate-root module docs for the thread model.  This file
+//! owns the public [`LayerShellRenderSink`] handle and threads the
+//! show/teardown commands to the dedicated wayland thread spawned by
+//! [`connection::spawn_wayland_thread`].
 
-mod thread;
+mod connection;
+mod state;
+mod surface;
 
 use std::fmt;
 
@@ -20,11 +22,11 @@ use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 use crate::command::RenderCommand;
 
 /// Per-display handle that ships [`RenderSink`] commands across the
-/// async-tokio → sync-calloop boundary to a dedicated Wayland thread.
+/// async-tokio → sync-calloop boundary to a dedicated wayland thread.
 ///
-/// `Clone`-able (the handle holds a small set of `Clone` channels); the
-/// actual Wayland objects live on the thread and are inaccessible from
-/// any other thread.
+/// `Clone`-able (the handle holds a small set of `Clone` channels);
+/// the actual Wayland objects live on the thread and are inaccessible
+/// from any other thread.
 #[derive(Clone)]
 pub struct LayerShellRenderSink {
     display_id: DisplayId,
@@ -42,7 +44,7 @@ impl fmt::Debug for LayerShellRenderSink {
 }
 
 impl LayerShellRenderSink {
-    /// Build a per-display sink.  Spawns a dedicated Wayland thread that
+    /// Build a per-display sink.  Spawns a dedicated wayland thread that
     /// owns the compositor connection, performs the initial bind, and
     /// drives a calloop event loop.
     ///
@@ -59,15 +61,16 @@ impl LayerShellRenderSink {
     /// # `input_wake_tx`
     ///
     /// When set, the first pointer / key event on the active surface
-    /// pushes the display id through this channel.  Task 8 wires it up to
-    /// `ControlMsg::InputWake` so the engine can route a wake.  When
-    /// `None`, the surface is still rendered but wake events are dropped.
+    /// pushes the display id through this channel.  The daemon wires
+    /// it up to `ControlMsg::InputWake` so the engine can route a wake.
+    /// When `None`, the surface is still rendered but wake events are
+    /// dropped.
     pub fn new(
         display_id: DisplayId,
         output_name: String,
         input_wake_tx: Option<&UnboundedSender<DisplayId>>,
     ) -> Result<Self, CmdFailure> {
-        let cmd_tx = thread::spawn_wayland_thread(&display_id, &output_name, input_wake_tx)?;
+        let cmd_tx = connection::spawn_wayland_thread(&display_id, &output_name, input_wake_tx)?;
         Ok(Self {
             display_id,
             output_name,

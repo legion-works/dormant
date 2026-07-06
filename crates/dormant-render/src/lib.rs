@@ -3,11 +3,12 @@
 //!
 //! This crate manages the lifecycle of render surfaces on an output:
 //!
-//! - **black overlay** (Task 6): full-screen black layer, the primary software-
+//! - **black overlay**: full-screen black layer, the primary software-
 //!   blank fallback when all hardware controllers fail or are unreachable.
-//! - **screensaver overlay** (Phase 2 / Task 7): last-resort idle surface,
-//!   shown only when the full ladder (controllers → black → screensaver) has
-//!   been exhausted and the display is still unblanked.
+//! - **screensaver overlay**: last-resort idle surface, shown only when
+//!   the full ladder (controllers → black → screensaver) has been exhausted
+//!   and the display is still unblanked.  Not implemented in this backend
+//!   yet — see [`LayerShellRenderSink::show`].
 //!
 //! All Wayland I/O is [`target_os = "linux"`]-gated.  On non-Linux the crate
 //! is a no-op binary balloon — the engine's fall-through logic already

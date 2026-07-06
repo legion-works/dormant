@@ -1,13 +1,17 @@
 //! USB LD2410 radar sensor probe — opens a serial port and decodes frames.
 
 use crate::types::ProbeResult;
+#[cfg(any(target_os = "linux", test))]
 use dormant_core::types::SensorState;
+#[cfg(any(target_os = "linux", test))]
 use dormant_sensors::usb_ld2410::FrameParser;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
 
 /// Probe a USB LD2410 sensor on the given serial port.
+#[cfg(target_os = "linux")]
 pub async fn probe_usb(port: &str, baud: u32) -> ProbeResult {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
     let builder = tokio_serial::new(port, baud)
         .data_bits(tokio_serial::DataBits::Eight)
         .stop_bits(tokio_serial::StopBits::One)
@@ -73,6 +77,15 @@ pub async fn probe_usb(port: &str, baud: u32) -> ProbeResult {
     ProbeResult::pass(
         format!("usb {port}"),
         format!("{total_frames} frames decoded, last state: {state_str}"),
+    )
+}
+
+/// USB serial probing is only supported on Linux in this release.
+#[cfg(not(target_os = "linux"))]
+pub async fn probe_usb(_port: &str, _baud: u32) -> ProbeResult {
+    ProbeResult::not_supported(
+        format!("usb {_port}"),
+        "USB serial is only supported on Linux in this release",
     )
 }
 

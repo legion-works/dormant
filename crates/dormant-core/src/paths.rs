@@ -80,6 +80,31 @@ fn socket_path_from(runtime_dir: Option<OsString>) -> PathBuf {
     PathBuf::from("/run/dormant/dormant.sock")
 }
 
+/// Return the fixed per-user-session lock path.
+///
+/// The lock path is deliberately NOT config-overridable — unlike the socket,
+/// a configurable lock path would defeat the single-instance guard: a second
+/// daemon with a different lock path would still start and fight the physical
+/// displays.
+///
+/// 1. `$XDG_RUNTIME_DIR/dormant.lock`
+/// 2. `/run/dormant/dormant.lock`
+#[must_use]
+pub fn default_lock_path() -> PathBuf {
+    lock_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// Internal: build lock path from explicit env value (test seam).
+#[must_use]
+fn lock_path_from(runtime_dir: Option<OsString>) -> PathBuf {
+    if let Some(dir) = runtime_dir {
+        let mut p = PathBuf::from(dir);
+        p.push("dormant.lock");
+        return p;
+    }
+    PathBuf::from("/run/dormant/dormant.lock")
+}
+
 /// Resolve the socket path from an optional config value or default.
 #[must_use]
 pub fn resolve_socket_path(config_socket: Option<&std::path::Path>) -> PathBuf {
@@ -152,5 +177,17 @@ mod tests {
     fn sibling_credentials_fallback() {
         let p = sibling_credentials(std::path::Path::new("config.toml"));
         assert_eq!(p, PathBuf::from("credentials.toml"));
+    }
+
+    #[test]
+    fn lock_path_from_xdg() {
+        let p = lock_path_from(Some(OsString::from("/run/user/1000")));
+        assert_eq!(p, PathBuf::from("/run/user/1000/dormant.lock"));
+    }
+
+    #[test]
+    fn lock_path_from_fallback() {
+        let p = lock_path_from(None);
+        assert_eq!(p, PathBuf::from("/run/dormant/dormant.lock"));
     }
 }

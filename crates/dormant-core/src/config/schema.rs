@@ -581,6 +581,27 @@ pub struct RuleConfig {
 
 // ── Credentials ─────────────────────────────────────────────────────────────────
 
+/// Per-broker MQTT credentials (username + password).
+///
+/// Keyed by broker URL (the same string used in [`MqttSensorCfg::broker_url`]).
+/// The password is redacted in [`Debug`] output.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct MqttCredential {
+    /// MQTT broker username.
+    pub username: String,
+    /// MQTT broker password — redacted in [`Debug`].
+    pub password: String,
+}
+
+impl std::fmt::Debug for MqttCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MqttCredential")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// External credentials loaded from a separate, permission-restricted file.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Credentials {
@@ -590,6 +611,10 @@ pub struct Credentials {
     /// Samsung TV tokens indexed by host (IP or hostname).
     #[serde(default)]
     pub samsung: IndexMap<String, String>,
+
+    /// MQTT broker credentials indexed by broker URL.
+    #[serde(default)]
+    pub mqtt: IndexMap<String, MqttCredential>,
 }
 
 // ── Serde default function shims ────────────────────────────────────────────────
@@ -917,5 +942,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.daemon.web_port, Some(8080));
+    }
+
+    // ── MqttCredential Debug redaction ─────────────────────────────────────
+
+    #[test]
+    fn mqtt_credential_debug_redacts_password() {
+        let cred = MqttCredential {
+            username: "alice".into(),
+            password: "s3cret!".into(),
+        };
+        let debug_str = format!("{cred:?}");
+        // Username must appear.
+        assert!(
+            debug_str.contains("alice"),
+            "Debug should show username: {debug_str}"
+        );
+        // Password must NOT appear.
+        assert!(
+            !debug_str.contains("s3cret"),
+            "Debug MUST NOT leak password: {debug_str}"
+        );
+        // Redacted marker must be present.
+        assert!(
+            debug_str.contains("<redacted>"),
+            "Debug should show <redacted> marker: {debug_str}"
+        );
     }
 }

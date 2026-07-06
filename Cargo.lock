@@ -828,6 +828,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dormant-render"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "dormant-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dormant-sensors"
 version = "0.0.0"
 dependencies = [
@@ -904,6 +914,7 @@ dependencies = [
  "dormant-core",
  "dormant-displays",
  "dormant-doctor",
+ "dormant-render",
  "dormant-sensors",
  "dormant-web",
  "indexmap",

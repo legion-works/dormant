@@ -7,6 +7,7 @@ members = [
   "crates/dormantd",
   "crates/dormantctl",
   "crates/dormant-doctor",
+  "crates/dormant-render",
   "crates/dormant-web",
 ]
 

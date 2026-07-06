@@ -87,13 +87,17 @@ export interface ControllerHealth {
 /**
  * rust: rules.rs DisplaySnapshot
  * serde: `controllers` is `#[serde(default)]` (absent for legacy snapshots).
+ * `stage` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+ * (absent from legacy wire and omitted when None — back-compat).
  */
 export interface DisplaySnapshot {
-  phase: string; // grep-stable literal: "active" | "grace" | "blanking" | "blanked" | "waking"
+  phase: string; // grep-stable literal: "active" | "grace" | "blanking" | "blanked" | "waking" | "render_pending" | "staged"
   inhibited: boolean;
   paused: boolean;
   cmd_gen: number;
   controllers: ControllerHealth[];
+  /** Present only when the display is in the `staged` phase. */
+  stage?: { idx: number; kind: string } | null;
 }
 
 /**

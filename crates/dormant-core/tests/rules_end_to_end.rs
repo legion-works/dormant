@@ -1773,3 +1773,124 @@ async fn render_failure_falls_through_to_controller() {
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;
 }
+
+// ── Engine-level dwell-advance: StageTick driven by the real timer wheel ────────
+
+/// A ladder `[render_black dwell=30s, power_off]` must escalate from the render
+/// stage to the controller blank after the dwell elapses — and NOT before.
+/// This is the first engine-level test that exercises the timer wheel's
+/// `DisplayStageTick` path end-to-end (the `StageTick` → advance path has never
+/// run through the real engine timer wheel before — every prior ladder test uses
+/// `dwell: None`).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(start_paused = true)]
+async fn render_ladder_dwell_advances_to_controller_blank() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let cmd_sink = Arc::new(RecordingSink::new());
+    let render_sink = Arc::new(RecordingRenderSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), cmd_sink.clone());
+    let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    renders.insert(display.clone(), render_sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::RenderBlack,
+                    dwell: Some(Duration::from_secs(30)),
+                },
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                },
+            ],
+            timings: timings_grace_60s(),
+        }],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@10s → grace 60s → ladder entry at ~70s.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine_with_render(cfg, zones, execs, renders, script);
+
+    // Advance past the grace period (absent@10 + 60s grace = 70s) — the
+    // render sink should be called with Show(RenderBlack).
+    tokio::time::sleep(Duration::from_secs(72)).await;
+    // Give the spawned render task a moment to complete and the engine to
+    // process the RenderResult.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let render_log = render_sink.log();
+    let show_call = render_log.iter().find(|(_, c)| {
+        matches!(
+            c,
+            RenderCmd::Show {
+                kind: StageKind::RenderBlack,
+                ..
+            }
+        )
+    });
+    assert!(
+        show_call.is_some(),
+        "expected RenderSink::show(RenderBlack), got {render_log:?}"
+    );
+
+    // Before the dwell expires (70s + 30s = 100s), no controller blank
+    // must have fired — the machine should be in the Staged phase.
+    tokio::time::sleep(Duration::from_secs(25)).await; // now at ~97s
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cmd_log_before = cmd_sink.log();
+    let blanks_before = cmd_log_before
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert_eq!(
+        blanks_before, 0,
+        "no controller blank must fire before dwell elapses (log={cmd_log_before:?})"
+    );
+
+    // Advance past the dwell deadline (100s).
+    tokio::time::sleep(Duration::from_secs(10)).await; // now at ~107s
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let cmd_log = cmd_sink.log();
+    let blank = cmd_log
+        .iter()
+        .find(|(_, c)| matches!(c, SinkCmd::Blank(BlankMode::PowerOff)));
+    assert!(
+        blank.is_some(),
+        "expected Blank(PowerOff) escalation after dwell, got {cmd_log:?}"
+    );
+    let (blank_at, _) = blank.unwrap();
+    // Should fire at ~100s (70s entry + 30s dwell).
+    assert!(
+        blank_at.abs_diff(Duration::from_secs(100)) <= Duration::from_secs(5),
+        "blank at {blank_at:?}, expected ~100s (entry@70 + dwell 30s)"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}

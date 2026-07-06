@@ -1131,6 +1131,22 @@ impl DisplayStateMachine {
         self.cmd_gen
     }
 
+    /// Return the active ladder stage when the machine is in [`Phase::Staged`].
+    ///
+    /// Looks up the stage kind from the machine's configured ladder by the
+    /// index carried in the `Staged` phase variant.  Returns `None` for every
+    /// other phase (including `RenderPending`, which is a transient state).
+    /// Also returns `None` if the index is out of bounds (defensive — should
+    /// never happen in normal operation).
+    #[must_use]
+    pub fn current_stage(&self) -> Option<(usize, StageKind)> {
+        if let Phase::Staged { idx, .. } = self.phase {
+            self.ladder.get(idx).map(|s| (idx, s.kind))
+        } else {
+            None
+        }
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
 
     /// Freeze the grace countdown, capturing the remaining time.

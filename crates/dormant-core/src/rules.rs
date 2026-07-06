@@ -46,7 +46,7 @@ use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
 use crate::traits::{CommandSink, RenderSink};
 use crate::types::{
     BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
-    Tick, Timestamp, ZoneId,
+    StageKind, Tick, Timestamp, ZoneId,
 };
 use crate::zone::ZoneEngine;
 
@@ -182,6 +182,15 @@ pub struct ControllerHealth {
     pub detail: Option<String>,
 }
 
+/// The active ladder stage of a display in the `staged` phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageInfo {
+    /// Zero-based index into the display's normalized ladder.
+    pub idx: usize,
+    /// The stage kind at that index.
+    pub kind: StageKind,
+}
+
 /// A display as seen by a [`StateSnapshot`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DisplaySnapshot {
@@ -200,6 +209,11 @@ pub struct DisplaySnapshot {
     /// field (serde back-compat).
     #[serde(default)]
     pub controllers: Vec<ControllerHealth>,
+    /// The active ladder stage when the display is in the `staged` phase.
+    /// `None` for every other phase (and for legacy wire — the key is
+    /// omitted when `None`, byte-identical to a pre-stage snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<StageInfo>,
 }
 
 /// A point-in-time view of engine state, returned by [`ControlMsg::Snapshot`].
@@ -860,6 +874,7 @@ impl RulesEngine {
                         paused: m.overlays().paused.is_some(),
                         cmd_gen: m.cmd_gen(),
                         controllers,
+                        stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
                     },
                 ));
             }
@@ -1182,6 +1197,57 @@ mod tests {
         let legacy = r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0}"#;
         let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
         assert!(snap.controllers.is_empty());
+    }
+
+    #[test]
+    fn display_snapshot_deserializes_legacy_without_stage() {
+        // A DisplaySnapshot JSON without the "stage" key must parse with
+        // stage=None (serde back-compat — same as doctor_report + controllers).
+        let legacy =
+            r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0,"controllers":[]}"#;
+        let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.stage.is_none());
+    }
+
+    #[test]
+    fn display_snapshot_serialize_omits_stage_when_none() {
+        // When stage is None the key must be absent from the wire (byte-back-compat
+        // with pre-stage readers — same skip_serializing_if pattern as doctor_report).
+        let snap = DisplaySnapshot {
+            phase: "active".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            controllers: vec![],
+            stage: None,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("stage"));
+    }
+
+    #[test]
+    fn display_snapshot_staged_roundtrips() {
+        // A Staged snapshot round-trips with a pinned wire shape.
+        let snap = DisplaySnapshot {
+            phase: "staged".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: vec![],
+            stage: Some(StageInfo {
+                idx: 1,
+                kind: StageKind::RenderBlack,
+            }),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        // Wire shape: idx=1, kind="render_black"
+        assert!(json.contains(r#""idx":1"#));
+        assert!(json.contains(r#""kind":"render_black""#));
+        let back: DisplaySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phase, "staged");
+        let si = back.stage.unwrap();
+        assert_eq!(si.idx, 1);
+        assert_eq!(si.kind, StageKind::RenderBlack);
     }
 
     #[test]

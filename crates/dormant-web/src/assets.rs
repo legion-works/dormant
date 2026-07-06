@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
 /// Compiled-in frontend bundle.  The folder must exist at build time;
-/// before Task 8 lands a placeholder `index.html` keeps it non-empty.
+/// a placeholder `index.html` keeps it non-empty until the real build.
 #[derive(RustEmbed)]
 #[folder = "webui/dist"]
 struct Assets;

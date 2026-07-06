@@ -163,8 +163,8 @@ impl DisplayExecutor {
 
     /// Union of every controller's `supported_modes()`.
     ///
-    /// Task 16 will validate that `DisplayConfig::blank_mode` (and the
-    /// degraded-mode fallback) are both members of this set.
+    /// Used to validate that a display config's `blank_mode` and
+    /// degraded-mode fallback are members of this set.
     #[must_use]
     pub fn effective_modes(&self) -> Vec<BlankMode> {
         let mut seen: HashSet<BlankMode> = HashSet::new();

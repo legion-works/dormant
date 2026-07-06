@@ -326,14 +326,13 @@ impl App {
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
 
-        // ── IPC server (optional, disabled for tests; Unix-only) ──────────
         // The doctor service is shared by the IPC server (for
-        // `IpcRequest::Doctor`) and the future web server (Task 5 for the
-        // `POST /api/doctor` route).  Construct it once here from the
-        // cloned config/creds watches + the front control channel so both
-        // surfaces see the SAME instance — the singleflight coalesce then
-        // dedupes a simultaneous CLI `dormantctl doctor` and a browser
-        // click on "Run Doctor".
+        // `IpcRequest::Doctor`) and the web server (for the
+        // `POST /api/doctor` route).  Construct it once here from
+        // cloned config/creds watches + the front control channel so
+        // both surfaces see the SAME instance — the singleflight
+        // coalesce then dedupes a simultaneous CLI `dormantctl doctor`
+        // and a browser click on "Run Doctor".
         let doctor_service =
             DoctorService::new(front_ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 

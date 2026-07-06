@@ -8,18 +8,19 @@
  *   POST /api/wake    → JSON { display: "<id>" }
  *   POST /api/pause   → JSON { rule?: string, duration_s?: number }
  *   POST /api/resume  → JSON { rule?: string }
- *   POST /api/reload  → no body
- *   POST /api/doctor  → no body, returns DoctorReport
+ *   POST /api/reload  → no body extractor; Content-Type header required by guard
+ *   POST /api/doctor  → no body extractor; Content-Type header required by guard
+ *
+ * All POSTs MUST send Content-Type: application/json — the security
+ * guard (security.rs:60-71) rejects POSTs without it (415).
  */
 import type { StateSnapshot, ConfigResponse, DoctorReport } from "./types";
 
 const BASE = "/api";
+const JSON_CT = { "Content-Type": "application/json" };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + url, {
-    headers: { Accept: "application/json" },
-    ...init,
-  });
+  const res = await fetch(BASE + url, init);
 
   if (!res.ok) {
     const body = await res.text().catch(() => "(no body)");
@@ -41,7 +42,7 @@ export function getConfig(): Promise<ConfigResponse> {
 export function postBlank(display: string): Promise<void> {
   return request<void>("/blank", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_CT,
     body: JSON.stringify({ display }),
   });
 }
@@ -50,7 +51,7 @@ export function postBlank(display: string): Promise<void> {
 export function postWake(display: string): Promise<void> {
   return request<void>("/wake", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_CT,
     body: JSON.stringify({ display }),
   });
 }
@@ -62,7 +63,7 @@ export function postPause(opts?: {
 }): Promise<void> {
   return request<void>("/pause", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_CT,
     body: JSON.stringify({
       ...(opts?.rule != null ? { rule: opts.rule } : {}),
       ...(opts?.duration_s !== undefined ? { duration_s: opts.duration_s } : {}),
@@ -74,17 +75,17 @@ export function postPause(opts?: {
 export function postResume(opts?: { rule?: string }): Promise<void> {
   return request<void>("/resume", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_CT,
     body: JSON.stringify(opts?.rule != null ? { rule: opts.rule } : {}),
   });
 }
 
 /** POST /api/reload — hot-reload the daemon config. */
 export function postReload(): Promise<void> {
-  return request<void>("/reload", { method: "POST" });
+  return request<void>("/reload", { method: "POST", headers: JSON_CT, body: "{}" });
 }
 
 /** POST /api/doctor — run the diagnosis probes. */
 export function runDoctor(): Promise<DoctorReport> {
-  return request<DoctorReport>("/doctor", { method: "POST" });
+  return request<DoctorReport>("/doctor", { method: "POST", headers: JSON_CT, body: "{}" });
 }

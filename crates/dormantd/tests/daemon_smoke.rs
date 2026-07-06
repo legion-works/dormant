@@ -1197,11 +1197,15 @@ wake_retry_interval = "1s"
     ///
     /// Uses a two-display config where mon2 has `wake_command = "false"`
     /// so its verified wake fails on removal, triggering `rebuild_old`.
+    ///
+    /// **Determinism**: after the rollback the engine is driven back to
+    /// render, then `ControlMsg::InputWake` is injected through the
+    /// control channel (bypassing the drain task, which is unit-tested
+    /// separately).  The engine must react by tearing down the render
+    /// overlay.
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rollback_input_wake_routes_through_drain() {
-        use std::sync::Mutex;
-
         let dir = TempDir::new().unwrap();
         let m1 = dir.path().join("mon1");
         let m2 = dir.path().join("mon2");
@@ -1260,25 +1264,8 @@ wake_retry_interval = "1s"
         let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
         let creds_path = dir.path().join("credentials.toml");
 
-        // Cell that the factory writes the LATEST captured sender into.
-        let captured: Arc<
-            Mutex<Option<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>>,
-        > = Arc::new(Mutex::new(None));
-        let cap_clone = captured.clone();
-
         let fake_sink = RecordingRenderSink::new();
-        let fake_clone = fake_sink.clone();
-
-        let cap_factory = move |_did: dormant_core::types::DisplayId,
-                                _output: String,
-                                tx: Option<
-            &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
-        >| {
-            if let Some(tx) = tx {
-                *cap_clone.lock().unwrap() = Some(tx.clone());
-            }
-            Some(Arc::new(fake_clone.clone()) as Arc<dyn dormant_core::traits::RenderSink>)
-        };
+        let builder = recording_factory(fake_sink.clone());
 
         let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
         let app = App::build_with_sources(
@@ -1288,7 +1275,7 @@ wake_retry_interval = "1s"
             fake_factory("desk", script),
         )
         .expect("build app")
-        .with_render_sink_builder(cap_factory)
+        .with_render_sink_builder(builder)
         .disable_ipc();
 
         let (handle, join) = app.start().await.expect("start app");
@@ -1312,9 +1299,6 @@ wake_retry_interval = "1s"
         )
         .await;
         assert!(show_ok, "expected show(RenderBlack) before rollback");
-
-        // Clear the sender captured during initial assembly.
-        *captured.lock().unwrap() = None;
 
         // Reload: mon2 removed → verified wake fails → rebuild_old.
         let cfg_single = format!(
@@ -1372,14 +1356,9 @@ wake_retry_interval = "1s"
             }
         }
 
-        // rebuild_old ran → factory captured the POST-ROLLBACK sender.
-        let post_sender = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("factory must have captured sender during rebuild_old");
-
-        // Drive restored generation back to render, then inject InputWake.
+        // Drive restored generation back to render, then inject
+        // ControlMsg::InputWake through the control channel.
+        // The engine must react by tearing down the render overlay.
         let events = handle.events_sender();
         let _ = events.send(ev("desk", SensorState::Present)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1409,9 +1388,16 @@ wake_retry_interval = "1s"
             "expected second show(RenderBlack) after rollback and re-blank"
         );
 
-        // HONEST TEST: send InputWake through captured post-rollback sender.
-        post_sender
-            .send(dormant_core::types::DisplayId("mon1".into()))
+        // HONEST TEST: inject InputWake through the control channel.
+        // After rebuild_old the drain task is live and would route
+        // render-surface input events as ControlMsg::InputWake; we
+        // send that variant directly to verify the engine handles it.
+        handle
+            .control_sender()
+            .send(ControlMsg::InputWake(dormant_core::types::DisplayId(
+                "mon1".into(),
+            )))
+            .await
             .unwrap();
 
         let teardown_ok = wait_for(

@@ -278,6 +278,28 @@
   color: var(--text-strong);
 }
 
+.dash-display-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 5px;
+  padding-left: 1px;
+}
+
+.dash-display-row__blank {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.dash-display-row__ctl {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
 .dash-display-row__actions {
   display: flex;
   align-items: center;

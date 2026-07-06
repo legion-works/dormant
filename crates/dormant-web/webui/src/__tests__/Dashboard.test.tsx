@@ -117,7 +117,7 @@ describe("Dashboard", () => {
     expect(screen.getByText("ANY")).toBeInTheDocument();
   });
 
-  it("renders display rows with blank/wake buttons", async () => {
+  it("renders display rows with blank/wake buttons and config metadata", async () => {
     render(<Dashboard />);
 
     await waitFor(() => {
@@ -126,6 +126,10 @@ describe("Dashboard", () => {
 
     expect(screen.getAllByText("blank").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("wake").length).toBeGreaterThanOrEqual(1);
+
+    // MUST 1: blank_mode and controller chain from config
+    expect(screen.getByText("power_off")).toBeInTheDocument();
+    expect(screen.getByText("ddcci")).toBeInTheDocument();
   });
 
   it("shows section headers", async () => {

@@ -14,7 +14,6 @@
  *   inhibited                                → --purple-400 (purple)
  *   fail | wake_retry                        → --danger (red)
  */
-import type { CSSProperties } from "react";
 import { statusLabel } from "./status";
 
 export type StatusKind =
@@ -78,7 +77,6 @@ export default function StatusChip({ kind, label, dot = true, className = "" }: 
   return (
     <span
       className={`status-chip status-chip--${cls}${className ? " " + className : ""}`}
-      style={{ "--chip-color": `var(--status-${cls}-fg)` } as CSSProperties}
     >
       {dot && <span className="status-chip__dot" />}
       <span>{displayLabel}</span>

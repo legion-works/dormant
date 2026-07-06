@@ -15,7 +15,6 @@ import { postBlank, postWake } from "../../api/client";
 import { useCallback, useState } from "react";
 import "./Dashboard.css";
 
-/* ── Stat cards ── */
 
 interface StatCardProps {
   label: string;
@@ -42,7 +41,6 @@ function StatCard({ label, value, sub, dotColor, subColor }: StatCardProps) {
   );
 }
 
-/* ── Section header ── */
 
 interface SectionHeaderProps {
   title: string;
@@ -61,7 +59,6 @@ function SectionHeader({ title, caption, right }: SectionHeaderProps) {
   );
 }
 
-/* ── Sensor row (Dashboard column) ── */
 
 interface SensorRowProps {
   sensor: SensorSnapshot;
@@ -86,7 +83,6 @@ function SensorRow({ sensor, typeLabel }: SensorRowProps) {
   );
 }
 
-/* ── Zone row (Dashboard column) ── */
 
 interface ZoneRowProps {
   zone: ZoneSnapshot;
@@ -115,14 +111,17 @@ function ZoneRow({ zone, modeLabel, membersLabel }: ZoneRowProps) {
   );
 }
 
-/* ── Display row (Dashboard column) ── */
 
 interface DashDisplayRowProps {
   id: string;
   snap: DisplaySnapshot;
+  /** Blank mode from config (e.g. "power_off"). */
+  blankMode: string;
+  /** Configured controller names from config. */
+  controllers: string[];
 }
 
-function DashDisplayRow({ id, snap }: DashDisplayRowProps) {
+function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProps) {
   const [blanking, setBlanking] = useState(false);
   const [waking, setWaking] = useState(false);
 
@@ -144,6 +143,12 @@ function DashDisplayRow({ id, snap }: DashDisplayRowProps) {
         <span className="dash-display-row__id">{id}</span>
         <StatusChip kind={snap.phase} />
       </div>
+      <div className="dash-display-row__meta">
+        <span className="dash-display-row__blank">{blankMode}</span>
+        {controllers.length > 0 && (
+          <span className="dash-display-row__ctl">{controllers.join(" → ")}</span>
+        )}
+      </div>
       <div className="dash-display-row__actions">
         <button className="dash-btn dash-btn--neutral" onClick={handleBlank} disabled={blanking}>
           {blanking ? "…" : "blank"}
@@ -156,7 +161,6 @@ function DashDisplayRow({ id, snap }: DashDisplayRowProps) {
   );
 }
 
-/* ── Recent activity row (Dashboard bottom) ── */
 
 interface RecentEvent {
   time: string;
@@ -178,10 +182,9 @@ function RecentRow({ ev }: { ev: RecentEvent }) {
   );
 }
 
-/* ── Main Dashboard component ── */
 
 export default function Dashboard() {
-  const { loading, error, snapshot, config, sensorConfigs, zoneConfigs } = useDashboardData();
+  const { loading, error, snapshot, config, sensorConfigs, zoneConfigs, displayConfigs } = useDashboardData();
   const navigate = useNavigate();
 
   if (loading) {
@@ -198,7 +201,6 @@ export default function Dashboard() {
 
   const { sensors, zones, displays } = snapshot;
 
-  // ── Stat row ──
   const activeDisplays = displays.filter(([, d]) => d.phase === "active" || d.phase === "waking").length;
   const blankedDisplays = displays.length - activeDisplays;
   const onlineSensors = sensors.filter((s) => s.state !== "unavailable").length;
@@ -215,7 +217,6 @@ export default function Dashboard() {
     { label: "OLED guard", value: "Active", sub: "protecting on vacancy", dotColor: dotGreen },
   ];
 
-  // ── Sensor type label helper ──
   const sensorTypeLabel = (sensor: SensorSnapshot): string => {
     const cfg = sensorConfigs[sensor.id];
     if (!cfg) return "—";
@@ -226,7 +227,7 @@ export default function Dashboard() {
     return t;
   };
 
-  // ── Recent events (synthesized from sensor state changes for now) ──
+  // Recent events synthesized from latest state changes for the activity feed.
   const recentEvents: RecentEvent[] = [];
   for (const s of sensors) {
     if (s.last_seen_secs_ago < 60) {
@@ -260,14 +261,14 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard">
-      {/* ── Stat row ── */}
+      {/* Stat row */}
       <div className="stat-row">
         {stats.map((s) => (
           <StatCard key={s.label} {...s} />
         ))}
       </div>
 
-      {/* ── Signal flow ── */}
+      {/* Signal flow */}
       <SectionHeader title="Signal flow" caption="sensors → zones → displays" />
 
       <div className="signal-grid">
@@ -303,13 +304,24 @@ export default function Dashboard() {
         {/* Displays column */}
         <Card>
           <div className="column-header">Displays</div>
-          {displays.map(([id, snap]) => (
-            <DashDisplayRow key={id} id={id} snap={snap} />
-          ))}
+          {displays.map(([id, snap]) => {
+            const dc = displayConfigs[id];
+            const blankMode = dc?.blank_mode ?? "—";
+            const controllers = dc?.controllers ?? [];
+            return (
+              <DashDisplayRow
+                key={id}
+                id={id}
+                snap={snap}
+                blankMode={blankMode}
+                controllers={controllers}
+              />
+            );
+          })}
         </Card>
       </div>
 
-      {/* ── Recent activity ── */}
+      {/* Recent activity */}
       <SectionHeader
         title="Recent activity"
         right={

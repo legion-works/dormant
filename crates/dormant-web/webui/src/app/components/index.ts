@@ -1,7 +1,6 @@
 /**
- * Shared component barrel — all views and Batch B (Events/Config/Doctor)
- * import from here.  Add new reusable components to this file as they
- * are extracted.
+ * Shared component barrel — all views import from here.
+ * Add new reusable components as they are extracted.
  */
 export { default as StatusChip } from "./StatusChip";
 export type { StatusKind } from "./StatusChip";

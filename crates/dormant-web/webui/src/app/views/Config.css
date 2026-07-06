@@ -1,0 +1,265 @@
+/* Config view — file viewer + inventory + validation.
+   All colors via DS tokens; zero hardcoded hex. */
+
+.config {
+  animation: dmRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.config-loading,
+.config-error {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: var(--space-6);
+}
+
+.config-error {
+  color: var(--danger);
+}
+
+
+.config-banner {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border: 1px solid color-mix(in oklab, var(--accent-warm) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  margin-bottom: 14px;
+}
+
+
+.config-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 16px;
+  align-items: start;
+}
+
+
+.config-file {
+  background: var(--glass-fill-strong);
+  border: 1px solid var(--glass-stroke);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+
+.config-file__header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 16px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 10%, transparent);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+}
+
+.config-file__icon {
+  flex-shrink: 0;
+}
+
+.config-file__path {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-file__status {
+  margin-left: auto;
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
+.config-file__status--ok {
+  color: var(--success);
+}
+
+.config-file__status--warning {
+  color: var(--warning);
+}
+
+.config-file__status--danger {
+  color: var(--danger);
+}
+
+
+.config-file__body {
+  padding: 16px 18px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.85;
+  color: var(--text-body);
+  overflow-x: auto;
+}
+
+.config-file__line {
+  white-space: pre;
+  min-height: 1.85em;
+}
+
+/* TOML syntax classes */
+.t-pre {
+  /* leading whitespace — no color override */
+}
+
+.t-key {
+  color: var(--blue-400);
+}
+
+.t-eq {
+  color: var(--text-muted);
+}
+
+.t-val {
+  /* color set inline via style prop */
+}
+
+.t-comment {
+  color: var(--text-faint);
+}
+
+.t-plain {
+  color: var(--text-body);
+}
+
+
+.config-right {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+
+.config-inventory {
+  padding: 16px 18px;
+}
+
+.config-inventory__title {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  margin-bottom: 13px;
+}
+
+.config-inventory__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+}
+.config-inventory__row:last-child {
+  border-bottom: none;
+}
+
+.config-inventory__key {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  width: 92px;
+  flex-shrink: 0;
+}
+
+.config-inventory__val {
+  font-size: 13px;
+  color: var(--text-strong);
+  flex-shrink: 0;
+}
+
+.config-inventory__names {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--success);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+
+.config-validation {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 15px 18px;
+  border-radius: var(--radius-lg);
+}
+
+.config-validation--ok {
+  background: color-mix(in oklab, var(--success) 7%, transparent);
+  border: 1px solid color-mix(in oklab, var(--success) 28%, transparent);
+}
+
+.config-validation--warning {
+  background: color-mix(in oklab, var(--warning) 7%, transparent);
+  border: 1px solid color-mix(in oklab, var(--warning) 28%, transparent);
+}
+
+.config-validation--danger {
+  background: color-mix(in oklab, var(--danger) 7%, transparent);
+  border: 1px solid color-mix(in oklab, var(--danger) 28%, transparent);
+}
+
+.config-validation__icon {
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.config-validation--ok .config-validation__icon {
+  color: var(--success);
+}
+
+.config-validation--warning .config-validation__icon {
+  color: var(--warning);
+}
+
+.config-validation--danger .config-validation__icon {
+  color: var(--danger);
+}
+
+.config-validation__text {
+  font-size: 12.5px;
+  color: var(--text-body);
+  line-height: 1.6;
+}
+
+
+.config-reload-btn {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--accent-muted);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-md);
+  padding: 10px 0;
+  cursor: pointer;
+  text-align: center;
+  transition: background var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease);
+}
+.config-reload-btn:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent) 24%, transparent);
+}
+.config-reload-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
+@keyframes dmRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .config { animation: none; }
+}

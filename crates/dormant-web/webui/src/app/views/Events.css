@@ -1,0 +1,126 @@
+/* Events view — live WS event log.
+   Colors per DS tokens; zero hardcoded hex. */
+
+.events {
+  animation: dmRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+
+.events-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.events-header__left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-strong);
+}
+
+.events-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.events-pulse--live {
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 80%, transparent);
+  animation: eventsPulse 1.8s ease infinite;
+}
+
+.events-header__label {
+  color: var(--text-body);
+}
+
+.events-header__count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-faint);
+}
+
+
+.events-banner {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  margin-bottom: 10px;
+}
+
+.events-banner--lag {
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
+}
+
+
+.events-row {
+  display: grid;
+  grid-template-columns: 82px 118px 1fr;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 16px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.events-row:last-child {
+  border-bottom: none;
+}
+
+.events-row__time {
+  color: var(--text-faint);
+}
+
+.events-row__badge {
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  text-align: center;
+  letter-spacing: var(--tracking-wide);
+}
+
+.events-row__msg {
+  color: var(--text-body);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+.events-empty {
+  padding: 16px 18px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+
+@keyframes eventsPulse {
+  0%   { opacity: 1; transform: scale(1); }
+  50%  { opacity: 0.4; transform: scale(0.85); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+
+@keyframes dmRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .events { animation: none; }
+  .events-pulse--live { animation: none; }
+}

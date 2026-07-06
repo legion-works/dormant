@@ -119,6 +119,21 @@ pub struct DaemonConfig {
     /// Debounce window coalescing rapid config-file changes into one reload.
     #[serde(default = "default_reload_debounce", with = "humantime_serde")]
     pub reload_debounce: Duration,
+
+    /// TCP port for the M2 web UI. `None` disables the web UI even when
+    /// compiled with `--features web-ui`.
+    #[serde(default)]
+    pub web_port: Option<u16>,
+
+    /// Bind address for the web UI. Defaults to loopback; a non-loopback
+    /// value requires `web_allow_nonloopback`.
+    #[serde(default = "default_web_bind")]
+    pub web_bind: std::net::IpAddr,
+
+    /// Opt-in to bind the web UI on a non-loopback address (widens the
+    /// unauthenticated surface — see spec §8).
+    #[serde(default)]
+    pub web_allow_nonloopback: bool,
 }
 
 impl Default for DaemonConfig {
@@ -131,6 +146,9 @@ impl Default for DaemonConfig {
             idle_time_unit: IdleTimeUnit::default(),
             idle_source: IdleSource::default(),
             reload_debounce: defaults::RELOAD_DEBOUNCE,
+            web_port: None,
+            web_bind: defaults::WEB_BIND_DEFAULT,
+            web_allow_nonloopback: false,
         }
     }
 }
@@ -630,6 +648,9 @@ fn default_wake_retry_backoff() -> Duration {
 fn default_wake_retry_interval() -> Duration {
     defaults::WAKE_RETRY_INTERVAL
 }
+fn default_web_bind() -> std::net::IpAddr {
+    defaults::WEB_BIND_DEFAULT
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -877,5 +898,24 @@ mod tests {
         let s = ve.to_string();
         assert!(s.starts_with("config error [missing credential]:"));
         assert!(s.contains("192.168.1.50"));
+    }
+
+    // ── Web-UI config keys ──────────────────────────────────────────────────
+
+    #[test]
+    fn daemon_web_keys_parse_with_defaults() {
+        let cfg: Config = toml::from_str("config_version = 1\n[daemon]\n").unwrap();
+        assert_eq!(cfg.daemon.web_port, None);
+        assert_eq!(cfg.daemon.web_bind, std::net::IpAddr::from([127, 0, 0, 1]));
+        assert!(!cfg.daemon.web_allow_nonloopback);
+    }
+
+    #[test]
+    fn daemon_web_keys_parse_explicit() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[daemon]\nweb_port = 8080\nweb_bind = \"127.0.0.1\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.daemon.web_port, Some(8080));
     }
 }

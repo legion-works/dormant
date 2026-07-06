@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::{ControlMsg, StateSnapshot};
+use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -32,6 +33,9 @@ const MAX_LINE_BYTES: usize = 1_048_576;
 /// the connection succeeds the old daemon is alive and we error out; if it
 /// fails (dead daemon) we unlink and bind fresh.
 ///
+/// `doctor_service` is intercepted by the connection handler for
+/// [`IpcRequest::Doctor`] (a non-engine path — see the module docstring).
+///
 /// # Errors
 ///
 /// - Bind failure (address in use by a live daemon, permission denied, …).
@@ -41,6 +45,7 @@ pub fn spawn(
     socket_path: &Path,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_trigger_tx: mpsc::Sender<()>,
+    doctor_service: DoctorService,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -117,7 +122,15 @@ pub fn spawn(
 
     let socket_owned = socket_path.to_path_buf();
     let handle = tokio::spawn(async move {
-        run(listener, ctl_tx, reload_trigger_tx, cancel, &socket_owned).await;
+        run(
+            listener,
+            ctl_tx,
+            reload_trigger_tx,
+            doctor_service,
+            cancel,
+            &socket_owned,
+        )
+        .await;
     });
 
     Ok(handle)
@@ -128,6 +141,7 @@ async fn run(
     listener: UnixListener,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_trigger_tx: mpsc::Sender<()>,
+    doctor_service: DoctorService,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -144,7 +158,8 @@ async fn run(
                     Ok((stream, addr)) => {
                         let ctl = ctl_tx.clone();
                         let reload = reload_trigger_tx.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload));
+                        let doctor = doctor_service.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -163,6 +178,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_trigger_tx: mpsc::Sender<()>,
+    doctor_service: DoctorService,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -219,6 +235,15 @@ async fn handle_connection(
             IpcRequest::Reload => {
                 let _ = reload_trigger_tx.send(()).await;
                 let resp = IpcResponse::ok(None);
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::Doctor => {
+                // Intercepted before the engine path: doctor reports
+                // owned-state from the live snapshot + active network
+                // probes, never re-opens held handles, and is
+                // coalesced across concurrent callers.
+                let report = doctor_service.run().await;
+                let resp = IpcResponse::doctor(report);
                 let _ = write_json(&mut writer, &resp).await;
             }
         }
@@ -426,9 +451,14 @@ async fn write_line(
 
 #[cfg(test)]
 mod tests {
+    use indexmap::IndexMap;
     use std::os::unix::fs::PermissionsExt;
-    use tokio::sync::mpsc;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
+
+    use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
+    use dormant_doctor::DoctorService;
 
     /// Minimal fake engine for unit tests.
     fn fake_engine() -> (mpsc::Sender<super::ControlMsg>, CancellationToken) {
@@ -437,6 +467,23 @@ mod tests {
         // Drop rx immediately — the IPC server will get send errors and
         // respond with "engine not available", which is fine for these tests.
         (tx, cancel)
+    }
+
+    /// Build a throwaway `DoctorService` wired to a dummy channel/watch
+    /// (these tests don't exercise the doctor path).
+    fn fake_doctor(ctl_tx: mpsc::Sender<super::ControlMsg>) -> DoctorService {
+        let (config_tx, config_rx) = watch::channel(Arc::new(Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        }));
+        let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
+        drop(config_tx);
+        drop(creds_tx);
+        DoctorService::new(ctl_tx, config_rx, creds_rx)
     }
 
     #[test]
@@ -471,8 +518,9 @@ mod tests {
 
         let (ctl_tx, cancel) = fake_engine();
         let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+        let doctor = fake_doctor(ctl_tx.clone());
 
-        let result = crate::ipc::spawn(&socket_path, ctl_tx, reload_tx, cancel);
+        let result = crate::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel);
         assert!(result.is_err(), "group-writable parent should be rejected");
         let err = format!("{}", result.unwrap_err());
         assert!(
@@ -488,8 +536,9 @@ mod tests {
 
         let (ctl_tx, cancel) = fake_engine();
         let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+        let doctor = fake_doctor(ctl_tx.clone());
 
-        let result = crate::ipc::spawn(&socket_path, ctl_tx, reload_tx, cancel.clone());
+        let result = crate::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel.clone());
         assert!(
             result.is_ok(),
             "plain tempdir should be accepted: {result:?}"

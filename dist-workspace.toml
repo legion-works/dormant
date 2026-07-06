@@ -22,3 +22,9 @@ hosting = "github"
 install-updater = false
 # Generate checksums for release artifacts
 checksums = true
+# Build with the web UI embedded. The release CI must build the frontend
+# dist first (the webui job uploads it as an artifact; the Rust
+# build job downloads it into crates/dormant-web/webui/dist/ before
+# running dist build).
+features = ["web-ui"]
+all-features = false

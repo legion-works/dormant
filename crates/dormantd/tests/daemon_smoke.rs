@@ -6,7 +6,9 @@
 //! real-clock; assertions are on ordering and presence, not exact ms.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use dormant_core::config::Strictness;
@@ -18,6 +20,7 @@ use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{App, ReloadOutcome, validate_only};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
+use tracing_subscriber::fmt::MakeWriter;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -105,6 +108,73 @@ wake_retry_interval = "1s"
 async fn shutdown(handle: dormantd::app::AppHandle, join: tokio::task::JoinHandle<()>) {
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
+
+/// Write a credentials file with correct 0o600 permissions (Unix).
+fn write_credentials(dir: &Path, toml: &str) -> PathBuf {
+    let path = dir.join("credentials.toml");
+    fs::write(&path, toml).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
+/// The global capture buffer, initialised once per process.
+static CAPTURE: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
+/// Install a global tracing subscriber that feeds into `CAPTURE`
+/// (idempotent — `OnceLock` guarantees single init).
+fn install_capture_subscriber() {
+    CAPTURE.get_or_init(|| Mutex::new(Vec::new()));
+    // Set global only once — ignore subsequent calls.
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(CaptureWriter)
+            .finish(),
+    );
+}
+
+/// A `MakeWriter` + `io::Write` that feeds into the global `OnceLock<Mutex<Vec<u8>>>`.
+#[derive(Clone)]
+struct CaptureWriter;
+
+impl io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        CAPTURE
+            .get()
+            .expect("capture subscriber not installed")
+            .lock()
+            .unwrap()
+            .write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        CAPTURE
+            .get()
+            .expect("capture subscriber not installed")
+            .lock()
+            .unwrap()
+            .flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        CaptureWriter
+    }
+}
+
+/// Drain the capture buffer (clears it) and return its contents.
+fn drain_capture() -> String {
+    CAPTURE.get().map_or(String::new(), |buf| {
+        let mut guard = buf.lock().unwrap();
+        let s = String::from_utf8(guard.clone()).unwrap_or_default();
+        guard.clear();
+        s
+    })
 }
 
 // ── 1: blank then wake ─────────────────────────────────────────────────────────
@@ -597,6 +667,275 @@ async fn ruleless_display_verified_wake() {
         wait_for(|| count(&m2, 'W') >= 1, Duration::from_secs(3)).await,
         "rule-less dropped display must get a verified wake via its old executor, mon2={:?}",
         read(&m2)
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── 8: config_watch updates on successful reload only ─────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_watch_updates_on_successful_reload_only() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    let mut config_watch = handle.config_watch();
+    let initial_holdoff = config_watch.borrow().daemon.startup_holdoff;
+    assert_eq!(initial_holdoff, Duration::from_secs(0));
+
+    // Wait for the initial blank so the run loop has fully settled.
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "first blank should occur"
+    );
+
+    // Write a valid config with a different startup_holdoff and reload.
+    let modified = one_display_config(&marker, "400ms")
+        .replace("startup_holdoff = \"0s\"", "startup_holdoff = \"5s\"");
+    fs::write(&cfg_path, &modified).unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    // The watch should deliver the updated config.
+    let changed = tokio::time::timeout(Duration::from_secs(2), config_watch.changed())
+        .await
+        .expect("watch changed in time");
+    assert!(
+        changed.is_ok(),
+        "config watch must reflect successful reload"
+    );
+    assert_eq!(
+        config_watch.borrow().daemon.startup_holdoff,
+        Duration::from_secs(5)
+    );
+
+    // Now trigger a rejected reload — the watch must NOT change.
+    fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
+    }
+
+    // The watch should NOT have changed after a rejected reload.
+    // Because watch::changed() would hang if no update is sent, we use
+    // a short timeout to confirm no update arrives.
+    let no_change = tokio::time::timeout(Duration::from_millis(300), config_watch.changed()).await;
+    assert!(
+        no_change.is_err(),
+        "config watch must NOT update after a rejected reload"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── 9: creds_watch updates on successful reload only ───────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creds_watch_updates_on_successful_reload_only() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = write_credentials(dir.path(), "ha_token = \"initial\"");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    let mut creds_watch = handle.creds_watch();
+    assert_eq!(creds_watch.borrow().ha_token, Some("initial".to_string()));
+
+    // Wait for the initial blank so the run loop has fully settled.
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "first blank should occur"
+    );
+
+    // Update the credentials and reload — watch must see the new value.
+    let _creds_path = write_credentials(dir.path(), "ha_token = \"updated\"");
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    let changed = tokio::time::timeout(Duration::from_secs(2), creds_watch.changed())
+        .await
+        .expect("creds watch changed in time");
+    assert!(
+        changed.is_ok(),
+        "creds watch must reflect successful reload"
+    );
+    assert_eq!(creds_watch.borrow().ha_token, Some("updated".to_string()));
+
+    // Trigger a rejected reload — creds watch must NOT change.
+    fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
+    }
+
+    let no_change = tokio::time::timeout(Duration::from_millis(300), creds_watch.changed()).await;
+    assert!(
+        no_change.is_err(),
+        "creds watch must NOT update after a rejected reload"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── 10: web_nonloopback_enabled warning fires at startup ───────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_nonloopback_warning_fires_at_startup() {
+    install_capture_subscriber();
+    drain_capture(); // discard any startup noise from prior tests
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+
+    // Build config with web_allow_nonloopback = true.
+    let base = one_display_config(&marker, "400ms");
+    let cfg_str = base.replacen(
+        "startup_holdoff = \"0s\"",
+        "startup_holdoff = \"0s\"\nweb_allow_nonloopback = true",
+        1,
+    );
+    let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    let output = drain_capture();
+    assert!(
+        output.contains("web_nonloopback_enabled"),
+        "expected web_nonloopback_enabled event in captured trace output: {output}"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── 11: web_bind_change_ignored fires on reload without rebinding ──────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_bind_change_ignored_on_reload() {
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+
+    // Initial config: no web_port (default None).
+    let initial = one_display_config(&marker, "400ms");
+    let cfg_path = write_file(dir.path(), "config.toml", &initial);
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    // Wait for the initial blank so the run loop has settled.
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "first blank should occur"
+    );
+
+    drain_capture(); // discard startup events
+
+    // Reload with a config that has a different web_port.
+    let modified = initial.replacen(
+        "startup_holdoff = \"0s\"",
+        "startup_holdoff = \"0s\"\nweb_port = 9999",
+        1,
+    );
+    fs::write(&cfg_path, &modified).unwrap();
+    assert!(handle.trigger_reload().await);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    let output = drain_capture();
+    assert!(
+        output.contains("web_bind_change_ignored"),
+        "expected web_bind_change_ignored event in captured trace output: {output}"
+    );
+
+    // The daemon must still be alive (no crash/rebind) — drive a wake+blank
+    // cycle through the injected-events seam to prove the live engine works.
+    let events = handle.events_sender();
+    events.send(ev("desk", SensorState::Present)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    events.send(ev("desk", SensorState::Absent)).await.unwrap();
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 2, Duration::from_secs(3)).await,
+        "engine must keep working after web_bind_change_ignored"
     );
 
     shutdown(handle, join).await;

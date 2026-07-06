@@ -104,6 +104,8 @@ struct Inner {
     wake_results: VecDeque<Result<(), CmdFailure>>,
     /// Monotonic instant captured at construction for virtual timestamps.
     created_at: tokio::time::Instant,
+    /// Scripted controller health snapshot (default empty).
+    health: Vec<crate::rules::ControllerHealth>,
 }
 
 impl RecordingSink {
@@ -117,6 +119,7 @@ impl RecordingSink {
                 blank_results: VecDeque::new(),
                 wake_results: VecDeque::new(),
                 created_at: tokio::time::Instant::now(),
+                health: Vec::new(),
             })),
         }
     }
@@ -163,6 +166,20 @@ impl RecordingSink {
             .wake_results
             .push_back(result);
     }
+
+    /// Set the controller health snapshot returned by
+    /// [`CommandSink::controller_health`].  Default is empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (another task panicked while
+    /// holding the lock).
+    pub fn set_health(&self, health: Vec<crate::rules::ControllerHealth>) {
+        self.inner
+            .lock()
+            .expect("RecordingSink lock poisoned")
+            .health = health;
+    }
 }
 
 impl Default for RecordingSink {
@@ -185,5 +202,13 @@ impl CommandSink for RecordingSink {
         let now = tokio::time::Instant::now().duration_since(g.created_at);
         g.log.push((now, SinkCmd::Wake));
         g.wake_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn controller_health(&self) -> Vec<crate::rules::ControllerHealth> {
+        self.inner
+            .lock()
+            .expect("RecordingSink lock poisoned")
+            .health
+            .clone()
     }
 }

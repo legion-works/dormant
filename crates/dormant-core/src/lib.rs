@@ -2,9 +2,11 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod ipc_proto;
 pub mod paths;
+pub mod reload;
 pub mod rules;
 pub mod state_machine;
 pub mod traits;

@@ -66,3 +66,6 @@ pub const LD2410_BAUD: u32 = 256_000;
 
 /// Default JSON-pointer field read from MQTT payloads.
 pub const MQTT_FIELD: &str = "/occupancy";
+
+/// Default web-UI bind address — loopback only (operator tool).
+pub const WEB_BIND_DEFAULT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);

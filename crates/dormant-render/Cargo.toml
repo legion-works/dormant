@@ -1,0 +1,14 @@
+[package]
+name = "dormant-render"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+dormant-core = { path = "../dormant-core" }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true

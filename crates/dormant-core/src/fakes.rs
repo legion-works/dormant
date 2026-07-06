@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::traits::{CommandSink, SensorSource};
-use crate::types::{BlankMode, CmdFailure, PresenceEvent};
+use crate::traits::{CommandSink, RenderSink, SensorSource};
+use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 
 // ── FakeSensorSource ───────────────────────────────────────────────────────────
 
@@ -210,5 +210,122 @@ impl CommandSink for RecordingSink {
             .expect("RecordingSink lock poisoned")
             .health
             .clone()
+    }
+}
+
+// ── RecordingRenderSink ────────────────────────────────────────────────────────
+
+/// A single show/teardown call recorded by [`RecordingRenderSink`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RenderCmd {
+    /// A show command (with generation, ladder index, and stage kind).
+    Show {
+        /// Stage generation counter.
+        r#gen: u64,
+        /// Index into the display's ladder.
+        idx: usize,
+        /// Stage kind — `RenderBlack` or `RenderScreensaver`.
+        kind: StageKind,
+    },
+    /// A teardown command.
+    Teardown {
+        /// Stage generation counter.
+        r#gen: u64,
+    },
+}
+
+/// A [`RenderSink`] that records every call (with the virtual time at which
+/// it was made) and serves scripted results for `show`.  `teardown` is
+/// infallible by contract, so it is always recorded but never scripted.
+///
+/// Empty result queue means "default Ok".  Use
+/// [`Self::push_show_result`] to enqueue scripted failures.
+#[derive(Debug, Clone)]
+pub struct RecordingRenderSink {
+    /// Shared log + result queue — `Arc<Mutex<...>>` so the public API can
+    /// hand out snapshots without disturbing the running engine.
+    inner: Arc<Mutex<RenderInner>>,
+}
+
+#[derive(Debug)]
+struct RenderInner {
+    /// `(virtual_offset_from_creation, command)` for every issued call.
+    log: Vec<(Duration, RenderCmd)>,
+    /// Scripted show results — popped FIFO; empty means Ok.
+    show_results: VecDeque<Result<(), CmdFailure>>,
+    /// Monotonic instant captured at construction for virtual timestamps.
+    created_at: tokio::time::Instant,
+}
+
+impl RecordingRenderSink {
+    /// Create a fresh sink.  Use [`Clone`] to share between the engine and the
+    /// test harness.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RenderInner {
+                log: Vec::new(),
+                show_results: VecDeque::new(),
+                created_at: tokio::time::Instant::now(),
+            })),
+        }
+    }
+
+    /// Snapshot of every render command issued so far, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (another task panicked while
+    /// holding the lock).
+    #[must_use]
+    pub fn log(&self) -> Vec<(Duration, RenderCmd)> {
+        self.inner
+            .lock()
+            .expect("RecordingRenderSink lock poisoned")
+            .log
+            .clone()
+    }
+
+    /// Push a scripted `show` result.  Drained FIFO by
+    /// [`RenderSink::show`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (another task panicked while
+    /// holding the lock).
+    pub fn push_show_result(&self, result: Result<(), CmdFailure>) {
+        self.inner
+            .lock()
+            .expect("RecordingRenderSink lock poisoned")
+            .show_results
+            .push_back(result);
+    }
+}
+
+impl Default for RecordingRenderSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl RenderSink for RecordingRenderSink {
+    async fn show(&self, r#gen: u64, idx: usize, kind: StageKind) -> Result<(), CmdFailure> {
+        let mut g = self
+            .inner
+            .lock()
+            .expect("RecordingRenderSink lock poisoned");
+        let now = tokio::time::Instant::now().duration_since(g.created_at);
+        g.log.push((now, RenderCmd::Show { r#gen, idx, kind }));
+        g.show_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    async fn teardown(&self, r#gen: u64) {
+        let mut g = self
+            .inner
+            .lock()
+            .expect("RecordingRenderSink lock poisoned");
+        let now = tokio::time::Instant::now().duration_since(g.created_at);
+        g.log.push((now, RenderCmd::Teardown { r#gen }));
     }
 }

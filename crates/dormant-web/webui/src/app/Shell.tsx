@@ -11,7 +11,7 @@ import "./Shell.css";
 
 const VIEWS = {
   dashboard: { label: "Dashboard", icon: "▦", Component: Dashboard },
-  displays: { label: "Displays", icon: "▤", Component: Displays, badge: "0" },
+  displays: { label: "Displays", icon: "▤", Component: Displays },
   events: { label: "Events", icon: "≣", Component: Events, badge: "live" },
   config: { label: "Config", icon: "{ }", Component: Config },
   doctor: { label: "Doctor", icon: "✚", Component: Doctor },
@@ -45,7 +45,7 @@ export default function Shell() {
 function ShellInner() {
   const [activeView, setActiveView] = useState<ViewKey>(getViewFromHash);
   const [clock, setClock] = useState(formatClock);
-  const { connected } = useLiveState();
+  const { connected, snapshot } = useLiveState();
 
   useEffect(() => {
     const onHashChange = () => setActiveView(getViewFromHash());
@@ -72,6 +72,9 @@ function ShellInner() {
     }
   }, []);
 
+  const displaysBadge =
+    snapshot ? (snapshot.displays.length > 0 ? String(snapshot.displays.length) : undefined) : undefined;
+
   const ActiveComponent = VIEWS[activeView].Component;
 
   return (
@@ -88,6 +91,8 @@ function ShellInner() {
         <nav className="sidebar-nav">
           {VIEW_KEYS.map((key) => {
             const v = VIEWS[key];
+            // Dynamic badge: Displays shows the live display count; Events keeps its "live" marker.
+            const badge = key === "displays" ? displaysBadge : ("badge" in v && v.badge != null ? v.badge : undefined);
             return (
               <button
                 key={key}
@@ -96,9 +101,9 @@ function ShellInner() {
               >
                 <span className="nav-icon">{v.icon}</span>
                 <span className="nav-label">{v.label}</span>
-                {"badge" in v && v.badge != null && (
-                  <span className={`nav-badge${v.badge === "live" ? " nav-badge--live" : ""}`}>
-                    {v.badge}
+                {badge != null && (
+                  <span className={`nav-badge${badge === "live" ? " nav-badge--live" : ""}`}>
+                    {badge}
                   </span>
                 )}
               </button>

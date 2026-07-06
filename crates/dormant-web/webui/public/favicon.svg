@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="dormant favicon">
+  <defs>
+    <mask id="dmC">
+      <rect width="32" height="32" fill="black"></rect>
+      <circle cx="16" cy="16" r="9.5" fill="white"></circle>
+      <circle cx="20.5" cy="12.5" r="8" fill="black"></circle>
+    </mask>
+  </defs>
+  <rect width="32" height="32" rx="7" fill="#16161E"></rect>
+  <rect width="32" height="32" fill="#C3E88D" mask="url(#dmC)"></rect>
+  <circle cx="12" cy="18.5" r="1.5" fill="#86E1FC"></circle>
+</svg>

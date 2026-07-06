@@ -233,10 +233,9 @@ describe("LiveStateProvider event-to-state patching", () => {
   });
 
   it("config_reloaded triggers config refetch", async () => {
-    // We can't easily spy on the API call from here, but we can verify
-    // that the provider does not crash on config_reloaded (the refetch
-    // is fire-and-forget).  The key invariant is that the event is
-    // handled without error.
+    const { getConfig } = await import("../api/client");
+
+    // Initial fetch counts: 1 call from LiveStateProvider's useEffect.
     render(
       <LiveStateProvider>
         <SensorConsumer />
@@ -247,13 +246,15 @@ describe("LiveStateProvider event-to-state patching", () => {
       expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
     });
 
+    const callsBefore = vi.mocked(getConfig).mock.calls.length;
+
     act(() => {
       mocks.onMessage?.({ event: "config_reloaded" });
     });
 
-    // No crash = pass.  The provider still renders.
+    // The provider should call getConfig again after config_reloaded.
     await waitFor(() => {
-      expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+      expect(vi.mocked(getConfig).mock.calls.length).toBeGreaterThan(callsBefore);
     });
   });
 });

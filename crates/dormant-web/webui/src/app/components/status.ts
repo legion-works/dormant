@@ -20,6 +20,8 @@ const STATE_LABELS: Record<string, string> = {
   ok: "ok",
   fail: "fail",
   wake_retry: "retry",
+  skip: "skip",
+  not_supported: "n/a",
 };
 
 export function statusLabel(kind: StatusKind): string {

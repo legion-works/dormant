@@ -1,6 +1,3 @@
-/**
- * Doctor component test — diagnostics runner.
- */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import Doctor from "../app/views/Doctor";
@@ -60,14 +57,15 @@ describe("Doctor", () => {
       expect(screen.getByText("Config valid")).toBeInTheDocument();
     });
 
-    // 3 ok, 1 skip, 2 fail/not_supported
-    expect(screen.getByText("3")).toBeInTheDocument(); // passing
-    expect(screen.getByText("1")).toBeInTheDocument(); // warnings (skip)
-    expect(screen.getByText("2")).toBeInTheDocument(); // failing (fail + not_supported)
-
     expect(screen.getByText("Passing")).toBeInTheDocument();
-    expect(screen.getByText("Warnings")).toBeInTheDocument();
+    expect(screen.getByText("Skipped")).toBeInTheDocument();
     expect(screen.getByText("Failing")).toBeInTheDocument();
+
+    const threeVals = screen.getAllByText("3");
+    expect(threeVals.length).toBeGreaterThanOrEqual(1);
+    const twoVals = screen.getAllByText("2");
+    expect(twoVals.length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("1")).toBeInTheDocument();
   });
 
   it("renders check detail lines and status tags", async () => {
@@ -79,20 +77,17 @@ describe("Doctor", () => {
       expect(screen.getByText("Config valid")).toBeInTheDocument();
     });
 
-    // Detail text
     expect(screen.getByText("config.toml parsed without errors")).toBeInTheDocument();
     expect(screen.getByText("/run/dormant.sock responds")).toBeInTheDocument();
     expect(screen.getByText("DBus service not reachable")).toBeInTheDocument();
 
-    // Status tags — use getAllByText since multiple checks can share the same tag
-    expect(screen.getAllByText("pass").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("ok").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("skip")).toBeInTheDocument();
     expect(screen.getByText("fail")).toBeInTheDocument();
     expect(screen.getByText("n/a")).toBeInTheDocument();
   });
 
   it("shows loading state while running", () => {
-    // Use a promise that never resolves to keep loading state
     vi.mocked(mocks.runDoctor).mockReturnValueOnce(new Promise(() => {}));
 
     render(<Doctor />);

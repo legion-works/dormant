@@ -1,6 +1,3 @@
-/**
- * Config component test — rendered config + validation + reload.
- */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import Config from "../app/views/Config";
@@ -86,7 +83,7 @@ describe("Config", () => {
     expect(screen.getByText('"usb-ld2410"')).toBeInTheDocument();
   });
 
-  it("renders validation OK state", async () => {
+  it("renders validation OK message when config is valid", async () => {
     render(<Config />);
 
     await waitFor(() => {
@@ -102,12 +99,10 @@ describe("Config", () => {
     });
 
     expect(screen.getByText("Sensors")).toBeInTheDocument();
-    expect(screen.getByText("2")).toBeInTheDocument(); // 2 sensors
-    // Inventory has: 2 sensors, 1 zone, 0 displays, 1 rule
-    // "1" appears for both zone count and rule count
+    expect(screen.getByText("2")).toBeInTheDocument();
     const vals = screen.getAllByText("1");
     expect(vals.length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("0")).toBeInTheDocument(); // displays
+    expect(screen.getByText("0")).toBeInTheDocument();
   });
 
   it("renders a reload button that calls postReload", async () => {
@@ -123,20 +118,73 @@ describe("Config", () => {
     });
   });
 
-  it("renders validation error state", async () => {
+  it("renders all validation errors when config has multiple errors", async () => {
     vi.mocked((await import("../api/client")).getConfig).mockResolvedValueOnce({
       ...SAMPLE_CONFIG,
       validation: {
         ok: false,
         warnings: [],
-        errors: [{ what: "unknown_key", detail: "field 'foo' is not recognized" }],
+        errors: [
+          { what: "unknown_key", detail: "field 'foo' is not recognized" },
+          { what: "bad_reference", detail: "zone 'ghost' not defined" },
+        ],
       },
-    } as typeof SAMPLE_CONFIG);
+    });
 
     render(<Config />);
 
     await waitFor(() => {
       expect(screen.getByText(/unknown_key/)).toBeInTheDocument();
     });
+
+    expect(screen.getByText(/field 'foo'/)).toBeInTheDocument();
+    expect(screen.getByText(/bad_reference/)).toBeInTheDocument();
+    expect(screen.getByText(/zone 'ghost'/)).toBeInTheDocument();
+    expect(screen.getByText("Validation errors")).toBeInTheDocument();
+  });
+
+  it("renders all validation warnings when config has multiple warnings", async () => {
+    vi.mocked((await import("../api/client")).getConfig).mockResolvedValueOnce({
+      ...SAMPLE_CONFIG,
+      validation: {
+        ok: true,
+        warnings: [
+          { key_path: "sensors.old-pir.topic", message: "deprecated — use 'entity_id' instead" },
+          { key_path: "daemon.web_port", message: "port below 1024 requires root" },
+        ],
+        errors: [],
+      },
+    });
+
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/sensors.old-pir.topic/)).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/deprecated/)).toBeInTheDocument();
+    expect(screen.getByText(/daemon.web_port/)).toBeInTheDocument();
+    expect(screen.getByText(/port below 1024/)).toBeInTheDocument();
+    expect(screen.getByText("Validation warnings")).toBeInTheDocument();
+  });
+
+  it("renders load_error when config fails to parse", async () => {
+    vi.mocked((await import("../api/client")).getConfig).mockResolvedValueOnce({
+      ...SAMPLE_CONFIG,
+      validation: {
+        ok: false,
+        warnings: [],
+        errors: [],
+        load_error: "TOML parse error at line 42: unexpected character",
+      },
+    });
+
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/TOML parse error/)).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("Validation errors")).toBeInTheDocument();
   });
 });

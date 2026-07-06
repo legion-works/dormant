@@ -124,4 +124,16 @@ describe("StatusChip", () => {
     // The chip element should NOT carry an inline style that overrides it.
     expect(el?.getAttribute("style")).toBeNull();
   });
+
+  it("skip maps to muted class (doctor check skipped)", () => {
+    const { container } = render(<StatusChip kind="skip" />);
+    const el = container.querySelector(".status-chip");
+    expect(el!.className).toContain("status-chip--muted");
+  });
+
+  it("not_supported maps to muted class (platform not applicable)", () => {
+    const { container } = render(<StatusChip kind="not_supported" />);
+    const el = container.querySelector(".status-chip");
+    expect(el!.className).toContain("status-chip--muted");
+  });
 });

@@ -9,8 +9,11 @@ import Displays from "../app/views/Displays";
 
 const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
   const postBlank = vi.fn().mockResolvedValue(undefined);
+  const postWake = vi.fn().mockResolvedValue(undefined);
+  const postPause = vi.fn().mockResolvedValue(undefined);
+  const postResume = vi.fn().mockResolvedValue(undefined);
   return {
-    mocks: { postBlank },
+    mocks: { postBlank, postWake, postPause, postResume },
     SAMPLE_STATE: {
       sensors: [
         { id: "desk-mmwave", state: "present" as const, last_seen_secs_ago: 3 },
@@ -83,9 +86,9 @@ vi.mock("../api/client", () => ({
   getState: vi.fn().mockResolvedValue(SAMPLE_STATE),
   getConfig: vi.fn().mockResolvedValue(SAMPLE_CONFIG),
   postBlank: mocks.postBlank,
-  postWake: vi.fn().mockResolvedValue(undefined),
-  postPause: vi.fn().mockResolvedValue(undefined),
-  postResume: vi.fn().mockResolvedValue(undefined),
+  postWake: mocks.postWake,
+  postPause: mocks.postPause,
+  postResume: mocks.postResume,
 }));
 
 afterEach(() => {
@@ -153,21 +156,36 @@ describe("Displays", () => {
     expect(screen.getByText("office-rule")).toBeInTheDocument();
   });
 
-  it("calls postBlank with the correct display id when Force blank is clicked", async () => {
+  it("calls postBlank/postWake/postPause/postResume with correct ids", async () => {
     render(<Displays />);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
     });
+    expect(screen.getByText("samsung-tv")).toBeInTheDocument();
 
-    const blankButtons = screen.getAllByText("Force blank");
-    expect(blankButtons.length).toBeGreaterThanOrEqual(1);
+    // First card (aoc-main): not paused → "Pause rule", "Force blank", "Force wake"
+    const blankBtns = screen.getAllByText("Force blank");
+    const wakeBtns = screen.getAllByText("Force wake");
+    const pauseBtns = screen.getAllByText("Pause rule");
+    const resumeBtns = screen.getAllByText("Resume rule");
 
-    fireEvent.click(blankButtons[0]);
+    // Click Force blank on first display
+    fireEvent.click(blankBtns[0]);
+    await waitFor(() => expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main"));
 
-    await waitFor(() => {
-      expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main");
-    });
+    // Click Force wake on first display
+    fireEvent.click(wakeBtns[0]);
+    await waitFor(() => expect(mocks.postWake).toHaveBeenCalledWith("aoc-main"));
+
+    // Click Pause rule on first display (aoc-main → rule "office-rule")
+    fireEvent.click(pauseBtns[0]);
+    await waitFor(() => expect(mocks.postPause).toHaveBeenCalledWith({ rule: "office-rule" }));
+
+    // Click Resume rule on second display (samsung-tv is paused → rule "tv-rule")
+    expect(resumeBtns.length).toBeGreaterThanOrEqual(1);
+    fireEvent.click(resumeBtns[0]);
+    await waitFor(() => expect(mocks.postResume).toHaveBeenCalledWith({ rule: "tv-rule" }));
   });
 
   it("has Force wake and Pause/Resume buttons for each display", async () => {

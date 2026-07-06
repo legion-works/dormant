@@ -13,11 +13,8 @@ import { useCallback, useState } from "react";
 import type { DisplaySnapshot } from "../../api/types";
 import "./Displays.css";
 
-/* ── Action button ── */
 
 type ActionState = { loading: boolean; error?: string };
-
-/* ── Display detail card ── */
 
 interface DisplayCardProps {
   id: string;
@@ -186,7 +183,6 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
   );
 }
 
-/* ── Main Displays component ── */
 
 export default function Displays() {
   const { loading, error, snapshot, config, displayConfigs, displayRules } = useDashboardData();

@@ -37,7 +37,7 @@ const { mockUseEventLog } = vi.hoisted(() => {
   };
 });
 
-vi.mock("../app/state", () => ({
+vi.mock("../app/hooks/useLiveState", () => ({
   useEventLog: mockUseEventLog.impl,
   useLiveState: vi.fn(() => ({
     loading: false,

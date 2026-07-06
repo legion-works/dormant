@@ -8,7 +8,7 @@
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 99-188.
  */
 import { useNavigate } from "../nav";
-import { useLiveState } from "../state";
+import { useLiveState } from "../hooks/useLiveState";
 import { Card, StatusChip, statusLabel } from "../components";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";

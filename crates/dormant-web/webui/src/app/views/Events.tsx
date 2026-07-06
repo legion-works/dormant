@@ -5,7 +5,7 @@
  * capped at MAX_EVENTS).  Each event is rendered per its variant with a
  * type-colored badge and a human-readable message.
  */
-import { useEventLog } from "../state";
+import { useEventLog } from "../hooks/useLiveState";
 import type { DaemonEvent } from "../../api/types";
 import { Card } from "../components";
 import "./Events.css";

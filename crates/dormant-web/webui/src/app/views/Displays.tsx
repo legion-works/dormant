@@ -6,7 +6,7 @@
  *
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 190-248.
  */
-import { useLiveState } from "../state";
+import { useLiveState } from "../hooks/useLiveState";
 import { Card, StatusChip, HealthChip } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
 import { useCallback, useState } from "react";

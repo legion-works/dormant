@@ -4,7 +4,8 @@ import Displays from "./views/Displays";
 import Events from "./views/Events";
 import Config from "./views/Config";
 import Doctor from "./views/Doctor";
-import { LiveStateProvider, useLiveState } from "./state";
+import { LiveStateProvider } from "./state";
+import { useLiveState } from "./hooks/useLiveState";
 import { postReload } from "../api/client";
 import "./Shell.css";
 

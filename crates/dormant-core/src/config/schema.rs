@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::defaults;
 use crate::error::DormantError;
-use crate::types::{BlankMode, SensorId, ZoneId};
+use crate::types::{BlankMode, LadderStage, SensorId, StageKind, ZoneId};
 use crate::zone::{FusionMode, UnavailablePolicy, ZoneMember, ZoneSpec};
 
 // ── Strictness / Warning / ValidationError ──────────────────────────────────────
@@ -464,17 +464,80 @@ fn parse_member(raw: &str) -> Result<ZoneMember, DormantError> {
 
 // ── DisplayConfig ───────────────────────────────────────────────────────────────
 
+/// A source for screensaver media: a local directory path, a set of URLs, or both.
+///
+/// Exactly one of `path` or non-empty `urls` must be set — both is a config error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreensaverSource {
+    /// Local filesystem path to a directory of images or a playlist file.
+    pub path: Option<String>,
+
+    /// Remote URLs pointing to image or video files.
+    #[serde(default)]
+    pub urls: Vec<String>,
+
+    /// Recurse into subdirectories when `path` is a directory.
+    #[serde(default)]
+    pub recurse: bool,
+
+    /// Shuffle the order of source items (mutually exclusive with `order`).
+    #[serde(default)]
+    pub shuffle: bool,
+
+    /// Explicit ordering strategy (`"sequential"`, `"random"`, …).
+    /// When set alongside `shuffle = true`, `shuffle` wins.
+    pub order: Option<String>,
+
+    /// How long each image is displayed before advancing.
+    #[serde(default, with = "humantime_serde::option")]
+    pub image_duration: Option<Duration>,
+}
+
+/// Configuration for the software screensaver overlay (render fallback).
+///
+/// Activated when a [`StageKind::RenderScreensaver`] ladder stage is reached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScreensaverConfig {
+    /// What event triggers the screensaver.  M1 only supports `"vacancy"`.
+    #[serde(default = "default_trigger")]
+    pub trigger: String,
+
+    /// Whether the screensaver overlay should play audio.
+    #[serde(default = "default_screensaver_audio")]
+    pub audio: bool,
+
+    /// Ordered list of media sources (files or URLs).
+    #[serde(default)]
+    pub source: Vec<ScreensaverSource>,
+}
+
 /// A display definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DisplayConfig {
     /// Ordered list of controller names to try.
     pub controllers: Vec<String>,
 
-    /// Primary blank mode to use.
-    pub blank_mode: BlankMode,
+    /// Primary blank mode to use.  Must be set unless `ladder` is provided.
+    /// When `ladder` is present this field is ignored — the first
+    /// `Controller(_)` stage in the ladder serves as the primary mode.
+    #[serde(default)]
+    pub blank_mode: Option<BlankMode>,
 
     /// Fallback blank mode if the primary is unsupported (best-effort).
+    /// Cannot be set when `ladder` is present.
+    #[serde(default)]
     pub degraded_mode: Option<BlankMode>,
+
+    /// Ordered escalation ladder (replaces `blank_mode`).  Each rung is a
+    /// [`LadderStage`]; the first `Controller(mode)` rung acts as the
+    /// primary blank mode for the executor.
+    #[serde(default)]
+    pub ladder: Vec<LadderStage>,
+
+    /// Software screensaver configuration, required when a ladder includes
+    /// a [`StageKind::RenderScreensaver`] stage.
+    #[serde(default)]
+    pub screensaver: Option<ScreensaverConfig>,
 
     /// `KWin` output name (e.g. `"DP-1"`).
     pub output: Option<String>,
@@ -527,6 +590,54 @@ pub struct DisplayConfig {
     /// (fail-safe — don't leave a screen on when we can't reach it).
     #[serde(default = "default_treat_unreachable_as_blanked")]
     pub treat_unreachable_as_blanked: bool,
+}
+
+impl DisplayConfig {
+    /// Return the normalised ladder: the user-supplied `ladder` if present,
+    /// otherwise desugar `blank_mode` into a single-stage ladder.
+    #[must_use]
+    pub fn normalized_ladder(&self) -> Vec<LadderStage> {
+        if !self.ladder.is_empty() {
+            return self.ladder.clone();
+        }
+        let mode = self.blank_mode.unwrap_or(BlankMode::PowerOff);
+        vec![LadderStage {
+            kind: StageKind::Controller(mode),
+            dwell: None,
+        }]
+    }
+
+    /// The primary blank mode — the first `Controller(mode)` stage in the
+    /// normalised ladder, or `PowerOff` if the ladder is render-only.
+    ///
+    /// Used by the executor and [`DisplayRuntimeCfg`] until Task 3 wires
+    /// full ladder consumption.
+    #[must_use]
+    pub fn primary_blank_mode(&self) -> BlankMode {
+        for stage in &self.normalized_ladder() {
+            if let StageKind::Controller(m) = stage.kind {
+                return m;
+            }
+        }
+        BlankMode::PowerOff
+    }
+
+    /// True when this display is capable of software rendering: at least
+    /// one controller is local (`kwin-dpms`, `ddcci`, or `command`) and
+    /// the controller list is not composed SOLELY of remote controllers
+    /// (`samsung-tizen`, `ha-passthrough`).
+    #[must_use]
+    pub fn is_render_eligible(&self) -> bool {
+        let has_local = self
+            .controllers
+            .iter()
+            .any(|c| matches!(c.as_str(), "kwin-dpms" | "ddcci" | "command"));
+        let only_remote = self
+            .controllers
+            .iter()
+            .all(|c| matches!(c.as_str(), "samsung-tizen" | "ha-passthrough"));
+        has_local && !only_remote
+    }
 }
 
 // ── RuleConfig ──────────────────────────────────────────────────────────────────
@@ -681,6 +792,12 @@ fn default_wake_retry_interval() -> Duration {
 fn default_web_bind() -> std::net::IpAddr {
     defaults::WEB_BIND_DEFAULT
 }
+fn default_trigger() -> String {
+    defaults::SCREENSAVER_TRIGGER.into()
+}
+fn default_screensaver_audio() -> bool {
+    defaults::SCREENSAVER_AUDIO
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -756,13 +873,13 @@ mod tests {
         assert_eq!(cfg.displays.len(), 3);
         let main = &cfg.displays["main_monitor"];
         assert_eq!(main.controllers, vec!["kwin-dpms", "ddcci"]);
-        assert_eq!(main.blank_mode, BlankMode::PowerOff);
+        assert_eq!(main.blank_mode, Some(BlankMode::PowerOff));
         assert_eq!(main.output.as_deref(), Some("DP-1"));
         assert_eq!(main.restore_brightness, 80); // default
 
         let tv = &cfg.displays["tv"];
         assert_eq!(tv.controllers, vec!["samsung-tizen"]);
-        assert_eq!(tv.blank_mode, BlankMode::ScreenOffAudioOn);
+        assert_eq!(tv.blank_mode, Some(BlankMode::ScreenOffAudioOn));
         assert_eq!(tv.host.as_deref(), Some("192.168.1.50"));
 
         let escape = &cfg.displays["escape"];

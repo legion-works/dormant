@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::types::{BlankMode, SensorId};
+use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
 
 use super::schema::{Config, Credentials, DisplayConfig, ValidationError};
@@ -109,6 +109,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "controllers",
             "blank_mode",
             "degraded_mode",
+            "ladder",
+            "screensaver",
             "output",
             "ddc_display",
             "host",
@@ -141,6 +143,22 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "wake_retries",
             "wake_retry_backoff",
             "wake_retry_interval",
+        ],
+    ),
+    // ── displays.<id>.ladder (array-of-tables entries) ─────────────────────
+    ("displays..ladder", &["kind", "dwell"]),
+    // ── displays.<id>.screensaver ─────────────────────────────────────────
+    ("displays..screensaver", &["trigger", "audio", "source"]),
+    // ── displays.<id>.screensaver.source (array-of-tables entries) ────────
+    (
+        "displays..screensaver.source",
+        &[
+            "path",
+            "urls",
+            "recurse",
+            "shuffle",
+            "order",
+            "image_duration",
         ],
     ),
 ];
@@ -196,6 +214,16 @@ fn walk_toml(value: &toml::Value, path: &str, results: &mut Vec<UnknownKey>) {
         if val.is_table() && !is_passthrough_data_key(key) {
             walk_toml(val, &key_path, results);
         }
+
+        // Recurse into array-of-tables entries (e.g. [[displays.d.ladder]]
+        // and [[displays.d.screensaver.source]]).  Scalar arrays produce
+        // non-Table elements which are skipped at the top of walk_toml, so
+        // this is safe for all array values.
+        if let toml::Value::Array(arr) = val {
+            for item in arr {
+                walk_toml(item, &key_path, results);
+            }
+        }
     }
 }
 
@@ -210,10 +238,9 @@ fn known_keys_for_path(path: &str) -> &'static [&'static str] {
             return keys;
         }
     }
-    // Try prefix-with-dot match (dynamic id).
+    // Try prefix-with-dot match (dynamic id), e.g. "sensors.desk" matches "sensors.".
     for (prefix, keys) in KNOWN_KEYS {
         if !prefix.is_empty() && path.starts_with(prefix) {
-            // e.g. path = "sensors.desk", prefix = "sensors."
             let remainder = &path[prefix.len()..];
             // Only match if the remainder has no dots (single dynamic id).
             if !remainder.contains('.') {
@@ -221,7 +248,27 @@ fn known_keys_for_path(path: &str) -> &'static [&'static str] {
             }
         }
     }
-    // Empty allowed set → every key is unknown.
+    // Try double-dot match — the ".." in the prefix stands for a single
+    // dynamic-ID segment.  E.g. "displays.mon.ladder" matches "displays..ladder".
+    for (prefix, keys) in KNOWN_KEYS {
+        if let Some(dd_pos) = prefix.find("..") {
+            let before = &prefix[..dd_pos]; // e.g. "displays"
+            let after = &prefix[dd_pos + 1..]; // e.g. ".ladder" (includes the leading dot)
+            if path.starts_with(before) && path.len() > before.len() {
+                let rest = &path[before.len()..]; // e.g. ".mon.ladder"
+                // rest must be non-empty and start with '.' (the collection separator).
+                if rest.len() > 1 {
+                    // Skip the leading dot + the dynamic ID segment (up to the next dot).
+                    if let Some(id_end) = rest[1..].find('.') {
+                        let after_id = &rest[1 + id_end..]; // e.g. ".ladder"
+                        if after_id == after {
+                            return keys;
+                        }
+                    }
+                }
+            }
+        }
+    }
     &[]
 }
 
@@ -466,28 +513,162 @@ fn validate_display(
             ),
         });
     } else {
-        // Check blank_mode against the union.
-        if !union_caps.contains(&dc.blank_mode) {
-            errors.push(ValidationError {
-                what: "unsupported blank mode".into(),
-                detail: format!(
-                    "display '{display_id}' blank_mode '{:?}' is not supported by any controller",
-                    dc.blank_mode
-                ),
-            });
+        // Mode-capability checks: use the ladder if present, otherwise the
+        // desugar path via blank_mode.
+        if !dc.ladder.is_empty() {
+            // Ladder path: validate each Controller(mode) stage against the
+            // union capability set.  Render stages are not checked here —
+            // they are validated in the render-stage block below.
+            for stage in &dc.ladder {
+                if let StageKind::Controller(mode) = stage.kind
+                    && !union_caps.contains(&mode)
+                {
+                    errors.push(ValidationError {
+                        what: "unsupported blank mode".into(),
+                        detail: format!(
+                            "display '{display_id}' ladder stage {mode:?} is not supported \
+                             by any controller"
+                        ),
+                    });
+                }
+            }
+        } else if let Some(bm) = dc.blank_mode {
+            // Desugar path — check as before.
+            if !union_caps.contains(&bm) {
+                errors.push(ValidationError {
+                    what: "unsupported blank mode".into(),
+                    detail: format!(
+                        "display '{display_id}' blank_mode '{bm:?}' is not supported \
+                         by any controller"
+                    ),
+                });
+            }
         }
 
-        // Check degraded_mode against the union.
-        if let Some(dm) = &dc.degraded_mode
+        // Check degraded_mode against the union (only relevant without ladder,
+        // per exactly-one-of rule).
+        if dc.ladder.is_empty()
+            && let Some(dm) = &dc.degraded_mode
             && !union_caps.contains(dm)
         {
             errors.push(ValidationError {
                 what: "unsupported degraded mode".into(),
                 detail: format!(
-                    "display '{display_id}' degraded_mode '{dm:?}' is not supported by any controller"
+                    "display '{display_id}' degraded_mode '{dm:?}' is not supported \
+                     by any controller"
                 ),
             });
         }
+    }
+
+    // ── Render-stage validation (R9 feature gate) ──────────────────────────
+    let ladder = dc.normalized_ladder();
+    let has_render = ladder.iter().any(|s| s.kind.is_render());
+
+    if has_render {
+        // Render-eligibility check: the display must have at least one local
+        // controller and must not be composed solely of remote controllers.
+        if !dc.is_render_eligible() {
+            errors.push(ValidationError {
+                what: "render unavailable".into(),
+                detail: format!(
+                    "display '{display_id}' uses a render stage but has only remote \
+                     controllers (render stages require a local output)"
+                ),
+            });
+        }
+
+        // Feature-gate check.
+        #[cfg(not(feature = "render"))]
+        {
+            errors.push(ValidationError {
+                what: "render unavailable".into(),
+                detail: format!(
+                    "display '{display_id}' uses a render stage but dormant was built \
+                     without the render feature"
+                ),
+            });
+        }
+
+        // Screensaver source check.
+        for stage in &ladder {
+            if stage.kind == StageKind::RenderScreensaver {
+                let Some(ss) = &dc.screensaver else {
+                    errors.push(ValidationError {
+                        what: "missing screensaver config".into(),
+                        detail: format!(
+                            "display '{display_id}' uses a RenderScreensaver stage \
+                             but has no [displays.{display_id}.screensaver] section"
+                        ),
+                    });
+                    continue;
+                };
+                let has_source = ss
+                    .source
+                    .iter()
+                    .any(|s| s.path.is_some() || !s.urls.is_empty());
+                if !has_source {
+                    errors.push(ValidationError {
+                        what: "screensaver source missing".into(),
+                        detail: format!(
+                            "display '{display_id}' screensaver has no source with \
+                             a path or urls"
+                        ),
+                    });
+                }
+                // Per-source path-xor-urls check.
+                for (i, src) in ss.source.iter().enumerate() {
+                    if src.path.is_some() && !src.urls.is_empty() {
+                        errors.push(ValidationError {
+                            what: "screensaver source conflict".into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} sets both \
+                                 path and urls — pick exactly one"
+                            ),
+                        });
+                    }
+                }
+                // Trigger check.
+                if ss.trigger != "vacancy" {
+                    errors.push(ValidationError {
+                        what: "unsupported trigger".into(),
+                        detail: format!(
+                            "trigger '{}' not supported in this release (vacancy only)",
+                            ss.trigger
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Dwell rules ────────────────────────────────────────────────────────
+    // Every non-terminal stage must have a dwell.  The terminal stage's dwell
+    // is ignored (optional — warn-worthy but not an error here).
+    let stage_count = ladder.len();
+    for (i, stage) in ladder.iter().enumerate() {
+        let is_terminal = i + 1 == stage_count;
+        if !is_terminal && stage.dwell.is_none() {
+            errors.push(ValidationError {
+                what: "missing dwell".into(),
+                detail: format!(
+                    "non-terminal ladder stage ({i}) for display '{display_id}' needs dwell"
+                ),
+            });
+        }
+    }
+
+    // Empty ladder explicitly set is invalid.
+    if !ladder.is_empty() && dc.ladder.is_empty() && dc.blank_mode.is_none() {
+        // This case is caught by the exactly-one-of check in load_config,
+        // but guard here as well for programmatic callers.
+        errors.push(ValidationError {
+            what: "empty ladder".into(),
+            detail: format!(
+                "display '{display_id}' has an empty ladder — either set ladder stages \
+                 or use blank_mode"
+            ),
+        });
     }
 
     // Per-controller required field checks (still per-controller).
@@ -844,7 +1025,7 @@ gracee_period = "60s"
         let mut cfg = valid_full_config();
         // Change tv to use PowerOff with samsung-tizen (it supports it, so use
         // BrightnessZero which samsung-tizen does NOT support).
-        cfg.displays.get_mut("tv").unwrap().blank_mode = BlankMode::BrightnessZero;
+        cfg.displays.get_mut("tv").unwrap().blank_mode = Some(BlankMode::BrightnessZero);
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
             errors.iter().any(|e| e.what == "unsupported blank mode"),
@@ -1142,8 +1323,10 @@ password = "test-pass"
                 "main".into(),
                 DisplayConfig {
                     controllers: vec!["kwin-dpms".into(), "ddcci".into()],
-                    blank_mode: BlankMode::PowerOff,
+                    blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
+                    ladder: vec![],
+                    screensaver: None,
                     output: None,
                     ddc_display: None,
                     host: None,
@@ -1189,8 +1372,10 @@ password = "test-pass"
                 "blankless".into(),
                 DisplayConfig {
                     controllers: vec!["command".into()],
-                    blank_mode: BlankMode::PowerOff,
+                    blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
+                    ladder: vec![],
+                    screensaver: None,
                     output: None,
                     ddc_display: None,
                     host: None,
@@ -1307,5 +1492,365 @@ password = "test-pass"
     fn valid_full_config() -> Config {
         let toml_str = include_str!("../../tests/fixtures/config/valid_full.toml");
         toml::from_str(toml_str).unwrap()
+    }
+
+    // ── R2 ladder desugar tests ────────────────────────────────────────────
+
+    #[test]
+    fn ladder_desugar_blank_mode_power_off() {
+        let dc = DisplayConfig {
+            blank_mode: Some(BlankMode::PowerOff),
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            controllers: vec!["ddcci".into()],
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
+            restore_brightness: 80,
+            treat_unreachable_as_blanked: true,
+        };
+        let ladder = dc.normalized_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(ladder[0].kind, StageKind::Controller(BlankMode::PowerOff));
+        assert_eq!(ladder[0].dwell, None);
+    }
+
+    #[test]
+    fn ladder_desugar_blank_mode_screen_off_audio_on() {
+        let dc = DisplayConfig {
+            blank_mode: Some(BlankMode::ScreenOffAudioOn),
+            ..blank_display_config()
+        };
+        let ladder = dc.normalized_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(
+            ladder[0].kind,
+            StageKind::Controller(BlankMode::ScreenOffAudioOn)
+        );
+    }
+
+    #[test]
+    fn ladder_desugar_blank_mode_brightness_zero() {
+        let dc = DisplayConfig {
+            blank_mode: Some(BlankMode::BrightnessZero),
+            ..blank_display_config()
+        };
+        let ladder = dc.normalized_ladder();
+        assert_eq!(ladder.len(), 1);
+        assert_eq!(
+            ladder[0].kind,
+            StageKind::Controller(BlankMode::BrightnessZero)
+        );
+    }
+
+    #[test]
+    fn both_blank_mode_and_ladder_rejected() {
+        let dir = std::env::temp_dir().join("dormant-test-both-ladder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("both.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+[[displays.d.ladder]]
+kind = "power_off"
+[[displays.d.ladder]]
+kind = "render_black"
+dwell = "5s"
+"#,
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("exactly one"),
+            "expected 'exactly one' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn neither_blank_mode_nor_ladder_rejected() {
+        let dir = std::env::temp_dir().join("dormant-test-neither");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("neither.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+"#,
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("needs blank_mode or ladder"),
+            "expected 'needs blank_mode or ladder' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn degraded_mode_with_ladder_rejected() {
+        let dir = std::env::temp_dir().join("dormant-test-degraded-ladder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("degraded.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+degraded_mode = "power_off"
+[[displays.d.ladder]]
+kind = "power_off"
+"#,
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("degraded_mode alongside ladder"),
+            "expected degraded+ladder error, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn ladder_render_black_on_local_display_loads() {
+        let dir = std::env::temp_dir().join("dormant-test-ladder-render-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("render_ok.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "render_black"
+dwell = "5s"
+[[displays.d.ladder]]
+kind = "power_off"
+"#,
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_ok(), "expected OK, got {:?}", result.err());
+        let (cfg, _) = result.unwrap();
+        let caps = test_capabilities();
+        let errors = validate(&cfg, &caps, &Credentials::default());
+        assert!(
+            !errors.iter().any(|e| e.what.contains("render")),
+            "expected no render errors on ddcci, got: {:?}",
+            errors
+        );
+    }
+
+    #[cfg(not(feature = "render"))]
+    #[test]
+    fn ladder_render_black_without_feature_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ladder-norender");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("norender.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "render_black"
+dwell = "5s"
+[[displays.d.ladder]]
+kind = "power_off"
+"#,
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_ok(), "expected OK, got {:?}", result.err());
+        let (cfg, _) = result.unwrap();
+        let caps = test_capabilities();
+        let errors = validate(&cfg, &caps, &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("render") && e.contains("without the render feature")),
+            "expected render-feature error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn ladder_render_on_remote_only_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-render-remote");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["samsung-tizen"]
+host = "192.168.1.50"
+[[displays.d.ladder]]
+kind = "render_black"
+dwell = "5s"
+[[displays.d.ladder]]
+kind = "screen_off_audio_on"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let mut caps = test_capabilities();
+        // Ensure samsung-tizen is in caps
+        caps.entry("samsung-tizen".into())
+            .or_insert_with(|| vec![BlankMode::ScreenOffAudioOn, BlankMode::PowerOff]);
+        let creds = Credentials {
+            ha_token: None,
+            samsung: IndexMap::from([("192.168.1.50".into(), "test-token".into())]),
+            mqtt: IndexMap::new(),
+        };
+        let errors = validate(&cfg, &caps, &creds);
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("render") && e.contains("remote")),
+            "expected render-on-remote error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn ladder_non_terminal_without_dwell_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ladder-no-dwell");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nodwell.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "power_off"
+[[displays.d.ladder]]
+kind = "screen_off_audio_on"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let caps = test_capabilities();
+        let errors = validate(&cfg, &caps, &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("non-terminal") && e.contains("dwell")),
+            "expected non-terminal-dwell error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn ladder_unknown_subkey_in_strict_mode_rejected() {
+        let dir = std::env::temp_dir().join("dormant-test-ladder-unknown-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unknown_subkey.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "power_off"
+bogus = true
+"#,
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bogus"),
+            "expected unknown-key error mentioning bogus, got: {err}"
+        );
+    }
+
+    #[test]
+    fn screensaver_trigger_unsupported_rejected() {
+        let dir = std::env::temp_dir().join("dormant-test-screensaver-trigger");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trigger.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+trigger = "idle"
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let caps = test_capabilities();
+        let errors = validate(&cfg, &caps, &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("not supported in this release")),
+            "expected unsupported trigger error, got: {:?}",
+            errs
+        );
+    }
+
+    /// Minimal `DisplayConfig` with all defaults filled in, for use in
+    /// desugar tests where only `blank_mode` varies.
+    fn blank_display_config() -> DisplayConfig {
+        DisplayConfig {
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            controllers: vec!["ddcci".into()],
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
+            restore_brightness: 80,
+            treat_unreachable_as_blanked: true,
+        }
     }
 }

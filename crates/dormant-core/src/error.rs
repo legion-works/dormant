@@ -32,6 +32,10 @@ pub const E_HA_AUTH: &str = "E_HA_AUTH";
 pub const E_SENSOR_IO: &str = "E_SENSOR_IO";
 /// I/O error from a display controller.
 pub const E_DISPLAY_IO: &str = "E_DISPLAY_IO";
+/// A render stage is requested for a display that cannot use it.
+pub const E_RENDER_UNAVAILABLE: &str = "E_RENDER_UNAVAILABLE";
+/// A screensaver stage is configured without a valid media source.
+pub const E_SCREENSAVER_SOURCE: &str = "E_SCREENSAVER_SOURCE";
 /// Inter-process communication error.
 pub const E_IPC: &str = "E_IPC";
 
@@ -136,6 +140,22 @@ pub enum DormantError {
         detail: String,
     },
 
+    /// A render stage ([`StageKind::RenderBlack`] or [`StageKind::RenderScreensaver`])
+    /// is requested for a display that cannot use software rendering.
+    #[error("E_RENDER_UNAVAILABLE: {detail}")]
+    RenderUnavailable {
+        /// Human-readable description.
+        detail: String,
+    },
+
+    /// A `RenderScreensaver` stage is configured without a valid media source
+    /// (no input files or URLs).
+    #[error("E_SCREENSAVER_SOURCE: {detail}")]
+    ScreensaverSource {
+        /// Human-readable description.
+        detail: String,
+    },
+
     /// Inter-process communication error.
     #[error("E_IPC: {detail}")]
     Ipc {
@@ -162,6 +182,8 @@ impl DormantError {
             Self::HaAuth { .. } => E_HA_AUTH,
             Self::SensorIo { .. } => E_SENSOR_IO,
             Self::DisplayIo { .. } => E_DISPLAY_IO,
+            Self::RenderUnavailable { .. } => E_RENDER_UNAVAILABLE,
+            Self::ScreensaverSource { .. } => E_SCREENSAVER_SOURCE,
             Self::Ipc { .. } => E_IPC,
         }
     }

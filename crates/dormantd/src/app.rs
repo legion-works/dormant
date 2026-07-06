@@ -891,7 +891,8 @@ async fn assemble_static(
 
         let controllers = build_controllers(name, dc, &creds)
             .with_context(|| format!("build controllers for display '{name}'"))?;
-        let mut executor = DisplayExecutor::new(did.clone(), controllers, dc.blank_mode, retry);
+        let mut executor =
+            DisplayExecutor::new(did.clone(), controllers, dc.primary_blank_mode(), retry);
 
         for (controller, result) in executor.probe_all().await {
             tracing::info!(
@@ -903,13 +904,13 @@ async fn assemble_static(
         }
 
         let effective = executor.effective_modes();
-        let chosen = if effective.contains(&dc.blank_mode) {
-            dc.blank_mode
+        let chosen = if effective.contains(&dc.primary_blank_mode()) {
+            dc.primary_blank_mode()
         } else if let Some(degraded) = dc.degraded_mode.filter(|d| effective.contains(d)) {
             tracing::warn!(
                 event = "display_mode_degraded",
                 display = %did,
-                wanted = ?dc.blank_mode,
+                wanted = ?dc.primary_blank_mode(),
                 using = ?degraded,
             );
             degraded
@@ -917,7 +918,7 @@ async fn assemble_static(
             anyhow::bail!(
                 "E_MODE_UNSUPPORTED: display '{name}' cannot blank: wanted {:?} \
                  (degraded {:?}), effective modes {:?}",
-                dc.blank_mode,
+                dc.primary_blank_mode(),
                 dc.degraded_mode,
                 effective,
             );

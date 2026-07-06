@@ -241,8 +241,10 @@ mod tests {
     fn command_cfg() -> DisplayConfig {
         DisplayConfig {
             controllers: vec!["command".into()],
-            blank_mode: BlankMode::PowerOff,
+            blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
             output: None,
             ddc_display: None,
             host: None,

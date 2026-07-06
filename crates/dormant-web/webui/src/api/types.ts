@@ -15,7 +15,7 @@
  *   crates/dormant-web/src/routes/config.rs  — ConfigResponse
  */
 
-// ── Enums — runtime `as const` arrays ARE the single source; types are
+// Enums — runtime `as const` arrays are the single source; types are
 //    derived from them so the drift-guard test can assert exact strings.
 
 /** rust: SensorState, serde(rename_all = "lowercase") */

@@ -22,7 +22,6 @@
   background-color: var(--chip-color);
 }
 
-/* ── Green: present / active / waking / ok ── */
 .status-chip--success {
   --chip-bg: var(--success-muted);
   --chip-color: var(--success);
@@ -31,7 +30,6 @@
   box-shadow: 0 0 5px var(--success);
 }
 
-/* ── Blue: absent / blanked ── */
 .status-chip--blue {
   --chip-bg: color-mix(in oklab, var(--blue-400) 13%, transparent);
   --chip-color: var(--blue-400);
@@ -40,7 +38,6 @@
   box-shadow: 0 0 5px var(--blue-400);
 }
 
-/* ── Yellow: grace / blanking / unavailable ── */
 .status-chip--warning {
   --chip-bg: var(--warning-muted);
   --chip-color: var(--warning);
@@ -49,7 +46,6 @@
   box-shadow: 0 0 5px var(--warning);
 }
 
-/* ── Amber: paused ── */
 .status-chip--amber {
   --chip-bg: var(--accent-warm-muted);
   --chip-color: var(--accent-warm);
@@ -58,7 +54,6 @@
   box-shadow: 0 0 5px var(--accent-warm);
 }
 
-/* ── Purple: inhibited ── */
 .status-chip--purple {
   --chip-bg: color-mix(in oklab, var(--purple-400) 14%, transparent);
   --chip-color: var(--purple-400);
@@ -67,7 +62,6 @@
   box-shadow: 0 0 5px var(--purple-400);
 }
 
-/* ── Red: fail / wake_retry ── */
 .status-chip--danger {
   --chip-bg: var(--danger-muted);
   --chip-color: var(--danger);
@@ -76,7 +70,6 @@
   box-shadow: 0 0 5px var(--danger);
 }
 
-/* ── Muted fallback for unknown states ── */
 .status-chip--muted {
   --chip-bg: var(--bg-sunken);
   --chip-color: var(--text-faint);

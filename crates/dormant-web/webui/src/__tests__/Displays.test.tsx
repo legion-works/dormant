@@ -5,7 +5,6 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import Displays from "../app/views/Displays";
 
-/* ── Hoisted fixture + mock ── */
 
 const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
   const postBlank = vi.fn().mockResolvedValue(undefined);

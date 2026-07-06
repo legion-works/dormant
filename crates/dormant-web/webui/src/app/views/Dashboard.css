@@ -17,7 +17,6 @@
   color: var(--danger);
 }
 
-/* ── Stat row ── */
 
 .stat-row {
   display: grid;
@@ -66,7 +65,6 @@
   margin-top: 8px;
 }
 
-/* ── Section header ── */
 
 .section-header {
   display: flex;
@@ -113,7 +111,6 @@
   color: var(--accent);
 }
 
-/* ── Signal grid ── */
 
 .signal-grid {
   display: grid;
@@ -133,7 +130,6 @@
   letter-spacing: var(--tracking-caps);
 }
 
-/* ── Sensor row ── */
 
 .sensor-row {
   display: flex;
@@ -206,7 +202,6 @@
   color: var(--text-faint);
 }
 
-/* ── Zone row in Dashboard ── */
 
 .dash-zone-row {
   padding: 13px 15px;
@@ -256,7 +251,6 @@
   color: var(--text-muted);
 }
 
-/* ── Display row in Dashboard ── */
 
 .dash-display-row {
   padding: 12px 15px;
@@ -330,7 +324,6 @@
   color: var(--text-body);
 }
 
-/* ── Recent activity ── */
 
 .recent-row {
   display: grid;
@@ -367,7 +360,6 @@
   color: var(--text-faint);
 }
 
-/* ── Keyframes ── */
 
 @keyframes dmRise {
   from { opacity: 0; transform: translateY(8px); }

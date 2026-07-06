@@ -1,10 +1,5 @@
 /**
  * Unit tests for StatusChip — the state → DS-color mapper.
- *
- * Tests that each state kind maps to the correct status class
- * so Batch B views (Events, Config, Doctor) can rely on the
- * same mapping.  The class names correspond to real DS token
- * groups (success/warning/danger/blue/accent-warm/purple).
  */
 import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
@@ -111,5 +106,22 @@ describe("StatusChip", () => {
       const el = container.querySelector(".status-chip");
       expect(el!.className).not.toContain("status-chip--muted");
     }
+  });
+
+  it("has no inline --chip-color style override (would mask CSS token mapping)", () => {
+    const { container } = render(<StatusChip kind="fail" />);
+    const el = container.querySelector(".status-chip");
+    // The inline --status-*-fg bug was removed — the element must NOT
+    // carry an inline --chip-color that overrides the stylesheet mapping.
+    expect(el?.getAttribute("style")).toBeNull();
+  });
+
+  it("fail chip uses class status-chip--danger (real DS token --danger)", () => {
+    const { container } = render(<StatusChip kind="fail" />);
+    const el = container.querySelector(".status-chip");
+    expect(el!.className).toContain("status-chip--danger");
+    // StatusChip.css sets --chip-color: var(--danger) on this class.
+    // The chip element should NOT carry an inline style that overrides it.
+    expect(el?.getAttribute("style")).toBeNull();
   });
 });

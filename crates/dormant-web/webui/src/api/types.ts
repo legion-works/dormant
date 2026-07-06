@@ -97,7 +97,7 @@ export interface DisplaySnapshot {
   cmd_gen: number;
   controllers: ControllerHealth[];
   /** Present only when the display is in the `staged` phase. */
-  stage?: { idx: number; kind: string } | null;
+  stage?: { idx: number; kind: StageKind } | null;
 }
 
 /**

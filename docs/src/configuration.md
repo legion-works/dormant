@@ -150,6 +150,76 @@ Each display has a user-chosen `id`. The `controllers` list is an ordered fallba
 | `restore_brightness` | integer | `80` | Brightness level to restore on wake (0–100) |
 | `treat_unreachable_as_blanked` | boolean | `true` | If controller is unreachable, assume display is blanked (fail-safe) |
 
+### Escalation ladder
+
+Instead of `blank_mode` and `degraded_mode`, a display can define an ordered
+**ladder** of stages. Each stage is tried in order; if one fails, the next one
+runs. A stage with a `dwell` duration ("dwell stage") is held for that long
+before the ladder advances. The last stage (the terminal stage) has no time
+limit — the ladder stays there until an external event (sensor, user wake)
+moves it.
+
+`blank_mode` and `ladder` are mutually exclusive — a config containing both
+is rejected at startup.
+
+#### Ladder form (array of tables)
+
+```toml
+[displays.main]
+controllers = ["ddcci", "kwin-dpms"]
+output = "DP-1"
+ladder = [
+  { kind = "render_black", dwell = "30s" },   # audio-safe black overlay
+  { kind = "power_off" },                       # terminal: true panel-off
+]
+```
+
+#### Stage kinds
+
+| Kind | Description |
+|------|-------------|
+| `power_off` | Controller power-off mode |
+| `screen_off_audio_on` | Controller screen-off-audio-on mode |
+| `brightness_zero` | Controller brightness-zero mode |
+| `render_black` | Software fullscreen black overlay (render backend) |
+| `render_screensaver` | Software screensaver (render backend; requires `screensaver` config) |
+
+#### `dwell`
+
+An optional [humantime](https://docs.rs/humantime/latest/humantime/) duration
+(e.g., `"30s"`, `"5m"`) the ladder stays at this stage before advancing.
+Omitting `dwell` (or setting it to `None`) makes the stage terminal — the
+ladder stops here and waits for an external event.
+
+Every non-terminal stage **must** have a `dwell`; validation rejects ladders
+that would skip past a dwell-less intermediate stage.
+
+#### Render stages
+
+`render_black` and `render_screensaver` use the software render backend, which
+is **off by default**. Build dormant with `--features render` to enable it;
+configs containing a render stage are rejected at startup with error
+`E_RENDER_UNAVAILABLE` when the feature is absent.
+
+Render stages require:
+
+1. **`output` set** on the display (the Wayland output connector name, e.g. `"DP-1"`).
+2. **At least one local controller** (`kwin-dpms`, `ddcci`, or `command`) in
+   the display's `controllers` list — render stages cannot run on a
+   remote-only display (`samsung-tizen` / `ha-passthrough` alone).
+
+`render_screensaver` additionally requires a `[displays.<id>.screensaver]`
+section with at least one image source (a `path` or `urls`).
+
+#### Backward compatibility
+
+Configs that use `blank_mode` (and optionally `degraded_mode`) — the pre-ladder
+style — continue to work unchanged. Internally, `blank_mode` is desugared to a
+single-stage ladder (`{ kind = "<blank_mode>" }`) with no dwell.
+
+`blank_mode` + `ladder` together is rejected. `degraded_mode` + `ladder` is
+also rejected (the ladder itself chains fallbacks).
+
 ## `[rules.<id>]` — rule definitions
 
 A rule links a zone to one or more displays with timing parameters.

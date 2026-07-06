@@ -610,7 +610,7 @@ impl DisplayConfig {
     /// The primary blank mode — the first `Controller(mode)` stage in the
     /// normalised ladder, or `PowerOff` if the ladder is render-only.
     ///
-    /// Used by the executor and [`DisplayRuntimeCfg`] until Task 3 wires
+    /// Used by the executor and `DisplayRuntimeCfg` until Task 3 wires
     /// full ladder consumption.
     #[must_use]
     pub fn primary_blank_mode(&self) -> BlankMode {

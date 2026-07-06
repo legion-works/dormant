@@ -248,7 +248,7 @@ impl App {
 
     /// Set an injected render-sink factory (test seam).
     ///
-    /// When set, [`assemble_static`] calls this factory instead of
+    /// When set, `assemble_static` calls this factory instead of
     /// building [`LayerShellRenderSink`] directly.  The factory receives
     /// the display id, output connector name, and an optional
     /// `UnboundedSender<DisplayId>` (the `InputWake` channel); return

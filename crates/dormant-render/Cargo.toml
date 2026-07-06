@@ -32,3 +32,8 @@ wayland-protocols = { version = "0.32.13", features = [
 # zwlr_layer_shell_v1 / zwlr_layer_surface_v1
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 calloop = "0.14"
+# Drives the Wayland socket as a calloop event source so input + configure
+# events dispatch whenever the FD has data, even when the thread is idle
+# between commands.  This is the canonical safe shape for a Wayland client
+# inside a calloop-driven thread.
+calloop-wayland-source = "0.4.1"

@@ -864,6 +864,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "calloop",
+ "calloop-wayland-source",
  "dormant-core",
  "smithay-client-toolkit",
  "tokio",

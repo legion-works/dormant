@@ -51,7 +51,6 @@ describe("Events", () => {
   it("renders empty state when no events have arrived", async () => {
     render(<Events />);
 
-    // After onConnect fires (simulated), wait for live label
     await waitFor(() => {
       expect(screen.getByText("live · subscribed to daemon event stream")).toBeInTheDocument();
     });
@@ -98,7 +97,6 @@ describe("Events", () => {
     expect(screen.getByText("config reloaded")).toBeInTheDocument();
     expect(screen.getByText("aoc-main: wake retry attempt 2")).toBeInTheDocument();
 
-    // Badge labels
     expect(screen.getByText("zone")).toBeInTheDocument();
     expect(screen.getByText("config")).toBeInTheDocument();
     expect(screen.getByText("retry")).toBeInTheDocument();
@@ -119,7 +117,6 @@ describe("Events", () => {
       expect(screen.getByText("stream lagged — catching up")).toBeInTheDocument();
     });
 
-    // Lagged events should NOT be added to the log.
     expect(screen.getByText("0 events")).toBeInTheDocument();
   });
 

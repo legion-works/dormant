@@ -31,6 +31,8 @@ export type StatusKind =
   | "ok"
   | "fail"
   | "wake_retry"
+  | "skip"
+  | "not_supported"
   | string;
 
 interface StatusChipProps {
@@ -65,6 +67,9 @@ const STATUS_CLASS_MAP: Record<string, string> = {
   // Red — fail / wake_retry
   fail: "danger",
   wake_retry: "danger",
+  // Neutral — skip / not_supported (doctor checks)
+  skip: "muted",
+  not_supported: "muted",
 };
 
 function statusClass(kind: StatusKind): string {

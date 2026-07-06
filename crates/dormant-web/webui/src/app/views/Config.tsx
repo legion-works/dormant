@@ -1,17 +1,13 @@
 /**
  * Config view — rendered config file + validation + inventory.
  *
- * Fetches /api/config for the full ConfigResponse and /api/state for
- * the pending_reload field.  Renders a two-column layout: left is the
- * syntax-highlighted TOML file viewer, right is the parsed inventory
- * summary and validation card.  A reload button triggers postReload.
- *
- * Data: /api/config + /api/state  |  Visual authority: design README §4 /
- * Dormant Dashboard.dc.html lines 272-302.
+ * Fetches /api/config + /api/state in parallel on mount. Two-column
+ * layout: left is the syntax-highlighted TOML file viewer, right is
+ * inventory summary, full validation detail, and a reload button.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
-import type { ConfigResponse, ConfigValidation } from "../../api/types";
+import type { ConfigResponse } from "../../api/types";
 import { Card } from "../components";
 import "./Config.css";
 
@@ -28,14 +24,13 @@ interface TomlLine {
   eq: string;
   val: string;
   comment: string;
-  /** CSS var() color token for the value span. */
   valColor: string;
 }
 
 /**
- * Crude TOML line classifier for syntax highlighting.
+ * Line-by-line TOML classifier for syntax highlighting.
  *
- * Strategy matches the design README §4 spec:
+ * Mapping per design spec §4:
  *   comments / section headers → --text-faint
  *   keys → --blue-400
  *   equals → --text-muted
@@ -44,22 +39,18 @@ interface TomlLine {
  */
 function parseTomlLines(raw: string): TomlLine[] {
   return raw.split("\n").map((line) => {
-    // Blank line
     if (line.trim() === "") {
       return { pre: line, key: "", eq: "", val: "", valColor: "var(--text-faint)", comment: "" };
     }
 
-    // Full-line comment or section header
     if (/^\s*(#|\[)/.test(line)) {
       return { pre: line, key: "", eq: "", val: "", valColor: "var(--text-faint)", comment: "" };
     }
 
-    // key = value  (with optional trailing comment)
     const kvMatch = line.match(/^(\s*)([\w._-]+)(\s*=\s*)(.*)$/);
     if (kvMatch) {
       const [, pre, key, eq, rest] = kvMatch;
 
-      // Split trailing comment from value
       const commentIdx = rest.indexOf("#");
       let valPart = rest;
       let commentPart = "";
@@ -68,7 +59,6 @@ function parseTomlLines(raw: string): TomlLine[] {
         commentPart = rest.slice(commentIdx);
       }
 
-      // Strip surrounding quotes for classification
       const valTrimmed = valPart.trim();
       const isString = /^".*"$/.test(valTrimmed) || /^'.*'$/.test(valTrimmed)
         || /^""".*"""$/.test(valTrimmed) || /'''.*'''/.test(valTrimmed);
@@ -83,24 +73,16 @@ function parseTomlLines(raw: string): TomlLine[] {
       return { pre, key, eq, val: valPart, valColor, comment: commentPart };
     }
 
-    // Everything else: render as a plain line
     return { pre: line, key: "", eq: "", val: "", valColor: "var(--text-body)", comment: "" };
   });
 }
 
-/** Build a short validation summary sentence. */
-function validationSummary(v: ConfigValidation): { cls: string; text: string } {
-  if (v.load_error) {
-    return { cls: "danger", text: `Load error: ${v.load_error}` };
-  }
-  if (v.errors.length > 0) {
-    const first = v.errors[0];
-    return { cls: "danger", text: `Validation failed: ${first.what} — ${first.detail}` };
-  }
-  if (v.warnings.length > 0) {
-    return { cls: "warning", text: `${v.warnings.length} warning${v.warnings.length > 1 ? "s" : ""} — config loaded with caveats` };
-  }
-  return { cls: "ok", text: "Configuration parsed with no unknown keys. All zone members resolve to defined sensors; all rule displays are defined. Reload is safe." };
+/** Overall validation severity class for the file header. */
+function validationSeverity(v: ConfigResponse["validation"]): "ok" | "warning" | "danger" {
+  if (v.load_error) return "danger";
+  if (v.errors.length > 0) return "danger";
+  if (v.warnings.length > 0) return "warning";
+  return "ok";
 }
 
 export default function Config() {
@@ -146,9 +128,9 @@ export default function Config() {
     try {
       await postReload();
     } catch {
-      // Reload may fail; re-fetch config to show current state.
+      // Reload may fail; re-fetch to show current state.
     }
-    void fetchData();
+    await fetchData();
     setReloading(false);
   }, [fetchData]);
 
@@ -162,7 +144,7 @@ export default function Config() {
 
   const cfg = state.config!;
   const tomlLines = parseTomlLines(cfg.raw_toml);
-  const vSum = validationSummary(cfg.validation);
+  const vSeverity = validationSeverity(cfg.validation);
   const inv = cfg.inventory;
   const inventoryRows = [
     { k: "Sensors", v: `${Object.keys(inv.sensors ?? {}).length}`, n: Object.keys(inv.sensors ?? {}).join(" · ") || "—" },
@@ -172,10 +154,13 @@ export default function Config() {
   ];
 
   const sourceMismatch = cfg.source !== "last_applied";
+  const hasValidationIssues =
+    cfg.validation.load_error != null ||
+    cfg.validation.errors.length > 0 ||
+    cfg.validation.warnings.length > 0;
 
   return (
     <div className="config">
-      {/* Pending reload banner */}
       {(state.pendingReload || sourceMismatch) && (
         <div className="config-banner">
           {state.pendingReload
@@ -184,15 +169,13 @@ export default function Config() {
         </div>
       )}
 
-      {/* Two-column grid */}
       <div className="config-grid">
-        {/* Left: file viewer */}
         <div className="config-file">
           <div className="config-file__header">
             <span className="config-file__icon">{"📄"}</span>
             <span className="config-file__path">{cfg.path}</span>
-            <span className={`config-file__status config-file__status--${vSum.cls}`}>
-              {vSum.cls === "ok" ? "✓ valid" : vSum.cls === "warning" ? "⚠ warned" : "✕ error"}
+            <span className={`config-file__status config-file__status--${vSeverity}`}>
+              {vSeverity === "ok" ? "✓ valid" : vSeverity === "warning" ? "⚠ warned" : "✕ error"}
               {" · v"}{cfg.config_version}
             </span>
           </div>
@@ -223,9 +206,7 @@ export default function Config() {
           </div>
         </div>
 
-        {/* Right column */}
         <div className="config-right">
-          {/* Inventory card */}
           <Card>
             <div className="config-inventory">
               <div className="config-inventory__title">Parsed inventory</div>
@@ -239,15 +220,50 @@ export default function Config() {
             </div>
           </Card>
 
-          {/* Validation card */}
-          <div className={`config-validation config-validation--${vSum.cls}`}>
-            <span className="config-validation__icon">
-              {vSum.cls === "ok" ? "✓" : vSum.cls === "warning" ? "⚠" : "✕"}
-            </span>
-            <span className="config-validation__text">{vSum.text}</span>
-          </div>
+          {hasValidationIssues ? (
+            <div className={`config-validation config-validation--${vSeverity}`}>
+              <div className="config-validation__header">
+                <span className="config-validation__icon">
+                  {vSeverity === "danger" ? "✕" : "⚠"}
+                </span>
+                <span className="config-validation__title">
+                  {vSeverity === "danger" ? "Validation errors" : "Validation warnings"}
+                </span>
+              </div>
 
-          {/* Reload button */}
+              {cfg.validation.load_error && (
+                <div className="config-validation__item config-validation__item--danger">
+                  {cfg.validation.load_error}
+                </div>
+              )}
+
+              {cfg.validation.errors.map((e, i) => (
+                <div key={i} className="config-validation__item config-validation__item--danger">
+                  <span className="config-validation__item-what">{e.what}</span>
+                  {e.detail && (
+                    <span className="config-validation__item-detail"> — {e.detail}</span>
+                  )}
+                </div>
+              ))}
+
+              {cfg.validation.warnings.map((w, i) => (
+                <div key={i} className="config-validation__item config-validation__item--warning">
+                  <span className="config-validation__item-path">{w.key_path}</span>
+                  {w.message && (
+                    <span className="config-validation__item-detail">: {w.message}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className={`config-validation config-validation--ok`}>
+              <span className="config-validation__icon">✓</span>
+              <span className="config-validation__text">
+                Configuration parsed with no unknown keys. All zone members resolve to defined sensors; all rule displays are defined. Reload is safe.
+              </span>
+            </div>
+          )}
+
           <button
             className="config-reload-btn"
             onClick={handleReload}

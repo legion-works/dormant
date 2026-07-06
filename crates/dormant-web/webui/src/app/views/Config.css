@@ -186,19 +186,25 @@
 
 
 .config-validation {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
   padding: 15px 18px;
   border-radius: var(--radius-lg);
 }
 
+/* OK state: simple flex row */
 .config-validation--ok {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
   background: color-mix(in oklab, var(--success) 7%, transparent);
   border: 1px solid color-mix(in oklab, var(--success) 28%, transparent);
 }
 
-.config-validation--warning {
+/* Warning / danger states: column layout for detail rows */
+.config-validation--warning,
+.config-validation--danger {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   background: color-mix(in oklab, var(--warning) 7%, transparent);
   border: 1px solid color-mix(in oklab, var(--warning) 28%, transparent);
 }
@@ -206,6 +212,13 @@
 .config-validation--danger {
   background: color-mix(in oklab, var(--danger) 7%, transparent);
   border: 1px solid color-mix(in oklab, var(--danger) 28%, transparent);
+}
+
+.config-validation__header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 4px;
 }
 
 .config-validation__icon {
@@ -217,18 +230,54 @@
   color: var(--success);
 }
 
+.config-validation--warning .config-validation__header .config-validation__icon,
 .config-validation--warning .config-validation__icon {
   color: var(--warning);
 }
 
+.config-validation--danger .config-validation__header .config-validation__icon,
 .config-validation--danger .config-validation__icon {
   color: var(--danger);
+}
+
+.config-validation__title {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-body);
 }
 
 .config-validation__text {
   font-size: 12.5px;
   color: var(--text-body);
   line-height: 1.6;
+}
+
+.config-validation__item {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  line-height: 1.55;
+  padding: 4px 0 4px 24px;
+}
+
+.config-validation__item--danger {
+  color: var(--danger);
+}
+
+.config-validation__item--warning {
+  color: var(--warning);
+}
+
+.config-validation__item-what {
+  font-weight: 500;
+}
+
+.config-validation__item-path {
+  font-weight: 500;
+}
+
+.config-validation__item-detail {
+  opacity: 0.85;
 }
 
 

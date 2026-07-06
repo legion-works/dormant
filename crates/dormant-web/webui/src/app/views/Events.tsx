@@ -2,11 +2,8 @@
  * Events view — live DaemonEvent log from the WS stream.
  *
  * Subscribes to useEvents and maintains a rolling log (newest first,
- * capped at 100).  Each event is rendered per its variant with a
+ * capped at MAX_EVENTS).  Each event is rendered per its variant with a
  * type-colored badge and a human-readable message.
- *
- * Data: WS /api/events  |  Visual authority: design README §3 /
- * Dormant Dashboard.dc.html lines 250-268.
  */
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useEvents } from "../../api/ws";
@@ -27,17 +24,6 @@ function formatTimestamp(): string {
   return new Date().toLocaleTimeString("en-GB", { hour12: false });
 }
 
-/**
- * Event tag → DS token color mapping.
- * Colors match the handoff README §3 event-type badge spec:
- *   zone_change   → green  (--success)
- *   sensor_change → blue   (--blue-400)
- *   display_phase → grey   (--text-muted)
- *   wake_retry    → red    (--danger)
- *   config_reload → amber  (--accent-warm)
- *   pause         → amber  (--accent-warm)
- *   resume        → green  (--success)
- */
 interface EventBadge {
   color: string;
   bg: string;
@@ -127,7 +113,6 @@ export default function Events() {
 
   return (
     <div className="events">
-      {/* Header */}
       <div className="events-header">
         <div className="events-header__left">
           <span className={`events-pulse${connected ? " events-pulse--live" : ""}`} />
@@ -138,14 +123,12 @@ export default function Events() {
         <span className="events-header__count">{events.length} events</span>
       </div>
 
-      {/* Lag / disconnect banner */}
       {showBanner && (
         <div className={`events-banner${lagged ? " events-banner--lag" : ""}`}>
           {bannerText}
         </div>
       )}
 
-      {/* Event log */}
       <Card opaque>
         {events.length === 0 ? (
           <div className="events-empty">

@@ -205,4 +205,26 @@ describe("LadderEditor", () => {
     expect(json).not.toMatch(/\[null\b/);
     expect(json).not.toMatch(/,null\b/);
   });
+
+  it("clearing a dwell emits stage without dwell key (empty string treated as absent)", async () => {
+    // Fixture: stage 0 has a dwell.  User clears the input ("").
+    const stages: LadderStage[] = [
+      { kind: "render_black", dwell: "5m" },
+      { kind: "power_off" },
+    ];
+    const { store } = renderEditor(stages);
+
+    const dwellInputs = screen.getAllByLabelText("dwell");
+    expect(dwellInputs.length).toBe(1); // only stage 0 has dwell input
+    fireEvent.change(dwellInputs[0], { target: { value: "" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as LadderStage[];
+
+    // Stage 0 must NOT have a dwell key after clearing.
+    expect("dwell" in (value[0] as unknown as Record<string, unknown>)).toBe(false);
+    expect(value[0].kind).toBe("render_black");
+  });
 });

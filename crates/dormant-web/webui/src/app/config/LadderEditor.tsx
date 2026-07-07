@@ -42,12 +42,20 @@ function getEffectiveStages(displayId: string, fetched: LadderStage[], store: Pa
 }
 
 /**
- * Strip null values from optional fields that come from the server's
- * JSON serialisation of Rust Option::None.  These must be absent, not
- * null, in emitted patches — the server (TOML) rejects null values.
+ * Whether a value represents "no input" — null from the server's JSON
+ * serialisation of Rust Option::None, or an empty/whitespace string
+ * from a cleared input field.
+ */
+function isAbsentInput(v: unknown): boolean {
+  return v === null || (typeof v === "string" && v.trim() === "");
+}
+
+/**
+ * Strip absent values from optional fields.  The server (TOML) rejects
+ * null and empty strings for optional fields like dwell.
  */
 function cleanStage(s: LadderStage): LadderStage {
-  if (s.dwell === null) {
+  if (isAbsentInput(s.dwell)) {
     const { dwell: _, ...rest } = s;
     return rest as LadderStage;
   }

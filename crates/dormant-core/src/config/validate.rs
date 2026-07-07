@@ -959,6 +959,17 @@ pub fn is_known_config_path(path: &[&str]) -> bool {
     check_valid("", path)
 }
 
+/// Does `parent` end with an array-of-tables key whose entries carry
+/// child keys?  Currently `ladder` (under `displays.<id>.ladder`) and
+/// `source` (under `displays.<id>.screensaver.source`) are the only
+/// array-of-tables keys in the M1 schema.
+///
+/// Kept next to [`KNOWN_KEYS`] so the name list is grep-stable and
+/// trivially auditable.
+fn is_array_of_tables_parent(parent: &str) -> bool {
+    parent.ends_with(".ladder") || parent.ends_with(".source")
+}
+
 /// Recursive helper: `parent` is the dot-joined path consumed so far;
 /// `remaining` is the path tail to validate.
 fn check_valid(parent: &str, remaining: &[&str]) -> bool {
@@ -989,9 +1000,12 @@ fn check_valid(parent: &str, remaining: &[&str]) -> bool {
         return true;
     }
 
-    // 3. Segment is all-digits — treat as an array-of-tables index.
-    //    Skip it (parent stays the same) and continue matching child keys.
-    if segment.chars().all(|c| c.is_ascii_digit())
+    // 3. Segment is all-digits after an array-of-tables key — treat as an
+    //    index.  Skip it (parent stays the same) and continue matching child
+    //    keys.  The guard ensures this ONLY fires for source/ladder, not for
+    //    arbitrary numeric segments under non-array tables.
+    if is_array_of_tables_parent(parent)
+        && segment.chars().all(|c| c.is_ascii_digit())
         && !segment.is_empty()
         && !rest.is_empty()
         && check_valid(parent, rest)
@@ -2878,5 +2892,22 @@ kind = "power_off"
             "abc",
             "shuffle"
         ]));
+    }
+
+    // M1 — digit-skip must NOT fire after non-array-of-tables keys.
+    #[test]
+    fn is_known_path_rejects_digit_after_non_array_table() {
+        assert!(!is_known_config_path(&["daemon", "0", "log_level"]));
+        assert!(!is_known_config_path(&["sensors", "x", "0", "topic"]));
+    }
+
+    // N1 — bare array index (no child key) is rejected.
+    // This is a deliberate stance: the fn rejects a path that ends on an
+    // index because a config patch always targets a leaf key, never an
+    // array slot alone.  The TOML walker would accept an empty table entry,
+    // but a tighter guard here costs nothing and is defensible.
+    #[test]
+    fn is_known_path_rejects_bare_ladder_index() {
+        assert!(!is_known_config_path(&["displays", "x", "ladder", "0"]));
     }
 }

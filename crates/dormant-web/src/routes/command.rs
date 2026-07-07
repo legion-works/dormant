@@ -222,9 +222,12 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
         config_rx,
         creds_rx,
         config_path: std::path::PathBuf::from("/dev/null"),
+        creds_path: std::path::PathBuf::from("/dev/null"),
+        apply_lock: tokio::sync::Mutex::new(()),
         doctor,
         web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         cancel,
+        reload_timeout: Duration::from_secs(10),
     });
 
     // Keep the reload trigger receiver alive in a spawned task so the
@@ -313,9 +316,12 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
+            reload_timeout: Duration::from_secs(10),
         })
     }
 
@@ -585,9 +591,12 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
+            reload_timeout: Duration::from_secs(10),
         });
 
         let router = axum::Router::new()

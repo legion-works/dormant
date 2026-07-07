@@ -9,6 +9,13 @@ extend-ignore-re = [
   "ESPresense",
 ]
 
+# Intentional typo in an is_known_config_path test (verifying wrong key
+# rejected).  Scoped to Rust source so a real "shufle" typo elsewhere is
+# still caught.
+[type.rust]
+extend-glob = ["**/src/**/*.rs", "**/tests/*.rs"]
+extend-ignore-re = ["shufle"]
+
 [files]
 # Vendored Legion Works design-system bundle (minified third-party JS/CSS/JSON) —
 # not project-authored; exclude from spell-check (e.g. a literal "teh" in _ds_bundle.js).

@@ -1,0 +1,210 @@
+/**
+ * ScreensaverEditor component tests — source add/remove, ancestor-lock.
+ */
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { createPatchStore } from "../app/config/patch";
+import ScreensaverEditor from "../app/config/ScreensaverEditor";
+import type { ScreensaverConfig, ScreensaverSource, ConfigPatch } from "../api/types";
+
+const FIXTURE_SS: ScreensaverConfig = {
+  trigger: "escalation",
+  audio: false,
+  scale_mode: "fill",
+  transition: "crossfade",
+  transition_duration: "1s",
+  source: [
+    { path: "/usr/share/wallpapers", recurse: true, shuffle: false, order: "sequential", image_duration: "10s" },
+  ],
+};
+
+function renderEditor(screensaver: ScreensaverConfig = FIXTURE_SS, redactedPaths: string[][] = []) {
+  const store = createPatchStore();
+  const onDirty = () => {};
+  const result = render(
+    <ScreensaverEditor
+      screensaver={screensaver}
+      displayId="tv"
+      store={store}
+      redactedPaths={redactedPaths}
+      onDirty={onDirty}
+      fieldErrors={{}}
+    />,
+  );
+  return { ...result, store };
+}
+
+describe("ScreensaverEditor", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("add source emits whole-array set on screensaver.source", async () => {
+    const { store } = renderEditor();
+
+    const addBtn = screen.getByRole("button", { name: /add source/i });
+    fireEvent.click(addBtn);
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0].op).toBe("set");
+    expect(patches[0].path).toEqual(["displays", "tv", "screensaver", "source"]);
+
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(2);
+    expect(value[0]).toEqual(FIXTURE_SS.source[0]);
+    // New source has default fields
+    expect(value[1]).toMatchObject({ recurse: false, shuffle: false });
+  });
+
+  it("remove source emits whole-array set on screensaver.source", async () => {
+    const ss: ScreensaverConfig = {
+      ...FIXTURE_SS,
+      source: [
+        { path: "/a" },
+        { path: "/b" },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    const removeBtns = screen.getAllByRole("button", { name: /remove source/i });
+    expect(removeBtns).toHaveLength(2);
+    fireEvent.click(removeBtns[1]); // Remove "/b"
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0].op).toBe("set");
+    expect(patches[0].path).toEqual(["displays", "tv", "screensaver", "source"]);
+
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(1);
+    expect(value[0]).toEqual({ path: "/a" });
+  });
+
+  it("locks sources editor when redacted path is a descendant of a source path", async () => {
+    // redacted_paths: [[displays,tv,screensaver,source,0,urls,0]]
+    // This is a descendant of screensaver.source — the ENTIRE sources editor locks
+    const redacted: string[][] = [
+      ["displays", "tv", "screensaver", "source", "0", "urls", "0"],
+    ];
+
+    renderEditor(FIXTURE_SS, redacted);
+
+    // Sources area should show a lock indicator
+    const lockEls = screen.getAllByTitle(/contains credentialed URLs/);
+    expect(lockEls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("renders scalar fields (audio, scale_mode, transition, transition_duration)", async () => {
+    renderEditor();
+
+    // These labels should be present
+    expect(screen.getByLabelText("audio")).toBeInTheDocument();
+    expect(screen.getByLabelText("scale_mode")).toBeInTheDocument();
+    expect(screen.getByLabelText("transition")).toBeInTheDocument();
+    expect(screen.getByLabelText("transition_duration")).toBeInTheDocument();
+  });
+
+  it("omits null optional fields when editing another source (null from JSON round-trip)", async () => {
+    // Mimic server response: order and image_duration are null (Option::None in Rust).
+    const ss: ScreensaverConfig = {
+      trigger: "escalation",
+      audio: false,
+      scale_mode: "fill",
+      transition: "crossfade",
+      transition_duration: "1s",
+      source: [
+        { path: "/a", recurse: false, shuffle: false, order: null as unknown as string, image_duration: null as unknown as string },
+        { path: "/b", recurse: true, shuffle: false, order: "sequential", image_duration: "5s" },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    // Edit path of source index 1
+    const pathInputs = screen.getAllByLabelText("path");
+    expect(pathInputs.length).toBe(2);
+    fireEvent.change(pathInputs[1], { target: { value: "/c" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(2);
+
+    // Source 0 (unchanged) must NOT have null keys.
+    const s0 = value[0] as Record<string, unknown>;
+    expect("order" in s0).toBe(false);
+    expect("image_duration" in s0).toBe(false);
+    // path should still be present (non-null)
+    expect(s0.path).toBe("/a");
+    expect(s0.recurse).toBe(false);
+    expect(s0.shuffle).toBe(false);
+
+    // Source 1 has the edited path
+    expect(value[1]).toEqual({ path: "/c", recurse: true, shuffle: false, order: "sequential", image_duration: "5s" });
+  });
+
+  it("clearing an optional image_duration emits source without image_duration key", async () => {
+    const ss: ScreensaverConfig = {
+      trigger: "escalation",
+      audio: false,
+      scale_mode: "fill",
+      transition: "crossfade",
+      transition_duration: "1s",
+      source: [
+        { path: "/a", recurse: false, shuffle: false, image_duration: "10s" },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    const durInputs = screen.getAllByLabelText("image_duration");
+    expect(durInputs.length).toBe(1);
+    fireEvent.change(durInputs[0], { target: { value: "" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(1);
+
+    // Cleared optional field must NOT appear as a key.
+    const s0 = value[0] as Record<string, unknown>;
+    expect("image_duration" in s0).toBe(false);
+    expect(s0.path).toBe("/a");
+  });
+
+  it("urls-source with null path omits path key on any edit (null from JSON round-trip)", async () => {
+    // A urls-based source has path: None in TOML → path: null in JSON.
+    // Editing ANY field must not leak path: null into the patch.
+    const ss: ScreensaverConfig = {
+      trigger: "escalation",
+      audio: false,
+      scale_mode: "fill",
+      transition: "crossfade",
+      transition_duration: "1s",
+      source: [
+        { path: null as unknown as string, urls: ["https://example.com/img.jpg"], recurse: false, shuffle: false },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    // Toggle shuffle (any edit — not touching path at all)
+    const shuffleCb = screen.getByLabelText("shuffle") as HTMLInputElement;
+    fireEvent.click(shuffleCb);
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(1);
+
+    const s0 = value[0] as Record<string, unknown>;
+    // Path must be absent — it's null from the server and optional.
+    expect("path" in s0).toBe(false);
+    // urls must survive intact.
+    expect(s0.urls).toEqual(["https://example.com/img.jpg"]);
+    expect(s0.shuffle).toBe(true);
+  });
+});

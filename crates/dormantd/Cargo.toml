@@ -48,6 +48,8 @@ render = ["dep:dormant-render", "dormant-core/render"]
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }
 dormant-doctor = { path = "../dormant-doctor" }
 indexmap = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
   "test-util",
   "macros",

@@ -377,7 +377,7 @@ impl App {
 
         let runner = Runner {
             config_path: self.config_path.clone(),
-            creds_path: self.creds_path,
+            creds_path: self.creds_path.clone(),
             strictness: self.strictness,
             source_builder: self.source_builder,
             #[cfg(feature = "render")]
@@ -438,9 +438,12 @@ impl App {
                     config_rx: config_rx.clone(),
                     creds_rx: creds_rx.clone(),
                     config_path: self.config_path.clone(),
+                    creds_path: self.creds_path.clone(),
+                    apply_lock: tokio::sync::Mutex::new(()),
                     doctor: doctor_service.clone(),
                     web_bind: addr,
                     cancel: root.clone(),
+                    reload_timeout: std::time::Duration::from_secs(10),
                 });
                 match dormant_web::spawn(addr, web_state).await {
                     Ok((handle, _addr)) => Some(handle),

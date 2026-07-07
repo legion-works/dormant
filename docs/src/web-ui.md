@@ -64,7 +64,67 @@ A scrolling, auto-pruning event log. Shows presence changes, display phase trans
 
 ### Config
 
-A two-column layout. The left column renders the running config file as syntax-highlighted TOML (keys, string values, numbers, comments, and section headers each colored distinctly). The right column shows a parsed inventory (sensor, zone, display, and rule counts with their names), validation issues (load errors, schema errors, and warnings) with detail messages, and a reload button for hot-reloading config from disk.
+Two tabs: **Settings** (a form editor for live config changes without touching the TOML file) and **Raw TOML** (the original read-only syntax-highlighted viewer with inventory sidebar and a reload button).
+
+#### Settings tab
+
+The Settings form presents the running config as editable sections: Daemon, Sensors, Zones, Rules, and Displays. Each field shows the current value from `GET /api/config`; edits are accumulated in a client-side patch store and submitted together via `POST /api/config/apply`.
+
+**What is editable (v1):**
+- Leaf string, number, and duration values (e.g. `grace_period`, `startup_holdoff`, `hold_time`).
+- Whole arrays (e.g. a rule's `displays` list, the `ladder` array-of-tables, screensaver `source` lists). Setting an array replaces it wholesale.
+- A limited set of optional keys can be *removed* via the Remove op: `blank_mode`, `degraded_mode`, `dwell`, `order`, `image_duration`, `scale_mode`, `transition`, `transition_duration`, `hold_time`, `stale_timeout`, `ddc_display`, `output`, `wol_mac`, `host`.
+
+**What is deliberately file-only in v1:**
+- Display command strings (`wake_command`, `blank_command`), controller lists (`controllers`), and mode lists (`modes`) are not rendered in the Settings form. They are valid targets for the patch API (a direct `POST /api/config/apply` can set them), but the form does not expose controls for them.
+
+**What is not editable:**
+- **Locked leaves** — `type`, `blank_data`, `wake_data`: never writable through the patch API. The form renders these with a 🔒 icon and a tooltip explaining the restriction (redacted path ancestor, or a hard-locked config key).
+- **Credentials-redacted fields** — URLs carrying inline userinfo (e.g. MQTT `broker_url` with `user:pass@`) are redacted by the server before the response is sent. The form locks these fields (🔒) and a redacted-path-ancestor lock cascades to their descendants (e.g. all fields under a screensaver `source` entry whose `urls` contain userinfo).
+- **Entity add/remove** — adding or removing a sensor, zone, display, or rule table from the config is file-only. The patch API can only modify existing entities.
+
+**Apply → reload flow:**
+
+1. The form computes the patch delta from the user's dirty edits.
+2. `POST /api/config/apply` sends the current `fingerprint` plus the patches.
+3. The server re-reads the file, checks the fingerprint, validates and applies the patches, writes the new file, backs up the old file, and subscribes to the daemon's reload outcome.
+4. The daemon's config-file watcher detects the write, waits through the `reload_debounce` window, then reloads the runtime.
+5. The reload outcome is reported back in the apply response.
+
+#### Outcome banners
+
+The apply bar displays one of four outcomes after the request completes:
+
+| Banner | Meaning |
+|---|---|
+| **✓ Reloaded** | The daemon accepted the new config and rebuilt the runtime successfully. The form clears its dirty state and re-fetches the new fingerprint. |
+| **✕ Rejected** | The config was valid at write time but the daemon's reload failed (e.g. assembly error, removed-display verified-wake failure). A detail message names the cause. *The old config is still running; the patched file is on disk.* |
+| **pending** | The apply handler waited for the reload outcome but it did not arrive within the timeout (10 s). Normal when `reload_debounce` is large — the daemon coalesces the event and will reload shortly. The form re-fetches immediately; the file was already written. |
+| **superseded** | Another writer (a second browser tab, `dormantctl`, or a direct file edit) landed *after* your apply wrote the file. The reload outcome belongs to their write, not yours. |
+
+#### Conflict dialog (409)
+
+If the fingerprint in the apply request does not match the on-disk file (someone else edited the config between your last `GET` and your `POST`), the server returns `409 Conflict`. The Settings form shows a red conflict dialog:
+
+> Config changed on disk — your edits are against an outdated version. Reload the form to get the latest config, or keep editing (your changes will be lost).
+
+**Reload form** discards your edits, re-fetches the fresh config, and refreshes the form. **Keep editing** dismisses the dialog and leaves your dirty edits in place — you can then re-apply (the next attempt will use the current fingerprint, not the stale one).
+
+#### Unsaved-changes guard
+
+While the form has dirty edits, a `beforeunload` browser guard prevents accidental navigation away from the page. Switching from the Settings tab to the Raw TOML tab also triggers a confirmation dialog: *"Discard N unsaved changes?"*. The guard is removed once all edits are applied or discarded.
+
+#### Backups
+
+Every `POST /api/config/apply` that succeeds (the file is written and fsync'd) creates a backup of the previous config file before the atomic rename. Backups are stored in `<config-dir>/backups/` with names derived from the current UTC time plus a random 4-hex-digit suffix:
+
+```
+config.toml.2026-07-07T14:22:03Z.a3f1
+```
+
+The directory is created with mode `0o700` (owner-only). A rotation policy keeps at most **5** newest backups (sorted by filename, which encodes an RFC 3339 timestamp); older files are deleted after each new backup.
+
+The config-file watcher uses `RecursiveMode::NonRecursive` on the config directory — writes inside `backups/` do *not* trigger a reload.
 
 ### Doctor
 

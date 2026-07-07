@@ -73,8 +73,11 @@ pub(super) fn attach_single_pixel_black(
     state: &WaylandState,
 ) -> (WlBuffer, WpViewport) {
     let qh = state.queue_handle.clone();
-    let buffer =
-        single_pixel_manager.create_u32_rgba_buffer(OPAQUE_BLACK_U32, 0, 0, u32::MAX, &qh, ());
+    // Per-channel u32 values scaled over the full u32 range — NOT a
+    // packed ARGB8888 pixel.  The `OPAQUE_BLACK_U32` constant is for the
+    // shm path (a packed pixel written into the buffer); passing it as the
+    // `r` channel here would give ~99.6% red.
+    let buffer = single_pixel_manager.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &qh, ());
     let viewport = viewporter.get_viewport(wl_surface, &qh, ());
     viewport.set_destination(width.cast_signed(), height.cast_signed());
     wl_surface.attach(Some(&buffer), 0, 0);

@@ -1890,6 +1890,23 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
         "blank at {blank_at:?}, expected ~100s (entry@70 + dwell 30s)"
     );
 
+    // The render surface that was up during the render stage must be torn
+    // down BEFORE the controller blank fires — otherwise the orphaned
+    // wl_surface is left mapped on top of the now-blanked panel and
+    // blocks visibility.  The RecordingRenderSink captures every
+    // teardown; we must see at least one.  Re-read the render log AFTER
+    // the dwell escalation (~100s) — the earlier snapshot at ~72s only
+    // saw the Show.
+    let render_log_after = render_sink.log();
+    let teardown_after_dwell = render_log_after
+        .iter()
+        .filter(|(_, c)| matches!(c, RenderCmd::Teardown { .. }))
+        .count();
+    assert!(
+        teardown_after_dwell >= 1,
+        "dwell escalation into the controller stage must tear down the render surface — got {render_log_after:?}"
+    );
+
     harness.cancel.cancel();
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;

@@ -1188,7 +1188,7 @@ field = "/val"
         assert!(fresh_temp.exists(), "fresh temp should survive");
     }
 
-    // ── Reload-outcome tests (Task 5) ────────────────────────────────────────
+    // ── Reload-outcome tests ──────────────────────────────────────────────
 
     /// Reloaded outcome + fingerprint matches → `"reloaded"`.
     #[tokio::test]

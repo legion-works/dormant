@@ -1359,31 +1359,35 @@ mod tests {
 
         tokio::spawn(async move {
             let mut gen1: Option<broadcast::Sender<DaemonEvent>> = Some(gen1_clone);
+            let mut first_post_close = true;
             loop {
                 if gen1.is_some() {
                     tokio::select! {
                         _ = &mut drop_gen1_rx => { gen1 = None; }
                         msg = ctl_rx.recv() => {
-                            match msg {
-                                Some(ControlMsg::SubscribeEvents(tx)) => {
-                                    if let Some(ref g1) = gen1 {
-                                        let _ = tx.send(g1.subscribe());
-                                    }
-                                }
-                                Some(_) => {}
-                                None => break,
+                            if let Some(ControlMsg::SubscribeEvents(tx)) = msg
+                                && let Some(ref g1) = gen1
+                            {
+                                let _ = tx.send(g1.subscribe());
                             }
                         }
                     }
+                } else if first_post_close {
+                    // First post-close SubscribeEvents: drop the oneshot
+                    // so the handler stays in events=None.  This forces
+                    // the Rejected outcome to arrive through the recovery
+                    // arm (the flowing arm is unreachable with events
+                    // still None).
+                    first_post_close = false;
+                    let msg = ctl_rx.recv().await;
+                    if let Some(ControlMsg::SubscribeEvents(tx)) = msg {
+                        drop(tx);
+                    }
                 } else {
                     let msg = ctl_rx.recv().await;
-                    match msg {
-                        Some(ControlMsg::SubscribeEvents(tx)) => {
-                            let _ = tx.send(gen2_clone.subscribe());
-                            let _ = resub_signal_tx.send(()).await;
-                        }
-                        Some(_) => {}
-                        None => break,
+                    if let Some(ControlMsg::SubscribeEvents(tx)) = msg {
+                        let _ = tx.send(gen2_clone.subscribe());
+                        let _ = resub_signal_tx.send(()).await;
                     }
                 }
             }
@@ -1413,9 +1417,16 @@ mod tests {
         assert_eq!(f1["event"], "sensor_changed");
         assert_eq!(f1["sensor"], "recovery-pre");
 
-        // Tear down gen1 so the events channel closes, then publish Rejected.
+        // Tear down gen1.  The handler calls SubscribeEvents; the engine
+        // drops the oneshot so the handler sits in events=None.
         let _ = drop_gen1_tx.send(());
         drop(gen1_tx);
+        // One turn for the handler to drain Closed, attempt the (failed)
+        // resubscribe, and re-enter the events=None select!.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send Rejected NOW, while the handler is genuinely in
+        // events=None.  The frame can only come from the recovery arm.
         let _ = reload_tx.send(ReloadOutcome::Rejected("rebuild rejected".into()));
 
         // The handler must emit config_reload_rejected BEFORE resubscribing.

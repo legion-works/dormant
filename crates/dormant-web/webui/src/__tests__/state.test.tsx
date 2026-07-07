@@ -6,6 +6,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import { LiveStateProvider } from "../app/state";
 import { useLiveState, useEventLog } from "../app/hooks/useLiveState";
+import type { StateSnapshot, DisplaySnapshot } from "../api/types";
 
 
 const { mocks, fixtures } = vi.hoisted(() => {
@@ -289,3 +290,130 @@ describe("LiveStateProvider event-to-state patching", () => {
     expect(vi.mocked(getConfig).mock.calls.length).toBeGreaterThan(configCallsBefore);
   });
 });
+
+  it("clears stage when display phase patches away from staged", async () => {
+    const stagedSnapshot: StateSnapshot = {
+      ...fixtures.state,
+      displays: [
+        [
+          "d1" as string,
+          {
+            phase: "staged",
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: [],
+            stage: { idx: 2, kind: "render_black" },
+          } as DisplaySnapshot,
+        ] as [string, DisplaySnapshot],
+      ],
+    };
+
+    // Override getState to return the staged fixture.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(stagedSnapshot);
+
+    function StageConsumer() {
+      const { snapshot } = useLiveState();
+      if (!snapshot) return <span>loading</span>;
+      return (
+        <div>
+          {snapshot.displays.map(([id, d]) => (
+            <span key={id} data-testid={`display-${id}`}>
+              {d.phase}:{d.stage?.kind ?? "none"}
+            </span>
+          ))}
+        </div>
+      );
+    }
+
+    render(
+      <LiveStateProvider>
+        <StageConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("display-d1")).toHaveTextContent("staged:render_black");
+    });
+
+    // Phase changes away from staged — stage must clear.
+    act(() => {
+      mocks.onMessage?.({
+        event: "display_phase",
+        display: "d1",
+        phase: "blanking",
+        cause: "z",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("display-d1")).toHaveTextContent("blanking:none");
+    });
+  });
+
+  it("stage stays intact during staged→staged phase patch", async () => {
+    const stagedSnapshot: StateSnapshot = {
+      ...fixtures.state,
+      displays: [
+        [
+          "d1" as string,
+          {
+            phase: "staged",
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: [],
+            stage: { idx: 1, kind: "render_screensaver" },
+          } as DisplaySnapshot,
+        ] as [string, DisplaySnapshot],
+      ],
+    };
+
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(stagedSnapshot);
+
+    function StageConsumer() {
+      const { snapshot } = useLiveState();
+      if (!snapshot) return <span>loading</span>;
+      return (
+        <div>
+          {snapshot.displays.map(([id, d]) => (
+            <span key={id} data-testid={`display-${id}`}>
+              {d.phase}:{d.stage?.kind ?? "none"}
+            </span>
+          ))}
+        </div>
+      );
+    }
+
+    render(
+      <LiveStateProvider>
+        <StageConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("display-d1")).toHaveTextContent(
+        "staged:render_screensaver",
+      );
+    });
+
+    // Same phase, different "reason" — stage must survive.
+    act(() => {
+      mocks.onMessage?.({
+        event: "display_phase",
+        display: "d1",
+        phase: "staged",
+        cause: "ladder advance",
+      });
+    });
+
+    await waitFor(() => {
+      // stage.kind should still be render_screensaver (from the fixture)
+      expect(screen.getByTestId("display-d1")).toHaveTextContent(
+        "staged:render_screensaver",
+      );
+    });
+  });

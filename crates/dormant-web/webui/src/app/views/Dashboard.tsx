@@ -9,7 +9,7 @@
  */
 import { useNavigate } from "../nav";
 import { useLiveState, useEventLog } from "../hooks/useLiveState";
-import { Card, StatusChip, statusLabel } from "../components";
+import { Card, StatusChip, statusLabel, phaseChipLabel } from "../components";
 import { badgeForEvent, messageForEvent } from "./eventFormat";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";
@@ -142,7 +142,7 @@ function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProp
     <div className="dash-display-row">
       <div className="dash-display-row__top">
         <span className="dash-display-row__id">{id}</span>
-        <StatusChip kind={snap.phase} />
+        <StatusChip kind={snap.phase} label={phaseChipLabel(snap.phase, snap.stage)} />
       </div>
       <div className="dash-display-row__meta">
         <span className="dash-display-row__blank">{blankMode}</span>

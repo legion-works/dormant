@@ -69,6 +69,23 @@ jobs:
           path: crates/dormant-web/webui/dist/
       - run: cargo test --workspace --all-features
 
+  render:
+    needs: webui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev pkg-config
+      - uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: crates/dormant-web/webui/dist/
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo build -p dormant-render
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo build -p dormantd --features render
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo test -p dormant-core --features render
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo test -p dormantd --features render
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo test -p dormant-render
+
   portability:
     strategy:
       matrix:

@@ -41,11 +41,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::SensorKind;
 use crate::error::DormantError;
+use crate::ownership::OwnershipGate;
 use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
-use crate::traits::CommandSink;
+use crate::traits::{CommandSink, RenderSink};
 use crate::types::{
-    BlankMode, CmdFailure, DisplayId, PresenceEvent, RuleId, SensorId, SensorState, Tick,
-    Timestamp, ZoneId,
+    BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
+    StageKind, Tick, Timestamp, ZoneId,
 };
 use crate::zone::ZoneEngine;
 
@@ -90,6 +91,9 @@ pub enum ControlMsg {
     /// in [`StateSnapshot`]s). Lets the daemon flag a rejected reload without
     /// tearing down the running engine.
     SetPendingReload(Option<String>),
+    /// Input-wake event from the render surface — route to the display
+    /// machine's [`Input::InputWake`].
+    InputWake(DisplayId),
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
@@ -178,6 +182,15 @@ pub struct ControllerHealth {
     pub detail: Option<String>,
 }
 
+/// The active ladder stage of a display in the `staged` phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageInfo {
+    /// Zero-based index into the display's normalized ladder.
+    pub idx: usize,
+    /// The stage kind at that index.
+    pub kind: StageKind,
+}
+
 /// A display as seen by a [`StateSnapshot`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DisplaySnapshot {
@@ -196,6 +209,11 @@ pub struct DisplaySnapshot {
     /// field (serde back-compat).
     #[serde(default)]
     pub controllers: Vec<ControllerHealth>,
+    /// The active ladder stage when the display is in the `staged` phase.
+    /// `None` for every other phase (and for legacy wire — the key is
+    /// omitted when `None`, byte-identical to a pre-stage snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<StageInfo>,
 }
 
 /// A point-in-time view of engine state, returned by [`ControlMsg::Snapshot`].
@@ -218,8 +236,10 @@ pub struct StateSnapshot {
 pub struct DisplayRuntimeCfg {
     /// The display this config applies to.
     pub display: DisplayId,
-    /// The blank mode to issue on a successful blank.
+    /// The primary blank mode — the first controller stage's mode.
     pub blank_mode: BlankMode,
+    /// The display's escalation ladder.
+    pub ladder: Vec<LadderStage>,
     /// Timing parameters for the display's state machine.
     pub timings: SmTimings,
 }
@@ -270,6 +290,9 @@ pub struct RulesEngineConfig {
 enum TimerEntry {
     /// Drive [`DisplayStateMachine::step`] with [`Input::Tick`] at deadline.
     DisplayTick(DisplayId),
+    /// Drive [`DisplayStateMachine::step`] with [`Input::StageTick`] at
+    /// deadline, carrying the generation counter for stale-detection.
+    DisplayStageTick(DisplayId, u64),
     /// Hold-time expiry: synthesize the held Absent event for this sensor.
     HoldExpiry(SensorId),
 }
@@ -291,6 +314,15 @@ enum InternalResult {
         /// Display the command was issued for.
         display: DisplayId,
         /// Generation counter matching the `IssueWake` effect.
+        r#gen: u64,
+        /// Outcome.
+        result: Result<(), CmdFailure>,
+    },
+    /// Result of a render command issued earlier.
+    Render {
+        /// Display the command was issued for.
+        display: DisplayId,
+        /// Generation counter matching the `ShowRender` effect.
         r#gen: u64,
         /// Outcome.
         result: Result<(), CmdFailure>,
@@ -325,6 +357,16 @@ pub struct RulesEngine {
     machines: HashMap<DisplayId, DisplayStateMachine>,
     /// Per-display command executors (the I/O side).
     executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+    /// Per-display render sinks (the surface I/O side).  Empty when no render
+    /// backend is injected; render stages then fall through.
+    render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+    /// Ownership gate — consulted every time the engine interacts with a
+    /// display.  Feeds [`Input::OwnershipChanged`] to the state machine when
+    /// the gate's verdict differs from the last-fed value.
+    ownership: Arc<dyn OwnershipGate>,
+    /// Last ownership value fed per display — change-detection to avoid
+    /// redundant [`Input::OwnershipChanged`] edges every tick.
+    last_owned: HashMap<DisplayId, bool>,
     /// Rule → its displays.
     rule_displays: HashMap<RuleId, Vec<DisplayId>>,
     /// Zone → rules bound to it.
@@ -356,8 +398,8 @@ pub struct RulesEngine {
 }
 
 impl RulesEngine {
-    /// Construct an engine from its runtime config, zone engine, and command
-    /// executors.
+    /// Construct an engine from its runtime config, zone engine, command
+    /// executors, render sinks, and ownership gate.
     ///
     /// # Errors
     ///
@@ -367,6 +409,8 @@ impl RulesEngine {
         cfg: RulesEngineConfig,
         zone_engine: ZoneEngine,
         executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+        render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+        ownership: Arc<dyn OwnershipGate>,
     ) -> Result<Self, DormantError> {
         let now = Tick::now();
 
@@ -375,8 +419,19 @@ impl RulesEngine {
         for dcfg in &cfg.displays {
             machines.insert(
                 dcfg.display.clone(),
-                DisplayStateMachine::new(dcfg.timings.clone(), dcfg.blank_mode, now),
+                DisplayStateMachine::new(dcfg.timings.clone(), dcfg.ladder.clone(), now),
             );
+        }
+
+        // Seed ownership state into each machine so it starts with the
+        // correct gate verdict.  Machines default to `owned: true`; this
+        // initial feed brings them in sync with the gate before the first
+        // event.
+        let mut last_owned: HashMap<DisplayId, bool> = HashMap::new();
+        for (display_id, machine) in &mut machines {
+            let owns = ownership.owns(display_id);
+            let _ = machine.step(Input::OwnershipChanged(owns), now);
+            last_owned.insert(display_id.clone(), owns);
         }
 
         // Validate cross-references and build index structures.
@@ -425,6 +480,9 @@ impl RulesEngine {
             zone_engine,
             machines,
             executors,
+            render_sinks,
+            ownership,
+            last_owned,
             rule_displays,
             zone_rules,
             paused_rules: HashSet::new(),
@@ -631,6 +689,12 @@ impl RulesEngine {
                 None => continue,
             };
             for display_id in displays {
+                // Feed ownership so the gate verdict is current before
+                // processing the presence edge.
+                let own_effects = self.feed_ownership(&display_id, now);
+                for effect in own_effects {
+                    self.process_effect(&display_id, effect);
+                }
                 let Some(machine) = self.machines.get_mut(&display_id) else {
                     continue;
                 };
@@ -650,6 +714,7 @@ impl RulesEngine {
             ControlMsg::Resume { rule } => self.handle_resume(rule.as_ref()),
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
+            ControlMsg::InputWake(d) => self.step_one(&d, Input::InputWake),
             ControlMsg::Snapshot(tx) => self.send_snapshot(tx),
             ControlMsg::SubscribeEvents(tx) => {
                 let _ = tx.send(self.event_tx.subscribe());
@@ -724,15 +789,41 @@ impl RulesEngine {
     }
 
     /// Step a single display machine and process its effects.
+    ///
+    /// Feeds [`Input::OwnershipChanged`] before the requested input so the
+    /// machine's `owned` flag always reflects the gate's current verdict.
     fn step_one(&mut self, display: &DisplayId, input: Input) {
+        let now = Tick::now();
+        let own_effects = self.feed_ownership(display, now);
+        for effect in own_effects {
+            self.process_effect(display, effect);
+        }
         let Some(machine) = self.machines.get_mut(display) else {
             return;
         };
-        let now = Tick::now();
         let effects = machine.step(input, now);
         for effect in effects {
             self.process_effect(display, effect);
         }
+    }
+
+    /// Consult the [`OwnershipGate`] for `display` and, if the verdict
+    /// differs from the last-fed value, feed
+    /// [`Input::OwnershipChanged`] to the state machine.
+    ///
+    /// Returns any effects the machine produced (e.g. teardown-render on
+    /// ownership-yield).  When the gate returns the same value as last
+    /// time this is a no-op (returns `vec![]`).
+    fn feed_ownership(&mut self, display: &DisplayId, now: Tick) -> Vec<Effect> {
+        let owns = self.ownership.owns(display);
+        if self.last_owned.get(display) == Some(&owns) {
+            return vec![];
+        }
+        self.last_owned.insert(display.clone(), owns);
+        let Some(machine) = self.machines.get_mut(display) else {
+            return vec![];
+        };
+        machine.step(Input::OwnershipChanged(owns), now)
     }
 
     fn send_snapshot(&self, tx: oneshot::Sender<StateSnapshot>) {
@@ -783,6 +874,7 @@ impl RulesEngine {
                         paused: m.overlays().paused.is_some(),
                         cmd_gen: m.cmd_gen(),
                         controllers,
+                        stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
                     },
                 ));
             }
@@ -834,6 +926,18 @@ impl RulesEngine {
                     });
                 }
             }
+            InternalResult::Render {
+                display,
+                r#gen,
+                result,
+            } => {
+                if let Some(machine) = self.machines.get_mut(&display) {
+                    let effects = machine.step(Input::RenderResult { r#gen, result }, now);
+                    for effect in effects {
+                        self.process_effect(&display, effect);
+                    }
+                }
+            }
         }
     }
 
@@ -862,8 +966,25 @@ impl RulesEngine {
                 let Reverse((deadline, timer_entry)) = self.timers.pop().expect("peeked");
                 match timer_entry {
                     TimerEntry::DisplayTick(display) => {
+                        let own_effects = self.feed_ownership(&display, deadline);
+                        for effect in own_effects {
+                            self.process_effect(&display, effect);
+                        }
                         if let Some(machine) = self.machines.get_mut(&display) {
                             let effects = machine.step(Input::Tick, deadline);
+                            for effect in effects {
+                                self.process_effect(&display, effect);
+                            }
+                        }
+                    }
+                    TimerEntry::DisplayStageTick(display, stage_gen) => {
+                        let own_effects = self.feed_ownership(&display, deadline);
+                        for effect in own_effects {
+                            self.process_effect(&display, effect);
+                        }
+                        if let Some(machine) = self.machines.get_mut(&display) {
+                            let effects =
+                                machine.step(Input::StageTick { r#gen: stage_gen }, deadline);
                             for effect in effects {
                                 self.process_effect(&display, effect);
                             }
@@ -980,6 +1101,56 @@ impl RulesEngine {
                 self.timers
                     .push(Reverse((tick, TimerEntry::DisplayTick(display_id.clone()))));
             }
+            Effect::ScheduleStageTickAt { r#gen, at } => {
+                self.timers.push(Reverse((
+                    at,
+                    TimerEntry::DisplayStageTick(display_id.clone(), r#gen),
+                )));
+            }
+            Effect::ShowRender { r#gen, idx, kind } => {
+                if let Some(sink) = self.render_sinks.get(display_id) {
+                    let sink = Arc::clone(sink);
+                    let display = display_id.clone();
+                    let tx = self.results_tx.clone();
+                    tokio::spawn(async move {
+                        let result = sink.show(r#gen, idx, kind).await;
+                        let _ = tx.send(InternalResult::Render {
+                            display,
+                            r#gen,
+                            result,
+                        });
+                    });
+                } else {
+                    // No render backend — render stage fails fall-through
+                    // so the machine never wedges in RenderPending.
+                    //
+                    // TODO(Task 8): this engine-level path is covered at the
+                    // SM level (render_only_total_cascade_returns_active) but
+                    // not engine-level until a real/fake RenderSink is wired
+                    // into rules_end_to_end.
+                    let display = display_id.clone();
+                    let tx = self.results_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(InternalResult::Render {
+                            display,
+                            r#gen,
+                            result: Err(CmdFailure {
+                                controller: "render-none".into(),
+                                error: "E_RENDER_UNAVAILABLE: no render backend".into(),
+                            }),
+                        });
+                    });
+                }
+            }
+            Effect::TeardownRender { r#gen } => {
+                if let Some(sink) = self.render_sinks.get(display_id) {
+                    let sink = Arc::clone(sink);
+                    tokio::spawn(async move {
+                        sink.teardown(r#gen).await;
+                    });
+                }
+                // No-op when no sink — teardown is idempotent.
+            }
             Effect::LogTransition { from: _, to, cause } => {
                 tracing::info!(
                     event = "display_phase",
@@ -1026,6 +1197,57 @@ mod tests {
         let legacy = r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0}"#;
         let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
         assert!(snap.controllers.is_empty());
+    }
+
+    #[test]
+    fn display_snapshot_deserializes_legacy_without_stage() {
+        // A DisplaySnapshot JSON without the "stage" key must parse with
+        // stage=None (serde back-compat — same as doctor_report + controllers).
+        let legacy =
+            r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0,"controllers":[]}"#;
+        let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.stage.is_none());
+    }
+
+    #[test]
+    fn display_snapshot_serialize_omits_stage_when_none() {
+        // When stage is None the key must be absent from the wire (byte-back-compat
+        // with pre-stage readers — same skip_serializing_if pattern as doctor_report).
+        let snap = DisplaySnapshot {
+            phase: "active".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            controllers: vec![],
+            stage: None,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("stage"));
+    }
+
+    #[test]
+    fn display_snapshot_staged_roundtrips() {
+        // A Staged snapshot round-trips with a pinned wire shape.
+        let snap = DisplaySnapshot {
+            phase: "staged".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: vec![],
+            stage: Some(StageInfo {
+                idx: 1,
+                kind: StageKind::RenderBlack,
+            }),
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        // Wire shape: idx=1, kind="render_black"
+        assert!(json.contains(r#""idx":1"#));
+        assert!(json.contains(r#""kind":"render_black""#));
+        let back: DisplaySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phase, "staged");
+        let si = back.stage.unwrap();
+        assert_eq!(si.idx, 1);
+        assert_eq!(si.kind, StageKind::RenderBlack);
     }
 
     #[test]

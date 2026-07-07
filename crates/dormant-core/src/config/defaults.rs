@@ -69,3 +69,23 @@ pub const MQTT_FIELD: &str = "/occupancy";
 
 /// Default web-UI bind address — loopback only (operator tool).
 pub const WEB_BIND_DEFAULT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// Default duration each screensaver source image is displayed (8 seconds).
+pub const IMAGE_DURATION: Duration = Duration::from_secs(8);
+
+/// Whether the screensaver overlay should play audio by default.
+pub const SCREENSAVER_AUDIO: bool = false;
+
+/// Default trigger for the screensaver overlay.
+pub const SCREENSAVER_TRIGGER: &str = "vacancy";
+
+/// Default mpv cache size for screensaver playback (64 MiB).
+/// Kept modest to avoid memory pressure on embedded / low-RAM hosts.
+pub const MPV_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `#[serde(default = "default_trigger")]` function shim — returns the default
+/// trigger string for [`super::schema::ScreensaverConfig::trigger`].
+#[must_use]
+pub fn default_trigger() -> String {
+    SCREENSAVER_TRIGGER.to_string()
+}

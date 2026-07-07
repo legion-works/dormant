@@ -5,6 +5,7 @@
 //! Newtype ids use `#[serde(transparent)]` so they serialize as plain strings.
 
 use std::fmt;
+use std::time::Duration;
 
 // ── Newtype IDs ───────────────────────────────────────────────────────────────
 
@@ -151,6 +152,92 @@ pub enum BlankMode {
     ScreenOffAudioOn,
     /// Set brightness to zero (backlight off, display still on).
     BrightnessZero,
+}
+
+// ── Stage kind ───────────────────────────────────────────────────────────────
+
+/// A single step in the escalation ladder — either a hardware controller blank
+/// mode or a fallback software render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageKind {
+    /// A display-controller blank mode (DPMS, DDC/CI, CEC, etc.).
+    Controller(BlankMode),
+    /// Render a black full-screen overlay (software blank).
+    RenderBlack,
+    /// Render a screensaver (last-resort fallback).
+    RenderScreensaver,
+}
+
+impl StageKind {
+    /// True for the two render variants — these run as software overlays
+    /// and should only be reached when hardware blanking has failed.
+    #[must_use]
+    pub fn is_render(self) -> bool {
+        matches!(self, StageKind::RenderBlack | StageKind::RenderScreensaver)
+    }
+}
+
+impl serde::Serialize for StageKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            StageKind::Controller(mode) => mode.serialize(serializer),
+            StageKind::RenderBlack => serializer.serialize_str("render_black"),
+            StageKind::RenderScreensaver => serializer.serialize_str("render_screensaver"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StageKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const EXPECTED: &[&str] = &[
+            "power_off",
+            "screen_off_audio_on",
+            "brightness_zero",
+            "render_black",
+            "render_screensaver",
+        ];
+
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = StageKind;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a stage kind: \"power_off\", \"screen_off_audio_on\", \"brightness_zero\", \"render_black\", or \"render_screensaver\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<StageKind, E> {
+                match s {
+                    "power_off" => Ok(StageKind::Controller(BlankMode::PowerOff)),
+                    "screen_off_audio_on" => Ok(StageKind::Controller(BlankMode::ScreenOffAudioOn)),
+                    "brightness_zero" => Ok(StageKind::Controller(BlankMode::BrightnessZero)),
+                    "render_black" => Ok(StageKind::RenderBlack),
+                    "render_screensaver" => Ok(StageKind::RenderScreensaver),
+                    _ => Err(E::unknown_variant(s, EXPECTED)),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+// ── Ladder stage ────────────────────────────────────────────────────────────
+
+/// One rung of the escalation ladder: a stage kind and an optional dwell
+/// (how long to stay in this stage before advancing).
+///
+/// When `dwell` is `None` the stage has no time limit — the ladder stays
+/// here until an external event (sensor, user wake) moves it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LadderStage {
+    /// What this rung does.
+    pub kind: StageKind,
+    /// How long to dwell at this stage before trying the next one.
+    /// Deserialized with `humantime_serde::option`, so TOML values like
+    /// `"5m"` or `"30s"` are accepted.
+    #[serde(default, with = "humantime_serde::option")]
+    pub dwell: Option<Duration>,
 }
 
 // ── Command failure ───────────────────────────────────────────────────────────
@@ -372,4 +459,65 @@ mod tests {
         assert!(t1 <= t1);
         assert!(t1 >= t1);
     }
+}
+
+// ── StageKind / LadderStage ────────────────────────────────────────────
+
+#[test]
+fn stage_kind_serde_tags_are_flat() {
+    assert_eq!(
+        serde_json::to_string(&StageKind::Controller(BlankMode::PowerOff)).unwrap(),
+        r#""power_off""#
+    );
+    assert_eq!(
+        serde_json::to_string(&StageKind::Controller(BlankMode::ScreenOffAudioOn)).unwrap(),
+        r#""screen_off_audio_on""#
+    );
+    assert_eq!(
+        serde_json::to_string(&StageKind::Controller(BlankMode::BrightnessZero)).unwrap(),
+        r#""brightness_zero""#
+    );
+    assert_eq!(
+        serde_json::to_string(&StageKind::RenderBlack).unwrap(),
+        r#""render_black""#
+    );
+    assert_eq!(
+        serde_json::to_string(&StageKind::RenderScreensaver).unwrap(),
+        r#""render_screensaver""#
+    );
+}
+
+#[test]
+fn stage_kind_roundtrips_all_five() {
+    for k in [
+        StageKind::Controller(BlankMode::PowerOff),
+        StageKind::Controller(BlankMode::ScreenOffAudioOn),
+        StageKind::Controller(BlankMode::BrightnessZero),
+        StageKind::RenderBlack,
+        StageKind::RenderScreensaver,
+    ] {
+        let s = serde_json::to_string(&k).unwrap();
+        let back: StageKind = serde_json::from_str(&s).unwrap();
+        assert_eq!(k, back);
+    }
+}
+
+#[test]
+fn stage_kind_is_render() {
+    assert!(StageKind::RenderBlack.is_render());
+    assert!(StageKind::RenderScreensaver.is_render());
+    assert!(!StageKind::Controller(BlankMode::PowerOff).is_render());
+}
+
+#[test]
+fn ladder_stage_dwell_parses_humantime() {
+    let s: LadderStage = toml::from_str(
+        r#"kind = "render_black"
+dwell = "5m""#,
+    )
+    .unwrap();
+    assert_eq!(s.kind, StageKind::RenderBlack);
+    assert_eq!(s.dwell, Some(std::time::Duration::from_secs(300)));
+    let t: LadderStage = toml::from_str(r#"kind = "power_off""#).unwrap();
+    assert_eq!(t.dwell, None);
 }

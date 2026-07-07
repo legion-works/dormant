@@ -940,3 +940,548 @@ async fn web_bind_change_ignored_on_reload() {
 
     shutdown(handle, join).await;
 }
+
+// ── 12: render sink wiring (feature-gated) ────────────────────────────────────
+
+#[cfg(feature = "render")]
+mod render_smoke {
+    use super::*;
+    use dormant_core::fakes::RecordingRenderSink;
+    use dormant_core::types::StageKind;
+    use std::sync::Arc;
+
+    /// Whether a recording sink has logged at least one `Show(RenderBlack)`.
+    fn sink_rendered(sink: &RecordingRenderSink) -> bool {
+        sink.log().iter().any(|(_dur, cmd)| {
+            matches!(
+                cmd,
+                dormant_core::fakes::RenderCmd::Show {
+                    kind: StageKind::RenderBlack,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// A render sink paired with the `InputWake` sender its generation was
+    /// built with — the unit of identity selection in
+    /// `rollback_input_wake_routes_through_drain`.
+    type WakePair = (
+        RecordingRenderSink,
+        tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+    );
+
+    fn render_ladder_config(marker: &Path, grace: &str) -> String {
+        format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_command = "printf B >> '{m}'"
+wake_command = "printf W >> '{m}'"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "200ms" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-1"
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            m = marker.display(),
+            g = grace,
+        )
+    }
+
+    /// A render sink factory that returns a shared [`RecordingRenderSink`]
+    /// so the test can inspect recorded commands after the engine runs.
+    fn recording_factory(
+        sink: RecordingRenderSink,
+    ) -> impl Fn(
+        dormant_core::types::DisplayId,
+        String,
+        Option<&tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
+    ) -> Option<Arc<dyn dormant_core::traits::RenderSink>>
+    + Send
+    + Sync
+    + 'static {
+        move |_did, _output, _tx| Some(Arc::new(sink.clone()))
+    }
+
+    /// Assembles a config with a render ladder and verifies the
+    /// `RecordingRenderSink` is passed through to the engine.  This test
+    /// wires the full `assemble_static` → `spawn_generation` pipeline
+    /// with an injected render sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assembled_render_sink_reaches_engine() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("marker");
+        let cfg_str = render_ladder_config(&marker, "300ms");
+        let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+        let creds_path = dir.path().join("credentials.toml");
+
+        let fake_sink = RecordingRenderSink::new();
+        let builder = recording_factory(fake_sink.clone());
+
+        let script = vec![
+            (Duration::from_millis(0), ev("desk", SensorState::Present)),
+            (Duration::from_millis(200), ev("desk", SensorState::Absent)),
+        ];
+
+        let app = App::build_with_sources(
+            cfg_path,
+            creds_path,
+            Strictness::Strict,
+            fake_factory("desk", script),
+        )
+        .expect("build app")
+        .with_render_sink_builder(builder)
+        .disable_ipc();
+
+        let (handle, join) = app.start().await.expect("start app");
+
+        // The command controller blanks successfully with `printf B >> ...`,
+        // then the 200ms dwell expires and the machine escalates to
+        // RenderBlack — the fake sink should receive show(RenderBlack).
+        let ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(
+                        cmd,
+                        dormant_core::fakes::RenderCmd::Show {
+                            kind: StageKind::RenderBlack,
+                            ..
+                        }
+                    )
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        // Wake the display — the engine should tear down the render surface.
+        let events = handle.events_sender();
+        let _ = events.send(ev("desk", SensorState::Present)).await;
+
+        let woken = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(cmd, dormant_core::fakes::RenderCmd::Teardown { .. })
+                })
+                // Note: no wake marker expected — the panel is physically ON
+                // during a render overlay; teardown alone reveals it.
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let full_log = fake_sink.log();
+        shutdown(handle, join).await;
+
+        assert!(
+            ok,
+            "expected show(RenderBlack) in render sink, log: {full_log:?}"
+        );
+        assert!(
+            woken,
+            "expected teardown after presence restored, log: {full_log:?}"
+        );
+    }
+
+    /// After a rejected reload triggers `rebuild_old`, the restored
+    /// generation uses fresh render sinks with a live `InputWake` channel
+    /// — no orphaned senders.  The engine must blank, render, and tear
+    /// down correctly after the rollback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_render_sink_wiring_is_live() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("marker");
+        let cfg_str = render_ladder_config(&marker, "300ms");
+        let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+        let creds_path = dir.path().join("credentials.toml");
+
+        let fake_sink = RecordingRenderSink::new();
+        let builder = recording_factory(fake_sink.clone());
+
+        let script = vec![
+            (Duration::from_millis(0), ev("desk", SensorState::Present)),
+            (Duration::from_millis(200), ev("desk", SensorState::Absent)),
+        ];
+
+        let app = App::build_with_sources(
+            cfg_path.clone(),
+            creds_path,
+            Strictness::Strict,
+            fake_factory("desk", script),
+        )
+        .expect("build app")
+        .with_render_sink_builder(builder)
+        .disable_ipc();
+
+        let (handle, join) = app.start().await.expect("start app");
+        let mut reloads = handle.subscribe_reload();
+
+        // Wait for the first show (blank then dwell then render_black).
+        let show_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(
+                        cmd,
+                        dormant_core::fakes::RenderCmd::Show {
+                            kind: StageKind::RenderBlack,
+                            ..
+                        }
+                    )
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+        assert!(show_ok, "expected show(RenderBlack) before rollback");
+
+        // Trigger a rejected reload: write an invalid config.
+        fs::write(&cfg_path, "config_version = 1\nbogus_key = true\n").unwrap();
+        assert!(handle.trigger_reload().await);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+            .await
+            .expect("reload outcome")
+            .expect("reload bus open");
+        match outcome {
+            ReloadOutcome::Rejected(_) => {}
+            ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
+        }
+
+        // rebuild_old ran — verify pending_reload is set.
+        let ctl = handle.control_sender();
+        let (tx, rx) = oneshot::channel();
+        ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
+        let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("snapshot")
+            .expect("snapshot reply");
+        assert!(
+            snap.pending_reload.is_some(),
+            "pending_reload must be set after rejected reload"
+        );
+
+        // The restored generation must still blank + render + wake.
+        // Drive a full cycle through the events seam.
+        let events = handle.events_sender();
+        let _ = events.send(ev("desk", SensorState::Present)).await;
+        let teardown_ok = wait_for(
+            || {
+                let log = fake_sink.log();
+                log.iter().any(|(_dur, cmd)| {
+                    matches!(cmd, dormant_core::fakes::RenderCmd::Teardown { .. })
+                })
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let full_log = fake_sink.log();
+        shutdown(handle, join).await;
+
+        assert!(
+            teardown_ok,
+            "expected teardown after presence in rebuilt generation, log: {full_log:?}"
+        );
+    }
+
+    /// After a rejected reload triggered by a removed-display wake failure,
+    /// the restored generation gets a fresh `InputWake` channel via
+    /// `build_render_sinks` → `rebuild_old`.  Sending a `DisplayId` through
+    /// that rollback generation's OWN sender must travel the REAL path —
+    /// unbounded channel → the drain task spawned by `spawn_generation` →
+    /// `ControlMsg::InputWake` → engine → render teardown — the exact wiring
+    /// the orphaned-sender bug broke.
+    ///
+    /// Uses a two-display config where mon2 has `wake_command = "false"`
+    /// so its verified wake fails on removal, triggering `rebuild_old`.
+    ///
+    /// **Determinism — identity-based, no counts.** The test factory pairs
+    /// each render sink it builds with the `InputWake` sender it was handed,
+    /// in build order.  Selection never counts invocations (that total is
+    /// environment-dependent — a single `fs::write` can wake both
+    /// `trigger_reload` and the config watcher, and CPU load shifts timing).
+    /// Instead, after draining the reload bus until quiet (so the installed
+    /// generation is FINAL) and re-driving the engine to a render stage, the
+    /// test selects the sink pinned by three identity marks: index >= 2 (only
+    /// a rollback generation lands here — indices 0..2 are the initial
+    /// assembly, and a rejected new-assembly's sink is dropped before its
+    /// generation is ever spawned, so it never renders), a LIVE sender (only
+    /// the CURRENT generation's `InputWake` receiver is still held by a drain
+    /// — superseded rollbacks are closed), and an actual `RenderBlack` (so a
+    /// teardown is observable).  Among matches it takes the highest index
+    /// (build order → newest generation).  No control-channel bypass, no
+    /// count gate.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_input_wake_routes_through_drain() {
+        let dir = TempDir::new().unwrap();
+        let m1 = dir.path().join("mon1");
+        let m2 = dir.path().join("mon2");
+
+        // Two-display render config.  mon2 has a failing wake command
+        // ("false") so its verified wake fails on removal, triggering
+        // rebuild_old.
+        let cfg_str = format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon1]
+controllers = ["command"]
+blank_command = "printf B >> '{m1}'"
+wake_command = "printf W >> '{m1}'"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "200ms" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-1"
+
+[displays.mon2]
+controllers = ["command"]
+blank_command = "printf B >> '{m2}'"
+wake_command = "false"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "20s" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-2"
+
+[rules.r]
+zone = "office"
+displays = ["mon1", "mon2"]
+grace_period = "300ms"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            m1 = m1.display(),
+            m2 = m2.display(),
+        );
+        let cfg_path = write_file(dir.path(), "config.toml", &cfg_str);
+        let creds_path = dir.path().join("credentials.toml");
+
+        // The factory builds a FRESH recording sink per invocation and pairs
+        // it with the `InputWake` sender it was handed.  Fresh (not shared)
+        // sinks give each generation its own render log, so identity
+        // selection can tell rollback sinks apart from initial ones.
+        let pairs: Arc<Mutex<Vec<WakePair>>> = Arc::new(Mutex::new(Vec::new()));
+        let pairs_for_factory = pairs.clone();
+        let builder = move |_did: dormant_core::types::DisplayId,
+                            _output: String,
+                            tx: Option<
+            &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+        >| {
+            let sink = RecordingRenderSink::new();
+            if let Some(tx) = tx {
+                pairs_for_factory
+                    .lock()
+                    .unwrap()
+                    .push((sink.clone(), tx.clone()));
+            }
+            Some(Arc::new(sink) as Arc<dyn dormant_core::traits::RenderSink>)
+        };
+
+        let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+        let app = App::build_with_sources(
+            cfg_path.clone(),
+            creds_path,
+            Strictness::Strict,
+            fake_factory("desk", script),
+        )
+        .expect("build app")
+        .with_render_sink_builder(builder)
+        .disable_ipc();
+
+        let (handle, join) = app.start().await.expect("start app");
+        let mut reloads = handle.subscribe_reload();
+
+        // Both displays blank + render — some initial sink shows RenderBlack.
+        let show_ok = wait_for(
+            || {
+                pairs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(sink, _)| sink_rendered(sink))
+            },
+            Duration::from_secs(6),
+        )
+        .await;
+        assert!(show_ok, "expected show(RenderBlack) before rollback");
+
+        // Reload: mon2 removed → verified wake fails → rebuild_old.
+        let cfg_single = format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon1]
+controllers = ["command"]
+blank_command = "printf B >> '{m1}'"
+wake_command = "printf W >> '{m1}'"
+modes = ["power_off"]
+ladder = [
+  {{ kind = "power_off", dwell = "200ms" }},
+  {{ kind = "render_black" }},
+]
+output = "DP-1"
+
+[rules.r]
+zone = "office"
+displays = ["mon1"]
+grace_period = "300ms"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            m1 = m1.display(),
+        );
+        fs::write(&cfg_path, &cfg_single).unwrap();
+        assert!(handle.trigger_reload().await);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+            .await
+            .expect("reload outcome")
+            .expect("reload bus open");
+        match outcome {
+            ReloadOutcome::Rejected(detail) => {
+                assert!(
+                    detail.contains("mon2"),
+                    "reject detail must name un-wakeable display: {detail}"
+                );
+            }
+            ReloadOutcome::Reloaded => {
+                panic!("expected Rejected on mon2 wake failure, got Reloaded")
+            }
+        }
+
+        // A single `fs::write` wakes BOTH the explicit `trigger_reload` AND
+        // the config file watcher, and `run_loop` services reload triggers
+        // serially — so a SECOND (watcher-driven) reload can follow the
+        // first, replacing its rollback generation (a `tokio::select!` race).
+        // Drain the reload bus until it goes quiet for longer than
+        // `reload_debounce` (500ms default): once no further outcome arrives
+        // and the test issues no more config writes, no new reload cycle can
+        // start, so the generation now installed is FINAL.
+        while (tokio::time::timeout(Duration::from_millis(900), reloads.recv()).await).is_ok() {
+            // Keep draining until the bus is quiet.
+        }
+
+        // Drive the final restored generation back to a render stage so its
+        // rollback sink renders and a teardown becomes observable.
+        let events = handle.events_sender();
+        let _ = events.send(ev("desk", SensorState::Present)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = events.send(ev("desk", SensorState::Absent)).await;
+
+        // Identity selection (NO counts): find the render sink of the CURRENT
+        // (final) generation and use ITS own channel.  Three identity marks
+        // pin it exactly:
+        //   * index >= 2 — indices 0..2 are the initial assembly; a rejected
+        //     new-assembly's sink is dropped before its generation is ever
+        //     spawned, so only a rollback generation's sink lands here;
+        //   * a LIVE sender (`!is_closed()`) — a generation's `InputWake`
+        //     receiver is held by its spawned drain and dropped when the
+        //     generation is torn down, so only the CURRENT generation's sink
+        //     still has an open sender (superseded rollbacks are closed);
+        //   * that has rendered `RenderBlack` — so a teardown is observable.
+        // Take the highest-index match (build order → the newest generation).
+        let live_pair = |sinks: &[WakePair]| -> Option<WakePair> {
+            sinks
+                .iter()
+                .enumerate()
+                .rfind(|(i, (sink, tx))| *i >= 2 && !tx.is_closed() && sink_rendered(sink))
+                .map(|(_, pair)| pair.clone())
+        };
+        let selected = wait_for(
+            || live_pair(&pairs.lock().unwrap()[..]).is_some(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            selected,
+            "no live post-initial render sink ever rendered — rebuild_old did not \
+             rebuild render sinks with a live InputWake channel"
+        );
+        let (live_sink, live_sender) = live_pair(&pairs.lock().unwrap()[..])
+            .expect("a live rollback render sink must exist after the wait");
+
+        // The honest send: push a DisplayId through the SELECTED rollback
+        // generation's OWN sender.  It must reach that generation's live
+        // drain (unbounded channel → spawn_input_wake_drain →
+        // ControlMsg::InputWake → engine).  A SendError here is the
+        // orphaned-sender bug — the receiver would be dropped instead of
+        // held by a spawned drain.
+        live_sender
+            .send(dormant_core::types::DisplayId("mon1".into()))
+            .expect("rollback generation's InputWake channel must be alive");
+
+        // Teardown must land on THAT SAME sink — proving the wake routed
+        // through the selected generation's real channel + drain.
+        let teardown_ok = wait_for(
+            || {
+                live_sink.log().iter().any(|(_dur, cmd)| {
+                    matches!(cmd, dormant_core::fakes::RenderCmd::Teardown { .. })
+                })
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let final_log = live_sink.log();
+        shutdown(handle, join).await;
+
+        assert!(
+            teardown_ok,
+            "expected teardown on the rollback sink after InputWake, log: {final_log:?}"
+        );
+    }
+}

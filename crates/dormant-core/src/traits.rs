@@ -6,7 +6,7 @@
 //! contract so that [`crate::rules::RulesEngine`] stays free of concrete I/O.
 
 use crate::error::DormantError;
-use crate::types::{BlankMode, CmdFailure, PresenceEvent};
+use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 
 /// A source of presence observations for one or more sensors (MQTT, Home
 /// Assistant WebSocket, USB-serial radar, ...).
@@ -69,4 +69,28 @@ pub trait CommandSink: Send + Sync {
     /// Per-controller health from the LAST blank/wake attempt (never
     /// re-probes).  Empty until the first attempt.
     fn controller_health(&self) -> Vec<crate::rules::ControllerHealth>;
+}
+
+/// The narrow interface [`crate::rules::RulesEngine`] uses to show and tear
+/// down render surfaces (layer-shell overlays) on a display.
+///
+/// Mirrors the [`CommandSink`] pattern: trait is defined in core, the real
+/// implementation lives externally; the engine only names this trait, never
+/// the implementation crate.
+#[async_trait::async_trait]
+pub trait RenderSink: Send + Sync {
+    /// Show a render surface for the given ladder stage.
+    ///
+    /// `r#gen` is a monotonically increasing generation counter for stale-
+    /// detection; `idx` identifies the ladder rung; `kind` carries the stage
+    /// type so the backend can choose the right surface (black overlay vs
+    /// screensaver).
+    async fn show(&self, r#gen: u64, idx: usize, kind: StageKind) -> Result<(), CmdFailure>;
+
+    /// Tear down any active render surface on this display.
+    ///
+    /// Idempotent: calling `teardown` when no surface is up is a no-op.
+    /// Infallible: the method has no failure mode — the engine always
+    /// considers the surface gone after this call returns.
+    async fn teardown(&self, r#gen: u64);
 }

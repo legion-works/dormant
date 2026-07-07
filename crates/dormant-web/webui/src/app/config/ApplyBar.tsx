@@ -8,7 +8,7 @@
 
 export type ApplyOutcome =
   | { kind: "reloaded" }
-  | { kind: "rejected"; detail?: string }
+  | { kind: "rejected"; detail?: string; fileWritten?: boolean }
   | { kind: "pending" | "superseded"; detail?: string };
 
 interface ApplyBarProps {
@@ -70,6 +70,8 @@ export default function ApplyBar({
           {outcome.kind === "rejected" && (
             <span>
               ✕ Config rejected{outcome.detail ? `: ${outcome.detail}` : ""}.
+              {outcome.fileWritten &&
+                " The file on disk contains your change; the daemon is running the previous config. Fix the error and apply again."}
             </span>
           )}
           {(outcome.kind === "pending" || outcome.kind === "superseded") && (

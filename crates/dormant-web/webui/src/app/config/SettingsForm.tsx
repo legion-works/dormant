@@ -52,6 +52,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
   const store = storeRef.current;
 
   const [config, setConfig] = useState<ConfigResponse>(initialConfig);
+  const lastFingerprintRef = useRef(initialConfig.fingerprint);
   const [dirtyVersion, setDirtyVersion] = useState(0);
   const dirtyCount = dirtyVersion === 0 ? 0 : store.buildPatches().length + 0; // force recalc on each version
 
@@ -62,10 +63,12 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
   const [bannerErrors, setBannerErrors] = useState<string[]>([]);
 
   // Re-sync config when the prop changes (e.g. after parent re-fetches).
-  // Also update our internal config after a pending-apply auto-refetch.
-  // Only sync when the prop actually changed (fingerprint differs).
+  // Uses a ref to track the last-synced fingerprint rather than reading
+  // config.fingerprint from state inside the effect, keeping the dep
+  // array minimal and avoiding a state-on-state dependency loop.
   useEffect(() => {
-    if (initialConfig.fingerprint !== config.fingerprint) {
+    if (initialConfig.fingerprint !== lastFingerprintRef.current) {
+      lastFingerprintRef.current = initialConfig.fingerprint;
       setConfig(initialConfig);
     }
   }, [initialConfig]);
@@ -123,7 +126,14 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
           .then((cfg) => setConfig(cfg))
           .catch(() => {});
       } else if (res.reload === "rejected") {
-        setOutcome({ kind: "rejected", detail: res.detail });
+        // File was written — the daemon then refused the reload.
+        // Refetch to get the new on-disk fingerprint so subsequent
+        // applies use the current version.  Preserve the dirty store:
+        // the user's edits are now the on-disk baseline.
+        getConfig()
+          .then((cfg) => setConfig(cfg))
+          .catch(() => {});
+        setOutcome({ kind: "rejected", detail: res.detail, fileWritten: true });
       } else {
         // pending or superseded — disk is final when the response returns
         setOutcome({ kind: res.reload as "pending" | "superseded", detail: res.detail });
@@ -135,6 +145,12 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         if (err.status === 409) {
+          // Another writer changed the file — refetch to get the new
+          // fingerprint.  Preserve the dirty store: "Keep editing"
+          // means the user keeps their edits against the fresh baseline.
+          getConfig()
+            .then((cfg) => setConfig(cfg))
+            .catch(() => {});
           setConflict(true);
         } else if (err.status === 422) {
           const body = err.body as ApplyErrorBody;

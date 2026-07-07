@@ -71,9 +71,12 @@ Two tabs: **Settings** (a form editor for live config changes without touching t
 The Settings form presents the running config as editable sections: Daemon, Sensors, Zones, Rules, and Displays. Each field shows the current value from `GET /api/config`; edits are accumulated in a client-side patch store and submitted together via `POST /api/config/apply`.
 
 **What is editable (v1):**
-- Leaf string, number, and duration values (e.g. `grace_period`, `wake_command`, `hold_time`).
-- Whole arrays (e.g. a rule's `displays` list, a display's `controllers` or `modes` list, the `ladder` array-of-tables). Setting an array replaces it wholesale.
+- Leaf string, number, and duration values (e.g. `grace_period`, `startup_holdoff`, `hold_time`).
+- Whole arrays (e.g. a rule's `displays` list, the `ladder` array-of-tables, screensaver `source` lists). Setting an array replaces it wholesale.
 - A limited set of optional keys can be *removed* via the Remove op: `blank_mode`, `degraded_mode`, `dwell`, `order`, `image_duration`, `scale_mode`, `transition`, `transition_duration`, `hold_time`, `stale_timeout`, `ddc_display`, `output`, `wol_mac`, `host`.
+
+**What is deliberately file-only in v1:**
+- Display command strings (`wake_command`, `blank_command`), controller lists (`controllers`), and mode lists (`modes`) are not rendered in the Settings form. They are valid targets for the patch API (a direct `POST /api/config/apply` can set them), but the form does not expose controls for them.
 
 **What is not editable:**
 - **Locked leaves** — `type`, `blank_data`, `wake_data`: never writable through the patch API. The form renders these with a 🔒 icon and a tooltip explaining the restriction (redacted path ancestor, or a hard-locked config key).

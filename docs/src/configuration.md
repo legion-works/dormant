@@ -363,7 +363,7 @@ ha_token = "eyJ..."
 
 When the web UI is enabled (see [Web UI](web-ui.md)), the **Settings** tab on the Config page provides a form-based editor for live config changes without editing the TOML file directly.
 
-**Editable fields (v1):** leaf values (strings, numbers, durations), whole arrays (ladders, controller lists, mode lists, rule display lists), and a limited set of optional keys can be removed. **Not editable:** `type`, `blank_data`, `wake_data` (hard-locked), any entity table add/remove (file-only), and any field whose value carries redacted credentials.
+**Editable fields (v1):** leaf values (strings, numbers, durations), whole arrays (ladders, rule display lists, screensaver source lists), and a limited set of optional keys can be removed. **Not editable:** `type`, `blank_data`, `wake_data` (hard-locked), any entity table add/remove (file-only), and any field whose value carries redacted credentials. Display command strings, controller lists, and mode lists are file-only in v1 (the Settings form does not render controls for them).
 
 **Backups:** every apply creates a timestamped backup of the previous config in `<config-dir>/backups/config.toml.<rfc3339>.<rand>`, keeping at most 5 newest copies. The directory is created with mode `0o700`.
 

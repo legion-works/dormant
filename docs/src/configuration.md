@@ -253,11 +253,10 @@ Each source supports:
 
 When `transition = "crossfade"` (the default), successive playlist items
 blend with a per-pixel u8 lerp over `transition_duration`.  The blend is
-driven by a calloop timer on the Wayland thread; the per-frame cost
-(spike-measured at `/tmp/opencode/p21-fade-spike/report.md` Q3) is
-0.9 ms at 3072×1728 — negligible against any reasonable frame budget.
-Set `transition_duration` between `100ms` and `10s`; the validator
-rejects anything outside that range.
+driven by a calloop timer on the Wayland thread; measured blend cost
+is ≈0.9 ms/frame at 3072×1728 — negligible against any reasonable
+frame budget.  Set `transition_duration` between `100ms` and `10s`;
+the validator rejects anything outside that range.
 
 `transition = "none"` keeps the legacy hard-cut behaviour (byte-identical
 to pre-M3) and is useful for benchmarks or operators who prefer the

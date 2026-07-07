@@ -540,8 +540,8 @@ pub struct ScreensaverConfig {
     ///
     /// - `"crossfade"` (default) — a calloop-timer-driven per-pixel u8
     ///   lerp over `transition_duration` replaces the hard-cut between
-    ///   playlist items.  Spike-measured cost 0.9 ms/frame at 3072×1728
-    ///   — trivially fits any reasonable budget.
+    ///   playlist items.  Measured blend cost is ≈0.9 ms/frame at
+    ///   3072×1728 — trivially fits any reasonable frame budget.
     /// - `"none"` — successive playlist items cut immediately (the
     ///   pre-feature behaviour; preserved for benchmarks and
     ///   operators who want the legacy look).

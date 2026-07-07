@@ -17,17 +17,16 @@ pub(crate) const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// How the screensaver transitions between two consecutive playlist items
 /// when the outgoing item ends and the next one becomes decodable.
 ///
-/// The production default is [`TransitionMode::Crossfade`] — the user
-/// asked for transitions, and the spike (`/tmp/opencode/p21-fade-spike/report.md`)
-/// measured 0.9 ms/frame at 3072×1728 for the pure u8 lerp (linearly
-/// scales with resolution, never a hot spot).  [`TransitionMode::None`]
-/// keeps the legacy hard-cut behaviour — useful for benchmarks and
-/// environments where the per-frame blend cost isn't worth it.
+/// The production default is [`TransitionMode::Crossfade`] — measured
+/// blend cost is ≈0.9 ms/frame at 3072×1728 for the pure u8 lerp
+/// (linearly scales with resolution, never a hot spot).
+/// [`TransitionMode::None`] keeps the legacy hard-cut behaviour —
+/// useful for benchmarks and environments where the per-frame blend
+/// cost isn't worth it.
 ///
-/// The state machine in [`crate::linux::state`] wakes a calloop timer
-/// on `ItemEnded` → `ItemLoaded` when this is `Crossfade`; `None`
-/// skips every transition-related field on the
-/// [`ScreensaverSettings`].
+/// The state machine in [`crate::linux::state`] drives the blend via
+/// a calloop timer on the Wayland thread; `None` skips every
+/// transition-related field on the [`ScreensaverSettings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionMode {
     /// Per-pixel u8 lerp `out = capture*(1-t) + new*t` driven by a
@@ -264,7 +263,7 @@ mod tests {
         assert!(s.items.is_empty());
         // scale_mode defaults to Fill — the OS-screensaver norm.
         assert_eq!(s.scale_mode, ScaleMode::Fill);
-        // transition defaults to Crossfade — the user asked for transitions.
+        // transition defaults to Crossfade — the production default.
         assert_eq!(s.transition, TransitionMode::Crossfade);
         // transition_duration defaults to 1 s — matches the validate.rs default.
         assert_eq!(s.transition_duration, Duration::from_secs(1));

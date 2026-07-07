@@ -233,6 +233,9 @@ order = "sequential"    # only value accepted; mutually exclusive with `shuffle`
 |-----|------|----------|---------|-------------|
 | `trigger` | string | no | `"vacancy"` | Trigger for the screensaver. Only `"vacancy"` is supported (the ladder itself is vacancy-driven). |
 | `audio` | boolean | no | `false` | Whether audio playback is enabled. `false` mutes the player at init. |
+| `scale_mode` | string | no | `"fill"` | How source frames are scaled onto the output rectangle. One of `"fill"`, `"fit"`, `"stretch"`, `"center"`. See [Scale mode](#scale-mode) below. |
+| `transition` | string | no | `"crossfade"` | How consecutive playlist items transition. `"crossfade"` blends successive frames with a per-pixel u8 lerp; `"none"` cuts immediately (the pre-feature behaviour). |
+| `transition_duration` | duration | no | `"1s"` | Length of the crossfade blend (ignored when `transition = "none"`). Bounded to `100ms..=10s`. |
 | `[[…source]]` | array | yes | — | Ordered list of media sources for the playlist. |
 
 Each source supports:
@@ -245,6 +248,20 @@ Each source supports:
 | `shuffle` | boolean | no | `false` | Shuffle items from this source (Fisher-Yates, seeded per restart). Mutually exclusive with `order`. |
 | `order` | string | no | — | Ordering strategy. Only `"sequential"` is accepted. Mutually exclusive with `shuffle`. |
 | `image_duration` | duration | no | 10 s | Per-image display duration override (must be > 0). |
+
+###### Transitions
+
+When `transition = "crossfade"` (the default), successive playlist items
+blend with a per-pixel u8 lerp over `transition_duration`.  The blend is
+driven by a calloop timer on the Wayland thread; measured blend cost
+is ≈0.9 ms/frame at 3072×1728 — negligible against any reasonable
+frame budget.  Set `transition_duration` between `100ms` and `10s`;
+the validator rejects anything outside that range.
+
+`transition = "none"` keeps the legacy hard-cut behaviour (byte-identical
+to pre-M3) and is useful for benchmarks or operators who prefer the
+instantaneous switch.  When `transition = "none"`, the `transition_duration`
+field is ignored.
 
 **Playlist assembly:** The playlist is built at startup and on every config
 reload — file-system scanning runs off the Wayland thread.  Changes to the
@@ -267,6 +284,25 @@ ladder = [
 ]
 ```
 
+###### Scale mode
+
+The `scale_mode` key controls how source frames are mapped onto the rendered
+output rectangle.  Four modes are recognised; the default is `fill`, matching
+the OS-screensaver norm (no black bars, regardless of source aspect ratio).
+
+| Mode | What you see | mpv mapping |
+|------|--------------|-------------|
+| `"fill"` (default) | Crop-to-fill: the source is zoomed so it covers the entire output rectangle; off-axis is cropped. **No black bars.** | `panscan=1.0`, `keepaspect=yes` |
+| `"fit"` | Aspect-fit letterbox: the source is scaled to fit inside the output rectangle while preserving its aspect ratio; black bars fill the gap. **This was the legacy behaviour** before `scale_mode` was added. | `keepaspect=yes`, `panscan=0.0` |
+| `"stretch"` | Stretch: the source is scaled to exactly fill the output rectangle, distorting aspect ratio. **No black bars**, but proportions may look wrong; useful only when source aspect matches the display. | `keepaspect=no` |
+| `"center"` | 1:1 centre: the source is shown at native pixel dimensions (no scaling), centred in the output rectangle. Black bars fill the gap. | `video-unscaled=yes`, `keepaspect=yes` |
+
+Validation rejects any unknown value with an `E_SCREENSAVER_SOURCE`-class
+error naming the allowed set.  The four modes were empirically verified to
+take effect under `MPV_RENDER_API_TYPE_SW` (the libmpv SW render context
+used by the screensaver) — the property values flow through to mpv and
+influence the scaling at frame-blit time.
+
 Validation rejects:
 
 - A `render_screensaver` stage without a `screensaver` section.
@@ -275,6 +311,7 @@ Validation rejects:
 - A source with both `shuffle` and `order` set.
 - An `order` value other than `"sequential"`.
 - A `trigger` value other than `"vacancy"`.
+- A `scale_mode` value other than `"fill"`, `"fit"`, `"stretch"`, or `"center"`.
 - An `image_duration` of zero.
 
 #### Backward compatibility

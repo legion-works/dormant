@@ -1202,10 +1202,46 @@ fn build_render_sinks(
         {
             dc.screensaver.as_ref().map(|ss| {
                 let items = playlist::build_playlist(&ss.source, None);
+                // scale_mode: None (absent) → Fill.  Validation has already
+                // rejected any unknown string value, so a failed parse here
+                // would only be reachable through a programmatic caller
+                // bypassing validate; in that case we still default to Fill
+                // rather than refuse to build the sink.
+                let scale_mode = ss
+                    .scale_mode
+                    .as_deref()
+                    .map(dormant_render::ScaleMode::from_config_str)
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                // transition: None (absent) → Crossfade.  Validation has
+                // already rejected any unknown string value; the parse
+                // fallback mirrors the scale_mode path above (default
+                // rather than refuse).
+                let transition = ss
+                    .transition
+                    .as_deref()
+                    .map(dormant_render::TransitionMode::from_config_str)
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                // transition_duration: None (absent) → 1 second default
+                // (matches `defaults::TRANSITION_DURATION` so the
+                // ScreensaverSettings default is the single source of
+                // truth).  Validation has already rejected any value
+                // outside the 100 ms ..= 10 s bound.
+                let transition_duration = ss
+                    .transition_duration
+                    .unwrap_or(ScreensaverSettings::default().transition_duration);
                 ScreensaverSettings {
                     items,
                     image_duration: ScreensaverSettings::default().image_duration,
                     audio: ss.audio,
+                    scale_mode,
+                    transition,
+                    transition_duration,
                 }
             })
         } else {
@@ -1513,6 +1549,35 @@ mod render_tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    /// Build a minimal `DisplayConfig` with sensible defaults for the
+    /// render-sink plumbing tests below.  Mirrors the helper used in
+    /// `validate::tests::base_display_cfg` but lives here as a test-local
+    /// helper to avoid coupling across crates.
+    fn base_display_cfg_for_test() -> dormant_core::config::schema::DisplayConfig {
+        dormant_core::config::schema::DisplayConfig {
+            controllers: Vec::new(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 100,
+            treat_unreachable_as_blanked: true,
+        }
+    }
+
     /// The drain task routes each `DisplayId` received on the unbounded
     /// channel to the engine as `ControlMsg::InputWake`.  When the control
     /// channel is closed (shutdown), the drain exits cleanly.
@@ -1646,5 +1711,359 @@ mod render_tests {
         // path through the real LayerShellRenderSink which clones the
         // sender.
         drop(input_wake_rx);
+    }
+
+    /// Full-hop plumbing test: a TOML-parsed config with
+    /// `screensaver.scale_mode = "stretch"` propagates through
+    /// `build_render_sinks` → factory seam, arriving at the player as
+    /// `ScreensaverSettings { scale_mode: ScaleMode::Stretch, .. }`.
+    ///
+    /// Closes the "silently dropped at a hop" gap (the per-mode tests in
+    /// dormant-render verify the enum → mpv property half; this test
+    /// proves the config-string → enum half survives the daemon's
+    /// `build_render_sinks`).
+    #[tokio::test]
+    #[cfg(feature = "render")]
+    async fn build_render_sinks_passes_scale_mode_stretch_through() {
+        use dormant_core::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
+        use dormant_core::fakes::RecordingRenderSink;
+        use dormant_core::types::{LadderStage, StageKind};
+        use std::sync::Mutex;
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: dormant_core::config::DaemonConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::from([(
+                "mon".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into()],
+                    ladder: vec![
+                        LadderStage {
+                            kind: StageKind::Controller(dormant_core::types::BlankMode::PowerOff),
+                            dwell: Some(Duration::from_secs(30)),
+                        },
+                        LadderStage {
+                            kind: StageKind::RenderScreensaver,
+                            dwell: None,
+                        },
+                    ],
+                    screensaver: Some(ScreensaverConfig {
+                        trigger: "vacancy".into(),
+                        audio: false,
+                        source: vec![ScreensaverSource {
+                            path: Some("/tmp/img.png".into()),
+                            urls: Vec::new(),
+                            recurse: false,
+                            shuffle: false,
+                            order: None,
+                            image_duration: None,
+                        }],
+                        scale_mode: Some("stretch".into()),
+                        transition: None,
+                        transition_duration: None,
+                    }),
+                    output: Some("DP-1".into()),
+                    ..base_display_cfg_for_test()
+                },
+            )]),
+            rules: indexmap::IndexMap::new(),
+        };
+
+        // Capture the `ScreensaverSettings` the factory receives so the
+        // assertion below can verify the scale_mode hop.
+        let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_for_factory = captured.clone();
+        let recording = RecordingRenderSink::new();
+        let recorded = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+            if let Some(s) = ss {
+                *captured_for_factory.lock().expect("capture") = Some(s.clone());
+            }
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
+
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        assert!(
+            !sinks.is_empty(),
+            "RenderScreensaver ladder stage must produce at least one sink"
+        );
+
+        let observed = captured
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("factory should have received ScreensaverSettings");
+        assert_eq!(
+            observed.scale_mode,
+            dormant_render::ScaleMode::Stretch,
+            "scale_mode = \"stretch\" must survive build_render_sinks hop"
+        );
+    }
+
+    /// Complement to `build_render_sinks_passes_scale_mode_stretch_through`:
+    /// an ABSENT `scale_mode` key falls back to the production default
+    /// (`ScaleMode::Fill` — OS-screensaver norm).
+    #[tokio::test]
+    #[cfg(feature = "render")]
+    async fn build_render_sinks_defaults_scale_mode_to_fill_when_absent() {
+        use dormant_core::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
+        use dormant_core::fakes::RecordingRenderSink;
+        use dormant_core::types::{LadderStage, StageKind};
+        use std::sync::Mutex;
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: dormant_core::config::DaemonConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::from([(
+                "mon".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into()],
+                    ladder: vec![
+                        LadderStage {
+                            kind: StageKind::Controller(dormant_core::types::BlankMode::PowerOff),
+                            dwell: Some(Duration::from_secs(30)),
+                        },
+                        LadderStage {
+                            kind: StageKind::RenderScreensaver,
+                            dwell: None,
+                        },
+                    ],
+                    screensaver: Some(ScreensaverConfig {
+                        trigger: "vacancy".into(),
+                        audio: false,
+                        source: vec![ScreensaverSource {
+                            path: Some("/tmp/img.png".into()),
+                            urls: Vec::new(),
+                            recurse: false,
+                            shuffle: false,
+                            order: None,
+                            image_duration: None,
+                        }],
+                        // scale_mode intentionally absent (None) — the
+                        // build_render_sinks hop must default to Fill.
+                        scale_mode: None,
+                        transition: None,
+                        transition_duration: None,
+                    }),
+                    output: Some("DP-1".into()),
+                    ..base_display_cfg_for_test()
+                },
+            )]),
+            rules: indexmap::IndexMap::new(),
+        };
+        assert!(
+            cfg.displays["mon"]
+                .screensaver
+                .as_ref()
+                .unwrap()
+                .scale_mode
+                .is_none(),
+            "absent scale_mode must parse as None"
+        );
+
+        let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_for_factory = captured.clone();
+        let recording = RecordingRenderSink::new();
+        let recorded = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+            if let Some(s) = ss {
+                *captured_for_factory.lock().expect("capture") = Some(s.clone());
+            }
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
+
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        assert!(!sinks.is_empty());
+
+        let observed = captured
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("factory should have received ScreensaverSettings");
+        assert_eq!(
+            observed.scale_mode,
+            dormant_render::ScaleMode::Fill,
+            "absent scale_mode must default to Fill at the build_render_sinks hop"
+        );
+    }
+
+    /// Companion to `build_render_sinks_passes_scale_mode_stretch_through`:
+    /// `screensaver.transition = "none"` survives the daemon's
+    /// `build_render_sinks` → factory seam hop, arriving at the player
+    /// as `ScreensaverSettings { transition: TransitionMode::None, .. }`.
+    #[tokio::test]
+    #[cfg(feature = "render")]
+    async fn build_render_sinks_passes_transition_none_through() {
+        use dormant_core::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
+        use dormant_core::fakes::RecordingRenderSink;
+        use dormant_core::types::{LadderStage, StageKind};
+        use std::sync::Mutex;
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: dormant_core::config::DaemonConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::from([(
+                "mon".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into()],
+                    ladder: vec![
+                        LadderStage {
+                            kind: StageKind::Controller(dormant_core::types::BlankMode::PowerOff),
+                            dwell: Some(Duration::from_secs(30)),
+                        },
+                        LadderStage {
+                            kind: StageKind::RenderScreensaver,
+                            dwell: None,
+                        },
+                    ],
+                    screensaver: Some(ScreensaverConfig {
+                        trigger: "vacancy".into(),
+                        audio: false,
+                        source: vec![ScreensaverSource {
+                            path: Some("/tmp/img.png".into()),
+                            urls: Vec::new(),
+                            recurse: false,
+                            shuffle: false,
+                            order: None,
+                            image_duration: None,
+                        }],
+                        scale_mode: None,
+                        transition: Some("none".into()),
+                        transition_duration: None,
+                    }),
+                    output: Some("DP-1".into()),
+                    ..base_display_cfg_for_test()
+                },
+            )]),
+            rules: indexmap::IndexMap::new(),
+        };
+
+        let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_for_factory = captured.clone();
+        let recording = RecordingRenderSink::new();
+        let recorded = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+            if let Some(s) = ss {
+                *captured_for_factory.lock().expect("capture") = Some(s.clone());
+            }
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
+
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        assert!(
+            !sinks.is_empty(),
+            "RenderScreensaver ladder stage must produce at least one sink"
+        );
+
+        let observed = captured
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("factory should have received ScreensaverSettings");
+        assert_eq!(
+            observed.transition,
+            dormant_render::TransitionMode::None,
+            "transition = \"none\" must survive build_render_sinks hop"
+        );
+    }
+
+    /// Companion to `build_render_sinks_defaults_scale_mode_to_fill_when_absent`:
+    /// an ABSENT `transition` key falls back to the production default
+    /// (`TransitionMode::Crossfade` — user asked for transitions).
+    #[tokio::test]
+    #[cfg(feature = "render")]
+    async fn build_render_sinks_defaults_transition_to_crossfade_when_absent() {
+        use dormant_core::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
+        use dormant_core::fakes::RecordingRenderSink;
+        use dormant_core::types::{LadderStage, StageKind};
+        use std::sync::Mutex;
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: dormant_core::config::DaemonConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::from([(
+                "mon".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into()],
+                    ladder: vec![
+                        LadderStage {
+                            kind: StageKind::Controller(dormant_core::types::BlankMode::PowerOff),
+                            dwell: Some(Duration::from_secs(30)),
+                        },
+                        LadderStage {
+                            kind: StageKind::RenderScreensaver,
+                            dwell: None,
+                        },
+                    ],
+                    screensaver: Some(ScreensaverConfig {
+                        trigger: "vacancy".into(),
+                        audio: false,
+                        source: vec![ScreensaverSource {
+                            path: Some("/tmp/img.png".into()),
+                            urls: Vec::new(),
+                            recurse: false,
+                            shuffle: false,
+                            order: None,
+                            image_duration: None,
+                        }],
+                        scale_mode: None,
+                        // transition intentionally absent (None) —
+                        // the build_render_sinks hop must default to
+                        // Crossfade (the user asked for transitions).
+                        transition: None,
+                        transition_duration: None,
+                    }),
+                    output: Some("DP-1".into()),
+                    ..base_display_cfg_for_test()
+                },
+            )]),
+            rules: indexmap::IndexMap::new(),
+        };
+        assert!(
+            cfg.displays["mon"]
+                .screensaver
+                .as_ref()
+                .unwrap()
+                .transition
+                .is_none(),
+            "absent transition must parse as None"
+        );
+
+        let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_for_factory = captured.clone();
+        let recording = RecordingRenderSink::new();
+        let recorded = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+            if let Some(s) = ss {
+                *captured_for_factory.lock().expect("capture") = Some(s.clone());
+            }
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
+
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        assert!(!sinks.is_empty());
+
+        let observed = captured
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("factory should have received ScreensaverSettings");
+        assert_eq!(
+            observed.transition,
+            dormant_render::TransitionMode::Crossfade,
+            "absent transition must default to Crossfade at the build_render_sinks hop"
+        );
     }
 }

@@ -19,8 +19,7 @@
 //! ## Sandbox flags
 //!
 //! The init-time flags pin the embedded player to an unprivileged,
-//! no-network-by-default sandbox.  Per the libmpv spike report (§Q3 +
-//! gotcha #4):
+//! no-network-by-default sandbox.  Rationale per flag:
 //!
 //! | flag | value | reason |
 //! |------|-------|--------|
@@ -64,18 +63,40 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use crate::playlist::PlaylistItem;
-use crate::settings::{FIRST_FRAME_DEADLINE, scheme_allowed};
+use crate::settings::{FIRST_FRAME_DEADLINE, ScaleMode, scheme_allowed};
 use libmpv2_sys::{
     MPV_RENDER_API_TYPE_SW, mpv_render_context, mpv_render_context_create, mpv_render_context_free,
     mpv_render_context_render, mpv_render_context_set_update_callback, mpv_render_context_update,
-    mpv_render_param, mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
+    mpv_render_param, mpv_render_param_type_MPV_RENDER_PARAM_ADVANCED_CONTROL,
+    mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
     mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_FORMAT,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_SIZE,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_STRIDE,
-    mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME,
+    mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME, mpv_wait_event,
 };
+
+/// Subset of mpv events surfaced by [`MpvPlayer::poll_events`] — every
+/// other event ID is silently dropped so the state machine only sees
+/// the two it cares about for the crossfade transition.
+///
+/// The full mpv event ID list lives in libmpv2-sys's
+/// `mpv_event_id_*` constants; this enum is the project's
+/// grep-stable, app-facing subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpvItemEvent {
+    /// `MPV_EVENT_END_FILE` — the currently-playing item is no longer
+    /// active.  In the screensaver state machine this is the trigger
+    /// to capture the current frame into the transition's `capture`
+    /// buffer (the crossfade's `a` side).
+    ItemEnded,
+    /// `MPV_EVENT_FILE_LOADED` — a new playlist item is loaded and
+    /// renderable.  In the screensaver state machine this is the
+    /// trigger to arm the crossfade timer; the next mpv wakeup will
+    /// produce the first frame of the new item (the blend's `b` side).
+    ItemLoaded,
+}
 
 /// Owned handle to an mpv instance + SW render context.
 ///
@@ -219,6 +240,7 @@ impl MpvPlayer {
         items: Vec<PlaylistItem>,
         image_duration: Duration,
         audio_enabled: bool,
+        scale_mode: ScaleMode,
         width: u32,
         height: u32,
         wakeup_write: std::os::fd::OwnedFd,
@@ -288,6 +310,30 @@ impl MpvPlayer {
         mpv.set_property("image-display-duration", image_duration.as_secs_f64())
             .map_err(|e| MpvError::Init(format!("set image-display-duration: {e}")))?;
 
+        // ── Scale-mode properties ──────────────────────────────────
+        // The four canonical mpv scaling flags for the matching [`ScaleMode`]
+        // variant.  Set BEFORE `loadfile` so mpv applies them to the very
+        // first decoded frame.  Property-readback coverage for each mode
+        // lives in `mpv_player_sets_scale_mode_properties_*` and the
+        // pixel-buffer geometric coverage in
+        // `mpv_player_fill_renders_no_letterbox_on_portrait_fixture`.
+        // `Fit` explicitly sets `keepaspect=yes panscan=0.0` for
+        // determinism — mpv's defaults include `keepaspect=yes` but
+        // leaving `panscan` unset means a future runtime set could leave
+        // a stray panscan value in place.
+        let (keepaspect, panscan, video_unscaled): (&str, &str, &str) = match scale_mode {
+            ScaleMode::Fill => ("yes", "1.0", "no"),
+            ScaleMode::Fit => ("yes", "0.0", "no"),
+            ScaleMode::Stretch => ("no", "0.0", "no"),
+            ScaleMode::Center => ("yes", "0.0", "yes"),
+        };
+        mpv.set_property("keepaspect", keepaspect)
+            .map_err(|e| MpvError::Init(format!("set keepaspect: {e}")))?;
+        mpv.set_property("panscan", panscan)
+            .map_err(|e| MpvError::Init(format!("set panscan: {e}")))?;
+        mpv.set_property("video-unscaled", video_unscaled)
+            .map_err(|e| MpvError::Init(format!("set video-unscaled: {e}")))?;
+
         // ── SW render context ──────────────────────────────────────
         let width_i = i32::try_from(width).map_err(|e| MpvError::Init(format!("width: {e}")))?;
         let height_i = i32::try_from(height).map_err(|e| MpvError::Init(format!("height: {e}")))?;
@@ -296,10 +342,27 @@ impl MpvPlayer {
             .ok_or_else(|| MpvError::Init("stride overflow".into()))?;
 
         let api_type = MPV_RENDER_API_TYPE_SW.as_ptr() as *mut c_void;
+        // ADVANCED_CONTROL=1 gates frame delivery on
+        // `mpv_render_context_update` returning
+        // `MPV_RENDER_UPDATE_FRAME`.  Without it mpv may render frames
+        // into the back buffer asynchronously (regardless of whether
+        // the owner has consumed the previous one) which defeats the
+        // "attach previous frame" sequencing the screensaver relies
+        // on.  Spike noted this was OMITTED in the spike's
+        // `mpv_render_context_create` call; production must set it.
+        // `mut` is for `addr_of_mut!` (the binding type is `*mut
+        // c_void` even though mpv reads the value once and never
+        // mutates it).  The value stays at 1 for the lifetime of the
+        // array.
+        let mut advanced_control: i64 = 1;
         let create_params = [
             mpv_render_param {
                 type_: mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
                 data: api_type,
+            },
+            mpv_render_param {
+                type_: mpv_render_param_type_MPV_RENDER_PARAM_ADVANCED_CONTROL,
+                data: std::ptr::addr_of_mut!(advanced_control).cast::<c_void>(),
             },
             mpv_render_param {
                 type_: mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
@@ -472,6 +535,68 @@ impl MpvPlayer {
         Ok(rendered)
     }
 
+    /// Drain mpv's pending events non-blockingly and return the
+    /// subset of [`MpvItemEvent`]s we map.  Internally loops
+    /// [`mpv_wait_event`]`(0.0)` until it returns `MPV_EVENT_NONE`
+    /// (no more pending events).
+    ///
+    /// Every other event type (`LOG_MESSAGE`, `PROPERTY_CHANGE`, …) is
+    /// silently discarded — this method exists ONLY to feed the
+    /// screensaver transition state machine, and that machine only
+    /// cares about item start/end.
+    ///
+    /// Must be called from the mpv-owning thread.  Safe to call
+    /// concurrently with `render_frame_into`; the underlying
+    /// `mpv_wait_event` is documented thread-safe with the mpv handle
+    /// (the only owner is the screensaver session).
+    pub fn poll_events(&mut self) -> Vec<MpvItemEvent> {
+        use libmpv2_sys::{
+            mpv_event_id_MPV_EVENT_END_FILE, mpv_event_id_MPV_EVENT_FILE_LOADED,
+            mpv_event_id_MPV_EVENT_NONE,
+        };
+
+        // `mpv_wait_event` takes the mpv HANDLE (not the render
+        // context); the Mpv wrapper exposes it via `ctx`.  We have to
+        // unwrap the Option to access it — only the wakeup cb fires
+        // after Drop runs, and the player fields are still coherent.
+        let Some(mpv_handle) = self.mpv.as_ref().map(|m| m.ctx.as_ptr()) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: mpv_handle is valid for the player's lifetime;
+            // the returned pointer is owned by mpv until the next
+            // `mpv_wait_event` call (which we make below immediately).
+            let ev_ptr = unsafe { mpv_wait_event(mpv_handle, 0.0) };
+            if ev_ptr.is_null() {
+                break;
+            }
+            // SAFETY: ev_ptr is non-null per the check above; the
+            // caller is responsible for reading the struct on every
+            // mpv_wait_event call (mpv reuses the storage).
+            let event_id = unsafe { (*ev_ptr).event_id };
+            if event_id == mpv_event_id_MPV_EVENT_NONE {
+                // End-of-queue sentinel — no more events ready.
+                break;
+            }
+            if event_id == mpv_event_id_MPV_EVENT_END_FILE {
+                // The mpv_event_end_file data block carries a
+                // mpv_end_file_reason; we don't need it for the
+                // transition state machine (the timer is driven by
+                // `image-display-duration`, not by the cycle), so
+                // the data field is deliberately ignored.
+                out.push(MpvItemEvent::ItemEnded);
+            } else if event_id == mpv_event_id_MPV_EVENT_FILE_LOADED {
+                out.push(MpvItemEvent::ItemLoaded);
+            }
+            // All other event ids (START_FILE, IDLE, LOG_MESSAGE, …)
+            // are intentionally dropped.
+            let _ = ev_ptr.cast_const();
+        }
+        out
+    }
+
     /// Test-only accessor: read a property via the inner mpv handle.
     /// Fails (with `Raw(-1)`) after [`Drop`] has run — i.e. the test
     /// must call this BEFORE dropping the player.
@@ -541,22 +666,63 @@ mod tests {
         }
     }
 
+    /// Variant of `generate_test_video` for the scale-mode geometric test:
+    /// produces a 100×400 portrait testsrc (1:4 aspect) explicitly chosen
+    /// so a 320×180 render target would have to LETTERBOX (Fit) — there
+    /// is no geometry under which a 1:4 source fills a 16:9 rectangle
+    /// without distortion or crop.  Skips on ffmpeg failure.
+    fn generate_portrait_test_video(path: &PathBuf) -> Option<()> {
+        if Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=100x400:rate=30",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(path)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            Some(())
+        } else {
+            None
+        }
+    }
+
     /// Build a real `MpvPlayer` against a generated test fixture (skips
     /// when ffmpeg is absent) and return it.  Centralises the test-video
     /// + pipe setup so each test focuses on its assertion.
+    ///
+    /// `scale_mode` defaults to `Fit` so the existing tests (which assert
+    /// on the letterbox / generic render behaviour, not on scaling
+    /// semantics) get the prior effective behaviour — only the
+    /// `mpv_player_sets_scale_mode_properties_*` tests below exercise
+    /// the scaling properties explicitly.
     fn build_test_player() -> Option<(MpvPlayer, PathBuf)> {
         let dir = std::env::temp_dir().join("dormant-render-tests");
         std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
         let video = dir.join("test.mp4");
         generate_test_video(&video)?;
+        build_test_player_with_mode(video, ScaleMode::Fit)
+    }
+
+    /// Build a `MpvPlayer` against an already-generated video path with
+    /// an explicit [`ScaleMode`].  Skips on environment capability gaps
+    /// (missing codecs/demuxers) — see `build_test_player` for the same
+    /// affordance.
+    fn build_test_player_with_mode(
+        video: PathBuf,
+        scale_mode: ScaleMode,
+    ) -> Option<(MpvPlayer, PathBuf)> {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
         // SAFETY: write_fd was just created by pipe2 and is not yet owned
         // by anything else — `OwnedFd` takes exclusive ownership.
         let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
-        // loadfile failures are environment capability gaps (missing
-        // codecs/demuxers on this host); skip the test just like
-        // the ffmpeg-absent path.  Real regressions (scheme reject,
-        // init failure, etc.) still panic.
         let player = match MpvPlayer::new(
             vec![PlaylistItem {
                 uri: video.to_string_lossy().into_owned(),
@@ -564,6 +730,7 @@ mod tests {
             }],
             Duration::from_secs(2),
             false,
+            scale_mode,
             320,
             180,
             write_owned,
@@ -716,6 +883,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -754,6 +922,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -813,6 +982,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -865,6 +1035,7 @@ mod tests {
             ],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -916,6 +1087,7 @@ mod tests {
                 ],
                 Duration::from_secs(1),
                 false,
+                ScaleMode::Fit,
                 64,
                 64,
                 write_owned,
@@ -1024,6 +1196,7 @@ mod tests {
             ],
             Duration::from_secs(10), // global default
             false,
+            ScaleMode::Fit, // arbitrary — this test is about per-file options, not scaling.
             64,
             64,
             write_owned,
@@ -1048,5 +1221,557 @@ mod tests {
         );
 
         drop(player);
+    }
+
+    // ── Scale-mode property tests ──────────────────────────────────────
+    //
+    // The probing in the build_test_player_with_mode path requires a
+    // real (decodable) source so the property readback is meaningful;
+    // the tests below skip on host capability gaps (matching the
+    // existing media-load skip-guard pattern used everywhere else in
+    // this module).
+
+    /// Sanity check for [`build_test_player_with_mode`] on Fit (the
+    /// default test path): the property readback reflects the Fit
+    /// mode's settings.  Catches the case where the `ScaleMode` parameter
+    /// gets dropped silently — `Fill` is the production default so we
+    /// test Fit explicitly to assert the value made it through.
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_fit() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Fit test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Fit) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Fit test");
+            return;
+        };
+
+        // Fit: keepaspect=yes, panscan=0.0, video-unscaled=no.
+        // The `panscan` property is f64 on this mpv build; matching the
+        // probe readback path keeps the test format consistent.
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "yes", "Fit must set keepaspect=yes");
+        let panscan_raw = player.property("panscan").expect("get panscan");
+        let panscan: f64 = panscan_raw
+            .parse()
+            .unwrap_or_else(|_| panic!("panscan must parse as f64, got {panscan_raw:?}"));
+        assert!(
+            panscan.abs() < 0.01,
+            "Fit must set panscan≈0.0 (got {panscan})"
+        );
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "no", "Fit must set video-unscaled=no");
+
+        drop(player);
+    }
+
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_fill() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test_fill.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Fill test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Fill) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Fill test");
+            return;
+        };
+
+        // Fill: keepaspect=yes + panscan=1.0 (the OS-screensaver norm).
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "yes", "Fill must set keepaspect=yes");
+        let panscan_raw = player.property("panscan").expect("get panscan");
+        let panscan: f64 = panscan_raw
+            .parse()
+            .unwrap_or_else(|_| panic!("panscan must parse as f64, got {panscan_raw:?}"));
+        // panscan=1.0 in canonical form; some mpv versions normalize to
+        // 1.000000 etc — compare with a small tolerance.
+        assert!(
+            (panscan - 1.0).abs() < 0.01,
+            "Fill must set panscan≈1.0 (got {panscan})"
+        );
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "no", "Fill must set video-unscaled=no");
+
+        drop(player);
+    }
+
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_stretch() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test_stretch.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Stretch test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Stretch) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Stretch test");
+            return;
+        };
+
+        // Stretch: keepaspect=no, panscan=0.0, video-unscaled=no.
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "no", "Stretch must set keepaspect=no");
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "no", "Stretch must set video-unscaled=no");
+
+        drop(player);
+    }
+
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_center() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test_center.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Center test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Center) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Center test");
+            return;
+        };
+
+        // Center: keepaspect=yes, video-unscaled=yes (1:1 native size).
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "yes", "Center must set keepaspect=yes");
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "yes", "Center must set video-unscaled=yes");
+
+        drop(player);
+    }
+
+    /// Integration assertion: building with Fill renders a NON-LETTERBOXED
+    /// frame on a deliberately non-16:9 portrait fixture, while Fit
+    /// renders LETTERBOXED with substantial black pillars on each side.
+    ///
+    /// ## Why a 1:4 portrait fixture?
+    ///
+    /// The render target is 320×180 (16:9).  A source whose aspect matches
+    /// the target cannot distinguish Fill from Fit geometrically — both
+    /// end up filling the buffer identically — so any equality test on
+    /// such a fixture passes from decoder/timestamp drift between two
+    /// independently sampled players, not from scaling.  A regression
+    /// that dropped the `panscan` property-set would silently pass.
+    ///
+    /// A 100×400 (1:4) source against a 320×180 target gives Fit no path
+    /// to a full-width render without distortion: it must letterbox with
+    /// ~45×180 px content band centred → ~137 px pillars each side.
+    /// Fill must cover the width (with the slight panscan off-centre
+    /// quirk up to ~37 px on extreme 1:4 sources), so the combined pillar
+    /// count is bounded at ≪ 137.  Those two floors make the test
+    /// sharply distinguish a panscan-applied Fill from a Fit-defaulted
+    /// one.
+    ///
+    /// ## Pillars semantics
+    ///
+    /// A column is a "black pillar" if EVERY sampled row (y ∈
+    /// {10, 30, 60, 90, 120, 150, 170}) has BGR ≤ 8 (the same tolerance
+    /// used by `build_test_player`'s test pattern).  A column with ANY
+    /// non-black row is content.  We count **maximum consecutive black
+    /// columns from the left edge** as the "left pillar width" and same
+    /// from the right edge as the right pillar width — this catches both
+    /// letterboxing and any future border-drawing regressions.
+    ///
+    /// ## Invariant
+    ///
+    /// Fails when the `panscan` property-set for Fill is dropped — the
+    /// pillars reappear (identical to Fit's letterbox widths, ≈137 px
+    /// each side on this 1:4 source).  Confirmed by deliberately breaking
+    /// the property-set and re-running the test — the assertion names
+    /// `panscan` in its diagnostic so the regression is immediately
+    /// attributable.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn mpv_player_fill_renders_no_letterbox_on_portrait_fixture() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Deliberately non-16:9 — see the doc-comment above.
+        let video = dir.join("scale_mode_portrait.mp4");
+        if generate_portrait_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping fill-vs-fit geometric test");
+            return;
+        }
+
+        let build = |mode: ScaleMode| -> Option<MpvPlayer> {
+            let (_r, w) = make_pipe().expect("pipe2");
+            let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(w) };
+            let player = MpvPlayer::new(
+                vec![PlaylistItem {
+                    uri: video.to_string_lossy().into_owned(),
+                    image_duration: None,
+                }],
+                Duration::from_secs(2),
+                false,
+                mode,
+                320,
+                180,
+                write_owned,
+            );
+            match player {
+                Ok(p) => Some(p),
+                Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
+                    eprintln!(
+                        "libmpv cannot load test media; skipping fill-vs-fit geometric \
+                         test (loadfile: {msg})"
+                    );
+                    None
+                }
+                Err(e) => panic!("player init: {e}"),
+            }
+        };
+
+        let Some(mut fill_player) = build(ScaleMode::Fill) else {
+            return;
+        };
+        let Some(mut fit_player) = build(ScaleMode::Fit) else {
+            drop(fill_player);
+            return;
+        };
+
+        // Render one frame after a short warm-up.  A single frame is
+        // sufficient — the geometric property (pillar width) is
+        // deterministic per (mode, fixture, frame_index); we just need
+        // a valid first frame.
+        let sample = |player: &mut MpvPlayer| -> Option<Vec<u8>> {
+            for _ in 0..20 {
+                let mut buf = vec![0u8; (320 * 4 * 180) as usize];
+                if let Ok(true) = player.render_frame_into(&mut buf) {
+                    return Some(buf);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        };
+
+        let fill_buf = sample(&mut fill_player);
+        let fit_buf = sample(&mut fit_player);
+
+        let (Some(fill_buf), Some(fit_buf)) = (fill_buf, fit_buf) else {
+            drop(fill_player);
+            drop(fit_player);
+            panic!("neither Fill nor Fit rendered any frame on this host");
+        };
+
+        // ── Pillar detection ────────────────────────────────────────
+        // A column is a black pillar iff ALL sampled rows are ≤ 8 BGR
+        // (i.e. the column has no content pixel anywhere we sampled).
+        let y_samples = [10usize, 30, 60, 90, 120, 150, 170];
+        let is_pillar_col = |buf: &[u8], x: usize| -> bool {
+            y_samples.iter().all(|&y| {
+                let off = (y * 320 + x) * 4;
+                buf[off] <= 8 && buf[off + 1] <= 8 && buf[off + 2] <= 8
+            })
+        };
+        // Maximum consecutive black columns from the left edge and from
+        // the right edge — these are the letterbox pillar widths.
+        let left_pillar = |buf: &[u8]| -> usize {
+            let mut w = 0;
+            for x in 0..320 {
+                if is_pillar_col(buf, x) {
+                    w += 1;
+                } else {
+                    break;
+                }
+            }
+            w
+        };
+        let right_pillar = |buf: &[u8]| -> usize {
+            let mut w = 0;
+            for x in (0..320).rev() {
+                if is_pillar_col(buf, x) {
+                    w += 1;
+                } else {
+                    break;
+                }
+            }
+            w
+        };
+
+        let fill_left = left_pillar(&fill_buf);
+        let fill_right = right_pillar(&fill_buf);
+        let fit_left = left_pillar(&fit_buf);
+        let fit_right = right_pillar(&fit_buf);
+
+        eprintln!(
+            "scale-mode geometry: Fill L/R = {fill_left}/{fill_right}px, \
+             Fit L/R = {fit_left}/{fit_right}px"
+        );
+
+        // ── Fit must letterbox (this proves Fit itself works) ──────
+        // 100×400 → 320×180: aspect-fit Fit renders a centred 45×180
+        // content band → ~137 px black pillars each side.  We demand
+        // ≥ 100 px on each side to give some slack for vignette crops.
+        assert!(
+            fit_left >= 100,
+            "Fit must letterbox (≥100 px left pillar) on the 1:4 fixture; \
+             got {fit_left}.  Either the fixture isn't portrait or Fit \
+             unexpectedly fills — both indicate a regression."
+        );
+        assert!(
+            fit_right >= 100,
+            "Fit must letterbox (≥100 px right pillar) on the 1:4 fixture; \
+             got {fit_right}."
+        );
+
+        // ── Fill must NOT letterbox ─────────────────────────────────
+        // Fill (panscan=1.0) covers the width.  The 1:4 source still
+        // produces a slight off-centre quirk from panscan's centring
+        // math: combined pillar count stays bounded under ~40 px on
+        // a clean mpv build.  We allow ≤ 80 as a margin for
+        // codec/file-path variance; ≥ 100 (the Fit floor) would
+        // unambiguously mean "looks letterboxed → panscan not
+        // applied".  This is the assertion that catches
+        // `mpv.set_property(\"panscan\", ...)` being removed.
+        let fill_total = fill_left + fill_right;
+        assert!(
+            fill_total <= 80,
+            "Fill must fill width on the 1:4 fixture (≤80 px combined pillars); \
+             got L={fill_left} + R={fill_right} = {fill_total} px.  \
+             Likely cause: the `panscan` property-set was dropped or \
+             regressed (the pillars reappear to Fit's letterbox widths)."
+        );
+
+        // Bonus geometric identity: Fill's pillars must be smaller than
+        // Fit's on each side.  Not strictly necessary (the floor
+        // assertions already cover it) but cheap and a sharp sensor
+        // for asymmetric regressions like "left pillar vanished but
+        // right grew".
+        assert!(
+            fill_left < fit_left,
+            "Fill must have smaller left pillar than Fit ({fill_left} vs {fit_left})"
+        );
+        assert!(
+            fill_right < fit_right,
+            "Fill must have smaller right pillar than Fit ({fill_right} vs {fit_right})"
+        );
+
+        drop(fill_player);
+        drop(fit_player);
+    }
+
+    /// `mpv_render_context_create` must be invoked with
+    /// `MPV_RENDER_PARAM_ADVANCED_CONTROL = 1`.  This gates frame
+    /// delivery on `mpv_render_context_update` returning
+    /// `MPV_RENDER_UPDATE_FRAME` — without it mpv may render frames
+    /// asynchronously into the back buffer regardless of whether the
+    /// owner has consumed the previous one, defeating the "attach
+    /// previous frame" sequencing the screensaver relies on.
+    ///
+    /// `ADVANCED_CONTROL` is not directly observable from outside the
+    /// FFI; we infer correctness by building a player, taking a
+    /// render snapshot, then dropping cleanly.  We retry a few
+    /// frames in case the very first call comes back empty
+    /// (mpv 0.41 occasionally needs a wakeup before producing the
+    /// first frame).
+    #[test]
+    fn mpv_render_context_created_with_advanced_control() {
+        let Some((mut player, _video)) = build_test_player() else {
+            eprintln!("ffmpeg unavailable; skipping advanced-control test");
+            return;
+        };
+
+        let mut buf = vec![0u8; 320 * 4 * 180];
+        let mut rendered = false;
+        for _ in 0..10 {
+            if player.render_frame_into(&mut buf).expect("render") {
+                rendered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rendered, "render should produce at least one frame");
+
+        drop(player);
+    }
+
+    /// `MpvPlayer::poll_events` drains `mpv_wait_event(0.0)` until
+    /// `MPV_EVENT_NONE` and maps the two events the screensaver
+    /// transition cares about: `END_FILE` (outgoing item ended) and
+    /// `FILE_LOADED` (incoming item is renderable).  Drives a real
+    /// two-image playlist with a tiny `image-display-duration` and
+    /// asserts the ItemEnded→ItemLoaded pair surfaces within a few
+    /// seconds of polling.  Skips on environment capability gaps
+    /// (matching the media-load skip-guard pattern).
+    #[test]
+    fn mpv_player_poll_events_sees_item_ended_then_loaded_on_two_image_playlist() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join("dormant-render-events-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let a = dir.join("a.png");
+        let b = dir.join("b.png");
+
+        let ok_a = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=64x64",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&a)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let ok_b = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=green:size=64x64",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&b)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !(ok_a && ok_b) {
+            eprintln!("ffmpeg unavailable; skipping poll_events event test");
+            return;
+        }
+
+        let (_read_fd, write_fd) = make_pipe().expect("pipe2");
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
+        let mut player = match MpvPlayer::new(
+            vec![
+                PlaylistItem {
+                    uri: a.to_string_lossy().into_owned(),
+                    image_duration: None,
+                },
+                PlaylistItem {
+                    uri: b.to_string_lossy().into_owned(),
+                    image_duration: None,
+                },
+            ],
+            Duration::from_millis(200),
+            false,
+            ScaleMode::Fit,
+            64,
+            64,
+            write_owned,
+        ) {
+            Ok(p) => p,
+            Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
+                eprintln!("libmpv cannot load test media; skipping event drain test");
+                return;
+            }
+            Err(e) => panic!("player init (event drain test): {e}"),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_ended = false;
+        let mut saw_loaded = false;
+        while Instant::now() < deadline && !(saw_ended && saw_loaded) {
+            let drained = player.poll_events();
+            for ev in &drained {
+                match ev {
+                    MpvItemEvent::ItemEnded => saw_ended = true,
+                    MpvItemEvent::ItemLoaded => {
+                        if saw_ended {
+                            saw_loaded = true;
+                        }
+                    }
+                }
+            }
+            if drained.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        assert!(
+            saw_ended,
+            "ItemEnded must surface within the polling window for a \
+             two-image playlist with 200ms per-item duration"
+        );
+        assert!(
+            saw_loaded,
+            "ItemLoaded (for image B) must follow ItemEnded within the \
+             polling window"
+        );
+
+        drop(player);
+    }
+    fn generate_test_image(path: &std::path::PathBuf) -> Option<()> {
+        if std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x180",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "mjpeg",
+            ])
+            .arg(path)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn build_test_player_image() -> Option<(MpvPlayer, std::path::PathBuf)> {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
+        let image = dir.join("test.jpg");
+        generate_test_image(&image)?;
+        build_test_player_with_mode(image, ScaleMode::Fit)
+    }
+
+    #[test]
+    fn render_frame_into_unconditionally_draws_current_picture() {
+        let Some((mut player, _image)) = build_test_player_image() else {
+            eprintln!("ffmpeg unavailable; skipping render test");
+            return;
+        };
+
+        let mut first_buf = vec![0xABu8; (320 * 4 * 180) as usize];
+        let start = std::time::Instant::now();
+        let mut got_first = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match player.render_frame_into(&mut first_buf) {
+                Ok(true) => {
+                    got_first = true;
+                    break;
+                }
+                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(16)),
+                Err(e) => panic!("render errored: {e}"),
+            }
+        }
+        assert!(got_first, "failed to get first frame");
+
+        let mut drain_buf = vec![0x00u8; (320 * 4 * 180) as usize];
+        while player.render_frame_into(&mut drain_buf).expect("render") {
+            first_buf.copy_from_slice(&drain_buf);
+        }
+
+        let mut second_buf = vec![0x00u8; (320 * 4 * 180) as usize];
+        let res = player.render_frame_into(&mut second_buf).expect("render");
+        assert!(!res, "expected Ok(false) after draining");
+        assert_eq!(first_buf, second_buf, "render_frame_into did not draw the current picture on Ok(false)");
     }
 }

@@ -5,6 +5,7 @@
 //! show/teardown commands to the dedicated wayland thread spawned by
 //! [`connection::spawn_wayland_thread`].
 
+mod blend;
 mod connection;
 mod state;
 mod surface;

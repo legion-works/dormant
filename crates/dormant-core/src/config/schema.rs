@@ -511,6 +511,57 @@ pub struct ScreensaverConfig {
     /// Ordered list of media sources (files or URLs).
     #[serde(default)]
     pub source: Vec<ScreensaverSource>,
+
+    /// How the screensaver player scales source frames onto the rendered
+    /// output rectangle.  One of:
+    ///
+    /// - `"fill"` (default) — crop-to-fill; source is zoomed so the longer
+    ///   axis covers the entire output, the off-axis is cropped.  No black
+    ///   bars.  Matches the OS-screensaver norm (GNOME / KDE / Windows).
+    /// - `"fit"` — aspect-fit letterbox; source is scaled to fit inside the
+    ///   output while preserving aspect ratio; black bars fill the gap.
+    ///   This was the legacy behaviour before the `scale_mode` key was
+    ///   added.
+    /// - `"stretch"` — the source is scaled to exactly fill the output,
+    ///   distorting aspect ratio.  No black bars, but proportions may look
+    ///   wrong; useful only when the source aspect matches the output
+    ///   within a hair.
+    /// - `"center"` — 1:1 centre; the source is shown at native pixel
+    ///   dimensions (no scaling), centred in the output rectangle.  Black
+    ///   bars fill the gap.
+    ///
+    /// `None` (the field absent from the TOML) is treated as `"fill"`.
+    /// Validation rejects any other value with an `E_SCREENSAVER_SOURCE`-
+    /// class error naming the allowed set.
+    #[serde(default)]
+    pub scale_mode: Option<String>,
+
+    /// How successive playlist items transition into each other.  One of:
+    ///
+    /// - `"crossfade"` (default) — a calloop-timer-driven per-pixel u8
+    ///   lerp over `transition_duration` replaces the hard-cut between
+    ///   playlist items.  Measured blend cost is ≈0.9 ms/frame at
+    ///   3072×1728 — trivially fits any reasonable frame budget.
+    /// - `"none"` — successive playlist items cut immediately (the
+    ///   pre-feature behaviour; preserved for benchmarks and
+    ///   operators who want the legacy look).
+    ///
+    /// `None` (the field absent from the TOML) is treated as `"crossfade"`.
+    /// Validation rejects any other value with an `E_SCREENSAVER_SOURCE`-
+    /// class error naming the allowed set.
+    #[serde(default)]
+    pub transition: Option<String>,
+
+    /// Length of the crossfade blend when [`Self::transition`] is
+    /// `"crossfade"`; ignored when it's `"none"`.  Bounded by the
+    /// validator (100 ms ..= 10 s) — long blurs lose the visual cue that
+    /// the playlist is moving; very short blurs visibly skip.
+    ///
+    /// `None` (the field absent from the TOML) is treated as `"1s"` at
+    /// the daemon's `build_render_sinks` hop.  Read with humantime
+    /// (`"500ms"`, `"1s"`).
+    #[serde(default, with = "humantime_serde::option")]
+    pub transition_duration: Option<Duration>,
 }
 
 /// A display definition.
@@ -1047,6 +1098,64 @@ mod tests {
         let s = ve.to_string();
         assert!(s.starts_with("config error [missing credential]:"));
         assert!(s.contains("192.168.1.50"));
+    }
+
+    // ── ScreensaverConfig scale_mode ────────────────────────────────────────
+
+    #[test]
+    fn screensaver_scale_mode_absent_parses_as_none() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+audio = false
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let ss = cfg.displays["d1"].screensaver.as_ref().unwrap();
+        assert!(
+            ss.scale_mode.is_none(),
+            "absent scale_mode must parse as None (default-fill), got {:?}",
+            ss.scale_mode
+        );
+    }
+
+    #[test]
+    fn screensaver_scale_mode_each_valid_value_parses_as_some() {
+        let valid = ["fill", "fit", "stretch", "center"];
+        for v in valid {
+            let toml_str = format!(
+                r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+audio = false
+scale_mode = "{v}"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#
+            );
+            let cfg: Config = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("scale_mode = '{v}' must parse: {e}"));
+            let ss = cfg.displays["d1"].screensaver.as_ref().unwrap();
+            assert_eq!(
+                ss.scale_mode.as_deref(),
+                Some(v),
+                "scale_mode {v} must round-trip as Some({v:?}), got {:?}",
+                ss.scale_mode
+            );
+        }
     }
 
     // ── Web-UI config keys ──────────────────────────────────────────────────

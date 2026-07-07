@@ -870,6 +870,7 @@ dependencies = [
  "libmpv2",
  "libmpv2-sys",
  "smithay-client-toolkit",
+ "tempfile",
  "tokio",
  "tracing",
  "wayland-client",

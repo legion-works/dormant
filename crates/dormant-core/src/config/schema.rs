@@ -535,6 +535,33 @@ pub struct ScreensaverConfig {
     /// class error naming the allowed set.
     #[serde(default)]
     pub scale_mode: Option<String>,
+
+    /// How successive playlist items transition into each other.  One of:
+    ///
+    /// - `"crossfade"` (default) — a calloop-timer-driven per-pixel u8
+    ///   lerp over `transition_duration` replaces the hard-cut between
+    ///   playlist items.  Spike-measured cost 0.9 ms/frame at 3072×1728
+    ///   — trivially fits any reasonable budget.
+    /// - `"none"` — successive playlist items cut immediately (the
+    ///   pre-feature behaviour; preserved for benchmarks and
+    ///   operators who want the legacy look).
+    ///
+    /// `None` (the field absent from the TOML) is treated as `"crossfade"`.
+    /// Validation rejects any other value with an `E_SCREENSAVER_SOURCE`-
+    /// class error naming the allowed set.
+    #[serde(default)]
+    pub transition: Option<String>,
+
+    /// Length of the crossfade blend when [`Self::transition`] is
+    /// `"crossfade"`; ignored when it's `"none"`.  Bounded by the
+    /// validator (100 ms ..= 10 s) — long blurs lose the visual cue that
+    /// the playlist is moving; very short blurs visibly skip.
+    ///
+    /// `None` (the field absent from the TOML) is treated as `"1s"` at
+    /// the daemon's `build_render_sinks` hop.  Read with humantime
+    /// (`"500ms"`, `"1s"`).
+    #[serde(default, with = "humantime_serde::option")]
+    pub transition_duration: Option<Duration>,
 }
 
 /// A display definition.

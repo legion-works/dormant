@@ -11,6 +11,7 @@
 //! The value is then deserialized into [`Config`] without `deny_unknown_fields`.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
@@ -150,7 +151,14 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
         "displays..screensaver",
-        &["trigger", "audio", "source", "scale_mode"],
+        &[
+            "trigger",
+            "audio",
+            "source",
+            "scale_mode",
+            "transition",
+            "transition_duration",
+        ],
     ),
     // ── displays.<id>.screensaver.source (array-of-tables entries) ────────
     (
@@ -652,6 +660,37 @@ fn validate_display(
                         detail: format!(
                             "display '{display_id}' screensaver scale_mode '{sm}' \
                              is unknown — allowed: \"fill\", \"fit\", \"stretch\", \"center\""
+                        ),
+                    });
+                }
+                // transition value check: must be one of {crossfade, none}
+                // when set.  `None` falls back to Crossfade at the render
+                // layer (the user asked for transitions); this validator only
+                // rejects explicit unknown values.
+                if let Some(ref tr) = ss.transition
+                    && !matches!(tr.as_str(), "crossfade" | "none")
+                {
+                    errors.push(ValidationError {
+                        what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                        detail: format!(
+                            "display '{display_id}' screensaver transition '{tr}' \
+                             is unknown — allowed: \"crossfade\", \"none\""
+                        ),
+                    });
+                }
+                // transition_duration bounds: when set, must be in
+                // [100 ms, 10 s].  Long blurs lose the visual cue that the
+                // playlist is moving; very short blurs visibly skip.  The
+                // hard upper bound also caps the worst-case blend work per
+                // item switch (timer ticks * frame size).
+                if let Some(d) = ss.transition_duration
+                    && (d < Duration::from_millis(100) || d > Duration::from_secs(10))
+                {
+                    errors.push(ValidationError {
+                        what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                        detail: format!(
+                            "display '{display_id}' screensaver transition_duration \
+                             {d:?} is out of range — allowed: 100ms..=10s"
                         ),
                     });
                 }
@@ -1306,6 +1345,8 @@ gracee_period = "60s"
                     image_duration: None,
                 }],
                 scale_mode: scale_mode.map(str::to_string),
+                transition: None,
+                transition_duration: None,
             }),
             output: Some("DP-1".into()),
             ..base_display_cfg()
@@ -1407,6 +1448,251 @@ gracee_period = "60s"
                     && e.detail.contains("scale_mode 'Fill'")),
             "wrong-cased scale_mode 'Fill' must be rejected, got: {:?}",
             errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    // ── transition validation ────────────────────────────────────────────
+
+    /// Build a render-eligible display with a `[controller, render_screensaver]`
+    /// ladder and the given transition / duration.  Used by the transition
+    /// tests; bypasses TOML parsing for clarity.
+    fn display_with_transition(
+        transition: Option<&str>,
+        transition_duration: Option<Duration>,
+    ) -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["kwin-dpms".into()],
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: Some(Duration::from_secs(5)),
+                },
+                LadderStage {
+                    kind: StageKind::RenderScreensaver,
+                    dwell: Some(Duration::from_secs(10)),
+                },
+            ],
+            screensaver: Some(ScreensaverConfig {
+                trigger: "vacancy".into(),
+                audio: false,
+                source: vec![ScreensaverSource {
+                    path: Some("/tmp/img.png".into()),
+                    urls: Vec::new(),
+                    recurse: false,
+                    shuffle: false,
+                    order: None,
+                    image_duration: None,
+                }],
+                scale_mode: None,
+                transition: transition.map(str::to_string),
+                transition_duration,
+            }),
+            output: Some("DP-1".into()),
+            ..base_display_cfg()
+        }
+    }
+
+    fn config_with_transition(
+        transition: Option<&str>,
+        transition_duration: Option<Duration>,
+    ) -> super::super::schema::Config {
+        super::super::schema::Config {
+            config_version: 1,
+            daemon: crate::config::DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([(
+                "d1".into(),
+                display_with_transition(transition, transition_duration),
+            )]),
+            rules: IndexMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_both_transition_values() {
+        // Both canonical values must be accepted — the validation gate
+        // exists ONLY to reject unknown strings.
+        for tr in ["crossfade", "none"] {
+            let cfg = config_with_transition(Some(tr), None);
+            let errors = validate(&cfg, &test_capabilities(), &test_creds());
+            let err_msgs: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            assert!(
+                !err_msgs.iter().any(|m| m.contains("transition")),
+                "transition = '{tr}' must be accepted, got errors: {err_msgs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_absent_transition() {
+        let cfg = config_with_transition(None, None);
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let err_msgs: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            !err_msgs.iter().any(|m| m.contains("transition")),
+            "absent transition must be accepted (renders as Crossfade), \
+             got: {err_msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_transition() {
+        let cfg = config_with_transition(Some("dissolve"), None);
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_SCREENSAVER_SOURCE
+                    && e.detail.contains("transition 'dissolve'")
+                    && e.detail.contains("crossfade")
+                    && e.detail.contains("none")),
+            "expected E_SCREENSAVER_SOURCE error for unknown transition 'dissolve' \
+             naming the allowed set, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_miscased_transition() {
+        let cfg = config_with_transition(Some("Crossfade"), None);
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_SCREENSAVER_SOURCE
+                    && e.detail.contains("transition 'Crossfade'")),
+            "wrong-cased transition 'Crossfade' must be rejected, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    // ── transition_duration bounds ───────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_transition_duration_within_bounds() {
+        // 100 ms (lower edge) and 10 s (upper edge) plus two interior
+        // values — every value in the [100ms, 10s] range must pass.
+        let cases = [
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        ];
+        for d in cases {
+            let cfg = config_with_transition(Some("crossfade"), Some(d));
+            let errors = validate(&cfg, &test_capabilities(), &test_creds());
+            let err_msgs: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            assert!(
+                !err_msgs.iter().any(|m| m.contains("transition_duration")),
+                "transition_duration = {d:?} must be accepted, got errors: {err_msgs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_transition_duration_below_minimum() {
+        // 50 ms is below the 100 ms floor — must be rejected with a
+        // message that names the bound.
+        let cfg = config_with_transition(Some("crossfade"), Some(Duration::from_millis(50)));
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|e| {
+                e.what == crate::error::E_SCREENSAVER_SOURCE
+                    && e.detail.contains("transition_duration")
+                    && e.detail.contains("out of range")
+                    && e.detail.contains("100ms")
+                    && e.detail.contains("10s")
+            }),
+            "50ms transition_duration must be rejected as out of range, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_transition_duration_above_maximum() {
+        // 11 s is above the 10 s ceiling — must be rejected with a
+        // message that names the bound.
+        let cfg = config_with_transition(Some("crossfade"), Some(Duration::from_secs(11)));
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|e| {
+                e.what == crate::error::E_SCREENSAVER_SOURCE
+                    && e.detail.contains("transition_duration")
+                    && e.detail.contains("out of range")
+                    && e.detail.contains("100ms")
+                    && e.detail.contains("10s")
+            }),
+            "11s transition_duration must be rejected as out of range, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_absent_transition_duration() {
+        // Absent → None → render layer defaults to 1 s; validator
+        // must accept it without flagging duration bounds.
+        let cfg = config_with_transition(Some("crossfade"), None);
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let err_msgs: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            !err_msgs.iter().any(|m| m.contains("transition_duration")),
+            "absent transition_duration must be accepted (renders as 1s default), \
+             got: {err_msgs:?}"
+        );
+    }
+
+    // ── unknown-key tree includes transition / transition_duration ──────
+
+    #[test]
+    fn collect_unknown_keys_accepts_transition_in_screensaver() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+transition = "crossfade"
+transition_duration = "500ms"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(
+            unknown.is_empty(),
+            "transition + transition_duration must be known keys under \
+             displays..screensaver, got unknown: {:?}",
+            unknown.iter().map(|u| &u.key_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collect_unknown_keys_flags_typo_in_screensaver_transition() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+transish = "crossfade"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(
+            unknown.iter().any(|u| u.key_path.contains("transish")),
+            "expected transish to be flagged under the screensaver path, got {:?}",
+            unknown.iter().map(|u| &u.key_path).collect::<Vec<_>>()
         );
     }
 

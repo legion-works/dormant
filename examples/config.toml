@@ -106,6 +106,16 @@ modes = ["power_off"]
 # # "stretch" fills the rectangle but distorts aspect.
 # # "center" shows the source at native pixel size, centred.
 # scale_mode = "fill"
+# # transition — how successive playlist items transition.
+# # "crossfade" (default) blends frames with a per-pixel u8 lerp over
+# # transition_duration; spike-measured 0.9 ms/frame at 3072×1728.
+# # "none" cuts immediately (the pre-M3 behaviour; useful for
+# # benchmarks or operators who want the legacy look).
+# transition = "crossfade"
+# # transition_duration — length of the crossfade blend (ignored when
+# # transition = "none").  Humantime string; bounded 100ms..=10s by the
+# # validator.  Default: "1s".
+# transition_duration = "500ms"
 # [[displays.desktop.screensaver.source]]
 # path = "/home/user/Pictures/screensaver"
 # recurse = false

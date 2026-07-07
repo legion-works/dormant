@@ -6,14 +6,7 @@
  * `error` (inline 422 validation detail rendered below the input).
  */
 
-/** Log levels matching Rust's tracing crate + dormant's custom levels. */
-export const LOG_LEVELS = ["trace", "debug", "info", "warn", "error"] as const;
-
-/** Zone fusion modes. */
-export const FUSION_MODES = ["any", "all", "quorum", "weighted"] as const;
-
-/** Unavailable-policy options. */
-export const UNAVAILABLE_POLICIES = ["present", "absent"] as const;
+export { LOG_LEVELS, FUSION_MODES, UNAVAILABLE_POLICIES } from "./constants";
 
 export interface FieldProps {
   path: string[];

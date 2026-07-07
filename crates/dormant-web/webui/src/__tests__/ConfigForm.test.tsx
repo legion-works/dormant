@@ -464,6 +464,111 @@ describe("SettingsForm", () => {
     expect(mocks.postConfigApply.mock.calls[1][0].fingerprint).toBe(UPDATED_CONFIG.fingerprint);
   });
 
+  // ── Fingerprint refetch on conflict / rejection ──
+
+  it("409 → refetches fingerprint, preserves dirty store", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    // Make an edit
+    const logLevelSelect = screen.getByLabelText("log_level") as HTMLSelectElement;
+    fireEvent.change(logLevelSelect, { target: { value: "debug" } });
+    await waitFor(() => {
+      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+    });
+
+    // 409 on apply — conflict dialog appears, refetch returns fresh fingerprint
+    mocks.postConfigApply.mockRejectedValueOnce(
+      new ApiError(409, { error: "fingerprint_mismatch" }),
+    );
+    mocks.getConfig.mockResolvedValueOnce(UPDATED_CONFIG);
+
+    fireEvent.click(screen.getByRole("button", { name: /apply/i }));
+
+    // Conflict dialog visible
+    await waitFor(() => {
+      expect(screen.getByText(/config changed on disk/i)).toBeInTheDocument();
+    });
+
+    // getConfig was called for the refetch
+    await waitFor(() => {
+      expect(mocks.getConfig).toHaveBeenCalled();
+    });
+
+    // Dirty store preserved — still 1 unsaved change
+    expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+
+    // "Keep editing" — dismiss the dialog
+    fireEvent.click(screen.getByRole("button", { name: /keep editing/i }));
+
+    // Make a second edit
+    const webPortField = screen.getByLabelText("web_port") as HTMLInputElement;
+    fireEvent.change(webPortField, { target: { value: "8080" } });
+    await waitFor(() => {
+      expect(screen.getByText(/2 unsaved/)).toBeInTheDocument();
+    });
+
+    // Next apply uses the fresh fingerprint (F2)
+    const applyRes: ApplyResponse = { applied: true, reload: "reloaded" };
+    mocks.postConfigApply.mockResolvedValueOnce(applyRes);
+
+    fireEvent.click(screen.getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => {
+      expect(mocks.postConfigApply).toHaveBeenCalledTimes(2);
+    });
+    expect(mocks.postConfigApply.mock.calls[1][0].fingerprint).toBe(UPDATED_CONFIG.fingerprint);
+  });
+
+  it("rejected → refetches fingerprint, preserves dirty store, banner shows file-written note", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    // Make an edit
+    const logLevelSelect = screen.getByLabelText("log_level") as HTMLSelectElement;
+    fireEvent.change(logLevelSelect, { target: { value: "debug" } });
+    await waitFor(() => {
+      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+    });
+
+    // Apply returns rejected — file was written but daemon refused the reload
+    const applyRes: ApplyResponse = { applied: true, reload: "rejected", detail: "invalid zone config" };
+    mocks.postConfigApply.mockResolvedValueOnce(applyRes);
+    mocks.getConfig.mockResolvedValueOnce(UPDATED_CONFIG);
+
+    fireEvent.click(screen.getByRole("button", { name: /apply/i }));
+
+    // Rejected banner visible with file-written note
+    await waitFor(() => {
+      expect(screen.getByText(/config rejected/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/file on disk contains your change/i)).toBeInTheDocument();
+    expect(screen.getByText(/invalid zone config/i)).toBeInTheDocument();
+
+    // getConfig was called for the refetch
+    await waitFor(() => {
+      expect(mocks.getConfig).toHaveBeenCalled();
+    });
+
+    // Dirty store preserved — still 1 unsaved change (store was not reset)
+    expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+
+    // Next apply uses the fresh fingerprint (F2)
+    const applyRes2: ApplyResponse = { applied: true, reload: "reloaded" };
+    mocks.postConfigApply.mockResolvedValueOnce(applyRes2);
+
+    fireEvent.click(screen.getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => {
+      expect(mocks.postConfigApply).toHaveBeenCalledTimes(2);
+    });
+    expect(mocks.postConfigApply.mock.calls[1][0].fingerprint).toBe(UPDATED_CONFIG.fingerprint);
+  });
+
   // ── Navigation guard: beforeunload ──
 
   it("registers beforeunload when dirty, removes after discard", async () => {

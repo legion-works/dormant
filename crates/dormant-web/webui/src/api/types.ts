@@ -156,6 +156,15 @@ export interface ConfigReloadRejectedEvent {
   detail: string;
 }
 
+// Compile-time pin: if ConfigReloadRejectedEvent is dropped from
+// the DaemonEvent union, the Extract narrows to `never` and the
+// assignment of a concrete object to `never` fails tsc.
+const _rejected: Extract<DaemonEvent, { event: "config_reload_rejected" }> = {
+  event: "config_reload_rejected",
+  detail: "",
+};
+void _rejected;
+
 export interface WakeRetryEvent {
   event: "wake_retry";
   display: string;

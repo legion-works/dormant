@@ -83,8 +83,9 @@ pub fn check_patches(
             )));
         }
 
-        // 3. Editable-subset — locked leaves + optional-only removal.
-        check_editable_subset(patch)?;
+        // 3. Editable-subset — locked leaves, container-Set rejection,
+        //    optional-only removal, recursive payload check.
+        check_editable_subset(patch, current)?;
 
         // 4. Redacted-reject — prefix-aware in both directions.
         check_redacted(&path_strs, redacted)?;
@@ -156,7 +157,7 @@ fn check_hygiene(path: &[String]) -> Result<(), PatchError> {
 
 // ── Pipeline step 3: editable-subset ───────────────────────────────────────
 
-fn check_editable_subset(p: &Patch) -> Result<(), PatchError> {
+fn check_editable_subset(p: &Patch, current: &toml_edit::DocumentMut) -> Result<(), PatchError> {
     let (path, is_remove) = match p {
         Patch::Set { path, .. } => (path, false),
         Patch::Remove { path } => (path, true),
@@ -171,6 +172,20 @@ fn check_editable_subset(p: &Patch) -> Result<(), PatchError> {
         )));
     }
 
+    // Container-Set rejection (M1 security fix).
+    // A Set on a table-level path (e.g. ["sensors"], ["displays","tv"]) would
+    // replace the whole sub-tree, smuggling locked leaves like `type`.
+    // Allowed Sets target VALUE leaves or whole ARRAYS only.
+    // Tables, collection-level keys, and AOT entry indices are containers.
+    if !is_remove {
+        let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
+        if is_table_container(current, &path_strs) {
+            return Err(PatchError::PathDenied(
+                "container paths are not patchable; set leaf values or whole arrays".into(),
+            ));
+        }
+    }
+
     // Remove is additionally restricted to explicitly optional keys.
     if is_remove
         && let Some(leaf) = path.last()
@@ -181,6 +196,94 @@ fn check_editable_subset(p: &Patch) -> Result<(), PatchError> {
         )));
     }
 
+    // Recursive payload check (defense-in-depth for container-Set bypass).
+    // Walk the JSON value tree and reject any object key that is a locked
+    // leaf name.  This catches smuggling via whole-array payloads (e.g.
+    // setting ladder with an entry that contains `"type"`).
+    // source/ladder entries legitimately contain `kind`/`path`/`urls` etc.;
+    // only `type`, `blank_data`, and `wake_data` are locked.
+    if let Patch::Set { value, .. } = p {
+        check_payload_for_locked_leaves(value)?;
+    }
+
+    Ok(())
+}
+
+/// Returns `true` when the item at `path` in the document is a Table
+/// (a structural container, not a leaf value or array).
+///
+/// AOT keys (`ladder`, `source`) return `false` — they are arrays, not
+/// containers.  Paths whose LAST segment is a digit (e.g. `ladder.0`,
+/// `source.0`) are AOT entry indices — those are always Tables.
+/// Paths with internal digit segments (e.g. `source.0.order`) are leaf
+/// edits inside AOT entries — the target is the final non-digit key.
+fn is_table_container(doc: &toml_edit::DocumentMut, path: &[&str]) -> bool {
+    if path.is_empty() {
+        // Root is always a table.
+        return true;
+    }
+
+    // Paths whose last segment is a digit are AOT entry indices.
+    if let Some(last) = path.last()
+        && is_digit_segment(last)
+    {
+        return true;
+    }
+
+    // AOT keys (ladder, source) at any depth are arrays, not tables.
+    if let Some(last) = path.last()
+        && (*last == "ladder" || *last == "source")
+    {
+        return false;
+    }
+
+    // Walk the document to the target and check the item type.
+    // Internal digit segments (inside AOT entries) cannot be navigated
+    // via &dyn TableLike; when we encounter one we know the path is inside
+    // an AOT entry and the eventual target is a leaf value, not a container.
+    let mut table_like: &dyn toml_edit::TableLike = doc.as_table();
+    for (i, seg) in path.iter().enumerate() {
+        let is_last = i == path.len() - 1;
+
+        // If we hit a digit mid-path, the target is deeper inside an AOT
+        // entry — it is a leaf, not a container.
+        if is_digit_segment(seg) && !is_last {
+            return false;
+        }
+
+        match table_like.get(seg) {
+            Some(item) if is_last => return item.is_table(),
+            Some(item) => match item.as_table_like() {
+                Some(t) => table_like = t,
+                None => return false,
+            },
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Walk a JSON value tree and reject any object key that matches a
+/// [`LOCKED_LEAVES`] entry.  Only fires for [`Patch::Set`].
+fn check_payload_for_locked_leaves(value: &serde_json::Value) -> Result<(), PatchError> {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (k, v) in obj {
+                if LOCKED_LEAVES.contains(&k.as_str()) {
+                    return Err(PatchError::PathDenied(format!(
+                        "locked key '{k}' found in replacement payload"
+                    )));
+                }
+                check_payload_for_locked_leaves(v)?;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                check_payload_for_locked_leaves(item)?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -188,6 +291,17 @@ fn check_editable_subset(p: &Patch) -> Result<(), PatchError> {
 
 /// Reject when a patch path equals, is a descendant of, or is an ancestor of
 /// any redacted path.  Both directions use a plain segment-prefix match.
+///
+/// ## Known deviation: inline-array element leaves
+///
+/// Inline array element indices (e.g. `source.0.urls.1`) are NOT recognised
+/// by [`is_known_config_path`] — T1 scopes numeric-index handling to the
+/// `ladder` / `source` `ArrayOfTables` keys only (see
+/// `dormant_core::config::validate::is_array_of_tables_parent`).
+/// Such paths therefore receive `PathDenied` before reaching this check.
+/// Protection is not lost: the ancestor rule rejects patches on the
+/// containing array (`...source`), and the descendant rule rejects leaf
+/// edits under any path that IS a known descendant of the redacted path.
 fn check_redacted(path: &[&str], redacted: &[Vec<String>]) -> Result<(), PatchError> {
     for r in redacted {
         let r_strs: Vec<&str> = r.iter().map(String::as_str).collect();
@@ -407,12 +521,10 @@ fn is_at_aot_key(doc: &toml_edit::DocumentMut, path: &[String]) -> bool {
                 // Last segment — check if it's an AOT.
                 return item.is_array_of_tables();
             }
-            Some(item) => {
-                match item.as_table_like() {
-                    Some(t) => table_like = t,
-                    None => return false, // Hit a value before end of path
-                }
-            }
+            Some(item) => match item.as_table_like() {
+                Some(t) => table_like = t,
+                None => return false, // Hit a value before end of path
+            },
             None => return false,
         }
         i += 1;
@@ -420,7 +532,7 @@ fn is_at_aot_key(doc: &toml_edit::DocumentMut, path: &[String]) -> bool {
     false
 }
 
-// ── Parent-table navigation ────────────────────────────────────────────────
+// ── Parent-table navigation (safe — no unsafe blocks) ──────────────────────
 
 /// Navigate to the *parent* table of the leaf operation.
 ///
@@ -430,8 +542,8 @@ fn is_at_aot_key(doc: &toml_edit::DocumentMut, path: &[String]) -> bool {
 /// 2. `parent_path` has a key last segment → walk to the containing table
 ///    and return the sub-table at that key.
 ///
-/// Uses raw-pointer chaining internally to satisfy the borrow checker when
-/// traversing mixed Table / `ArrayOfTables` paths.
+/// Uses safe per-segment re-borrow via chained `get_mut → as_table_mut` in a
+/// single expression so the borrow checker can see the exclusive chain.
 fn parent_table_mut<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     parent_path: &[String],
@@ -444,14 +556,6 @@ fn parent_table_mut<'a>(
         .last()
         .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
 
-    // Safety: we hold `&mut doc` exclusively for `'a`.  All intermediate
-    // mutable references are ephemeral (live only within this function)
-    // and the returned reference is re-derived from the root pointer.
-    //
-    // We use raw pointers to suppress the borrow checker for the loop;
-    // the actual access pattern is a single linear chain with no aliasing.
-    let doc_ptr: *mut toml_edit::DocumentMut = doc;
-
     if last_is_digit {
         let (aot_parent, digit) = parent_path.split_at(parent_path.len() - 1);
         let idx: usize = digit[0]
@@ -462,13 +566,9 @@ fn parent_table_mut<'a>(
         let (table_path, aot_key_seg) = aot_parent.split_at(aot_parent.len() - 1);
         let aot_key = &aot_key_seg[0];
 
-        // Walk to the table containing the AOT.
-        let container_table: &mut toml_edit::Table;
-        unsafe {
-            container_table = simple_table_mut(doc_ptr, table_path)?;
-        }
-
-        let aot_item = container_table
+        // Walk to the table containing the AOT key, then index into it.
+        let container = walk_table(doc.as_table_mut(), table_path)?;
+        let aot_item = container
             .get_mut(aot_key.as_str())
             .ok_or_else(|| PatchError::PathDenied(format!("AOT key not found: {aot_key}")))?;
         let aot = aot_item
@@ -482,12 +582,8 @@ fn parent_table_mut<'a>(
         let (table_path, key_seg) = parent_path.split_at(parent_path.len() - 1);
         let key = &key_seg[0];
 
-        let container_table: &mut toml_edit::Table;
-        unsafe {
-            container_table = simple_table_mut(doc_ptr, table_path)?;
-        }
-
-        let item = container_table
+        let container = walk_table(doc.as_table_mut(), table_path)?;
+        let item = container
             .get_mut(key.as_str())
             .ok_or_else(|| PatchError::PathDenied(format!("key not found: {key}")))?;
         item.as_table_mut()
@@ -495,46 +591,27 @@ fn parent_table_mut<'a>(
     }
 }
 
-/// Walk `doc` through a path of regular table keys (no AOT indices) and
-/// return a mutable reference to the final table.
+/// Walk `root` through `path` segments, returning the final table.
 ///
-/// # Safety
-///
-/// Caller must ensure `doc_ptr` is a valid, non-aliased mutable pointer to
-/// the document for the lifetime of the returned reference.
-unsafe fn simple_table_mut<'a>(
-    doc_ptr: *mut toml_edit::DocumentMut,
+/// Each iteration chains `get_mut → as_table_mut` in a single expression.
+/// The intermediate `&mut Item` is dropped at the semicolon before `current`
+/// is reassigned, so the borrow checker sees a linear exclusive chain.
+fn walk_table<'a>(
+    root: &'a mut toml_edit::Table,
     path: &[String],
 ) -> Result<&'a mut toml_edit::Table, PatchError> {
     if path.is_empty() {
-        // Safety: doc_ptr is valid and non-aliased.
-        return Ok(unsafe { (&mut *doc_ptr).as_table_mut() });
+        return Ok(root);
     }
-
-    // Safety: we create a mutable reference from the pointer, but it's
-    // ephemeral — we don't hold it alongside other &mut references.
-    let root = unsafe { (&mut *doc_ptr).as_table_mut() };
-
-    // Use a raw-pointer chain to walk the path without borrow-checker
-    // complaints about reborrowing from a reference that was already
-    // borrowed.
-    let mut current: *mut toml_edit::Table = root;
-
+    let mut current: &mut toml_edit::Table = root;
     for seg in path {
-        // Safety: current is derived from doc_ptr, which is non-aliased.
-        let table = unsafe { &mut *current };
-        let item = table
+        current = current
             .get_mut(seg.as_str())
-            .ok_or_else(|| PatchError::PathDenied(format!("key not found: {seg}")))?;
-        current = item
+            .ok_or_else(|| PatchError::PathDenied(format!("key not found: {seg}")))?
             .as_table_mut()
             .ok_or_else(|| PatchError::PathDenied(format!("{seg} is not a table")))?;
     }
-
-    // Safety: current was derived from doc_ptr through the chain and
-    // remains within the document's allocation.  All intermediate &mut
-    // references have been dropped.
-    Ok(unsafe { &mut *current })
+    Ok(current)
 }
 
 // ── JSON → toml_edit conversion ────────────────────────────────────────────
@@ -1207,29 +1284,9 @@ grace_period = "30s" # trailing grace_period comment
 
         let after = doc.to_string();
 
-        // grace_period changed
-        assert!(after.contains("grace_period = \"20s\""));
-        // top-level header comment preserved
-        assert!(after.contains("# Top-level header comment"));
-        // daemon section doc comment preserved
-        assert!(after.contains("# daemon section doc comment"));
-        // trailing comment on log_level preserved
-        assert!(after.contains("# trailing comment on log_level"));
-        // trailing broker comment preserved
-        assert!(after.contains("# trailing broker comment"));
-        // inline array comment preserved
-        assert!(after.contains("# inline array comment"));
-        // per-table comment above controllers preserved
-        assert!(after.contains("# per-table comment above controllers"));
-        // per-table comment above screensaver preserved
-        assert!(after.contains("# per-table comment above screensaver"));
-        // comment inside ladder preserved
-        assert!(after.contains("# a comment inside ladder array entry"));
-        // trailing grace_period comment preserved
-        assert!(after.contains("# trailing grace_period comment"));
-
-        // The old value is gone
-        assert!(!after.contains("grace_period = \"30s\""));
+        // Full-string equality: the only change is 30s → 20s.
+        let expected = GOLDEN_FIXTURE.replace("\"30s\"", "\"20s\"");
+        assert_eq!(after, expected, "only grace_period value should change");
     }
 
     #[test]
@@ -1261,13 +1318,10 @@ grace_period = "30s" # trailing grace_period comment
         apply_patches(&mut doc, &patches).unwrap();
 
         let after = doc.to_string();
-        // blank_mode removed
-        assert!(!after.contains("blank_mode"));
-        // neighbors intact
-        assert!(after.contains("controllers"));
-        assert!(after.contains("samsung_tizen"));
-        // per-table comment above screensaver preserved
-        assert!(after.contains("# per-table comment above screensaver"));
+
+        // Full-string equality: blank_mode line removed, everything else intact.
+        let expected = GOLDEN_FIXTURE.replace("blank_mode = \"picture_off\"\n", "");
+        assert_eq!(after, expected, "only blank_mode line should be removed");
     }
 
     #[test]
@@ -1367,5 +1421,128 @@ grace_period = "30s" # trailing grace_period comment
         // Inline array, not [[...]]
         assert!(after.contains("controllers = [\"kwin_dpms\", \"ddcci\"]"));
         assert!(!after.contains("[[displays.tv.controllers]]"));
+    }
+
+    // ==================================================================
+    // 8. Container-Set bypass regression tests (MUST fail pre-fix)
+    // ==================================================================
+
+    #[test]
+    fn set_sensors_table_is_denied() {
+        // Reviewer probe: setting the whole sensors table smuggles locked 'type'.
+        let cur = minimal_config();
+        let err = check_patches(
+            &[set(
+                &["sensors"],
+                json!({"desk": {"type": "ha", "broker_url": "mqtt://x", "topic": "t", "field": "f"}}),
+            )],
+            &cur,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PatchError::PathDenied(_)),
+            "setting container table should be denied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_display_table_is_denied() {
+        // Reviewer probe: setting displays.tv table smuggles locked leaves.
+        let cur = minimal_config();
+        let err = check_patches(
+            &[set(
+                &["displays", "tv"],
+                json!({"controllers": ["kwin_dpms"], "blank_data": {"x": 1}, "wake_data": {"y": 2}}),
+            )],
+            &cur,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PatchError::PathDenied(_)),
+            "setting container table should be denied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_displays_root_table_is_denied() {
+        // Reviewer probe: setting the displays collection smuggles locked leaves.
+        let cur = minimal_config();
+        let err = check_patches(
+            &[set(
+                &["displays"],
+                json!({"tv": {"controllers": ["kwin_dpms"], "blank_data": {"x": 1}}}),
+            )],
+            &cur,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PatchError::PathDenied(_)),
+            "setting container table should be denied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn nested_smuggle_in_source_payload_is_denied() {
+        // Nested-smuggle: setting a whole source AOT with a locked leaf in payload.
+        let cur = minimal_config();
+        let err = check_patches(
+            &[set(
+                &["displays", "tv", "screensaver", "source"],
+                json!([{"path": "/x", "type": "evil"}]),
+            )],
+            &cur,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PatchError::PathDenied(_)),
+            "locked leaf in array payload should be denied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clean_source_array_set_is_allowed() {
+        // A clean whole-array Set on source (no locked leaves) is allowed.
+        let cur = minimal_config();
+        check_ok(
+            &[set(
+                &["displays", "tv", "screensaver", "source"],
+                json!([{"path": "/pics"}]),
+            )],
+            &cur,
+            &[],
+        );
+    }
+
+    // ==================================================================
+    // 9. Wire-shape serde tests
+    // ==================================================================
+
+    #[test]
+    fn deserialize_set_patch() {
+        let json = r#"{"op":"set","path":["daemon","log_level"],"value":"debug"}"#;
+        let patch: Patch = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            patch,
+            Patch::Set {
+                path: p(&["daemon", "log_level"]),
+                value: json!("debug"),
+            }
+        );
+    }
+
+    #[test]
+    fn deserialize_remove_patch() {
+        let json = r#"{"op":"remove","path":["displays","tv","blank_mode"]}"#;
+        let patch: Patch = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            patch,
+            Patch::Remove {
+                path: p(&["displays", "tv", "blank_mode"]),
+            }
+        );
     }
 }

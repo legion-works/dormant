@@ -1,109 +1,139 @@
-# dormant
+<p align="center">
+  <img src="design/web-ui/assets/logo.svg" alt="dormant" width="280">
+</p>
 
-Blanks OLED PC monitors and TVs when presence sensors detect an empty room, and wakes them on return. Rust daemon + CLI.
+<p align="center">
+  <strong>Blank OLED screens when the room empties. Wake them the moment you return.</strong>
+</p>
 
-Multi-sensor fusion (any/all/quorum/weighted zones), MQTT, Home Assistant WebSocket, and USB mmWave radar input. Controls displays via DDC/CI, shell commands, Home Assistant service calls, and (planned) KWin DPMS and Samsung Tizen.
+<p align="center">
+  <a href="https://github.com/iceteaSA/dormant/actions/workflows/ci.yml"><img src="https://github.com/iceteaSA/dormant/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="MSRV 1.88">
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
+  <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux">
+</p>
 
-Status: **pre-alpha** — design phase complete, core daemon functional, hardware integration spikes in progress (KWin DPMS, Samsung Tizen). Not yet suitable for unattended production use.
+---
 
-## What dormant protects against
+OLED panels burn in when they hold a static image. OS idle timers are a blunt fix — they blank while you're reading and linger after you leave. Presence sensors know the difference: they can tell an empty room from a still one.
 
-OLED panels degrade with static content. The effectiveness of each blank mode varies:
+`dormant` is a Rust daemon that reads those sensors and blanks your displays only when the room is actually empty, then wakes them the instant someone walks back in. It runs your PC monitors and your TVs, over local buses and over the network, on rules you write per display.
 
-| Mode | OLED protection | Audio | Wake speed |
+## Why it exists
+
+The whole point is protecting OLEDs *without* the usual trade-offs — no black bars burned into the panel, no audio cutting out when the TV screen goes dark, no three-second wait to see your desktop again. Every blank mode makes a different bargain:
+
+| Mode | OLED protection | Audio survives | Wake |
 |---|---|---|---|
 | `screen_off_audio_on` | Full | Yes | Fast |
-| `power_off` | Full | No | Slower |
-| `brightness_zero` | Partial (pixels still powered) | Yes | Instant |
+| `power_off` | Full | No | ~1s standby |
+| `brightness_zero` | Partial — pixels stay lit | Yes | Instant |
 
-`screen_off_audio_on` is the recommended mode for TVs where you want music to keep playing while the screen is off. `power_off` gives the same protection with cold-boot wake latency. `brightness_zero` is a fallback for controllers that support neither — better than nothing, but the panel is still energized.
+On Linux the only audio-safe way to truly darken a panel is DDC/CI: `power_off` writes VCP `0xD6` straight to the monitor, so the OS output — and its audio sink — stay up. Every DPMS path (`kwin-dpms` included) tears the output down and takes the audio with it, which is why it's a documented fallback, not a default. For a Samsung TV, `samsung-tizen` sends `KEY_PICTURE_OFF` and the panel goes dark while the sound plays on.
 
-## Feature matrix
+## What's in the box
+
+Three binaries: **`dormantd`** (the daemon), **`dormantctl`** (the CLI), and **`dormant-tray`** (a KDE tray applet).
 
 ### Sensors
 
-| Source | Status |
+| Source | |
 |---|---|
-| MQTT (Zigbee2MQTT, ESPHome, any broker) | Ready |
+| MQTT — Zigbee2MQTT, ESPHome, any broker (auth supported) | Ready |
 | Home Assistant WebSocket | Ready |
 | USB-serial LD2410 mmWave radar | Ready |
-| Input activity (keyboard/mouse idle) | Ready (inhibitor) |
+| Keyboard/mouse idle (Wayland `ext_idle_notifier` + DBus fallback) | Ready |
+
+Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A sensor that goes quiet — broker down, USB unplugged, a stale reading — resolves as *present*, never absent. dormant will not blank a room it can't see.
 
 ### Display controllers
 
-| Controller | Status |
+| Controller | |
 |---|---|
-| Shell command (arbitrary blank/wake scripts) | Ready |
-| DDC/CI (VCP power/input/screen-off) | Ready |
-| Home Assistant passthrough (service calls) | Ready |
-| KWin DPMS (KDE Wayland) | M1 spike in progress |
-| Samsung Tizen (KEY_PICTURE_OFF) | M1 spike in progress |
+| `ddcci` — DDC/CI power-off and brightness (audio-safe) | Ready |
+| `samsung-tizen` — Samsung Tizen TVs over WebSocket | Ready |
+| `kwin-dpms` — KDE Wayland DPMS (audio-unsafe fallback) | Ready |
+| `ha-passthrough` — any Home Assistant service call | Ready |
+| `command` — arbitrary blank/wake shell commands | Ready |
+
+Each display gets an ordered controller chain with automatic fallback and bounded wake-retry. A wake that fails on the first controller escalates to the next; wake is unconditional and never gives up on a dark screen.
+
+### Web dashboard and tray
+
+Build with `--features web-ui` for a loopback web dashboard: a live view of the sensor → zone → rule → display pipeline, force blank/wake, pause/resume, and a full config editor that writes your `config.toml` in place — comments preserved, secrets locked, every change validated exactly as the daemon would before it touches disk.
+
+Build with `--features render` for audio-safe blanking that never touches DPMS: a fullscreen black Wayland overlay, an escalation ladder (screensaver → black → power-off on your own dwell timers), and a muted streaming screensaver driven by mpv.
+
+The `dormant-tray` applet puts per-display status and blank/wake/pause controls in the KDE system tray.
 
 ## Quickstart
 
-### Install (from source, pre-release)
+Build from source (Linux, Rust 1.88+):
 
 ```bash
-git clone https://github.com/icetea/dormant.git
+git clone https://github.com/iceteaSA/dormant.git
 cd dormant
-cargo build --release
-install -Dm755 target/release/dormantd ~/.local/bin/dormantd
+cargo build --release --features web-ui,render
+install -Dm755 target/release/dormantd  ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 ```
 
-### Minimal config
-
-Save as `~/.config/dormant/config.toml`:
+Write `~/.config/dormant/config.toml`:
 
 ```toml
 config_version = 1
 
 [sensors.desk]
 type = "mqtt"
-broker_url = "tcp://localhost:1883"
-topic = "zigbee2mqtt/desk-sensor"
+broker_url = "mqtt://localhost:1883"
+topic = "zigbee2mqtt/desk-presence"
 
 [zones.office]
 mode = "any"
 members = ["desk"]
 
-[displays.main]
+[displays.monitor]
 controllers = ["ddcci"]
 blank_mode = "power_off"
 
-[rules.office_blank]
+[rules.office]
 zone = "office"
-displays = ["main"]
+displays = ["monitor"]
+grace_period = "60s"
 ```
 
-### Run
+Then:
 
 ```bash
-# Validate config
-dormantctl validate
-
-# Start the daemon
-dormantd
-
-# Check status
-dormantctl status
+dormantctl validate     # check the config
+dormantd                # start the daemon
+dormantctl status       # watch the pipeline
+dormantctl doctor       # diagnose sensors and displays against your hardware
 ```
 
-## Systemd user unit
-
-Install the daemon as a user service:
+Run it as a user service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
 cp crates/dormantd/systemd/dormant.service ~/.config/systemd/user/
-systemctl --user daemon-reload
 systemctl --user enable --now dormant
 ```
 
 ## Documentation
 
-Full docs at [docs/](./docs/src/introduction.md) — configuration reference, sensor setup guides, troubleshooting, and the doctor command reference.
+Configuration reference, sensor and controller guides, and the `doctor` command are in [docs/](./docs/src/introduction.md). Hardware-specific findings — which DDC codes work, how Samsung standby behaves — live in [docs/research/](./docs/research/).
+
+## Status
+
+Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows. It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
 
 ## License
 
 MIT OR Apache-2.0, at your option.
+
+---
+
+<p align="center">
+  <img src="design/web-ui/assets/legion-mark.svg" alt="Legion Works" width="16" valign="middle">
+  &nbsp;A <strong>Legion Works</strong> fleet daemon. Many programs. One consensus.
+</p>

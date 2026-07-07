@@ -138,7 +138,13 @@ fn create_dual_buffers(
     stride: u32,
 ) -> (WlBuffer, WlBuffer) {
     let stride_i32 = stride.cast_signed();
-    let fmt = wayland_client::protocol::wl_shm::Format::Argb8888;
+    // XRGB8888 — NOT ARGB8888.  mpv's `bgr0` SW format writes bytes
+    // [B,G,R,X] with X = 0x00; under ARGB8888 the compositor reads that
+    // byte as alpha=0 and composites every frame fully transparent
+    // (the desktop shows through — invisible screensaver).  XRGB8888
+    // declares "the 4th byte is ignored"; the same byte stream is
+    // correct content either way.
+    let fmt = wayland_client::protocol::wl_shm::Format::Xrgb8888;
     let buf0 = pool.create_buffer(
         0,
         width.cast_signed(),

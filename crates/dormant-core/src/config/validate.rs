@@ -628,8 +628,29 @@ fn validate_display(
                         ),
                     });
                 }
-                // Per-source path-xor-urls check.
+                // Trigger check.
+                if ss.trigger != "vacancy" {
+                    errors.push(ValidationError {
+                        what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                        detail: format!(
+                            "trigger '{}' not supported — only \"vacancy\" is allowed",
+                            ss.trigger
+                        ),
+                    });
+                }
+                // Per-source checks.
                 for (i, src) in ss.source.iter().enumerate() {
+                    // Source must have exactly one of path or non-empty
+                    // urls — not both AND not neither.
+                    if src.path.is_none() && src.urls.is_empty() {
+                        errors.push(ValidationError {
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} has neither \
+                                 path nor urls — each source needs exactly one"
+                            ),
+                        });
+                    }
                     if src.path.is_some() && !src.urls.is_empty() {
                         errors.push(ValidationError {
                             what: crate::error::E_SCREENSAVER_SOURCE.into(),
@@ -639,16 +660,42 @@ fn validate_display(
                             ),
                         });
                     }
-                }
-                // Trigger check.
-                if ss.trigger != "vacancy" {
-                    errors.push(ValidationError {
-                        what: "unsupported trigger".into(),
-                        detail: format!(
-                            "trigger '{}' not supported in this release (vacancy only)",
-                            ss.trigger
-                        ),
-                    });
+                    // shuffle + order exactly-one: validation guarantees they
+                    // are never both set, so playlist.rs never hits the
+                    // shuffle-wins branch at runtime.
+                    if src.shuffle && src.order.is_some() {
+                        errors.push(ValidationError {
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} sets both \
+                                 shuffle and order — pick exactly one"
+                            ),
+                        });
+                    }
+                    // order must be a known value.
+                    if let Some(ref ord) = src.order
+                        && !matches!(ord.as_str(), "sequential")
+                    {
+                        errors.push(ValidationError {
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} \
+                                 order '{ord}' is unknown — allowed: \"sequential\""
+                            ),
+                        });
+                    }
+                    // image_duration must be non-zero when set.
+                    if let Some(d) = src.image_duration
+                        && d.as_secs() == 0
+                    {
+                        errors.push(ValidationError {
+                            what: "invalid duration".into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} \
+                                 image_duration must be > 0"
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -1837,9 +1884,12 @@ path = "/tmp/pics"
         let errors = validate(&cfg, &caps, &Credentials::default());
         let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
         assert!(
-            errs.iter()
-                .any(|e| e.contains("not supported in this release")),
-            "expected unsupported trigger error, got: {:?}",
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_SCREENSAVER_SOURCE)
+                    && e.contains("vacancy")
+                    && e.contains("idle")
+            }),
+            "expected E_SCREENSAVER_SOURCE trigger error for 'idle', got: {:?}",
             errs
         );
     }
@@ -1904,6 +1954,181 @@ urls = ["https://example.com/img.jpg"]
                 e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("pick exactly one")
             }),
             "expected E_SCREENSAVER_SOURCE path-urls conflict error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_empty_source_neither_path_nor_urls_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-neither");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("neither.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+[[displays.d.screensaver.source]]
+shuffle = true
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("neither")
+            }),
+            "expected E_SCREENSAVER_SOURCE neither-path-nor-urls error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_shuffle_order_conflict_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-shuffle-order");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shuffle_order.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+shuffle = true
+order = "sequential"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("pick exactly one")
+            }),
+            "expected E_SCREENSAVER_SOURCE shuffle-order conflict error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_unknown_order_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-unknown-order");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unknown_order.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+order = "random"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("random")
+            }),
+            "expected E_SCREENSAVER_SOURCE unknown-order error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_image_duration_zero_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-imgdur-zero");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zero_duration.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+image_duration = "0s"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("invalid duration") && e.contains("image_duration")),
+            "expected invalid-duration error for image_duration=0, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_valid_config_passes() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-valid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("valid_ss.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+trigger = "vacancy"
+audio = true
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+shuffle = true
+image_duration = "3s"
+[[displays.d.screensaver.source]]
+urls = ["https://example.com/img.jpg"]
+order = "sequential"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errors.is_empty(),
+            "expected no errors on valid screensaver config, got: {:?}",
             errs
         );
     }

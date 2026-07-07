@@ -20,6 +20,7 @@ use dormant_core::traits::RenderSink;
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 use crate::command::RenderCommand;
+use crate::settings::ScreensaverSettings;
 
 /// Per-display handle that ships [`RenderSink`] commands across the
 /// async-tokio → sync-calloop boundary to a dedicated wayland thread.
@@ -32,6 +33,11 @@ pub struct LayerShellRenderSink {
     display_id: DisplayId,
     output_name: String,
     cmd_tx: Sender<RenderCommand>,
+    /// Per-display screensaver config — registered by the daemon at
+    /// sink-build time (Task 13).  `None` means no screensaver config
+    /// is associated with this display; a `show(RenderScreensaver)` then
+    /// resolves with `E_RENDER_UNAVAILABLE` and the engine falls through.
+    screensaver: std::sync::Arc<std::sync::Mutex<Option<ScreensaverSettings>>>,
 }
 
 impl fmt::Debug for LayerShellRenderSink {
@@ -75,7 +81,23 @@ impl LayerShellRenderSink {
             display_id,
             output_name,
             cmd_tx,
+            screensaver: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Register the per-display screensaver config so a subsequent
+    /// `show(RenderScreensaver)` can build the player.  Replaces any
+    /// previously-registered config (T11: the daemon calls this once
+    /// at sink-build time; later live config reloads would also call
+    /// here).
+    ///
+    /// Held behind a `Mutex` so a clone of the sink can be live in the
+    /// daemon while the config is updated; the wayland thread's `show`
+    /// read sees either the old or the new value, never a torn one.
+    pub fn set_screensaver(&self, settings: ScreensaverSettings) {
+        if let Ok(mut guard) = self.screensaver.lock() {
+            *guard = Some(settings);
+        }
     }
 
     /// Identifier of the display this sink was built for.
@@ -95,17 +117,57 @@ impl LayerShellRenderSink {
 impl RenderSink for LayerShellRenderSink {
     async fn show(&self, r#gen: u64, idx: usize, kind: StageKind) -> Result<(), CmdFailure> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Result<(), CmdFailure>>();
-        self.cmd_tx
-            .send(RenderCommand::Show {
-                r#gen,
-                idx,
-                kind,
-                reply: reply_tx,
-            })
-            .map_err(|_send_err| CmdFailure {
-                controller: "render-black".into(),
-                error: format!("{E_RENDER_UNAVAILABLE}: wayland thread not running"),
-            })?;
+        match kind {
+            StageKind::RenderBlack | StageKind::Controller(_) => {
+                // Controller stages never reach a render sink at all (the
+                // engine routes them through the command-sink chain).
+                // If one does, fall through with E_RENDER_UNAVAILABLE.
+                self.cmd_tx
+                    .send(RenderCommand::Show {
+                        r#gen,
+                        idx,
+                        kind,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_send_err| CmdFailure {
+                        controller: "render-black".into(),
+                        error: format!("{E_RENDER_UNAVAILABLE}: wayland thread not running"),
+                    })?;
+            }
+            StageKind::RenderScreensaver => {
+                // Without a registered config, fall through to the next
+                // ladder stage — same shape as the `RenderBlack` path
+                // failing on a missing sink.  The sink's lifetime is the
+                // sink's; the daemon's T13 wires `set_screensaver`.
+                let settings = self.screensaver.lock().ok().and_then(|guard| guard.clone());
+                let Some(settings) = settings else {
+                    let _ = reply_tx.send(Err(CmdFailure {
+                        controller: "render-screensaver".into(),
+                        error: format!(
+                            "{E_RENDER_UNAVAILABLE}: no screensaver config registered for display"
+                        ),
+                    }));
+                    return reply_rx
+                        .await
+                        .map_err(|_recv_err| CmdFailure {
+                            controller: "render-screensaver".into(),
+                            error: format!("{E_RENDER_UNAVAILABLE}: wayland thread dropped reply"),
+                        })
+                        .and_then(|inner| inner);
+                };
+                self.cmd_tx
+                    .send(RenderCommand::ShowScreensaver {
+                        r#gen,
+                        idx,
+                        settings,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_send_err| CmdFailure {
+                        controller: "render-screensaver".into(),
+                        error: format!("{E_RENDER_UNAVAILABLE}: wayland thread not running"),
+                    })?;
+            }
+        }
         reply_rx.await.map_err(|_recv_err| CmdFailure {
             controller: "render-black".into(),
             error: format!("{E_RENDER_UNAVAILABLE}: wayland thread dropped reply"),

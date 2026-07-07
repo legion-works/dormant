@@ -211,6 +211,10 @@ fn init(
         queue_handle,
         loop_should_exit.clone(),
     );
+    // Inject the loop handle so the screensaver install path can register
+    // its wakeup source mid-flight (the install is invoked from inside
+    // the configure handler, which runs from within a calloop tick).
+    state.install_loop_handle(loop_handle.clone());
 
     // First roundtrip populates output info.
     if let Err(e) = event_queue.roundtrip(&mut state) {
@@ -276,6 +280,15 @@ fn install_command_source(
                     let display_id = state.display_id.clone();
                     arm_configure_timer(&handle_for_timer, &display_id, *r#gen);
                 }
+                // A screensaver show may create a NEW surface (if the
+                // prior stage was a controller), which needs the same
+                // gen-guarded configure timer as a `Show`.  The
+                // surface-reuse (direct install) path doesn't need it
+                // because there's no configure reply to wait for.
+                if let RenderCommand::ShowScreensaver { r#gen, .. } = &cmd {
+                    let display_id = state.display_id.clone();
+                    arm_configure_timer(&handle_for_timer, &display_id, *r#gen);
+                }
                 state.handle_command(cmd);
             }
             ChannelEvent::Closed => {
@@ -327,6 +340,30 @@ fn arm_configure_timer(
         // a subsequent configure/closed).
         tracing::warn!(event = "configure_timer_insert_failed", error = %e);
     }
+}
+
+/// Arm the screensaver first-frame deadline timer.  If no successful
+/// `on_mpv_wakeup` render lands within
+/// [`crate::settings::FIRST_FRAME_DEADLINE`], the timer's callback
+/// fails the pending show reply with `Err(E_RENDER_UNAVAILABLE)` and
+/// tears the session down — the engine falls through to the next
+/// ladder stage.  Returned [`calloop::RegistrationToken`] is stored on
+/// the session so `destroy_screensaver_session` can remove it on
+/// teardown; a successful first render also removes it eagerly.
+pub(super) fn arm_screensaver_first_frame_timer(
+    handle: &LoopHandle<'static, WaylandState>,
+    display_id: &DisplayId,
+    r#gen: u64,
+) -> Result<calloop::RegistrationToken, calloop::InsertError<Timer>> {
+    let display_id = display_id.clone();
+    let timer = Timer::from_duration(crate::settings::FIRST_FRAME_DEADLINE);
+    handle.insert_source(
+        timer,
+        move |_event, _meta: &mut (), state: &mut WaylandState| {
+            state.handle_screensaver_first_frame_timeout(&display_id, r#gen);
+            TimeoutAction::Drop
+        },
+    )
 }
 
 /// Run the calloop dispatch forever.  Exits when `loop_should_exit`

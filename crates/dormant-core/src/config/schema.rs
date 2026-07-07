@@ -480,12 +480,14 @@ pub struct ScreensaverSource {
     #[serde(default)]
     pub recurse: bool,
 
-    /// Shuffle the order of source items (mutually exclusive with `order`).
+    /// Shuffle the order of source items (mutually exclusive with `order` —
+    /// validation rejects a config that sets both).
     #[serde(default)]
     pub shuffle: bool,
 
-    /// Explicit ordering strategy (`"sequential"`, `"random"`, …).
-    /// When set alongside `shuffle = true`, `shuffle` wins.
+    /// Explicit ordering strategy (`"sequential"`).
+    /// Mutually exclusive with `shuffle`; validation rejects a config
+    /// that sets both.
     pub order: Option<String>,
 
     /// How long each image is displayed before advancing.

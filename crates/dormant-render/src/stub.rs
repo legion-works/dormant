@@ -22,6 +22,8 @@ use dormant_core::error::E_RENDER_UNAVAILABLE;
 use dormant_core::traits::RenderSink;
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
+use crate::settings::ScreensaverSettings;
+
 /// Cross-platform placeholder for the Wayland layer-shell backend.
 ///
 /// Carries the constructor arguments (`display_id`, `output_name`,
@@ -64,6 +66,13 @@ impl LayerShellRenderSink {
     #[must_use]
     pub fn output_name(&self) -> &str {
         &self.output_name
+    }
+
+    /// Register the per-display screensaver config.  No-op on this
+    /// platform — the stub can never show a screensaver overlay.
+    /// Kept so callers can invoke it unconditionally.
+    pub fn set_screensaver(&self, _settings: ScreensaverSettings) {
+        // No compositor → no-op.
     }
 }
 

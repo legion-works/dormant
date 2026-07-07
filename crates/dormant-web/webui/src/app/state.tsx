@@ -61,7 +61,19 @@ function patchDisplayPhase(
 ): StateSnapshot {
   const displays = snapshot.displays.map(
     ([id, d]): [string, DisplaySnapshot] =>
-      id === display ? [id, { ...d, phase }] : [id, d],
+      id === display
+        ? [
+            id,
+            {
+              ...d,
+              phase,
+              // Clear stage when leaving the staged phase; the WS event
+              // carries no stage detail — a stale label would persist until
+              // the next poll otherwise.
+              stage: phase === "staged" ? d.stage : null,
+            },
+          ]
+        : [id, d],
   );
   return { ...snapshot, displays };
 }

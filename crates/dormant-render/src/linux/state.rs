@@ -6,7 +6,7 @@
 //! `'static`) so surface-creation calls can still bind proxies to the
 //! right queue without storing the queue itself.
 
-use std::os::fd::{BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -111,9 +111,12 @@ fn cmd_failure(controller: &'static str, detail: &str) -> CmdFailure {
 }
 
 /// Create a non-blocking `CLOEXEC` pipe for the mpv wakeup callback
-/// to write into.  Returns `(read_fd, write_fd)` — the read end is
-/// registered with calloop, the write end is given to the mpv player.
-fn make_wakeup_pipe() -> Result<(RawFd, RawFd), CmdFailure> {
+/// to write into.  Returns `(read_fd, write_fd)` as [`OwnedFd`]s — the
+/// read end is registered with calloop (borrowed) and ultimately
+/// stored in `ScreensaverSession`; the write end is consumed by
+/// [`MpvPlayer::new`] which closes it on construction failure via
+/// [`OwnedFd::drop`] (the caller MUST NOT close it on the Err path).
+fn make_wakeup_pipe() -> Result<(OwnedFd, OwnedFd), CmdFailure> {
     let mut pipe_fds = [0 as RawFd; 2];
     // SAFETY: pipe2 writes both fds into the provided array.
     let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
@@ -123,7 +126,11 @@ fn make_wakeup_pipe() -> Result<(RawFd, RawFd), CmdFailure> {
             &format!("pipe2: {}", std::io::Error::last_os_error()),
         ));
     }
-    Ok((pipe_fds[0], pipe_fds[1]))
+    // SAFETY: pipe2 returned two fresh fds; we own both and have not
+    // closed them.  `OwnedFd::from_raw_fd` takes exclusive ownership.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+    Ok((read_fd, write_fd))
 }
 
 /// Build two `WlBuffer`s from a single `RawPool` — `buf0` at offset 0,
@@ -221,7 +228,7 @@ pub(super) struct ScreensaverSession {
     /// closed when the session is dropped (calloop doesn't close the
     /// fd when a source is removed).  The matching write end lives
     /// inside the `MpvPlayer`.
-    pub(super) read_fd: RawFd,
+    pub(super) read_fd: OwnedFd,
     /// Per-buffer compositor-busy flag — `true` after we attach a
     /// buffer (the compositor may still be reading from a prior
     /// attach); reset to `false` when the compositor sends the
@@ -586,27 +593,34 @@ impl WaylandState {
             .ok_or_else(|| cmd_failure("screensaver", "stride overflow"))?;
 
         // ── mpv wakeup pipe ─────────────────────────────────────────
-        // The write fd is consumed by the player; the read fd is owned
-        // by `self` and registered as a calloop source below.
+        // The write `OwnedFd` is consumed by `MpvPlayer::new` and
+        // closed on its Err path via the player's `Drop` (which runs
+        // when the `OwnedFd` falls out of scope at the function's
+        // `Err` return).  The read `OwnedFd` lives on across this
+        // function (stored in `ScreensaverSession`); on any error
+        // AFTER `MpvPlayer::new` succeeds we `drop(read_fd)` explicitly
+        // to close it.
         let (read_fd, write_fd) = make_wakeup_pipe()?;
 
         // ── mpv player ──────────────────────────────────────────────
-        // On failure, the player's `Drop` will close the write fd.
-        let player = MpvPlayer::new(
+        // Build the player.  On Err, `write_fd` is dropped here
+        // (closing it) and we still own `read_fd` — the caller-side
+        // match below handles the read-fd close on Err.
+        let player_result = MpvPlayer::new(
             settings.items,
             settings.image_duration,
             settings.audio,
             width,
             height,
             write_fd,
-        )
-        .map_err(|e| {
-            // SAFETY: pipe read end is ours to close on early failure.
-            unsafe {
-                libc::close(read_fd);
+        );
+        let player = match player_result {
+            Ok(p) => p,
+            Err(e) => {
+                drop(read_fd);
+                return Err(cmd_failure("screensaver", &format!("{e}")));
             }
-            cmd_failure("screensaver", &format!("{e}"))
-        })?;
+        };
 
         // ── double-buffered shm pool ────────────────────────────────
         let pool_byte_len = (stride as usize)
@@ -634,13 +648,13 @@ impl WaylandState {
         // ── calloop wakeup source ───────────────────────────────────
         // SAFETY: read_fd was created by `make_wakeup_pipe` above; we
         // own it until `destroy_screensaver_session` closes it.
-        let borrowed_read_fd = unsafe { BorrowedFd::borrow_raw(read_fd) };
+        let borrowed_read_fd = unsafe { BorrowedFd::borrow_raw(read_fd.as_raw_fd()) };
         let source = Generic::new(borrowed_read_fd, Interest::READ, Mode::Level);
 
         let Some(loop_handle) = self.loop_handle.as_ref() else {
             // pool + player drop here (player closes write fd).
-            unsafe {
-                libc::close(read_fd);
+            {
+                drop(read_fd);
             }
             return Err(cmd_failure(
                 "screensaver",
@@ -650,8 +664,8 @@ impl WaylandState {
         let wakeup_token = match loop_handle.insert_source(source, screensaver_wakeup_cb) {
             Ok(t) => t,
             Err(e) => {
-                unsafe {
-                    libc::close(read_fd);
+                {
+                    drop(read_fd);
                 }
                 return Err(cmd_failure("screensaver", &format!("insert_source: {e}")));
             }
@@ -669,8 +683,8 @@ impl WaylandState {
             Ok(t) => Some(t),
             Err(e) => {
                 loop_handle.remove(wakeup_token);
-                unsafe {
-                    libc::close(read_fd);
+                {
+                    drop(read_fd);
                 }
                 return Err(cmd_failure(
                     "screensaver",
@@ -777,7 +791,7 @@ impl WaylandState {
             // for non-blocking pipes.
             let n = unsafe {
                 libc::read(
-                    session.read_fd,
+                    session.read_fd.as_raw_fd(),
                     drain_buf.as_mut_ptr().cast(),
                     drain_buf.len(),
                 )
@@ -959,8 +973,8 @@ impl WaylandState {
             drop(player);
             // SAFETY: read_fd was created via pipe2 and is owned by the
             // session; closing once here after the player drops.
-            unsafe {
-                libc::close(read_fd);
+            {
+                drop(read_fd);
             }
             // pool + buffers drop here; RawPool's Drop destroys the
             // wl_shm_pool, which in turn releases the WlBuffers.

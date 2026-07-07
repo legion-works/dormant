@@ -14,6 +14,7 @@ import DaemonSection from "./DaemonSection";
 import SensorsSection from "./SensorsSection";
 import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
+import DisplaysSection from "./DisplaysSection";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 
@@ -217,17 +218,13 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         fieldErrors={fieldErrors}
       />
 
-      {/* Displays — placeholder for T8 */}
-      <div className="cf-section">
-        <div className="cf-section__header">
-          <h2 className="cf-section__title">Displays</h2>
-        </div>
-        <div className="cf-card">
-          <p className="cf-placeholder">
-            Display editors land with the ladder/screensaver editor — T8 owns that file set.
-          </p>
-        </div>
-      </div>
+      <DisplaysSection
+        displays={inv.displays}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
 
       {/* Banner-level errors not mapped to fields */}
       {bannerErrors.length > 0 && (

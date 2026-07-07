@@ -7,6 +7,10 @@
  * Ancestor-lock: the ENTIRE sources editor locks when any redacted path
  * is a descendant of this display's `screensaver.source` prefix
  * (e.g. a redacted URL inside a source entry).
+ *
+ * The working source array is `store.getEdit(sourcePath) ?? fetchedSources`,
+ * so sequential edits on different fields of the same source accumulate
+ * instead of overwriting each other.
  */
 import { BoolField, DurationField, EnumField, TextField } from "./fields";
 import type { ScreensaverConfig, ScreensaverSource } from "../../api/types";
@@ -33,6 +37,15 @@ interface ScreensaverEditorProps {
   fieldErrors: Record<string, string | undefined>;
 }
 
+/**
+ * Read the effective source array: pending state wins over fetched prop.
+ */
+function getEffectiveSources(displayId: string, fetched: ScreensaverSource[], store: PatchStore): ScreensaverSource[] {
+  const sourcePath = ["displays", displayId, "screensaver", "source"];
+  const pending = store.getEdit(sourcePath);
+  return (pending as ScreensaverSource[] | undefined) ?? fetched;
+}
+
 export default function ScreensaverEditor({ screensaver, displayId, store, redactedPaths, onDirty, fieldErrors }: ScreensaverEditorProps) {
   const basePath = ["displays", displayId, "screensaver"];
   const sourcePath = [...basePath, "source"];
@@ -42,7 +55,9 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
   const sourcesLocked = store.isLocked(sourcePath, redactedPaths);
   const sourcesLockReason = sourcesLocked ? "contains credentialed URLs — edit in the config file" : undefined;
 
-  const sources: ScreensaverSource[] = screensaver.source ?? [];
+  // Working array: pending overlay wins over fetched prop.
+  const fetchedSources: ScreensaverSource[] = screensaver.source ?? [];
+  const sources = getEffectiveSources(displayId, fetchedSources, store);
 
   function emitSources(next: ScreensaverSource[]) {
     store.trackEdit(sourcePath, next);
@@ -124,7 +139,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                     className="cf-apply__btn cf-apply__btn--discard"
                     style={{ marginLeft: "auto", padding: "2px 8px", fontSize: "10px" }}
                     onClick={() => {
-                      const next = sources.filter((_, i) => i !== idx);
+                      const effective = getEffectiveSources(displayId, fetchedSources, store);
+                      const next = effective.filter((_, i) => i !== idx);
                       emitSources(next);
                     }}
                     aria-label="Remove source"
@@ -142,7 +158,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   value={src.path ?? ""}
                   locked={srcLocked || store.isLocked([...srcBase, "path"], redactedPaths)}
                   onEdit={(_p, v) => {
-                    const next = [...sources];
+                    const effective = getEffectiveSources(displayId, fetchedSources, store);
+                    const next = [...effective];
                     next[idx] = { ...next[idx], path: v as string };
                     emitSources(next);
                   }}
@@ -155,7 +172,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   value={src.recurse ?? false}
                   locked={srcLocked || store.isLocked([...srcBase, "recurse"], redactedPaths)}
                   onEdit={(_p, v) => {
-                    const next = [...sources];
+                    const effective = getEffectiveSources(displayId, fetchedSources, store);
+                    const next = [...effective];
                     next[idx] = { ...next[idx], recurse: v as boolean };
                     emitSources(next);
                   }}
@@ -168,7 +186,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   value={src.shuffle ?? false}
                   locked={srcLocked || store.isLocked([...srcBase, "shuffle"], redactedPaths)}
                   onEdit={(_p, v) => {
-                    const next = [...sources];
+                    const effective = getEffectiveSources(displayId, fetchedSources, store);
+                    const next = [...effective];
                     next[idx] = { ...next[idx], shuffle: v as boolean };
                     emitSources(next);
                   }}
@@ -181,7 +200,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   value={src.order ?? "sequential"}
                   locked={srcLocked || store.isLocked([...srcBase, "order"], redactedPaths)}
                   onEdit={(_p, v) => {
-                    const next = [...sources];
+                    const effective = getEffectiveSources(displayId, fetchedSources, store);
+                    const next = [...effective];
                     next[idx] = { ...next[idx], order: v as string };
                     emitSources(next);
                   }}
@@ -195,7 +215,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   value={src.image_duration ?? ""}
                   locked={srcLocked || store.isLocked([...srcBase, "image_duration"], redactedPaths)}
                   onEdit={(_p, v) => {
-                    const next = [...sources];
+                    const effective = getEffectiveSources(displayId, fetchedSources, store);
+                    const next = [...effective];
                     next[idx] = { ...next[idx], image_duration: v as string };
                     emitSources(next);
                   }}
@@ -212,7 +233,8 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
             type="button"
             className="cf-apply__btn"
             onClick={() => {
-              const next = [...sources, { ...DEFAULT_SOURCE }];
+              const effective = getEffectiveSources(displayId, fetchedSources, store);
+              const next = [...effective, { ...DEFAULT_SOURCE }];
               emitSources(next);
             }}
             aria-label="Add source"

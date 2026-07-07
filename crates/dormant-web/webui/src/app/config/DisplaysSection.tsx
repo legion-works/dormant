@@ -4,11 +4,17 @@
  * Renders the mode toggle (simple blank vs escalation ladder) and
  * the corresponding editor for each display.  Displays with no
  * configured mode get a read-only warning card.
+ *
+ * When a mode switch is queued (pending in the store), the toggle
+ * reflects the QUEUED mode (active button + "applies on Apply" hint)
+ * and the editor renders the queued mode's editor operating on the
+ * pending starter array.
  */
 import FormSection from "./FormSection";
 import LadderEditor from "./LadderEditor";
 import ScreensaverEditor from "./ScreensaverEditor";
 import { EnumField } from "./fields";
+import { useState } from "react";
 import type { DisplayConfig, LadderStage } from "../../api/types";
 import type { PatchStore } from "./patch";
 
@@ -23,6 +29,23 @@ const STARTER_LADDER: LadderStage[] = [
   { kind: "power_off" },
 ];
 
+/** Which mode the display is effectively in, considering pending store state. */
+type EffectiveMode = { kind: "blank" } | { kind: "ladder" };
+
+function getEffectiveMode(id: string, cfg: DisplayConfig, store: PatchStore): EffectiveMode {
+  const pendingLadder = store.getEdit(["displays", id, "ladder"]);
+  const pendingBlank = store.getEdit(["displays", id, "blank_mode"]);
+
+  // If ladder is pending (set), queued mode is ladder
+  if (pendingLadder !== undefined) return { kind: "ladder" };
+  // If blank_mode is pending (set), queued mode is blank
+  if (pendingBlank !== undefined) return { kind: "blank" };
+
+  // Fall back to fetched config
+  if (cfg.ladder && cfg.ladder.length > 0) return { kind: "ladder" };
+  return { kind: "blank" };
+}
+
 interface DisplaysSectionProps {
   displays: Record<string, DisplayConfig>;
   store: PatchStore;
@@ -33,6 +56,10 @@ interface DisplaysSectionProps {
 
 export default function DisplaysSection({ displays, store, redactedPaths, onDirty, fieldErrors }: DisplaysSectionProps) {
   const ids = Object.keys(displays);
+  // Re-render tick: incremented on mode switch so the pending indicator
+  // and effective mode update immediately even without a parent re-render.
+  const [, rerender] = useState(0);
+
   if (ids.length === 0) return null;
 
   return (
@@ -41,10 +68,20 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
         const cfg = displays[id];
         const basePath = ["displays", id];
 
-        // Determine current mode
-        const hasLadder = cfg.ladder && cfg.ladder.length > 0;
-        const hasBlankMode = cfg.blank_mode !== undefined;
-        const hasNeither = !hasLadder && !hasBlankMode;
+        // Fetched state
+        const fetchedLadder = cfg.ladder && cfg.ladder.length > 0;
+        const fetchedBlank = cfg.blank_mode !== undefined;
+        const hasNeither = !fetchedLadder && !fetchedBlank;
+
+        // Effective mode (pending overlay)
+        const effective = getEffectiveMode(id, cfg, store);
+        const isLadder = effective.kind === "ladder";
+        const isBlank = effective.kind === "blank";
+
+        // Is a mode switch queued? (effective ≠ fetched)
+        const modeSwitchPending =
+          (isLadder && !fetchedLadder) || (isBlank && fetchedLadder) ||
+          (hasNeither && (store.getEdit(["displays", id, "ladder"]) !== undefined || store.getEdit(["displays", id, "blank_mode"]) !== undefined));
 
         return (
           <div key={id} className="cf-card">
@@ -53,10 +90,9 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
             </div>
 
             {/* ── No-mode warning ── */}
-            {hasNeither && (
+            {hasNeither && !modeSwitchPending && (
               <p className="cf-placeholder">
-                This display has no blank_mode or ladder configured.
-                Choose a mode below — the config file must be edited directly until this editor ships.
+                This display has neither blank_mode nor a ladder — fix the config file.
               </p>
             )}
 
@@ -64,30 +100,40 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
               {/* ── Mode toggle ── */}
               <div className="cf-field">
                 <label className="cf-field__label">Mode</label>
-                <div style={{ display: "flex", gap: "8px" }}>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
                   <button
                     type="button"
-                    className={`cf-apply__btn${!hasLadder ? " cf-apply__btn--apply" : ""}`}
-                    onClick={() => switchToBlank(id, cfg, store, onDirty)}
+                    className={`cf-apply__btn${isBlank ? " cf-apply__btn--apply" : ""}`}
+                    onClick={() => { switchToBlank(id, cfg, store, onDirty); rerender((n) => n + 1); }}
                     aria-label="Simple blank mode"
-                    aria-pressed={!hasLadder}
+                    aria-pressed={isBlank}
                   >
                     Simple blank
+                    {isBlank && modeSwitchPending && (
+                      <span style={{ fontSize: "10px", color: "var(--text-faint)", marginLeft: "4px" }}>
+                        — applies on Apply
+                      </span>
+                    )}
                   </button>
                   <button
                     type="button"
-                    className={`cf-apply__btn${hasLadder ? " cf-apply__btn--apply" : ""}`}
-                    onClick={() => switchToLadder(id, cfg, store, onDirty)}
+                    className={`cf-apply__btn${isLadder ? " cf-apply__btn--apply" : ""}`}
+                    onClick={() => { switchToLadder(id, cfg, store, onDirty); rerender((n) => n + 1); }}
                     aria-label="Escalation ladder"
-                    aria-pressed={hasLadder}
+                    aria-pressed={isLadder}
                   >
                     Escalation ladder
+                    {isLadder && modeSwitchPending && (
+                      <span style={{ fontSize: "10px", color: "var(--text-faint)", marginLeft: "4px" }}>
+                        — applies on Apply
+                      </span>
+                    )}
                   </button>
                 </div>
               </div>
 
               {/* ── Simple blank mode editor ── */}
-              {!hasLadder && (
+              {isBlank && (
                 <>
                   <EnumField
                     path={[...basePath, "blank_mode"]}
@@ -111,9 +157,9 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
               )}
 
               {/* ── Ladder editor ── */}
-              {hasLadder && (
+              {isLadder && (
                 <LadderEditor
-                  stages={cfg.ladder!}
+                  stages={cfg.ladder ?? STARTER_LADDER}
                   displayId={id}
                   store={store}
                   redactedPaths={redactedPaths}
@@ -149,13 +195,11 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
  */
 function switchToBlank(
   id: string,
-  _cfg: DisplayConfig,
+  cfg: DisplayConfig,
   store: PatchStore,
   onDirty: () => void,
 ) {
-  const prevBlank = _cfg.blank_mode ?? "power_off";
-  // The fetched config's blank_mode value — if the config currently has a ladder,
-  // we set the blank_mode to what it was before (or default).
+  const prevBlank = cfg.blank_mode ?? "power_off";
   store.trackEdit(["displays", id, "blank_mode"], prevBlank);
   store.trackRemove(["displays", id, "ladder"]);
   onDirty();

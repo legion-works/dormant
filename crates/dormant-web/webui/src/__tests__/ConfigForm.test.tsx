@@ -668,35 +668,95 @@ describe("DisplaysSection — mode switch", () => {
   it("switching from blank_mode to ladder emits set ladder + remove blank_mode + remove degraded_mode", async () => {
     mocks.getConfig.mockResolvedValue(DISPLAY_BLANK_MODE);
 
-    render(<SettingsForm config={DISPLAY_BLANK_MODE} />);
+    // Render DisplaysSection directly with a real store for precise patch assertions
+    const { createPatchStore } = await import("../app/config/patch");
+    const { default: DisplaysSection } = await import("../app/config/DisplaysSection");
+    const store = createPatchStore();
+
+    render(
+      <DisplaysSection
+        displays={DISPLAY_BLANK_MODE.inventory.displays}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
 
     await waitFor(() => {
-      expect(screen.getByText("Displays")).toBeInTheDocument();
+      expect(screen.getByText("lg-oled")).toBeInTheDocument();
     });
 
-    // Current mode is "Simple blank" — find the toggle and switch to ladder
+    // Click "Escalation ladder" toggle
     const ladderToggle = screen.getByRole("button", { name: /escalation ladder/i });
     fireEvent.click(ladderToggle);
 
-    // This should trigger a mode switch — but the stub won't emit patches.
-    // We verify the component rendered and the toggle exists.
-    expect(screen.getByText("Displays")).toBeInTheDocument();
+    const patches = store.buildPatches();
+
+    // Must contain: set ladder, remove blank_mode, remove degraded_mode
+    const hasSetLadder = patches.some(
+      (p) => p.op === "set" && p.path.join(".") === "displays.lg-oled.ladder",
+    );
+    const hasRemoveBlank = patches.some(
+      (p) => p.op === "remove" && p.path.join(".") === "displays.lg-oled.blank_mode",
+    );
+    const hasRemoveDegraded = patches.some(
+      (p) => p.op === "remove" && p.path.join(".") === "displays.lg-oled.degraded_mode",
+    );
+
+    expect(hasSetLadder).toBe(true);
+    expect(hasRemoveBlank).toBe(true);
+    expect(hasRemoveDegraded).toBe(true);
+
+    // No OTHER patches targeting this display
+    const displayPatches = patches.filter(
+      (p) => p.path[0] === "displays" && p.path[1] === "lg-oled",
+    );
+    expect(displayPatches).toHaveLength(3);
   });
 
   it("switching from ladder to blank_mode emits set blank_mode + remove ladder", async () => {
-    mocks.getConfig.mockResolvedValue(DISPLAY_WITH_LADDER);
+    // Render DisplaysSection directly with a real store
+    const { createPatchStore } = await import("../app/config/patch");
+    const { default: DisplaysSection } = await import("../app/config/DisplaysSection");
+    const store = createPatchStore();
 
-    render(<SettingsForm config={DISPLAY_WITH_LADDER} />);
+    render(
+      <DisplaysSection
+        displays={DISPLAY_WITH_LADDER.inventory.displays}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
 
     await waitFor(() => {
-      expect(screen.getByText("Displays")).toBeInTheDocument();
+      expect(screen.getByText("lg-oled")).toBeInTheDocument();
     });
 
-    // Current mode is ladder — find toggle and switch to blank
+    // Click "Simple blank" toggle
     const blankToggle = screen.getByRole("button", { name: /simple blank/i });
     fireEvent.click(blankToggle);
 
-    expect(screen.getByText("Displays")).toBeInTheDocument();
+    const patches = store.buildPatches();
+
+    // Must contain: set blank_mode, remove ladder
+    const hasSetBlank = patches.some(
+      (p) => p.op === "set" && p.path.join(".") === "displays.lg-oled.blank_mode",
+    );
+    const hasRemoveLadder = patches.some(
+      (p) => p.op === "remove" && p.path.join(".") === "displays.lg-oled.ladder",
+    );
+
+    expect(hasSetBlank).toBe(true);
+    expect(hasRemoveLadder).toBe(true);
+
+    // No OTHER patches targeting this display
+    const displayPatches = patches.filter(
+      (p) => p.path[0] === "displays" && p.path[1] === "lg-oled",
+    );
+    expect(displayPatches).toHaveLength(2);
   });
 
   it("display with NEITHER blank_mode NOR ladder — renders warning card, no crash", async () => {
@@ -710,8 +770,46 @@ describe("DisplaysSection — mode switch", () => {
 
     // Should render the display name
     expect(screen.getByText("monitor")).toBeInTheDocument();
-    // Should NOT crash — the section renders
-    expect(screen.getByText("Displays")).toBeInTheDocument();
+    // Updated warning text (no stale "until this editor ships" copy)
+    expect(screen.getByText(/neither blank_mode nor a ladder/)).toBeInTheDocument();
+  });
+
+  it("queued mode switch — ladder editor visible immediately with 'applies on Apply' hint", async () => {
+    // Use DISPLAY_BLANK_MODE — currently in blank mode
+    const { createPatchStore } = await import("../app/config/patch");
+    const { default: DisplaysSection } = await import("../app/config/DisplaysSection");
+    const store = createPatchStore();
+
+    render(
+      <DisplaysSection
+        displays={DISPLAY_BLANK_MODE.inventory.displays}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("lg-oled")).toBeInTheDocument();
+    });
+
+    // Fetched mode is blank — "Simple blank" button should be active, ladder NOT
+    const blankBtn = screen.getByRole("button", { name: /simple blank/i });
+    expect(blankBtn.getAttribute("aria-pressed")).toBe("true");
+
+    // Click "Escalation ladder" → queued mode switch
+    fireEvent.click(screen.getByRole("button", { name: /escalation ladder/i }));
+
+    // After click: ladder editor should render immediately (pending state)
+    // "Escalation ladder" appears in BOTH the toggle button and the card header
+    await waitFor(() => {
+      const ladderEls = screen.getAllByText("Escalation ladder");
+      expect(ladderEls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    // The "applies on Apply" hint should appear
+    expect(screen.getByText(/applies on Apply/)).toBeInTheDocument();
   });
 
   it("display with ladder shows the ladder editor", async () => {

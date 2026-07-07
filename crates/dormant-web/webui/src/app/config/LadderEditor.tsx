@@ -6,6 +6,10 @@
  * The terminal stage (last in array) shows "(terminal — no dwell)"
  * when its dwell is absent — the server treats no-dwell as an
  * immediate power-off/sleep signal.
+ *
+ * The working array is `store.getEdit(ladderPath) ?? fetchedStages`,
+ * so sequential edits on different fields of the same stage
+ * accumulate instead of overwriting each other.
  */
 import { DurationField, EnumField } from "./fields";
 import { STAGE_KINDS } from "../../api/types";
@@ -26,15 +30,29 @@ const LADDER_PATH = (id: string): string[] => ["displays", id, "ladder"];
 /** Default stage appended when "Add Stage" is clicked. */
 const DEFAULT_STAGE: LadderStage = { kind: "render_black", dwell: "30s" };
 
+/**
+ * Read the effective ladder array: pending state wins over fetched prop.
+ * Sequential edits on different fields of the same stage accumulate
+ * because every mutation rebuilds from the EFFECTIVE array, not the
+ * fetched prop.
+ */
+function getEffectiveStages(displayId: string, fetched: LadderStage[], store: PatchStore): LadderStage[] {
+  const pending = store.getEdit(LADDER_PATH(displayId));
+  return (pending as LadderStage[] | undefined) ?? fetched;
+}
+
 /** Clone stages and emit the new array. */
 function emitStages(id: string, stages: LadderStage[], store: PatchStore, onDirty: () => void) {
   store.trackEdit(LADDER_PATH(id), stages);
   onDirty();
 }
 
-export default function LadderEditor({ stages, displayId, store, redactedPaths, onDirty, fieldErrors }: LadderEditorProps) {
+export default function LadderEditor({ stages: fetchedStages, displayId, store, redactedPaths, onDirty, fieldErrors }: LadderEditorProps) {
   const ladderPath = LADDER_PATH(displayId);
   const ladderLocked = store.isLocked(ladderPath, redactedPaths);
+
+  // Working array: pending overlay wins over fetched prop.
+  const stages = getEffectiveStages(displayId, fetchedStages, store);
 
   const isTerminal = (idx: number) => idx === stages.length - 1;
 
@@ -70,7 +88,8 @@ export default function LadderEditor({ stages, displayId, store, redactedPaths, 
                 value={stage.kind}
                 locked={ladderLocked || store.isLocked(kindPath, redactedPaths)}
                 onEdit={(_p, v) => {
-                  const next = [...stages];
+                  const effective = getEffectiveStages(displayId, fetchedStages, store);
+                  const next = [...effective];
                   next[idx] = { ...next[idx], kind: v as LadderStage["kind"] };
                   emitStages(displayId, next, store, onDirty);
                 }}
@@ -95,7 +114,8 @@ export default function LadderEditor({ stages, displayId, store, redactedPaths, 
                   value={stage.dwell ?? ""}
                   locked={ladderLocked || store.isLocked(dwellPath, redactedPaths)}
                   onEdit={(_p, v) => {
-                    const next = [...stages];
+                    const effective = getEffectiveStages(displayId, fetchedStages, store);
+                    const next = [...effective];
                     next[idx] = { ...next[idx], dwell: v as string };
                     emitStages(displayId, next, store, onDirty);
                   }}
@@ -113,7 +133,8 @@ export default function LadderEditor({ stages, displayId, store, redactedPaths, 
                   style={{ padding: "4px 8px", fontSize: "10px" }}
                   disabled={idx === 0}
                   onClick={() => {
-                    const next = [...stages];
+                    const effective = getEffectiveStages(displayId, fetchedStages, store);
+                    const next = [...effective];
                     [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
                     emitStages(displayId, next, store, onDirty);
                   }}
@@ -128,7 +149,8 @@ export default function LadderEditor({ stages, displayId, store, redactedPaths, 
                   style={{ padding: "4px 8px", fontSize: "10px" }}
                   disabled={idx === stages.length - 1}
                   onClick={() => {
-                    const next = [...stages];
+                    const effective = getEffectiveStages(displayId, fetchedStages, store);
+                    const next = [...effective];
                     [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
                     emitStages(displayId, next, store, onDirty);
                   }}
@@ -143,7 +165,8 @@ export default function LadderEditor({ stages, displayId, store, redactedPaths, 
                   style={{ padding: "4px 8px", fontSize: "10px" }}
                   disabled={stages.length <= 1}
                   onClick={() => {
-                    const next = stages.filter((_, i) => i !== idx);
+                    const effective = getEffectiveStages(displayId, fetchedStages, store);
+                    const next = effective.filter((_, i) => i !== idx);
                     emitStages(displayId, next, store, onDirty);
                   }}
                   aria-label="Remove stage"
@@ -164,7 +187,8 @@ export default function LadderEditor({ stages, displayId, store, redactedPaths, 
           className="cf-apply__btn"
           style={{ marginTop: "6px" }}
           onClick={() => {
-            const next = [...stages, { ...DEFAULT_STAGE }];
+            const effective = getEffectiveStages(displayId, fetchedStages, store);
+            const next = [...effective, { ...DEFAULT_STAGE }];
             emitStages(displayId, next, store, onDirty);
           }}
           aria-label="Add stage"

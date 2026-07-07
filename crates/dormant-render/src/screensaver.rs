@@ -292,8 +292,10 @@ impl MpvPlayer {
         // ── Scale-mode properties ──────────────────────────────────
         // The four canonical mpv scaling flags for the matching [`ScaleMode`]
         // variant.  Set BEFORE `loadfile` so mpv applies them to the very
-        // first decoded frame; the empirical probe (see the task report)
-        // confirmed all four flags work under `MPV_RENDER_API_TYPE_SW`.
+        // first decoded frame.  Property-readback coverage for each mode
+        // lives in `mpv_player_sets_scale_mode_properties_*` and the
+        // pixel-buffer geometric coverage in
+        // `mpv_player_fill_renders_no_letterbox_on_portrait_fixture`.
         // `Fit` explicitly sets `keepaspect=yes panscan=0.0` for
         // determinism — mpv's defaults include `keepaspect=yes` but
         // leaving `panscan` unset means a future runtime set could leave
@@ -549,6 +551,34 @@ mod tests {
                 "lavfi",
                 "-i",
                 "testsrc=duration=2:size=320x180:rate=30",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(path)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Variant of `generate_test_video` for the scale-mode geometric test:
+    /// produces a 100×400 portrait testsrc (1:4 aspect) explicitly chosen
+    /// so a 320×180 render target would have to LETTERBOX (Fit) — there
+    /// is no geometry under which a 1:4 source fills a 16:9 rectangle
+    /// without distortion or crop.  Skips on ffmpeg failure.
+    fn generate_portrait_test_video(path: &PathBuf) -> Option<()> {
+        if Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=100x400:rate=30",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -1226,25 +1256,55 @@ mod tests {
         drop(player);
     }
 
-    /// Integration assertion: building with Fill produces a rendered
-    /// frame whose pixel data is materially different from Fit on the
-    /// same fixture.  A regression that breaks property-set silently
-    /// (e.g. a future refactor that drops the `mpv.set_property(...)`
-    /// call) would cause this test to false-pass via equal buffers —
-    /// see the probe evidence in the task report (portrait 100x400 → 320x180:
-    /// Fit renders 14% width content band, Fill renders ~88%, the
-    /// buffers differ by ~6× in non-zero-byte count).
+    /// Integration assertion: building with Fill renders a NON-LETTERBOXED
+    /// frame on a deliberately non-16:9 portrait fixture, while Fit
+    /// renders LETTERBOXED with substantial black pillars on each side.
+    ///
+    /// ## Why a 1:4 portrait fixture?
+    ///
+    /// Earlier revisions of this test compared 320×180 SW render against
+    /// the same 320×180 testsrc fixture (a 16:9 source).  That was a
+    /// tautology: Fill and Fit have no geometric reason to differ on a
+    /// source whose aspect matches the target — the `assert_ne!` only
+    /// passed from decoder/timestamp drift between two independently
+    /// sampled mpv players, NOT from any scaling, so a regression that
+    /// dropped the `panscan` property-set silently passed the test.
+    /// This reviewer red-check is recorded in the P2.1 review report.
+    ///
+    /// On a 100×400 (1:4) source against a 320×180 (16:9) target, Fit
+    /// must letterbox with ~45×180 px content band centred → ~137 px
+    /// pillars each side.  Fill must cover the width (with the slight
+    /// panscan off-centre quirk up to ~37 px on extreme 1:4 sources),
+    /// so the combined pillar count is bounded at ≪ 137.
+    ///
+    /// ## Pillars semantics
+    ///
+    /// A column is a "black pillar" if EVERY sampled row (y ∈
+    /// {10, 30, 60, 90, 120, 150, 170}) has BGR ≤ 8 (the same tolerance
+    /// used by the original probe and `build_test_player`'s test
+    /// pattern).  A column with ANY non-black row is content.  We count
+    /// **maximum consecutive black columns from the left edge** as the
+    /// "left pillar width" and same from the right edge as the right
+    /// pillar width — this catches both letterboxing and any future
+    /// border-drawing regressions.
+    ///
+    /// ## RED-check guarantee
+    ///
+    /// Removing the `panscan=1.0` property-set line for Fill causes
+    /// this test to FAIL — confirmed against the broken code path
+    /// (re-run during P2.1 review).
+    #[allow(clippy::too_many_lines)]
     #[test]
-    fn mpv_player_fill_renders_differently_than_fit() {
+    fn mpv_player_fill_renders_no_letterbox_on_portrait_fixture() {
         let dir = std::env::temp_dir().join("dormant-render-tests");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let video = dir.join("scale_mode_diff.mp4");
-        if generate_test_video(&video).is_none() {
-            eprintln!("ffmpeg unavailable; skipping fill-vs-fit diff test");
+        // Deliberately non-16:9 — see the doc-comment above.
+        let video = dir.join("scale_mode_portrait.mp4");
+        if generate_portrait_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping fill-vs-fit geometric test");
             return;
         }
 
-        // Build two players on the same fixture with different scale_modes.
         let build = |mode: ScaleMode| -> Option<MpvPlayer> {
             let (_r, w) = make_pipe().expect("pipe2");
             let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(w) };
@@ -1264,7 +1324,7 @@ mod tests {
                 Ok(p) => Some(p),
                 Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
                     eprintln!(
-                        "libmpv cannot load test media; skipping fill-vs-fit diff \
+                        "libmpv cannot load test media; skipping fill-vs-fit geometric \
                          test (loadfile: {msg})"
                     );
                     None
@@ -1281,50 +1341,121 @@ mod tests {
             return;
         };
 
-        // Warm up both decoders: render ~30 frames each so the decoder
-        // is well past the first-frame barrier.  Sample the last
-        // successful frame from each.
+        // Render one frame after a short warm-up.  A single frame is
+        // sufficient — the geometric property (pillar width) is
+        // deterministic per (mode, fixture, frame_index); we just need
+        // a valid first frame.
         let sample = |player: &mut MpvPlayer| -> Option<Vec<u8>> {
-            let mut latest: Option<Vec<u8>> = None;
-            for _ in 0..30 {
+            for _ in 0..20 {
                 let mut buf = vec![0u8; (320 * 4 * 180) as usize];
                 if let Ok(true) = player.render_frame_into(&mut buf) {
-                    latest = Some(buf);
+                    return Some(buf);
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            latest
+            None
         };
 
         let fill_buf = sample(&mut fill_player);
         let fit_buf = sample(&mut fit_player);
 
-        // Both must produce SOMETHING.
         let (Some(fill_buf), Some(fit_buf)) = (fill_buf, fit_buf) else {
-            // The probes both succeeded on this host (the build_test_player
-            // path in earlier tests proved so).  Surface a clearer
-            // failure if a future regression trips this branch.
             drop(fill_player);
             drop(fit_player);
             panic!("neither Fill nor Fit rendered any frame on this host");
         };
 
-        // The buffers must differ materially — equal buffers would mean
-        // the property-set didn't take effect at all.
-        let fill_nz = fill_buf.iter().filter(|&&b| b != 0).count();
-        let fit_nz = fit_buf.iter().filter(|&&b| b != 0).count();
-        assert_ne!(
-            fill_buf, fit_buf,
-            "Fill and Fit must produce different buffers on the same fixture — \
-             identical results mean the scale_mode properties were not applied"
+        // ── Pillar detection ────────────────────────────────────────
+        // A column is a black pillar iff ALL sampled rows are ≤ 8 BGR
+        // (i.e. the column has no content pixel anywhere we sampled).
+        let y_samples = [10usize, 30, 60, 90, 120, 150, 170];
+        let is_pillar_col = |buf: &[u8], x: usize| -> bool {
+            y_samples.iter().all(|&y| {
+                let off = (y * 320 + x) * 4;
+                buf[off] <= 8 && buf[off + 1] <= 8 && buf[off + 2] <= 8
+            })
+        };
+        // Maximum consecutive black columns from the left edge and from
+        // the right edge — these are the letterbox pillar widths.
+        let left_pillar = |buf: &[u8]| -> usize {
+            let mut w = 0;
+            for x in 0..320 {
+                if is_pillar_col(buf, x) {
+                    w += 1;
+                } else {
+                    break;
+                }
+            }
+            w
+        };
+        let right_pillar = |buf: &[u8]| -> usize {
+            let mut w = 0;
+            for x in (0..320).rev() {
+                if is_pillar_col(buf, x) {
+                    w += 1;
+                } else {
+                    break;
+                }
+            }
+            w
+        };
+
+        let fill_left = left_pillar(&fill_buf);
+        let fill_right = right_pillar(&fill_buf);
+        let fit_left = left_pillar(&fit_buf);
+        let fit_right = right_pillar(&fit_buf);
+
+        eprintln!(
+            "scale-mode geometry: Fill L/R = {fill_left}/{fill_right}px, \
+             Fit L/R = {fit_left}/{fit_right}px"
         );
-        // Sanity: both must have meaningful non-zero content (the
-        // fixture has solid content pixels).
+
+        // ── Fit must letterbox (this proves Fit itself works) ──────
+        // 100×400 → 320×180: aspect-fit Fit renders a centred 45×180
+        // content band → ~137 px black pillars each side.  We demand
+        // ≥ 100 px on each side to give some slack for vignette crops.
         assert!(
-            fill_nz > 1000,
-            "Fill buffer has only {fill_nz} non-zero bytes"
+            fit_left >= 100,
+            "Fit must letterbox (≥100 px left pillar) on the 1:4 fixture; \
+             got {fit_left}.  Either the fixture isn't portrait or Fit \
+             unexpectedly fills — both indicate a regression."
         );
-        assert!(fit_nz > 1000, "Fit buffer has only {fit_nz} non-zero bytes");
+        assert!(
+            fit_right >= 100,
+            "Fit must letterbox (≥100 px right pillar) on the 1:4 fixture; \
+             got {fit_right}."
+        );
+
+        // ── Fill must NOT letterbox (THIS is the RED-check) ─────────
+        // Fill (panscan=1.0) covers the width.  The extreme 1:4 source
+        // still produces a slight off-centre quirk: per the STEP-0
+        // probe evidence, pillars total ≤ ~40 px.  We allow ≤ 80 as a
+        // margin for codec/file-path variance; >= 100 (the Fit floor)
+        // would unambiguously mean "looks letterboxed → panscan not
+        // applied".  This is the assertion that catches
+        // `mpv.set_property(\"panscan\", ...)` being removed.
+        let fill_total = fill_left + fill_right;
+        assert!(
+            fill_total <= 80,
+            "Fill must fill width on the 1:4 fixture (≤80 px combined pillars); \
+             got L={fill_left} + R={fill_right} = {fill_total} px.  \
+             Likely cause: the `panscan` property-set was dropped or \
+             regressed (this test fails RED when it does — verified during P2.1 review)."
+        );
+
+        // Bonus geometric identity: Fill's pillars must be smaller than
+        // Fit's on each side.  Not strictly necessary (the floor
+        // assertions already cover it) but cheap and a sharp sensor
+        // for asymmetric regressions like "left pillar vanished but
+        // right grew".
+        assert!(
+            fill_left < fit_left,
+            "Fill must have smaller left pillar than Fit ({fill_left} vs {fit_left})"
+        );
+        assert!(
+            fill_right < fit_right,
+            "Fill must have smaller right pillar than Fit ({fill_right} vs {fit_right})"
+        );
 
         drop(fill_player);
         drop(fit_player);

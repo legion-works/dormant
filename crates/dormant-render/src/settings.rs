@@ -17,10 +17,11 @@ pub(crate) const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// How the screensaver player scales its source video to the rendered output
 /// rectangle.
 ///
-/// Maps 1:1 to the four canonical mpv scaling modes; the empirical mpv
-/// probe (recorded in the task report) confirmed all four modes work under
-/// `MPV_RENDER_API_TYPE_SW` — the property values apply as expected to
-/// the SW render path, so we don't have to scale in our own blit.
+/// Maps 1:1 to the four canonical mpv scaling modes; covered end-to-end
+/// by the property-readback tests (`mpv_player_sets_scale_mode_properties_*`)
+/// and the geometry test (`mpv_player_fill_renders_no_letterbox_on_portrait_fixture`)
+/// in this crate — every variant's flags do take effect under
+/// `MPV_RENDER_API_TYPE_SW`, so we don't have to scale in our own blit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleMode {
     /// Crop-to-fill: source is zoomed so it covers the entire output

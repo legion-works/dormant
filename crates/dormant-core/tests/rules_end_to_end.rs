@@ -16,22 +16,25 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use dormant_core::config::SensorKind;
-use dormant_core::fakes::{FakeSensorSource, RecordingSink, SinkCmd};
+use dormant_core::fakes::{
+    FakeSensorSource, RecordingRenderSink, RecordingSink, RenderCmd, SinkCmd,
+};
 use dormant_core::rules::{
     ControlMsg, DaemonEvent, DisplayRuntimeCfg, RuleRuntimeCfg, RulesEngine, RulesEngineConfig,
     SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::SmTimings;
-use dormant_core::traits::{CommandSink, SensorSource};
+use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
 use dormant_core::types::{
-    BlankMode, CmdFailure, DisplayId, PresenceEvent, RuleId, SensorId, SensorState, Timestamp,
-    ZoneId,
+    BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
+    StageKind, Timestamp, ZoneId,
 };
 use dormant_core::zone::{FusionMode, UnavailablePolicy, ZoneEngine, ZoneMember, ZoneSpec};
 
@@ -70,6 +73,10 @@ fn display_cfg(id: &str) -> DisplayRuntimeCfg {
     DisplayRuntimeCfg {
         display: DisplayId(id.into()),
         blank_mode: BlankMode::PowerOff,
+        ladder: vec![LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: None,
+        }],
         timings: timings_grace_60s(),
     }
 }
@@ -119,7 +126,56 @@ fn spawn_engine(
     let (ctl_tx, ctl_rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
 
-    let engine = RulesEngine::new(cfg, zones, executors).expect("valid engine config");
+    let engine = RulesEngine::new(
+        cfg,
+        zones,
+        executors,
+        HashMap::new(),
+        Arc::new(dormant_core::ownership::AlwaysOwned),
+    )
+    .expect("valid engine config");
+    let engine_cancel = cancel.clone();
+    let engine_handle = tokio::spawn(async move {
+        engine.run(events_rx, ctl_rx, engine_cancel).await;
+    });
+
+    let source = FakeSensorSource {
+        id: "fake".into(),
+        script,
+    };
+    let source_tx = events_tx.clone();
+    let source_cancel = cancel.clone();
+    let source_handle =
+        tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
+
+    Harness {
+        events_tx,
+        ctl_tx,
+        cancel,
+        engine_handle,
+        source_handle,
+    }
+}
+
+fn spawn_engine_with_render(
+    cfg: RulesEngineConfig,
+    zones: ZoneEngine,
+    executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+    render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+    script: Vec<(Duration, PresenceEvent)>,
+) -> Harness {
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let (ctl_tx, ctl_rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+
+    let engine = RulesEngine::new(
+        cfg,
+        zones,
+        executors,
+        render_sinks,
+        Arc::new(dormant_core::ownership::AlwaysOwned),
+    )
+    .expect("valid engine config");
     let engine_cancel = cancel.clone();
     let engine_handle = tokio::spawn(async move {
         engine.run(events_rx, ctl_rx, engine_cancel).await;
@@ -1195,6 +1251,643 @@ async fn set_pending_reload_surfaces_in_snapshot() {
             .await
             .pending_reload
             .is_none()
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Helper: spawn engine with a custom OwnershipGate ───────────────────────────
+
+fn spawn_engine_with_gate(
+    cfg: RulesEngineConfig,
+    zones: ZoneEngine,
+    executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+    script: Vec<(Duration, PresenceEvent)>,
+    gate: Arc<dyn dormant_core::ownership::OwnershipGate>,
+) -> Harness {
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let (ctl_tx, ctl_rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+
+    let engine =
+        RulesEngine::new(cfg, zones, executors, HashMap::new(), gate).expect("valid engine config");
+    let engine_cancel = cancel.clone();
+    let engine_handle = tokio::spawn(async move {
+        engine.run(events_rx, ctl_rx, engine_cancel).await;
+    });
+
+    let source = FakeSensorSource {
+        id: "fake".into(),
+        script,
+    };
+    let source_tx = events_tx.clone();
+    let source_cancel = cancel.clone();
+    let source_handle =
+        tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
+
+    Harness {
+        events_tx,
+        ctl_tx,
+        cancel,
+        engine_handle,
+        source_handle,
+    }
+}
+
+// ── Ownership gate: NeverOwns test double ────────────────────────────────────
+
+struct NeverOwns;
+
+impl dormant_core::ownership::OwnershipGate for NeverOwns {
+    fn owns(&self, _display: &DisplayId) -> bool {
+        false
+    }
+}
+
+// ── Test: NeverOwns blocks blanking ─────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn never_owns_blocks_blanking() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@0 → should drive grace → expiry, but NeverOwns gates entry.
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(cfg, zones, execs, script, Arc::new(NeverOwns));
+
+    // Wait past the grace period (60s) + blank time + settling.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    // NeverOwns must prevent any blank — the ownership gate says "not
+    // owned", so the machine's `owned` flag is false, which blocks
+    // entry at the grace-expiry gate (`!self.owned` check).
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert_eq!(
+        blank_count, 0,
+        "NeverOwns must block blanking — expected 0 blanks, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Test: AlwaysOwned lets it blank (control) ────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn always_owned_lets_it_blank() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@0 → grace expires → blank (AlwaysOwned always permits).
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(
+        cfg,
+        zones,
+        execs,
+        script,
+        Arc::new(dormant_core::ownership::AlwaysOwned),
+    );
+
+    // Wait past grace period + blank time.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert!(
+        blank_count >= 1,
+        "AlwaysOwned must permit blanking — expected >=1 blank, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Ownership gate: FlipGate test double (dynamic, edge-sensitive) ───────────
+
+/// Gate backed by shared mutable state — starts `true`, flips externally.
+/// Exercises the run-loop `feed_ownership` path (the constructor seed sets
+/// `owned=true`, so only a mid-run flip can change the verdict).
+struct FlipGate(Arc<AtomicBool>);
+
+impl dormant_core::ownership::OwnershipGate for FlipGate {
+    fn owns(&self, _display: &DisplayId) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+// ── Test: flip gate during grace blocks blank (run-loop feed) ─────────────
+
+/// The gate starts `true` so the display enters Grace normally.  After
+/// the absent edge is processed but BEFORE the grace timer fires, the
+/// gate is flipped to `false`.  This proves the run-loop `feed_ownership`
+/// call in `fire_due_timers` actually consults the gate and feeds
+/// `OwnershipChanged(false)` — the constructor seed can't catch a
+/// post-construction flip.
+#[tokio::test(start_paused = true)]
+async fn flip_gate_during_grace_blocks_blank() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let flag = Arc::new(AtomicBool::new(true));
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@0 → enters Grace (owned=seed true → proceeds).
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(
+        cfg,
+        zones,
+        execs,
+        script,
+        Arc::new(FlipGate(Arc::clone(&flag))),
+    );
+
+    // Let the absent edge land and grace start (t=0 → t=30s).
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Flip the gate BEFORE the grace timer fires at ~60s.
+    flag.store(false, Ordering::Relaxed);
+
+    // Advance past the grace deadline (60s) + settling.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert_eq!(
+        blank_count, 0,
+        "gate flip during grace must block blank — expected 0 blanks, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Test: control — gate stays true, blank fires (paired control) ────────
+
+/// Same scenario as `flip_gate_during_grace_blocks_blank` but without
+/// the flip.  The gate stays `true` → the grace timer fires → the
+/// machine blanks normally.  This isolates the flip as the cause.
+#[tokio::test(start_paused = true)]
+async fn flip_gate_control_blank_fires_when_owned() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let flag = Arc::new(AtomicBool::new(true));
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_gate(
+        cfg,
+        zones,
+        execs,
+        script,
+        Arc::new(FlipGate(Arc::clone(&flag))),
+    );
+
+    // Advance past the grace deadline (60s) + settling.  Gate stays
+    // `true` the whole time → blank fires normally.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_count = log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert!(
+        blank_count >= 1,
+        "paired control must blank — expected >=1 blank, got {blank_count}: {log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Render ladder: engine drives RenderSink (closes T3 S3 gap) ─────────────────
+
+/// A display whose ladder starts with `RenderBlack` must call
+/// `RenderSink::show` when the zone goes absent, and
+/// `RenderSink::teardown` when presence returns — no
+/// controller-level blank/wake should fire for the render stage.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(start_paused = true)]
+async fn render_ladder_drives_render_sink() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let cmd_sink = Arc::new(RecordingSink::new());
+    let render_sink = Arc::new(RecordingRenderSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), cmd_sink.clone());
+    let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    renders.insert(display.clone(), render_sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::RenderBlack,
+                    dwell: None, // terminal — stays until presence returns
+                },
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                },
+            ],
+            timings: timings_grace_60s(),
+        }],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@10s → grace 60s → show triggered at ~70s.
+    // Present@100s → teardown + active.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(90),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine_with_render(cfg, zones, execs, renders, script);
+
+    // Wait past the full sequence + flush spawned tasks.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let render_log = render_sink.log();
+
+    // Must have recorded a Show(RenderBlack).
+    let show_call = render_log.iter().find(|(_, c)| {
+        matches!(
+            c,
+            RenderCmd::Show {
+                kind: StageKind::RenderBlack,
+                ..
+            }
+        )
+    });
+    assert!(
+        show_call.is_some(),
+        "expected RenderSink::show(RenderBlack), got {render_log:?}"
+    );
+    let (show_at, _show_cmd) = show_call.unwrap();
+    assert!(
+        show_at.abs_diff(Duration::from_secs(70)) <= Duration::from_secs(2),
+        "show at {show_at:?}, expected ~70s (absent@10 + grace 60s)"
+    );
+
+    // Must have recorded a Teardown.
+    let teardown_call = render_log
+        .iter()
+        .find(|(_, c)| matches!(c, RenderCmd::Teardown { .. }));
+    assert!(
+        teardown_call.is_some(),
+        "expected RenderSink::teardown, got {render_log:?}"
+    );
+    let (td_at, _td_cmd) = teardown_call.unwrap();
+    assert!(
+        td_at.abs_diff(Duration::from_secs(100)) <= Duration::from_secs(2),
+        "teardown at {td_at:?}, expected ~100s (present@100)"
+    );
+
+    // No controller-level blank or wake for the render stage.
+    let cmd_log = cmd_sink.log();
+    let blanks = cmd_log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    let wakes = cmd_log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Wake))
+        .count();
+    assert_eq!(
+        blanks, 0,
+        "no controller blank should fire for a render stage: {cmd_log:?}"
+    );
+    assert_eq!(
+        wakes, 0,
+        "no controller wake should fire for a render stage: {cmd_log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// When the `RenderSink` fails `show`, the engine must fall through
+/// to the next ladder rung — here a controller `PowerOff` blank.
+/// This proves the engine-level render fall-through (complements the
+/// SM-level test).
+#[tokio::test(start_paused = true)]
+async fn render_failure_falls_through_to_controller() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let cmd_sink = Arc::new(RecordingSink::new());
+    let render_sink = Arc::new(RecordingRenderSink::new());
+    // Script the render sink to fail.
+    render_sink.push_show_result(Err(CmdFailure {
+        controller: "wayland".into(),
+        error: "E_RENDER_UNAVAILABLE: compositor gone".into(),
+    }));
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), cmd_sink.clone());
+    let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    renders.insert(display.clone(), render_sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::RenderBlack,
+                    dwell: None,
+                },
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                },
+            ],
+            timings: timings_grace_60s(),
+        }],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let script = vec![(
+        Duration::from_secs(10),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine_with_render(cfg, zones, execs, renders, script);
+
+    // Absent@10 + grace 60s + render-fail → fall-through → blank.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Render sink must have recorded a Show attempt.
+    let render_log = render_sink.log();
+    assert!(
+        render_log.iter().any(|(_, c)| matches!(
+            c,
+            RenderCmd::Show {
+                kind: StageKind::RenderBlack,
+                ..
+            }
+        )),
+        "expected RenderSink::show to be called, got {render_log:?}"
+    );
+
+    // Controller sink must have recorded a Blank — the fall-through.
+    let cmd_log = cmd_sink.log();
+    let blanks = cmd_log
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert!(
+        blanks >= 1,
+        "render failure must fall through to controller Blank, got {cmd_log:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── Engine-level dwell-advance: StageTick driven by the real timer wheel ────────
+
+/// A ladder `[render_black dwell=30s, power_off]` must escalate from the render
+/// stage to the controller blank after the dwell elapses — and NOT before.
+/// This is the first engine-level test that exercises the timer wheel's
+/// `DisplayStageTick` path end-to-end (the `StageTick` → advance path has never
+/// run through the real engine timer wheel before — every prior ladder test uses
+/// `dwell: None`).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(start_paused = true)]
+async fn render_ladder_dwell_advances_to_controller_blank() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let cmd_sink = Arc::new(RecordingSink::new());
+    let render_sink = Arc::new(RecordingRenderSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), cmd_sink.clone());
+    let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    renders.insert(display.clone(), render_sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::RenderBlack,
+                    dwell: Some(Duration::from_secs(30)),
+                },
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                },
+            ],
+            timings: timings_grace_60s(),
+        }],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@10s → grace 60s → ladder entry at ~70s.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine_with_render(cfg, zones, execs, renders, script);
+
+    // Advance past the grace period (absent@10 + 60s grace = 70s) — the
+    // render sink should be called with Show(RenderBlack).
+    tokio::time::sleep(Duration::from_secs(72)).await;
+    // Give the spawned render task a moment to complete and the engine to
+    // process the RenderResult.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let render_log = render_sink.log();
+    let show_call = render_log.iter().find(|(_, c)| {
+        matches!(
+            c,
+            RenderCmd::Show {
+                kind: StageKind::RenderBlack,
+                ..
+            }
+        )
+    });
+    assert!(
+        show_call.is_some(),
+        "expected RenderSink::show(RenderBlack), got {render_log:?}"
+    );
+
+    // Before the dwell expires (70s + 30s = 100s), no controller blank
+    // must have fired — the machine should be in the Staged phase.
+    tokio::time::sleep(Duration::from_secs(25)).await; // now at ~97s
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cmd_log_before = cmd_sink.log();
+    let blanks_before = cmd_log_before
+        .iter()
+        .filter(|(_, c)| matches!(c, SinkCmd::Blank(_)))
+        .count();
+    assert_eq!(
+        blanks_before, 0,
+        "no controller blank must fire before dwell elapses (log={cmd_log_before:?})"
+    );
+
+    // Advance past the dwell deadline (100s).
+    tokio::time::sleep(Duration::from_secs(10)).await; // now at ~107s
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let cmd_log = cmd_sink.log();
+    let blank = cmd_log
+        .iter()
+        .find(|(_, c)| matches!(c, SinkCmd::Blank(BlankMode::PowerOff)));
+    assert!(
+        blank.is_some(),
+        "expected Blank(PowerOff) escalation after dwell, got {cmd_log:?}"
+    );
+    let (blank_at, _) = blank.unwrap();
+    // Should fire at ~100s (70s entry + 30s dwell).
+    assert!(
+        blank_at.abs_diff(Duration::from_secs(100)) <= Duration::from_secs(5),
+        "blank at {blank_at:?}, expected ~100s (entry@70 + dwell 30s)"
     );
 
     harness.cancel.cancel();

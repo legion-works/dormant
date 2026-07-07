@@ -1,0 +1,39 @@
+[package]
+name = "dormant-render"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+dormant-core = { path = "../dormant-core" }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# smithay-client-toolkit brings in the calloop / Wayland / shm helpers used
+# to bind layer-shell, single-pixel-buffer, and viewporter.  Default features
+# are disabled to keep the build small; only the `calloop` integration is
+# needed.
+smithay-client-toolkit = { version = "0.20.0", default-features = false, features = [
+  "calloop",
+] }
+wayland-client = "0.31.14"
+# staging: wp_single_pixel_buffer_manager_v1, wp_viewporter
+# unstable: zxdg_output_manager_v1 (kept for parity with the spike)
+wayland-protocols = { version = "0.32.13", features = [
+  "staging",
+  "unstable",
+  "client",
+] }
+# zwlr_layer_shell_v1 / zwlr_layer_surface_v1
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+calloop = "0.14"
+# Drives the Wayland socket as a calloop event source so input + configure
+# events dispatch whenever the FD has data, even when the thread is idle
+# between commands.  This is the canonical safe shape for a Wayland client
+# inside a calloop-driven thread.
+calloop-wayland-source = "0.4.1"

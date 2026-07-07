@@ -15,6 +15,7 @@ dormant-sensors = { path = "../dormant-sensors" }
 dormant-displays = { path = "../dormant-displays" }
 dormant-doctor = { path = "../dormant-doctor" }
 dormant-web = { path = "../dormant-web", optional = true }
+dormant-render = { path = "../dormant-render", optional = true }
 clap = { workspace = true }
 notify = { workspace = true }
 zbus = { workspace = true }
@@ -41,6 +42,7 @@ rustix = { version = "1", default-features = false, features = [
 
 [features]
 web-ui = ["dep:dormant-web"]
+render = ["dep:dormant-render", "dormant-core/render"]
 
 [dev-dependencies]
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }

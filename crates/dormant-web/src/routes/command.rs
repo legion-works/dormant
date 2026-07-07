@@ -334,6 +334,7 @@ mod tests {
                             paused: false,
                             cmd_gen: 1,
                             controllers: vec![],
+                            stage: None,
                         },
                     )
                 })

@@ -1,11 +1,12 @@
 //! `dormantctl status` — display current daemon state.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::Result;
 use comfy_table::Table;
 use dormant_core::ipc_proto::IpcRequest;
-use dormant_core::rules::StateSnapshot;
+use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
 
 use crate::client;
 
@@ -32,17 +33,26 @@ pub fn run(socket_path: &Path, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(snapshot)?);
     } else {
-        render_table(snapshot);
+        print!("{}", render_table(snapshot));
     }
 
     Ok(())
 }
 
-/// Render a [`StateSnapshot`] as a human-readable table.
-fn render_table(snapshot: &StateSnapshot) {
+/// Render a [`StateSnapshot`] as a human-readable table and return the
+/// formatted output as a `String`.
+///
+/// Pure — performs no I/O. The command path prints the returned value, and
+/// tests can call this directly to assert on the bytes a user would see.
+fn render_table(snapshot: &StateSnapshot) -> String {
+    let mut out = String::new();
+
     // ── Sensors ────────────────────────────────────────────────────────────
     if !snapshot.sensors.is_empty() {
-        println!("── Sensors ──────────────────────────────────────────────");
+        let _ = writeln!(
+            out,
+            "── Sensors ──────────────────────────────────────────────"
+        );
         let mut table = Table::new();
         table.set_header(vec!["ID", "State", "Last Seen"]);
         for s in &snapshot.sensors {
@@ -52,12 +62,15 @@ fn render_table(snapshot: &StateSnapshot) {
                 &format!("{}s ago", s.last_seen_secs_ago),
             ]);
         }
-        println!("{table}");
+        let _ = writeln!(out, "{table}");
     }
 
     // ── Zones ─────────────────────────────────────────────────────────────
     if !snapshot.zones.is_empty() {
-        println!("── Zones ────────────────────────────────────────────────");
+        let _ = writeln!(
+            out,
+            "── Zones ────────────────────────────────────────────────"
+        );
         let mut table = Table::new();
         table.set_header(vec!["ID", "Present"]);
         for z in &snapshot.zones {
@@ -68,29 +81,50 @@ fn render_table(snapshot: &StateSnapshot) {
             };
             table.add_row(vec![&z.id, present]);
         }
-        println!("{table}");
+        let _ = writeln!(out, "{table}");
     }
 
     // ── Displays ──────────────────────────────────────────────────────────
     if !snapshot.displays.is_empty() {
-        println!("── Displays ──────────────────────────────────────────────");
+        let _ = writeln!(
+            out,
+            "── Displays ──────────────────────────────────────────────"
+        );
         let mut table = Table::new();
         table.set_header(vec!["ID", "Phase", "Inhibited", "Paused"]);
         for (id, d) in &snapshot.displays {
+            let phase = phase_cell(d);
             table.add_row(vec![
                 id.as_str(),
-                d.phase.as_str(),
+                phase.as_str(),
                 if d.inhibited { "yes" } else { "no" },
                 if d.paused { "yes" } else { "no" },
             ]);
         }
-        println!("{table}");
+        let _ = writeln!(out, "{table}");
     }
 
     // ── Pending reload warning ────────────────────────────────────────────
     if let Some(detail) = &snapshot.pending_reload {
-        println!();
-        println!("⚠  Pending reload: {detail}");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "⚠  Pending reload: {detail}");
+    }
+
+    out
+}
+
+/// Build the Phase column cell for a [`DisplaySnapshot`].
+///
+/// For a staged display the cell reads `staged [idx: "kind"]`;
+/// otherwise it returns the plain phase string.
+fn phase_cell(d: &DisplaySnapshot) -> String {
+    match &d.stage {
+        Some(si) => format!(
+            "staged [{}: {}]",
+            si.idx,
+            serde_json::to_string(&si.kind).unwrap()
+        ),
+        None => d.phase.clone(),
     }
 }
 
@@ -126,6 +160,7 @@ mod tests {
                         paused: false,
                         cmd_gen: 1,
                         controllers: vec![],
+                        stage: None,
                     },
                 ),
                 (
@@ -136,6 +171,7 @@ mod tests {
                         paused: true,
                         cmd_gen: 3,
                         controllers: vec![],
+                        stage: None,
                     },
                 ),
             ],
@@ -181,5 +217,77 @@ mod tests {
         snap.pending_reload = Some("config error: bad key".into());
         // Just verify the field is set
         assert!(snap.pending_reload.is_some());
+    }
+
+    #[test]
+    fn staged_display_snapshot_has_stage_info() {
+        use dormant_core::rules::StageInfo;
+        use dormant_core::types::StageKind;
+
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "staged".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 1,
+                    controllers: vec![],
+                    stage: Some(StageInfo {
+                        idx: 2,
+                        kind: StageKind::RenderBlack,
+                    }),
+                },
+            )],
+            pending_reload: None,
+        };
+
+        let d = &snap.displays[0].1;
+        let si = d.stage.as_ref().unwrap();
+        assert_eq!(si.idx, 2);
+        assert_eq!(si.kind, StageKind::RenderBlack);
+    }
+
+    #[test]
+    fn staged_display_renders_stage_marker() {
+        use dormant_core::rules::{DisplaySnapshot, StageInfo};
+        use dormant_core::types::StageKind;
+
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "staged".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 1,
+                    controllers: vec![],
+                    stage: Some(StageInfo {
+                        idx: 1,
+                        kind: StageKind::RenderBlack,
+                    }),
+                },
+            )],
+            pending_reload: None,
+        };
+
+        // Must exercise the production rendering path, not a helper — a
+        // reviewer who bypasses `phase_cell` (e.g. by inlining `d.phase.clone()`
+        // into `render_table`) would otherwise silently regress the stage
+        // marker without any test signal.
+        let out = render_table(&snap);
+
+        assert!(
+            out.contains("staged [1:"),
+            "render_table output missing stage marker: {out}"
+        );
+        assert!(
+            out.contains("\"render_black\""),
+            "render_table output missing render_black kind: {out}"
+        );
     }
 }

@@ -161,3 +161,56 @@ Two controllers blank without touching the output, preserving audio:
 Run `dormantctl doctor` to probe DDC/CI VCP D6 support. For Tizen TVs, the
 doctor check verifies WebSocket reachability, token validity, and REST
 PowerState.
+
+## Escalation ladder & audio-safe black
+
+When a hardware blank mode fails (controller unreachable, capability missing),
+dormant can fall back to a **software render** — a fullscreen overlay drawn
+directly on the output via the Wayland layer-shell protocol.
+
+### `render_black` — audio-safe black overlay
+
+A fullscreen black layer-shell overlay that covers the entire output.
+The panel stays on (no DPMS, no VCP power-off), so audio continues playing
+through any sink attached to that output. Input (mouse/keyboard) or a
+presence event tears it down instantly; the cursor is hidden while the
+overlay is up.
+
+This is the preferred first stage in an OLED escalation ladder when the
+display doubles as an audio sink:
+
+```toml
+[displays.oled]
+controllers = ["ddcci"]
+modes = ["power_off"]
+ladder = [
+  { kind = "render_black", dwell = "30s" },
+  { kind = "power_off" },
+]
+output = "DP-1"
+```
+
+Here `render_black` buys 30 seconds of audio-safe, cursorless black before
+the panel actually powers off. If the sensor reports presence during those
+30 seconds, the overlay vanishes — no wake latency, no re-handshake.
+
+### When to use it
+
+- **OLED + audio over monitor:** the panel powers off via DDC/CI or Tizen,
+  but you want audio to keep playing during a short absence.
+- **DDC/CI fallback:** the primary `power_off` controller is unreachable;
+  the ladder falls through to a render stage instead of leaving the screen on.
+- **KWin DPMS replacement:** DPMS destroys the DRM/KMS output and its audio
+  sink; `render_black` preserves both.
+
+### Build requirement
+
+The render backend is **off by default**. Build with:
+
+```bash
+cargo build --release --features render
+```
+
+Without the `render` feature, configs containing a render stage are rejected
+at startup with error `E_RENDER_UNAVAILABLE`. On Linux, the render backend
+also requires `libwayland-dev` at build time.

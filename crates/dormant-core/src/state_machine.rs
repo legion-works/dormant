@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use crate::types::{BlankMode, Tick};
+use crate::types::{BlankMode, LadderStage, StageKind, Tick};
 
 // ── Phase ──────────────────────────────────────────────────────────────────────
 
@@ -38,6 +38,21 @@ pub enum Phase {
     Blanked,
     /// A wake command is in flight, awaiting its result.
     Waking,
+    /// A render `ShowRender` has been emitted; awaiting the backend's
+    /// `RenderResult`.
+    RenderPending {
+        /// Index into the display's ladder.
+        idx: usize,
+        /// Generation counter matching the `ShowRender` that was issued.
+        r#gen: u64,
+    },
+    /// A render surface is currently shown on the display.
+    Staged {
+        /// Index into the display's ladder.
+        idx: usize,
+        /// Generation counter matching the active render surface.
+        r#gen: u64,
+    },
 }
 
 // ── Overlays ───────────────────────────────────────────────────────────────────
@@ -102,6 +117,32 @@ pub enum Input {
     ForceBlank,
     /// Force-immediate wake (operator override).
     ForceWake,
+    /// A stage-dwell timer has fired — advance to the next ladder rung.
+    ///
+    /// Distinct from [`Input::Tick`] so stale ticks from a prior stage
+    /// generation are naturally dropped by the gen-matching logic.
+    StageTick {
+        /// Generation counter matching the current stage.
+        r#gen: u64,
+    },
+    /// Result of a previously issued render command (from
+    /// [`Effect::ShowRender`]).
+    RenderResult {
+        /// Generation counter matching the `ShowRender` that was issued.
+        r#gen: u64,
+        /// `Ok(())` if the render succeeded; `Err(CmdFailure)` on failure.
+        result: Result<(), crate::types::CmdFailure>,
+    },
+    /// Input wake event from the render surface (keyboard / mouse / touch
+    /// grabbed by the layer-shell overlay).  Treated the same as zone-presence
+    /// for waking.
+    InputWake,
+    /// The external ownership gate changed state.
+    ///
+    /// `true` → this daemon instance owns the display and may drive it.
+    /// `false` → another instance owns it; yield any active stage and
+    /// do not enter new ones.
+    OwnershipChanged(bool),
 }
 
 // ── Effect ─────────────────────────────────────────────────────────────────────
@@ -131,6 +172,29 @@ pub enum Effect {
         to: &'static str,
         /// Literal cause string (grep-stable for alerting).
         cause: &'static str,
+    },
+    /// Show a render surface for a ladder stage (layer-shell overlay).
+    ShowRender {
+        /// Monotonically increasing stage generation counter.
+        r#gen: u64,
+        /// Index into the display's ladder.
+        idx: usize,
+        /// The stage kind — tells the render backend which surface to build.
+        kind: StageKind,
+    },
+    /// Tear down any active render surface on this display.
+    TeardownRender {
+        /// Stage generation counter — the engine matches this to the owning
+        /// stage so that stale teardowns are harmless.
+        r#gen: u64,
+    },
+    /// Schedule a [`Input::StageTick`] at the given monotonic instant.
+    ScheduleStageTickAt {
+        /// Stage generation counter — allows the engine to drop a tick that
+        /// fires for an already-advanced stage.
+        r#gen: u64,
+        /// Monotonic instant at which to deliver the `StageTick`.
+        at: Tick,
     },
 }
 
@@ -180,8 +244,27 @@ pub struct DisplayStateMachine {
     last_blank: Option<Tick>,
     /// Monotonic instant when this machine was created (for startup holdoff).
     started_at: Tick,
-    /// The blank mode to use.
+    /// The primary blank mode — derived from the first [`StageKind::Controller`]
+    /// in the ladder, or `PowerOff` if the ladder is render-only.
     blank_mode: BlankMode,
+    /// The display's escalation ladder.
+    ladder: Vec<LadderStage>,
+    /// Monotonically increasing stage generation counter — bumped on every
+    /// stage entry so that stale ticks and results from a prior stage are
+    /// silently dropped.
+    stage_gen: u64,
+    /// The current ladder index, or `None` when not in a ladder stage
+    /// (Active, Grace, Waking).
+    current_stage: Option<usize>,
+    /// When `Some`, the stage-dwell countdown is frozen with this much time
+    /// remaining.  Set when inhibitor or pause activates during a staged
+    /// dwell; cleared when both are removed.  Mirrors `grace_frozen_remaining`.
+    stage_dwell_frozen_remaining: Option<Duration>,
+    /// Whether the external ownership gate denies ownership.
+    ///
+    /// When `true`, the machine will not enter blank stages and will yield
+    /// any active render/controller stage back to `Active`.
+    owned: bool,
     /// Timing parameters.
     timings: SmTimings,
     /// Set when presence arrives during a blank command — the machine will
@@ -199,10 +282,23 @@ pub struct DisplayStateMachine {
     grace_frozen_remaining: Option<Duration>,
 }
 
+/// Derive the primary blank mode from a ladder — the first controller stage's
+/// mode, or `PowerOff` if the ladder is render-only.
+#[must_use]
+pub fn primary_blank_mode(ladder: &[LadderStage]) -> BlankMode {
+    for stage in ladder {
+        if let StageKind::Controller(m) = stage.kind {
+            return m;
+        }
+    }
+    BlankMode::PowerOff
+}
+
 impl DisplayStateMachine {
     /// Create a new state machine starting in [`Phase::Active`].
     #[must_use]
-    pub fn new(timings: SmTimings, blank_mode: BlankMode, now: Tick) -> Self {
+    pub fn new(timings: SmTimings, ladder: Vec<LadderStage>, now: Tick) -> Self {
+        let blank_mode = primary_blank_mode(&ladder);
         Self {
             phase: Phase::Active,
             overlays: Overlays::default(),
@@ -213,6 +309,11 @@ impl DisplayStateMachine {
             last_blank: None,
             started_at: now,
             blank_mode,
+            ladder,
+            stage_gen: 0,
+            current_stage: None,
+            stage_dwell_frozen_remaining: None,
+            owned: true,
             timings,
             pending_wake: false,
             pending_reblank: false,
@@ -232,11 +333,12 @@ impl DisplayStateMachine {
     #[must_use]
     pub fn restore(
         timings: SmTimings,
-        blank_mode: BlankMode,
+        ladder: Vec<LadderStage>,
         phase: Phase,
         cmd_gen: u64,
         now: Tick,
     ) -> (Self, Vec<Effect>) {
+        let blank_mode = primary_blank_mode(&ladder);
         let mut sm = Self {
             phase: Phase::Active, // placeholder, overwritten below
             overlays: Overlays::default(),
@@ -247,6 +349,11 @@ impl DisplayStateMachine {
             last_blank: None,
             started_at: now,
             blank_mode,
+            ladder,
+            stage_gen: 0,
+            current_stage: None,
+            stage_dwell_frozen_remaining: None,
+            owned: true,
             timings,
             pending_wake: false,
             pending_reblank: false,
@@ -333,6 +440,19 @@ impl DisplayStateMachine {
             (Phase::Active, Input::ForceWake) => {
                 vec![]
             }
+            // InputWake in Active is a no-op — already awake.
+            (Phase::Active, Input::InputWake) => {
+                vec![]
+            }
+            // OwnershipChanged: record the state; does not gate active.
+            (Phase::Active, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                vec![]
+            }
+            // Stale stage-tick / render-result — ignored.
+            (Phase::Active, Input::StageTick { .. } | Input::RenderResult { .. }) => {
+                vec![]
+            }
 
             // ── Grace ───────────────────────────────────────────────────────
             // Presence returns during grace → cancel blank, go active.
@@ -413,13 +533,13 @@ impl DisplayStateMachine {
                     return effects;
                 }
 
-                // All gates passed — issue blank.
-                effects.push(Effect::LogTransition {
-                    from: "grace",
-                    to: "blanking",
-                    cause: "grace_expired",
-                });
-                effects.append(&mut self.issue_blank(vec![]));
+                // Ownership gate: deny entry if we don't own the display.
+                if !self.owned {
+                    return effects;
+                }
+
+                // All gates passed — enter the first ladder stage.
+                effects.append(&mut self.enter_ladder_stage(0, now, "grace_expired"));
                 effects
             }
             // Inhibitor activation during Grace: freeze the countdown.
@@ -475,6 +595,20 @@ impl DisplayStateMachine {
                 self.grace_frozen_remaining = None;
                 self.enter_active(now, "force_wake")
             }
+            // InputWake during Grace: treat like ForceWake — wake immediately.
+            (Phase::Grace { .. }, Input::InputWake) => {
+                self.grace_frozen_remaining = None;
+                self.enter_active(now, "input_wake")
+            }
+            // Ownership changed during Grace: record, does not gate.
+            (Phase::Grace { .. }, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                vec![]
+            }
+            // Stale stage-tick / render-result during Grace — ignored.
+            (Phase::Grace { .. }, Input::StageTick { .. } | Input::RenderResult { .. }) => {
+                vec![]
+            }
 
             // ── Blanking ────────────────────────────────────────────────────
             // Presence during blanking: defer wake until blank result arrives.
@@ -526,11 +660,15 @@ impl DisplayStateMachine {
                         )
                     } else {
                         self.phase = Phase::Blanked;
-                        vec![Effect::LogTransition {
+                        let mut effects = vec![Effect::LogTransition {
                             from: "blanking",
                             to: "blanked",
                             cause: "blank_succeeded",
-                        }]
+                        }];
+                        // Schedule stage-tick if this was a ladder controller
+                        // stage with a dwell (non-terminal).
+                        effects.append(&mut self.schedule_stage_tick(now));
+                        effects
                     }
                 } else {
                     // Blank failed.
@@ -557,6 +695,20 @@ impl DisplayStateMachine {
             // ForceWake in Blanking: defer to after blank result.
             (Phase::Blanking, Input::ForceWake) => {
                 self.pending_wake = true;
+                vec![]
+            }
+            // InputWake in Blanking: same as ForceWake via pending_wake.
+            (Phase::Blanking, Input::InputWake) => {
+                self.pending_wake = true;
+                vec![]
+            }
+            // OwnershipChanged in Blanking: record; does not gate.
+            (Phase::Blanking, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                vec![]
+            }
+            // Stale stage-tick / render-result during Blanking — ignored.
+            (Phase::Blanking, Input::StageTick { .. } | Input::RenderResult { .. }) => {
                 vec![]
             }
 
@@ -606,6 +758,10 @@ impl DisplayStateMachine {
             (Phase::Blanked, Input::WakeResult { .. }) => {
                 vec![]
             }
+            // Stale render result — ignored.
+            (Phase::Blanked, Input::RenderResult { .. }) => {
+                vec![]
+            }
             // ForceBlank in Blanked: already blanked; no-op.
             (Phase::Blanked, Input::ForceBlank) => {
                 vec![]
@@ -619,6 +775,35 @@ impl DisplayStateMachine {
                 }],
                 now,
             ),
+            // InputWake in Blanked: same as presence — wake.
+            (Phase::Blanked, Input::InputWake) => self.issue_wake(
+                vec![Effect::LogTransition {
+                    from: "blanked",
+                    to: "waking",
+                    cause: "input_wake",
+                }],
+                now,
+            ),
+            // StageTick with matching generation: advance to next rung.
+            (Phase::Blanked, Input::StageTick { r#gen }) => {
+                if r#gen != self.stage_gen {
+                    // Stale — tick belongs to a prior stage generation.
+                    vec![]
+                } else if self.stage_advance_frozen() || self.overlays.inhibited || !self.owned {
+                    vec![]
+                } else {
+                    self.advance_stage(now, "stage_tick")
+                }
+            }
+            // OwnershipChanged: if we lose ownership while blanked, yield.
+            (Phase::Blanked, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                if owns {
+                    vec![]
+                } else {
+                    self.enter_active(now, "ownership_yielded")
+                }
+            }
 
             // ── Waking ──────────────────────────────────────────────────────
             // Zone level is recorded but wake completes first.
@@ -693,6 +878,213 @@ impl DisplayStateMachine {
             // ForceWake in Waking: restart the wake attempt with a fresh
             // generation.
             (Phase::Waking, Input::ForceWake) => self.issue_wake(vec![], now),
+            // InputWake in Waking: same as ForceWake.
+            (Phase::Waking, Input::InputWake) => self.issue_wake(vec![], now),
+            // OwnershipChanged in Waking: record; does not gate wake.
+            (Phase::Waking, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                vec![]
+            }
+            // Stale stage-tick / render-result during Waking — ignored.
+            (Phase::Waking, Input::StageTick { .. } | Input::RenderResult { .. }) => {
+                vec![]
+            }
+
+            // ── RenderPending ────────────────────────────────────────────────
+            // Awaiting a render backend result.  Zone presence, input wake,
+            // or force wake tears the surface down and returns to Active.
+            (Phase::RenderPending { .. }, Input::ZonePresent(present)) => {
+                self.zone_present = Some(present);
+                if present {
+                    self.teardown_render(now, "presence_detected")
+                } else {
+                    vec![]
+                }
+            }
+            // Tick in RenderPending: only auto-resume applies.
+            (Phase::RenderPending { .. }, Input::Tick) => self.maybe_auto_resume(now),
+            // Inhibitor in RenderPending: record; wake unaffected.
+            (Phase::RenderPending { .. }, Input::InhibitorChanged(inhibited)) => {
+                self.overlays.inhibited = inhibited;
+                vec![]
+            }
+            // Pause in RenderPending: record; wake unaffected.
+            (Phase::RenderPending { .. }, Input::Pause { until }) => {
+                self.overlays.paused = Some(PauseState { until });
+                if let Some(deadline) = until {
+                    vec![Effect::ScheduleTickAt(deadline)]
+                } else {
+                    vec![]
+                }
+            }
+            // Resume in RenderPending.
+            (Phase::RenderPending { .. }, Input::Resume) => {
+                self.overlays.paused = None;
+                vec![]
+            }
+            // RenderResult with matching generation: process.
+            (
+                Phase::RenderPending {
+                    idx,
+                    r#gen: pending_gen,
+                },
+                Input::RenderResult { r#gen, result },
+            ) => {
+                if *pending_gen != r#gen {
+                    // Stale — result belongs to a prior stage.
+                    vec![]
+                } else if result.is_ok() {
+                    let mut effects = vec![Effect::LogTransition {
+                        from: "render_pending",
+                        to: "staged",
+                        cause: "render_succeeded",
+                    }];
+                    self.phase = Phase::Staged {
+                        idx: *idx,
+                        r#gen: *pending_gen,
+                    };
+                    // Schedule stage-tick if non-terminal.
+                    effects.append(&mut self.schedule_stage_tick(now));
+                    effects
+                } else {
+                    // Render failed — fall through to next controller stage.
+                    self.advance_to_next_controller(now, "render_failed")
+                }
+            }
+            // InputWake in RenderPending: tear down, go Active.
+            (Phase::RenderPending { .. }, Input::InputWake) => {
+                self.teardown_render(now, "input_wake")
+            }
+            // ForceWake in RenderPending: tear down, go Active.
+            (Phase::RenderPending { .. }, Input::ForceWake) => {
+                self.teardown_render(now, "force_wake")
+            }
+            // ForceBlank in RenderPending: tear down, blank via primary mode.
+            (Phase::RenderPending { .. }, Input::ForceBlank) => {
+                let r#gen = self.stage_gen;
+                let mut effects = vec![Effect::TeardownRender { r#gen }];
+                self.current_stage = None;
+                effects.push(Effect::LogTransition {
+                    from: "render_pending",
+                    to: "blanking",
+                    cause: "force_blank",
+                });
+                effects.append(&mut self.issue_blank(vec![]));
+                effects
+            }
+            // OwnershipChanged in RenderPending: yield on loss.
+            (Phase::RenderPending { .. }, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                if owns {
+                    vec![]
+                } else {
+                    self.teardown_render(now, "ownership_yielded")
+                }
+            }
+            // Stale blank/wake result — ignored.
+            (Phase::RenderPending { .. }, Input::BlankResult { .. } | Input::WakeResult { .. }) => {
+                vec![]
+            }
+            // StageTick in RenderPending — stale, dropped.
+            (Phase::RenderPending { .. }, Input::StageTick { .. }) => {
+                vec![]
+            }
+
+            // ── Staged ───────────────────────────────────────────────────────
+            // Render surface is up.  Zone presence tears down + Active.
+            (Phase::Staged { .. }, Input::ZonePresent(present)) => {
+                self.zone_present = Some(present);
+                if present {
+                    self.teardown_render(now, "presence_detected")
+                } else {
+                    vec![]
+                }
+            }
+            // Tick in Staged: only auto-resume applies.
+            (Phase::Staged { .. }, Input::Tick) => self.maybe_auto_resume(now),
+            // Inhibitor in Staged: freeze the stage advance (wake unaffected).
+            (Phase::Staged { .. }, Input::InhibitorChanged(inhibited)) => {
+                self.overlays.inhibited = inhibited;
+                if inhibited {
+                    // Freeze the dwell if there's a scheduled tick pending.
+                    // The tick itself carries the deadline; we don't have it
+                    // here, so we mark as frozen.  On next StageTick, the
+                    // freeze gate will drop it.  The caller must re-arm.
+                    self.stage_dwell_frozen_remaining =
+                        self.stage_dwell_frozen_remaining.or(Some(Duration::ZERO));
+                } else {
+                    // Inhibitor cleared — re-arm the stage tick.
+                    return self.rearm_stage_tick(now);
+                }
+                vec![]
+            }
+            // Pause in Staged: freeze the stage advance.
+            (Phase::Staged { .. }, Input::Pause { until }) => {
+                let was_paused = self.overlays.paused.is_some();
+                self.overlays.paused = Some(PauseState { until });
+                let mut effects = Vec::new();
+                if !was_paused {
+                    self.stage_dwell_frozen_remaining =
+                        self.stage_dwell_frozen_remaining.or(Some(Duration::ZERO));
+                }
+                if let Some(deadline) = until {
+                    effects.push(Effect::ScheduleTickAt(deadline));
+                }
+                effects
+            }
+            // Resume in Staged: re-arm the stage tick.
+            (Phase::Staged { .. }, Input::Resume) => {
+                self.overlays.paused = None;
+                if self.overlays.inhibited {
+                    vec![]
+                } else {
+                    self.rearm_stage_tick(now)
+                }
+            }
+            // StageTick with matching generation: advance to next rung.
+            (Phase::Staged { .. }, Input::StageTick { r#gen }) => {
+                if r#gen != self.stage_gen {
+                    // Stale — tick belongs to a prior stage.
+                    vec![]
+                } else if self.stage_advance_frozen() || self.overlays.inhibited || !self.owned {
+                    vec![]
+                } else {
+                    self.advance_stage(now, "stage_tick")
+                }
+            }
+            // InputWake in Staged: tear down, go Active.
+            (Phase::Staged { .. }, Input::InputWake) => self.teardown_render(now, "input_wake"),
+            // ForceWake in Staged: tear down, go Active.
+            (Phase::Staged { .. }, Input::ForceWake) => self.teardown_render(now, "force_wake"),
+            // ForceBlank in Staged: tear down, blank via primary mode.
+            (Phase::Staged { .. }, Input::ForceBlank) => {
+                let r#gen = self.stage_gen;
+                let mut effects = vec![Effect::TeardownRender { r#gen }];
+                self.current_stage = None;
+                effects.push(Effect::LogTransition {
+                    from: "staged",
+                    to: "blanking",
+                    cause: "force_blank",
+                });
+                effects.append(&mut self.issue_blank(vec![]));
+                effects
+            }
+            // OwnershipChanged in Staged: yield on loss.
+            (Phase::Staged { .. }, Input::OwnershipChanged(owns)) => {
+                self.owned = owns;
+                if owns {
+                    vec![]
+                } else {
+                    self.teardown_render(now, "ownership_yielded")
+                }
+            }
+            // Stale blank/wake result / render result — ignored.
+            (
+                Phase::Staged { .. },
+                Input::BlankResult { .. } | Input::WakeResult { .. } | Input::RenderResult { .. },
+            ) => {
+                vec![]
+            }
         };
 
         // Invariant: frozen-Grace state is never observable from a
@@ -722,6 +1114,8 @@ impl DisplayStateMachine {
             Phase::Blanking => "blanking",
             Phase::Blanked => "blanked",
             Phase::Waking => "waking",
+            Phase::RenderPending { .. } => "render_pending",
+            Phase::Staged { .. } => "staged",
         }
     }
 
@@ -735,6 +1129,22 @@ impl DisplayStateMachine {
     #[must_use]
     pub fn cmd_gen(&self) -> u64 {
         self.cmd_gen
+    }
+
+    /// Return the active ladder stage when the machine is in [`Phase::Staged`].
+    ///
+    /// Looks up the stage kind from the machine's configured ladder by the
+    /// index carried in the `Staged` phase variant.  Returns `None` for every
+    /// other phase (including `RenderPending`, which is a transient state).
+    /// Also returns `None` if the index is out of bounds (defensive — should
+    /// never happen in normal operation).
+    #[must_use]
+    pub fn current_stage(&self) -> Option<(usize, StageKind)> {
+        if let Phase::Staged { idx, .. } = self.phase {
+            self.ladder.get(idx).map(|s| (idx, s.kind))
+        } else {
+            None
+        }
     }
 
     // ── Private helpers ─────────────────────────────────────────────────────
@@ -782,6 +1192,8 @@ impl DisplayStateMachine {
         // Clear any stale frozen-Grace state (Must 2: frozen state must be
         // impossible to observe from any non-Grace phase).
         self.grace_frozen_remaining = None;
+        self.stage_dwell_frozen_remaining = None;
+        self.current_stage = None;
         let from = self.phase_name();
         self.phase = Phase::Active;
         let mut effects = vec![Effect::LogTransition {
@@ -859,12 +1271,134 @@ impl DisplayStateMachine {
         )));
         effects
     }
+
+    /// Issue a blank with a specific mode — used for ladder controller stages
+    /// whose mode may differ from the primary.
+    fn issue_blank_for_mode(&mut self, prefix: Vec<Effect>, mode: BlankMode) -> Vec<Effect> {
+        self.cmd_gen = self.cmd_gen.wrapping_add(1);
+        let r#gen = self.cmd_gen;
+        self.last_blank_gen = Some(r#gen);
+        self.phase = Phase::Blanking;
+        let mut effects = prefix;
+        effects.push(Effect::IssueBlank { r#gen, mode });
+        effects
+    }
+
+    // ── Ladder stage helpers ──────────────────────────────────────────────
+
+    /// Enter a specific ladder stage.  Bumps `stage_gen`, sets
+    /// `current_stage`, and emits the stage's entry effect — `ShowRender`
+    /// for render stages, `IssueBlank` via [`Self::issue_blank_for_mode`]
+    /// for controller stages.
+    fn enter_ladder_stage(&mut self, idx: usize, now: Tick, cause: &'static str) -> Vec<Effect> {
+        if idx >= self.ladder.len() {
+            return self.enter_active(now, cause);
+        }
+        let stage = &self.ladder[idx];
+        self.stage_gen = self.stage_gen.wrapping_add(1);
+        let r#gen = self.stage_gen;
+        self.current_stage = Some(idx);
+
+        let from = self.phase_name();
+        let dest_name = if stage.kind.is_render() {
+            "render_pending"
+        } else {
+            "blanking"
+        };
+        let mut effects = vec![Effect::LogTransition {
+            from,
+            to: dest_name,
+            cause,
+        }];
+
+        if stage.kind.is_render() {
+            self.phase = Phase::RenderPending { idx, r#gen };
+            effects.push(Effect::ShowRender {
+                r#gen,
+                idx,
+                kind: stage.kind,
+            });
+        } else {
+            let StageKind::Controller(mode) = stage.kind else {
+                unreachable!("non-render stage must be Controller");
+            };
+            effects.append(&mut self.issue_blank_for_mode(vec![], mode));
+        }
+        effects
+    }
+
+    /// Advance to the next ladder rung, or fall back to Active if terminal.
+    fn advance_stage(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
+        let next_idx = self.current_stage.map_or(0, |i| i + 1);
+        if next_idx >= self.ladder.len() {
+            return self.enter_active(now, cause);
+        }
+        self.enter_ladder_stage(next_idx, now, cause)
+    }
+
+    /// Advance to the next NON-render stage, skipping all intervening render
+    /// stages.  Used when a render stage fails — the fall-through rule.
+    fn advance_to_next_controller(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
+        let start = self.current_stage.map_or(0, |i| i + 1);
+        for idx in start..self.ladder.len() {
+            if !self.ladder[idx].kind.is_render() {
+                return self.enter_ladder_stage(idx, now, cause);
+            }
+        }
+        // No controller stages left — total cascade, teardown + Active.
+        self.teardown_render(now, cause)
+    }
+
+    /// Tear down any active render surface and transition to Active.
+    fn teardown_render(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
+        let r#gen = self.stage_gen;
+        let mut effects = vec![Effect::TeardownRender { r#gen }];
+        effects.append(&mut self.enter_active(now, cause));
+        effects
+    }
+
+    /// Schedule a stage-tick for the current stage if it has a dwell.
+    fn schedule_stage_tick(&mut self, now: Tick) -> Vec<Effect> {
+        let Some(idx) = self.current_stage else {
+            return vec![];
+        };
+        let Some(dwell) = self.ladder.get(idx).and_then(|s| s.dwell) else {
+            return vec![];
+        };
+        self.stage_gen = self.stage_gen.wrapping_add(1);
+        let r#gen = self.stage_gen;
+        let at = Tick(now.0 + dwell);
+        vec![Effect::ScheduleStageTickAt { r#gen, at }]
+    }
+
+    /// Return true if the stage advance is frozen by inhibitor or pause.
+    fn stage_advance_frozen(&self) -> bool {
+        self.stage_dwell_frozen_remaining.is_some()
+    }
+
+    /// Re-arm the stage tick after unfreezing, using the captured remaining
+    /// dwell time.  Bumps `stage_gen` so stale ticks from the frozen
+    /// generation are dropped.
+    fn rearm_stage_tick(&mut self, now: Tick) -> Vec<Effect> {
+        let remaining = self.stage_dwell_frozen_remaining.take().unwrap_or_default();
+        let Some(idx) = self.current_stage else {
+            return vec![];
+        };
+        let Some(dwell) = self.ladder.get(idx).and_then(|s| s.dwell) else {
+            return vec![];
+        };
+        let effective = remaining.min(dwell);
+        self.stage_gen = self.stage_gen.wrapping_add(1);
+        let r#gen = self.stage_gen;
+        let at = Tick(now.0 + effective);
+        vec![Effect::ScheduleStageTickAt { r#gen, at }]
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(unused_must_use)]
+#[allow(unused_must_use, dead_code)]
 mod tests {
     use super::*;
 
@@ -891,9 +1425,61 @@ mod tests {
         }
     }
 
-    /// Create a fresh state machine with the given grace period.
+    /// Create a fresh state machine with the given grace period and a
+    /// single controller-stage ladder (`PowerOff`, terminal).
     fn sm(grace_ms: u64) -> DisplayStateMachine {
-        DisplayStateMachine::new(timings(grace_ms), BlankMode::PowerOff, t(0))
+        DisplayStateMachine::new(
+            timings(grace_ms),
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            t(0),
+        )
+    }
+
+    /// Create a state machine with a custom ladder.
+    #[allow(dead_code)]
+    fn sm_with_ladder(grace_ms: u64, ladder: Vec<LadderStage>) -> DisplayStateMachine {
+        DisplayStateMachine::new(timings(grace_ms), ladder, t(0))
+    }
+
+    /// Build a controller stage (no dwell = terminal).
+    fn controller_stage(mode: BlankMode) -> LadderStage {
+        LadderStage {
+            kind: StageKind::Controller(mode),
+            dwell: None,
+        }
+    }
+
+    /// Build a controller stage with a dwell.
+    fn controller_stage_dwell(mode: BlankMode, dwell: Duration) -> LadderStage {
+        LadderStage {
+            kind: StageKind::Controller(mode),
+            dwell: Some(dwell),
+        }
+    }
+
+    /// Build a render stage.
+    fn render_stage(kind: StageKind, dwell: Option<Duration>) -> LadderStage {
+        LadderStage { kind, dwell }
+    }
+
+    /// Return the stage generation counter embedded in the first `ShowRender`
+    /// effect, if any.
+    fn show_render_gen(effects: &[Effect]) -> Option<u64> {
+        effects.iter().find_map(|e| {
+            if let Effect::ShowRender { r#gen, .. } = e {
+                Some(*r#gen)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Return the stage generation counter from the machine.
+    fn stage_gen(sm: &DisplayStateMachine) -> u64 {
+        sm.stage_gen
     }
 
     /// Assert that `effects` contains exactly one `IssueBlank` with the
@@ -988,7 +1574,7 @@ mod tests {
     #[test]
     fn grace_then_blank_happy_path() {
         let t0 = t(0);
-        let mut sm = DisplayStateMachine::new(timings(500), BlankMode::PowerOff, t0);
+        let mut sm = sm(500);
 
         // Zone clears → Grace.
         let effects = sm.step(Input::ZonePresent(false), t0);
@@ -1074,7 +1660,10 @@ mod tests {
                 startup_holdoff: Duration::from_secs(0),
                 wake_retry_interval: Duration::from_secs(60),
             },
-            BlankMode::PowerOff,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
             t(0),
         );
 
@@ -1128,7 +1717,10 @@ mod tests {
                 startup_holdoff: Duration::from_secs(1),
                 wake_retry_interval: Duration::from_secs(60),
             },
-            BlankMode::PowerOff,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
             t(0),
         );
 
@@ -1537,13 +2129,57 @@ mod tests {
         drive_blank(&mut s, t(0), true);
         s.step(Input::ZonePresent(true), t(100));
         assert_eq!(s.phase_name(), "waking");
+
+        // Drive to RenderPending.
+        let mut s = sm_with_ladder(
+            500,
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            }],
+        );
+        s.step(Input::ZonePresent(false), t(0));
+        s.step(Input::Tick, t(550));
+        assert_eq!(s.phase_name(), "render_pending");
+
+        // Drive to Staged via RenderResult(Ok).
+        let mut s = sm_with_ladder(
+            500,
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            }],
+        );
+        s.step(Input::ZonePresent(false), t(0));
+        let effects = s.step(Input::Tick, t(550));
+        let r#gen = effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::ShowRender { r#gen, .. } = e {
+                    Some(*r#gen)
+                } else {
+                    None
+                }
+            })
+            .expect("expected ShowRender");
+        s.step(
+            Input::RenderResult {
+                r#gen,
+                result: Ok(()),
+            },
+            t(600),
+        );
+        assert_eq!(s.phase_name(), "staged");
     }
 
     #[test]
     fn restore_carries_over_cmd_gen_and_phase() {
         let (sm, _effects) = DisplayStateMachine::restore(
             timings(500),
-            BlankMode::ScreenOffAudioOn,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::ScreenOffAudioOn),
+                dwell: None,
+            }],
             Phase::Blanked,
             42,
             t(0),
@@ -1557,8 +2193,16 @@ mod tests {
 
     #[test]
     fn restore_into_waking_emits_schedule_tick() {
-        let (_sm, effects) =
-            DisplayStateMachine::restore(timings(500), BlankMode::PowerOff, Phase::Waking, 7, t(0));
+        let (_sm, effects) = DisplayStateMachine::restore(
+            timings(500),
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            Phase::Waking,
+            7,
+            t(0),
+        );
         // Restoring into Waking must own its exit driver.
         let has_schedule = effects
             .iter()
@@ -1570,7 +2214,10 @@ mod tests {
     fn restore_into_grace_emits_schedule_tick() {
         let (_sm, effects) = DisplayStateMachine::restore(
             timings(500),
-            BlankMode::PowerOff,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
             Phase::Grace { until: t(500) },
             0,
             t(0),
@@ -1755,7 +2402,10 @@ mod tests {
                 startup_holdoff: Duration::from_secs(0),
                 wake_retry_interval: Duration::from_millis(100),
             },
-            BlankMode::PowerOff,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
             t0,
         );
 
@@ -1816,7 +2466,10 @@ mod tests {
                 startup_holdoff: Duration::from_secs(0),
                 wake_retry_interval: Duration::from_millis(100),
             },
-            BlankMode::PowerOff,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
             t0,
         );
 
@@ -2223,5 +2876,570 @@ mod tests {
                 sm.phase()
             );
         }
+    }
+}
+// ── Ladder tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(unused_must_use, dead_code)]
+mod ladder_tests {
+    use super::*;
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    fn off_stage() -> LadderStage {
+        LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: None,
+        }
+    }
+
+    fn render_black_stage(dwell_secs: u64) -> LadderStage {
+        LadderStage {
+            kind: StageKind::RenderBlack,
+            dwell: Some(Duration::from_secs(dwell_secs)),
+        }
+    }
+
+    fn controller_stage(mode: BlankMode, dwell: Option<Duration>) -> LadderStage {
+        LadderStage {
+            kind: StageKind::Controller(mode),
+            dwell,
+        }
+    }
+
+    fn cmd_failure(ctrl: &str) -> crate::types::CmdFailure {
+        crate::types::CmdFailure {
+            controller: ctrl.into(),
+            error: "test failure".into(),
+        }
+    }
+
+    fn t(offset_ms: u64) -> Tick {
+        Tick(
+            std::time::Instant::now()
+                .checked_add(Duration::from_millis(offset_ms))
+                .unwrap(),
+        )
+    }
+
+    fn timings(grace_ms: u64) -> SmTimings {
+        SmTimings {
+            grace_period: Duration::from_millis(grace_ms),
+            min_blank_time: Duration::from_secs(10),
+            min_wake_time: Duration::from_secs(0),
+            startup_holdoff: Duration::from_secs(0),
+            wake_retry_interval: Duration::from_millis(100),
+        }
+    }
+
+    fn sm_with(ladder: Vec<LadderStage>) -> DisplayStateMachine {
+        DisplayStateMachine::new(timings(500), ladder, t(0))
+    }
+
+    /// Drive through Grace expiry and enter the first ladder stage.
+    fn drive_to_entry(sm: &mut DisplayStateMachine) -> Vec<Effect> {
+        let t0 = t(0);
+        sm.step(Input::ZonePresent(false), t0);
+        let grace_tick = t(550);
+        sm.step(Input::Tick, grace_tick)
+    }
+
+    /// Drive to `RenderPending` for a render stage, then confirm `RenderResult`
+    /// `Ok`, ending in `Staged`.  Returns the stage generation.
+    #[allow(clippy::needless_pass_by_value)]
+    fn drive_to_staged(sm: &mut DisplayStateMachine) -> u64 {
+        let effects = drive_to_entry(sm);
+        let r#gen = effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::ShowRender { r#gen, .. } = e {
+                    Some(*r#gen)
+                } else {
+                    None
+                }
+            })
+            .expect("expected ShowRender effect");
+        sm.step(
+            Input::RenderResult {
+                r#gen,
+                result: Ok(()),
+            },
+            t(600),
+        );
+        r#gen
+    }
+
+    /// Feed a `BlankResult` `Ok` to complete a controller-stage blank.
+    fn feed_blank_ok(sm: &mut DisplayStateMachine) {
+        let r#gen = sm.cmd_gen();
+        sm.step(
+            Input::BlankResult {
+                r#gen,
+                result: Ok(()),
+            },
+            t(700),
+        );
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wake_from_staged_emits_teardown_not_issue_wake() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        drive_to_staged(&mut sm);
+        assert_eq!(sm.phase_name(), "staged");
+
+        let effects = sm.step(Input::ZonePresent(true), t(800));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "expected TeardownRender"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::IssueWake { .. })),
+            "must not emit IssueWake from render stage"
+        );
+        assert_eq!(sm.phase_name(), "active");
+    }
+
+    #[test]
+    fn force_wake_from_staged_emits_teardown() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        drive_to_staged(&mut sm);
+
+        let effects = sm.step(Input::ForceWake, t(800));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "ForceWake from Staged must emit TeardownRender, got {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::IssueWake { .. }))
+        );
+        // Machine may re-enter Grace via deferred_zone_clear since zone was
+        // absent, but it MUST NOT stay in a render phase.
+        assert!(!matches!(
+            sm.phase(),
+            Phase::RenderPending { .. } | Phase::Staged { .. }
+        ));
+        // zone_present=Some(false) after drive_to_staged, so enter_active
+        // chains into Grace.  Pin the exact outcome.
+        assert_eq!(sm.phase_name(), "grace");
+    }
+
+    #[test]
+    fn input_wake_from_staged_emits_teardown() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        drive_to_staged(&mut sm);
+
+        let effects = sm.step(Input::InputWake, t(800));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "InputWake from Staged must emit TeardownRender, got {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::IssueWake { .. }))
+        );
+        assert!(!matches!(
+            sm.phase(),
+            Phase::RenderPending { .. } | Phase::Staged { .. }
+        ));
+        assert_eq!(sm.phase_name(), "grace");
+    }
+
+    #[test]
+    fn stale_stage_tick_is_dropped() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        let r#gen = drive_to_staged(&mut sm);
+
+        sm.step(Input::ZonePresent(true), t(900));
+        assert_eq!(sm.phase_name(), "active");
+
+        sm.step(Input::ZonePresent(false), t(1000));
+        let grace_tick = t(1550);
+        sm.step(Input::Tick, grace_tick);
+        assert_eq!(sm.phase_name(), "render_pending");
+
+        let effects = sm.step(Input::StageTick { r#gen }, t(1600));
+        assert!(
+            effects.is_empty(),
+            "stale stage-tick must produce empty effects, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stale_render_result_is_dropped() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        let effects = drive_to_entry(&mut sm);
+        let r#gen = effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::ShowRender { r#gen, .. } = e {
+                    Some(*r#gen)
+                } else {
+                    None
+                }
+            })
+            .expect("expected ShowRender");
+        assert_eq!(sm.phase_name(), "render_pending");
+
+        // Feed a gen-MISMATCHED RenderResult while still in RenderPending.
+        // This tests the RenderPending arm's gen-mismatch branch, NOT the
+        // Active-stage stale-drop arm.
+        let effects = sm.step(
+            Input::RenderResult {
+                r#gen: r#gen + 1, // mismatched — doesn't match pending_gen
+                result: Ok(()),
+            },
+            t(700),
+        );
+        assert!(
+            effects.is_empty(),
+            "stale RenderResult must be dropped, got {effects:?}"
+        );
+        // Machine must still be in RenderPending — not advanced.
+        assert_eq!(sm.phase_name(), "render_pending");
+    }
+
+    #[test]
+    fn render_fail_falls_through_to_next_controller_stage() {
+        let mut sm = sm_with(vec![
+            LadderStage {
+                kind: StageKind::RenderScreensaver,
+                dwell: Some(Duration::from_secs(60)),
+            },
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(60)),
+            },
+            off_stage(),
+        ]);
+
+        let effects = drive_to_entry(&mut sm);
+        let r#gen = effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::ShowRender { r#gen, .. } = e {
+                    Some(*r#gen)
+                } else {
+                    None
+                }
+            })
+            .expect("expected ShowRender for idx:0");
+
+        let fx = sm.step(
+            Input::RenderResult {
+                r#gen,
+                result: Err(cmd_failure("render-screensaver")),
+            },
+            t(700),
+        );
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::IssueBlank {
+                    mode: BlankMode::PowerOff,
+                    ..
+                }
+            )),
+            "expected IssueBlank(PowerOff) at idx:2, got {fx:?}"
+        );
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::ShowRender { .. })),
+            "must not emit ShowRender for idx:1"
+        );
+        assert_eq!(sm.phase_name(), "blanking");
+    }
+
+    #[test]
+    fn render_only_total_cascade_returns_active() {
+        // Per R7: render failure skips intervening render stages to the next
+        // controller stage.  In a render-only ladder there is no controller
+        // stage, so the first failure cascades straight to Active with a
+        // TeardownRender.
+        let mut sm = sm_with(vec![
+            LadderStage {
+                kind: StageKind::RenderScreensaver,
+                dwell: Some(Duration::from_secs(60)),
+            },
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(60)),
+            },
+        ]);
+
+        let effects = drive_to_entry(&mut sm);
+        let r#gen = effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::ShowRender { r#gen, .. } = e {
+                    Some(*r#gen)
+                } else {
+                    None
+                }
+            })
+            .expect("expected ShowRender for idx:0");
+
+        let fx = sm.step(
+            Input::RenderResult {
+                r#gen,
+                result: Err(cmd_failure("render-screensaver")),
+            },
+            t(700),
+        );
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "render-only ladder failure must emit TeardownRender, got {fx:?}"
+        );
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::ShowRender { .. })),
+            "render failure must skip intervening render stages"
+        );
+        assert!(!matches!(
+            sm.phase(),
+            Phase::RenderPending { .. } | Phase::Staged { .. }
+        ));
+    }
+
+    #[test]
+    fn single_off_stage_reproduces_m1_blank_path() {
+        let mut sm = sm_with(vec![off_stage()]);
+        let effects = drive_to_entry(&mut sm);
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::IssueBlank {
+                    mode: BlankMode::PowerOff,
+                    ..
+                }
+            )),
+            "expected IssueBlank(PowerOff) for single off stage"
+        );
+        feed_blank_ok(&mut sm);
+        assert_eq!(sm.phase_name(), "blanked");
+    }
+
+    #[test]
+    fn controller_stage_dwell_advance() {
+        let mut sm = sm_with(vec![
+            LadderStage {
+                kind: StageKind::Controller(BlankMode::BrightnessZero),
+                dwell: Some(Duration::from_secs(300)),
+            },
+            off_stage(),
+        ]);
+
+        let effects = drive_to_entry(&mut sm);
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::IssueBlank {
+                    mode: BlankMode::BrightnessZero,
+                    ..
+                }
+            )),
+            "expected IssueBlank(BrightnessZero), got {effects:?}"
+        );
+        feed_blank_ok(&mut sm);
+        assert_eq!(sm.phase_name(), "blanked");
+
+        let r#gen = sm.stage_gen;
+        assert!(r#gen > 0, "stage_gen must have been bumped");
+
+        let fx = sm.step(Input::StageTick { r#gen }, t(1000));
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::IssueBlank {
+                    mode: BlankMode::PowerOff,
+                    ..
+                }
+            )),
+            "expected advance to IssueBlank(PowerOff), got {fx:?}"
+        );
+    }
+
+    #[test]
+    fn inhibitor_freezes_stage_advance_wake_unaffected() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        // drive_to_staged bumps stage_gen to 2 (enter_ladder_stage→1,
+        // RenderResult(Ok)→schedule_stage_tick→2).  Capture the post-bump
+        // gen so the StageTick gen-matches and the freeze is the only
+        // reason it gets dropped.
+        let _ = drive_to_staged(&mut sm);
+        let gen_now = sm.stage_gen; // 2
+
+        // Use Pause to freeze the dwell timer — it sets
+        // stage_dwell_frozen_remaining but does NOT set overlays.inhibited,
+        // so stage_advance_frozen() becomes the SOLE gate dropping StageTick.
+        sm.step(Input::Pause { until: None }, t(700));
+        assert!(sm.stage_advance_frozen(), "Pause must set the freeze flag");
+
+        let fx = sm.step(Input::StageTick { r#gen: gen_now }, t(800));
+        assert!(
+            fx.iter().all(|e| !matches!(e, Effect::IssueBlank { .. })),
+            "frozen stage must not advance, got {fx:?}"
+        );
+
+        // Wake still works during pause (pause doesn't gate wake).
+        let fx = sm.step(Input::ZonePresent(true), t(900));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "wake must work during pause"
+        );
+        assert_eq!(sm.phase_name(), "active");
+    }
+
+    #[test]
+    fn resume_rearms_stage_tick() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        drive_to_staged(&mut sm);
+
+        sm.step(Input::InhibitorChanged(true), t(700));
+        assert!(sm.stage_advance_frozen());
+
+        sm.step(Input::InhibitorChanged(false), t(800));
+        assert!(!sm.stage_advance_frozen());
+    }
+
+    #[test]
+    fn wake_from_every_stage_correct() {
+        let ladder = vec![
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(60)),
+            },
+            controller_stage(BlankMode::BrightnessZero, Some(Duration::from_secs(300))),
+            off_stage(),
+        ];
+
+        let mut sm = sm_with(ladder.clone());
+        sm.step(Input::ZonePresent(false), t(0));
+        assert_eq!(sm.phase_name(), "grace");
+        let fx = sm.step(Input::ZonePresent(true), t(100));
+        assert_eq!(sm.phase_name(), "active");
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::LogTransition {
+                    cause: "presence_during_grace",
+                    ..
+                }
+            )),
+            "wake-from-Grace lost"
+        );
+
+        let mut sm = sm_with(ladder.clone());
+        let _ = drive_to_entry(&mut sm);
+        assert_eq!(sm.phase_name(), "render_pending");
+        let fx = sm.step(Input::ZonePresent(true), t(600));
+        assert_eq!(sm.phase_name(), "active");
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "wake from RenderPending must emit TeardownRender"
+        );
+
+        let mut sm = sm_with(ladder.clone());
+        drive_to_staged(&mut sm);
+        let fx = sm.step(Input::ZonePresent(true), t(800));
+        assert_eq!(sm.phase_name(), "active");
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "wake from Staged must emit TeardownRender"
+        );
+
+        // Wake from Blanked (terminal) — emits IssueWake.
+        let mut sm = sm_with(vec![off_stage()]);
+        let _ = drive_to_entry(&mut sm);
+        feed_blank_ok(&mut sm);
+        assert_eq!(sm.phase_name(), "blanked");
+        let fx = sm.step(Input::ZonePresent(true), t(900));
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::IssueWake { .. })),
+            "wake from Blanked (terminal) must emit IssueWake"
+        );
+
+        // Wake from Blanked (NON-terminal) — a controller stage WITH dwell.
+        // The stage-tick was scheduled, but ZonePresent must still wake via
+        // IssueWake (controller path), NOT TeardownRender (render path).
+        let mut sm = sm_with(vec![
+            controller_stage(BlankMode::PowerOff, Some(Duration::from_secs(300))),
+            off_stage(),
+        ]);
+        let _ = drive_to_entry(&mut sm);
+        feed_blank_ok(&mut sm);
+        // Stage-tick should have been scheduled (non-terminal).
+        assert!(sm.stage_gen > 0, "stage_gen must be bumped");
+        assert_eq!(sm.phase_name(), "blanked");
+        // Wake.
+        let fx = sm.step(Input::ZonePresent(true), t(950));
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::IssueWake { .. })),
+            "wake from Blanked (non-terminal) must emit IssueWake, got {fx:?}"
+        );
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "wake from Blanked must NOT emit TeardownRender (controller path)"
+        );
+    }
+
+    #[test]
+    fn ownership_loss_from_active_no_entry() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        sm.step(Input::OwnershipChanged(false), t(0));
+        sm.step(Input::ZonePresent(false), t(10));
+        let grace_tick = t(550);
+        let fx = sm.step(Input::Tick, grace_tick);
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::IssueBlank { .. } | Effect::ShowRender { .. })),
+            "Grace expiry must not enter blank stage when unowned"
+        );
+        assert_eq!(sm.phase_name(), "grace");
+    }
+
+    #[test]
+    fn ownership_loss_from_staged_yields() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        drive_to_staged(&mut sm);
+        assert_eq!(sm.phase_name(), "staged");
+
+        let fx = sm.step(Input::OwnershipChanged(false), t(700));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "ownership loss from Staged must teardown, got {fx:?}"
+        );
+        assert!(!matches!(
+            sm.phase(),
+            Phase::RenderPending { .. } | Phase::Staged { .. }
+        ));
+    }
+
+    #[test]
+    fn phase_name_returns_render_pending_and_staged() {
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        let _ = drive_to_entry(&mut sm);
+        assert_eq!(sm.phase_name(), "render_pending");
+
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+        drive_to_staged(&mut sm);
+        assert_eq!(sm.phase_name(), "staged");
     }
 }

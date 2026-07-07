@@ -7,6 +7,18 @@
 - `libudev` for USB-serial sensor support: `sudo apt install libudev-dev pkg-config`
 - If `pkg-config` cannot find `libudev`, set `PKG_CONFIG_PATH=/usr/lib/pkgconfig`
 
+### Optional: render backend
+
+The software render backend (`render_black`, `render_screensaver` ladder stages)
+is off by default. To enable it:
+
+- **Build:** add `--features render` — `cargo build --release --features render`
+- **Deps (Linux):** `sudo apt install libwayland-dev` (Wayland client protocol
+  headers)
+- Without the feature, configs using render stages are rejected at startup with
+  `E_RENDER_UNAVAILABLE`; the daemon, CLI, and non-render sensors/displays still
+  build and run normally.
+
 ## From source (current, pre-release)
 
 ```bash

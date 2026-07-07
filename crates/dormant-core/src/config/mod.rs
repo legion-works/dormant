@@ -87,6 +87,34 @@ pub fn load_config(
         });
     }
 
+    // ── Exactly-one-of blank_mode / ladder (R12 symmetric rule) ─────────────
+    for (display_id, dc) in &cfg.displays {
+        let has_blank = dc.blank_mode.is_some();
+        let has_ladder = !dc.ladder.is_empty();
+        let has_degraded = dc.degraded_mode.is_some();
+
+        if has_blank && has_ladder {
+            return Err(DormantError::ConfigInvalid {
+                detail: format!(
+                    "display '{display_id}' set both blank_mode and ladder — set exactly one"
+                ),
+            });
+        }
+        if !has_blank && !has_ladder {
+            return Err(DormantError::ConfigInvalid {
+                detail: format!("display '{display_id}' needs blank_mode or ladder"),
+            });
+        }
+        if has_degraded && has_ladder {
+            return Err(DormantError::ConfigInvalid {
+                detail: format!(
+                    "display '{display_id}' set degraded_mode alongside ladder — \
+                     degraded_mode is only valid with blank_mode"
+                ),
+            });
+        }
+    }
+
     Ok((cfg, warnings))
 }
 

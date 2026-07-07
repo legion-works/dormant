@@ -50,6 +50,7 @@ fn spawn_fake_engine() -> (
                     paused: false,
                     cmd_gen: 1,
                     controllers: vec![],
+                    stage: None,
                 },
             ),
             (
@@ -60,6 +61,7 @@ fn spawn_fake_engine() -> (
                     paused: false,
                     cmd_gen: 3,
                     controllers: vec![],
+                    stage: None,
                 },
             ),
         ],

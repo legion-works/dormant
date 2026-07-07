@@ -47,6 +47,17 @@ const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
             ],
           },
         ],
+        [
+          "lg-oled",
+          {
+            phase: "staged",
+            inhibited: false,
+            paused: false,
+            cmd_gen: 7,
+            controllers: [{ name: "lg-webos", role: "primary" as const, healthy: true }],
+            stage: { idx: 0, kind: "render_black" },
+          },
+        ],
       ],
       pending_reload: null,
     },
@@ -67,6 +78,7 @@ const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
         displays: {
           "aoc-main": { controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" as const },
           "samsung-tv": { controllers: ["samsung-tizen"], blank_mode: "screen_off_audio_on" as const },
+          "lg-oled": { controllers: ["lg-webos"], blank_mode: "power_off" as const, ladder: [{ kind: "render_black", dwell: "5s" }] },
         },
         rules: {
           "office-rule": { zone: "office", displays: ["aoc-main"], wake_retries: 3 },
@@ -77,6 +89,7 @@ const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
       display_rules: {
         "aoc-main": { rule: "office-rule", zone: "office" },
         "samsung-tv": { rule: "tv-rule", zone: "office" },
+        "lg-oled": { rule: "office-rule", zone: "office" },
       },
     },
   };
@@ -157,7 +170,7 @@ describe("Displays", () => {
 
     // Both displays map to the "office" zone in the fixture
     expect(screen.getAllByText("office").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("office-rule")).toBeInTheDocument();
+    expect(screen.getAllByText("office-rule").length).toBeGreaterThanOrEqual(1);
   });
 
   it("calls postBlank/postWake/postPause/postResume with correct ids", async () => {
@@ -206,3 +219,31 @@ describe("Displays", () => {
     expect(screen.getAllByText("Pause rule").length).toBeGreaterThanOrEqual(1);
   });
 });
+
+  it("renders stage detail when a display is in the staged phase", async () => {
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("lg-oled")).toBeInTheDocument();
+    });
+
+    // The chip should show "staged · render black" for the staged display.
+    expect(screen.getByText("staged · render black")).toBeInTheDocument();
+  });
+
+  it("does not render stage detail for non-staged displays", async () => {
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("aoc-main")).toBeInTheDocument();
+    });
+
+    // The active display shows its phase label as "active" (unchanged).
+    expect(screen.getByText("active")).toBeInTheDocument();
+    // The blanked display shows "blanked".
+    expect(screen.getByText("blanked")).toBeInTheDocument();
+
+    // The stage-detail label only appears ONCE — for the staged display.
+    const stageLabels = screen.getAllByText(/render black/);
+    expect(stageLabels).toHaveLength(1);
+  });

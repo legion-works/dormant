@@ -33,6 +33,10 @@ const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
         "samsung-tv",
         { phase: "blanked", inhibited: false, paused: true, cmd_gen: 15, controllers: [{ name: "samsung-tizen", role: "primary" as const, healthy: true }] },
       ],
+      [
+        "lg-oled",
+        { phase: "staged", inhibited: false, paused: false, cmd_gen: 7, controllers: [{ name: "lg-webos", role: "primary" as const, healthy: true }], stage: { idx: 1, kind: "render_screensaver" } },
+      ],
     ],
     pending_reload: null,
   },
@@ -56,6 +60,7 @@ const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
       displays: {
         "aoc-main": { controllers: ["ddcci"], blank_mode: "power_off" as const },
         "samsung-tv": { controllers: ["samsung-tizen"], blank_mode: "screen_off_audio_on" as const },
+        "lg-oled": { controllers: ["lg-webos"], blank_mode: "power_off" as const, ladder: [{ kind: "render_screensaver", dwell: "10s" }] },
       },
       rules: {
         "office-rule": { zone: "office", displays: ["aoc-main"], wake_retries: 3 },
@@ -63,10 +68,11 @@ const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
       },
     },
     validation: { ok: true, warnings: [], errors: [] },
-    display_rules: {
-      "aoc-main": { rule: "office-rule", zone: "office" },
-      "samsung-tv": { rule: "tv-rule", zone: "hallway" },
-    },
+      display_rules: {
+        "aoc-main": { rule: "office-rule", zone: "office" },
+        "samsung-tv": { rule: "tv-rule", zone: "hallway" },
+        "lg-oled": { rule: "office-rule", zone: "office" },
+      },
   },
 }));
 
@@ -93,7 +99,7 @@ describe("Dashboard", () => {
       expect(labels.length).toBeGreaterThanOrEqual(2);
     });
 
-    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
     expect(screen.getByText("2/3")).toBeInTheDocument();
     expect(screen.getByText("1/2")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
@@ -135,7 +141,7 @@ describe("Dashboard", () => {
     expect(screen.getAllByText("wake").length).toBeGreaterThanOrEqual(1);
 
     // MUST 1: blank_mode and controller chain from config
-    expect(screen.getByText("power_off")).toBeInTheDocument();
+    expect(screen.getAllByText("power_off").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("ddcci")).toBeInTheDocument();
   });
 
@@ -191,3 +197,32 @@ describe("Dashboard", () => {
     expect(screen.getByText("sensor")).toBeInTheDocument();
   });
 });
+
+  it("renders stage detail in display row when a display is staged", async () => {
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("lg-oled")).toBeInTheDocument();
+    });
+
+    // The staged display chip shows "staged · render screensaver".
+    expect(screen.getByText("staged · render screensaver")).toBeInTheDocument();
+  });
+
+  it("does not render stage detail on non-staged display rows", async () => {
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("aoc-main")).toBeInTheDocument();
+    });
+
+    // The active display chip label is "active", not a stage label.
+    expect(screen.getByText("active")).toBeInTheDocument();
+    // The blanked display chip label is "blanked".
+    expect(screen.getByText("blanked")).toBeInTheDocument();
+
+    // Stage detail only for the staged display.
+    const stageLabels = screen.getAllByText(/render screensaver/);
+    // lg-oled chip + possibly the blank_mode in config metadata
+    expect(stageLabels.length).toBeGreaterThanOrEqual(1);
+  });

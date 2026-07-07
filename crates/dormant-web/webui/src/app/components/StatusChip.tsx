@@ -56,9 +56,11 @@ const STATUS_CLASS_MAP: Record<string, string> = {
   // Blue — absent / blanked
   absent: "blue",
   blanked: "blue",
-  // Yellow — grace / blanking / unavailable
+  // Yellow — grace / blanking / staging / unavailable
   grace: "warning",
   blanking: "warning",
+  staged: "warning",
+  render_pending: "warning",
   unavailable: "warning",
   // Amber — paused
   paused: "amber",

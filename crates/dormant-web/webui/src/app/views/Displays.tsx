@@ -7,7 +7,7 @@
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 190-248.
  */
 import { useLiveState } from "../hooks/useLiveState";
-import { Card, StatusChip, HealthChip } from "../components";
+import { Card, StatusChip, HealthChip, phaseChipLabel } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
 import { useCallback, useState } from "react";
 import type { DisplaySnapshot } from "../../api/types";
@@ -78,6 +78,8 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
       case "blanking": return "◑ …";
       case "blanked": return "○ OFF";
       case "waking": return "◔ wake";
+      case "staged": return "◑ staged";
+      case "render_pending": return "◐ render";
       default: return snap.phase;
     }
   })();
@@ -99,7 +101,7 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
         <div className="display-card__details">
           <div className="display-card__title-row">
             <span className="display-card__id">{id}</span>
-            <StatusChip kind={snap.phase} />
+            <StatusChip kind={snap.phase} label={phaseChipLabel(snap.phase, snap.stage)} />
             {isPaused && <StatusChip kind="paused" />}
             {snap.inhibited && <StatusChip kind="inhibited" />}
           </div>

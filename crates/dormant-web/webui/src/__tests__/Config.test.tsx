@@ -33,7 +33,25 @@ const { mocks, SAMPLE_CONFIG, SAMPLE_STATE } = vi.hoisted(() => {
         zones: {
           office: { mode: "any", members: ["desk-mmwave"], weights: {}, unavailable_policy: "present" as const },
         },
-        displays: {},
+        displays: {
+          "lg-oled": {
+            controllers: ["lg-webos"],
+            blank_mode: "power_off" as const,
+            ladder: [
+              { kind: "render_black" as const, dwell: "5s" },
+              { kind: "render_screensaver" as const, dwell: "30s" },
+              { kind: "power_off" as const },
+            ],
+            screensaver: {
+              trigger: "on_stage" as const,
+              audio: false,
+              source: [
+                { path: "/home/user/screensavers/", recurse: true, shuffle: true },
+                { urls: ["https://example.com/feed"], image_duration: "10s" },
+              ],
+            },
+          },
+        },
         rules: {
           "office-rule": { zone: "office", displays: [], wake_retries: 3 },
         },
@@ -99,10 +117,9 @@ describe("Config", () => {
     });
 
     expect(screen.getByText("Sensors")).toBeInTheDocument();
-    expect(screen.getByText("2")).toBeInTheDocument();
-    const vals = screen.getAllByText("1");
-    expect(vals.length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("0")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument(); // 2 sensors
+    const vals = screen.getAllByText("1"); // zones, displays, rules: one each
+    expect(vals.length).toBeGreaterThanOrEqual(3);
   });
 
   it("renders a reload button that calls postReload", async () => {
@@ -214,3 +231,43 @@ describe("Config", () => {
     });
   });
 });
+
+  it("renders ladder and screensaver summary when displays have them configured", async () => {
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Ladder & Screensaver")).toBeInTheDocument();
+    });
+
+    // Display name — appears in both the key and inventory-names columns.
+    const nameEls = screen.getAllByText("lg-oled");
+    expect(nameEls.length).toBeGreaterThanOrEqual(2);
+
+    // Ladder stages rendered with dwells in order
+    expect(screen.getByText(/render black \(5s\) → render screensaver \(30s\) → power off/)).toBeInTheDocument();
+
+    // Screensaver source count
+    expect(screen.getByText("2 sources")).toBeInTheDocument();
+  });
+
+  it("does not render ladder section when no display has ladder or screensaver", async () => {
+    // Override with config that has no ladder/screensaver on any display.
+    vi.mocked((await import("../api/client")).getConfig).mockResolvedValueOnce({
+      ...SAMPLE_CONFIG,
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        displays: {
+          "aoc-main": { controllers: ["ddcci"], blank_mode: "power_off" as const },
+        },
+      },
+    });
+
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
+    });
+
+    // Ladder section should be absent.
+    expect(screen.queryByText("Ladder & Screensaver")).toBeNull();
+  });

@@ -1290,11 +1290,28 @@ impl DisplayStateMachine {
     /// `current_stage`, and emits the stage's entry effect — `ShowRender`
     /// for render stages, `IssueBlank` via [`Self::issue_blank_for_mode`]
     /// for controller stages.
+    ///
+    /// When transitioning OUT of a render stage INTO a controller stage,
+    /// prepends `TeardownRender` (with the OLD `stage_gen`, captured
+    /// before the bump) so the render backend destroys the orphaned
+    /// `wl_surface` BEFORE the controller blank fires.  Without this,
+    /// the overlay stays mapped on top of the blanked panel.
     fn enter_ladder_stage(&mut self, idx: usize, now: Tick, cause: &'static str) -> Vec<Effect> {
         if idx >= self.ladder.len() {
             return self.enter_active(now, cause);
         }
         let stage = &self.ladder[idx];
+
+        // Detect a render→controller transition BEFORE the bump so the
+        // teardown carries the OLD `stage_gen` (the gen the live surface
+        // was created under — the convention `teardown_render` /
+        // ForceBlank from Staged / RenderPending also follow).
+        let prev_was_render = self
+            .current_stage
+            .and_then(|i| self.ladder.get(i))
+            .is_some_and(|s| s.kind.is_render());
+        let prev_stage_gen = self.stage_gen;
+
         self.stage_gen = self.stage_gen.wrapping_add(1);
         let r#gen = self.stage_gen;
         self.current_stage = Some(idx);
@@ -1310,6 +1327,18 @@ impl DisplayStateMachine {
             to: dest_name,
             cause,
         }];
+
+        if prev_was_render && !stage.kind.is_render() {
+            // Render→controller: tear down the orphaned overlay first.
+            // Render→render advances reuse the surface (no teardown);
+            // controller→controller has nothing to tear down.
+            effects.insert(
+                0,
+                Effect::TeardownRender {
+                    r#gen: prev_stage_gen,
+                },
+            );
+        }
 
         if stage.kind.is_render() {
             self.phase = Phase::RenderPending { idx, r#gen };
@@ -3269,6 +3298,101 @@ mod ladder_tests {
             )),
             "expected advance to IssueBlank(PowerOff), got {fx:?}"
         );
+    }
+
+    #[test]
+    fn stage_tick_render_to_controller_emits_teardown_before_blank() {
+        // Per R7 + the live-observed P1 acceptance gap: when a stage dwell
+        // ticks out of a render stage into a controller stage, the orphaned
+        // wl_surface must be torn down BEFORE the controller blank fires.
+        // Without the TeardownRender, the controller blanks the panel but
+        // the overlay stays mapped on top — panel re-lit with the
+        // black-stuck overlay covering it.
+        let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
+
+        let _show_gen = drive_to_staged(&mut sm);
+        assert_eq!(sm.phase_name(), "staged");
+        // drive_to_staged bumps stage_gen twice (enter_ladder_stage + the
+        // schedule_stage_tick that follows RenderResult Ok).  The
+        // Staged-phase gen is the SECOND bump — capture it here, the
+        // _show_gen captured above is the prior gen.
+        let staged_gen = sm.stage_gen;
+
+        let fx = sm.step(Input::StageTick { r#gen: staged_gen }, t(2000));
+
+        // Both effects must be present.
+        let teardown_pos = fx
+            .iter()
+            .position(|e| matches!(e, Effect::TeardownRender { .. }))
+            .unwrap_or_else(|| panic!("expected TeardownRender, got {fx:?}"));
+        let blank_pos = fx
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Effect::IssueBlank {
+                        mode: BlankMode::PowerOff,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("expected IssueBlank(PowerOff), got {fx:?}"));
+
+        // TeardownRender must be ordered BEFORE the IssueBlank — the
+        // controller blank can only fire after the overlay surface is gone.
+        assert!(
+            teardown_pos < blank_pos,
+            "TeardownRender (pos {teardown_pos}) must be ordered BEFORE IssueBlank (pos {blank_pos}), got {fx:?}"
+        );
+
+        // The TeardownRender must use the OLD render stage's gen — captured
+        // by enter_ladder_stage BEFORE the bump at the start of stage
+        // entry.  This matches the convention used by `teardown_render`
+        // and ForceBlank from Staged / RenderPending (see lines 964,
+        // 1062, 1354): the teardown always carries the current stage_gen
+        // so the backend can match it against the live surface.
+        let teardown_gen = match &fx[teardown_pos] {
+            Effect::TeardownRender { r#gen } => *r#gen,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            teardown_gen, staged_gen,
+            "TeardownRender must use the OLD stage_gen ({staged_gen}) captured before the bump, got {teardown_gen}"
+        );
+
+        assert_eq!(sm.phase_name(), "blanking");
+    }
+
+    #[test]
+    fn stage_tick_render_to_render_advance_does_not_emit_teardown() {
+        // The backend reuses the same wl_surface for back-to-back render
+        // stages (e.g. RenderBlack → RenderScreensaver dwell escalation).
+        // Tearing down between render→render would force an unnecessary
+        // configure/commit cycle.  Only render→controller must tear down.
+        let mut sm = sm_with(vec![
+            render_black_stage(30),
+            LadderStage {
+                kind: StageKind::RenderScreensaver,
+                dwell: Some(Duration::from_secs(30)),
+            },
+        ]);
+
+        let _show_gen = drive_to_staged(&mut sm);
+        assert_eq!(sm.phase_name(), "staged");
+        let staged_gen = sm.stage_gen;
+
+        let fx = sm.step(Input::StageTick { r#gen: staged_gen }, t(2000));
+
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. })),
+            "render→render advance must NOT emit TeardownRender, got {fx:?}"
+        );
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::ShowRender { .. })),
+            "expected ShowRender for the next render stage, got {fx:?}"
+        );
+        assert_eq!(sm.phase_name(), "render_pending");
     }
 
     #[test]

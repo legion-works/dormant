@@ -59,7 +59,7 @@
 //! that same loop, so all Wayland object access stays on one thread.
 
 use std::ffi::{CString, c_void};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
@@ -190,14 +190,18 @@ impl Default for ScreensaverSettings {
 /// Cleanup runs in [`Drop`]: unset the wakeup callback BEFORE freeing
 /// the render context (so a racing mpv thread can't fire the trampoline
 /// against a freed context), free the context, drop the mpv handle,
-/// close the write fd.  Every `MpvPlayer` value owns exactly one of
-/// each resource — `Drop` is the single point of teardown, so
-/// post-`new` failure paths in the caller no longer leak.
+/// then the `wakeup_write` [`OwnedFd`] field drops LAST via Rust's
+/// struct-field declaration order — the fd is only closed after the
+/// context it was registered against is gone.
+///
+/// The write fd is `OwnedFd` end-to-end so any pre-construction
+/// `?`/early-return in [`MpvPlayer::new`] drops it automatically; the
+/// only path the caller has to worry about is the `Err` it
+/// propagates back, and even there the caller must NOT close the fd
+/// — `OwnedFd::drop` already ran.
 pub struct MpvPlayer {
     mpv: Option<libmpv2::Mpv>,
     ctx: NonNull<mpv_render_context>,
-    /// Write end of the wakeup pipe.  `None` after [`Drop`] runs.
-    wakeup_write_fd: Option<RawFd>,
     width: i32,
     height: i32,
     stride: i32,
@@ -211,6 +215,20 @@ pub struct MpvPlayer {
     /// the playlist later; unused today beyond logging.
     #[allow(dead_code)]
     items: Vec<String>,
+    /// Write end of the wakeup pipe — `OwnedFd` so any pre-construction
+    /// `?`-early-return in [`MpvPlayer::new`] drops it automatically.
+    /// Declared LAST so its `Drop` (which closes the fd) runs AFTER the
+    /// mpv handle, context, and callback cleanup in [`Drop::drop`] —
+    /// the callback fires against this fd until [`Drop::drop`] unregisters
+    /// it, so the fd must outlive everything else.
+    ///
+    /// The field is "never read" by any method body — its only job
+    /// is to hold the `OwnedFd` until [`Drop::drop`] runs, then the
+    /// field's natural drop closes the fd.  The `dead_code` allow is
+    /// intentional: do not introduce a spurious read just to silence
+    /// the lint — the field is load-bearing on Drop.
+    #[allow(dead_code)]
+    wakeup_write: Option<std::os::fd::OwnedFd>,
 }
 
 /// Errors that [`MpvPlayer::new`] / [`MpvPlayer::render_frame_into`] can return.
@@ -270,16 +288,13 @@ impl Drop for MpvPlayer {
         if let Some(mpv) = self.mpv.take() {
             drop(mpv);
         }
-        // Close the write fd exactly once.
-        //
-        // SAFETY: fd was created by `libc::pipe2` in the calloop layer
-        // and is owned exclusively by this player; closing it twice
-        // would be a bug but the calloop read end is a separate fd.
-        if let Some(fd) = self.wakeup_write_fd.take() {
-            unsafe {
-                libc::close(fd);
-            }
-        }
+        // The `wakeup_write` `OwnedFd` field drops NEXT via Rust's
+        // struct-field declaration order — it was declared LAST
+        // specifically so this Drop runs first (which unregisters the
+        // callback against a still-valid fd), and the fd close runs
+        // last (after the context it was registered against is freed).
+        // Nothing else to do here — the field's natural drop closes
+        // the fd exactly once.
     }
 }
 
@@ -287,17 +302,20 @@ impl MpvPlayer {
     /// Build the player with the sandbox flags described in the module
     /// docs, filter the playlist through [`scheme_allowed`], create
     /// the SW render context sized to `(width, height)`, arm the
-    /// wakeup callback on `wakeup_write_fd`, and (last) load the
+    /// wakeup callback on `wakeup_write`, and (last) load the
     /// first surviving playlist item.
     ///
     /// Order matters for leak-freedom: the owned `MpvPlayer` struct
-    /// is constructed (with `Option`-wrapped mpv handle, wakeup fd,
-    /// and the render-context pointer) BEFORE `loadfile` runs.  Any
-    /// error after the `MpvPlayer` value exists lets `Drop` clean up
-    /// — unset the callback, free the context, drop mpv, close the
-    /// write fd.  Pre-construction errors (mpv init, render-context
-    /// creation) still rely on the prior pattern of returning `Err`
-    /// before any owned state leaks.
+    /// is constructed (with `Option`-wrapped mpv handle, `OwnedFd`
+    /// wakeup fd, and the render-context pointer) BEFORE `loadfile`
+    /// runs.  Any error after the `MpvPlayer` value exists lets `Drop`
+    /// clean up — unset the callback, free the context, drop mpv, then
+    /// the `OwnedFd` field drops last via Rust's struct-field
+    /// declaration order, closing the fd.  Pre-construction errors
+    /// (mpv init, render-context creation, all-items-rejected) also
+    /// leak-freely: `wakeup_write: OwnedFd` is a function parameter
+    /// (owned from the caller's first frame), and any `?` early-return
+    /// drops it before the `Err` propagates.
     #[allow(clippy::too_many_lines)]
     pub fn new(
         items: Vec<String>,
@@ -305,7 +323,7 @@ impl MpvPlayer {
         audio_enabled: bool,
         width: u32,
         height: u32,
-        wakeup_write_fd: RawFd,
+        wakeup_write: std::os::fd::OwnedFd,
     ) -> Result<Self, MpvError> {
         // ── Scheme allowlist (PRIMARY security control) ───────────
         // Runs BEFORE any mpv interaction so a rejected item never
@@ -417,24 +435,27 @@ impl MpvPlayer {
             mpv_render_context_set_update_callback(
                 ctx.as_ptr(),
                 Some(wakeup_trampoline),
-                usize::try_from(wakeup_write_fd).expect("pipe fd fits in usize") as *mut c_void,
+                usize::try_from(wakeup_write.as_raw_fd()).expect("pipe fd fits in usize")
+                    as *mut c_void,
             );
         }
 
         // ── Construct the owned player BEFORE loadfile ────────────
         // After this point, `Drop` owns the cleanup of ctx, mpv, and
-        // the wakeup write fd.  `load_items` runs against the
-        // constructed player — on Err, the value drops and cleans up.
+        // the wakeup write fd (the `wakeup_write` `OwnedFd` field is
+        // declared LAST so its `Drop` runs after `Drop::drop`'s explicit
+        // cleanup).  `load_items` runs against the constructed player —
+        // on Err, the value drops and cleans up.
         let mut player = Self {
             mpv: Some(mpv),
             ctx,
-            wakeup_write_fd: Some(wakeup_write_fd),
             width: width_i,
             height: height_i,
             stride,
             first_frame_deadline: Some(Instant::now() + FIRST_FRAME_DEADLINE),
             has_first_frame: false,
             items: filtered_items,
+            wakeup_write: Some(wakeup_write),
         };
 
         // ── Load first playlist entry (last fallible step) ────────
@@ -543,6 +564,7 @@ impl MpvPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -583,9 +605,12 @@ mod tests {
         }
     }
 
-    /// Wrap a raw fd so its Drop closes the fd.  Used by tests so a
-    /// panic mid-test doesn't leak fds.
+    /// Wrap a raw fd so its Drop closes the fd.  Used by tests for the
+    /// read end (which `MpvPlayer::new` doesn't accept — the write end
+    /// is wrapped in `OwnedFd` directly when passed to `new()`).
+    #[allow(dead_code)]
     struct OwnedRawFd(RawFd);
+    #[allow(dead_code)]
     impl OwnedRawFd {
         unsafe fn from_raw(fd: RawFd) -> Self {
             Self(fd)
@@ -594,6 +619,7 @@ mod tests {
             self.0
         }
     }
+    #[allow(dead_code)]
     impl Drop for OwnedRawFd {
         fn drop(&mut self) {
             // SAFETY: fd was created via pipe2; closing once.
@@ -612,14 +638,16 @@ mod tests {
         let video = dir.join("test.mp4");
         generate_test_video(&video)?;
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
-        let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
+        // SAFETY: write_fd was just created by pipe2 and is not yet owned
+        // by anything else — `OwnedFd` takes exclusive ownership.
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
         let player = MpvPlayer::new(
             vec![video.to_string_lossy().into_owned()],
             Duration::from_secs(2),
             false,
             320,
             180,
-            write_owned.as_raw(),
+            write_owned,
         )
         .expect("player init");
         Some((player, video))
@@ -747,7 +775,7 @@ mod tests {
     #[test]
     fn lavf_protocol_whitelist_accepted_without_fixture() {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
-        let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
 
         // One absolute path so the scheme allowlist accepts it; we
         // never loadfile successfully because the path doesn't exist —
@@ -759,7 +787,7 @@ mod tests {
             false,
             64,
             64,
-            write_owned.as_raw(),
+            write_owned,
         )
         .expect("player init must accept demuxer-lavf-o at construction time");
 
@@ -775,7 +803,7 @@ mod tests {
     #[test]
     fn missing_file_yields_no_first_frame() {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
-        let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
 
         let mut player = MpvPlayer::new(
             vec!["/nonexistent/path/that/never/exists.mp4".into()],
@@ -783,7 +811,7 @@ mod tests {
             false,
             64,
             64,
-            write_owned.as_raw(),
+            write_owned,
         )
         .expect("player init (loadfile error is async)");
 
@@ -819,7 +847,7 @@ mod tests {
     #[test]
     fn drop_tears_down_unused_player_without_panic() {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
-        let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
 
         // Provide one allowlisted item so `MpvPlayer::new` gets past
         // the empty-after-filter check.  We never loadfile the item
@@ -830,7 +858,7 @@ mod tests {
             false,
             64,
             64,
-            write_owned.as_raw(),
+            write_owned,
         )
         .expect("player init");
 
@@ -940,7 +968,7 @@ mod tests {
     #[test]
     fn mpv_player_rejects_all_exotic_schemes_without_loadfile() {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
-        let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
 
         let result = MpvPlayer::new(
             vec![
@@ -952,12 +980,71 @@ mod tests {
             false,
             64,
             64,
-            write_owned.as_raw(),
+            write_owned,
         );
 
         assert!(
             result.is_err(),
             "all-exotic input must Err before loadfile (no network attempt)"
+        );
+    }
+
+    /// Companion to `mpv_player_rejects_all_exotic_schemes_without_loadfile`:
+    /// the write fd MUST be closed after the Err (it's `OwnedFd`, so
+    /// the function's early-return drops it).  Deterministic headless
+    /// check via `libc::write` on the raw fd value — EBADF confirms the
+    /// fd is closed.  We hold the raw fd in a local (NOT `OwnedFd`) so
+    /// the assertion sees the kernel state, not the Rust destructor.
+    #[test]
+    fn write_fd_is_closed_after_all_rejected_err() {
+        let (read_fd, write_fd) = make_pipe().expect("pipe2");
+        // Close read_fd manually so it doesn't leak the test fd — the
+        // point of this test is the WRITE fd's close, not the read end.
+        unsafe {
+            libc::close(read_fd);
+        }
+        // Hold the raw write_fd value across the new() call so we can
+        // observe the kernel close via libc::write.
+        let write_raw = write_fd;
+
+        // Construct inside a block so `OwnedFd` (the wrapper we pass
+        // to new()) is dropped deterministically at the block's end —
+        // whether new() returned Ok or Err, the OwnedFd drops there.
+        let result = {
+            let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
+            MpvPlayer::new(
+                vec!["ftp://127.0.0.1:1/x".into(), "data:text/plain,hi".into()],
+                Duration::from_secs(1),
+                false,
+                64,
+                64,
+                write_owned,
+            )
+        };
+
+        // Assert the path WAS the filter-rejection Err — without this,
+        // the fd-closed check below would pass even if the filter was
+        // bypassed (the player would be constructed and the fd would
+        // be closed by the player's drop instead of the early-return
+        // drop).  Both paths close the fd; the point of this test is
+        // to prove the EARLY-RETURN drop runs.
+        assert!(
+            result.is_err(),
+            "all-exotic input must Err before loadfile (so the early-return drop runs)"
+        );
+
+        // The write fd must now be closed.  A non-blocking write of 1
+        // byte returns -1 with errno=EBADF.  (If it returns 0/positive
+        // we'd be writing into a pipe that nobody holds the read end
+        // of — that would be a leak.)
+        let byte: [u8; 1] = [1];
+        let n = unsafe { libc::write(write_raw, byte.as_ptr().cast(), 1) };
+        assert_eq!(n, -1, "write fd must be closed after MpvPlayer::new Err");
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            errno,
+            Some(libc::EBADF),
+            "expected EBADF, got errno={errno:?}"
         );
     }
 

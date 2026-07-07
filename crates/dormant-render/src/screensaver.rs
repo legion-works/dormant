@@ -1711,4 +1711,67 @@ mod tests {
 
         drop(player);
     }
+    fn generate_test_image(path: &std::path::PathBuf) -> Option<()> {
+        if std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x180",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "mjpeg",
+            ])
+            .arg(path)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn build_test_player_image() -> Option<(MpvPlayer, std::path::PathBuf)> {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
+        let image = dir.join("test.jpg");
+        generate_test_image(&image)?;
+        build_test_player_with_mode(image, ScaleMode::Fit)
+    }
+
+    #[test]
+    fn render_frame_into_unconditionally_draws_current_picture() {
+        let Some((mut player, _image)) = build_test_player_image() else {
+            eprintln!("ffmpeg unavailable; skipping render test");
+            return;
+        };
+
+        let mut first_buf = vec![0xABu8; (320 * 4 * 180) as usize];
+        let start = std::time::Instant::now();
+        let mut got_first = false;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            match player.render_frame_into(&mut first_buf) {
+                Ok(true) => {
+                    got_first = true;
+                    break;
+                }
+                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(16)),
+                Err(e) => panic!("render errored: {e}"),
+            }
+        }
+        assert!(got_first, "failed to get first frame");
+
+        let mut drain_buf = vec![0x00u8; (320 * 4 * 180) as usize];
+        while player.render_frame_into(&mut drain_buf).expect("render") {
+            first_buf.copy_from_slice(&drain_buf);
+        }
+
+        let mut second_buf = vec![0x00u8; (320 * 4 * 180) as usize];
+        let res = player.render_frame_into(&mut second_buf).expect("render");
+        assert!(!res, "expected Ok(false) after draining");
+        assert_eq!(first_buf, second_buf, "render_frame_into did not draw the current picture on Ok(false)");
+    }
 }

@@ -80,6 +80,7 @@ pub(crate) enum RenderCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::ScaleMode;
     use dormant_core::types::CmdFailure;
 
     #[test]
@@ -183,6 +184,7 @@ mod tests {
             ],
             image_duration: Duration::from_secs(4),
             audio: true,
+            scale_mode: ScaleMode::Stretch,
         };
         let expected_items = settings.items.clone();
         let expected_dur = settings.image_duration;
@@ -207,6 +209,7 @@ mod tests {
         assert_eq!(settings.items, expected_items);
         assert_eq!(settings.image_duration, expected_dur);
         assert_eq!(settings.audio, expected_audio);
+        assert_eq!(settings.scale_mode, ScaleMode::Stretch);
         let _ = reply.send(Ok(()));
         let r = tokio::runtime::Runtime::new()
             .unwrap()

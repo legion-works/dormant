@@ -278,6 +278,8 @@ export interface ScreensaverSource {
 export interface ScreensaverConfig {
   trigger: string;
   audio: boolean;
+  /** Source-frame scaling onto the rendered output. `null`/undefined → Fill. */
+  scale_mode?: "fill" | "fit" | "stretch" | "center" | null;
   source: ScreensaverSource[];
 }
 

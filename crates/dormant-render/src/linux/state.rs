@@ -611,6 +611,7 @@ impl WaylandState {
             settings.items,
             settings.image_duration,
             settings.audio,
+            settings.scale_mode,
             width,
             height,
             write_fd,

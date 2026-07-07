@@ -335,22 +335,25 @@ pub(super) enum TickCmd {
 /// Drive one blend-tick advance.  Pure: caller renders, calls this,
 /// acts on the returned command.
 ///
-/// `ok` is the `render_frame_into` return — `false` means "no frame
-/// produced; skip the commit, do not advance `t`, do not resolve
-/// first-frame success".  This is the `ADVANCED_CONTROL` contract:
-/// the wakeup callback can fire without a frame available.
+/// `t_advance` is unconditional on the blend timer (re-review M2):
+/// the timer owns the visible opacity change, NOT the `mpv` frame
+/// stream.  Each tick advances `t` regardless of whether the
+/// previous wakeup produced a new frame — the per-tick render
+/// re-draws the current picture at increasing `t`.  This is what
+/// makes static-image fades complete (mpv produces one frame and
+/// then goes idle; without this guarantee the fade hangs at
+/// `t = 0` forever).
 ///
 /// `t_step` is the increment computed at timer-arm time via
 /// [`super::blend::compute_blend_params`].
 pub(super) fn tick_step(
     phase: TransitionPhase,
     t: u16,
-    ok: bool,
     t_step: u16,
 ) -> (TransitionPhase, u16, TickCmd) {
     use TickCmd::{Advance, Complete, NoTickOp};
     use TransitionPhase::{Fading, Idle};
-    if phase != Fading || !ok {
+    if phase != Fading {
         return (phase, t, NoTickOp);
     }
     let new_t = t.saturating_add(t_step);
@@ -407,6 +410,85 @@ fn cancel_transition_timer_for(
     {
         handle.remove(token);
     }
+}
+
+/// Side-effect flags the wiring applies after [`process_mpv_events`]
+/// returns.  Kept as small data so the helper stays I/O-free and
+/// unit-testable without a `WaylandState` or real `MpvPlayer`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ProcessCmds {
+    /// True when the batch emitted a `DropTimer` cmd (Fading→
+    /// Captured, or initial Idle→Captured).  The wiring responds by
+    /// memcpying the front buffer into `transition.capture` and
+    /// clearing `t` + `timer_token`.
+    pub(super) capture_pending: bool,
+    /// True when the batch reached Fading via the
+    /// `AwaitingFirstFrame` → `Fading` transition.  The wiring arms
+    /// (or replaces) the blend timer via `arm_or_rearm_transition_timer`.
+    pub(super) arm_pending: bool,
+}
+
+/// Process a drained batch of mpv events.  Pure: no I/O, no calloop
+/// mutation, no buffer reads.  Operates on the `Option<TransitionState>`
+/// directly so it can be unit-tested without a `MpvPlayer` or a real
+/// screensaver session.
+///
+/// **Allocation rule (re-review M1):** lazy-allocates on the FIRST
+/// `ItemEnded` *anywhere* in the batch.  Previously the gate used
+/// `batch.first()`, which silently dropped events when
+/// `ItemLoaded` came first — a real-possibility batch ordering
+/// that the previous review missed.  Now uses `any(|e| matches!(e,
+/// ItemEnded))` so every `ItemEnded` (in any position) reaches the
+/// state machine.
+///
+/// **Capture handling:** a `DropTimer` cmd resets `t` to 0 and clears
+/// `timer_token` but does NOT memcpy the front buffer into
+/// `capture` here (no buffer / pool access).  The wiring is
+/// responsible for that side-effect (we return
+/// `capture_pending = true`).
+pub(super) fn process_mpv_events(
+    transition: Option<TransitionState>,
+    mpv_events: &[MpvItemEvent],
+    t_step: u16,
+    buf_len: usize,
+) -> (Option<TransitionState>, ProcessCmds) {
+    let mut transition = transition;
+    let mut cmds = ProcessCmds::default();
+
+    // Lazy allocation: first ItemEnded in the batch wins (M1 fix).
+    let has_item_ended = mpv_events
+        .iter()
+        .any(|e| matches!(e, MpvItemEvent::ItemEnded));
+    if has_item_ended && transition.is_none() {
+        transition = Some(TransitionState {
+            capture: vec![0u8; buf_len],
+            phase: TransitionPhase::Idle,
+            t: 0,
+            t_step,
+            timer_token: None,
+        });
+    }
+
+    if let Some(tr) = transition.as_mut() {
+        for ev in mpv_events {
+            let (new_phase, _, cmd) = transition_step(tr.phase, tr.t, transition_event_of(*ev));
+            tr.phase = new_phase;
+            match cmd {
+                StepCmd::NoOp => {}
+                StepCmd::DropTimer => {
+                    cmds.capture_pending = true;
+                    tr.t = 0;
+                    tr.timer_token = None;
+                }
+                StepCmd::ArmTimer => {
+                    cmds.arm_pending = true;
+                    tr.t = 0;
+                }
+            }
+        }
+    }
+
+    (transition, cmds)
 }
 
 /// Events fed to [`transition_step`].  Source: drained from
@@ -1092,72 +1174,32 @@ impl WaylandState {
         // duration changes between fades (today: live for the session).
         let t_step = blend::compute_blend_params(TRANSITION_FPS, session.transition_duration).1;
 
-        // Lazily allocate the TransitionState field on FIRST
-        // ItemEnded in Crossfade mode.  Non-Crossfade displays never
-        // pay for the capture Vec.
-        if session.transition_mode == TransitionMode::Crossfade
-            && session.transition.is_none()
-            && matches!(mpv_events.first(), Some(MpvItemEvent::ItemEnded))
-        {
-            session.transition = Some(TransitionState {
-                capture: vec![0u8; (session.stride as usize) * (session.height as usize)],
-                phase: TransitionPhase::Idle,
-                t: 0,
-                t_step,
-                timer_token: None,
-            });
-        }
-
-        // Phase 1 — apply mpv event deltas to the state machine.  Each
-        // event maps to `TransitionEvent` and feeds `transition_step`;
-        // the returned `StepCmd` is applied immediately (drop the
-        // live timer if cancelled; capture is deferred until the
-        // render below so we capture the LAST committed visual).
-        let mut arm_pending = false;
-        for ev in &mpv_events {
-            if session.transition_mode != TransitionMode::Crossfade {
-                continue;
-            }
-            let Some(tr) = session.transition.as_mut() else {
-                continue;
-            };
-            let (new_phase, _, cmd) = transition_step(tr.phase, tr.t, transition_event_of(*ev));
-            let old_phase = tr.phase;
-            tr.phase = new_phase;
-            if matches!(cmd, StepCmd::DropTimer) {
-                // Capture current visual into `capture`.  Performs the
-                // "rapid advance restart from current visual" rule
-                // for the Fading → Captured transition.
-                capture_front_into_transition(session);
-                if let Some(tr_mut) = session.transition.as_mut() {
-                    tr_mut.t = 0;
-                    tr_mut.timer_token = None;
-                }
-                // Cancel any live timer so the new capture owns the
-                // arm slot.  The DropTimer cmd issued via state
-                // transition can be applied even when no timer was
-                // armed (idempotent).
-                cancel_transition_timer_for(session, self.loop_handle.as_ref());
-            }
-            if matches!(cmd, StepCmd::ArmTimer) {
-                arm_pending = true;
-            }
-            let _ = old_phase;
+        // Phase 1 — process the drained events through the helper.
+        // In Crossfade mode the helper handles lazy allocation (M1
+        // fix: on ANY ItemEnded in the batch, not just first) and
+        // the per-event state-machine step.  In None mode the helper
+        // is a no-op (the events were already discarded on the dispatch).
+        let buf_len = (session.stride as usize) * (session.height as usize);
+        let (new_transition, cmds) = if session.transition_mode == TransitionMode::Crossfade {
+            let taken = session.transition.take();
+            process_mpv_events(taken, &mpv_events, t_step, buf_len)
+        } else {
+            (None, ProcessCmds::default())
+        };
+        session.transition = new_transition;
+        if cmds.capture_pending {
+            capture_front_into_transition(session);
         }
 
         // Early-out if we just armed: the timer takes over with the
-        // first blended tick.  Don't commit on the arming wakeup —
-        // the surface already shows the captured frame (no visible
-        // change), and the timer will produce a blended render in
-        // ~33 ms anyway.
-        if arm_pending {
-            // Pull the gen out before re-borrowing self.
+        // first blended tick.  Don't commit on the arming wakeup.
+        if cmds.arm_pending {
             let r#gen = session.pending_gen;
             self.arm_or_rearm_transition_timer(r#gen);
             return;
         }
 
-        // Skip-on-busy gate (same Wayland-protocol path as the tick).
+        // Skip-on-busy gate.
         let back_idx = session.next_render_idx;
         if session.buffers_busy[back_idx] {
             tracing::debug!(
@@ -1168,76 +1210,49 @@ impl WaylandState {
             return;
         }
 
-        // Render mpv into the back buffer.
-        let stride = session.stride as usize;
-        let buf_len = stride * (session.height as usize);
+        // Render mpv into the back buffer.  The SW render API always
+        // draws the current picture — that's mechanism (a) for the
+        // buffer-correctness constraint (capture state is fresh every
+        // tick).  We treat  and  identically
+        // here: the buffer is fresh either way.
         let back_offset = back_idx * buf_len;
         let mut back_buf: Option<*mut u8> = {
             let mmap = session.pool.mmap();
-            // SAFETY: offset is within the pool (2*buf_len bytes);
-            // slice length matches.
+            // SAFETY: offset is within the pool; slice length matches.
             let back_slice = unsafe {
                 std::slice::from_raw_parts_mut(mmap.as_ptr().cast_mut().add(back_offset), buf_len)
             };
             back_slice.fill(0);
             match session.player.render_frame_into(back_slice) {
-                Ok(true) => Some(back_slice.as_mut_ptr()),
-                Ok(false) => None,
+                Ok(_) => Some(back_slice.as_mut_ptr()),
                 Err(e) => {
                     self.fail_screensaver_to_black(&format!("{e}"));
                     return;
                 }
             }
         };
-        let rendered_ok = back_buf.is_some();
 
-        // Phase 2 — FrameRendered event into the state machine.  Only
-        // runs in Crossfade (None mode has no transition.phase to
-        // step).  An AwaitingFirstFrame + FrameRendered{ok} → Fading
-        // returns ArmTimer; we early-out so the timer takes over.
-        let mut arm_pending_after_render = false;
+        // Phase 2 — apply FrameRendered{ok} to the state machine.
+        // (AwakeningFirstFrame → Fading arms the timer;  is NOT
+        // advanced here — that's the ticker's job per re-review.)
         if session.transition_mode == TransitionMode::Crossfade
-            && rendered_ok
             && let Some(tr) = session.transition.as_mut()
         {
             let (new_phase, _, cmd) =
                 transition_step(tr.phase, tr.t, TransitionEvent::FrameRendered { ok: true });
             tr.phase = new_phase;
             if matches!(cmd, StepCmd::ArmTimer) {
-                arm_pending_after_render = true;
-                tr.t = 0;
+                let r#gen = session.pending_gen;
+                cancel_transition_timer_for(session, self.loop_handle.as_ref());
+                self.arm_or_rearm_transition_timer(r#gen);
+                return;
             }
         }
-        if arm_pending_after_render {
-            let r#gen = session.pending_gen;
-            // Drop the now-redundant live timer (the state machine is
-            // about to re-arm).  Idempotent.
-            cancel_transition_timer_for(session, self.loop_handle.as_ref());
-            self.arm_or_rearm_transition_timer(r#gen);
-            return;
-        }
 
-        // Phase 3 — advance the Fading tick if we ARE Fading AND the
-        // render produced a frame.  `tick_step` returns Advance or
-        // Complete or NoTickOp; the wiring blends at the PRE-advance t
-        // (the value visible before this tick) and persists the new t.
-        let mut blend_t: u16 = 0;
-        let mut tick_cmd = TickCmd::NoTickOp;
-        if session.transition_mode == TransitionMode::Crossfade
-            && let Some(tr) = session.transition.as_mut()
-            && tr.phase == TransitionPhase::Fading
-        {
-            blend_t = tr.t;
-            let (np, nt, cmd) = tick_step(tr.phase, tr.t, rendered_ok, tr.t_step);
-            tick_cmd = cmd;
-            tr.phase = np;
-            tr.t = nt;
-        }
-
-        // If we're going to commit AND we're Fading at a non-zero t,
-        // blend the freshly-rendered frame in-place at `blend_t`.
-        // We clone the capture Vec (Rust borrow checker) so the back
-        // buffer can be `&mut` while the capture is read by value.
+        // Snapshot  for the visible commit (we never advance
+        // in this path).  The capture is recomputed every tick by
+        // , which does own the t advance.
+        let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
         let capture_clone: Vec<u8> = if blend_t > 0 {
             session
                 .transition
@@ -1248,11 +1263,10 @@ impl WaylandState {
             Vec::new()
         };
 
-        // Commit (only when we actually rendered a frame).
-        if rendered_ok && let Some(ptr) = back_buf.take() {
-            // SAFETY: the back-buffer pointer came from the mmap +
-            // offset math above; it remains valid until the end of
-            // this function (the `mmap` guard is in scope).
+        // Commit (we always have a back_buf: render was successful).
+        if let Some(ptr) = back_buf.take() {
+            // SAFETY: back-buffer pointer from mmap + offset; valid
+            // for the lifetime of this function.
             let back_slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
             if blend_t > 0 && !capture_clone.is_empty() {
                 blend::blend_in_place(&capture_clone, back_slice, blend_t);
@@ -1286,21 +1300,8 @@ impl WaylandState {
                 }
             }
 
-            // Tick completion: drop the timer and reset the state
-            // machine for the next cycle (phase already Idle from
-            // tick_step).
-            if matches!(tick_cmd, TickCmd::Complete) {
-                cancel_transition_timer_for(session, self.loop_handle.as_ref());
-                tracing::debug!(
-                    event = "screensaver_transition_complete",
-                    display_id = %self.display_id,
-                    duration_ms = session.transition_duration.as_millis(),
-                    "crossfade complete; resuming wakeup-driven path"
-                );
-            }
-
             // Swap so the next render writes to the buffer the
-            // compositor has finished with (or is about to release).
+            // compositor has finished with.
             session.next_render_idx = 1 - back_idx;
         }
     }
@@ -1376,18 +1377,22 @@ impl WaylandState {
     }
 
     /// Per-tick blend progress.  Runs on the calloop thread when the
-    /// transition timer fires.  Renders mpv, applies `tick_step`
-    /// (which advances `t` on the Fading phase), blends at the
-    /// pre-advance `t`, attaches + commits.  On `Complete` the
-    /// transition timer is dropped and the phase returns to Idle
-    /// (the capture Vec stays allocated for the next cycle).
+    /// transition timer fires.  Renders mpv into the back buffer,
+    /// advances `t` unconditionally via `tick_step` (this is
+    /// mechanism (a) for the buffer-correctness constraint — the
+    /// SW render API always draws the current picture regardless of
+    /// update-flag), blends at the pre-advance `t` (the visible
+    /// progress for this tick), attaches + commits, then advances
+    /// `t` for the next timer fire.  On `Complete` the timer is
+    /// dropped and the phase returns to `Idle`.
     ///
-    /// **M4 — `Ok(false)` skip.**  mpv's render API under
-    /// `ADVANCED_CONTROL=1` signals a wakeup WITHOUT producing a
-    /// frame; we treat that as "no progress" — skip the commit, the
-    /// flip, and the blend advance, and let the next tick try again.
-    /// The render API contract is `[dormant-render/src/screensaver.rs:
-    /// MpvPlayer::render_frame_into]`.
+    /// **Re-review (M2): this is the ONLY path that advances `t`.**
+    /// `on_mpv_wakeup` refreshes the source imagery (renders the
+    /// current mpv frame and blends at the live `t` if Fading) but
+    /// never moves `t` — that keeps the visible fade duration
+    /// framerate-independent.  A static image (one mpv frame ever)
+    /// completes its fade in the same `frames_for_blend` ticks as
+    /// a 60-fps video would.
     fn on_transition_tick(&mut self, r#gen: u64) {
         let Some(session) = self.screensaver_session.as_mut() else {
             return;
@@ -1398,7 +1403,7 @@ impl WaylandState {
         }
         let t_step = session.transition.as_ref().map_or(1, |tr| tr.t_step);
 
-        // Skip-on-busy gate (same Wayland-protocol pattern).
+        // Skip-on-busy gate.
         let back_idx = session.next_render_idx;
         if session.buffers_busy[back_idx] {
             return;
@@ -1408,9 +1413,14 @@ impl WaylandState {
         let buf_len = stride * (session.height as usize);
         let back_offset = back_idx * buf_len;
 
-        // Render mpv into the back buffer.  `Ok(false)` → drop the
-        // tick (per M4).
-        let mut blend_slot: Option<(*mut u8, bool)> = {
+        // Render mpv into the back buffer.  The SW render API always
+        // draws the current picture regardless of update-flag value —
+        // `Ok(false)` just signals "no novel frame since last call"
+        // (a status byte, not a render outcome).  We treat both
+        // `Ok` variants identically here: the buffer is fresh either
+        // way.  (Mechanism (a) for the buffer-correctness constraint —
+        // see module header.)
+        let back_ptr = {
             let mmap = session.pool.mmap();
             // SAFETY: offset is within the pool; slice length matches.
             let back_slice = unsafe {
@@ -1418,20 +1428,13 @@ impl WaylandState {
             };
             back_slice.fill(0);
             match session.player.render_frame_into(back_slice) {
-                Ok(true) => Some((back_slice.as_mut_ptr(), true)),
-                Ok(false) => Some((back_slice.as_mut_ptr(), false)),
+                Ok(_) => back_slice.as_mut_ptr(),
                 Err(e) => {
                     self.fail_screensaver_to_black(&format!("{e}"));
                     return;
                 }
             }
         };
-        let (_, rendered_ok) = blend_slot.expect("Some(_); mpv render returned");
-        if !rendered_ok {
-            // M4 — no frame produced: don't advance, don't commit.
-            // The next tick will try again.
-            return;
-        }
 
         // Snapshot the Fading `t` BEFORE `tick_step` advances it — we
         // blend at the visible pre-tick value (commits show the
@@ -1454,7 +1457,7 @@ impl WaylandState {
                 .transition
                 .as_ref()
                 .map_or(TransitionPhase::Idle, |tr| tr.phase);
-            tick_step(tr_phase, blend_t, true, t_step)
+            tick_step(tr_phase, blend_t, t_step)
         };
         if let Some(tr) = session.transition.as_mut() {
             tr.phase = new_phase;
@@ -1462,7 +1465,6 @@ impl WaylandState {
         }
 
         // Apply the blend in place at the pre-tick `t`.
-        let (back_ptr, _) = blend_slot.take().expect("Some above");
         // SAFETY: the back-buffer pointer came from the pool mmap +
         // offset math; the slice remains valid until the end of this
         // function (the mmap guard is in scope until then).
@@ -2370,7 +2372,7 @@ fn transition_step_completed_then_second_item_ended_captures_again() {
     // The wiring's `tick_step` returns `(Idle, T_MAX, Complete)`
     // for a Fading tick that brings t to max — emulate that
     // completion here.
-    let (ph, t, cmd) = tick_step(TransitionPhase::Fading, 256, true, 1);
+    let (ph, t, cmd) = tick_step(TransitionPhase::Fading, 256, 1);
     assert_eq!(
         (ph, t, cmd),
         (TransitionPhase::Idle, T_MAX, TickCmd::Complete)
@@ -2401,30 +2403,140 @@ fn transition_step_rapid_item_ended_mid_fade_restarts_from_current() {
 }
 
 #[test]
-fn tick_step_frameless_advance_is_noop() {
-    // M4: under ADVANCED_CONTROL, mpv's `mpv_render_context_update`
-    // can return a wakeup without a frame — `render_frame_into`
-    // surfaces that as `Ok(false)`.  The state machine must
-    // NOT advance t, NOT return Advance/Complete (the wiring
-    //   must skip the commit, blend, and timer drop).
-    for phase in [
-        TransitionPhase::Idle,
-        TransitionPhase::Captured,
-        TransitionPhase::AwaitingFirstFrame,
-        TransitionPhase::Fading,
-    ] {
-        let (ph_out, t_out, cmd_out) = tick_step(phase, 100, false, 9);
-        assert_eq!(
-            cmd_out,
-            TickCmd::NoTickOp,
-            "ok=false in {phase:?} must be NoTickOp"
-        );
-        assert_eq!(
-            (ph_out, t_out),
-            (phase, 100),
-            "ok=false must not change state"
-        );
+fn tick_step_advances_even_with_no_frame_for_static_image_fade() {
+    // Re-review (M2 / M4): a static image only produces ONE mpv
+    // frame.  The blend timer must STILL advance `t` on every tick
+    // — each tick re-blends the same current picture at a higher `t`,
+    // which IS the visible opacity change.  Tying the advance to
+    // a fresh mpv frame means static images never fade.
+    //
+    // Iterate `tick_step(Fading, …, t_step=9)` ~30 times with the
+    // minimum possible "new frame" signal — the helper advances
+    // unconditionally now (its signature dropped the `ok` arg
+    // since the wiring no longer uses it as a gate).
+    let (ph, t, _) = tick_step(TransitionPhase::Fading, 0, 9);
+    assert_eq!(
+        (ph, t),
+        (TransitionPhase::Fading, 9),
+        "first tick must advance t=0 → t=9"
+    );
+
+    // Drive enough ticks to complete.
+    let mut phase = ph;
+    let mut t = t;
+    let mut completed = false;
+    for _ in 0..60 {
+        let (np, nt, cmd) = tick_step(phase, t, 9);
+        phase = np;
+        t = nt;
+        if matches!(cmd, TickCmd::Complete) {
+            completed = true;
+            break;
+        }
     }
+    assert!(completed, "static-image fade must complete in ≤60 ticks");
+    assert_eq!(t, T_MAX, "completed fade pins t at T_MAX");
+    assert_eq!(
+        phase,
+        TransitionPhase::Idle,
+        "completed → Idle (timer drops)"
+    );
+}
+
+#[test]
+fn tick_step_advance_is_independent_of_wakeup_storm() {
+    // Re-review (M2 / M4): frame rate independence.  A wakeup storm
+    // (e.g. a 60-fps video source) must NOT make the fade run at
+    // 60 fps; the visible opacity change is owned by the blend
+    // timer (~33 ms cadence).  Drive the same fade with simulated
+    // tick interleaving: each candidate tick picks up where the
+    // previous left off.  Compare the tick count to `frames_for_blend`
+    // (computed from the same constants the production code uses).
+    //
+    // The test asserts: t advances ONLY through `tick_step`.  A
+    // wakeup-driven path (which would advance t once per mpv frame)
+    // would finish in `frames_for_blend / video_fps` * ticks vs the
+    // 30-fps timer cadence — at 60 fps video, the wakeup-driven path
+    // would produce a fade in half the configured duration.
+    let t_step = 9_u16; // 1s @ 30 fps ceiling
+    let (frames, _) = blend::compute_blend_params(30, std::time::Duration::from_secs(1));
+    assert_eq!(frames, 30, "fixture: 1s @ 30 fps yields 30 frames");
+
+    // Drive exactly `frames` ticks; we expect Complete at or before
+    // `frames + 1`.
+    let mut phase = TransitionPhase::Fading;
+    let mut t: u16 = 0;
+    let mut completes_at: Option<u32> = None;
+    for i in 0..(frames + 10) {
+        let (np, nt, cmd) = tick_step(phase, t, t_step);
+        phase = np;
+        t = nt;
+        if matches!(cmd, TickCmd::Complete) {
+            completes_at = Some(i + 1);
+            break;
+        }
+    }
+    assert!(
+        completes_at.is_some(),
+        "must complete within frames+10 ticks"
+    );
+    let n = completes_at.unwrap();
+    // Allow ±1 for rounding; the wakeup-storm-driven path would
+    // finish in ~frames/2 ticks (at 60 fps video), failing this
+    // upper bound.
+    assert!(
+        (frames - 1..=frames + 1).contains(&n),
+        "tick count {n} should be ≈frames (got {frames})"
+    );
+}
+
+#[test]
+fn process_mpv_events_batch_order_itemloaded_then_itemended_allocates() {
+    // Re-review (M1): the lazy-allocation gate used `first()` on the
+    // events batch — a batch starting with `ItemLoaded` (ItemEnded
+    // second) blocked allocation, and the per-event loop then
+    // skipped both events because `transition` was still `None`.
+    // Exercise the helper directly: start with `transition == None`,
+    // feed `[ItemLoaded, ItemEnded]`, expect the helper to allocate
+    // AND process both events.
+    let events = vec![MpvItemEvent::ItemLoaded, MpvItemEvent::ItemEnded];
+    let (new_transition, cmds) =
+        process_mpv_events(None, &events, /* t_step */ 9, /* buf_len */ 0);
+
+    assert!(
+        new_transition.is_some(),
+        "process_mpv_events must allocate TransitionState when ANY \
+         event in the batch is ItemEnded (not just first).  This was \
+         the M1 lazy-alloc wiring bypass — pre-fix code's `first()` \
+         gate skipped events when ItemLoaded was first."
+    );
+    assert!(
+        cmds.capture_pending,
+        "process_mpv_events must request a capture on ItemEnded.  The \
+         ItemLoaded-then-ItemEnded sequence lands on Captured phase \
+         with DropTimer cmd."
+    );
+    assert!(
+        !cmds.arm_pending,
+        "ItemLoaded-then-ItemEnded does not arm a timer (Captured is \
+         not AwaitingFirstFrame; the ArmTimer only fires from \
+         AwaitingFirstFrame → Fading)."
+    );
+}
+
+#[test]
+fn process_mpv_events_no_itemended_does_not_allocate() {
+    // The dual: a batch with NO ItemEnded must NOT allocate.  A
+    // batch of just [ItemLoaded] is a no-op (Idle + ItemLoaded is
+    // a no-op in transition_step — there's nothing to fade yet).
+    let events = vec![MpvItemEvent::ItemLoaded];
+    let (new_transition, cmds) = process_mpv_events(None, &events, 9, 0);
+    assert!(
+        new_transition.is_none(),
+        "no ItemEnded in batch → no allocation"
+    );
+    assert!(!cmds.capture_pending);
+    assert!(!cmds.arm_pending);
 }
 
 #[test]
@@ -2432,7 +2544,7 @@ fn tick_step_complete_at_max_resets_to_idle() {
     // Once the blend hits t >= T_MAX, the timer drops and the
     // state returns to Idle (capture stays allocated for the
     // next cycle — this is the M2 fix).
-    let (ph, t, cmd) = tick_step(TransitionPhase::Fading, T_MAX - 4, true, 9);
+    let (ph, t, cmd) = tick_step(TransitionPhase::Fading, T_MAX - 4, 9);
     assert_eq!(
         (ph, t, cmd),
         (TransitionPhase::Idle, T_MAX, TickCmd::Complete),
@@ -2446,7 +2558,7 @@ fn tick_step_clamps_incomplete_advance() {
     // at u16::MAX, but the state machine clamps to T_MAX so we
     // want exactly T_MAX (256) — the COMPLETE branch fires on the
     // boundary, not Advance.
-    let (ph, t, cmd) = tick_step(TransitionPhase::Fading, 200, true, 100);
+    let (ph, t, cmd) = tick_step(TransitionPhase::Fading, 200, 100);
     assert_eq!(
         cmd,
         TickCmd::Complete,

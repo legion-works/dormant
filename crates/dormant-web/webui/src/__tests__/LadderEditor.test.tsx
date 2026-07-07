@@ -154,4 +154,55 @@ describe("LadderEditor", () => {
     expect(options).toContain("render_screensaver");
     expect(options).toContain("power_off");
   });
+
+  it("omits absent dwell on terminal stage when editing another stage (null from JSON round-trip)", async () => {
+    // Mimic the real server response: terminal stage has dwell: null, not absent.
+    const serverStages: LadderStage[] = [
+      { kind: "render_screensaver", dwell: "5m" },
+      { kind: "render_black", dwell: "5m" },
+      { kind: "power_off", dwell: null as unknown as undefined },
+    ];
+    const { store } = renderEditor(serverStages);
+
+    // Edit the dwell of stage index 1 (render_black)
+    const dwellInputs = screen.getAllByLabelText("dwell");
+    expect(dwellInputs.length).toBeGreaterThanOrEqual(2);
+    // The terminal stage has null dwell -> coerced to "" by DurationField,
+    // but we edit index 1.
+    fireEvent.change(dwellInputs[1], { target: { value: "10s" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as LadderStage[];
+
+    // Terminal stage (index 2) must NOT have a dwell key at all.
+    expect("dwell" in (value[2] as unknown as Record<string, unknown>)).toBe(false);
+    // Edited stage has the new dwell
+    expect(value[1]).toEqual({ kind: "render_black", dwell: "10s" });
+  });
+
+  it("serialised patch value contains no null for absent dwell", async () => {
+    const serverStages: LadderStage[] = [
+      { kind: "render_screensaver", dwell: "5m" },
+      { kind: "render_black", dwell: "5m" },
+      { kind: "power_off", dwell: null as unknown as undefined },
+    ];
+    const { store } = renderEditor(serverStages);
+
+    // Edit dwell of stage index 1
+    const dwellInputs = screen.getAllByLabelText("dwell");
+    fireEvent.change(dwellInputs[1], { target: { value: "10s" } });
+
+    const patches = store.buildPatches();
+    const json = JSON.stringify(patches);
+
+    // The serialised JSON must not contain null anywhere.
+    // JSON.stringify produces the literal string "null" for null values;
+    // we check that the word "null" does not appear as a JSON value.
+    // Use a regex that matches null as a JSON value (after : or [ or ,)
+    expect(json).not.toMatch(/:null\b/);
+    expect(json).not.toMatch(/\[null\b/);
+    expect(json).not.toMatch(/,null\b/);
+  });
 });

@@ -106,4 +106,43 @@ describe("ScreensaverEditor", () => {
     expect(screen.getByLabelText("transition")).toBeInTheDocument();
     expect(screen.getByLabelText("transition_duration")).toBeInTheDocument();
   });
+
+  it("omits null optional fields when editing another source (null from JSON round-trip)", async () => {
+    // Mimic server response: order and image_duration are null (Option::None in Rust).
+    const ss: ScreensaverConfig = {
+      trigger: "escalation",
+      audio: false,
+      scale_mode: "fill",
+      transition: "crossfade",
+      transition_duration: "1s",
+      source: [
+        { path: "/a", recurse: false, shuffle: false, order: null as unknown as string, image_duration: null as unknown as string },
+        { path: "/b", recurse: true, shuffle: false, order: "sequential", image_duration: "5s" },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    // Edit path of source index 1
+    const pathInputs = screen.getAllByLabelText("path");
+    expect(pathInputs.length).toBe(2);
+    fireEvent.change(pathInputs[1], { target: { value: "/c" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(2);
+
+    // Source 0 (unchanged) must NOT have null keys.
+    const s0 = value[0] as Record<string, unknown>;
+    expect("order" in s0).toBe(false);
+    expect("image_duration" in s0).toBe(false);
+    // path should still be present (non-null)
+    expect(s0.path).toBe("/a");
+    expect(s0.recurse).toBe(false);
+    expect(s0.shuffle).toBe(false);
+
+    // Source 1 has the edited path
+    expect(value[1]).toEqual({ path: "/c", recurse: true, shuffle: false, order: "sequential", image_duration: "5s" });
+  });
 });

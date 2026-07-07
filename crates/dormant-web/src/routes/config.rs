@@ -19,6 +19,7 @@ use dormant_core::config::{
 };
 use dormant_displays::registry::capabilities;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::WebState;
 use crate::error::WebError;
@@ -73,6 +74,11 @@ pub(crate) struct ConfigResponse {
     pub(crate) validation: ConfigValidation,
     /// Per-display → {rule, zone} reverse-lookup (spec §7 — backend-owned).
     pub(crate) display_rules: HashMap<String, DisplayRuleInfo>,
+    /// Lowercase hex SHA-256 of the on-disk config bytes, computed before redaction.
+    pub(crate) fingerprint: String,
+    /// TOML-key paths of every value that was redacted, in discovery order.
+    /// Array indices are rendered as decimal strings.
+    pub(crate) redacted_paths: Vec<Vec<String>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -94,14 +100,14 @@ pub(crate) async fn get_config(
     // EVERY return path MUST use this redacted inventory so no secret leaks
     // on error paths.  Compute once up front.
     let mut inventory = Arc::unwrap_or_clone(config_rx);
-    redact_config_secrets(&mut inventory);
+    let redacted_paths = redact_config_secrets(&mut inventory);
     let display_rules = build_display_rules(&inventory);
 
     // ── Step 2 — on-disk validation (raw TOML + load/parse/creds) ──────
     let creds_path = config_path.with_extension("creds.toml");
 
-    let raw_on_disk = match std::fs::read_to_string(config_path) {
-        Ok(raw) => raw,
+    let raw_bytes = match std::fs::read(config_path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             // I/O read failure → normal body with load_error, redacted inventory.
             let raw_toml = redact_raw_secrets("");
@@ -118,9 +124,14 @@ pub(crate) async fn get_config(
                     load_error: Some(format!("cannot read config file: {e}")),
                 },
                 display_rules,
+                fingerprint: String::new(),
+                redacted_paths,
             }));
         }
     };
+
+    let fingerprint = format!("{:x}", Sha256::digest(&raw_bytes));
+    let raw_on_disk = String::from_utf8_lossy(&raw_bytes).into_owned();
 
     let (warnings, errors, load_error) = match load_config(config_path, Strictness::Warn) {
         Ok((cfg, warns)) => {
@@ -142,6 +153,8 @@ pub(crate) async fn get_config(
                             load_error: Some(e.to_string()),
                         },
                         display_rules,
+                        fingerprint,
+                        redacted_paths,
                     }));
                 }
             };
@@ -192,6 +205,8 @@ pub(crate) async fn get_config(
             load_error,
         },
         display_rules,
+        fingerprint,
+        redacted_paths,
     }))
 }
 
@@ -215,32 +230,78 @@ fn build_display_rules(cfg: &Config) -> HashMap<String, DisplayRuleInfo> {
 // ── Secret redaction ─────────────────────────────────────────────────────────
 
 /// Redact inline userinfo from every URL-shaped string field across all sensor
-/// configs and display configs.
-fn redact_config_secrets(cfg: &mut Config) {
-    for sensor in cfg.sensors.values_mut() {
+/// configs and display configs, returning the TOML-key path of each redacted
+/// value in discovery order.
+fn redact_config_secrets(cfg: &mut Config) -> Vec<Vec<String>> {
+    let mut paths: Vec<Vec<String>> = Vec::new();
+
+    for (sensor_id, sensor) in cfg.sensors.iter_mut() {
         match sensor {
             SensorConfig::Mqtt(MqttSensorCfg { broker_url, .. }) => {
-                *broker_url = redact_url(broker_url);
+                let redacted = redact_url(broker_url);
+                if redacted != *broker_url {
+                    *broker_url = redacted;
+                    paths.push(vec![
+                        "sensors".to_string(),
+                        sensor_id.clone(),
+                        "broker_url".to_string(),
+                    ]);
+                }
             }
             SensorConfig::Ha(HaSensorCfg { url, .. }) => {
-                *url = redact_url(url);
+                let redacted = redact_url(url);
+                if redacted != *url {
+                    *url = redacted;
+                    paths.push(vec![
+                        "sensors".to_string(),
+                        sensor_id.clone(),
+                        "url".to_string(),
+                    ]);
+                }
             }
             SensorConfig::UsbLd2410(_) => {
                 // No URL fields.
             }
         }
     }
-    for display in cfg.displays.values_mut() {
-        redact_display_secrets(display);
+    for (display_id, display) in cfg.displays.iter_mut() {
+        redact_display_secrets(display, &mut paths, display_id);
     }
+    paths
 }
 
-/// Redact userinfo in URL-shaped fields of a [`DisplayConfig`].
-fn redact_display_secrets(dc: &mut DisplayConfig) {
+/// Redact userinfo in URL-shaped fields of a [`DisplayConfig`], appending each
+/// redacted field's TOML-key path to `paths`.
+fn redact_display_secrets(dc: &mut DisplayConfig, paths: &mut Vec<Vec<String>>, display_id: &str) {
     if let Some(ref url) = dc.ha_url {
         let redacted = redact_url(url);
         if redacted != *url {
             dc.ha_url = Some(redacted);
+            paths.push(vec![
+                "displays".to_string(),
+                display_id.to_string(),
+                "ha_url".to_string(),
+            ]);
+        }
+    }
+    // Screensaver source URLs — each is a URL-shaped string that may carry userinfo.
+    if let Some(ref mut sc) = dc.screensaver {
+        for (src_idx, source) in sc.source.iter_mut().enumerate() {
+            for (url_idx, url) in source.urls.iter_mut().enumerate() {
+                let redacted = redact_url(url);
+                if redacted != *url {
+                    *url = redacted;
+                    paths.push(vec![
+                        "displays".to_string(),
+                        display_id.to_string(),
+                        "screensaver".to_string(),
+                        "source".to_string(),
+                        src_idx.to_string(),
+                        "urls".to_string(),
+                        url_idx.to_string(),
+                    ]);
+                }
+            }
         }
     }
     // host (IP/hostname) and wol_mac have no userinfo.
@@ -284,7 +345,9 @@ fn redact_url(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dormant_core::config::schema::{DaemonConfig, SensorConfig};
+    use dormant_core::config::schema::{
+        DaemonConfig, ScreensaverConfig, ScreensaverSource, SensorConfig,
+    };
     use indexmap::IndexMap;
 
     fn write_temp_config(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -472,6 +535,122 @@ mod tests {
     }
 
     #[test]
+    fn redacted_paths_from_cfg_mqtt_and_screensaver_urls() {
+        use dormant_core::config::schema::MqttSensorCfg;
+
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert(
+            "desk".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://u:p@h:1883".into(),
+                topic: "dormant/desk".into(),
+                field: "/val".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: dormant_core::config::schema::SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+
+        let mut displays: IndexMap<String, DisplayConfig> = IndexMap::new();
+        let source = ScreensaverSource {
+            path: None,
+            urls: vec!["http://user:pass@example.com/img.jpg".into()],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+        let screensaver = ScreensaverConfig {
+            trigger: "vacancy".into(),
+            audio: false,
+            source: vec![source],
+            scale_mode: None,
+            transition: None,
+            transition_duration: None,
+        };
+        displays.insert(
+            "tv".into(),
+            DisplayConfig {
+                controllers: vec!["kwin-dpms".into()],
+                blank_mode: None,
+                degraded_mode: None,
+                ladder: vec![],
+                screensaver: Some(screensaver),
+                output: None,
+                ddc_display: None,
+                host: None,
+                wol_mac: None,
+                blank_command: None,
+                wake_command: None,
+                modes: None,
+                ha_url: None,
+                blank_service: None,
+                blank_data: None,
+                wake_service: None,
+                wake_data: None,
+                command_timeout: std::time::Duration::from_secs(5),
+                restore_brightness: 100,
+                treat_unreachable_as_blanked: false,
+            },
+        );
+
+        let mut cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors,
+            zones: IndexMap::default(),
+            displays,
+            rules: IndexMap::default(),
+        };
+
+        let paths = redact_config_secrets(&mut cfg);
+
+        let expected: Vec<Vec<String>> = vec![
+            vec!["sensors".into(), "desk".into(), "broker_url".into()],
+            vec![
+                "displays".into(),
+                "tv".into(),
+                "screensaver".into(),
+                "source".into(),
+                "0".into(),
+                "urls".into(),
+                "0".into(),
+            ],
+        ];
+        assert_eq!(paths, expected, "redacted_paths must be exact");
+    }
+
+    #[test]
+    fn redacted_paths_empty_when_no_secrets() {
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert(
+            "desk".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://host:1883".into(), // No userinfo
+                topic: "dormant/desk".into(),
+                field: "/val".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: dormant_core::config::schema::SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        let mut cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors,
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        };
+        let paths = redact_config_secrets(&mut cfg);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
     fn redact_raw_secrets_redacts_userinfo_in_toml() {
         let raw = r#"[sensors.desk]
 type = "mqtt"
@@ -505,6 +684,23 @@ topic = "test""#;
         assert!(resp.validation.ok);
         assert!(resp.validation.errors.is_empty());
         assert!(resp.validation.load_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn fingerprint_is_sha256_of_disk_bytes() {
+        let content = "config_version = 1\n";
+        let (_dir, path) = write_temp_config(content);
+        let state = test_config_state(path, config_with_secret());
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+        let expected = format!("{:x}", Sha256::digest(content.as_bytes()));
+        assert_eq!(resp.fingerprint, expected);
+        // Fingerprint must be lowercase hex.
+        assert!(
+            resp.fingerprint
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[tokio::test]

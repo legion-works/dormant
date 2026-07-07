@@ -46,6 +46,7 @@ ddc-hi = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 notify = "7"
+sha2 = "0.10"
 tempfile = "3"
 
 # The profile that 'dist' will build with

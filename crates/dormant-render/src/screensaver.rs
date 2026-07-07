@@ -19,8 +19,7 @@
 //! ## Sandbox flags
 //!
 //! The init-time flags pin the embedded player to an unprivileged,
-//! no-network-by-default sandbox.  Per the libmpv spike report (§Q3 +
-//! gotcha #4):
+//! no-network-by-default sandbox.  Rationale per flag:
 //!
 //! | flag | value | reason |
 //! |------|-------|--------|
@@ -1262,37 +1261,40 @@ mod tests {
     ///
     /// ## Why a 1:4 portrait fixture?
     ///
-    /// Earlier revisions of this test compared 320×180 SW render against
-    /// the same 320×180 testsrc fixture (a 16:9 source).  That was a
-    /// tautology: Fill and Fit have no geometric reason to differ on a
-    /// source whose aspect matches the target — the `assert_ne!` only
-    /// passed from decoder/timestamp drift between two independently
-    /// sampled mpv players, NOT from any scaling, so a regression that
-    /// dropped the `panscan` property-set silently passed the test.
-    /// This reviewer red-check is recorded in the P2.1 review report.
+    /// The render target is 320×180 (16:9).  A source whose aspect matches
+    /// the target cannot distinguish Fill from Fit geometrically — both
+    /// end up filling the buffer identically — so any equality test on
+    /// such a fixture passes from decoder/timestamp drift between two
+    /// independently sampled players, not from scaling.  A regression
+    /// that dropped the `panscan` property-set would silently pass.
     ///
-    /// On a 100×400 (1:4) source against a 320×180 (16:9) target, Fit
-    /// must letterbox with ~45×180 px content band centred → ~137 px
-    /// pillars each side.  Fill must cover the width (with the slight
-    /// panscan off-centre quirk up to ~37 px on extreme 1:4 sources),
-    /// so the combined pillar count is bounded at ≪ 137.
+    /// A 100×400 (1:4) source against a 320×180 target gives Fit no path
+    /// to a full-width render without distortion: it must letterbox with
+    /// ~45×180 px content band centred → ~137 px pillars each side.
+    /// Fill must cover the width (with the slight panscan off-centre
+    /// quirk up to ~37 px on extreme 1:4 sources), so the combined pillar
+    /// count is bounded at ≪ 137.  Those two floors make the test
+    /// sharply distinguish a panscan-applied Fill from a Fit-defaulted
+    /// one.
     ///
     /// ## Pillars semantics
     ///
     /// A column is a "black pillar" if EVERY sampled row (y ∈
     /// {10, 30, 60, 90, 120, 150, 170}) has BGR ≤ 8 (the same tolerance
-    /// used by the original probe and `build_test_player`'s test
-    /// pattern).  A column with ANY non-black row is content.  We count
-    /// **maximum consecutive black columns from the left edge** as the
-    /// "left pillar width" and same from the right edge as the right
-    /// pillar width — this catches both letterboxing and any future
-    /// border-drawing regressions.
+    /// used by `build_test_player`'s test pattern).  A column with ANY
+    /// non-black row is content.  We count **maximum consecutive black
+    /// columns from the left edge** as the "left pillar width" and same
+    /// from the right edge as the right pillar width — this catches both
+    /// letterboxing and any future border-drawing regressions.
     ///
-    /// ## RED-check guarantee
+    /// ## Invariant
     ///
-    /// Removing the `panscan=1.0` property-set line for Fill causes
-    /// this test to FAIL — confirmed against the broken code path
-    /// (re-run during P2.1 review).
+    /// Fails when the `panscan` property-set for Fill is dropped — the
+    /// pillars reappear (identical to Fit's letterbox widths, ≈137 px
+    /// each side on this 1:4 source).  Confirmed by deliberately breaking
+    /// the property-set and re-running the test — the assertion names
+    /// `panscan` in its diagnostic so the regression is immediately
+    /// attributable.
     #[allow(clippy::too_many_lines)]
     #[test]
     fn mpv_player_fill_renders_no_letterbox_on_portrait_fixture() {
@@ -1426,12 +1428,13 @@ mod tests {
              got {fit_right}."
         );
 
-        // ── Fill must NOT letterbox (THIS is the RED-check) ─────────
-        // Fill (panscan=1.0) covers the width.  The extreme 1:4 source
-        // still produces a slight off-centre quirk: per the STEP-0
-        // probe evidence, pillars total ≤ ~40 px.  We allow ≤ 80 as a
-        // margin for codec/file-path variance; >= 100 (the Fit floor)
-        // would unambiguously mean "looks letterboxed → panscan not
+        // ── Fill must NOT letterbox ─────────────────────────────────
+        // Fill (panscan=1.0) covers the width.  The 1:4 source still
+        // produces a slight off-centre quirk from panscan's centring
+        // math: combined pillar count stays bounded under ~40 px on
+        // a clean mpv build.  We allow ≤ 80 as a margin for
+        // codec/file-path variance; ≥ 100 (the Fit floor) would
+        // unambiguously mean "looks letterboxed → panscan not
         // applied".  This is the assertion that catches
         // `mpv.set_property(\"panscan\", ...)` being removed.
         let fill_total = fill_left + fill_right;
@@ -1440,7 +1443,7 @@ mod tests {
             "Fill must fill width on the 1:4 fixture (≤80 px combined pillars); \
              got L={fill_left} + R={fill_right} = {fill_total} px.  \
              Likely cause: the `panscan` property-set was dropped or \
-             regressed (this test fails RED when it does — verified during P2.1 review)."
+             regressed (the pillars reappear to Fit's letterbox widths)."
         );
 
         // Bonus geometric identity: Fill's pillars must be smaller than

@@ -51,16 +51,19 @@ pub(crate) enum RenderCommand {
     /// registered config the sink resolves the show with
     /// `E_RENDER_UNAVAILABLE` and never sends this command.
     ///
-    /// On success, the reply resolves once the surface is committed
-    /// with the screensaver's first shm buffer attached.  Pre-first-
-    /// frame failures (mpv init / loadfile / 5-second-no-first-frame
-    /// timeout) resolve as `Err` so the engine falls through.  Post-
-    /// first-frame failures during operation switch the surface back
-    /// to the opaque-black buffer on the SAME surface (no destroy /
-    /// flicker) and log `screensaver_failed_to_black`.
+    /// The reply is held pending until EITHER the first successful mpv
+    /// render lands (→ `Ok(())`) OR the first-frame deadline fires
+    /// (→ `Err(E_RENDER_UNAVAILABLE)`).  Pre-install failures
+    /// (mpv init / shm pool / calloop insert) also resolve with
+    /// `Err` so the engine falls through — a missing file must NOT
+    /// produce `Ok`-then-failed-to-black.  Post-first-frame failures
+    /// during operation switch the surface back to the opaque-black
+    /// buffer on the SAME surface (no destroy / flicker) and log
+    /// `screensaver_failed_to_black`.
     #[cfg(target_os = "linux")]
     ShowScreensaver {
-        /// Stage generation counter (forwarded to logs).
+        /// Stage generation counter (forwarded to logs and the
+        /// deadline timer's gen-guard).
         r#gen: u64,
         /// Index of the stage in the display's ladder.
         idx: usize,
@@ -68,9 +71,8 @@ pub(crate) enum RenderCommand {
         /// with the command so the wayland thread doesn't need to look
         /// it up via a back-channel.
         settings: ScreensaverSettings,
-        /// Reply channel — resolves once the surface is committed with
-        /// the screensaver buffer attached, or with an error if mpv
-        /// failed to produce a first frame within the deadline.
+        /// Reply channel — resolved by `on_mpv_wakeup` on first frame
+        /// (`Ok`) or by the first-frame deadline timer (`Err`).
         reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
     },
 }

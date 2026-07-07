@@ -235,7 +235,7 @@ fn build_display_rules(cfg: &Config) -> HashMap<String, DisplayRuleInfo> {
 fn redact_config_secrets(cfg: &mut Config) -> Vec<Vec<String>> {
     let mut paths: Vec<Vec<String>> = Vec::new();
 
-    for (sensor_id, sensor) in cfg.sensors.iter_mut() {
+    for (sensor_id, sensor) in &mut cfg.sensors {
         match sensor {
             SensorConfig::Mqtt(MqttSensorCfg { broker_url, .. }) => {
                 let redacted = redact_url(broker_url);
@@ -264,7 +264,7 @@ fn redact_config_secrets(cfg: &mut Config) -> Vec<Vec<String>> {
             }
         }
     }
-    for (display_id, display) in cfg.displays.iter_mut() {
+    for (display_id, display) in &mut cfg.displays {
         redact_display_secrets(display, &mut paths, display_id);
     }
     paths

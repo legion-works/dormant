@@ -15,6 +15,7 @@
 //! compiled and the daemon binary is byte-identical to M1.
 
 mod assets;
+mod config_patch;
 mod error;
 mod routes;
 mod security;

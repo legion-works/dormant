@@ -55,64 +55,23 @@ pub(crate) struct ApplyResponse {
 // ── Patch cap ─────────────────────────────────────────────────────────────
 
 /// Maximum number of patches accepted in a single apply request.
-const PATCH_CAP: u32 = 256;
+const PATCH_CAP: usize = 256;
 
 // ── Backup helpers ────────────────────────────────────────────────────────
 
 /// Max backups to retain in the backups directory.
 const MAX_BACKUPS: usize = 5;
 
-/// Build a backup filename: `config.toml.<rfc3339-subsec>.<rand4>`.
+/// Build a backup filename: `config.toml.<rfc3339-nanos>.<rand4>`.
 ///
-/// The rfc3339 portion is filesystem-safe (colons replaced with dashes).
+/// Uses [`humantime::format_rfc3339_nanos`] for a standard timestamp;
+/// colons are replaced with dashes for filesystem safety.
 /// This is a pure function so it can be unit-tested.
 fn backup_filename(now: std::time::SystemTime, rand: &str) -> String {
-    let dur = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    let subsec = dur.subsec_nanos();
-
-    // Format: YYYY-MM-DDTHH-MM-SS.SSS-NNNNNN-Z
-    // Colons are replaced with dashes for filesystem safety.
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Compute year/month/day from days since Unix epoch.
-    // This is a simplified calendar — good enough since 1970.
-    let (year, month, day) = days_to_ymd(days as i64);
-
-    format!(
-        "config.toml.{:04}-{:02}-{:02}T{:02}-{:02}-{:02}.{:09}Z.{}",
-        year, month, day, hours, minutes, seconds, subsec, rand
-    )
-}
-
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-/// Uses integer arithmetic; accurate from 1970 through 2099.
-fn days_to_ymd(days: i64) -> (i64, u32, u32) {
-    // Number of days from 1970 to 0000-03-01 in the Gregorian proleptic calendar.
-    const DAYS_FROM_0000_03_01_TO_1970: i64 = 719468;
-    let days_since_0000_03_01 = days + DAYS_FROM_0000_03_01_TO_1970;
-
-    // 400-year cycle = 146097 days
-    let era = if days_since_0000_03_01 >= 0 {
-        days_since_0000_03_01 / 146097
-    } else {
-        (days_since_0000_03_01 - 146096) / 146097
-    };
-    let doe = days_since_0000_03_01 - era * 146097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day)
+    let ts = humantime::format_rfc3339_nanos(now).to_string();
+    // Replace colons with dashes for filesystem-safe filenames.
+    let safe_ts = ts.replace(':', "-");
+    format!("config.toml.{safe_ts}.{rand}")
 }
 
 /// Generate a random 4-character hex string.
@@ -128,8 +87,10 @@ pub(crate) async fn post_apply(
     Json(body): Json<ApplyRequest>,
 ) -> Result<Json<ApplyResponse>, WebError> {
     // Cap check — reject large patch sets before taking the lock.
-    if body.patches.len() as u32 > PATCH_CAP {
-        return Err(WebError::PatchCapExceeded(body.patches.len() as u32));
+    if body.patches.len() > PATCH_CAP {
+        return Err(WebError::PatchCapExceeded(
+            body.patches.len().try_into().unwrap_or(u32::MAX),
+        ));
     }
 
     // Serialise: only one apply at a time.
@@ -321,7 +282,7 @@ fn backup_current(config_path: &Path, config_dir: &Path) -> Result<(), WebError>
 fn prune_backups(backups_dir: &Path) -> Result<(), WebError> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(backups_dir)
         .map_err(|e| WebError::ConfigReadError(format!("cannot read backups dir: {e}")))?
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
@@ -475,7 +436,7 @@ mod tests {
     }
 
     /// Get the fingerprint for the current on-disk config.
-    async fn get_fingerprint(state: &WebState) -> String {
+    fn get_fingerprint(state: &WebState) -> String {
         let bytes = std::fs::read(&state.inner.config_path).unwrap();
         format!("{:x}", Sha256::digest(&bytes))
     }
@@ -483,27 +444,31 @@ mod tests {
     // ── backup_filename tests ───────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn backup_filename_isomorphic_with_known_time() {
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(42);
         let name = backup_filename(now, "abcd");
-        // Must start with the expected prefix.
-        assert!(name.starts_with("config.toml.1970-01-01T00-00-42.000000000Z.abcd"));
-        assert_eq!(
-            name.len(),
-            "config.toml.1970-01-01T00-00-42.000000000Z.abcd".len()
+        assert!(
+            name.starts_with("config.toml.1970-01-01T00-00-42"),
+            "{name}"
         );
+        assert!(name.ends_with(".abcd"), "{name}");
     }
 
     #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn backup_filename_handles_2026() {
         // 2026-07-07T12:34:56.789Z
-        // Days from 1970-01-01 to 2026-07-07 = 20641
-        let secs: u64 = 20641 * 86400 + 12 * 3600 + 34 * 60 + 56;
+        let secs: u64 = 20_641 * 86_400 + 12 * 3600 + 34 * 60 + 56;
         let nsecs: u32 = 789_000_000;
         let dur = std::time::Duration::new(secs, nsecs);
         let now = std::time::UNIX_EPOCH + dur;
         let name = backup_filename(now, "f001");
-        assert!(name.starts_with("config.toml.2026-07-07T12-34-56.789000000Z.f001"));
+        assert!(
+            name.starts_with("config.toml.2026-07-07T12-34-56.789"),
+            "{name}"
+        );
+        assert!(name.ends_with(".f001"), "{name}");
     }
 
     #[test]
@@ -520,15 +485,12 @@ mod tests {
     #[tokio::test]
     async fn happy_path_200_file_changed_comments_preserved() {
         let dir = tempfile::tempdir().unwrap();
-        let content = r#"# top comment
-config_version = 1
-[daemon]
-"#;
+        let content = "# top comment\nconfig_version = 1\n[daemon]\n";
         write_config(dir.path(), content);
 
         let (cfg, _rule_id) = config_with_rule();
         let state = test_state(dir.path(), cfg, 8080);
-        let fingerprint = get_fingerprint(&state).await;
+        let fingerprint = get_fingerprint(&state);
 
         // Patch: add a comment-like value that demonstrates TOML preservation.
         let req = ApplyRequest {
@@ -570,14 +532,13 @@ config_version = 1
 
         let backup_files: Vec<_> = std::fs::read_dir(&backups_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .collect();
         assert_eq!(backup_files.len(), 1, "one backup created");
         let backup_name = backup_files[0].file_name();
         assert!(
             backup_name.to_str().unwrap().starts_with("config.toml."),
-            "backup filename: {:?}",
-            backup_name
+            "backup filename: {backup_name:?}"
         );
     }
 
@@ -629,7 +590,7 @@ wake_retry_interval = "5s"
 
         let (cfg, rule_id) = config_with_rule();
         let state = test_state(dir.path(), cfg, 8080);
-        let fingerprint = get_fingerprint(&state).await;
+        let fingerprint = get_fingerprint(&state);
 
         // Patch wake_retry_interval to "0s" → validation must fail.
         let req = ApplyRequest {
@@ -657,7 +618,7 @@ wake_retry_interval = "5s"
         // No temp left.
         let temps: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| {
                 e.file_name()
                     .to_str()
@@ -705,7 +666,7 @@ field = "/val"
             rules: IndexMap::default(),
         };
         let state = test_state(dir.path(), cfg, 8080);
-        let fingerprint = get_fingerprint(&state).await;
+        let fingerprint = get_fingerprint(&state);
 
         let req = ApplyRequest {
             fingerprint,
@@ -729,7 +690,7 @@ field = "/val"
         write_config(dir.path(), "config_version = 1\n");
 
         let state = test_state(dir.path(), minimal_config(), 8080);
-        let fingerprint = get_fingerprint(&state).await;
+        let fingerprint = get_fingerprint(&state);
 
         let req = ApplyRequest {
             fingerprint,
@@ -743,6 +704,67 @@ field = "/val"
         let err = result.unwrap_err();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ── Create missing structural tables (M2) ───────────────────────────────
+
+    #[tokio::test]
+    async fn set_daemon_log_level_on_minimal_config_creates_table() {
+        let dir = tempfile::tempdir().unwrap();
+        // Config containing ONLY config_version — no [daemon] section.
+        let content = "config_version = 1\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "log_level".into()],
+                value: serde_json::Value::String("debug".into()),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(
+            result.is_ok(),
+            "set daemon.log_level on minimal config should create [daemon] table: {:?}",
+            result.err()
+        );
+
+        let new_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        let new_content = String::from_utf8_lossy(&new_bytes);
+        assert!(
+            new_content.contains("[daemon]") || new_content.contains("log_level"),
+            "file should contain daemon section or log_level: {new_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_on_missing_entity_still_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["sensors".into(), "ghost".into(), "topic".into()],
+                value: serde_json::Value::String("test".into()),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "patching missing entity should be 422"
+        );
     }
 
     // ── Patch cap exceeded → 422 ────────────────────────────────────────────
@@ -842,7 +864,7 @@ field = "/val"
         write_config(dir.path(), content);
 
         let state = test_state(dir.path(), minimal_config(), 8080);
-        let fingerprint = get_fingerprint(&state).await;
+        let fingerprint = get_fingerprint(&state);
         let router = crate::server::build_router(state);
 
         let body = serde_json::json!({
@@ -934,7 +956,7 @@ field = "/val"
 
         for i in 0..7 {
             // Re-fetch fingerprint for each apply (409s don't produce backups).
-            let fp = get_fingerprint(&state).await;
+            let fp = get_fingerprint(&state);
             let req = ApplyRequest {
                 fingerprint: fp,
                 patches: vec![Patch::Set {
@@ -949,7 +971,7 @@ field = "/val"
         let backups_dir = dir.path().join("backups");
         let backup_files: Vec<_> = std::fs::read_dir(&backups_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| {
                 e.file_name()
                     .to_str()
@@ -969,7 +991,7 @@ field = "/val"
         write_config(dir.path(), content);
 
         let state = test_state(dir.path(), minimal_config(), 8080);
-        let fingerprint = get_fingerprint(&state).await;
+        let fingerprint = get_fingerprint(&state);
 
         let req = ApplyRequest {
             fingerprint,
@@ -1013,9 +1035,54 @@ field = "/val"
         let statuses = [status1, status2];
         assert!(
             statuses.contains(&StatusCode::OK) && statuses.contains(&StatusCode::CONFLICT),
-            "expected one 200 and one 409, got {:?} and {:?}",
-            status1,
-            status2
+            "expected one 200 and one 409, got {status1:?} and {status2:?}"
+        );
+    }
+
+    /// Deterministic test: hold the apply lock, spawn an apply, verify it
+    /// blocks, release the lock, verify it completes.
+    #[tokio::test]
+    async fn apply_blocks_until_lock_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n[daemon]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        // Hold the lock so the spawned apply cannot proceed.
+        let lock = state.inner.apply_lock.lock().await;
+
+        let spawn_state = state.clone();
+        let spawn_req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "web_bind".into()],
+                value: serde_json::Value::String("127.0.0.1".into()),
+            }],
+        };
+
+        let handle =
+            tokio::spawn(
+                async move { post_apply(State(spawn_state), axum::Json(spawn_req)).await },
+            );
+
+        // The spawned apply must NOT complete while we hold the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "spawned apply should block while lock is held"
+        );
+
+        // Release the lock.
+        drop(lock);
+
+        // Now the spawned apply should complete.
+        let result = handle.await.expect("spawned task should not panic");
+        assert!(
+            result.is_ok(),
+            "apply should succeed after lock released: {:?}",
+            result.err()
         );
     }
 

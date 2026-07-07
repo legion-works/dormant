@@ -175,23 +175,21 @@ fn is_loopback_origin(origin: &str) -> bool {
 /// the CSRF gap the generic `is_same_origin` leaves when the Origin is
 /// absent.
 fn check_apply_origin(headers: &HeaderMap, web_bind: std::net::SocketAddr) -> bool {
-    let origin = match headers
+    let Some(origin) = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
-    {
-        Some(o) => o,
-        None => return false, // absent Origin → reject
+    else {
+        return false; // absent Origin → reject
     };
 
     let origin_lower = origin.to_lowercase();
 
     // Must be http:// scheme.
-    let after_scheme = match origin_lower
+    let Some(after_scheme) = origin_lower
         .strip_prefix("http://")
         .or_else(|| origin_lower.strip_prefix("https://"))
-    {
-        Some(a) => a,
-        None => return false,
+    else {
+        return false;
     };
 
     // Check the host is loopback.
@@ -374,7 +372,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // ── IPv6 Host tests (SHOULD-1) ────────────────────────────────────────
+    // ── IPv6 Host tests ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn accepts_ipv6_loopback_bracketed_host() {
@@ -538,7 +536,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // ── WebSocket upgrade Origin tests (SEC-1) ────────────────────────────
+    // ── WebSocket upgrade Origin tests ─────────────────────────────────────
 
     #[tokio::test]
     async fn rejects_cross_origin_websocket_upgrade() {

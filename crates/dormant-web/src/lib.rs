@@ -75,20 +75,18 @@ pub async fn spawn(
 /// before it could clean up its temp file; they are safe to delete
 /// because any apply writing them is long dead.
 pub(crate) fn prune_stale_temps(config_path: &std::path::Path) {
-    let dir = match config_path.parent() {
-        Some(d) => d,
-        None => return,
+    let Some(dir) = config_path.parent() else {
+        return;
     };
 
-    let cutoff =
-        match std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(3600)) {
-            Some(t) => t,
-            None => return,
-        };
+    let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(3600))
+    else {
+        return;
+    };
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
 
     for entry in entries.flatten() {
@@ -97,13 +95,11 @@ pub(crate) fn prune_stale_temps(config_path: &std::path::Path) {
         if !name_str.starts_with("config.toml.tmp.") {
             continue;
         }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(meta) = entry.metadata() else {
+            continue;
         };
-        let modified = match meta.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(modified) = meta.modified() else {
+            continue;
         };
         if modified < cutoff {
             let _ = std::fs::remove_file(entry.path());

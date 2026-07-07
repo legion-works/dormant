@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -59,12 +60,19 @@ impl Drop for TickShutdown {
 /// Spawn the synchronous event-iterator pump on a dedicated OS thread
 /// and return a tokio-side receiver plus the [`TickShutdown`] guard.
 ///
-/// Exposed for tests; the production path uses [`tick`] which calls
+/// `exited` is flipped to `true` immediately before the pump thread
+/// returns, giving tests a deterministic, cross-environment handle on
+/// thread lifetime (the OS-thread-count trick is racy under CI load and
+/// gets this exact class wrong — the memory-1824 leak-guard regression
+/// was red on the runner because of it).
+///
+/// Exposed for tests; the production path uses `tick` which calls
 /// this with the result of [`client::connect_events`].
 #[must_use]
 pub fn spawn_event_pump(
     stream: client::EventStream,
     shutdown: client::EventShutdown,
+    exited: Arc<AtomicBool>,
 ) -> (
     tokio::sync::mpsc::Receiver<Result<DaemonEvent>>,
     TickShutdown,
@@ -77,6 +85,7 @@ pub fn spawn_event_pump(
                 break; // receiver dropped
             }
         }
+        exited.store(true, Ordering::SeqCst);
     });
     (rx, TickShutdown::new(shutdown))
 }
@@ -145,7 +154,11 @@ async fn tick(
     // unwind) — that unblocks the pump thread's `read_line` so it
     // exits instead of leaking across reconnects.
     let (stream, shutdown) = client::connect_events(socket_path).context("subscribe Events")?;
-    let (mut rx, _shutdown_guard) = spawn_event_pump(stream, shutdown);
+    // Per-tick exit flag — tests assert on this; production drops the
+    // handle on every iteration so the value is meaningless here, but
+    // allocating once per tick is fine (it's a single AtomicBool).
+    let pump_exited = Arc::new(AtomicBool::new(false));
+    let (mut rx, _shutdown_guard) = spawn_event_pump(stream, shutdown, pump_exited);
 
     loop {
         tokio::select! {

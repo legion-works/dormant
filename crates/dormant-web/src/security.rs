@@ -261,6 +261,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio_util::sync::CancellationToken;
     use tower::util::ServiceExt;
 
@@ -306,6 +307,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         (state, cancel)

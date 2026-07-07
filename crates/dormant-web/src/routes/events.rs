@@ -146,12 +146,19 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                                 .unwrap_or_default();
                             let _ = tx.send(Message::Text(frame)).await;
                         }
-                        Ok(ReloadOutcome::Rejected(_)) => {
-                            // Normal validation reject keeps the
-                            // receiver valid; nothing to do.  Any
-                            // subsequent teardown is signalled canonically
-                            // by `Closed` on `ev_rx` (not by anything
-                            // on the reload bus).
+                        Ok(ReloadOutcome::Rejected(detail)) => {
+                            // Emit a rejected frame so the frontend can
+                            // show the validation failure.  The events
+                            // receiver is still valid (normal reject
+                            // never tears down the generation), so no
+                            // resubscribe is needed here.
+                            let frame = serde_json::json!({
+                                "event": "config_reload_rejected",
+                                "detail": detail,
+                            });
+                            let text =
+                                serde_json::to_string(&frame).unwrap_or_default();
+                            let _ = tx.send(Message::Text(text)).await;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             reload_rx = state.inner.reload_rx.resubscribe();
@@ -181,7 +188,17 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                             let _ = tx.send(Message::Text(frame)).await;
                             events = resubscribe_events(&ctl_tx).await.ok();
                         }
-                        Ok(ReloadOutcome::Rejected(_)) => {
+                        Ok(ReloadOutcome::Rejected(detail)) => {
+                            // Emit the reject frame even when the
+                            // events channel lagged — the frontend
+                            // must see the validation failure.
+                            let frame = serde_json::json!({
+                                "event": "config_reload_rejected",
+                                "detail": detail,
+                            });
+                            let text =
+                                serde_json::to_string(&frame).unwrap_or_default();
+                            let _ = tx.send(Message::Text(text)).await;
                             // Events channel is already closed — try
                             // subscribing to whatever generation is
                             // currently running.
@@ -295,6 +312,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let event_tx_for_engine = event_tx.clone();
@@ -430,6 +448,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let event_tx_for_engine = event_tx.clone();
@@ -537,6 +556,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let event_tx_for_engine = event_tx.clone();
@@ -641,6 +661,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let gen1_clone = gen1_tx.clone();
@@ -796,6 +817,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let gen1_clone = gen1_tx.clone();
@@ -879,6 +901,12 @@ mod tests {
         // messages sent after they subscribe).
         let _ = resub_signal_rx.recv().await;
 
+        // Drain the config_reload_rejected frame emitted by the recovery
+        // arm BEFORE the resubscribe completed.
+        let reject_drain = recv_json(&mut ws).await;
+        assert_eq!(reject_drain["event"], "config_reload_rejected");
+        assert_eq!(reject_drain["detail"], "rebuild rejected");
+
         // A gen2 event arrives.  With the flag+Closed→resubscribe path,
         // the handler's WS connection survives the teardown and delivers
         // gen2 events.
@@ -948,6 +976,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let first_subscribe = StdArc::new(AtomicBool::new(true));
@@ -1004,6 +1033,12 @@ mod tests {
         // buggy handler, all three land in the OLD receiver's buffer and
         // are dropped when the OLD receiver is replaced mid-resubscribe.
         // With the fix, ev_rx is never replaced and forwards all three.
+        // The Rejected arm now emits a config_reload_rejected frame first
+        // — drain it before checking the event stream.
+        let reject_drain = recv_json(&mut ws).await;
+        assert_eq!(reject_drain["event"], "config_reload_rejected");
+        assert_eq!(reject_drain["detail"], "bad config");
+
         let _ = event_tx.send(DaemonEvent::ZoneChanged {
             zone: dormant_core::types::ZoneId("z1".to_string()),
             present: true,
@@ -1094,6 +1129,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         let gen1_clone = gen1_tx.clone();
@@ -1167,6 +1203,13 @@ mod tests {
         // true`; on the new design it does nothing to the receiver.
         let _ = reload_tx.send(ReloadOutcome::Rejected("validation".into()));
 
+        // Drain the config_reload_rejected frame emitted by the Rejected
+        // arm before continuing — it arrives before the Closed/Reloaded
+        // sequence below.
+        let reject_drain = recv_json(&mut ws).await;
+        assert_eq!(reject_drain["event"], "config_reload_rejected");
+        assert_eq!(reject_drain["detail"], "validation");
+
         // Step 2: daemon tears down gen1 BEFORE publishing Reloaded.
         let _ = drop_gen1_tx.send(());
         drop(gen1_tx);
@@ -1217,6 +1260,182 @@ mod tests {
             got_e_reload,
             "missing e-reload zone_changed frame — Reloaded's second resubscribe dropped the buffered gen2 event"
         );
+
+        let _ = ws.close(None).await;
+    }
+
+    /// Flowing arm (events = Some): a normal `Rejected` must emit a
+    /// `config_reload_rejected` WS frame with the detail.
+    #[tokio::test]
+    async fn rejected_emits_config_reload_rejected_frame_flowing() {
+        let harness = harness().await;
+
+        let url = harness.ws_url();
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Baseline event to confirm the WS is live.
+        let _ = harness.event_tx.send(DaemonEvent::SensorChanged {
+            sensor: dormant_core::types::SensorId("flowing-pre".to_string()),
+            state: SensorState::Present,
+        });
+        let f1 = recv_json(&mut ws).await;
+        assert_eq!(f1["event"], "sensor_changed");
+        assert_eq!(f1["sensor"], "flowing-pre");
+
+        // Normal reject — flowing arm should emit the reject frame.
+        let _ = harness
+            .reload_tx
+            .send(ReloadOutcome::Rejected("bad sensor config".into()));
+
+        let reject_frame = recv_json(&mut ws).await;
+        assert_eq!(reject_frame["event"], "config_reload_rejected");
+        assert_eq!(reject_frame["detail"], "bad sensor config");
+
+        // Events channel is still valid — subsequent events arrive.
+        let _ = harness.event_tx.send(DaemonEvent::SensorChanged {
+            sensor: dormant_core::types::SensorId("flowing-post".to_string()),
+            state: SensorState::Absent,
+        });
+        let f2 = recv_json(&mut ws).await;
+        assert_eq!(f2["event"], "sensor_changed");
+        assert_eq!(f2["sensor"], "flowing-post");
+
+        let _ = ws.close(None).await;
+        harness.cancel.cancel();
+    }
+
+    /// Recovery arm (events = None): a `Rejected` when the events channel
+    /// is dead must still emit the `config_reload_rejected` frame before
+    /// resubscribing.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn rejected_recovery_emits_config_reload_rejected_frame() {
+        let cancel = CancellationToken::new();
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (gen1_tx, _gen1_rx) = broadcast::channel::<DaemonEvent>(64);
+        let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
+
+        let config = Arc::new(Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        });
+        let creds = Arc::new(Credentials::default());
+        let (config_tx, config_rx) = watch::channel(config);
+        let (creds_tx, creds_rx) = watch::channel(creds);
+        std::mem::forget(config_tx);
+        std::mem::forget(creds_tx);
+
+        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        std::mem::forget(reload_trigger_rx);
+
+        let doctor =
+            dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let state = WebState::new(crate::state::WebStateInner {
+            ctl_tx,
+            reload_trigger: reload_trigger_tx,
+            reload_rx,
+            config_rx,
+            creds_rx,
+            config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
+            doctor,
+            web_bind: bind,
+            cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
+        });
+
+        let gen1_clone = gen1_tx.clone();
+        let gen2_clone = gen2_tx.clone();
+        let (drop_gen1_tx, mut drop_gen1_rx) = oneshot::channel::<()>();
+        let (resub_signal_tx, mut resub_signal_rx) = mpsc::channel::<()>(1);
+
+        tokio::spawn(async move {
+            let mut gen1: Option<broadcast::Sender<DaemonEvent>> = Some(gen1_clone);
+            loop {
+                if gen1.is_some() {
+                    tokio::select! {
+                        _ = &mut drop_gen1_rx => { gen1 = None; }
+                        msg = ctl_rx.recv() => {
+                            match msg {
+                                Some(ControlMsg::SubscribeEvents(tx)) => {
+                                    if let Some(ref g1) = gen1 {
+                                        let _ = tx.send(g1.subscribe());
+                                    }
+                                }
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                    }
+                } else {
+                    let msg = ctl_rx.recv().await;
+                    match msg {
+                        Some(ControlMsg::SubscribeEvents(tx)) => {
+                            let _ = tx.send(gen2_clone.subscribe());
+                            let _ = resub_signal_tx.send(()).await;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+        });
+
+        let app = Router::new()
+            .route("/api/events", get(ws_events))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { cancel.cancelled().await })
+                .await
+                .ok();
+        });
+
+        let url = format!("ws://{addr}/api/events");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // Baseline on gen1.
+        let _ = gen1_tx.send(DaemonEvent::SensorChanged {
+            sensor: dormant_core::types::SensorId("recovery-pre".to_string()),
+            state: SensorState::Present,
+        });
+        let f1 = recv_json(&mut ws).await;
+        assert_eq!(f1["event"], "sensor_changed");
+        assert_eq!(f1["sensor"], "recovery-pre");
+
+        // Tear down gen1 so the events channel closes, then publish Rejected.
+        let _ = drop_gen1_tx.send(());
+        drop(gen1_tx);
+        let _ = reload_tx.send(ReloadOutcome::Rejected("rebuild rejected".into()));
+
+        // The handler must emit config_reload_rejected BEFORE resubscribing.
+        let reject_frame = recv_json(&mut ws).await;
+        assert_eq!(reject_frame["event"], "config_reload_rejected");
+        assert_eq!(reject_frame["detail"], "rebuild rejected");
+
+        // Wait until resubscribed to gen2.
+        let _ = resub_signal_rx.recv().await;
+
+        // gen2 events arrive after recovery.
+        let _ = gen2_tx.send(DaemonEvent::ZoneChanged {
+            zone: dormant_core::types::ZoneId("recovery-post".to_string()),
+            present: true,
+            cause: dormant_core::types::SensorId("gen2".to_string()),
+        });
+
+        let f2 = recv_json(&mut ws).await;
+        assert_eq!(f2["event"], "zone_changed");
+        assert_eq!(f2["zone"], "recovery-post");
 
         let _ = ws.close(None).await;
     }

@@ -43,6 +43,7 @@ describe("enum arrays match Rust serde wire strings", () => {
       "display_phase",
       "config_reloaded",
       "wake_retry",
+      "config_reload_rejected",
     ]);
   });
 });

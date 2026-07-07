@@ -443,6 +443,7 @@ impl App {
                     doctor: doctor_service.clone(),
                     web_bind: addr,
                     cancel: root.clone(),
+                    reload_timeout: std::time::Duration::from_secs(10),
                 });
                 match dormant_web::spawn(addr, web_state).await {
                     Ok((handle, _addr)) => Some(handle),

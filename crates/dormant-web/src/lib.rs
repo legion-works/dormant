@@ -118,6 +118,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::{broadcast, mpsc, watch};
     use tokio_util::sync::CancellationToken;
 
@@ -181,6 +182,7 @@ mod tests {
                 8080,
             ),
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         (state, cancel)

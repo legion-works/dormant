@@ -168,6 +168,7 @@ mod tests {
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         (state, cancel)

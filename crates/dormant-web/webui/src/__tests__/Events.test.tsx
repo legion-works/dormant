@@ -170,4 +170,54 @@ describe("Events", () => {
 
     expect(screen.getByText("2 events")).toBeInTheDocument();
   });
+
+  it("renders config_reload_rejected with detail", () => {
+    mockUseEventLog.events = [
+      {
+        time: "12:00:00",
+        event: {
+          event: "config_reload_rejected",
+          detail: "invalid sensor config: unknown type 'foo'",
+        },
+      },
+    ];
+
+    render(<Events />);
+
+    expect(
+      screen.getByText(
+        "config reload rejected: invalid sensor config: unknown type 'foo'",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("config")).toBeInTheDocument();
+    expect(screen.getByText("1 events")).toBeInTheDocument();
+  });
+
+  it("handles unknown event tag gracefully", () => {
+    mockUseEventLog.events = [
+      {
+        time: "12:00:00",
+        event: {
+          event: "future_event_v2",
+          payload: "test",
+        },
+      },
+    ];
+
+    // Must not throw — the default arm in messageForEvent produces
+    // JSON.stringify output and the default badge arm labels by
+    // event name.
+    expect(() => {
+      render(<Events />);
+    }).not.toThrow();
+
+    // The event count still renders.
+    expect(screen.getByText("1 events")).toBeInTheDocument();
+    // The badge label is the event name.
+    expect(screen.getByText("future_event_v2")).toBeInTheDocument();
+    // The message is the JSON representation.
+    expect(
+      screen.getByText('{"event":"future_event_v2","payload":"test"}'),
+    ).toBeInTheDocument();
+  });
 });

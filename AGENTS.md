@@ -21,7 +21,8 @@ crates/dormant-core/       # domain types, traits, zone+rules engines, state mac
 crates/dormant-sensors/    # one file per sensor: mqtt.rs, ha_ws.rs, usb_ld2410.rs
 crates/dormant-displays/   # one file per controller: kwin_dpms.rs, ddcci.rs, samsung_tizen.rs, ...
 crates/dormantd/           # daemon binary: config, event loop, control surfaces
-crates/dormantctl/         # CLI binary
+crates/dormantctl/         # CLI binary + library (re-exports the IPC client for dormant-tray)
+crates/dormant-tray/       # KDE StatusNotifierItem applet (M3, Linux only)
 webui/                     # SPA (M2), embedded into dormantd
 docs/                      # mdBook + docs/adr/ decision records
 ```

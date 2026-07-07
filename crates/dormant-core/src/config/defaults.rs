@@ -85,8 +85,9 @@ pub const MPV_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default crossfade duration when [`super::schema::ScreensaverConfig::transition`]
 /// is `"crossfade"`.  One second reads as a deliberate transition without
-/// dragging the playlist — the spike measured 0.9 ms/frame at 3072×1728,
-/// so longer blends are essentially free at any sane display resolution.
+/// dragging the playlist — measured crossfade cost is ≈0.9 ms/frame at
+/// 3072×1728, so longer blends are essentially free at any sane display
+/// resolution.
 pub const TRANSITION_DURATION: Duration = Duration::from_secs(1);
 
 /// `#[serde(default = "default_trigger")]` function shim — returns the default

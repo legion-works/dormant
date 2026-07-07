@@ -665,7 +665,7 @@ fn validate_display(
                 }
                 // transition value check: must be one of {crossfade, none}
                 // when set.  `None` falls back to Crossfade at the render
-                // layer (the user asked for transitions); this validator only
+                // layer (the production default); this validator only
                 // rejects explicit unknown values.
                 if let Some(ref tr) = ss.transition
                     && !matches!(tr.as_str(), "crossfade" | "none")

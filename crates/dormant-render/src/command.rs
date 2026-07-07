@@ -167,9 +167,20 @@ mod tests {
     fn show_screensaver_carries_settings() {
         use std::time::Duration;
 
+        use crate::playlist::PlaylistItem;
+
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), CmdFailure>>();
         let settings = ScreensaverSettings {
-            items: vec!["a.mp4".into(), "b.png".into()],
+            items: vec![
+                PlaylistItem {
+                    uri: "a.mp4".into(),
+                    image_duration: Some(Duration::from_secs(2)),
+                },
+                PlaylistItem {
+                    uri: "b.png".into(),
+                    image_duration: Some(Duration::from_secs(5)),
+                },
+            ],
             image_duration: Duration::from_secs(4),
             audio: true,
         };

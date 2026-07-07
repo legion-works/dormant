@@ -63,6 +63,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+use crate::playlist::PlaylistItem;
 use libmpv2_sys::{
     MPV_RENDER_API_TYPE_SW, mpv_render_context, mpv_render_context_create, mpv_render_context_free,
     mpv_render_context_render, mpv_render_context_set_update_callback, mpv_render_context_update,
@@ -156,12 +157,12 @@ pub(crate) fn scheme_allowed(item: &str) -> bool {
 /// sink construction.
 #[derive(Debug, Clone)]
 pub struct ScreensaverSettings {
-    /// Ordered list of media items (local paths or URLs).  mpv loads the
-    /// first as the active playlist entry; the rest queue via
-    /// `append-play` if the runtime needs to grow the playlist.
-    pub items: Vec<String>,
-    /// How long each image is displayed (mpv's `image-display-duration`).
-    /// Ignored for video sources.
+    /// Ordered list of [`PlaylistItem`]s, each with an optional
+    /// per-item image duration.  mpv loads the first as the active
+    /// playlist entry; the rest queue via `append-play`.
+    pub items: Vec<PlaylistItem>,
+    /// Global default image duration (mpv's `image-display-duration`).
+    /// Applied to any item without a per-item duration set.
     pub image_duration: Duration,
     /// Whether audio should be enabled.  False (the default) mutes the
     /// player at init; a future config can flip this on the
@@ -211,10 +212,10 @@ pub struct MpvPlayer {
     /// Set after the first successful render — used to gate the
     /// pre-first-frame timeout.
     has_first_frame: bool,
-    /// Held for the lifetime of the player so `append-play` can grow
-    /// the playlist later; unused today beyond logging.
+    /// Items loaded into the mpv playlist — kept to pass per-item
+    /// durations via the `loadfile` options string.
     #[allow(dead_code)]
-    items: Vec<String>,
+    items: Vec<PlaylistItem>,
     /// Write end of the wakeup pipe — `OwnedFd` so any pre-construction
     /// `?`-early-return in [`MpvPlayer::new`] drops it automatically.
     /// Declared LAST so its `Drop` (which closes the fd) runs AFTER the
@@ -318,7 +319,7 @@ impl MpvPlayer {
     /// drops it before the `Err` propagates.
     #[allow(clippy::too_many_lines)]
     pub fn new(
-        items: Vec<String>,
+        items: Vec<PlaylistItem>,
         image_duration: Duration,
         audio_enabled: bool,
         width: u32,
@@ -329,15 +330,15 @@ impl MpvPlayer {
         // Runs BEFORE any mpv interaction so a rejected item never
         // causes mpv to even consider opening it.  Logged at warn so
         // operators can audit config sources that produce URLs.
-        let filtered_items: Vec<String> = items
+        let filtered_items: Vec<PlaylistItem> = items
             .into_iter()
             .filter(|item| {
-                if scheme_allowed(item) {
+                if scheme_allowed(&item.uri) {
                     true
                 } else {
                     tracing::warn!(
                         event = "screensaver_item_rejected",
-                        item = %item,
+                        item = %item.uri,
                         reason = "scheme",
                     );
                     false
@@ -458,20 +459,58 @@ impl MpvPlayer {
             wakeup_write: Some(wakeup_write),
         };
 
-        // ── Load first playlist entry (last fallible step) ────────
+        // ── Load playlist items (last fallible step) ───────────────
         // `items` was already filtered through `scheme_allowed` above,
-        // so the first item is by construction inside the allowlist
-        // and safe to hand to mpv.
-        if let Some(first) = player.items.first() {
-            let mpv = player
-                .mpv
-                .as_mut()
-                .ok_or_else(|| MpvError::Init("player destroyed".into()))?;
-            mpv.command("loadfile", &[first.as_str(), "replace"])
-                .map_err(|e| MpvError::Init(format!("loadfile '{first}': {e}")))?;
-        }
+        // so every item is by construction inside the allowlist.
+        player.load_items()?;
 
         Ok(player)
+    }
+
+    /// Load the filtered [`PlaylistItem`]s into mpv's playlist.
+    ///
+    /// The first item uses `loadfile <uri> replace -1 <options>`;
+    /// subsequent items use `loadfile <uri> append-play -1 <options>`.
+    /// Per-item `image_duration` is passed as a per-file option
+    /// (`image-display-duration=N`); items with `None` duration omit
+    /// the option string entirely, falling back to the global default.
+    ///
+    /// # mpv per-file options — mpv 0.41 (verified)
+    ///
+    /// `loadfile` takes 4 positional args on mpv ≥0.38:
+    ///
+    /// ```text
+    /// loadfile <url> <flags> <index> <options>
+    /// ```
+    ///
+    /// - `flags`: `"replace"` for the first entry, `"append-play"` for the rest.
+    /// - `index`: `-1` (auto: end of playlist for append-play).
+    /// - `options`: comma-separated `key=value` pairs, e.g.
+    ///   `"image-display-duration=5.0"`.
+    ///
+    /// The 3-arg form (`loadfile <url> <flags> <options>`) is **rejected** on
+    /// mpv 0.41 (`"invalid parameter"` in the IPC probe); the index position
+    /// is mandatory despite mpv's help text claiming it's optional.
+    fn load_items(&mut self) -> Result<(), MpvError> {
+        let mpv = self
+            .mpv
+            .as_mut()
+            .ok_or_else(|| MpvError::Init("player destroyed before load_items".into()))?;
+
+        for (i, item) in self.items.iter().enumerate() {
+            let flags = if i == 0 { "replace" } else { "append-play" };
+
+            match item.image_duration {
+                Some(dur) => {
+                    let opt = format!("image-display-duration={}", dur.as_secs_f64());
+                    mpv.command("loadfile", &[item.uri.as_str(), flags, "-1", &opt])
+                }
+                None => mpv.command("loadfile", &[item.uri.as_str(), flags, "-1", ""]),
+            }
+            .map_err(|e| MpvError::Init(format!("loadfile '{}': {e}", item.uri)))?;
+        }
+
+        Ok(())
     }
 
     /// Drain mpv's pending events and render the current frame into
@@ -605,30 +644,6 @@ mod tests {
         }
     }
 
-    /// Wrap a raw fd so its Drop closes the fd.  Used by tests for the
-    /// read end (which `MpvPlayer::new` doesn't accept — the write end
-    /// is wrapped in `OwnedFd` directly when passed to `new()`).
-    #[allow(dead_code)]
-    struct OwnedRawFd(RawFd);
-    #[allow(dead_code)]
-    impl OwnedRawFd {
-        unsafe fn from_raw(fd: RawFd) -> Self {
-            Self(fd)
-        }
-        fn as_raw(&self) -> RawFd {
-            self.0
-        }
-    }
-    #[allow(dead_code)]
-    impl Drop for OwnedRawFd {
-        fn drop(&mut self) {
-            // SAFETY: fd was created via pipe2; closing once.
-            unsafe {
-                libc::close(self.0);
-            }
-        }
-    }
-
     /// Build a real `MpvPlayer` against a generated test fixture (skips
     /// when ffmpeg is absent) and return it.  Centralises the test-video
     /// + pipe setup so each test focuses on its assertion.
@@ -642,7 +657,10 @@ mod tests {
         // by anything else — `OwnedFd` takes exclusive ownership.
         let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
         let player = MpvPlayer::new(
-            vec![video.to_string_lossy().into_owned()],
+            vec![PlaylistItem {
+                uri: video.to_string_lossy().into_owned(),
+                image_duration: None,
+            }],
             Duration::from_secs(2),
             false,
             320,
@@ -782,7 +800,10 @@ mod tests {
         // the test only cares that the lavf option was accepted at
         // init.
         let player = MpvPlayer::new(
-            vec!["/tmp/dormant-render-tests/lavf-probe.mp4".into()],
+            vec![PlaylistItem {
+                uri: "/tmp/dormant-render-tests/lavf-probe.mp4".into(),
+                image_duration: None,
+            }],
             Duration::from_secs(1),
             false,
             64,
@@ -806,7 +827,10 @@ mod tests {
         let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
 
         let mut player = MpvPlayer::new(
-            vec!["/nonexistent/path/that/never/exists.mp4".into()],
+            vec![PlaylistItem {
+                uri: "/nonexistent/path/that/never/exists.mp4".into(),
+                image_duration: None,
+            }],
             Duration::from_secs(1),
             false,
             64,
@@ -853,7 +877,10 @@ mod tests {
         // the empty-after-filter check.  We never loadfile the item
         // (no render call follows) — the test is purely about Drop.
         let player = MpvPlayer::new(
-            vec!["/tmp/dormant-render-tests/drop-probe.mp4".into()],
+            vec![PlaylistItem {
+                uri: "/tmp/dormant-render-tests/drop-probe.mp4".into(),
+                image_duration: None,
+            }],
             Duration::from_secs(1),
             false,
             64,
@@ -882,17 +909,28 @@ mod tests {
     fn screensaver_settings_keeps_items_in_order() {
         let s = ScreensaverSettings {
             items: vec![
-                "a.mp4".into(),
-                "b.png".into(),
-                "https://example/c.jpg".into(),
+                PlaylistItem {
+                    uri: "a.mp4".into(),
+                    image_duration: Some(Duration::from_secs(2)),
+                },
+                PlaylistItem {
+                    uri: "b.png".into(),
+                    image_duration: Some(Duration::from_secs(5)),
+                },
+                PlaylistItem {
+                    uri: "https://example/c.jpg".into(),
+                    image_duration: None,
+                },
             ],
             image_duration: Duration::from_secs(3),
             audio: true,
         };
         assert_eq!(s.items.len(), 3);
-        assert_eq!(s.items[0], "a.mp4");
-        assert_eq!(s.items[1], "b.png");
-        assert!(s.items[2].starts_with("https://"));
+        assert_eq!(s.items[0].uri, "a.mp4");
+        assert_eq!(s.items[0].image_duration, Some(Duration::from_secs(2)));
+        assert_eq!(s.items[1].uri, "b.png");
+        assert_eq!(s.items[2].image_duration, None);
+        assert!(s.items[2].uri.starts_with("https://"));
         assert_eq!(s.image_duration, Duration::from_secs(3));
         assert!(s.audio);
     }
@@ -972,9 +1010,18 @@ mod tests {
 
         let result = MpvPlayer::new(
             vec![
-                "ftp://127.0.0.1:1/x".into(),
-                "data:text/plain,hi".into(),
-                "subfile:///etc/passwd".into(),
+                PlaylistItem {
+                    uri: "ftp://127.0.0.1:1/x".into(),
+                    image_duration: None,
+                },
+                PlaylistItem {
+                    uri: "data:text/plain,hi".into(),
+                    image_duration: None,
+                },
+                PlaylistItem {
+                    uri: "subfile:///etc/passwd".into(),
+                    image_duration: None,
+                },
             ],
             Duration::from_secs(1),
             false,
@@ -992,9 +1039,13 @@ mod tests {
     /// Companion to `mpv_player_rejects_all_exotic_schemes_without_loadfile`:
     /// the write fd MUST be closed after the Err (it's `OwnedFd`, so
     /// the function's early-return drops it).  Deterministic headless
-    /// check via `libc::write` on the raw fd value — EBADF confirms the
-    /// fd is closed.  We hold the raw fd in a local (NOT `OwnedFd`) so
-    /// the assertion sees the kernel state, not the Rust destructor.
+    /// check via `libc::fcntl(fd, F_GETFD)` — EBADF confirms the fd is
+    /// closed.  `F_GETFD` is side-effect-free and unambiguous: a closed
+    /// fd returns -1 with errno EBADF regardless of how the fd was
+    /// originally opened, while `write()` on a read-only fd that was
+    /// REUSED by another process could false-pass.  We hold the raw fd
+    /// in a local (NOT `OwnedFd`) so the assertion sees the kernel
+    /// state, not the Rust destructor.
     #[test]
     fn write_fd_is_closed_after_all_rejected_err() {
         let (read_fd, write_fd) = make_pipe().expect("pipe2");
@@ -1004,7 +1055,7 @@ mod tests {
             libc::close(read_fd);
         }
         // Hold the raw write_fd value across the new() call so we can
-        // observe the kernel close via libc::write.
+        // observe the kernel close via libc::fcntl.
         let write_raw = write_fd;
 
         // Construct inside a block so `OwnedFd` (the wrapper we pass
@@ -1013,7 +1064,16 @@ mod tests {
         let result = {
             let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
             MpvPlayer::new(
-                vec!["ftp://127.0.0.1:1/x".into(), "data:text/plain,hi".into()],
+                vec![
+                    PlaylistItem {
+                        uri: "ftp://127.0.0.1:1/x".into(),
+                        image_duration: None,
+                    },
+                    PlaylistItem {
+                        uri: "data:text/plain,hi".into(),
+                        image_duration: None,
+                    },
+                ],
                 Duration::from_secs(1),
                 false,
                 64,
@@ -1033,18 +1093,19 @@ mod tests {
             "all-exotic input must Err before loadfile (so the early-return drop runs)"
         );
 
-        // The write fd must now be closed.  A non-blocking write of 1
-        // byte returns -1 with errno=EBADF.  (If it returns 0/positive
-        // we'd be writing into a pipe that nobody holds the read end
-        // of — that would be a leak.)
-        let byte: [u8; 1] = [1];
-        let n = unsafe { libc::write(write_raw, byte.as_ptr().cast(), 1) };
-        assert_eq!(n, -1, "write fd must be closed after MpvPlayer::new Err");
+        // The write fd must now be closed.  `fcntl(fd, F_GETFD)` is
+        // the unambiguous probe: returns -1 with errno EBADF for a
+        // closed fd; no side effects on any fd state.
+        let ret = unsafe { libc::fcntl(write_raw, libc::F_GETFD) };
+        assert_eq!(
+            ret, -1,
+            "write fd must be closed after MpvPlayer::new Err (fcntl F_GETFD returned {ret})"
+        );
         let errno = std::io::Error::last_os_error().raw_os_error();
         assert_eq!(
             errno,
             Some(libc::EBADF),
-            "expected EBADF, got errno={errno:?}"
+            "expected EBADF from fcntl F_GETFD on closed fd, got errno={errno:?}"
         );
     }
 

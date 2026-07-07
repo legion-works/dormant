@@ -45,3 +45,6 @@ calloop-wayland-source = "0.4.1"
 # constants.
 libmpv2 = { version = "6.0.0", features = ["render"] }
 libmpv2-sys = "4.0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

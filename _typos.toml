@@ -7,6 +7,8 @@ extend-ignore-re = [
   "(?i)Mosquitto",
   # ESPresense is a proper name (ESP32 presence detection project)
   "ESPresense",
+  # Intentional typo in is_known_config_path test (verifying wrong key rejected)
+  "shufle",
 ]
 
 [files]

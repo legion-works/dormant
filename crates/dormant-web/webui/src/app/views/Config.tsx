@@ -278,6 +278,12 @@ export default function Config() {
   const [tab, setTab] = useState<ConfigTab>("settings");
   const mountedRef = useRef(true);
 
+  // Navigation guard state from SettingsForm
+  const [navGuard, setNavGuard] = useState<{
+    dirtyCount: number;
+    discard: () => void;
+  } | null>(null);
+
   const fetchData = useCallback(async () => {
     setState((prev) => ({ ...prev, error: null }));
     try {
@@ -317,6 +323,21 @@ export default function Config() {
     setReloading(false);
   }, [fetchData]);
 
+  /** Tab click handler — guards against losing dirty edits on switch. */
+  const handleTabClick = useCallback(
+    (targetTab: ConfigTab) => {
+      if (tab === "settings" && targetTab !== "settings" && navGuard) {
+        const ok = window.confirm(
+          `Discard ${navGuard.dirtyCount} unsaved change${navGuard.dirtyCount !== 1 ? "s" : ""}?`,
+        );
+        if (!ok) return;
+        navGuard.discard();
+      }
+      setTab(targetTab);
+    },
+    [tab, navGuard],
+  );
+
   if (state.loading) {
     return <div className="config-loading">Loading configuration…</div>;
   }
@@ -333,21 +354,21 @@ export default function Config() {
         <button
           type="button"
           className={`config-tab${tab === "settings" ? " config-tab--active" : ""}`}
-          onClick={() => setTab("settings")}
+          onClick={() => handleTabClick("settings")}
         >
           Settings
         </button>
         <button
           type="button"
           className={`config-tab${tab === "raw" ? " config-tab--active" : ""}`}
-          onClick={() => setTab("raw")}
+          onClick={() => handleTabClick("raw")}
         >
           Raw TOML
         </button>
       </div>
 
       {tab === "settings" ? (
-        <SettingsForm config={cfg} />
+        <SettingsForm config={cfg} onNavigationGuard={setNavGuard} />
       ) : (
         <RawTomlTab
           config={cfg}

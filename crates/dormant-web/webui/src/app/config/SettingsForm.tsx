@@ -19,6 +19,11 @@ import type { ApplyOutcome } from "./ApplyBar";
 
 interface SettingsFormProps {
   config: ConfigResponse;
+  /**
+   * Called when the dirty state changes so the parent can guard
+   * navigation (tab-switch, route change).  Passes null when clean.
+   */
+  onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void } | null) => void;
 }
 
 /** Extract field-level errors from a 422 ApplyErrorBody by matching detail strings. */
@@ -41,7 +46,7 @@ function extractFieldErrors(body: ApplyErrorBody): Record<string, string | undef
   return map;
 }
 
-export function SettingsForm({ config: initialConfig }: SettingsFormProps) {
+export function SettingsForm({ config: initialConfig, onNavigationGuard }: SettingsFormProps) {
   const storeRef = useRef<PatchStore>(createPatchStore());
   const store = storeRef.current;
 
@@ -110,21 +115,21 @@ export function SettingsForm({ config: initialConfig }: SettingsFormProps) {
 
       if (res.reload === "reloaded") {
         setOutcome({ kind: "reloaded" });
-        // Config was accepted — re-fetch to get the new fingerprint
+        // Patches accepted — clear dirty state and re-fetch for new fingerprint
+        store.reset();
+        setDirtyVersion(0);
         getConfig()
           .then((cfg) => setConfig(cfg))
           .catch(() => {});
       } else if (res.reload === "rejected") {
         setOutcome({ kind: "rejected", detail: res.detail });
       } else {
-        // pending or superseded
+        // pending or superseded — disk is final when the response returns
         setOutcome({ kind: res.reload as "pending" | "superseded", detail: res.detail });
-        // Auto re-fetch after a short delay so tests can catch it
-        setTimeout(() => {
-          getConfig()
-            .then((cfg) => setConfig(cfg))
-            .catch(() => {});
-        }, 200);
+        // Refetch immediately: the file was already written before the response
+        getConfig()
+          .then((cfg) => setConfig(cfg))
+          .catch(() => {});
       }
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -151,6 +156,30 @@ export function SettingsForm({ config: initialConfig }: SettingsFormProps) {
       setApplying(false);
     }
   }, [config.fingerprint, store]);
+
+  // beforeunload guard — registered while dirty, removed when clean
+  // Must be declared after handleDiscard (it's a dependency of the next effect).
+  useEffect(() => {
+    if (dirtyCount > 0) {
+      const handler = (e: BeforeUnloadEvent) => {
+        e.preventDefault();
+        e.returnValue = "";
+      };
+      window.addEventListener("beforeunload", handler);
+      return () => window.removeEventListener("beforeunload", handler);
+    }
+  }, [dirtyCount]);
+
+  // Tell the parent about dirty state for in-app tab/route guards
+  useEffect(() => {
+    if (onNavigationGuard) {
+      if (dirtyCount > 0) {
+        onNavigationGuard({ dirtyCount, discard: handleDiscard });
+      } else {
+        onNavigationGuard(null);
+      }
+    }
+  }, [dirtyCount, onNavigationGuard, handleDiscard]);
 
   const inv = config.inventory;
 

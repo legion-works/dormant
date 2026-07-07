@@ -23,6 +23,23 @@
 /// `include_bytes!` expansion.
 pub const SIZES: &[u32] = &[22, 24, 32, 48];
 
+// Compile-time-embedded base-mark pixmaps.  `env!("OUT_DIR")` is
+// resolved by the compiler at build time (it freezes the OUT_DIR that
+// `build.rs` wrote to), and `include_bytes!` bakes the bytes into the
+// compiled binary.  The installed `dormant-tray` therefore carries the
+// icons with it — there is no runtime read of `OUT_DIR` or the build
+// tree.  See `load_does_not_depend_on_out_dir_at_runtime` for the
+// regression test that guards this invariant.
+//
+// These constants exist once per supported size; adding a new size
+// requires a matching constant here and an entry in `build.rs`'s
+// `SIZES`.  The compiler will fail with a clear "file not found" if
+// either side drifts.
+const BLOB_22: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_22.bin"));
+const BLOB_24: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_24.bin"));
+const BLOB_32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_32.bin"));
+const BLOB_48: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_48.bin"));
+
 /// All ARGB32 blobs at every size, in their three derived variants.
 ///
 /// Holds owned `Vec<u8>` for each (state, size) pair.  The tray binary
@@ -40,40 +57,29 @@ pub struct IconSet {
 }
 
 impl IconSet {
-    /// Load the base blobs from `OUT_DIR` (set by `build.rs`) and derive
-    /// the two variants in pure Rust.
+    /// Build the icon set from the compile-time-embedded base blobs
+    /// and derive the paused / unreachable variants in pure Rust.
     ///
-    /// # Panics
-    ///
-    /// Panics if any pre-baked blob is missing — that's a build-script /
-    /// source-tree drift, and the tray cannot operate without it.
+    /// The base blobs are baked into the binary by `include_bytes!`
+    /// (see the module-level constants); `load` performs zero
+    /// filesystem I/O and reads zero environment variables, so the
+    /// installed `dormant-tray` carries its icons with it.
     #[must_use]
     pub fn load() -> Self {
+        let raw: [(u32, &[u8]); SIZES.len()] =
+            [(22, BLOB_22), (24, BLOB_24), (32, BLOB_32), (48, BLOB_48)];
+
         let mut base = Vec::with_capacity(SIZES.len());
         let mut paused = Vec::with_capacity(SIZES.len());
         let mut unreachable = Vec::with_capacity(SIZES.len());
 
-        for &size in SIZES {
-            let path = format!(
-                "{OUT_DIR}/mark_{size}.bin",
-                OUT_DIR = std::env::var("OUT_DIR").expect("OUT_DIR set at build time")
-            );
-            let bytes = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
-                Ok("linux") => std::fs::read(&path)
-                    .unwrap_or_else(|e| panic!("read baked icon blob {path}: {e}")),
-                // Non-Linux builds skip the build.rs blob — the stub main
-                // never instantiates this.  Synthesize a 1×1 transparent
-                // pixmap so unit tests on macOS / Windows can still
-                // exercise the variant transforms.
-                _ => vec![0u8; (size as usize) * (size as usize) * 4],
-            };
-
-            let mut p = bytes.clone();
+        for (size, bytes) in raw {
+            let mut p = bytes.to_vec();
             draw_pause_badge(&mut p, size);
-            let mut u = bytes.clone();
+            let mut u = bytes.to_vec();
             desaturate(&mut u);
 
-            base.push((size, bytes));
+            base.push((size, bytes.to_vec()));
             paused.push((size, p));
             unreachable.push((size, u));
         }
@@ -301,6 +307,59 @@ mod tests {
         assert_eq!(set.unreachable.len(), SIZES.len());
         for (size, bytes) in &set.base {
             assert_eq!(bytes.len(), (*size as usize) * (*size as usize) * 4);
+        }
+    }
+
+    /// Icon blobs must be baked into the binary at compile time, not read
+    /// from the filesystem at runtime.  Cargo sets `OUT_DIR` during build
+    /// and test runs but never for an installed binary — an `IconSet::load`
+    /// that reads `OUT_DIR` at runtime panics with `"OUT_DIR set at build
+    /// time: NotPresent"` the moment the operator runs `dormant-tray`
+    /// outside a cargo build context.  This test simulates that by
+    /// stripping the env var before calling `load` and verifies the
+    /// loader has no runtime filesystem dependency on the build tree.
+    #[test]
+    fn load_does_not_depend_on_out_dir_at_runtime() {
+        // `std::env::set_var` / `remove_var` are `unsafe` in Rust 2024
+        // because they race with other threads' reads of `env::*`.  This
+        // test runs single-threaded against the process env; the only
+        // other reader in `cargo test`'s libtest harness is
+        // `AssertUnwindSafe` capturing `IconSet::load`'s panic — and
+        // `IconSet::load` does not read `OUT_DIR` once this fix lands.
+        let prev = std::env::var_os("OUT_DIR");
+        unsafe {
+            std::env::remove_var("OUT_DIR");
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(IconSet::load));
+
+        // Restore OUT_DIR regardless of outcome so we don't pollute
+        // sibling tests that might rely on it (they don't today, but
+        // keep the contract honest).
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("OUT_DIR", v),
+                None => std::env::remove_var("OUT_DIR"),
+            }
+        }
+
+        let set = result.unwrap_or_else(|_| {
+            panic!(
+                "IconSet::load panicked with OUT_DIR removed — runtime OUT_DIR dependency still present"
+            );
+        });
+
+        // Every (state, size) slot must be present and the right size.
+        for variant in [&set.base, &set.paused, &set.unreachable] {
+            assert_eq!(variant.len(), SIZES.len(), "wrong variant entry count");
+            for (size, bytes) in variant {
+                assert_eq!(
+                    bytes.len(),
+                    (*size as usize) * (*size as usize) * 4,
+                    "wrong blob length for size {size}"
+                );
+                assert!(!bytes.is_empty(), "blob for size {size} is empty");
+            }
         }
     }
 }

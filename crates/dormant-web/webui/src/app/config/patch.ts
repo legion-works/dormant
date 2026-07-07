@@ -18,6 +18,8 @@ function pathKey(path: string[]): string {
 export interface PatchStore {
   trackEdit(path: string[], value: unknown): void;
   trackRemove(path: string[]): void;
+  /** Return the pending set value for a path, or undefined if not tracked (or a remove is pending). */
+  getEdit(path: string[]): unknown | undefined;
   buildPatches(): ConfigPatch[];
   isLocked(path: string[], redactedPaths: string[][]): boolean;
   reset(): void;
@@ -47,6 +49,19 @@ export function createPatchStore(): PatchStore {
     removals.add(key);
     // Last-write-wins: a remove after an edit replaces the edit.
     edits.delete(key);
+  }
+
+  /**
+   * Return the pending set value for a path.
+   *
+   * Returns undefined when the path has a pending remove, has never
+   * been edited, or was last touched by a remove.  Components use this
+   * to compute their effective working state: `getEdit(path) ?? fetched`.
+   */
+  function getEdit(path: string[]): unknown | undefined {
+    const key = pathKey(path);
+    if (removals.has(key)) return undefined;
+    return edits.get(key);
   }
 
   function buildPatches(): ConfigPatch[] {
@@ -111,5 +126,5 @@ export function createPatchStore(): PatchStore {
     removals.clear();
   }
 
-  return { trackEdit, trackRemove, buildPatches, isLocked, reset };
+  return { trackEdit, trackRemove, getEdit, buildPatches, isLocked, reset };
 }

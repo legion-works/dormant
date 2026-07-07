@@ -210,3 +210,88 @@ describe("reset", () => {
     expect(s.buildPatches()).toEqual([]);
   });
 });
+
+describe("getEdit", () => {
+  it("returns the pending edit value for a tracked path", () => {
+    const s = createPatchStore();
+    set(s, "displays.tv.ladder", [
+      { kind: "render_black", dwell: "30s" },
+      { kind: "power_off" },
+    ]);
+
+    const val = s.getEdit(["displays", "tv", "ladder"]) as Array<{ kind: string }>;
+    expect(val).toHaveLength(2);
+    expect(val[0]).toEqual({ kind: "render_black", dwell: "30s" });
+  });
+
+  it("returns undefined for an untracked path", () => {
+    const s = createPatchStore();
+    expect(s.getEdit(["displays", "tv", "ladder"])).toBeUndefined();
+  });
+
+  it("returns undefined when a pending remove exists for the path", () => {
+    const s = createPatchStore();
+    set(s, "displays.tv.ladder", [{ kind: "render_black" }]);
+    del(s, "displays.tv.ladder"); // remove wins
+
+    expect(s.getEdit(["displays", "tv", "ladder"])).toBeUndefined();
+  });
+
+  it("returns the fresh value when a remove is overridden by a later edit", () => {
+    const s = createPatchStore();
+    const arr = [{ kind: "render_black", dwell: "30s" }];
+    set(s, "displays.tv.ladder", [{ kind: "power_off" }]);
+    del(s, "displays.tv.ladder");
+    set(s, "displays.tv.ladder", arr); // edit wins
+
+    const val = s.getEdit(["displays", "tv", "ladder"]);
+    expect(val).toEqual(arr);
+  });
+});
+
+/**
+ * M2 RED test — sequential array edits must NOT clobber.
+ *
+ * Simulates: user edits stage-0's kind, then edits stage-0's dwell.
+ * Without getEdit, the second edit clones from the fetched prop and
+ * the kind change is lost.  With getEdit, the effective array carries
+ * both modifications.
+ */
+describe("sequential array edits do not clobber (M2)", () => {
+  /** Helper: apply two edits to a ladder array via the store, simulating
+   *  the component's `emitStages` flow using `getEdit ?? fetched`. */
+  function ladderClobberTest(stages: unknown[]): unknown[] {
+    const s = createPatchStore();
+    const arrPath = ["displays", "tv", "ladder"];
+
+    // Step 1: edit stage[0].kind
+    const effective1 = (s.getEdit(arrPath) as unknown[] | undefined) ?? stages;
+    const next1 = [...effective1];
+    next1[0] = { ...(next1[0] as Record<string, unknown>), kind: "render_screensaver" };
+    s.trackEdit(arrPath, next1);
+
+    // Step 2: edit stage[0].dwell
+    const effective2 = (s.getEdit(arrPath) as unknown[] | undefined) ?? stages;
+    const next2 = [...effective2];
+    next2[0] = { ...(next2[0] as Record<string, unknown>), dwell: "2m" };
+    s.trackEdit(arrPath, next2);
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0].op).toBe("set");
+    expect(patches[0].path).toEqual(arrPath);
+
+    return (patches[0] as Extract<ConfigPatch, { op: "set" }>).value as unknown[];
+  }
+
+  it("carries both edits (kind + dwell) when using getEdit ?? fetched", () => {
+    const initial = [
+      { kind: "render_black", dwell: "30s" },
+      { kind: "power_off" },
+    ];
+
+    const result = ladderClobberTest(initial);
+    expect(result[0]).toEqual({ kind: "render_screensaver", dwell: "2m" });
+    expect(result[1]).toEqual({ kind: "power_off" });
+  });
+});

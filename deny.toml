@@ -12,6 +12,9 @@ allow = [
   "CC0-1.0",
   "MPL-2.0",
   "CDLA-Permissive-2.0",
+  # libmpv2 / libmpv2-sys — the LGPL-2.1+ mpv library; dormant dynamically
+  # links libmpv via dlopen (loaded at run time, not statically incorporated)
+  "LGPL-2.1",
 ]
 confidence-threshold = 0.8
 

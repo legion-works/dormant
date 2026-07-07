@@ -253,7 +253,7 @@ impl App {
     /// building [`LayerShellRenderSink`] directly.  The factory receives
     /// the display id, output connector name, an optional
     /// `UnboundedSender<DisplayId>` (the `InputWake` channel), and an
-    /// optional [`ScreensaverSettings`]; return `None` to skip the sink
+    /// optional [`dormant_render::ScreensaverSettings`]; return `None` to skip the sink
     /// (fall-through).
     #[cfg(feature = "render")]
     #[must_use]

@@ -931,7 +931,7 @@ mod tests {
     }
 
     /// Per-file options via the 4-arg `loadfile` path must be accepted
-    /// by the real mpv.  Two PNGs with different `image_duration` values
+    /// by the real mpv.  Two PNG files with different `image_duration` values
     /// are loaded; the construction succeeds for both and the playlist
     /// contains both entries.  (Visual duration effect is acceptance-
     /// tested visually — this test proves the non-empty options string

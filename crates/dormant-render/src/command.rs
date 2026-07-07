@@ -80,7 +80,7 @@ pub(crate) enum RenderCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::ScaleMode;
+    use crate::settings::{ScaleMode, TransitionMode};
     use dormant_core::types::CmdFailure;
 
     #[test]
@@ -185,6 +185,8 @@ mod tests {
             image_duration: Duration::from_secs(4),
             audio: true,
             scale_mode: ScaleMode::Stretch,
+            transition: TransitionMode::None,
+            transition_duration: Duration::from_millis(500),
         };
         let expected_items = settings.items.clone();
         let expected_dur = settings.image_duration;

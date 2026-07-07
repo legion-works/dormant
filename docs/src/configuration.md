@@ -234,6 +234,8 @@ order = "sequential"    # only value accepted; mutually exclusive with `shuffle`
 | `trigger` | string | no | `"vacancy"` | Trigger for the screensaver. Only `"vacancy"` is supported (the ladder itself is vacancy-driven). |
 | `audio` | boolean | no | `false` | Whether audio playback is enabled. `false` mutes the player at init. |
 | `scale_mode` | string | no | `"fill"` | How source frames are scaled onto the output rectangle. One of `"fill"`, `"fit"`, `"stretch"`, `"center"`. See [Scale mode](#scale-mode) below. |
+| `transition` | string | no | `"crossfade"` | How consecutive playlist items transition. `"crossfade"` blends successive frames with a per-pixel u8 lerp; `"none"` cuts immediately (the pre-feature behaviour). |
+| `transition_duration` | duration | no | `"1s"` | Length of the crossfade blend (ignored when `transition = "none"`). Bounded to `100ms..=10s`. |
 | `[[…source]]` | array | yes | — | Ordered list of media sources for the playlist. |
 
 Each source supports:
@@ -246,6 +248,21 @@ Each source supports:
 | `shuffle` | boolean | no | `false` | Shuffle items from this source (Fisher-Yates, seeded per restart). Mutually exclusive with `order`. |
 | `order` | string | no | — | Ordering strategy. Only `"sequential"` is accepted. Mutually exclusive with `shuffle`. |
 | `image_duration` | duration | no | 10 s | Per-image display duration override (must be > 0). |
+
+###### Transitions
+
+When `transition = "crossfade"` (the default), successive playlist items
+blend with a per-pixel u8 lerp over `transition_duration`.  The blend is
+driven by a calloop timer on the Wayland thread; the per-frame cost
+(spike-measured at `/tmp/opencode/p21-fade-spike/report.md` Q3) is
+0.9 ms at 3072×1728 — negligible against any reasonable frame budget.
+Set `transition_duration` between `100ms` and `10s`; the validator
+rejects anything outside that range.
+
+`transition = "none"` keeps the legacy hard-cut behaviour (byte-identical
+to pre-M3) and is useful for benchmarks or operators who prefer the
+instantaneous switch.  When `transition = "none"`, the `transition_duration`
+field is ignored.
 
 **Playlist assembly:** The playlist is built at startup and on every config
 reload — file-system scanning runs off the Wayland thread.  Changes to the

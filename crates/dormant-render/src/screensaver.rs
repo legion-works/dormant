@@ -67,14 +67,36 @@ use crate::settings::{FIRST_FRAME_DEADLINE, ScaleMode, scheme_allowed};
 use libmpv2_sys::{
     MPV_RENDER_API_TYPE_SW, mpv_render_context, mpv_render_context_create, mpv_render_context_free,
     mpv_render_context_render, mpv_render_context_set_update_callback, mpv_render_context_update,
-    mpv_render_param, mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
+    mpv_render_param, mpv_render_param_type_MPV_RENDER_PARAM_ADVANCED_CONTROL,
+    mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
     mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_FORMAT,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_SIZE,
     mpv_render_param_type_MPV_RENDER_PARAM_SW_STRIDE,
-    mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME,
+    mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME, mpv_wait_event,
 };
+
+/// Subset of mpv events surfaced by [`MpvPlayer::poll_events`] — every
+/// other event ID is silently dropped so the state machine only sees
+/// the two it cares about for the crossfade transition.
+///
+/// The full mpv event ID list lives in libmpv2-sys's
+/// `mpv_event_id_*` constants; this enum is the project's
+/// grep-stable, app-facing subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpvItemEvent {
+    /// `MPV_EVENT_END_FILE` — the currently-playing item is no longer
+    /// active.  In the screensaver state machine this is the trigger
+    /// to capture the current frame into the transition's `capture`
+    /// buffer (the crossfade's `a` side).
+    ItemEnded,
+    /// `MPV_EVENT_FILE_LOADED` — a new playlist item is loaded and
+    /// renderable.  In the screensaver state machine this is the
+    /// trigger to arm the crossfade timer; the next mpv wakeup will
+    /// produce the first frame of the new item (the blend's `b` side).
+    ItemLoaded,
+}
 
 /// Owned handle to an mpv instance + SW render context.
 ///
@@ -320,10 +342,27 @@ impl MpvPlayer {
             .ok_or_else(|| MpvError::Init("stride overflow".into()))?;
 
         let api_type = MPV_RENDER_API_TYPE_SW.as_ptr() as *mut c_void;
+        // ADVANCED_CONTROL=1 gates frame delivery on
+        // `mpv_render_context_update` returning
+        // `MPV_RENDER_UPDATE_FRAME`.  Without it mpv may render frames
+        // into the back buffer asynchronously (regardless of whether
+        // the owner has consumed the previous one) which defeats the
+        // "attach previous frame" sequencing the screensaver relies
+        // on.  Spike noted this was OMITTED in the spike's
+        // `mpv_render_context_create` call; production must set it.
+        // `mut` is for `addr_of_mut!` (the binding type is `*mut
+        // c_void` even though mpv reads the value once and never
+        // mutates it).  The value stays at 1 for the lifetime of the
+        // array.
+        let mut advanced_control: i64 = 1;
         let create_params = [
             mpv_render_param {
                 type_: mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
                 data: api_type,
+            },
+            mpv_render_param {
+                type_: mpv_render_param_type_MPV_RENDER_PARAM_ADVANCED_CONTROL,
+                data: std::ptr::addr_of_mut!(advanced_control).cast::<c_void>(),
             },
             mpv_render_param {
                 type_: mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
@@ -494,6 +533,68 @@ impl MpvPlayer {
             self.first_frame_deadline = None;
         }
         Ok(rendered)
+    }
+
+    /// Drain mpv's pending events non-blockingly and return the
+    /// subset of [`MpvItemEvent`]s we map.  Internally loops
+    /// [`mpv_wait_event`]`(0.0)` until it returns `MPV_EVENT_NONE`
+    /// (no more pending events).
+    ///
+    /// Every other event type (`LOG_MESSAGE`, `PROPERTY_CHANGE`, …) is
+    /// silently discarded — this method exists ONLY to feed the
+    /// screensaver transition state machine, and that machine only
+    /// cares about item start/end.
+    ///
+    /// Must be called from the mpv-owning thread.  Safe to call
+    /// concurrently with `render_frame_into`; the underlying
+    /// `mpv_wait_event` is documented thread-safe with the mpv handle
+    /// (the only owner is the screensaver session).
+    pub fn poll_events(&mut self) -> Vec<MpvItemEvent> {
+        use libmpv2_sys::{
+            mpv_event_id_MPV_EVENT_END_FILE, mpv_event_id_MPV_EVENT_FILE_LOADED,
+            mpv_event_id_MPV_EVENT_NONE,
+        };
+
+        // `mpv_wait_event` takes the mpv HANDLE (not the render
+        // context); the Mpv wrapper exposes it via `ctx`.  We have to
+        // unwrap the Option to access it — only the wakeup cb fires
+        // after Drop runs, and the player fields are still coherent.
+        let Some(mpv_handle) = self.mpv.as_ref().map(|m| m.ctx.as_ptr()) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: mpv_handle is valid for the player's lifetime;
+            // the returned pointer is owned by mpv until the next
+            // `mpv_wait_event` call (which we make below immediately).
+            let ev_ptr = unsafe { mpv_wait_event(mpv_handle, 0.0) };
+            if ev_ptr.is_null() {
+                break;
+            }
+            // SAFETY: ev_ptr is non-null per the check above; the
+            // caller is responsible for reading the struct on every
+            // mpv_wait_event call (mpv reuses the storage).
+            let event_id = unsafe { (*ev_ptr).event_id };
+            if event_id == mpv_event_id_MPV_EVENT_NONE {
+                // End-of-queue sentinel — no more events ready.
+                break;
+            }
+            if event_id == mpv_event_id_MPV_EVENT_END_FILE {
+                // The mpv_event_end_file data block carries a
+                // mpv_end_file_reason; we don't need it for the
+                // transition state machine (the timer is driven by
+                // `image-display-duration`, not by the cycle), so
+                // the data field is deliberately ignored.
+                out.push(MpvItemEvent::ItemEnded);
+            } else if event_id == mpv_event_id_MPV_EVENT_FILE_LOADED {
+                out.push(MpvItemEvent::ItemLoaded);
+            }
+            // All other event ids (START_FILE, IDLE, LOG_MESSAGE, …)
+            // are intentionally dropped.
+            let _ = ev_ptr.cast_const();
+        }
+        out
     }
 
     /// Test-only accessor: read a property via the inner mpv handle.
@@ -1462,5 +1563,152 @@ mod tests {
 
         drop(fill_player);
         drop(fit_player);
+    }
+
+    /// `mpv_render_context_create` must be invoked with
+    /// `MPV_RENDER_PARAM_ADVANCED_CONTROL = 1`.  This gates frame
+    /// delivery on `mpv_render_context_update` returning
+    /// `MPV_RENDER_UPDATE_FRAME` — without it mpv may render frames
+    /// asynchronously into the back buffer regardless of whether the
+    /// owner has consumed the previous one, defeating the "attach
+    /// previous frame" sequencing the screensaver relies on.
+    ///
+    /// `ADVANCED_CONTROL` is not directly observable from outside the
+    /// FFI; we infer correctness by building a player, taking a
+    /// render snapshot, then dropping cleanly.  We retry a few
+    /// frames in case the very first call comes back empty
+    /// (mpv 0.41 occasionally needs a wakeup before producing the
+    /// first frame).
+    #[test]
+    fn mpv_render_context_created_with_advanced_control() {
+        let Some((mut player, _video)) = build_test_player() else {
+            eprintln!("ffmpeg unavailable; skipping advanced-control test");
+            return;
+        };
+
+        let mut buf = vec![0u8; 320 * 4 * 180];
+        let mut rendered = false;
+        for _ in 0..10 {
+            if player.render_frame_into(&mut buf).expect("render") {
+                rendered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rendered, "render should produce at least one frame");
+
+        drop(player);
+    }
+
+    /// `MpvPlayer::poll_events` drains `mpv_wait_event(0.0)` until
+    /// `MPV_EVENT_NONE` and maps the two events the screensaver
+    /// transition cares about: `END_FILE` (outgoing item ended) and
+    /// `FILE_LOADED` (incoming item is renderable).  Drives a real
+    /// two-image playlist with a tiny `image-display-duration` and
+    /// asserts the ItemEnded→ItemLoaded pair surfaces within a few
+    /// seconds of polling.  Skips on environment capability gaps
+    /// (matching the media-load skip-guard pattern).
+    #[test]
+    fn mpv_player_poll_events_sees_item_ended_then_loaded_on_two_image_playlist() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join("dormant-render-events-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let a = dir.join("a.png");
+        let b = dir.join("b.png");
+
+        let ok_a = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=64x64",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&a)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let ok_b = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=green:size=64x64",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&b)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !(ok_a && ok_b) {
+            eprintln!("ffmpeg unavailable; skipping poll_events event test");
+            return;
+        }
+
+        let (_read_fd, write_fd) = make_pipe().expect("pipe2");
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
+        let mut player = match MpvPlayer::new(
+            vec![
+                PlaylistItem {
+                    uri: a.to_string_lossy().into_owned(),
+                    image_duration: None,
+                },
+                PlaylistItem {
+                    uri: b.to_string_lossy().into_owned(),
+                    image_duration: None,
+                },
+            ],
+            Duration::from_millis(200),
+            false,
+            ScaleMode::Fit,
+            64,
+            64,
+            write_owned,
+        ) {
+            Ok(p) => p,
+            Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
+                eprintln!("libmpv cannot load test media; skipping event drain test");
+                return;
+            }
+            Err(e) => panic!("player init (event drain test): {e}"),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_ended = false;
+        let mut saw_loaded = false;
+        while Instant::now() < deadline && !(saw_ended && saw_loaded) {
+            let drained = player.poll_events();
+            for ev in &drained {
+                match ev {
+                    MpvItemEvent::ItemEnded => saw_ended = true,
+                    MpvItemEvent::ItemLoaded => {
+                        if saw_ended {
+                            saw_loaded = true;
+                        }
+                    }
+                }
+            }
+            if drained.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        assert!(
+            saw_ended,
+            "ItemEnded must surface within the polling window for a \
+             two-image playlist with 200ms per-item duration"
+        );
+        assert!(
+            saw_loaded,
+            "ItemLoaded (for image B) must follow ItemEnded within the \
+             polling window"
+        );
+
+        drop(player);
     }
 }

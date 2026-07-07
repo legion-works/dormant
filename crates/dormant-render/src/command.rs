@@ -10,6 +10,9 @@
 
 use dormant_core::types::{CmdFailure, StageKind};
 
+#[cfg(target_os = "linux")]
+use crate::screensaver::ScreensaverSettings;
+
 /// A command sent from the async engine task to the dedicated Wayland
 /// thread via a [`calloop::channel`].
 #[derive(Debug)]
@@ -40,6 +43,36 @@ pub(crate) enum RenderCommand {
         /// flushed.
         reply: tokio::sync::oneshot::Sender<()>,
     },
+
+    /// Linux-only: replace the current surface content with a libmpv-
+    /// driven screensaver overlay.  Issued by the sink impl when the
+    /// engine asks for `StageKind::RenderScreensaver` AND a screensaver
+    /// config has been registered for this display.  Without a
+    /// registered config the sink resolves the show with
+    /// `E_RENDER_UNAVAILABLE` and never sends this command.
+    ///
+    /// On success, the reply resolves once the surface is committed
+    /// with the screensaver's first shm buffer attached.  Pre-first-
+    /// frame failures (mpv init / loadfile / 5-second-no-first-frame
+    /// timeout) resolve as `Err` so the engine falls through.  Post-
+    /// first-frame failures during operation switch the surface back
+    /// to the opaque-black buffer on the SAME surface (no destroy /
+    /// flicker) and log `screensaver_failed_to_black`.
+    #[cfg(target_os = "linux")]
+    ShowScreensaver {
+        /// Stage generation counter (forwarded to logs).
+        r#gen: u64,
+        /// Index of the stage in the display's ladder.
+        idx: usize,
+        /// Screensaver config (`items` / `image_duration` / `audio`) carried
+        /// with the command so the wayland thread doesn't need to look
+        /// it up via a back-channel.
+        settings: ScreensaverSettings,
+        /// Reply channel — resolves once the surface is committed with
+        /// the screensaver buffer attached, or with an error if mpv
+        /// failed to produce a first frame within the deadline.
+        reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
+    },
 }
 
 #[cfg(test)]
@@ -69,32 +102,14 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
             RenderCommand::Teardown { .. } => panic!("expected Show variant"),
+            #[cfg(target_os = "linux")]
+            RenderCommand::ShowScreensaver { .. } => panic!("expected Show variant"),
         }
         let r = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(rx)
             .unwrap();
         assert!(r.is_ok());
-    }
-
-    #[test]
-    fn teardown_command_carries_through_oneshot() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let cmd = RenderCommand::Teardown {
-            r#gen: 9,
-            reply: tx,
-        };
-        match cmd {
-            RenderCommand::Teardown { r#gen, reply } => {
-                assert_eq!(r#gen, 9);
-                let _ = reply.send(());
-            }
-            RenderCommand::Show { .. } => panic!("expected Teardown variant"),
-        }
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(rx)
-            .unwrap();
     }
 
     #[test]
@@ -120,6 +135,97 @@ mod tests {
             .unwrap();
         let err = result.unwrap_err();
         assert_eq!(err.controller, "render-black");
+        assert!(err.error.starts_with("E_RENDER_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn teardown_command_carries_through_oneshot() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cmd = RenderCommand::Teardown {
+            r#gen: 9,
+            reply: tx,
+        };
+        match cmd {
+            RenderCommand::Teardown { r#gen, reply } => {
+                assert_eq!(r#gen, 9);
+                let _ = reply.send(());
+            }
+            RenderCommand::Show { .. } => panic!("expected Teardown variant"),
+            #[cfg(target_os = "linux")]
+            RenderCommand::ShowScreensaver { .. } => panic!("expected Teardown variant"),
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rx)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn show_screensaver_carries_settings() {
+        use std::time::Duration;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), CmdFailure>>();
+        let settings = ScreensaverSettings {
+            items: vec!["a.mp4".into(), "b.png".into()],
+            image_duration: Duration::from_secs(4),
+            audio: true,
+        };
+        let expected_items = settings.items.clone();
+        let expected_dur = settings.image_duration;
+        let expected_audio = settings.audio;
+        let cmd = RenderCommand::ShowScreensaver {
+            r#gen: 11,
+            idx: 1,
+            settings,
+            reply: tx,
+        };
+        let RenderCommand::ShowScreensaver {
+            r#gen,
+            idx,
+            settings,
+            reply,
+        } = cmd
+        else {
+            panic!("expected ShowScreensaver variant");
+        };
+        assert_eq!(r#gen, 11);
+        assert_eq!(idx, 1);
+        assert_eq!(settings.items, expected_items);
+        assert_eq!(settings.image_duration, expected_dur);
+        assert_eq!(settings.audio, expected_audio);
+        let _ = reply.send(Ok(()));
+        let r = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rx)
+            .unwrap();
+        assert!(r.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn show_screensaver_err_round_trips() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), CmdFailure>>();
+        let failure = CmdFailure {
+            controller: "render-screensaver".into(),
+            error: "E_RENDER_UNAVAILABLE: mpv init failed".into(),
+        };
+        let cmd = RenderCommand::ShowScreensaver {
+            r#gen: 1,
+            idx: 0,
+            settings: ScreensaverSettings::default(),
+            reply: tx,
+        };
+        let RenderCommand::ShowScreensaver { reply, .. } = cmd else {
+            panic!("expected ShowScreensaver variant");
+        };
+        let _ = reply.send(Err(failure.clone()));
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(rx)
+            .unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.controller, "render-screensaver");
         assert!(err.error.starts_with("E_RENDER_UNAVAILABLE"));
     }
 }

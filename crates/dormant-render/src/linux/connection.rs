@@ -211,6 +211,10 @@ fn init(
         queue_handle,
         loop_should_exit.clone(),
     );
+    // Inject the loop handle so the screensaver install path can register
+    // its wakeup source mid-flight (the install is invoked from inside
+    // the configure handler, which runs from within a calloop tick).
+    state.install_loop_handle(loop_handle.clone());
 
     // First roundtrip populates output info.
     if let Err(e) = event_queue.roundtrip(&mut state) {

@@ -12,11 +12,28 @@ allow = [
   "CC0-1.0",
   "MPL-2.0",
   "CDLA-Permissive-2.0",
-  # libmpv2 / libmpv2-sys — the LGPL-2.1+ mpv library; dormant dynamically
-  # links libmpv via dlopen (loaded at run time, not statically incorporated)
-  "LGPL-2.1",
+  # ksni (dormant-tray's StatusNotifierItem library) is Unlicensed —
+  # the maintainer placed it under the Unlicense; OSI-approved, FSF
+  # Free/Libre.  Allowed because it's source-only consumption from us.
+  "Unlicense",
+  # slotmap (transitive via fontdb → usvg → resvg → dormant-tray
+  # build-dep) ships under the zlib license.  Build-time codegen only;
+  # not linked into the tray binary.
+  "Zlib",
 ]
-confidence-threshold = 0.8
+# libmpv2 / libmpv2-sys declare license = "LGPL-2.1", which is a
+# deprecated SPDX expression in SPDX-3; cargo-deny's license parser
+# flags them as parse-errors and can't classify the crate against the
+# allow list.  The crates are LGPL-2.1 (equivalent to LGPL-2.1-only);
+# pinning the exception by crate name is the documented workaround for
+# unfixable upstream metadata.
+[[licenses.exceptions]]
+crate = "libmpv2"
+allow = ["LGPL-2.1"]
+
+[[licenses.exceptions]]
+crate = "libmpv2-sys"
+allow = ["LGPL-2.1"]
 
 [bans]
 # "wildcards" are semver-minimum specs like "2" (≥2.0.0) — standard Cargo practice

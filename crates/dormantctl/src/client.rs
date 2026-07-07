@@ -143,10 +143,10 @@ impl EventShutdown {
     /// Returns the same I/O errors as
     /// [`std::os::unix::net::UnixStream::shutdown`]: `ENOTCONN` /
     /// `EBADF` if the underlying socket is no longer connected or has
-    /// already been shut down.  Callers (the [`TickShutdown`] drop
-    /// guard) treat the result as best-effort — the goal is to
-    /// unblock the blocked read on the original FD, not to perform a
-    /// clean half-close.
+    /// already been shut down.  Callers (the `TickShutdown` drop
+    /// guard in `dormant-tray`) treat the result as best-effort —
+    /// the goal is to unblock the blocked read on the original FD,
+    /// not to perform a clean half-close.
     pub fn shutdown(&self) -> std::io::Result<()> {
         self.stream.shutdown(std::net::Shutdown::Both)
     }

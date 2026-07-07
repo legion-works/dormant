@@ -7,7 +7,7 @@
 //!
 //! ## Module layout
 //!
-//! - [`state`] — pure-logic icon-state derivation from a [`StateSnapshot`].
+//! - [`state`] — pure-logic icon-state derivation from a `StateSnapshot`.
 //! - [`tooltip`] — pure-logic tooltip construction.
 //! - [`menu`] — pure-logic menu model construction (without `ksni` types so
 //!   it can be unit-tested against canned snapshots).

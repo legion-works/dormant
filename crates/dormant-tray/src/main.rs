@@ -12,7 +12,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use dormant_core::paths;
-use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 #[cfg(target_os = "linux")]
@@ -21,6 +20,11 @@ use dormant_tray::DEFAULT_WEB_PORT;
 use dormant_tray::ipc_loop;
 #[cfg(target_os = "linux")]
 use dormant_tray::tray::{self, TrayState};
+// `tokio::sync::Mutex` is only used inside `run_linux`; keeping it inside
+// the linux-gated block keeps the macOS/Windows stub `main` compiling
+// without a `tokio` dependency (memory-1718 — cross-platform CI gauntlet).
+#[cfg(target_os = "linux")]
+use tokio::sync::Mutex;
 
 fn main() -> ExitCode {
     install_tracing();

@@ -104,8 +104,8 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Mqtt) => {
-            let (cfg, _creds) = load_config_and_creds(args)?;
-            let results = dormant_doctor::probe_mqtt_all(&cfg).await;
+            let (cfg, creds) = load_config_and_creds(args)?;
+            let results = dormant_doctor::probe_mqtt_all(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
         }

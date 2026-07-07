@@ -1,15 +1,30 @@
 //! Pure-logic tooltip construction.
 //!
-//! Tooltip shape: a single-line status header followed by a per-display
-//! detail line joined with ` · `.  Examples:
+//! Tooltip shape: a single-line status header followed by the phase
+//! glyph legend and a per-display detail line joined with ` · `.
+//! Examples:
 //!
-//! - `dormant — 2 displays, 1 paused` (header)
-//! - `main: active · tv: blanked`     (detail)
+//! - `dormant — 2 displays, 1 paused`               (header)
+//! - `● active · ◐ staged · ○ blanked · ⚠ unreachable` (legend)
+//! - `main: active · tv: blanked`                    (detail)
 //!
-//! When the IPC is unreachable the caller feeds [`TooltipInputs::unreachable`]
-//! and the function emits a single "dormant: daemon unreachable" line.
+//! The legend is what makes the per-display detail line self-documenting:
+//! the same glyphs appear in the per-display submenu labels, so the
+//! operator sees the same vocabulary in two places and the tooltip
+//! answers "what does this circle mean" without leaving the tray.
+//!
+//! When the IPC is unreachable the caller feeds
+//! [`TooltipInputs::unreachable`] and the function emits a single
+//! "dormant: daemon unreachable" line.
 
 use dormant_core::rules::StateSnapshot;
+
+/// The legend block the tooltip carries below the header.  Kept
+/// inline so the renderer stays pure; matches the format
+/// `crate::menu::submenu_label` uses for per-display submenu
+/// labels, and `crate::icon::draw_pause_badge` for the tray icon
+/// variant.
+const PHASE_GLYPH_LEGEND: &str = "● active · ◐ staged · ○ blanked · ⚠ unreachable";
 
 /// Inputs the tooltip builder needs from the runtime.  The runtime owns
 /// reachability because [`StateSnapshot`] does not carry it; the builder
@@ -28,7 +43,8 @@ pub struct TooltipInputs<'a> {
 pub struct Tooltip {
     /// The headline (e.g. "dormant — 2 displays, 1 paused").
     pub title: String,
-    /// The per-display detail line (e.g. "main: active · tv: blanked").
+    /// The combined legend + per-display detail (e.g. "● active · ◐
+    /// staged · ○ blanked · ⚠ unreachable\nmain: active · tv: blanked").
     /// Empty when there are no displays or the daemon is unreachable.
     pub body: String,
 }
@@ -80,7 +96,16 @@ pub fn build_tooltip(inputs: &TooltipInputs<'_>) -> Tooltip {
         };
         parts.push(format!("{id}: {phase}"));
     }
-    let body = parts.join(" · ");
+    let detail = parts.join(" · ");
+
+    // Body is the legend on its own line followed by the per-display
+    // detail; an empty detail (no displays yet) collapses to just the
+    // legend so the operator always sees the vocabulary.
+    let body = if detail.is_empty() {
+        PHASE_GLYPH_LEGEND.to_string()
+    } else {
+        format!("{PHASE_GLYPH_LEGEND}\n{detail}")
+    };
 
     Tooltip {
         title: header,
@@ -155,16 +180,19 @@ mod tests {
     }
 
     #[test]
-    fn body_lists_per_display_phase() {
+    fn body_lists_per_display_phase_below_glyph_legend() {
         let t = build_tooltip(&TooltipInputs {
             snapshot: Some(&snap_two_displays()),
             unreachable: false,
         });
-        assert_eq!(t.body, "main: active · tv: blanked (paused)");
+        assert_eq!(
+            t.body,
+            "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmain: active · tv: blanked (paused)"
+        );
     }
 
     #[test]
-    fn empty_displays_announces_zero() {
+    fn empty_displays_still_carries_legend() {
         let snap = StateSnapshot {
             sensors: vec![],
             zones: vec![],
@@ -176,7 +204,9 @@ mod tests {
             unreachable: false,
         });
         assert_eq!(t.title, "dormant — no displays configured");
-        assert!(t.body.is_empty());
+        // Even with no displays the operator still sees the glyph legend
+        // (collapsed to a single line because the detail line is empty).
+        assert_eq!(t.body, "● active · ◐ staged · ○ blanked · ⚠ unreachable");
     }
 
     #[test]
@@ -202,6 +232,9 @@ mod tests {
             unreachable: false,
         });
         assert_eq!(t.title, "dormant — 1 display");
-        assert_eq!(t.body, "mon: active");
+        assert_eq!(
+            t.body,
+            "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: active"
+        );
     }
 }

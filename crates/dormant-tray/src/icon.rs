@@ -40,6 +40,66 @@ const BLOB_24: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_24.bin"));
 const BLOB_32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_32.bin"));
 const BLOB_48: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark_48.bin"));
 
+// Compile-time-embedded per-item menu glyphs (16×16 PNG, RGBA8).  The
+// same `include_bytes!(concat!(env!("OUT_DIR"), …))` pattern as the
+// mark blobs above — see `load_does_not_depend_on_out_dir_at_runtime`
+// for the runtime-environment-independence contract.
+//
+// Each glyph SVG lives at `crates/dormant-tray/assets/glyphs/<name>.svg`
+// and is rasterized to PNG by `build.rs`.  Adding a new glyph requires
+// (1) the SVG file, (2) a `GLYPHS` entry in `build.rs`, and (3) a
+// `const` here — the compiler will reject the build if any step drifts.
+const GLYPH_PAUSE_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph_pause.png"));
+const GLYPH_PLAY_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph_play.png"));
+const GLYPH_DISPLAY_OFF_PNG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/glyph_display-off.png"));
+const GLYPH_DISPLAY_ON_PNG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/glyph_display-on.png"));
+const GLYPH_WEB_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph_web.png"));
+const GLYPH_EXIT_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph_exit.png"));
+const GLYPH_INFO_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyph_info.png"));
+
+/// The per-item menu glyph set.
+///
+/// Embedded as PNG bytes at build time; the `ksni::StandardItem.icon_data`
+/// field carries the byte slice directly.  The list is closed (not
+/// user-extensible at runtime) so every menu entry's glyph is known
+/// to the compiler — no missing-icon fallback paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Glyph {
+    /// Pause glyph (two vertical bars).
+    Pause,
+    /// Play / resume glyph (right-pointing triangle).
+    Play,
+    /// Display-off glyph (monitor outline with diagonal slash).
+    DisplayOff,
+    /// Display-on glyph (monitor outline with stand).
+    DisplayOn,
+    /// Web / globe glyph.
+    Web,
+    /// Exit / quit glyph (door + arrow).
+    Exit,
+    /// Info glyph (i in a circle) — used for the disabled "Paused —
+    /// Resume to restore" status line.
+    Info,
+}
+
+impl Glyph {
+    /// The PNG bytes for this glyph, suitable for `ksni::StandardItem.icon_data`.
+    #[must_use]
+    pub fn png_bytes(self) -> &'static [u8] {
+        match self {
+            Glyph::Pause => GLYPH_PAUSE_PNG,
+            Glyph::Play => GLYPH_PLAY_PNG,
+            Glyph::DisplayOff => GLYPH_DISPLAY_OFF_PNG,
+            Glyph::DisplayOn => GLYPH_DISPLAY_ON_PNG,
+            Glyph::Web => GLYPH_WEB_PNG,
+            Glyph::Exit => GLYPH_EXIT_PNG,
+            Glyph::Info => GLYPH_INFO_PNG,
+        }
+    }
+}
+
 /// All ARGB32 blobs at every size, in their three derived variants.
 ///
 /// Holds owned `Vec<u8>` for each (state, size) pair.  The tray binary

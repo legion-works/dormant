@@ -70,12 +70,25 @@ pub(crate) async fn security_guard(
             return (StatusCode::UNSUPPORTED_MEDIA_TYPE, axum::Json(body)).into_response();
         }
 
-        // Origin / Sec-Fetch-Site check: reject unless same-origin.
-        let origin_ok = is_same_origin(&headers);
-        if !origin_ok {
-            tracing::warn!(event = "web_reject_origin", reason = "cross_site");
-            let body = serde_json::json!({ "error": "web_reject_origin" });
-            return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
+        // For the config-apply write endpoint, the Origin header MUST be
+        // present (the generic is_same_origin allows absent Origin, which is
+        // a CSRF gap for a write endpoint) and must exact-match the loopback
+        // origin including the actual bound port.
+        if request.uri().path() == "/api/config/apply" {
+            let origin_ok = check_apply_origin(&headers, state.inner.web_bind);
+            if !origin_ok {
+                tracing::warn!(event = "web_reject_origin", reason = "apply_origin");
+                let body = serde_json::json!({ "error": "web_reject_origin" });
+                return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
+            }
+        } else {
+            // Origin / Sec-Fetch-Site check: reject unless same-origin.
+            let origin_ok = is_same_origin(&headers);
+            if !origin_ok {
+                tracing::warn!(event = "web_reject_origin", reason = "cross_site");
+                let body = serde_json::json!({ "error": "web_reject_origin" });
+                return (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
+            }
         }
     }
 
@@ -154,6 +167,67 @@ fn is_loopback_origin(origin: &str) -> bool {
     host_clean == "localhost"
 }
 
+/// Stricter Origin check for the config-apply write endpoint.
+///
+/// The Origin header MUST be present and MUST match
+/// `http://<loopback>:<port>` where `<port>` equals the actual bound web
+/// port.  Absent Origin or wrong-port loopback is rejected — this closes
+/// the CSRF gap the generic `is_same_origin` leaves when the Origin is
+/// absent.
+fn check_apply_origin(headers: &HeaderMap, web_bind: std::net::SocketAddr) -> bool {
+    let origin = match headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(o) => o,
+        None => return false, // absent Origin → reject
+    };
+
+    let origin_lower = origin.to_lowercase();
+
+    // Must be http:// scheme.
+    let after_scheme = match origin_lower
+        .strip_prefix("http://")
+        .or_else(|| origin_lower.strip_prefix("https://"))
+    {
+        Some(a) => a,
+        None => return false,
+    };
+
+    // Check the host is loopback.
+    if !is_loopback_origin(&origin_lower) {
+        return false;
+    }
+
+    // Extract the port from the origin and require it matches the bound port.
+    let origin_port = extract_port(after_scheme);
+    origin_port == web_bind.port()
+}
+
+/// Extract the port from a `host[:port]` string (scheme already stripped).
+/// Returns the parsed port if present, or `0` if no port was found.
+fn extract_port(host: &str) -> u16 {
+    // Bracket notation: after `[::1]:8080` → port is 8080.
+    if host.starts_with('[') {
+        if let Some(bracket_end) = host.find(']') {
+            let rest = &host[bracket_end + 1..];
+            if let Some(port_str) = rest.strip_prefix(':') {
+                return port_str.parse().unwrap_or(0);
+            }
+        }
+        return 0;
+    }
+    // Count colons: single colon = host:port, 2+ = bare IPv6.
+    let colon_count = host.chars().filter(|&c| c == ':').count();
+    if colon_count == 1
+        && let Some(colon_pos) = host.find(':')
+    {
+        return host[colon_pos + 1..].parse().unwrap_or(0);
+    }
+    // No port (plain hostname or bare IPv6).
+    0
+}
+
 /// Extract the host portion from `host[:port]`, correctly handling
 /// bracketed IPv6 addresses like `[::1]:8080`, plain `localhost:8080`,
 /// and bare IPv6 `::1`.
@@ -229,6 +303,8 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),

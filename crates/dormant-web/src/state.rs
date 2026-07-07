@@ -14,7 +14,7 @@ use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::reload::ReloadOutcome;
 use dormant_core::rules::ControlMsg;
 use dormant_doctor::DoctorService;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Shared state for the web server.
@@ -51,6 +51,15 @@ pub struct WebStateInner {
     /// Path to the daemon's config file (for `/api/config` raw display +
     /// validation re-run).
     pub config_path: PathBuf,
+
+    /// Path to the daemon's credentials file.  Used by GET and apply
+    /// endpoints to load credentials from the same canonical location
+    /// rather than deriving the path from the config file name.
+    pub creds_path: PathBuf,
+
+    /// Serialises config-apply operations so concurrent apply requests
+    /// cannot race each other.
+    pub apply_lock: Mutex<()>,
 
     /// Shared, coalesced [`DoctorService`] — same instance the IPC server
     /// uses.

@@ -58,6 +58,8 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,

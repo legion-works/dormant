@@ -207,10 +207,11 @@ async fn run_inner(
             SensorConfig::Mqtt(mqtt_cfg) => {
                 let id = id.clone();
                 let cfg = mqtt_cfg.clone();
+                let creds = creds.clone();
                 probe_futs.push(Box::pin(async move {
                     let res = tokio::time::timeout(
                         NETWORK_PROBE_TIMEOUT,
-                        crate::probes::mqtt::probe_mqtt_one(&id, &cfg),
+                        crate::probes::mqtt::probe_mqtt_one(&id, &cfg, &creds),
                     )
                     .await
                     .unwrap_or_else(|_| ProbeResult::fail(format!("mqtt {id}"), "probe timeout"));

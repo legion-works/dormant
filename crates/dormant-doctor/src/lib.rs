@@ -92,8 +92,9 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
             dormant_core::config::schema::SensorConfig::Mqtt(mqtt_cfg) => {
                 let id = id.clone();
                 let cfg = mqtt_cfg.clone();
+                let creds = creds.clone();
                 sensor_futs.push(Box::pin(async move {
-                    probes::mqtt::probe_mqtt_one(&id, &cfg).await
+                    probes::mqtt::probe_mqtt_one(&id, &cfg, &creds).await
                 }));
             }
             dormant_core::config::schema::SensorConfig::Ha(ha_cfg) => {

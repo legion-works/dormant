@@ -64,7 +64,7 @@ use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use crate::playlist::PlaylistItem;
-use crate::settings::{FIRST_FRAME_DEADLINE, scheme_allowed};
+use crate::settings::{FIRST_FRAME_DEADLINE, ScaleMode, scheme_allowed};
 use libmpv2_sys::{
     MPV_RENDER_API_TYPE_SW, mpv_render_context, mpv_render_context_create, mpv_render_context_free,
     mpv_render_context_render, mpv_render_context_set_update_callback, mpv_render_context_update,
@@ -219,6 +219,7 @@ impl MpvPlayer {
         items: Vec<PlaylistItem>,
         image_duration: Duration,
         audio_enabled: bool,
+        scale_mode: ScaleMode,
         width: u32,
         height: u32,
         wakeup_write: std::os::fd::OwnedFd,
@@ -287,6 +288,28 @@ impl MpvPlayer {
             .map_err(|e| MpvError::Init(format!("set loop-playlist: {e}")))?;
         mpv.set_property("image-display-duration", image_duration.as_secs_f64())
             .map_err(|e| MpvError::Init(format!("set image-display-duration: {e}")))?;
+
+        // ── Scale-mode properties ──────────────────────────────────
+        // The four canonical mpv scaling flags for the matching [`ScaleMode`]
+        // variant.  Set BEFORE `loadfile` so mpv applies them to the very
+        // first decoded frame; the empirical probe (see the task report)
+        // confirmed all four flags work under `MPV_RENDER_API_TYPE_SW`.
+        // `Fit` explicitly sets `keepaspect=yes panscan=0.0` for
+        // determinism — mpv's defaults include `keepaspect=yes` but
+        // leaving `panscan` unset means a future runtime set could leave
+        // a stray panscan value in place.
+        let (keepaspect, panscan, video_unscaled): (&str, &str, &str) = match scale_mode {
+            ScaleMode::Fill => ("yes", "1.0", "no"),
+            ScaleMode::Fit => ("yes", "0.0", "no"),
+            ScaleMode::Stretch => ("no", "0.0", "no"),
+            ScaleMode::Center => ("yes", "0.0", "yes"),
+        };
+        mpv.set_property("keepaspect", keepaspect)
+            .map_err(|e| MpvError::Init(format!("set keepaspect: {e}")))?;
+        mpv.set_property("panscan", panscan)
+            .map_err(|e| MpvError::Init(format!("set panscan: {e}")))?;
+        mpv.set_property("video-unscaled", video_unscaled)
+            .map_err(|e| MpvError::Init(format!("set video-unscaled: {e}")))?;
 
         // ── SW render context ──────────────────────────────────────
         let width_i = i32::try_from(width).map_err(|e| MpvError::Init(format!("width: {e}")))?;
@@ -544,19 +567,32 @@ mod tests {
     /// Build a real `MpvPlayer` against a generated test fixture (skips
     /// when ffmpeg is absent) and return it.  Centralises the test-video
     /// + pipe setup so each test focuses on its assertion.
+    ///
+    /// `scale_mode` defaults to `Fit` so the existing tests (which assert
+    /// on the letterbox / generic render behaviour, not on scaling
+    /// semantics) get the prior effective behaviour — only the
+    /// `mpv_player_sets_scale_mode_properties_*` tests below exercise
+    /// the scaling properties explicitly.
     fn build_test_player() -> Option<(MpvPlayer, PathBuf)> {
         let dir = std::env::temp_dir().join("dormant-render-tests");
         std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
         let video = dir.join("test.mp4");
         generate_test_video(&video)?;
+        build_test_player_with_mode(video, ScaleMode::Fit)
+    }
+
+    /// Build a `MpvPlayer` against an already-generated video path with
+    /// an explicit [`ScaleMode`].  Skips on environment capability gaps
+    /// (missing codecs/demuxers) — see `build_test_player` for the same
+    /// affordance.
+    fn build_test_player_with_mode(
+        video: PathBuf,
+        scale_mode: ScaleMode,
+    ) -> Option<(MpvPlayer, PathBuf)> {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
         // SAFETY: write_fd was just created by pipe2 and is not yet owned
         // by anything else — `OwnedFd` takes exclusive ownership.
         let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
-        // loadfile failures are environment capability gaps (missing
-        // codecs/demuxers on this host); skip the test just like
-        // the ffmpeg-absent path.  Real regressions (scheme reject,
-        // init failure, etc.) still panic.
         let player = match MpvPlayer::new(
             vec![PlaylistItem {
                 uri: video.to_string_lossy().into_owned(),
@@ -564,6 +600,7 @@ mod tests {
             }],
             Duration::from_secs(2),
             false,
+            scale_mode,
             320,
             180,
             write_owned,
@@ -716,6 +753,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -754,6 +792,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -813,6 +852,7 @@ mod tests {
             }],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -865,6 +905,7 @@ mod tests {
             ],
             Duration::from_secs(1),
             false,
+            ScaleMode::Fit,
             64,
             64,
             write_owned,
@@ -916,6 +957,7 @@ mod tests {
                 ],
                 Duration::from_secs(1),
                 false,
+                ScaleMode::Fit,
                 64,
                 64,
                 write_owned,
@@ -1024,6 +1066,7 @@ mod tests {
             ],
             Duration::from_secs(10), // global default
             false,
+            ScaleMode::Fit, // arbitrary — this test is about per-file options, not scaling.
             64,
             64,
             write_owned,
@@ -1048,5 +1091,242 @@ mod tests {
         );
 
         drop(player);
+    }
+
+    // ── Scale-mode property tests ──────────────────────────────────────
+    //
+    // The probing in the build_test_player_with_mode path requires a
+    // real (decodable) source so the property readback is meaningful;
+    // the tests below skip on host capability gaps (matching the
+    // existing media-load skip-guard pattern used everywhere else in
+    // this module).
+
+    /// Sanity check for [`build_test_player_with_mode`] on Fit (the
+    /// default test path): the property readback reflects the Fit
+    /// mode's settings.  Catches the case where the `ScaleMode` parameter
+    /// gets dropped silently — `Fill` is the production default so we
+    /// test Fit explicitly to assert the value made it through.
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_fit() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Fit test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Fit) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Fit test");
+            return;
+        };
+
+        // Fit: keepaspect=yes, panscan=0.0, video-unscaled=no.
+        // The `panscan` property is f64 on this mpv build; matching the
+        // probe readback path keeps the test format consistent.
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "yes", "Fit must set keepaspect=yes");
+        let panscan_raw = player.property("panscan").expect("get panscan");
+        let panscan: f64 = panscan_raw
+            .parse()
+            .unwrap_or_else(|_| panic!("panscan must parse as f64, got {panscan_raw:?}"));
+        assert!(
+            panscan.abs() < 0.01,
+            "Fit must set panscan≈0.0 (got {panscan})"
+        );
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "no", "Fit must set video-unscaled=no");
+
+        drop(player);
+    }
+
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_fill() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test_fill.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Fill test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Fill) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Fill test");
+            return;
+        };
+
+        // Fill: keepaspect=yes + panscan=1.0 (the OS-screensaver norm).
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "yes", "Fill must set keepaspect=yes");
+        let panscan_raw = player.property("panscan").expect("get panscan");
+        let panscan: f64 = panscan_raw
+            .parse()
+            .unwrap_or_else(|_| panic!("panscan must parse as f64, got {panscan_raw:?}"));
+        // panscan=1.0 in canonical form; some mpv versions normalize to
+        // 1.000000 etc — compare with a small tolerance.
+        assert!(
+            (panscan - 1.0).abs() < 0.01,
+            "Fill must set panscan≈1.0 (got {panscan})"
+        );
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "no", "Fill must set video-unscaled=no");
+
+        drop(player);
+    }
+
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_stretch() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test_stretch.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Stretch test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Stretch) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Stretch test");
+            return;
+        };
+
+        // Stretch: keepaspect=no, panscan=0.0, video-unscaled=no.
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "no", "Stretch must set keepaspect=no");
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "no", "Stretch must set video-unscaled=no");
+
+        drop(player);
+    }
+
+    #[test]
+    fn mpv_player_sets_scale_mode_properties_center() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_test_center.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping scale-mode Center test");
+            return;
+        }
+        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Center) else {
+            eprintln!("libmpv cannot load test media; skipping scale-mode Center test");
+            return;
+        };
+
+        // Center: keepaspect=yes, video-unscaled=yes (1:1 native size).
+        let keepaspect = player.property("keepaspect").expect("get keepaspect");
+        assert_eq!(keepaspect, "yes", "Center must set keepaspect=yes");
+        let video_unscaled = player
+            .property("video-unscaled")
+            .expect("get video-unscaled");
+        assert_eq!(video_unscaled, "yes", "Center must set video-unscaled=yes");
+
+        drop(player);
+    }
+
+    /// Integration assertion: building with Fill produces a rendered
+    /// frame whose pixel data is materially different from Fit on the
+    /// same fixture.  A regression that breaks property-set silently
+    /// (e.g. a future refactor that drops the `mpv.set_property(...)`
+    /// call) would cause this test to false-pass via equal buffers —
+    /// see the probe evidence in the task report (portrait 100x400 → 320x180:
+    /// Fit renders 14% width content band, Fill renders ~88%, the
+    /// buffers differ by ~6× in non-zero-byte count).
+    #[test]
+    fn mpv_player_fill_renders_differently_than_fit() {
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let video = dir.join("scale_mode_diff.mp4");
+        if generate_test_video(&video).is_none() {
+            eprintln!("ffmpeg unavailable; skipping fill-vs-fit diff test");
+            return;
+        }
+
+        // Build two players on the same fixture with different scale_modes.
+        let build = |mode: ScaleMode| -> Option<MpvPlayer> {
+            let (_r, w) = make_pipe().expect("pipe2");
+            let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(w) };
+            let player = MpvPlayer::new(
+                vec![PlaylistItem {
+                    uri: video.to_string_lossy().into_owned(),
+                    image_duration: None,
+                }],
+                Duration::from_secs(2),
+                false,
+                mode,
+                320,
+                180,
+                write_owned,
+            );
+            match player {
+                Ok(p) => Some(p),
+                Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
+                    eprintln!(
+                        "libmpv cannot load test media; skipping fill-vs-fit diff \
+                         test (loadfile: {msg})"
+                    );
+                    None
+                }
+                Err(e) => panic!("player init: {e}"),
+            }
+        };
+
+        let Some(mut fill_player) = build(ScaleMode::Fill) else {
+            return;
+        };
+        let Some(mut fit_player) = build(ScaleMode::Fit) else {
+            drop(fill_player);
+            return;
+        };
+
+        // Warm up both decoders: render ~30 frames each so the decoder
+        // is well past the first-frame barrier.  Sample the last
+        // successful frame from each.
+        let sample = |player: &mut MpvPlayer| -> Option<Vec<u8>> {
+            let mut latest: Option<Vec<u8>> = None;
+            for _ in 0..30 {
+                let mut buf = vec![0u8; (320 * 4 * 180) as usize];
+                if let Ok(true) = player.render_frame_into(&mut buf) {
+                    latest = Some(buf);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            latest
+        };
+
+        let fill_buf = sample(&mut fill_player);
+        let fit_buf = sample(&mut fit_player);
+
+        // Both must produce SOMETHING.
+        let (Some(fill_buf), Some(fit_buf)) = (fill_buf, fit_buf) else {
+            // The probes both succeeded on this host (the build_test_player
+            // path in earlier tests proved so).  Surface a clearer
+            // failure if a future regression trips this branch.
+            drop(fill_player);
+            drop(fit_player);
+            panic!("neither Fill nor Fit rendered any frame on this host");
+        };
+
+        // The buffers must differ materially — equal buffers would mean
+        // the property-set didn't take effect at all.
+        let fill_nz = fill_buf.iter().filter(|&&b| b != 0).count();
+        let fit_nz = fit_buf.iter().filter(|&&b| b != 0).count();
+        assert_ne!(
+            fill_buf, fit_buf,
+            "Fill and Fit must produce different buffers on the same fixture — \
+             identical results mean the scale_mode properties were not applied"
+        );
+        // Sanity: both must have meaningful non-zero content (the
+        // fixture has solid content pixels).
+        assert!(
+            fill_nz > 1000,
+            "Fill buffer has only {fill_nz} non-zero bytes"
+        );
+        assert!(fit_nz > 1000, "Fit buffer has only {fit_nz} non-zero bytes");
+
+        drop(fill_player);
+        drop(fit_player);
     }
 }

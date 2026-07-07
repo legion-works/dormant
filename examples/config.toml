@@ -100,6 +100,12 @@ modes = ["power_off"]
 # [displays.desktop.screensaver]
 # trigger = "vacancy"
 # audio = false
+# # scale_mode — how source frames are mapped onto the rendered rectangle.
+# # "fill" (default) crops to fill (no black bars; OS-screensaver norm).
+# # "fit" preserves aspect with black bars (legacy behaviour).
+# # "stretch" fills the rectangle but distorts aspect.
+# # "center" shows the source at native pixel size, centred.
+# scale_mode = "fill"
 # [[displays.desktop.screensaver.source]]
 # path = "/home/user/Pictures/screensaver"
 # recurse = false

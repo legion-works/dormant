@@ -148,7 +148,10 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     // ── displays.<id>.ladder (array-of-tables entries) ─────────────────────
     ("displays..ladder", &["kind", "dwell"]),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
-    ("displays..screensaver", &["trigger", "audio", "source"]),
+    (
+        "displays..screensaver",
+        &["trigger", "audio", "source", "scale_mode"],
+    ),
     // ── displays.<id>.screensaver.source (array-of-tables entries) ────────
     (
         "displays..screensaver.source",
@@ -638,6 +641,21 @@ fn validate_display(
                         ),
                     });
                 }
+                // scale_mode value check: must be one of {fill, fit, stretch,
+                // center} when set.  `None` falls back to Fill at the render
+                // layer; this validator only rejects explicit unknown values.
+                if let Some(ref sm) = ss.scale_mode
+                    && !matches!(sm.as_str(), "fill" | "fit" | "stretch" | "center")
+                {
+                    errors.push(ValidationError {
+                        what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                        detail: format!(
+                            "display '{display_id}' screensaver scale_mode '{sm}' \
+                             is unknown — allowed: \"fill\", \"fit\", \"stretch\", \"center\""
+                        ),
+                    });
+                }
+
                 // Per-source checks.
                 for (i, src) in ss.source.iter().enumerate() {
                     // Source must have exactly one of path or non-empty
@@ -929,6 +947,55 @@ gracee_period = "60s"
         );
     }
 
+    #[test]
+    fn collect_unknown_keys_accepts_scale_mode_in_screensaver() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+scale_mode = "fill"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(
+            unknown.is_empty(),
+            "scale_mode must be a known key under displays..screensaver, \
+             got unknown: {:?}",
+            unknown.iter().map(|u| &u.key_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collect_unknown_keys_flags_typo_in_screensaver_scale_mode() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+scalee_mode = "fill"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(
+            unknown.iter().any(|u| u.key_path.contains("scalee_mode")),
+            "expected scalee_mode to be flagged under the screensaver path, got {:?}",
+            unknown.iter().map(|u| &u.key_path).collect::<Vec<_>>()
+        );
+    }
+
     // ── load_config ────────────────────────────────────────────────────────
 
     #[test]
@@ -1199,6 +1266,147 @@ gracee_period = "60s"
             errors.iter().any(|e| e.what == "empty zone"),
             "expected empty zone error, got: {:?}",
             errors
+        );
+    }
+
+    // ── Screensaver scale_mode validation ────────────────────────────────
+
+    use std::time::Duration;
+
+    use crate::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
+    use crate::types::{LadderStage, StageKind};
+
+    /// Build a render-eligible display with a `[controller, render_screensaver]`
+    /// ladder and the given `scale_mode` value.  Used by the `scale_mode`
+    /// validation tests; bypasses TOML parsing for clarity.
+    fn display_with_scale_mode(scale_mode: Option<&str>) -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["kwin-dpms".into()],
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: Some(Duration::from_secs(5)),
+                },
+                LadderStage {
+                    kind: StageKind::RenderScreensaver,
+                    dwell: Some(Duration::from_secs(10)),
+                },
+            ],
+            screensaver: Some(ScreensaverConfig {
+                trigger: "vacancy".into(),
+                audio: false,
+                source: vec![ScreensaverSource {
+                    path: Some("/tmp/img.png".into()),
+                    urls: Vec::new(),
+                    recurse: false,
+                    shuffle: false,
+                    order: None,
+                    image_duration: None,
+                }],
+                scale_mode: scale_mode.map(str::to_string),
+            }),
+            output: Some("DP-1".into()),
+            ..base_display_cfg()
+        }
+    }
+
+    /// Minimal `DisplayConfig` "base" with sensible defaults for the non-screensaver
+    /// fields.  Override fields via struct-update syntax (`..base_display_cfg()`)
+    /// and the rest is filled in.
+    fn base_display_cfg() -> DisplayConfig {
+        use crate::config::defaults;
+        DisplayConfig {
+            controllers: Vec::new(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: defaults::COMMAND_TIMEOUT,
+            restore_brightness: defaults::RESTORE_BRIGHTNESS,
+            treat_unreachable_as_blanked: true,
+        }
+    }
+
+    fn config_with_scale_mode(scale_mode: Option<&str>) -> super::super::schema::Config {
+        super::super::schema::Config {
+            config_version: 1,
+            daemon: crate::config::DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d1".into(), display_with_scale_mode(scale_mode))]),
+            rules: IndexMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_all_four_scale_modes() {
+        for sm in ["fill", "fit", "stretch", "center"] {
+            let cfg = config_with_scale_mode(Some(sm));
+            let errors = validate(&cfg, &test_capabilities(), &test_creds());
+            let err_msgs: Vec<String> = errors.iter().map(ToString::to_string).collect();
+            assert!(
+                !err_msgs.iter().any(|m| m.contains("scale_mode")),
+                "scale_mode = '{sm}' must be accepted, got errors: {err_msgs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_absent_scale_mode() {
+        let cfg = config_with_scale_mode(None);
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let err_msgs: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            !err_msgs.iter().any(|m| m.contains("scale_mode")),
+            "absent scale_mode must be accepted (renders as Fill), got: {err_msgs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_scale_mode() {
+        let cfg = config_with_scale_mode(Some("zoom"));
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_SCREENSAVER_SOURCE
+                    && e.detail.contains("scale_mode 'zoom'")
+                    && e.detail.contains("fill")
+                    && e.detail.contains("fit")
+                    && e.detail.contains("stretch")
+                    && e.detail.contains("center")),
+            "expected E_SCREENSAVER_SOURCE error for unknown scale_mode 'zoom' \
+             naming the allowed set, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_miscased_scale_mode() {
+        // Case-sensitive parsing — wrong-cased values are unknown.
+        let cfg = config_with_scale_mode(Some("Fill"));
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_SCREENSAVER_SOURCE
+                    && e.detail.contains("scale_mode 'Fill'")),
+            "wrong-cased scale_mode 'Fill' must be rejected, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
     }
 

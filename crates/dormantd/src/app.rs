@@ -1202,10 +1202,24 @@ fn build_render_sinks(
         {
             dc.screensaver.as_ref().map(|ss| {
                 let items = playlist::build_playlist(&ss.source, None);
+                // scale_mode: None (absent) → Fill.  Validation has already
+                // rejected any unknown string value, so a failed parse here
+                // would only be reachable through a programmatic caller
+                // bypassing validate; in that case we still default to Fill
+                // rather than refuse to build the sink.
+                let scale_mode = ss
+                    .scale_mode
+                    .as_deref()
+                    .map(dormant_render::ScaleMode::from_config_str)
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 ScreensaverSettings {
                     items,
                     image_duration: ScreensaverSettings::default().image_duration,
                     audio: ss.audio,
+                    scale_mode,
                 }
             })
         } else {

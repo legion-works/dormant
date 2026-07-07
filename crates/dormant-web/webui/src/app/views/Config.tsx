@@ -1,15 +1,18 @@
 /**
- * Config view — rendered config file + validation + inventory.
+ * Config view — rendered config file + validation + inventory (Raw TOML tab)
+ * + editable settings form (Settings tab, default).
  *
- * Fetches /api/config + /api/state in parallel on mount. Two-column
- * layout: left is the syntax-highlighted TOML file viewer, right is
- * inventory summary, full validation detail, and a reload button.
+ * Fetches /api/config + /api/state in parallel on mount. Two-tab layout:
+ * "Settings" (default) renders the editable form; "Raw TOML" shows the
+ * syntax-highlighted file viewer with inventory and validation.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
 import type { ConfigResponse } from "../../api/types";
 import { Card, stageKindLabel } from "../components";
+import { SettingsForm } from "../config/SettingsForm";
 import "./Config.css";
+import "../config/ConfigForm.css";
 
 interface ConfigState {
   loading: boolean;
@@ -26,6 +29,8 @@ interface TomlLine {
   comment: string;
   valColor: string;
 }
+
+type ConfigTab = "settings" | "raw";
 
 /**
  * Line-by-line TOML classifier for syntax highlighting.
@@ -85,64 +90,13 @@ function validationSeverity(v: ConfigResponse["validation"]): "ok" | "warning" |
   return "ok";
 }
 
-export default function Config() {
-  const [state, setState] = useState<ConfigState>({
-    loading: true,
-    error: null,
-    config: null,
-    pendingReload: null,
-  });
-  const [reloading, setReloading] = useState(false);
-  const mountedRef = useRef(true);
-
-  const fetchData = useCallback(async () => {
-    setState((prev) => ({ ...prev, error: null }));
-    try {
-      const [cfg, snap] = await Promise.all([getConfig(), getState()]);
-      if (!mountedRef.current) return;
-      setState({
-        loading: false,
-        error: null,
-        config: cfg,
-        pendingReload: snap.pending_reload,
-      });
-    } catch (err: unknown) {
-      if (!mountedRef.current) return;
-      setState({
-        loading: false,
-        error: err instanceof Error ? err.message : "Unknown error",
-        config: null,
-        pendingReload: null,
-      });
-    }
-  }, []);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    void fetchData();
-    return () => { mountedRef.current = false; };
-  }, [fetchData]);
-
-  const handleReload = useCallback(async () => {
-    setReloading(true);
-    try {
-      await postReload();
-    } catch {
-      // Reload may fail; re-fetch to show current state.
-    }
-    await fetchData();
-    setReloading(false);
-  }, [fetchData]);
-
-  if (state.loading) {
-    return <div className="config-loading">Loading configuration…</div>;
-  }
-
-  if (state.error) {
-    return <div className="config-error">Daemon unreachable: {state.error}</div>;
-  }
-
-  const cfg = state.config!;
+/** Raw TOML tab content — identical to the original Config view. */
+function RawTomlTab({ config: cfg, pendingReload, reloading, onReload }: {
+  config: ConfigResponse;
+  pendingReload: string | null;
+  reloading: boolean;
+  onReload: () => void;
+}) {
   const tomlLines = parseTomlLines(cfg.raw_toml);
   const vSeverity = validationSeverity(cfg.validation);
   const inv = cfg.inventory;
@@ -160,11 +114,11 @@ export default function Config() {
     cfg.validation.warnings.length > 0;
 
   return (
-    <div className="config">
-      {(state.pendingReload || sourceMismatch) && (
+    <>
+      {(pendingReload || sourceMismatch) && (
         <div className="config-banner">
-          {state.pendingReload
-            ? `Config reload pending — ${state.pendingReload}`
+          {pendingReload
+            ? `Config reload pending — ${pendingReload}`
             : `Config source: ${cfg.source} (not yet applied)`}
         </div>
       )}
@@ -302,13 +256,106 @@ export default function Config() {
 
           <button
             className="config-reload-btn"
-            onClick={handleReload}
+            onClick={onReload}
             disabled={reloading}
           >
             {reloading ? "Reloading…" : "↻ Reload config"}
           </button>
         </div>
       </div>
+    </>
+  );
+}
+
+export default function Config() {
+  const [state, setState] = useState<ConfigState>({
+    loading: true,
+    error: null,
+    config: null,
+    pendingReload: null,
+  });
+  const [reloading, setReloading] = useState(false);
+  const [tab, setTab] = useState<ConfigTab>("settings");
+  const mountedRef = useRef(true);
+
+  const fetchData = useCallback(async () => {
+    setState((prev) => ({ ...prev, error: null }));
+    try {
+      const [cfg, snap] = await Promise.all([getConfig(), getState()]);
+      if (!mountedRef.current) return;
+      setState({
+        loading: false,
+        error: null,
+        config: cfg,
+        pendingReload: snap.pending_reload,
+      });
+    } catch (err: unknown) {
+      if (!mountedRef.current) return;
+      setState({
+        loading: false,
+        error: err instanceof Error ? err.message : "Unknown error",
+        config: null,
+        pendingReload: null,
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void fetchData();
+    return () => { mountedRef.current = false; };
+  }, [fetchData]);
+
+  const handleReload = useCallback(async () => {
+    setReloading(true);
+    try {
+      await postReload();
+    } catch {
+      // Reload may fail; re-fetch to show current state.
+    }
+    await fetchData();
+    setReloading(false);
+  }, [fetchData]);
+
+  if (state.loading) {
+    return <div className="config-loading">Loading configuration…</div>;
+  }
+
+  if (state.error) {
+    return <div className="config-error">Daemon unreachable: {state.error}</div>;
+  }
+
+  const cfg = state.config!;
+
+  return (
+    <div className="config">
+      <div className="config-tabs">
+        <button
+          type="button"
+          className={`config-tab${tab === "settings" ? " config-tab--active" : ""}`}
+          onClick={() => setTab("settings")}
+        >
+          Settings
+        </button>
+        <button
+          type="button"
+          className={`config-tab${tab === "raw" ? " config-tab--active" : ""}`}
+          onClick={() => setTab("raw")}
+        >
+          Raw TOML
+        </button>
+      </div>
+
+      {tab === "settings" ? (
+        <SettingsForm config={cfg} />
+      ) : (
+        <RawTomlTab
+          config={cfg}
+          pendingReload={state.pendingReload}
+          reloading={reloading}
+          onReload={handleReload}
+        />
+      )}
     </div>
   );
 }

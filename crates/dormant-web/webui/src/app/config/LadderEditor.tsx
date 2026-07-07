@@ -41,9 +41,22 @@ function getEffectiveStages(displayId: string, fetched: LadderStage[], store: Pa
   return (pending as LadderStage[] | undefined) ?? fetched;
 }
 
-/** Clone stages and emit the new array. */
+/**
+ * Strip null values from optional fields that come from the server's
+ * JSON serialisation of Rust Option::None.  These must be absent, not
+ * null, in emitted patches — the server (TOML) rejects null values.
+ */
+function cleanStage(s: LadderStage): LadderStage {
+  if (s.dwell === null) {
+    const { dwell: _, ...rest } = s;
+    return rest as LadderStage;
+  }
+  return s;
+}
+
+/** Clone stages, strip null optional fields, and emit the new array. */
 function emitStages(id: string, stages: LadderStage[], store: PatchStore, onDirty: () => void) {
-  store.trackEdit(LADDER_PATH(id), stages);
+  store.trackEdit(LADDER_PATH(id), stages.map(cleanStage));
   onDirty();
 }
 
@@ -100,7 +113,7 @@ export default function LadderEditor({ stages: fetchedStages, displayId, store, 
 
             {/* Dwell — optional, terminal stage shows marker when absent */}
             <div style={{ flex: 1 }}>
-              {terminal && stage.dwell === undefined ? (
+              {terminal && stage.dwell == null ? (
                 <div className="cf-field">
                   <label className="cf-field__label">dwell</label>
                   <span className="cf-field__value-text" style={{ borderStyle: "dashed", opacity: 0.6 }}>

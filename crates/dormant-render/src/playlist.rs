@@ -145,6 +145,12 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
         src_items.append(&mut url_items);
 
         // ── Shuffle (if requested) ─────────────────────────────────
+        // shuffle + order is exclusive (enforced by config validation);
+        // this debug_assert catches any path that slips through.
+        debug_assert!(
+            !(source.shuffle && source.order.is_some()),
+            "shuffle and order must not both be set — validation should reject this"
+        );
         if source.shuffle && src_items.len() > 1 {
             // Fisher-Yates in-place with SplitMix64.
             #[allow(clippy::cast_possible_truncation)]
@@ -153,8 +159,8 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
                 src_items.swap(i, j);
             }
         }
-        // `order` is silently ignored when `shuffle` wins; otherwise
-        // "sequential" (the default) keeps the deterministic order.
+        // `order` is "sequential" (the only value validation accepts)
+        // which means the deterministic sorted order is the right one.
 
         items.append(&mut src_items);
     }

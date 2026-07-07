@@ -86,6 +86,29 @@ wake_service = "media_player.turn_on"
 wake_data = { entity_id = "media_player.living_room_tv" }
 modes = ["power_off"]
 
+# Desktop monitor with a render ladder: blank the panel via DDC/CI, then
+# switch to a black software overlay, and finally show a screensaver of
+# local images if the room stays vacant.  Requires `--features render`.
+# [displays.desktop]
+# controllers = ["ddcci"]
+# output = "DP-1"
+# ladder = [
+#   { kind = "power_off", dwell = "30s" },
+#   { kind = "render_black", dwell = "5m" },
+#   { kind = "render_screensaver" },
+# ]
+# [displays.desktop.screensaver]
+# trigger = "vacancy"
+# audio = false
+# [[displays.desktop.screensaver.source]]
+# path = "/home/user/Pictures/screensaver"
+# recurse = false
+# shuffle = true
+# image_duration = "8s"
+# [[displays.desktop.screensaver.source]]
+# urls = ["https://example.com/background.jpg"]
+# order = "sequential"
+
 # ── Rules ──────────────────────────────────────────────────────────────────────
 
 # Blank the main monitor when the office empties; respect user activity so the

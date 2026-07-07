@@ -47,7 +47,8 @@ use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
-use crate::screensaver::{MpvPlayer, ScreensaverSettings};
+use crate::screensaver::MpvPlayer;
+use crate::settings::ScreensaverSettings;
 
 /// Re-export of the long `WpSinglePixelBufferManagerV1` type so callers
 /// in [`crate::linux::surface`] can name it without a full

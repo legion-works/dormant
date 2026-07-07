@@ -41,9 +41,30 @@ function getEffectiveStages(displayId: string, fetched: LadderStage[], store: Pa
   return (pending as LadderStage[] | undefined) ?? fetched;
 }
 
-/** Clone stages and emit the new array. */
+/**
+ * Whether a value represents "no input" — null from the server's JSON
+ * serialisation of Rust Option::None, or an empty/whitespace string
+ * from a cleared input field.
+ */
+function isAbsentInput(v: unknown): boolean {
+  return v === null || (typeof v === "string" && v.trim() === "");
+}
+
+/**
+ * Strip absent values from optional fields.  The server (TOML) rejects
+ * null and empty strings for optional fields like dwell.
+ */
+function cleanStage(s: LadderStage): LadderStage {
+  if (isAbsentInput(s.dwell)) {
+    const { dwell: _, ...rest } = s;
+    return rest as LadderStage;
+  }
+  return s;
+}
+
+/** Clone stages, strip null optional fields, and emit the new array. */
 function emitStages(id: string, stages: LadderStage[], store: PatchStore, onDirty: () => void) {
-  store.trackEdit(LADDER_PATH(id), stages);
+  store.trackEdit(LADDER_PATH(id), stages.map(cleanStage));
   onDirty();
 }
 
@@ -100,7 +121,7 @@ export default function LadderEditor({ stages: fetchedStages, displayId, store, 
 
             {/* Dwell — optional, terminal stage shows marker when absent */}
             <div style={{ flex: 1 }}>
-              {terminal && stage.dwell === undefined ? (
+              {terminal && stage.dwell == null ? (
                 <div className="cf-field">
                   <label className="cf-field__label">dwell</label>
                   <span className="cf-field__value-text" style={{ borderStyle: "dashed", opacity: 0.6 }}>

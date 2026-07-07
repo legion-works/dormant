@@ -8,7 +8,7 @@ use comfy_table::Table;
 use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
 
-use crate::client;
+use dormantctl::client;
 
 /// Run the `status` command.
 ///

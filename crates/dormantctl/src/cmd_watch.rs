@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use dormant_core::rules::DaemonEvent;
 
-use crate::client;
+use dormantctl::client;
 
 /// Run the `watch` command.
 ///

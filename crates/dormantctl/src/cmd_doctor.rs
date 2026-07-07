@@ -104,19 +104,28 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Mqtt) => {
-            let (cfg, creds) = load_config_and_creds(args)?;
+            let (cfg, creds, note) = load_config_and_creds(args)?;
+            if let Some(n) = &note {
+                println!("{n}");
+            }
             let results = dormant_doctor::probe_mqtt_all(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Ha) => {
-            let (cfg, creds) = load_config_and_creds(args)?;
+            let (cfg, creds, note) = load_config_and_creds(args)?;
+            if let Some(n) = &note {
+                println!("{n}");
+            }
             let results = dormant_doctor::probe_ha_all(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Config) => {
-            let results = probe_config(args);
+            let (results, note) = probe_config(args);
+            if let Some(n) = &note {
+                println!("{n}");
+            }
             print_table(&results);
             Ok(outcome(&results))
         }
@@ -124,7 +133,10 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
         Some(DoctorSubcommand::Samsung) => Ok(DoctorOutcome::NotSupported("samsung-tizen".into())),
         None => {
             // Bare doctor: delegate to the single-source orchestration.
-            let (cfg, creds) = load_config_and_creds(args)?;
+            let (cfg, creds, note) = load_config_and_creds(args)?;
+            if let Some(n) = &note {
+                println!("{n}");
+            }
             let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
@@ -135,7 +147,14 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
 // ── Config loading ──────────────────────────────────────────────────────────────
 
 /// Load config and credentials using the same default-path logic as `validate`.
-fn load_config_and_creds(args: &DoctorArgs) -> Result<(dormant_core::config::Config, Credentials)> {
+///
+/// Credential errors are degraded gracefully: missing, unreadable, or
+/// invalid credential files produce an empty `Credentials` plus a note
+/// so every other probe still executes.  The note is printed by the
+/// caller before the probe table.
+fn load_config_and_creds(
+    args: &DoctorArgs,
+) -> Result<(dormant_core::config::Config, Credentials, Option<String>)> {
     let config_path =
         paths::resolve_config_path(args.config.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let creds_path = args
@@ -144,20 +163,54 @@ fn load_config_and_creds(args: &DoctorArgs) -> Result<(dormant_core::config::Con
         .unwrap_or_else(|| paths::sibling_credentials(&config_path));
 
     let (cfg, _warnings) = load_config(&config_path, Strictness::Warn)?;
-    let creds = load_credentials(&creds_path)?;
-    Ok((cfg, creds))
+    let (creds, note) = load_credentials_resilient(&creds_path);
+    Ok((cfg, creds, note))
+}
+
+/// Load credentials with diagnosis-preserving degradation.
+///
+/// - **Missing file** → proceed anonymous; note says "no file at <path>".
+/// - **Unreadable / invalid TOML / wrong perms** → proceed anonymous; note
+///   carries the actual error text so the operator can fix it.
+/// - **Readable file** → normal credentials load.
+///
+/// This keeps the doctor usable even when the credentials file has a
+/// problem — the probe can still detect `NotAuthorized` and surface the
+/// correct root cause.
+fn load_credentials_resilient(path: &std::path::Path) -> (Credentials, Option<String>) {
+    if !path.exists() {
+        return (
+            Credentials::default(),
+            Some(format!(
+                "credentials: no file at {} — auth-dependent probes run anonymous",
+                path.display()
+            )),
+        );
+    }
+
+    match load_credentials(path) {
+        Ok(creds) => (creds, None),
+        Err(e) => (
+            Credentials::default(),
+            Some(format!(
+                "credentials: {e} — auth-dependent probes run anonymous"
+            )),
+        ),
+    }
 }
 
 // ── Probe: config (CLI wrapper) ─────────────────────────────────────────────────
 
 /// CLI-level config probe: loads config + credentials, then delegates to the
 /// doctor crate.
-fn probe_config(args: &DoctorArgs) -> Vec<ProbeResult> {
-    let (cfg, creds) = match load_config_and_creds(args) {
-        Ok(pair) => pair,
-        Err(e) => return vec![ProbeResult::fail("config", format!("{e:#}"))],
-    };
-    vec![dormant_doctor::probe_config_inner(&cfg, &creds)]
+///
+/// Returns the probe results and any credential-loading note that should be
+/// printed before the table.
+fn probe_config(args: &DoctorArgs) -> (Vec<ProbeResult>, Option<String>) {
+    match load_config_and_creds(args) {
+        Ok((cfg, creds, note)) => (vec![dormant_doctor::probe_config_inner(&cfg, &creds)], note),
+        Err(e) => (vec![ProbeResult::fail("config", format!("{e:#}"))], None),
+    }
 }
 
 // ── Table printing ──────────────────────────────────────────────────────────────
@@ -274,5 +327,106 @@ mod tests {
     fn outcome_all_skip_returns_all_ok() {
         let results = [ProbeResult::skip("a", "no config")];
         assert_eq!(outcome(&results), DoctorOutcome::AllOk);
+    }
+
+    // ── load_credentials_resilient ────────────────────────────────────────────
+
+    fn make_temp_path(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        let name = format!("dormantctl-test-{prefix}-{}", std::process::id());
+        dir.join(name)
+    }
+
+    #[test]
+    fn load_credentials_resilient_missing_file() {
+        let path = make_temp_path("missing");
+        // Ensure it does not exist.
+        let _ = std::fs::remove_file(&path);
+
+        let (creds, note) = load_credentials_resilient(&path);
+
+        assert_eq!(creds, Credentials::default());
+        assert!(note.is_some(), "missing file should produce a note");
+        let n = note.unwrap();
+        assert!(
+            n.contains("credentials: no file at"),
+            "note should mention missing file; got: {n}"
+        );
+        assert!(
+            n.contains("auth-dependent probes run anonymous"),
+            "note should say probes run anonymous; got: {n}"
+        );
+    }
+
+    #[test]
+    fn load_credentials_resilient_perms_error() {
+        let path = make_temp_path("perms");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"ha_token = \"fake\"\n").unwrap();
+
+        // Set permissions to 0o644 (world-readable) — should trigger
+        // CredsPerms on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&path, perms).unwrap();
+            // Sanity: mode is not 0o600.
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_ne!(
+                mode & 0o777,
+                0o600,
+                "test setup failed: expected non-600 mode"
+            );
+        }
+
+        let (creds, note) = load_credentials_resilient(&path);
+
+        assert_eq!(creds, Credentials::default());
+        assert!(note.is_some(), "perms error should produce a note");
+        let n = note.unwrap();
+        assert!(
+            n.contains("E_CREDS_PERMS"),
+            "note should contain E_CREDS_PERMS; got: {n}"
+        );
+        assert!(
+            n.contains("auth-dependent probes run anonymous"),
+            "note should say probes run anonymous; got: {n}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_credentials_resilient_invalid_toml() {
+        let path = make_temp_path("invalid");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"this is not toml\n").unwrap();
+
+        // Set permissions to 0o600 (passes the perms gate).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        let (creds, note) = load_credentials_resilient(&path);
+
+        assert_eq!(creds, Credentials::default());
+        assert!(note.is_some(), "invalid TOML should produce a note");
+        let n = note.unwrap();
+        assert!(
+            n.contains("E_CONFIG_INVALID"),
+            "note should contain E_CONFIG_INVALID; got: {n}"
+        );
+        assert!(
+            n.contains("auth-dependent probes run anonymous"),
+            "note should say probes run anonymous; got: {n}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,8 +1,8 @@
 //! Platform-independent screensaver settings and scheme allowlist.
 //!
-//! Split from [`crate::screensaver`] so the daemon can construct
+//! Split from `crate::screensaver` so the daemon can construct
 //! [`ScreensaverSettings`] on any target — only the mpv-backed
-//! [`MpvPlayer`] stays Linux-gated.
+//! `MpvPlayer` stays Linux-gated.
 
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ pub(crate) fn scheme_allowed(item: &str) -> bool {
 
 /// Per-display screensaver configuration carried by the render sink.
 ///
-/// The daemon assembles this from a [`dormant_core::config::ScreensaverConfig`]
+/// The daemon assembles this from a [`dormant_core::config::schema::ScreensaverConfig`]
 /// at sink-build time — one construction per display, at startup and on
 /// every config reload.  Playlist scanning is done at assembly time
 /// (not per-show) so the wayland thread never touches the filesystem.

@@ -2,7 +2,7 @@
 //! directory scans.
 //!
 //! Takes a list of [`ScreensaverSource`] configs from
-//! [`dormant_core::config::ScreensaverConfig`] and produces a flat,
+//! [`dormant_core::config::schema::ScreensaverConfig`] and produces a flat,
 //! ordered [`PlaylistItem`] sequence.  The mpv player consumes the
 //! resulting items with per-item image durations.
 
@@ -67,7 +67,7 @@ pub struct PlaylistItem {
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Build a flat playlist from the configured sources.  Convenience
-/// wrapper over [`build_playlist_capped`] with the production cap.
+/// wrapper over `build_playlist_capped` with the production cap.
 #[must_use]
 pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<PlaylistItem> {
     build_playlist_capped(sources, seed, MAX_PLAYLIST_ITEMS)

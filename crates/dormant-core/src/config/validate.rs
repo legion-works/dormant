@@ -640,6 +640,17 @@ fn validate_display(
                 }
                 // Per-source checks.
                 for (i, src) in ss.source.iter().enumerate() {
+                    // Source must have exactly one of path or non-empty
+                    // urls — not both AND not neither.
+                    if src.path.is_none() && src.urls.is_empty() {
+                        errors.push(ValidationError {
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} has neither \
+                                 path nor urls — each source needs exactly one"
+                            ),
+                        });
+                    }
                     if src.path.is_some() && !src.urls.is_empty() {
                         errors.push(ValidationError {
                             what: crate::error::E_SCREENSAVER_SOURCE.into(),
@@ -1943,6 +1954,41 @@ urls = ["https://example.com/img.jpg"]
                 e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("pick exactly one")
             }),
             "expected E_SCREENSAVER_SOURCE path-urls conflict error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_empty_source_neither_path_nor_urls_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-ss-neither");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("neither.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+[[displays.d.screensaver.source]]
+shuffle = true
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_SCREENSAVER_SOURCE) && e.contains("neither")
+            }),
+            "expected E_SCREENSAVER_SOURCE neither-path-nor-urls error, got: {:?}",
             errs
         );
     }

@@ -27,6 +27,13 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
 /// is still bounded to avoid unbounded stack growth.
 const MAX_RECURSE_DEPTH: u32 = 8;
 
+/// Maximum total playlist items across all sources before truncation.
+///
+/// A huge/networked directory can produce unbounded items; this cap bounds
+/// scan time, the playlist `Vec` RAM, and what mpv ingests — all at once,
+/// deterministically (not a flaky time budget).
+const MAX_PLAYLIST_ITEMS: usize = 10_000;
+
 // ── SplitMix64 — deterministic seeded PRNG (no extra deps) ────────────
 
 /// Return the next pseudo-random `u64` and update `state` in place.
@@ -59,35 +66,21 @@ pub struct PlaylistItem {
 
 // ── Public API ─────────────────────────────────────────────────────────
 
-/// Build a flat playlist from the configured sources.
-///
-/// # Ordering guarantee
-///
-/// Sources are processed in config-file order.  Within each source:
-///
-/// 1. If `path` is set → scan the directory (recursively if
-///    `recurse=true`) and collect media files sorted
-///    lexicographically.  Shuffle if `shuffle=true`.
-/// 2. If `urls` is non-empty → add them in listed order.
-///
-/// If both `path` and `urls` are set, path items come first,
-/// then urls (validation that they should be exclusive is a
-/// config-time check, not this function's concern).
-///
-/// If neither is set, the source contributes no items (the
-/// player's empty-playlist guard handles fall-through).
-///
-/// # Seeding
-///
-/// `seed` drives the shuffle: `Some(s)` gives reproducible
-/// results; `None` seeds from `SystemTime::now()` nanos so each
-/// daemon restart produces a fresh shuffle.
-///
-/// # Logging
-///
-/// Emits `screensaver_playlist_built{source_count, item_count}`.
+/// Build a flat playlist from the configured sources.  Convenience
+/// wrapper over [`build_playlist_capped`] with the production cap.
 #[must_use]
 pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<PlaylistItem> {
+    build_playlist_capped(sources, seed, MAX_PLAYLIST_ITEMS)
+}
+
+/// Build a flat playlist with an explicit item cap (exposed for testing).
+///
+/// See [`build_playlist`] for the contract.
+fn build_playlist_capped(
+    sources: &[ScreensaverSource],
+    seed: Option<u64>,
+    max_items: usize,
+) -> Vec<PlaylistItem> {
     let seed = seed.unwrap_or_else(|| {
         #[allow(clippy::cast_possible_truncation)]
         {
@@ -99,18 +92,20 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
     let mut rng = seed;
 
     let mut items: Vec<PlaylistItem> = Vec::new();
+    let mut truncated = false;
 
     for source in sources {
+        if items.len() >= max_items {
+            truncated = true;
+            break;
+        }
         let src_duration = source.image_duration;
+        let remaining = max_items.saturating_sub(items.len());
         let mut path_items: Vec<PlaylistItem> = Vec::new();
         let mut url_items: Vec<PlaylistItem> = Vec::new();
 
         // ── Path-based scanning ────────────────────────────────────
         if let Some(ref path_str) = source.path {
-            // Canonicalize ONCE so every scanned entry is absolute —
-            // the daemon's CWD is arbitrary and relative paths break
-            // at loadfile time.  On failure (missing dir, permissions),
-            // log and skip the source entirely.
             let Ok(root) = std::fs::canonicalize(path_str) else {
                 tracing::warn!(
                     event = "screensaver_source_skipped",
@@ -120,7 +115,14 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
                 continue;
             };
             if root.is_dir() {
-                scan_dir(&root, source.recurse, 0, &mut path_items, src_duration);
+                scan_dir(
+                    &root,
+                    source.recurse,
+                    0,
+                    &mut path_items,
+                    src_duration,
+                    remaining,
+                );
             }
         }
         // Path items are sorted lexicographically for determinism
@@ -128,10 +130,13 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
         path_items.sort_by(|a, b| a.uri.cmp(&b.uri));
 
         // ── URL-based items ────────────────────────────────────────
-        // Kept in listed order — the operator authored the list
-        // intentionally.
         if !source.urls.is_empty() {
             for url in &source.urls {
+                let tentative = items.len() + path_items.len() + url_items.len();
+                if tentative >= max_items {
+                    truncated = true;
+                    break;
+                }
                 url_items.push(PlaylistItem {
                     uri: url.clone(),
                     image_duration: src_duration,
@@ -144,15 +149,19 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
         src_items.append(&mut path_items);
         src_items.append(&mut url_items);
 
+        // ── Cap total ──────────────────────────────────────────────
+        let space = max_items.saturating_sub(items.len());
+        if src_items.len() > space {
+            src_items.truncate(space);
+            truncated = true;
+        }
+
         // ── Shuffle (if requested) ─────────────────────────────────
-        // shuffle + order is exclusive (enforced by config validation);
-        // this debug_assert catches any path that slips through.
         debug_assert!(
             !(source.shuffle && source.order.is_some()),
             "shuffle and order must not both be set — validation should reject this"
         );
         if source.shuffle && src_items.len() > 1 {
-            // Fisher-Yates in-place with SplitMix64.
             #[allow(clippy::cast_possible_truncation)]
             for i in (1..src_items.len()).rev() {
                 let j = (splitmix64_next(&mut rng) as usize) % (i + 1);
@@ -163,6 +172,14 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
         // which means the deterministic sorted order is the right one.
 
         items.append(&mut src_items);
+    }
+
+    if truncated {
+        tracing::warn!(
+            event = "screensaver_playlist_truncated",
+            cap = max_items,
+            item_count = items.len(),
+        );
     }
 
     tracing::info!(
@@ -178,14 +195,19 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
 
 /// Recursively scan `dir` for media files, appending [`PlaylistItem`]s
 /// to `out`.  Symlinks are skipped (`is_symlink()` guard).
+///
+/// `limit` is the maximum size `out` may reach before this function
+/// stops collecting.  When `out.len() >= limit`, the scan short-circuits
+/// (no more filesystem entries are read).
 fn scan_dir(
     dir: &Path,
     recurse: bool,
     depth: u32,
     out: &mut Vec<PlaylistItem>,
     image_duration: Option<Duration>,
+    limit: usize,
 ) {
-    if depth > MAX_RECURSE_DEPTH {
+    if out.len() >= limit || depth > MAX_RECURSE_DEPTH {
         return;
     }
 
@@ -206,7 +228,14 @@ fn scan_dir(
 
         if ft.is_dir() {
             if recurse {
-                scan_dir(&entry.path(), recurse, depth + 1, out, image_duration);
+                scan_dir(
+                    &entry.path(),
+                    recurse,
+                    depth + 1,
+                    out,
+                    image_duration,
+                    limit,
+                );
             }
             continue;
         }
@@ -699,6 +728,63 @@ mod tests {
             8,
             "depth bound at 8 yields 8 files (depth 1-8 inclusive)"
         );
+    }
+
+    #[test]
+    fn item_cap_truncates_playlist() {
+        // Create 15 JPEGs, cap at 10 — exactly 10 items should survive.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for i in 0..15 {
+            fs::write(tmp.path().join(format!("img_{i:02}.jpg")), b"").expect("write");
+        }
+
+        let source = ScreensaverSource {
+            path: Some(tmp.path().to_string_lossy().into_owned()),
+            urls: vec![],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+
+        let playlist = build_playlist_capped(&[source], Some(42), 10);
+        assert_eq!(
+            playlist.len(),
+            10,
+            "cap 10 should truncate 15 files to exactly 10 items"
+        );
+    }
+
+    /// URL items also respect the cap, interleaved with path scanning.
+    #[test]
+    fn item_cap_truncates_urls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("img_{i}.jpg")), b"").expect("write");
+        }
+
+        let source = ScreensaverSource {
+            path: Some(tmp.path().to_string_lossy().into_owned()),
+            urls: vec![
+                "https://example.com/a.jpg".into(),
+                "https://example.com/b.jpg".into(),
+                "https://example.com/c.jpg".into(),
+                "https://example.com/d.jpg".into(),
+                "https://example.com/e.jpg".into(),
+            ],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+
+        // 3 path + 5 URLs = 8 total.  Cap at 5 → 3 path + 2 URLs.
+        let playlist = build_playlist_capped(&[source], Some(42), 5);
+        assert_eq!(playlist.len(), 5);
+        // Last item should be the second URL (URLs are truncated from the
+        // tail, not skipped from the head — path items always come first).
+        assert!(playlist[3].uri.starts_with("https://"));
+        assert!(playlist[4].uri.starts_with("https://"));
     }
 
     #[test]

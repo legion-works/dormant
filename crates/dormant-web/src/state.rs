@@ -9,12 +9,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::reload::ReloadOutcome;
 use dormant_core::rules::ControlMsg;
 use dormant_doctor::DoctorService;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Shared state for the web server.
@@ -52,6 +53,15 @@ pub struct WebStateInner {
     /// validation re-run).
     pub config_path: PathBuf,
 
+    /// Path to the daemon's credentials file.  Used by GET and apply
+    /// endpoints to load credentials from the same canonical location
+    /// rather than deriving the path from the config file name.
+    pub creds_path: PathBuf,
+
+    /// Serialises config-apply operations so concurrent apply requests
+    /// cannot race each other.
+    pub apply_lock: Mutex<()>,
+
     /// Shared, coalesced [`DoctorService`] — same instance the IPC server
     /// uses.
     pub doctor: DoctorService,
@@ -64,6 +74,11 @@ pub struct WebStateInner {
     /// Signalled by the daemon on shutdown; the web listener uses this for
     /// graceful shutdown.
     pub cancel: CancellationToken,
+
+    /// Maximum time to wait for a reload outcome after writing the config
+    /// file via `POST /api/config/apply`.  Default is 10 s; tests use a
+    /// shorter value.
+    pub reload_timeout: Duration,
 }
 
 impl WebState {

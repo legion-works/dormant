@@ -51,6 +51,7 @@ export const DAEMON_EVENT_TAGS = [
   "display_phase",
   "config_reloaded",
   "wake_retry",
+  "config_reload_rejected",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -123,6 +124,7 @@ export type DaemonEvent =
   | ZoneChangedEvent
   | DisplayPhaseEvent
   | ConfigReloadedEvent
+  | ConfigReloadRejectedEvent
   | WakeRetryEvent;
 
 export interface SensorChangedEvent {
@@ -148,6 +150,20 @@ export interface DisplayPhaseEvent {
 export interface ConfigReloadedEvent {
   event: "config_reloaded";
 }
+
+export interface ConfigReloadRejectedEvent {
+  event: "config_reload_rejected";
+  detail: string;
+}
+
+// Compile-time pin: if ConfigReloadRejectedEvent is dropped from
+// the DaemonEvent union, the Extract narrows to `never` and the
+// assignment of a concrete object to `never` fails tsc.
+const _rejected: Extract<DaemonEvent, { event: "config_reload_rejected" }> = {
+  event: "config_reload_rejected",
+  detail: "",
+};
+void _rejected;
 
 export interface WakeRetryEvent {
   event: "wake_retry";
@@ -311,6 +327,52 @@ export interface DisplayConfig {
   treat_unreachable_as_blanked?: boolean;
 }
 
+// ─── Config-apply wire types ──────────────────────────────────────────────
+// rust: config_apply.rs + config_patch.rs + error.rs
+// Serde: Patch uses tag="op", rename_all="lowercase".
+
+/** rust: config_patch.rs Patch, serde(tag = "op", rename_all = "lowercase") */
+export type ConfigPatch =
+  | { op: "set"; path: string[]; value: unknown }
+  | { op: "remove"; path: string[] };
+
+/** rust: config_apply.rs ApplyRequest */
+export interface ApplyRequest {
+  /** Lowercase hex SHA-256 of the on-disk config bytes. */
+  fingerprint: string;
+  /** Ordered list of patches to apply. */
+  patches: ConfigPatch[];
+}
+
+/** rust: config_apply.rs ApplyResponse */
+export interface ApplyResponse {
+  applied: boolean;
+  /** Outcome: `"reloaded"` | `"rejected"` | `"pending"` | `"superseded"`. */
+  reload: string;
+  /** Human-readable detail when `reload` is `"rejected"`. */
+  detail?: string;
+}
+
+/** 422 error body from `POST /api/config/apply` (`{ "errors": […] }`).
+ *  rust: error.rs into_response — ValidationFailed, RedactedPathTargeted,
+ *  PatchPathDenied, EntityUnknown, PatchValueRejected, PatchCapExceeded. */
+export interface ApplyErrorBody {
+  errors: ConfigApplyErrorDetail[];
+}
+
+/** A single error entry in the 422 `errors` array.
+ *  rust: error.rs SerializableValidationError { what, detail }. */
+export interface ConfigApplyErrorDetail {
+  what: string;
+  detail: string;
+}
+
+/** 409 error body from `POST /api/config/apply` (fingerprint mismatch).
+ *  rust: error.rs into_response — FingerprintMismatch. */
+export interface ApplyConflictBody {
+  error: string;
+}
+
 /** rust: config/schema.rs RuleConfig */
 export interface RuleConfig {
   zone: string;
@@ -329,6 +391,12 @@ export interface RuleConfig {
 /**
  * rust: config/routes.rs ConfigResponse
  * Full shape of GET /api/config.
+ *
+ * `fingerprint` is a lowercase hex SHA-256 of the on-disk config bytes
+ * (computed before redaction) — the client must send it back with every
+ * `POST /api/config/apply` for optimistic-concurrency control.
+ * `redacted_paths` are TOML-key paths of every value redacted from
+ * `raw_toml`; array indices are decimal strings.
  */
 export interface ConfigResponse {
   path: string;
@@ -338,4 +406,8 @@ export interface ConfigResponse {
   inventory: ConfigInventory;
   validation: ConfigValidation;
   display_rules: Record<string, DisplayRuleInfo>;
+  /** Lowercase hex SHA-256 of the on-disk config bytes as returned by GET /api/config. */
+  fingerprint: string;
+  /** TOML-key paths of every value that was redacted, in discovery order. */
+  redacted_paths: string[][];
 }

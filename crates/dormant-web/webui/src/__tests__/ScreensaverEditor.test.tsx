@@ -175,7 +175,9 @@ describe("ScreensaverEditor", () => {
     expect(s0.path).toBe("/a");
   });
 
-  it("required path field with empty string still emits path (passthrough)", async () => {
+  it("urls-source with null path omits path key on any edit (null from JSON round-trip)", async () => {
+    // A urls-based source has path: None in TOML → path: null in JSON.
+    // Editing ANY field must not leak path: null into the patch.
     const ss: ScreensaverConfig = {
       trigger: "escalation",
       audio: false,
@@ -183,14 +185,14 @@ describe("ScreensaverEditor", () => {
       transition: "crossfade",
       transition_duration: "1s",
       source: [
-        { path: "/a", recurse: false, shuffle: false },
+        { path: null as unknown as string, urls: ["https://example.com/img.jpg"], recurse: false, shuffle: false },
       ],
     };
     const { store } = renderEditor(ss);
 
-    const pathInputs = screen.getAllByLabelText("path");
-    expect(pathInputs.length).toBe(1);
-    fireEvent.change(pathInputs[0], { target: { value: "" } });
+    // Toggle shuffle (any edit — not touching path at all)
+    const shuffleCb = screen.getByLabelText("shuffle") as HTMLInputElement;
+    fireEvent.click(shuffleCb);
 
     const patches = store.buildPatches();
     expect(patches).toHaveLength(1);
@@ -198,7 +200,11 @@ describe("ScreensaverEditor", () => {
     const value = setPatch.value as ScreensaverSource[];
     expect(value).toHaveLength(1);
 
-    // Required field: empty path IS emitted (server catches the error).
-    expect(value[0].path).toBe("");
+    const s0 = value[0] as Record<string, unknown>;
+    // Path must be absent — it's null from the server and optional.
+    expect("path" in s0).toBe(false);
+    // urls must survive intact.
+    expect(s0.urls).toEqual(["https://example.com/img.jpg"]);
+    expect(s0.shuffle).toBe(true);
   });
 });

@@ -107,9 +107,20 @@ pub fn build_playlist(sources: &[ScreensaverSource], seed: Option<u64>) -> Vec<P
 
         // ── Path-based scanning ────────────────────────────────────
         if let Some(ref path_str) = source.path {
-            let root = Path::new(path_str);
+            // Canonicalize ONCE so every scanned entry is absolute —
+            // the daemon's CWD is arbitrary and relative paths break
+            // at loadfile time.  On failure (missing dir, permissions),
+            // log and skip the source entirely.
+            let Ok(root) = std::fs::canonicalize(path_str) else {
+                tracing::warn!(
+                    event = "screensaver_source_skipped",
+                    path = %path_str,
+                    reason = "canonicalize",
+                );
+                continue;
+            };
             if root.is_dir() {
-                scan_dir(root, source.recurse, 0, &mut path_items, src_duration);
+                scan_dir(&root, source.recurse, 0, &mut path_items, src_duration);
             }
         }
         // Path items are sorted lexicographically for determinism
@@ -195,16 +206,25 @@ fn scan_dir(
         }
 
         // Regular file — check extension.
-        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+        // The path must be valid UTF-8; non-UTF-8 filenames are
+        // silently skipped with a warning because mpv can only open
+        // paths that survive the C-string round-trip.
+        let file_path = entry.path();
+        let Some(path_str) = file_path.to_str() else {
+            tracing::warn!(
+                event = "screensaver_item_skipped",
+                path = %file_path.to_string_lossy(),
+                reason = "non-utf8",
+            );
+            continue;
+        };
+        if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_ascii_lowercase();
             if IMAGE_EXTENSIONS.contains(&ext_lower.as_str())
                 || VIDEO_EXTENSIONS.contains(&ext_lower.as_str())
             {
-                // Use `to_string_lossy()` so non-UTF-8 paths are
-                // included rather than silently dropped — mpv handles
-                // arbitrary byte paths on Linux.
                 out.push(PlaylistItem {
-                    uri: entry.path().to_string_lossy().into_owned(),
+                    uri: path_str.to_owned(),
                     image_duration,
                 });
             }
@@ -218,6 +238,7 @@ fn scan_dir(
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
 
     /// Build a tempdir tree with the given structure.
     ///
@@ -694,5 +715,89 @@ mod tests {
         let u2 = uris(&p2);
         assert_eq!(u1.len(), u2.len());
         assert_ne!(u1, u2, "different seeds must produce different order");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_paths_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Create a valid UTF-8 media file (should be included).
+        fs::write(tmp.path().join("good.jpg"), b"").expect("write good.jpg");
+        // Create a non-UTF-8 filename — byte 0xFF is never valid UTF-8.
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad\xFF.jpg");
+        fs::write(tmp.path().join(bad_name), b"").expect("write bad file");
+
+        let source = ScreensaverSource {
+            path: Some(tmp.path().to_string_lossy().into_owned()),
+            urls: vec![],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+
+        let playlist = build_playlist(&[source], Some(42));
+        assert_eq!(playlist.len(), 1, "only the UTF-8 file should be included");
+        assert!(playlist[0].uri.ends_with("good.jpg"));
+    }
+
+    #[test]
+    fn canonicalize_makes_paths_absolute() {
+        let tmp = make_tree(&["img.jpg", "vid.mp4"]);
+        // Append a redundant "." component — canonicalize resolves it,
+        // proving the function actually calls canonicalize (not just
+        // passes the raw string through).  The path is still valid.
+        let dot_path = tmp.path().join(".");
+        assert!(dot_path.exists(), "test precondition: dotted path exists");
+
+        let source = ScreensaverSource {
+            path: Some(dot_path.to_string_lossy().into_owned()),
+            urls: vec![],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+
+        let playlist = build_playlist(&[source], Some(42));
+        assert_eq!(
+            playlist.len(),
+            2,
+            "both media files found via canonicalized root"
+        );
+        for item in &playlist {
+            assert!(
+                item.uri.starts_with('/'),
+                "canonicalized path must be absolute: {}",
+                item.uri
+            );
+            // The redundant dot must be absent (canonicalize stripped it).
+            assert!(
+                !item.uri.contains("/./"),
+                "canonicalize must strip redundant '.' from path: {}",
+                item.uri
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_error_skips_source() {
+        let source = ScreensaverSource {
+            path: Some("/nonexistent/path/that/does/not/exist".into()),
+            urls: vec!["https://example.com/fallback.mp4".into()],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+
+        // Path canonicalization fails → the ENTIRE source is skipped
+        // (no path items, no URL items — the source contributes nothing).
+        let playlist = build_playlist(&[source], Some(42));
+        assert_eq!(
+            playlist.len(),
+            0,
+            "failed canonicalize skips the whole source, including URLs"
+        );
     }
 }

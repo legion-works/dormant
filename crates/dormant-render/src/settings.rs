@@ -14,6 +14,130 @@ use crate::playlist::PlaylistItem;
 /// so the engine falls through.
 pub(crate) const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How the screensaver transitions between two consecutive playlist items
+/// when the outgoing item ends and the next one becomes decodable.
+///
+/// The production default is [`TransitionMode::Crossfade`] — measured
+/// blend cost is ≈0.9 ms/frame at 3072×1728 for the pure u8 lerp
+/// (linearly scales with resolution, never a hot spot).
+/// [`TransitionMode::None`] keeps the legacy hard-cut behaviour —
+/// useful for benchmarks and environments where the per-frame blend
+/// cost isn't worth it.
+///
+/// The state machine in [`crate::linux::state`] drives the blend via
+/// a calloop timer on the Wayland thread; `None` skips every
+/// transition-related field on the [`ScreensaverSettings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionMode {
+    /// Per-pixel u8 lerp `out = capture*(1-t) + new*t` driven by a
+    /// calloop timer at the configured [`ScreensaverSettings::transition_duration`].
+    /// Allocation-free per frame; one `Vec<u8>` capture buffer per
+    /// session (~21 MiB at 4K).
+    Crossfade,
+    /// No transition — successive playlist items cut immediately
+    /// (the pre-feature behaviour; preserved byte-identical).
+    None,
+}
+
+impl TransitionMode {
+    /// Parse the TOML value of [`super::ScreensaverConfig::transition`]
+    /// (after the daemon has extracted it from the config) into a
+    /// [`TransitionMode`].
+    ///
+    /// Note: case-sensitive — `Crossfade` ≠ `crossfade`.  The canonical
+    /// lowercase strings are what operators write in the TOML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(msg)` for unknown values; the validation layer
+    /// formats the message into an `E_SCREENSAVER_SOURCE`-class
+    /// `ValidationError`.
+    pub fn from_config_str(s: &str) -> Result<Self, String> {
+        match s {
+            "crossfade" => Ok(Self::Crossfade),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "unknown transition '{other}' (allowed: crossfade, none)"
+            )),
+        }
+    }
+}
+
+#[allow(clippy::derivable_impls)] // doc-comment on `default()` explains the user-favoured transitions rationale
+impl Default for TransitionMode {
+    fn default() -> Self {
+        // User asked for transitions — the production default is the
+        // crossfade.  Operators who want the legacy hard-cut set
+        // `transition = "none"` explicitly.
+        Self::Crossfade
+    }
+}
+
+/// How the screensaver player scales its source video to the rendered output
+/// rectangle.
+///
+/// Maps 1:1 to the four canonical mpv scaling modes; covered end-to-end
+/// by the property-readback tests (`mpv_player_sets_scale_mode_properties_*`)
+/// and the geometry test (`mpv_player_fill_renders_no_letterbox_on_portrait_fixture`)
+/// in this crate — every variant's flags do take effect under
+/// `MPV_RENDER_API_TYPE_SW`, so we don't have to scale in our own blit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleMode {
+    /// Crop-to-fill: source is zoomed so it covers the entire output
+    /// rectangle; the off-buffer axis is cropped.  No black bars.
+    /// mpv: `panscan=1.0`.
+    Fill,
+    /// Aspect-fit letterbox: source is scaled to fit inside the output
+    /// rectangle while preserving aspect ratio; black bars fill the gap.
+    /// mpv: defaults (`keepaspect=yes`, `panscan=0.0`).
+    Fit,
+    /// Stretch: source is scaled to exactly fill the output rectangle,
+    /// distorting aspect ratio.  No black bars, but proportions may look
+    /// wrong.  mpv: `keepaspect=no`.
+    Stretch,
+    /// 1:1 centre: source is shown at native pixel dimensions (no scaling),
+    /// centred in the output rectangle.  Black bars fill the gap.  mpv:
+    /// `video-unscaled=yes`.
+    Center,
+}
+
+impl ScaleMode {
+    /// Parse the TOML value of [`super::ScreensaverConfig::scale_mode`]
+    /// (after the daemon has extracted it from the config) into a
+    /// [`ScaleMode`].
+    ///
+    /// Note: case-sensitive — `Fill` ≠ `fill`.  The canonical lowercase
+    /// strings are what operators write in the TOML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(msg)` for unknown values; the validation layer
+    /// formats the message into an `E_SCREENSAVER_SOURCE`-class
+    /// `ValidationError`.
+    pub fn from_config_str(s: &str) -> Result<Self, String> {
+        match s {
+            "fill" => Ok(Self::Fill),
+            "fit" => Ok(Self::Fit),
+            "stretch" => Ok(Self::Stretch),
+            "center" => Ok(Self::Center),
+            other => Err(format!(
+                "unknown scale_mode '{other}' (allowed: fill, fit, stretch, center)"
+            )),
+        }
+    }
+}
+
+#[allow(clippy::derivable_impls)] // doc-comment on `default()` explains the OS-screensaver norm rationale
+impl Default for ScaleMode {
+    fn default() -> Self {
+        // OS-screensaver norm: images fill the monitor (no black bars) —
+        // matches user expectation set by GNOME / KDE / Windows
+        // screensavers, and fixes the legacy letterbox artefact for
+        // non-16:9 source aspect ratios.
+        Self::Fill
+    }
+}
+
 /// Decide whether a single playlist item is safe to hand to mpv's
 /// `loadfile`.  The allowlist is the PRIMARY security control for
 /// screensaver media — mpv's `demuxer-lavf-o` whitelist is
@@ -97,6 +221,17 @@ pub struct ScreensaverSettings {
     /// player at init; a future config can flip this on the
     /// runtime-toggleable `mute` property.
     pub audio: bool,
+    /// How to scale source frames onto the rendered output rectangle.
+    /// See [`ScaleMode`].  Default [`ScaleMode::Fill`].
+    pub scale_mode: ScaleMode,
+    /// How successive playlist items transition into each other.
+    /// See [`TransitionMode`].  Default [`TransitionMode::Crossfade`].
+    pub transition: TransitionMode,
+    /// Length of the [`TransitionMode::Crossfade`] blend in
+    /// [`TransitionMode::None`] this field is present but unused.
+    /// Bounded by the validator (100 ms ..= 10 s) — see
+    /// `dormant_core::config::validate` screensaver-transition rules.
+    pub transition_duration: Duration,
 }
 
 impl Default for ScreensaverSettings {
@@ -105,6 +240,9 @@ impl Default for ScreensaverSettings {
             items: Vec::new(),
             image_duration: Duration::from_secs(10),
             audio: false,
+            scale_mode: ScaleMode::Fill,
+            transition: TransitionMode::Crossfade,
+            transition_duration: Duration::from_secs(1),
         }
     }
 }
@@ -123,6 +261,12 @@ mod tests {
         assert!(!s.audio);
         assert_eq!(s.image_duration, Duration::from_secs(10));
         assert!(s.items.is_empty());
+        // scale_mode defaults to Fill — the OS-screensaver norm.
+        assert_eq!(s.scale_mode, ScaleMode::Fill);
+        // transition defaults to Crossfade — the production default.
+        assert_eq!(s.transition, TransitionMode::Crossfade);
+        // transition_duration defaults to 1 s — matches the validate.rs default.
+        assert_eq!(s.transition_duration, Duration::from_secs(1));
     }
 
     #[test]
@@ -144,6 +288,9 @@ mod tests {
             ],
             image_duration: Duration::from_secs(3),
             audio: true,
+            scale_mode: ScaleMode::Center,
+            transition: TransitionMode::None,
+            transition_duration: Duration::from_millis(500),
         };
         assert_eq!(s.items.len(), 3);
         assert_eq!(s.items[0].uri, "a.mp4");
@@ -153,6 +300,87 @@ mod tests {
         assert!(s.items[2].uri.starts_with("https://"));
         assert_eq!(s.image_duration, Duration::from_secs(3));
         assert!(s.audio);
+        assert_eq!(s.scale_mode, ScaleMode::Center);
+        assert_eq!(s.transition, TransitionMode::None);
+        assert_eq!(s.transition_duration, Duration::from_millis(500));
+    }
+
+    // ── TransitionMode ────────────────────────────────────────────────
+
+    #[test]
+    fn transition_mode_default_is_crossfade() {
+        // User asked for transitions — must default to Crossfade, not None.
+        assert_eq!(TransitionMode::default(), TransitionMode::Crossfade);
+    }
+
+    #[test]
+    fn transition_mode_from_config_str_accepts_both_values() {
+        assert_eq!(
+            TransitionMode::from_config_str("crossfade").unwrap(),
+            TransitionMode::Crossfade
+        );
+        assert_eq!(
+            TransitionMode::from_config_str("none").unwrap(),
+            TransitionMode::None
+        );
+    }
+
+    #[test]
+    fn transition_mode_from_config_str_rejects_unknown_values() {
+        let err = TransitionMode::from_config_str("fade").unwrap_err();
+        assert!(err.contains("unknown transition 'fade'"), "{err}");
+        assert!(err.contains("crossfade"), "{err}");
+        assert!(err.contains("none"), "{err}");
+    }
+
+    #[test]
+    fn transition_mode_from_config_str_is_case_sensitive() {
+        // Canonical strings are lowercase; wrong-cased values are rejected
+        // (config validation surfaces the error first, but the parser is
+        // authoritative for the fallback path).
+        assert!(TransitionMode::from_config_str("Crossfade").is_err());
+        assert!(TransitionMode::from_config_str("NONE").is_err());
+    }
+
+    // ── ScaleMode ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn scale_mode_default_is_fill() {
+        // OS-screensaver norm — must default to Fill (no black bars).
+        assert_eq!(ScaleMode::default(), ScaleMode::Fill);
+    }
+
+    #[test]
+    fn scale_mode_from_config_str_accepts_all_four_modes() {
+        assert_eq!(ScaleMode::from_config_str("fill").unwrap(), ScaleMode::Fill);
+        assert_eq!(ScaleMode::from_config_str("fit").unwrap(), ScaleMode::Fit);
+        assert_eq!(
+            ScaleMode::from_config_str("stretch").unwrap(),
+            ScaleMode::Stretch
+        );
+        assert_eq!(
+            ScaleMode::from_config_str("center").unwrap(),
+            ScaleMode::Center
+        );
+    }
+
+    #[test]
+    fn scale_mode_from_config_str_rejects_unknown_values() {
+        let err = ScaleMode::from_config_str("zoom").unwrap_err();
+        assert!(err.contains("unknown scale_mode 'zoom'"), "{err}");
+        assert!(err.contains("fill"), "{err}");
+        assert!(err.contains("fit"), "{err}");
+        assert!(err.contains("stretch"), "{err}");
+        assert!(err.contains("center"), "{err}");
+    }
+
+    #[test]
+    fn scale_mode_from_config_str_is_case_sensitive() {
+        // The canonical strings are lowercase; wrong-cased values are rejected
+        // (config validation surfaces the error first, but the parser is
+        // authoritative for the fallback path).
+        assert!(ScaleMode::from_config_str("Fill").is_err());
+        assert!(ScaleMode::from_config_str("STRETCH").is_err());
     }
 
     // ── scheme_allowed ────────────────────────────────────────────────

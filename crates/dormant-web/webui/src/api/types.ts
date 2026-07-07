@@ -278,6 +278,12 @@ export interface ScreensaverSource {
 export interface ScreensaverConfig {
   trigger: string;
   audio: boolean;
+  /** Source-frame scaling onto the rendered output. `null`/undefined → Fill. */
+  scale_mode?: "fill" | "fit" | "stretch" | "center" | null;
+  /** Transition between consecutive playlist items. `null`/undefined → Crossfade. */
+  transition?: "crossfade" | "none" | null;
+  /** Length of the Crossfade blend. `null`/undefined → 1 second. */
+  transition_duration?: string | null;
   source: ScreensaverSource[];
 }
 

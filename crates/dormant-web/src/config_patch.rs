@@ -172,7 +172,8 @@ fn check_editable_subset(p: &Patch, current: &toml_edit::DocumentMut) -> Result<
         )));
     }
 
-    // Container-Set rejection (M1 security fix).
+    // Container-Set rejection — a Set on a table-level path would
+    // replace the whole sub-tree, smuggling locked leaves like `type`.
     // A Set on a table-level path (e.g. ["sensors"], ["displays","tv"]) would
     // replace the whole sub-tree, smuggling locked leaves like `type`.
     // Allowed Sets target VALUE leaves or whole ARRAYS only.
@@ -450,7 +451,7 @@ fn apply_set(
     // decorations (trailing comments).  toml_edit stores trailing comments
     // on the Item's decor (not the Key), so replacing an Item discards them.
     // We copy the old suffix onto the new Item to keep comments alive.
-    let parent_table = parent_table_mut(doc, parent_path)?;
+    let parent_table = parent_table_mut(doc, parent_path, true)?;
 
     // Snapshot the old item's trailing decoration before we mutate.
     // In toml_edit 0.25, decorations (including trailing comments) live on
@@ -487,7 +488,7 @@ fn apply_remove(doc: &mut toml_edit::DocumentMut, path: &[String]) -> Result<(),
     let (parent_path, leaf) = path.split_at(path.len() - 1);
     let leaf_key = leaf[0].as_str();
 
-    let parent_table = parent_table_mut(doc, parent_path)?;
+    let parent_table = parent_table_mut(doc, parent_path, false)?;
     parent_table.remove(leaf_key);
 
     Ok(())
@@ -542,11 +543,18 @@ fn is_at_aot_key(doc: &toml_edit::DocumentMut, path: &[String]) -> bool {
 /// 2. `parent_path` has a key last segment → walk to the containing table
 ///    and return the sub-table at that key.
 ///
+/// When `create_missing` is true, missing intermediate non-collection tables
+/// are created as implicit tables (no formatting damage on absent tables).
+/// Dynamic entity IDs (children of `sensors`/`zones`/`displays`/`rules`) are
+/// never created — entity existence is enforced by `check_patches` before
+/// apply.
+///
 /// Uses safe per-segment re-borrow via chained `get_mut → as_table_mut` in a
 /// single expression so the borrow checker can see the exclusive chain.
 fn parent_table_mut<'a>(
     doc: &'a mut toml_edit::DocumentMut,
     parent_path: &[String],
+    create_missing: bool,
 ) -> Result<&'a mut toml_edit::Table, PatchError> {
     if parent_path.is_empty() {
         return Ok(doc.as_table_mut());
@@ -567,7 +575,7 @@ fn parent_table_mut<'a>(
         let aot_key = &aot_key_seg[0];
 
         // Walk to the table containing the AOT key, then index into it.
-        let container = walk_table(doc.as_table_mut(), table_path)?;
+        let container = walk_table(doc.as_table_mut(), table_path, create_missing)?;
         let aot_item = container
             .get_mut(aot_key.as_str())
             .ok_or_else(|| PatchError::PathDenied(format!("AOT key not found: {aot_key}")))?;
@@ -582,16 +590,35 @@ fn parent_table_mut<'a>(
         let (table_path, key_seg) = parent_path.split_at(parent_path.len() - 1);
         let key = &key_seg[0];
 
-        let container = walk_table(doc.as_table_mut(), table_path)?;
-        let item = container
+        let container = walk_table(doc.as_table_mut(), table_path, create_missing)?;
+
+        if !container.contains_key(key.as_str()) {
+            if create_missing {
+                // Create an implicit table for missing structural keys.
+                // Dynamic entity IDs never reach here because
+                // check_patches rejects unknown entities before apply.
+                container.insert(
+                    key.as_str(),
+                    toml_edit::Item::Table(toml_edit::Table::new()),
+                );
+            } else {
+                return Err(PatchError::PathDenied(format!("key not found: {key}")));
+            }
+        }
+
+        container
             .get_mut(key.as_str())
-            .ok_or_else(|| PatchError::PathDenied(format!("key not found: {key}")))?;
-        item.as_table_mut()
+            .and_then(|item| item.as_table_mut())
             .ok_or_else(|| PatchError::PathDenied(format!("{key} is not a table")))
     }
 }
 
 /// Walk `root` through `path` segments, returning the final table.
+///
+/// When `create_missing` is true, intermediate segments that are missing and
+/// are NOT immediate children of collection keys (`sensors`, `zones`,
+/// `displays`, `rules`) are created as implicit tables.  Entity IDs (the
+/// first segment under a collection) are never created.
 ///
 /// Each iteration chains `get_mut → as_table_mut` in a single expression.
 /// The intermediate `&mut Item` is dropped at the semicolon before `current`
@@ -599,19 +626,40 @@ fn parent_table_mut<'a>(
 fn walk_table<'a>(
     root: &'a mut toml_edit::Table,
     path: &[String],
+    create_missing: bool,
 ) -> Result<&'a mut toml_edit::Table, PatchError> {
     if path.is_empty() {
         return Ok(root);
     }
     let mut current: &mut toml_edit::Table = root;
-    for seg in path {
+    for (i, seg) in path.iter().enumerate() {
+        let is_collection_child = i > 0 && is_collection_key(&path[i - 1]);
+
+        let exists = current.contains_key(seg.as_str());
+        if !exists {
+            if create_missing && !is_collection_child {
+                current.insert(
+                    seg.as_str(),
+                    toml_edit::Item::Table(toml_edit::Table::new()),
+                );
+            } else {
+                return Err(PatchError::PathDenied(format!("key not found: {seg}")));
+            }
+        }
+
+        // Second borrow — after potential insert, get the table ref.
         current = current
             .get_mut(seg.as_str())
-            .ok_or_else(|| PatchError::PathDenied(format!("key not found: {seg}")))?
-            .as_table_mut()
+            .and_then(|item| item.as_table_mut())
             .ok_or_else(|| PatchError::PathDenied(format!("{seg} is not a table")))?;
     }
     Ok(current)
+}
+
+/// Returns true when `key` is a collection-level key whose immediate
+/// children are dynamic entity IDs.
+fn is_collection_key(key: &str) -> bool {
+    matches!(key, "sensors" | "zones" | "displays" | "rules")
 }
 
 // ── JSON → toml_edit conversion ────────────────────────────────────────────
@@ -1424,12 +1472,14 @@ grace_period = "30s" # trailing grace_period comment
     }
 
     // ==================================================================
-    // 8. Container-Set bypass regression tests (MUST fail pre-fix)
+    // 8. Container-Set bypass regression tests — verify the
+    //    container-level rejection catches smuggling of locked leaves
+    //    through whole-table Set operations.
     // ==================================================================
 
     #[test]
     fn set_sensors_table_is_denied() {
-        // Reviewer probe: setting the whole sensors table smuggles locked 'type'.
+        // Setting the whole sensors table smuggles locked 'type'.
         let cur = minimal_config();
         let err = check_patches(
             &[set(
@@ -1448,7 +1498,7 @@ grace_period = "30s" # trailing grace_period comment
 
     #[test]
     fn set_display_table_is_denied() {
-        // Reviewer probe: setting displays.tv table smuggles locked leaves.
+        // Setting displays.tv table smuggles locked leaves.
         let cur = minimal_config();
         let err = check_patches(
             &[set(
@@ -1467,7 +1517,7 @@ grace_period = "30s" # trailing grace_period comment
 
     #[test]
     fn set_displays_root_table_is_denied() {
-        // Reviewer probe: setting the displays collection smuggles locked leaves.
+        // Setting the displays collection smuggles locked leaves.
         let cur = minimal_config();
         let err = check_patches(
             &[set(

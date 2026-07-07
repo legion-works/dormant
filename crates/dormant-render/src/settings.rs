@@ -24,7 +24,7 @@ pub(crate) const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 /// useful for benchmarks and environments where the per-frame blend
 /// cost isn't worth it.
 ///
-/// The state machine in [`crate::linux::state`] drives the blend via
+/// The state machine in `crate::linux::state` drives the blend via
 /// a calloop timer on the Wayland thread; `None` skips every
 /// transition-related field on the [`ScreensaverSettings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum TransitionMode {
 }
 
 impl TransitionMode {
-    /// Parse the TOML value of [`super::ScreensaverConfig::transition`]
+    /// Parse the TOML value of `ScreensaverConfig::transition` (dormant-core schema)
     /// (after the daemon has extracted it from the config) into a
     /// [`TransitionMode`].
     ///
@@ -102,7 +102,7 @@ pub enum ScaleMode {
 }
 
 impl ScaleMode {
-    /// Parse the TOML value of [`super::ScreensaverConfig::scale_mode`]
+    /// Parse the TOML value of `ScreensaverConfig::scale_mode` (dormant-core schema)
     /// (after the daemon has extracted it from the config) into a
     /// [`ScaleMode`].
     ///

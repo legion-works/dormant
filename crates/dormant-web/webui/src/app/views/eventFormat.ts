@@ -23,6 +23,8 @@ export function badgeForEvent(ev: DaemonEvent): EventBadge {
       return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "retry" };
     case "config_reloaded":
       return { color: "var(--accent-warm)", bg: "var(--accent-warm-muted)", label: "config" };
+    case "config_reload_rejected":
+      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "config" };
     default:
       return { color: "var(--text-muted)", bg: "var(--bg-sunken)", label: (ev as { event: string }).event };
   }
@@ -38,6 +40,8 @@ export function messageForEvent(ev: DaemonEvent): string {
       return `${ev.display}: ${ev.phase} (cause: ${ev.cause})`;
     case "config_reloaded":
       return "config reloaded";
+    case "config_reload_rejected":
+      return `config reload rejected: ${ev.detail}`;
     case "wake_retry":
       return `${ev.display}: wake retry attempt ${ev.attempt}`;
     default:

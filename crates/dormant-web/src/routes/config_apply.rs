@@ -27,8 +27,10 @@ use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::broadcast;
 
 use dormant_core::config::{Strictness, load_config, load_credentials, validate};
+use dormant_core::reload::ReloadOutcome;
 use dormant_displays::registry::capabilities;
 
 // ── Request / response types ──────────────────────────────────────────────
@@ -43,13 +45,16 @@ pub(crate) struct ApplyRequest {
     pub patches: Vec<Patch>,
 }
 
-/// Interim response for `POST /api/config/apply`.
+/// Response for `POST /api/config/apply`.
 #[derive(Serialize, Debug)]
 pub(crate) struct ApplyResponse {
     pub applied: bool,
-    /// Always `"pending"` for now — Task 5 replaces this with actual
-    /// reload semantics.
+    /// Reload outcome: `"reloaded"`, `"rejected"`, `"superseded"`, or
+    /// `"pending"` (timeout/lagged).
     pub reload: String,
+    /// Human-readable detail when `reload == "rejected"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 // ── Patch cap ─────────────────────────────────────────────────────────────
@@ -178,9 +183,44 @@ pub(crate) async fn post_apply(
     })?;
     sync_dir(config_dir)?;
 
+    // ── Step 9: subscribe to reload outcome, wait for it ─────────────────
+    // Subscribe AFTER the rename but INSIDE the apply_lock so concurrent
+    // applies cannot interleave their reload-outcome waits.  The reload
+    // bus carries the last outcome from the daemon's config watcher; if
+    // our write triggered a reload, the outcome arrives here.
+    let written_fingerprint = format!("{:x}", Sha256::digest(patched_toml.as_bytes()));
+    let mut rx = state.inner.reload_rx.resubscribe();
+    let timeout = state.inner.reload_timeout;
+
+    let (reload, detail) = match tokio::time::timeout(timeout, rx.recv()).await {
+        Ok(Ok(outcome)) => {
+            let disk_bytes = std::fs::read(&state.inner.config_path)
+                .map_err(|e| WebError::ConfigReadError(format!("cannot read config: {e}")))?;
+            let disk_fingerprint = format!("{:x}", Sha256::digest(&disk_bytes));
+
+            if disk_fingerprint == written_fingerprint {
+                match outcome {
+                    ReloadOutcome::Reloaded => (String::from("reloaded"), None),
+                    ReloadOutcome::Rejected(detail) => (String::from("rejected"), Some(detail)),
+                }
+            } else {
+                // Another writer landed after us — outcome belongs to them.
+                (String::from("superseded"), None)
+            }
+        }
+        Ok(Err(broadcast::error::RecvError::Lagged(_) | broadcast::error::RecvError::Closed)) => {
+            (String::from("pending"), None)
+        }
+        Err(_elapsed) => {
+            // Timeout — daemon hasn't responded yet or reload is stalled.
+            (String::from("pending"), None)
+        }
+    };
+
     Ok(Json(ApplyResponse {
         applied: true,
-        reload: "pending".into(),
+        reload,
+        detail,
     }))
 }
 
@@ -322,9 +362,12 @@ mod tests {
     use dormant_core::config::schema::{
         Config, DaemonConfig, RuleConfig, SensorConfig, ZoneConfig,
     };
+    use dormant_core::reload::ReloadOutcome;
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
 
     // ── Test helpers ────────────────────────────────────────────────────────
 
@@ -374,7 +417,52 @@ mod tests {
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
             cancel,
+            reload_timeout: Duration::from_secs(10),
         })
+    }
+
+    /// Like [`test_state`] but returns the [`broadcast::Sender`]`<`[`ReloadOutcome`]`>`
+    /// so the test can control the reload outcome the apply handler awaits.
+    fn test_state_with_reload(
+        config_dir: &std::path::Path,
+        config: Config,
+        bind_port: u16,
+        reload_timeout: Duration,
+    ) -> (WebState, broadcast::Sender<ReloadOutcome>) {
+        let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<dormant_core::rules::ControlMsg>(8);
+        let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
+        let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(config));
+        let creds = Arc::new(dormant_core::config::schema::Credentials::default());
+        let (creds_tx, creds_rx) = tokio::sync::watch::channel(creds);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // Senders that must stay alive for the channel to remain open.
+        std::mem::forget(config_tx);
+        std::mem::forget(creds_tx);
+
+        let doctor =
+            dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
+        let config_path = config_dir.join("config.toml");
+        let creds_path = config_dir.join("config.creds.toml");
+
+        let state = WebState::new(crate::state::WebStateInner {
+            ctl_tx,
+            reload_trigger: reload_trigger_tx,
+            reload_rx,
+            config_rx,
+            creds_rx,
+            config_path,
+            creds_path,
+            apply_lock: tokio::sync::Mutex::new(()),
+            doctor,
+            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
+            cancel,
+            reload_timeout,
+        });
+
+        (state, reload_tx)
     }
 
     /// A minimal valid config for apply tests.
@@ -1098,5 +1186,187 @@ field = "/val"
         crate::prune_stale_temps(&config_path);
 
         assert!(fresh_temp.exists(), "fresh temp should survive");
+    }
+
+    // ── Reload-outcome tests (Task 5) ────────────────────────────────────────
+
+    /// Reloaded outcome + fingerprint matches → `"reloaded"`.
+    #[tokio::test]
+    async fn reload_sync_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n";
+        write_config(dir.path(), content);
+
+        let (state, reload_tx) = test_state_with_reload(
+            dir.path(),
+            minimal_config(),
+            8080,
+            Duration::from_millis(500),
+        );
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "web_bind".into()],
+                value: serde_json::Value::String("127.0.0.1".into()),
+            }],
+        };
+
+        let handle = tokio::spawn(async move { post_apply(State(state), axum::Json(req)).await });
+
+        // Allow the handler to subscribe to the reload bus.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = reload_tx.send(ReloadOutcome::Reloaded);
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.applied);
+        assert_eq!(result.reload, "reloaded");
+        assert!(result.detail.is_none());
+    }
+
+    /// Rejected outcome + fingerprint matches → `"rejected"` with detail.
+    #[tokio::test]
+    async fn reload_sync_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n";
+        write_config(dir.path(), content);
+
+        let (state, reload_tx) = test_state_with_reload(
+            dir.path(),
+            minimal_config(),
+            8080,
+            Duration::from_millis(500),
+        );
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "web_bind".into()],
+                value: serde_json::Value::String("127.0.0.1".into()),
+            }],
+        };
+
+        let handle = tokio::spawn(async move { post_apply(State(state), axum::Json(req)).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = reload_tx.send(ReloadOutcome::Rejected("invalid zone config".into()));
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.applied);
+        assert_eq!(result.reload, "rejected");
+        assert_eq!(result.detail.as_deref(), Some("invalid zone config"));
+    }
+
+    /// Outcome arrives but on-disk fingerprint changed (another writer) →
+    /// `"superseded"`.
+    #[tokio::test]
+    async fn reload_sync_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n";
+        write_config(dir.path(), content);
+
+        let (state, reload_tx) = test_state_with_reload(
+            dir.path(),
+            minimal_config(),
+            8080,
+            Duration::from_millis(500),
+        );
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "web_bind".into()],
+                value: serde_json::Value::String("127.0.0.1".into()),
+            }],
+        };
+
+        let config_path = state.inner.config_path.clone();
+        let handle = tokio::spawn(async move { post_apply(State(state), axum::Json(req)).await });
+
+        // Let the handler write and rename the file, then subscribe.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Another writer overwrites the file AFTER ours was renamed.
+        std::fs::write(&config_path, "config_version = 1\n# superseded\n").unwrap();
+
+        let _ = reload_tx.send(ReloadOutcome::Reloaded);
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.applied);
+        assert_eq!(result.reload, "superseded");
+    }
+
+    /// No outcome within the short timeout window → `"pending"`.
+    #[tokio::test]
+    async fn reload_sync_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n";
+        write_config(dir.path(), content);
+
+        let (state, _reload_tx) = test_state_with_reload(
+            dir.path(),
+            minimal_config(),
+            8080,
+            Duration::from_millis(50),
+        );
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "web_bind".into()],
+                value: serde_json::Value::String("127.0.0.1".into()),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await.unwrap();
+        assert!(result.applied);
+        assert_eq!(result.reload, "pending");
+    }
+
+    /// Lagged on the reload bus (17+ outcomes before the handler reads) →
+    /// `"pending"`.
+    #[tokio::test]
+    async fn reload_sync_lagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n";
+        write_config(dir.path(), content);
+
+        let (state, reload_tx) = test_state_with_reload(
+            dir.path(),
+            minimal_config(),
+            8080,
+            Duration::from_millis(500),
+        );
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "web_bind".into()],
+                value: serde_json::Value::String("127.0.0.1".into()),
+            }],
+        };
+
+        // Overflow the 16-capacity broadcast channel BEFORE the handler reads.
+        for i in 0..17 {
+            let _ = reload_tx.send(ReloadOutcome::Reloaded);
+            // The first 16 fill the ring buffer; the 17th evicts the oldest.
+            // When the handler arrives, it sees Lagged.
+            let _ = i;
+        }
+
+        let handle = tokio::spawn(async move { post_apply(State(state), axum::Json(req)).await });
+
+        // Let the handler subscribe — it sees Lagged because the channel
+        // overflowed before it arrived.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.applied);
+        assert_eq!(result.reload, "pending");
     }
 }

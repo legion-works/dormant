@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::reload::ReloadOutcome;
@@ -73,6 +74,11 @@ pub struct WebStateInner {
     /// Signalled by the daemon on shutdown; the web listener uses this for
     /// graceful shutdown.
     pub cancel: CancellationToken,
+
+    /// Maximum time to wait for a reload outcome after writing the config
+    /// file via `POST /api/config/apply`.  Default is 10 s; tests use a
+    /// shorter value.
+    pub reload_timeout: Duration,
 }
 
 impl WebState {

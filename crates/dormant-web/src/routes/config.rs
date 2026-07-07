@@ -349,6 +349,7 @@ mod tests {
         DaemonConfig, ScreensaverConfig, ScreensaverSource, SensorConfig,
     };
     use indexmap::IndexMap;
+    use std::time::Duration;
 
     fn write_temp_config(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -389,6 +390,7 @@ mod tests {
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
+            reload_timeout: Duration::from_secs(10),
         })
     }
 

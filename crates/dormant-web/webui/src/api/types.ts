@@ -51,6 +51,7 @@ export const DAEMON_EVENT_TAGS = [
   "display_phase",
   "config_reloaded",
   "wake_retry",
+  "config_reload_rejected",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -123,6 +124,7 @@ export type DaemonEvent =
   | ZoneChangedEvent
   | DisplayPhaseEvent
   | ConfigReloadedEvent
+  | ConfigReloadRejectedEvent
   | WakeRetryEvent;
 
 export interface SensorChangedEvent {
@@ -147,6 +149,11 @@ export interface DisplayPhaseEvent {
 
 export interface ConfigReloadedEvent {
   event: "config_reloaded";
+}
+
+export interface ConfigReloadRejectedEvent {
+  event: "config_reload_rejected";
+  detail: string;
 }
 
 export interface WakeRetryEvent {

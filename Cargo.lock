@@ -968,6 +968,7 @@ dependencies = [
  "dormantctl",
  "dormantd",
  "ksni",
+ "png",
  "resvg",
  "serde_json",
  "tempfile",

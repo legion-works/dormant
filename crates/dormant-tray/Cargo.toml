@@ -32,6 +32,7 @@ tokio-util = { workspace = true }
 
 [build-dependencies]
 resvg = "0.47"
+png = "0.18"
 
 [dev-dependencies]
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }

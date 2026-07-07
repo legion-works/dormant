@@ -188,13 +188,27 @@ fn menu_entry_to_ksni(entry: MenuEntry) -> MenuItem<DormantTray> {
         MenuEntry::Action {
             label,
             enabled,
+            icon,
             action,
-        } => StandardItem {
-            label,
-            enabled,
-            ..action_item(action)
+        } => {
+            let mut item = action_item(action);
+            item.label = label;
+            item.enabled = enabled;
+            item.icon_data = icon.png_bytes().to_vec();
+            item.into()
         }
-        .into(),
+        MenuEntry::Info { label, icon } => {
+            // Info lines are non-clickable status lines; ksni expresses
+            // "always disabled" via the existing StandardItem with a
+            // never-called activate closure.
+            let mut item: StandardItem<DormantTray> = StandardItem {
+                label,
+                enabled: false,
+                ..Default::default()
+            };
+            item.icon_data = icon.png_bytes().to_vec();
+            item.into()
+        }
         MenuEntry::Submenu {
             label,
             enabled: _,

@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use comfy_table::Table;
 use dormant_core::ipc_proto::IpcRequest;
-use dormant_core::rules::StateSnapshot;
+use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
 
 use crate::client;
 
@@ -77,14 +77,7 @@ fn render_table(snapshot: &StateSnapshot) {
         let mut table = Table::new();
         table.set_header(vec!["ID", "Phase", "Inhibited", "Paused"]);
         for (id, d) in &snapshot.displays {
-            let phase = match &d.stage {
-                Some(si) => format!(
-                    "staged [{}: {}]",
-                    si.idx,
-                    serde_json::to_string(&si.kind).unwrap()
-                ),
-                None => d.phase.clone(),
-            };
+            let phase = phase_cell(d);
             table.add_row(vec![
                 id.as_str(),
                 phase.as_str(),
@@ -99,6 +92,21 @@ fn render_table(snapshot: &StateSnapshot) {
     if let Some(detail) = &snapshot.pending_reload {
         println!();
         println!("⚠  Pending reload: {detail}");
+    }
+}
+
+/// Build the Phase column cell for a [`DisplaySnapshot`].
+///
+/// For a staged display the cell reads `staged [idx: "kind"]`;
+/// otherwise it returns the plain phase string.
+fn phase_cell(d: &DisplaySnapshot) -> String {
+    match &d.stage {
+        Some(si) => format!(
+            "staged [{}: {}]",
+            si.idx,
+            serde_json::to_string(&si.kind).unwrap()
+        ),
+        None => d.phase.clone(),
     }
 }
 
@@ -241,14 +249,7 @@ mod tests {
             }),
         };
 
-        let si = d.stage.as_ref().unwrap();
-        // Mirror the exact rendering logic in render_table:
-        //   format!("staged [{}: {}]", si.idx, serde_json::to_string(&si.kind).unwrap())
-        let phase = format!(
-            "staged [{}: {}]",
-            si.idx,
-            serde_json::to_string(&si.kind).unwrap()
-        );
+        let phase = phase_cell(&d);
 
         assert!(
             phase.contains("staged [1:"),

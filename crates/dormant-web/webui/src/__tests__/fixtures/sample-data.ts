@@ -88,4 +88,6 @@ export const SAMPLE_CONFIG: ConfigResponse = {
     "aoc-main": { rule: "office-rule", zone: "office" },
     "samsung-tv": { rule: "tv-rule", zone: "hallway" },
   },
+  fingerprint: "abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+  redacted_paths: [],
 };

@@ -1,0 +1,16 @@
+# Custom build-prep steps injected into the dist-generated release workflow
+# via `github-build-setup` in dist-workspace.toml.
+# Placed after "Install dependencies" and before "Build artifacts" in the
+# build-local-artifacts job.
+
+- name: Setup Node.js
+  uses: actions/setup-node@v4
+  with:
+    node-version: 20
+    cache: npm
+    cache-dependency-path: crates/dormant-web/webui/package-lock.json
+- name: Build web UI (for rust-embed)
+  run: |
+    cd crates/dormant-web/webui
+    npm ci
+    npm run build

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
-use crate::routes::{command, config, doctor, events};
+use crate::routes::{command, config, config_apply, doctor, events};
 use crate::security::security_guard;
 
 /// Duration the `/api/state` handler waits for a snapshot reply before
@@ -34,6 +34,10 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = Router::new()
         .route("/state", get(get_state))
         .route("/config", get(config::get_config))
+        .route(
+            "/config/apply",
+            post(config_apply::post_apply).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/blank", post(command::post_blank))
         .route("/wake", post(command::post_wake))
         .route("/pause", post(command::post_pause))
@@ -159,6 +163,8 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: bind,
             cancel: cancel.clone(),

@@ -44,6 +44,11 @@ pub async fn spawn(
     bind: SocketAddr,
     state: WebState,
 ) -> std::io::Result<(JoinHandle<()>, SocketAddr)> {
+    // ── Startup hygiene: prune stale temp files ─────────────────────────────
+    // config.toml.tmp.* files older than 1 hour are leftovers from a
+    // previous apply that crashed before it could clean up.
+    prune_stale_temps(&state.inner.config_path);
+
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
 
     let handle = tokio::spawn(async move {
@@ -63,6 +68,47 @@ pub async fn spawn(
     );
 
     Ok((handle, addr))
+}
+
+/// Remove `config.toml.tmp.*` files older than 1 hour from the config
+/// directory.  These are leftovers from a previous apply that crashed
+/// before it could clean up its temp file; they are safe to delete
+/// because any apply writing them is long dead.
+pub(crate) fn prune_stale_temps(config_path: &std::path::Path) {
+    let dir = match config_path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let cutoff =
+        match std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(3600)) {
+            Some(t) => t,
+            None => return,
+        };
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("config.toml.tmp.") {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = match meta.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
@@ -131,6 +177,8 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: PathBuf::from("/dev/null"),
+            creds_path: PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),

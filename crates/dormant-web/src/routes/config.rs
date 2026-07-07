@@ -104,7 +104,7 @@ pub(crate) async fn get_config(
     let display_rules = build_display_rules(&inventory);
 
     // ── Step 2 — on-disk validation (raw TOML + load/parse/creds) ──────
-    let creds_path = config_path.with_extension("creds.toml");
+    let creds_path = &state.inner.creds_path;
 
     let raw_bytes = match std::fs::read(config_path) {
         Ok(bytes) => bytes,
@@ -135,7 +135,7 @@ pub(crate) async fn get_config(
 
     let (warnings, errors, load_error) = match load_config(config_path, Strictness::Warn) {
         Ok((cfg, warns)) => {
-            let creds = match load_credentials(&creds_path) {
+            let creds = match load_credentials(creds_path) {
                 Ok(c) => c,
                 Err(e) => {
                     // Creds load failure → load_error, redacted inventory + raw_toml.
@@ -232,7 +232,7 @@ fn build_display_rules(cfg: &Config) -> HashMap<String, DisplayRuleInfo> {
 /// Redact inline userinfo from every URL-shaped string field across all sensor
 /// configs and display configs, returning the TOML-key path of each redacted
 /// value in discovery order.
-fn redact_config_secrets(cfg: &mut Config) -> Vec<Vec<String>> {
+pub(super) fn redact_config_secrets(cfg: &mut Config) -> Vec<Vec<String>> {
     let mut paths: Vec<Vec<String>> = Vec::new();
 
     for (sensor_id, sensor) in &mut cfg.sensors {
@@ -375,6 +375,8 @@ mod tests {
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
+        let creds_path = config_path.with_extension("creds.toml");
+
         WebState::new(super::super::super::state::WebStateInner {
             ctl_tx,
             reload_trigger: reload_trigger_tx,
@@ -382,6 +384,8 @@ mod tests {
             config_rx,
             creds_rx,
             config_path,
+            creds_path,
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,

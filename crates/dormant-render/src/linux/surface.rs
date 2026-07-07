@@ -117,7 +117,12 @@ pub(super) fn create_shm_black_buffer(
         width.cast_signed(),
         height.cast_signed(),
         stride,
-        wayland_client::protocol::wl_shm::Format::Argb8888,
+        // XRGB8888 — the 4th byte is "ignored"; we still fill it
+        // with 0xFF (OPAQUE_BLACK_U32) for symmetry with the single-
+        // pixel buffer path, but the declaration is semantically
+        // "opaque content, no alpha channel" rather than "ARGB
+        // content with FF alpha".
+        wayland_client::protocol::wl_shm::Format::Xrgb8888,
         (),
         &qh,
     );

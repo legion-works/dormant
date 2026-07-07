@@ -6,7 +6,6 @@
 
 #![warn(missing_docs)]
 
-mod client;
 mod cmd_blank;
 mod cmd_doctor;
 mod cmd_pause;
@@ -119,17 +118,19 @@ fn main() -> ExitCode {
         Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
         Command::Blank { display } => cmd_blank::run_blank(&socket_path, &display),
         Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
-        Command::Reload => match client::send_request(&socket_path, &IpcRequest::Reload) {
-            Ok(resp) if resp.ok => {
-                println!("ok");
-                Ok(())
+        Command::Reload => {
+            match dormantctl::client::send_request(&socket_path, &IpcRequest::Reload) {
+                Ok(resp) if resp.ok => {
+                    println!("ok");
+                    Ok(())
+                }
+                Ok(resp) => Err(anyhow::anyhow!(
+                    "{}",
+                    resp.error.as_deref().unwrap_or("unknown")
+                )),
+                Err(e) => Err(e),
             }
-            Ok(resp) => Err(anyhow::anyhow!(
-                "{}",
-                resp.error.as_deref().unwrap_or("unknown")
-            )),
-            Err(e) => Err(e),
-        },
+        }
         Command::Validate {
             config,
             credentials,

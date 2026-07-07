@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::Result;
 use dormant_core::ipc_proto::IpcRequest;
 
-use crate::client;
+use dormantctl::client;
 
 /// Run the `blank` command.
 ///

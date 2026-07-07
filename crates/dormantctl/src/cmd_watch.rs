@@ -13,7 +13,7 @@ use dormantctl::client;
 ///
 /// Propagates connection and I/O errors.
 pub fn run(socket_path: &Path, json_output: bool) -> Result<()> {
-    let stream = client::connect_events(socket_path)?;
+    let (stream, _shutdown) = client::connect_events(socket_path)?;
 
     for event_result in stream {
         match event_result {

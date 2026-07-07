@@ -29,6 +29,58 @@ use crate::tray::TrayState;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Drop-guard that fires [`client::EventShutdown::shutdown`] on every
+/// exit path so the pump thread's blocked `read_line` returns and the
+/// thread exits cleanly.  Holding this guard in `tick` is what stops
+/// the per-failure thread leak: without it, every early `?` (failed
+/// `fetch_status`, parse error, etc.) would leave the pump thread
+/// parked on the FD until the daemon eventually sent something — leaking
+/// one thread per reconnect.
+pub struct TickShutdown(Option<client::EventShutdown>);
+
+impl TickShutdown {
+    fn new(shutdown: client::EventShutdown) -> Self {
+        Self(Some(shutdown))
+    }
+}
+
+impl Drop for TickShutdown {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            // Best-effort: the kernel-level shutdown(Both) makes the
+            // blocked read on the original FD return EOF/Err.  An error
+            // here (e.g. already-closed FD) is fine — the goal is to
+            // unblock the read, not to perform a clean half-close.
+            let _ = s.shutdown();
+        }
+    }
+}
+
+/// Spawn the synchronous event-iterator pump on a dedicated OS thread
+/// and return a tokio-side receiver plus the [`TickShutdown`] guard.
+///
+/// Exposed for tests; the production path uses [`tick`] which calls
+/// this with the result of [`client::connect_events`].
+#[must_use]
+pub fn spawn_event_pump(
+    stream: client::EventStream,
+    shutdown: client::EventShutdown,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<DaemonEvent>>,
+    TickShutdown,
+) {
+    let (tx, rx) = mpsc::channel::<Result<DaemonEvent>>(32);
+    std::thread::spawn(move || {
+        let mut stream = stream;
+        for ev in stream.by_ref() {
+            if tx.blocking_send(ev).is_err() {
+                break; // receiver dropped
+            }
+        }
+    });
+    (rx, TickShutdown::new(shutdown))
+}
+
 /// Drive the IPC loop until `cancel` is triggered.
 ///
 /// Blocks (returns only on `cancel.cancel()`).  Spawn this on a
@@ -88,15 +140,12 @@ async fn tick(
 
     // Subscribe to events.  Wrap the synchronous iterator in a
     // blocking-thread → tokio-mpsc pump so we can `select!` on it.
-    let mut stream = client::connect_events(socket_path).context("subscribe Events")?;
-    let (tx, mut rx) = mpsc::channel::<Result<DaemonEvent>>(32);
-    std::thread::spawn(move || {
-        for ev in stream.by_ref() {
-            if tx.blocking_send(ev).is_err() {
-                break; // receiver dropped
-            }
-        }
-    });
+    // The `TickShutdown` guard calls `shutdown(Both)` on the cloned
+    // socket FD on every exit path (normal return, `?` error, panic
+    // unwind) — that unblocks the pump thread's `read_line` so it
+    // exits instead of leaking across reconnects.
+    let (stream, shutdown) = client::connect_events(socket_path).context("subscribe Events")?;
+    let (mut rx, _shutdown_guard) = spawn_event_pump(stream, shutdown);
 
     loop {
         tokio::select! {

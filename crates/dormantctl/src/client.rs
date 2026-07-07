@@ -57,28 +57,46 @@ pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcRespo
     }
 }
 
-/// Connect to the daemon's event stream: send an `Events` request and return
-/// an iterator over [`DaemonEvent`] JSON lines.
+/// Connect to the daemon's event stream: send an `Events` request and
+/// return an iterator over [`DaemonEvent`] JSON lines plus a shutdown
+/// handle.
+///
+/// The returned [`EventShutdown`] holds a clone of the underlying
+/// Unix-stream FD.  Callers that want to abort the blocking read on the
+/// stream (for early exit on cancellation or error) should invoke
+/// [`EventShutdown::shutdown`] — that fires the FD's `shutdown(Both)`,
+/// which makes the in-flight `read_line` return EOF/Err so the iterator
+/// ends and the pump thread exits.  Without this, a blocking read on
+/// a socket whose remote end has already closed (or whose caller has
+/// stopped iterating) leaks the pump thread.
 ///
 /// # Errors
 ///
 /// - Connection refused / file not found → friendly error.
 /// - I/O or JSON errors on the initial response.
 /// - On non-Unix platforms, always returns an error.
-pub fn connect_events(socket_path: &Path) -> Result<EventStream> {
+pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)> {
     #[cfg(unix)]
     {
         use std::io::{BufReader, Write};
 
         let mut stream = connect(socket_path)?;
+        // Keep a clone of the FD just so we can shut the read direction
+        // down on early exit — see the doc above.
+        let shutdown_fd = stream.try_clone()?;
         let request = IpcRequest::Events;
         let line = serde_json::to_string(&request)?;
         writeln!(stream, "{line}")?;
         stream.flush()?;
 
-        Ok(EventStream {
-            reader: BufReader::new(stream),
-        })
+        Ok((
+            EventStream {
+                reader: BufReader::new(stream),
+            },
+            EventShutdown {
+                stream: shutdown_fd,
+            },
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -90,12 +108,83 @@ pub fn connect_events(socket_path: &Path) -> Result<EventStream> {
     }
 }
 
+/// A handle that can abort an in-flight event-stream read.
+///
+/// Constructed by [`connect_events`]; holds a clone of the underlying
+/// Unix-stream FD.  Call [`EventShutdown::shutdown`] from a Drop guard
+/// or cancellation path so the blocked `read_line` on the main stream
+/// returns immediately and the pump thread exits cleanly.
+#[cfg(unix)]
+pub struct EventShutdown {
+    /// Clone of the event-stream's Unix FD.  Held open so we can call
+    /// `shutdown(Both)` on it; the kernel-level shutdown propagates to
+    /// the original FD held by the iterator.
+    stream: UnixStream,
+}
+
+#[cfg(unix)]
+impl EventShutdown {
+    /// Build an `EventShutdown` from an existing `UnixStream` clone.
+    ///
+    /// Useful for tests that drive the iterator against a
+    /// `UnixStream::pair()` and need to construct both halves
+    /// manually.  Production code uses [`connect_events`].
+    #[must_use]
+    pub fn from_stream(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+
+    /// Shutdown both directions of the underlying socket.  After this
+    /// returns, any blocked read on the event-stream iterator will
+    /// return `Ok(0)` (EOF) — unblocking the pump thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same I/O errors as
+    /// [`std::os::unix::net::UnixStream::shutdown`]: `ENOTCONN` /
+    /// `EBADF` if the underlying socket is no longer connected or has
+    /// already been shut down.  Callers (the [`TickShutdown`] drop
+    /// guard) treat the result as best-effort — the goal is to
+    /// unblock the blocked read on the original FD, not to perform a
+    /// clean half-close.
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+#[cfg(not(unix))]
+pub struct EventShutdown {
+    _marker: std::marker::PhantomData<()>,
+}
+
+#[cfg(not(unix))]
+impl EventShutdown {
+    /// No-op on non-Unix — IPC is not supported there.
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// An iterator over [`DaemonEvent`] JSON lines from the event stream.
 pub struct EventStream {
     #[cfg(unix)]
     reader: BufReader<UnixStream>,
     #[cfg(not(unix))]
     _marker: std::marker::PhantomData<()>,
+}
+
+#[cfg(unix)]
+impl EventStream {
+    /// Build an `EventStream` from a pre-connected `BufReader<UnixStream>`.
+    ///
+    /// The caller is responsible for writing the `Events` request line
+    /// to `reader.get_ref()` before constructing the stream — this
+    /// constructor is primarily for tests that drive the iterator
+    /// against a `UnixStream::pair()` or similar.
+    #[must_use]
+    pub fn from_reader(reader: BufReader<UnixStream>) -> Self {
+        Self { reader }
+    }
 }
 
 impl Iterator for EventStream {

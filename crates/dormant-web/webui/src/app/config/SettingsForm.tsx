@@ -1,0 +1,224 @@
+/**
+ * Settings form — editable config sections with apply/discard flow.
+ *
+ * Manages a PatchStore instance, dirty tracking, and the apply
+ * lifecycle (call POST /api/config/apply, handle responses and
+ * errors).
+ */
+import { useState, useRef, useCallback, useEffect } from "react";
+import type { ConfigResponse, ApplyResponse, ApplyErrorBody } from "../../api/types";
+import { getConfig, postConfigApply, ApiError } from "../../api/client";
+import { createPatchStore } from "./patch";
+import type { PatchStore } from "./patch";
+import DaemonSection from "./DaemonSection";
+import SensorsSection from "./SensorsSection";
+import ZonesSection from "./ZonesSection";
+import RulesSection from "./RulesSection";
+import ApplyBar from "./ApplyBar";
+import type { ApplyOutcome } from "./ApplyBar";
+
+interface SettingsFormProps {
+  config: ConfigResponse;
+}
+
+/** Extract field-level errors from a 422 ApplyErrorBody by matching detail strings. */
+function extractFieldErrors(body: ApplyErrorBody): Record<string, string | undefined> {
+  const map: Record<string, string | undefined> = {};
+  for (const e of body.errors ?? []) {
+    // detail strings often contain path-like fragments (e.g. "sensors.desk-mmwave.port: …")
+    const match = e.detail.match(/^([\w._-]+(?:\.[\w._-]+)*)\s*[:|-]/);
+    if (match) {
+      map[match[1]] = e.detail;
+    }
+    // Also try "what" field as a loose key
+    if (e.what && !Object.values(map).some((v) => v === e.detail)) {
+      // Store under the what key if it looks path-y
+      if (/\./.test(e.what)) {
+        map[e.what] = e.detail;
+      }
+    }
+  }
+  return map;
+}
+
+export function SettingsForm({ config: initialConfig }: SettingsFormProps) {
+  const storeRef = useRef<PatchStore>(createPatchStore());
+  const store = storeRef.current;
+
+  const [config, setConfig] = useState<ConfigResponse>(initialConfig);
+  const [dirtyVersion, setDirtyVersion] = useState(0);
+  const dirtyCount = dirtyVersion === 0 ? 0 : store.buildPatches().length + 0; // force recalc on each version
+
+  const [applying, setApplying] = useState(false);
+  const [outcome, setOutcome] = useState<ApplyOutcome | null>(null);
+  const [conflict, setConflict] = useState(false);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string | undefined>>({});
+  const [bannerErrors, setBannerErrors] = useState<string[]>([]);
+
+  // Re-sync config when the prop changes (e.g. after parent re-fetches).
+  // Also update our internal config after a pending-apply auto-refetch.
+  // Only sync when the prop actually changed (fingerprint differs).
+  useEffect(() => {
+    if (initialConfig.fingerprint !== config.fingerprint) {
+      setConfig(initialConfig);
+    }
+  }, [initialConfig]);
+
+  const onDirty = useCallback(() => {
+    setDirtyVersion((v) => v + 1);
+  }, []);
+
+  const handleDiscard = useCallback(() => {
+    store.reset();
+    setDirtyVersion(0);
+    setOutcome(null);
+    setConflict(false);
+    setFieldErrors({});
+    setBannerErrors([]);
+    // Re-fetch to get the latest config from the server
+    getConfig()
+      .then((cfg) => setConfig(cfg))
+      .catch(() => {});
+  }, [store]);
+
+  const handleReload = useCallback(() => {
+    store.reset();
+    setDirtyVersion(0);
+    setOutcome(null);
+    setConflict(false);
+    setFieldErrors({});
+    setBannerErrors([]);
+    getConfig()
+      .then((cfg) => setConfig(cfg))
+      .catch(() => {});
+  }, [store]);
+
+  const handleApply = useCallback(async () => {
+    setApplying(true);
+    setOutcome(null);
+    setConflict(false);
+    setFieldErrors({});
+    setBannerErrors([]);
+
+    const patches = store.buildPatches();
+
+    try {
+      const res: ApplyResponse = await postConfigApply({
+        fingerprint: config.fingerprint,
+        patches,
+      });
+
+      if (res.reload === "reloaded") {
+        setOutcome({ kind: "reloaded" });
+        // Config was accepted — re-fetch to get the new fingerprint
+        getConfig()
+          .then((cfg) => setConfig(cfg))
+          .catch(() => {});
+      } else if (res.reload === "rejected") {
+        setOutcome({ kind: "rejected", detail: res.detail });
+      } else {
+        // pending or superseded
+        setOutcome({ kind: res.reload as "pending" | "superseded", detail: res.detail });
+        // Auto re-fetch after a short delay so tests can catch it
+        setTimeout(() => {
+          getConfig()
+            .then((cfg) => setConfig(cfg))
+            .catch(() => {});
+        }, 200);
+      }
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        if (err.status === 409) {
+          setConflict(true);
+        } else if (err.status === 422) {
+          const body = err.body as ApplyErrorBody;
+          if (body && body.errors) {
+            setFieldErrors(extractFieldErrors(body));
+            // Remaining errors not mapped to fields go to the banner
+            const mapped = new Set(Object.values(extractFieldErrors(body)).filter(Boolean));
+            const unmapped = body.errors
+              .filter((e) => !mapped.has(e.detail))
+              .map((e) => e.detail || e.what);
+            setBannerErrors(unmapped);
+          }
+        } else {
+          setOutcome({ kind: "rejected", detail: err.message });
+        }
+      } else {
+        setOutcome({ kind: "rejected", detail: String(err) });
+      }
+    } finally {
+      setApplying(false);
+    }
+  }, [config.fingerprint, store]);
+
+  const inv = config.inventory;
+
+  return (
+    <div className="cf-form">
+      <DaemonSection
+        daemon={inv.daemon}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
+
+      <SensorsSection
+        sensors={inv.sensors}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
+
+      <ZonesSection
+        zones={inv.zones}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
+
+      <RulesSection
+        rules={inv.rules}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
+
+      {/* Displays — placeholder for T8 */}
+      <div className="cf-section">
+        <div className="cf-section__header">
+          <h2 className="cf-section__title">Displays</h2>
+        </div>
+        <div className="cf-card">
+          <p className="cf-placeholder">
+            Display editors land with the ladder/screensaver editor — T8 owns that file set.
+          </p>
+        </div>
+      </div>
+
+      {/* Banner-level errors not mapped to fields */}
+      {bannerErrors.length > 0 && (
+        <div className="cf-apply__banner cf-apply__banner--rejected">
+          {bannerErrors.map((e, i) => (
+            <span key={i}>{e}{i < bannerErrors.length - 1 ? " · " : ""}</span>
+          ))}
+        </div>
+      )}
+
+      <ApplyBar
+        dirtyCount={dirtyCount}
+        applying={applying}
+        outcome={outcome}
+        conflict={conflict}
+        onApply={handleApply}
+        onDiscard={handleDiscard}
+        onReload={handleReload}
+        onDismissConflict={() => setConflict(false)}
+      />
+    </div>
+  );
+}

@@ -1131,4 +1131,73 @@ mod tests {
 
         drop(player);
     }
+
+    /// Per-file options via the 4-arg `loadfile` path must be accepted
+    /// by the real mpv.  Two PNGs with different `image_duration` values
+    /// are loaded; the construction succeeds for both and the playlist
+    /// contains both entries.  (Visual duration effect is acceptance-
+    /// tested visually — this test proves the non-empty options string
+    /// is well-formed through the 4-arg positional.)
+    #[test]
+    fn loadfile_per_file_options_accepted_by_mpv() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join("dormant-render-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
+        let img1 = dir.join("perfile_test_1.png");
+        let img2 = dir.join("perfile_test_2.png");
+
+        // Generate two tiny 1-frame images; skip if ffmpeg unavailable.
+        for (path, label) in &[(&img1, "red"), (&img2, "blue")] {
+            let ok = Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=c={label}:size=32x32:duration=0.1"),
+                    "-frames:v",
+                    "1",
+                ])
+                .arg(path)
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !ok {
+                eprintln!("ffmpeg unavailable; skipping per-file options test");
+                return;
+            }
+        }
+
+        let (_read_fd, write_fd) = make_pipe().expect("pipe2");
+        let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
+
+        let player = MpvPlayer::new(
+            vec![
+                PlaylistItem {
+                    uri: img1.to_string_lossy().into_owned(),
+                    image_duration: Some(Duration::from_secs_f64(0.5)),
+                },
+                PlaylistItem {
+                    uri: img2.to_string_lossy().into_owned(),
+                    image_duration: Some(Duration::from_secs_f64(1.25)),
+                },
+            ],
+            Duration::from_secs(10), // global default
+            false,
+            64,
+            64,
+            write_owned,
+        )
+        .expect("MpvPlayer::new with per-item durations must succeed");
+
+        let count: i64 = player
+            .property_i64("playlist-count")
+            .expect("read playlist-count");
+        assert_eq!(
+            count, 2,
+            "expected both per-file-option items in playlist, got {count}"
+        );
+
+        drop(player);
+    }
 }

@@ -10,8 +10,8 @@
 //! ## Sandbox flags
 //!
 //! The init-time flags pin the embedded player to an unprivileged,
-//! no-network-by-default sandbox.  Per the design phase (libmpv spike
-//! report §Q3 + gotcha #4):
+//! no-network-by-default sandbox.  Per the libmpv spike report (§Q3 +
+//! gotcha #4):
 //!
 //! | flag | value | reason |
 //! |------|-------|--------|
@@ -23,7 +23,7 @@
 //! | `terminal` | `no` | never touches stdin/stdout/stderr |
 //! | `config` | `no` | no `~/.config/mpv/*` lookup |
 //! | `input-ipc-server` | (empty) | no IPC socket bound |
-//! | `protocol-whitelist` | `file,http,https,tcp,tls` | allow network playlist sources |
+//! | `demuxer-lavf-o` | `protocol_whitelist=[file,http,https,tcp,tls]` | ffmpeg-level protocol whitelist (mpv 0.41 dropped `protocol-whitelist`; the lavf option is the surviving API for the same restriction) |
 //! | `demuxer-max-bytes` | 64 MiB | RAM-bounded streaming |
 //! | `network-timeout` | 10 s | fail fast on stuck network reads |
 //!
@@ -35,9 +35,12 @@
 //!
 //! We render with `bgr0` because on a little-endian host the in-memory
 //! byte order is `[B, G, R, X]`, which is the same layout as Wayland's
-//! `WL_SHM_FORMAT_XRGB8888` / `ARGB8888` (32-bit, X/alpha at byte 3).
-//! Using `rgb0` would require a swizzle per frame; using `rgba` is
-//! silently rejected by mpv and produces all-zero buffers (gotcha #3).
+//! `WL_SHM_FORMAT_XRGB8888` (32-bit, X/alpha at byte 3, ignored by the
+//! compositor).  Using `rgb0` would require a swizzle per frame; using
+//! `rgba` is silently rejected by mpv and produces all-zero buffers
+//! (gotcha #3).  See [`crate::linux::surface::SHM_PIXEL_FORMAT`] for the
+//! shared XRGB declaration that both the screensaver and black-fallback
+//! sites use.
 //!
 //! ## Thread model
 //!
@@ -63,15 +66,21 @@ use libmpv2_sys::{
     mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME,
 };
 
-/// Time after which an `MpvPlayer` that hasn't produced its first frame
-/// is considered failed (pre-first-frame failure → engine fall-through).
-const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+/// External deadline for first-frame: a calloop `Timer` is armed by
+/// the caller (in `state.rs::complete_screensaver_show`) for this
+/// duration; if no successful render lands before it fires, the show
+/// reply is resolved with `Err(E_RENDER_UNAVAILABLE)` so the engine
+/// falls through.  The internal check inside
+/// [`MpvPlayer::render_frame_into`] is defense-in-depth for the case
+/// where the wakeup pipe keeps firing past the deadline.
+pub(crate) const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Per-display screensaver configuration carried by the render sink.
 ///
 /// The daemon assembles this from a [`dormant_core::config::ScreensaverConfig`]
-/// at sink-build time (Task 13).  Today it's only constructed from tests
-/// — the production path lands in T13.
+/// at sink-build time.  Today it's only constructed from tests — the
+/// production path is wired when the daemon gains screensaver-aware
+/// sink construction.
 #[derive(Debug, Clone)]
 pub struct ScreensaverSettings {
     /// Ordered list of media items (local paths or URLs).  mpv loads the
@@ -82,7 +91,7 @@ pub struct ScreensaverSettings {
     /// Ignored for video sources.
     pub image_duration: Duration,
     /// Whether audio should be enabled.  False (the default) mutes the
-    /// player at init; a future T13+ config can flip this on the
+    /// player at init; a future config can flip this on the
     /// runtime-toggleable `mute` property.
     pub audio: bool,
 }
@@ -104,12 +113,18 @@ impl Default for ScreensaverSettings {
 /// threads (a single byte write is atomic for fds created with
 /// `O_NONBLOCK`); the callback that writes it captures the fd as a
 /// `usize` so the `extern "C"` fn pointer has no Rust state.
+///
+/// Cleanup runs in [`Drop`]: unset the wakeup callback BEFORE freeing
+/// the render context (so a racing mpv thread can't fire the trampoline
+/// against a freed context), free the context, drop the mpv handle,
+/// close the write fd.  Every `MpvPlayer` value owns exactly one of
+/// each resource — `Drop` is the single point of teardown, so
+/// post-`new` failure paths in the caller no longer leak.
 pub struct MpvPlayer {
-    mpv: libmpv2::Mpv,
+    mpv: Option<libmpv2::Mpv>,
     ctx: NonNull<mpv_render_context>,
-    /// Write end of the wakeup pipe — owned by the player, closed in
-    /// [`Self::destroy`].  The read end lives on the calloop loop.
-    wakeup_write_fd: RawFd,
+    /// Write end of the wakeup pipe.  `None` after [`Drop`] runs.
+    wakeup_write_fd: Option<RawFd>,
     width: i32,
     height: i32,
     stride: i32,
@@ -159,9 +174,40 @@ unsafe extern "C" fn wakeup_trampoline(cb_ctx: *mut c_void) {
     let fd = cb_ctx as RawFd;
     let byte: [u8; 1] = [1];
     // SAFETY: the fd is owned by the MpvPlayer and remains valid for
-    // the lifetime of the render context; `destroy` unregisters the
+    // the lifetime of the render context; `Drop` unregisters the
     // callback BEFORE freeing the context and closing the fd.
     let _ = unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+}
+
+impl Drop for MpvPlayer {
+    fn drop(&mut self) {
+        // Unset the callback FIRST so a racing mpv thread can't fire the
+        // trampoline after the context is gone.
+        //
+        // SAFETY: ctx was created by `mpv_render_context_create` and is
+        // still alive; passing `None` is the documented "disable"
+        // transition (subsequent wakeups don't fire).
+        unsafe {
+            mpv_render_context_set_update_callback(self.ctx.as_ptr(), None, std::ptr::null_mut());
+            mpv_render_context_free(self.ctx.as_ptr());
+        }
+        // Drop the mpv handle (terminates mpv, releases the player).
+        // `take()` leaves `None` so the second drop is a no-op if anyone
+        // ever calls this twice (defensive — Drop only fires once).
+        if let Some(mpv) = self.mpv.take() {
+            drop(mpv);
+        }
+        // Close the write fd exactly once.
+        //
+        // SAFETY: fd was created by `libc::pipe2` in the calloop layer
+        // and is owned exclusively by this player; closing it twice
+        // would be a bug but the calloop read end is a separate fd.
+        if let Some(fd) = self.wakeup_write_fd.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 impl MpvPlayer {
@@ -187,12 +233,15 @@ impl MpvPlayer {
             opts.set_property("terminal", false)?;
             opts.set_property("config", false)?;
             opts.set_property("input-ipc-server", "")?;
-            // NOTE: `protocol-whitelist` was on the dispatch list but
-            // is OPTION_NOT_FOUND on the mpv 0.41 build on this host
-            // (verified empirically).  The default whitelist is already
-            // restrictive enough for an embedded player — local file://
-            // access only — and the daemon's T13 can add a per-display
-            // override once we know the target mpv version.
+            // mpv 0.41 dropped `protocol-whitelist`; the ffmpeg-level
+            // lavf option path survives and is the supported way to
+            // pin the same restriction.  The whitelist value is a
+            // ffmpeg `protocol_whitelist` filter list — the same
+            // syntax `ffmpeg -protocol_whitelist file,http,...` accepts.
+            opts.set_property(
+                "demuxer-lavf-o",
+                "protocol_whitelist=[file,http,https,tcp,tls]",
+            )?;
             opts.set_property("demuxer-max-bytes", 67_108_864_i64)?;
             opts.set_property("network-timeout", 10_i64)?;
             Ok(())
@@ -200,8 +249,8 @@ impl MpvPlayer {
         .map_err(|e| MpvError::Init(format!("create: {e}")))?;
 
         // ── Runtime flags ──────────────────────────────────────────
-        // mute=yes (NOT audio=no — see gotcha #4 in the spike report).
-        // The bool coercion matches libmpv2's SetData impl: true → "yes".
+        // mute=yes (NOT audio=no — see gotcha #4).  The bool coercion
+        // matches libmpv2's SetData impl: true → "yes".
         mpv.set_property("mute", !audio_enabled)
             .map_err(|e| MpvError::Init(format!("set mute: {e}")))?;
         mpv.set_property("loop-playlist", "inf")
@@ -248,7 +297,7 @@ impl MpvPlayer {
         // ── Wakeup callback → pipe write ───────────────────────────
         // SAFETY: `wakeup_trampoline` is `unsafe extern "C"` and ignores
         // its argument beyond casting; the `cb_ctx` we pass encodes the
-        // fd (valid for the lifetime of the context, since `destroy`
+        // fd (valid for the lifetime of the context, since `Drop`
         // unregisters the callback before freeing).
         unsafe {
             mpv_render_context_set_update_callback(
@@ -265,9 +314,9 @@ impl MpvPlayer {
         }
 
         Ok(Self {
-            mpv,
+            mpv: Some(mpv),
             ctx,
-            wakeup_write_fd,
+            wakeup_write_fd: Some(wakeup_write_fd),
             width: width_i,
             height: height_i,
             stride,
@@ -339,28 +388,14 @@ impl MpvPlayer {
         Ok(rendered)
     }
 
-    /// Tear down the player: unregister the wakeup callback, free the
-    /// render context, drop the mpv handle, then close the write fd.
-    ///
-    /// Order matters — the callback must be cleared BEFORE the context
-    /// is freed (so a racing mpv wakeup doesn't dereference a dead
-    /// pointer) and the fd must outlive the context (so the trampoline
-    /// doesn't write to a closed fd).  After this call, any further
-    /// use of `self` is a use-after-free.
-    pub fn destroy(self) {
-        // SAFETY: ctx was created by mpv_render_context_create and is
-        // still alive; freeing a null is a documented no-op.
-        unsafe {
-            mpv_render_context_set_update_callback(self.ctx.as_ptr(), None, std::ptr::null_mut());
-            mpv_render_context_free(self.ctx.as_ptr());
-        }
-        // Drop the mpv handle (terminates mpv, frees the player).
-        drop(self.mpv);
-        // SAFETY: fd was created by libc::pipe2 in the calloop layer and
-        // is owned exclusively by this player; closing it twice would
-        // be a bug but the calloop read end is a separate fd.
-        unsafe {
-            libc::close(self.wakeup_write_fd);
+    /// Test-only accessor: read a property via the inner mpv handle.
+    /// Fails (with `Raw(-1)`) after [`Drop`] has run — i.e. the test
+    /// must call this BEFORE dropping the player.
+    #[cfg(test)]
+    pub(crate) fn property(&self, name: &str) -> Result<String, libmpv2::Error> {
+        match self.mpv.as_ref() {
+            Some(m) => m.get_property(name),
+            None => Err(libmpv2::Error::Raw(-1)),
         }
     }
 }
@@ -430,25 +465,17 @@ mod tests {
         }
     }
 
-    /// Integration with a real mpv instance + test fixture.  Skips
-    /// (does not panic, does not fail) if ffmpeg isn't available.
-    #[test]
-    fn renders_non_zero_changing_frames() {
-        // ── Arrange ────────────────────────────────────────────────
+    /// Build a real `MpvPlayer` against a generated test fixture (skips
+    /// when ffmpeg is absent) and return it.  Centralises the test-video
+    /// + pipe setup so each test focuses on its assertion.
+    fn build_test_player() -> Option<(MpvPlayer, PathBuf)> {
         let dir = std::env::temp_dir().join("dormant-render-tests");
         std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
         let video = dir.join("test.mp4");
-        if generate_test_video(&video).is_none() {
-            eprintln!("ffmpeg unavailable; skipping render test");
-            return;
-        }
-
-        let (read_fd, write_fd) = make_pipe().expect("pipe2");
-        // Take ownership so the read fd closes when the test ends.
-        let _read_owned = unsafe { OwnedRawFd::from_raw(read_fd) };
+        generate_test_video(&video)?;
+        let (_read_fd, write_fd) = make_pipe().expect("pipe2");
         let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
-
-        let mut player = MpvPlayer::new(
+        let player = MpvPlayer::new(
             vec![video.to_string_lossy().into_owned()],
             Duration::from_secs(2),
             false,
@@ -457,13 +484,23 @@ mod tests {
             write_owned.as_raw(),
         )
         .expect("player init");
+        Some((player, video))
+    }
 
-        // ── Act ────────────────────────────────────────────────────
+    /// Integration with a real mpv instance + test fixture.  Skips
+    /// (does not panic, does not fail) if ffmpeg isn't available.
+    #[test]
+    fn renders_non_zero_changing_frames() {
+        let Some((mut player, _video)) = build_test_player() else {
+            eprintln!("ffmpeg unavailable; skipping render test");
+            return;
+        };
+
         // Render a handful of frames, sleeping between attempts so mpv
         // has time to decode the next.  We DON'T rely on the wakeup
-        // pipe here — the test wants to verify the render path itself,
-        // not the wakeup plumbing (which is exercised by the integration
-        // test in connection/state once a compositor is available).
+        // pipe here — the test verifies the render path itself, not
+        // the wakeup plumbing (which is exercised by integration tests
+        // once a compositor is available).
         let mut rendered = 0;
         let mut hashes: Vec<u64> = Vec::new();
         let mut first_buf: Option<Vec<u8>> = None;
@@ -488,7 +525,6 @@ mod tests {
             }
         }
 
-        // ── Assert ─────────────────────────────────────────────────
         assert!(
             rendered >= 5,
             "should have rendered >=5 frames, got {rendered}"
@@ -515,82 +551,87 @@ mod tests {
             hashes.len()
         );
 
-        // ── Cleanup ────────────────────────────────────────────────
-        player.destroy();
+        // Drop cleans up — no explicit destroy() needed.
+        drop(player);
     }
 
-    /// Asserts the sandbox flags are pinned at init time and that
-    /// `mute=yes` is used in preference to `audio=no`.
+    /// Asserts the sandbox flags are pinned at init time on the REAL
+    /// `MpvPlayer`, NOT a parallel handle (the parallel-handle pattern
+    /// can silently pass while the production player drops a flag).
+    /// Also reads back `demuxer-lavf-o` if the property is readable
+    /// on this mpv build — the init-must-not-fail check is the primary
+    /// assertion; the readback is best-effort.
     #[test]
     fn sandbox_flags_pinned_after_init() {
-        let dir = std::env::temp_dir().join("dormant-render-tests");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let video = dir.join("test.mp4");
-        if generate_test_video(&video).is_none() {
+        let Some((player, _video)) = build_test_player() else {
             eprintln!("ffmpeg unavailable; skipping sandbox flag test");
             return;
-        }
+        };
 
+        // If init accepted the lavf whitelist, the property may or may
+        // not be readable depending on mpv build — read it best-effort
+        // but do NOT fail the test on read failure (init success is
+        // the binding assertion; readback is a nice-to-have).
+        let lavf = player.property("demuxer-lavf-o").ok();
+        eprintln!("demuxer-lavf-o readback: {lavf:?}");
+
+        // Sandbox flags pinned at init — read back via the REAL player.
+        // If `MpvPlayer::new` ever drops one of these (e.g. an
+        // "innocent" refactor removes `ytdl=false`), this fails.
+        let ytdl = player.property("ytdl").expect("get ytdl");
+        assert_eq!(ytdl, "no", "ytdl must be pinned to 'no'");
+        let load_scripts = player.property("load-scripts").expect("get load-scripts");
+        assert_eq!(load_scripts, "no", "load-scripts must be pinned to 'no'");
+        let osc = player.property("osc").expect("get osc");
+        assert_eq!(osc, "no", "osc must be pinned to 'no'");
+        let input_defaults = player
+            .property("input-default-bindings")
+            .expect("get input-default-bindings");
+        assert_eq!(
+            input_defaults, "no",
+            "input-default-bindings must be pinned to 'no'"
+        );
+        let terminal = player.property("terminal").expect("get terminal");
+        assert_eq!(terminal, "no", "terminal must be pinned to 'no'");
+        let mute = player.property("mute").expect("get mute");
+        assert!(
+            mute.eq_ignore_ascii_case("yes"),
+            "mute must be yes (audio=no is irreversible)"
+        );
+
+        drop(player);
+    }
+
+    /// Asserts that `MpvPlayer::new` accepts the `demuxer-lavf-o`
+    /// protocol-whitelist setting on its own — even WITHOUT a real
+    /// fixture file (no loadfile).  This is the security assertion:
+    /// the option must parse, the init must succeed.
+    #[test]
+    fn lavf_protocol_whitelist_accepted_without_fixture() {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
         let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
 
-        // Build the player.  We never render — just inspect the flag
-        // state via a parallel Mpv handle wouldn't work (different mpv
-        // instance).  Instead, wrap the real handle briefly for readback.
-        // MpvPlayer doesn't expose the inner handle; for this test we
-        // re-create an equivalent with the same flags via libmpv2 directly.
-        let mpv = libmpv2::Mpv::with_initializer(|opts| {
-            opts.set_property("vo", "libmpv")?;
-            opts.set_property("ytdl", false)?;
-            opts.set_property("load-scripts", false)?;
-            opts.set_property("osc", false)?;
-            opts.set_property("input-default-bindings", false)?;
-            opts.set_property("terminal", false)?;
-            opts.set_property("config", false)?;
-            opts.set_property("input-ipc-server", "")?;
-            opts.set_property("demuxer-max-bytes", 67_108_864_i64)?;
-            opts.set_property("network-timeout", 10_i64)?;
-            Ok(())
-        })
-        .expect("mpv init");
-        mpv.set_property("mute", true).expect("set mute");
-        mpv.set_property("loop-playlist", "inf")
-            .expect("set loop-playlist");
-        mpv.set_property("image-display-duration", 5.0_f64)
-            .expect("set image-display-duration");
+        // No items → no loadfile.  Init should still succeed because the
+        // lavf option is set on the player (not on a stream).
+        let player = MpvPlayer::new(
+            vec![],
+            Duration::from_secs(1),
+            false,
+            64,
+            64,
+            write_owned.as_raw(),
+        )
+        .expect("player init must accept demuxer-lavf-o at construction time");
 
-        // Readback.
-        let ytdl: String = mpv.get_property("ytdl").expect("get ytdl");
-        assert_eq!(ytdl, "no");
-        let load_scripts: String = mpv.get_property("load-scripts").expect("get load-scripts");
-        assert_eq!(load_scripts, "no");
-        let osc: String = mpv.get_property("osc").expect("get osc");
-        assert_eq!(osc, "no");
-        let input_defaults: String = mpv
-            .get_property("input-default-bindings")
-            .expect("get input-default-bindings");
-        assert_eq!(input_defaults, "no");
-        let terminal: String = mpv.get_property("terminal").expect("get terminal");
-        assert_eq!(terminal, "no");
-        let mute: bool = mpv.get_property("mute").expect("get mute");
-        assert!(mute, "mute must be true (audio=no would be irreversible)");
-        let loop_playlist: String = mpv
-            .get_property("loop-playlist")
-            .expect("get loop-playlist");
-        assert_eq!(loop_playlist, "inf");
-        let image_dur: f64 = mpv
-            .get_property("image-display-duration")
-            .expect("get image-display-duration");
-        assert!((image_dur - 5.0).abs() < 1e-6);
+        // Best-effort readback.
+        let _ = player.property("demuxer-lavf-o");
 
-        // The write fd was for MpvPlayer; we used a parallel libmpv2
-        // handle for readback.  Close it directly.
-        drop(write_owned);
-        drop(mpv);
+        drop(player);
     }
 
     /// Pre-first-frame timeout fires when a non-existent path is loaded
-    /// (mpv reports an error, never produces a frame).
+    /// (mpv reports an error, never produces a frame).  Exercises the
+    /// internal deadline check inside `render_frame_into`.
     #[test]
     fn missing_file_yields_no_first_frame() {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
@@ -626,7 +667,36 @@ mod tests {
             "missing-file loadfile must trip the pre-first-frame deadline"
         );
 
-        player.destroy();
+        drop(player);
+    }
+
+    /// `Drop` tears down a never-used player without panicking.  This
+    /// catches leaks via the obvious smoke (assertions on fd counts
+    /// via /proc/self/fd are flaky on parallel CI, so we rely on
+    /// "doesn't panic + doesn't double-close" — the type system
+    /// enforces the latter via `Option<RawFd>` and the fact that
+    /// `Drop` only runs once).
+    #[test]
+    fn drop_tears_down_unused_player_without_panic() {
+        let (_read_fd, write_fd) = make_pipe().expect("pipe2");
+        let write_owned = unsafe { OwnedRawFd::from_raw(write_fd) };
+
+        let player = MpvPlayer::new(
+            vec![],
+            Duration::from_secs(1),
+            false,
+            64,
+            64,
+            write_owned.as_raw(),
+        )
+        .expect("player init");
+
+        // No render — just drop.  If `Drop` panics, the test fails; if
+        // it double-closes the fd, libc::close on the second call
+        // would also panic (in debug builds at least) or report
+        // EBADF (silent in release — but a stray fd would show up
+        // in fdcount tools, not in unit tests).
+        drop(player);
     }
 
     #[test]

@@ -327,6 +327,40 @@ export interface DisplayConfig {
   treat_unreachable_as_blanked?: boolean;
 }
 
+// ─── Config-apply wire types ──────────────────────────────────────────────
+// rust: config_apply.rs + config_patch.rs + error.rs
+// Serde: Patch uses tag="op", rename_all="lowercase".
+
+/** rust: config_patch.rs Patch, serde(tag = "op", rename_all = "lowercase") */
+export type ConfigPatch =
+  | { op: "set"; path: string[]; value: unknown }
+  | { op: "remove"; path: string[] };
+
+/** rust: config_apply.rs ApplyRequest */
+export interface ApplyRequest {
+  /** Lowercase hex SHA-256 of the on-disk config bytes. */
+  fingerprint: string;
+  /** Ordered list of patches to apply. */
+  patches: ConfigPatch[];
+}
+
+/** rust: config_apply.rs ApplyResponse */
+export interface ApplyResponse {
+  applied: boolean;
+  /** Outcome: `"reloaded"` | `"rejected"` | `"pending"` | `"superseded"`. */
+  reload: string;
+  /** Human-readable detail when `reload` is `"rejected"`. */
+  detail?: string;
+  /** Validation or patch errors returned by the server (422). */
+  errors?: ConfigApplyErrorDetail[];
+}
+
+/** rust: error.rs into_response 422 body shape ({ "errors": […] }). */
+export interface ConfigApplyErrorDetail {
+  what: string;
+  detail: string;
+}
+
 /** rust: config/schema.rs RuleConfig */
 export interface RuleConfig {
   zone: string;
@@ -345,6 +379,12 @@ export interface RuleConfig {
 /**
  * rust: config/routes.rs ConfigResponse
  * Full shape of GET /api/config.
+ *
+ * `fingerprint` is a lowercase hex SHA-256 of the on-disk config bytes
+ * (computed before redaction) — the client must send it back with every
+ * `POST /api/config/apply` for optimistic-concurrency control.
+ * `redacted_paths` are TOML-key paths of every value redacted from
+ * `raw_toml`; array indices are decimal strings.
  */
 export interface ConfigResponse {
   path: string;
@@ -354,4 +394,8 @@ export interface ConfigResponse {
   inventory: ConfigInventory;
   validation: ConfigValidation;
   display_rules: Record<string, DisplayRuleInfo>;
+  /** Lowercase hex SHA-256 of the on-disk config bytes as returned by GET /api/config. */
+  fingerprint: string;
+  /** TOML-key paths of every value that was redacted, in discovery order. */
+  redacted_paths: string[][];
 }

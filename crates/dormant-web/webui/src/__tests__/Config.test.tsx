@@ -58,6 +58,8 @@ const { mocks, SAMPLE_CONFIG, SAMPLE_STATE } = vi.hoisted(() => {
       },
       validation: { ok: true, warnings: [], errors: [] },
       display_rules: {},
+      fingerprint: "abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+      redacted_paths: [],
     },
     SAMPLE_STATE: {
       sensors: [],

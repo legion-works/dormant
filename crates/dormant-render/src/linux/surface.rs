@@ -29,6 +29,20 @@ pub(super) const OPAQUE_BLACK_U32: u32 = 0xFF00_0000;
 /// Namespace surfaced in `wayland-info` / `wayland-debug`.
 pub(super) const LAYER_NAMESPACE: &str = "dormant";
 
+/// Pixel format for every shm buffer this crate hands to the compositor.
+///
+/// **`XRGB8888` is intentional, not a typo for `ARGB8888`.**  mpv's
+/// `bgr0` SW format writes bytes `[B, G, R, X]` with `X = 0x00`
+/// (verified by the spike's `[ff,00,ff,00]` magenta pixel dump).
+/// Under `ARGB8888` the compositor reads that 4th byte as ALPHA → an
+/// alpha=0 frame composites fully transparent (the desktop shows
+/// through — the screensaver renders invisible).  `XRGB8888` declares
+/// "the 4th byte is ignored"; the same byte stream is correct opaque
+/// content either way.  The black shm fallback uses the same format
+/// for symmetry — opaque content, no alpha channel to manage.
+pub(super) const SHM_PIXEL_FORMAT: wayland_client::protocol::wl_shm::Format =
+    wayland_client::protocol::wl_shm::Format::Xrgb8888;
+
 /// Create a fullscreen-anchored Overlay layer surface on `target_output`.
 ///
 /// The returned [`LayerSurface`] is in the *initial* state — a single
@@ -117,11 +131,26 @@ pub(super) fn create_shm_black_buffer(
         width.cast_signed(),
         height.cast_signed(),
         stride,
-        wayland_client::protocol::wl_shm::Format::Argb8888,
+        SHM_PIXEL_FORMAT,
         (),
         &qh,
     );
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned at `XRGB8888` so the alpha-trap regression cannot
+    /// silently return.  See the const's doc for why ARGB is wrong.
+    #[test]
+    fn shm_pixel_format_is_xrgb_8888_to_ignore_mpv_bgr0_pad_byte() {
+        assert_eq!(
+            SHM_PIXEL_FORMAT,
+            wayland_client::protocol::wl_shm::Format::Xrgb8888
+        );
+    }
 }
 
 // (SinglePixelBufferManager alias lives in `state.rs` for callers that

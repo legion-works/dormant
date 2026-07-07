@@ -4,6 +4,6 @@
  */
 export { default as StatusChip } from "./StatusChip";
 export type { StatusKind } from "./StatusChip";
-export { statusLabel } from "./status";
+export { statusLabel, stageKindLabel, phaseChipLabel } from "./status";
 export { default as Card } from "./Card";
 export { default as HealthChip } from "./HealthChip";

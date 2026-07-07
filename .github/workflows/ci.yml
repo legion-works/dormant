@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev libmpv-dev pkg-config
       - uses: actions/download-artifact@v4
         with:
           name: webui-dist
@@ -75,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev libmpv-dev pkg-config ffmpeg libavcodec-extra
       - uses: actions/download-artifact@v4
         with:
           name: webui-dist

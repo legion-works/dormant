@@ -211,6 +211,72 @@ Render stages require:
 `render_screensaver` additionally requires a `[displays.<id>.screensaver]`
 section with at least one image source (a `path` or `urls`).
 
+##### Screensaver configuration
+
+```toml
+[displays.my-display.screensaver]
+trigger = "vacancy"     # only value supported
+audio = false           # default: false (muted)
+
+[[displays.my-display.screensaver.source]]
+path = "/home/user/Pictures/screensaver"
+recurse = false         # default: false
+shuffle = true          # mutually exclusive with `order`
+image_duration = "8s"   # per-item duration override
+
+[[displays.my-display.screensaver.source]]
+urls = ["https://example.com/background.jpg"]
+order = "sequential"    # only value accepted; mutually exclusive with `shuffle`
+```
+
+| Key | Type | Required | Default | Description |
+|-----|------|----------|---------|-------------|
+| `trigger` | string | no | `"vacancy"` | Trigger for the screensaver. Only `"vacancy"` is supported (the ladder itself is vacancy-driven). |
+| `audio` | boolean | no | `false` | Whether audio playback is enabled. `false` mutes the player at init. |
+| `[[…source]]` | array | yes | — | Ordered list of media sources for the playlist. |
+
+Each source supports:
+
+| Key | Type | Required | Default | Description |
+|-----|------|----------|---------|-------------|
+| `path` | string | conditional | — | Local directory of images / video files. Mutually exclusive with `urls`. |
+| `urls` | []string | conditional | `[]` | Remote URLs. Mutually exclusive with `path`. |
+| `recurse` | boolean | no | `false` | Scan `path` recursively for media files. |
+| `shuffle` | boolean | no | `false` | Shuffle items from this source (Fisher-Yates, seeded per restart). Mutually exclusive with `order`. |
+| `order` | string | no | — | Ordering strategy. Only `"sequential"` is accepted. Mutually exclusive with `shuffle`. |
+| `image_duration` | duration | no | 10 s | Per-image display duration override (must be > 0). |
+
+**Playlist assembly:** The playlist is built at startup and on every config
+reload — file-system scanning runs off the Wayland thread.  Changes to the
+source directories or `screensaver` config require a reload (`SIGHUP` or
+`dormantctl reload`) to take effect.
+
+**Feature gate:** `render_screensaver` requires the `render` build feature.
+
+To use the screensaver, the display's ladder must include a `render_screensaver`
+stage, typically as the terminal stage after controller attempts have failed:
+
+```toml
+[displays.my-display]
+controllers = ["ddcci", "command"]
+output = "DP-1"
+ladder = [
+  { kind = "power_off", dwell = "30s" },
+  { kind = "render_black", dwell = "5m" },
+  { kind = "render_screensaver" },
+]
+```
+
+Validation rejects:
+
+- A `render_screensaver` stage without a `screensaver` section.
+- A `screensaver` section with no sources, or sources with neither `path` nor `urls`.
+- A source with both `path` and `urls` set.
+- A source with both `shuffle` and `order` set.
+- An `order` value other than `"sequential"`.
+- A `trigger` value other than `"vacancy"`.
+- An `image_duration` of zero.
+
 #### Backward compatibility
 
 Configs that use `blank_mode` (and optionally `degraded_mode`) — the pre-ladder

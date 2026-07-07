@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
 import type { ConfigResponse } from "../../api/types";
-import { Card } from "../components";
+import { Card, stageKindLabel } from "../components";
 import "./Config.css";
 
 interface ConfigState {
@@ -219,6 +219,42 @@ export default function Config() {
               ))}
             </div>
           </Card>
+
+          {/* Ladder & Screensaver per-display summary */}
+          {Object.values(inv.displays ?? {}).some(
+            (dc) => dc.ladder?.length || dc.screensaver,
+          ) && (
+            <Card>
+              <div className="config-inventory">
+                <div className="config-inventory__title">Ladder &amp; Screensaver</div>
+                {Object.entries(inv.displays ?? {})
+                  .filter(([, dc]) => dc.ladder?.length || dc.screensaver)
+                  .map(([id, dc]) => (
+                    <div key={id} className="config-inventory__row">
+                      <span className="config-inventory__key">{id}</span>
+                      <span className="config-inventory__val">
+                        {dc.ladder?.length
+                          ? dc.ladder
+                              .map(
+                                (s) =>
+                                  stageKindLabel(s.kind) +
+                                  (s.dwell ? ` (${s.dwell})` : ""),
+                              )
+                              .join(" → ")
+                          : "—"}
+                      </span>
+                      <span className="config-inventory__names">
+                        {dc.screensaver
+                          ? `${dc.screensaver.source.length} source${
+                              dc.screensaver.source.length !== 1 ? "s" : ""
+                            }`
+                          : null}
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </Card>
+          )}
 
           {hasValidationIssues ? (
             <div className={`config-validation config-validation--${vSeverity}`}>

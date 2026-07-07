@@ -60,15 +60,25 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
   const sources = getEffectiveSources(displayId, fetchedSources, store);
 
   /**
-   * Strip null values from optional ScreensaverSource fields that come
-   * from the server's JSON serialisation of Rust Option::None (path,
-   * order, image_duration).  Absent, not null, in emitted patches.
+   * Whether a value represents "no input" — null from the server's JSON
+   * serialisation of Rust Option::None, or an empty/whitespace string
+   * from a cleared input field.
+   */
+  function isAbsentInput(v: unknown): boolean {
+    return v === null || (typeof v === "string" && v.trim() === "");
+  }
+
+  /**
+   * Strip absent values from optional ScreensaverSource fields (order,
+   * image_duration).  Path is REQUIRED — an empty path passes through
+   * so the server can surface its own validation error.
    */
   function cleanSource(s: ScreensaverSource): ScreensaverSource {
     const out: Record<string, unknown> = { ...s };
-    // Delete null optional fields — they must be absent in patches.
-    for (const key of ["path", "order", "image_duration"]) {
-      if (out[key] === null) delete out[key];
+    // Optional fields — absent when null or empty.
+    const optionalKeys = ["order", "image_duration"];
+    for (const key of optionalKeys) {
+      if (isAbsentInput(out[key])) delete out[key];
     }
     return out as ScreensaverSource;
   }

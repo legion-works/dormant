@@ -145,4 +145,60 @@ describe("ScreensaverEditor", () => {
     // Source 1 has the edited path
     expect(value[1]).toEqual({ path: "/c", recurse: true, shuffle: false, order: "sequential", image_duration: "5s" });
   });
+
+  it("clearing an optional image_duration emits source without image_duration key", async () => {
+    const ss: ScreensaverConfig = {
+      trigger: "escalation",
+      audio: false,
+      scale_mode: "fill",
+      transition: "crossfade",
+      transition_duration: "1s",
+      source: [
+        { path: "/a", recurse: false, shuffle: false, image_duration: "10s" },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    const durInputs = screen.getAllByLabelText("image_duration");
+    expect(durInputs.length).toBe(1);
+    fireEvent.change(durInputs[0], { target: { value: "" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(1);
+
+    // Cleared optional field must NOT appear as a key.
+    const s0 = value[0] as Record<string, unknown>;
+    expect("image_duration" in s0).toBe(false);
+    expect(s0.path).toBe("/a");
+  });
+
+  it("required path field with empty string still emits path (passthrough)", async () => {
+    const ss: ScreensaverConfig = {
+      trigger: "escalation",
+      audio: false,
+      scale_mode: "fill",
+      transition: "crossfade",
+      transition_duration: "1s",
+      source: [
+        { path: "/a", recurse: false, shuffle: false },
+      ],
+    };
+    const { store } = renderEditor(ss);
+
+    const pathInputs = screen.getAllByLabelText("path");
+    expect(pathInputs.length).toBe(1);
+    fireEvent.change(pathInputs[0], { target: { value: "" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toHaveLength(1);
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    const value = setPatch.value as ScreensaverSource[];
+    expect(value).toHaveLength(1);
+
+    // Required field: empty path IS emitted (server catches the error).
+    expect(value[0].path).toBe("");
+  });
 });

@@ -1772,6 +1772,9 @@ mod tests {
         let mut second_buf = vec![0x00u8; (320 * 4 * 180) as usize];
         let res = player.render_frame_into(&mut second_buf).expect("render");
         assert!(!res, "expected Ok(false) after draining");
-        assert_eq!(first_buf, second_buf, "render_frame_into did not draw the current picture on Ok(false)");
+        assert_eq!(
+            first_buf, second_buf,
+            "render_frame_into did not draw the current picture on Ok(false)"
+        );
     }
 }

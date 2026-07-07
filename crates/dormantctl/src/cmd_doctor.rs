@@ -169,7 +169,7 @@ fn load_config_and_creds(
 
 /// Load credentials with diagnosis-preserving degradation.
 ///
-/// - **Missing file** → proceed anonymous; note says "no file at <path>".
+/// - **Missing file** → proceed anonymous; note says "no file at `<path>`".
 /// - **Unreadable / invalid TOML / wrong perms** → proceed anonymous; note
 ///   carries the actual error text so the operator can fix it.
 /// - **Readable file** → normal credentials load.

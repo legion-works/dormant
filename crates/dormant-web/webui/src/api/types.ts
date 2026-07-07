@@ -351,14 +351,26 @@ export interface ApplyResponse {
   reload: string;
   /** Human-readable detail when `reload` is `"rejected"`. */
   detail?: string;
-  /** Validation or patch errors returned by the server (422). */
-  errors?: ConfigApplyErrorDetail[];
 }
 
-/** rust: error.rs into_response 422 body shape ({ "errors": […] }). */
+/** 422 error body from `POST /api/config/apply` (`{ "errors": […] }`).
+ *  rust: error.rs into_response — ValidationFailed, RedactedPathTargeted,
+ *  PatchPathDenied, EntityUnknown, PatchValueRejected, PatchCapExceeded. */
+export interface ApplyErrorBody {
+  errors: ConfigApplyErrorDetail[];
+}
+
+/** A single error entry in the 422 `errors` array.
+ *  rust: error.rs SerializableValidationError { what, detail }. */
 export interface ConfigApplyErrorDetail {
   what: string;
   detail: string;
+}
+
+/** 409 error body from `POST /api/config/apply` (fingerprint mismatch).
+ *  rust: error.rs into_response — FingerprintMismatch. */
+export interface ApplyConflictBody {
+  error: string;
 }
 
 /** rust: config/schema.rs RuleConfig */

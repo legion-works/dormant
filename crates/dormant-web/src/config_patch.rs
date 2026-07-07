@@ -305,6 +305,10 @@ fn check_payload_for_locked_leaves(value: &serde_json::Value) -> Result<(), Patc
 /// edits under any path that IS a known descendant of the redacted path.
 fn check_redacted(path: &[&str], redacted: &[Vec<String>]) -> Result<(), PatchError> {
     for r in redacted {
+        // Defensive: skip empty redacted entries (mirrors TS isLocked guard).
+        if r.is_empty() {
+            continue;
+        }
         let r_strs: Vec<&str> = r.iter().map(String::as_str).collect();
 
         // Exact match or descendant: patch-path starts with redacted.
@@ -1229,6 +1233,21 @@ grace_period = "30s"
     fn unrelated_path_not_redacted() {
         let cur = minimal_config();
         let redacted = vec![p(&["displays", "tv", "screensaver", "source", "0", "path"])];
+        check_ok(
+            &[set(&["daemon", "web_port"], json!(8080))],
+            &cur,
+            &redacted,
+        );
+    }
+
+    #[test]
+    fn empty_redacted_entry_skipped() {
+        let cur = minimal_config();
+        // An empty redacted entry would match every path if the check were
+        // not skipped (both prefix slices would be empty).  Mirror the TS
+        // isLocked defensive skip.
+        let redacted: Vec<Vec<String>> = vec![vec![], p(&["sensors", "desk", "broker_url"])];
+        // Not under the non-empty redacted path → should pass.
         check_ok(
             &[set(&["daemon", "web_port"], json!(8080))],
             &cur,

@@ -22,6 +22,8 @@ import type {
   ApplyResponse,
 } from "./types";
 
+export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
+
 const BASE = "/api";
 const JSON_CT = { "Content-Type": "application/json" };
 

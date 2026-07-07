@@ -6,6 +6,7 @@
 //! `'static`) so surface-creation calls can still bind proxies to the
 //! right queue without storing the queue itself.
 
+use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -38,11 +39,15 @@ use wayland_protocols::wp::viewporter::client::{
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
+use calloop::generic::Generic;
+use calloop::{Interest, Mode, PostAction};
+
 use dormant_core::error::E_RENDER_UNAVAILABLE;
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
+use crate::screensaver::{MpvPlayer, ScreensaverSettings};
 
 /// Re-export of the long `WpSinglePixelBufferManagerV1` type so callers
 /// in [`crate::linux::surface`] can name it without a full
@@ -95,14 +100,122 @@ pub(super) fn surface_match(
     }
 }
 
+/// Build a `CmdFailure` for one of the render sub-controllers.
+/// Centralised so the error sites in this file don't drift on the
+/// `E_RENDER_UNAVAILABLE` prefix or the controller tag.
+fn cmd_failure(controller: &'static str, detail: &str) -> CmdFailure {
+    CmdFailure {
+        controller: controller.into(),
+        error: format!("{E_RENDER_UNAVAILABLE}: {detail}"),
+    }
+}
+
+/// Create a non-blocking `CLOEXEC` pipe for the mpv wakeup callback
+/// to write into.  Returns `(read_fd, write_fd)` — the read end is
+/// registered with calloop, the write end is given to the mpv player.
+fn make_wakeup_pipe() -> Result<(RawFd, RawFd), CmdFailure> {
+    let mut pipe_fds = [0 as RawFd; 2];
+    // SAFETY: pipe2 writes both fds into the provided array.
+    let ret = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if ret < 0 {
+        return Err(cmd_failure(
+            "screensaver",
+            &format!("pipe2: {}", std::io::Error::last_os_error()),
+        ));
+    }
+    Ok((pipe_fds[0], pipe_fds[1]))
+}
+
+/// Build two `WlBuffer`s from a single `RawPool` — `buf0` at offset 0,
+/// `buf1` at offset `stride * height`.  Together they cover the full
+/// pool so mpv can ping-pong writes without overwriting a buffer the
+/// compositor is still reading.
+fn create_dual_buffers(
+    pool: &mut smithay_client_toolkit::shm::raw::RawPool,
+    qh: &QueueHandle<WaylandState>,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> (WlBuffer, WlBuffer) {
+    let stride_i32 = stride.cast_signed();
+    let fmt = wayland_client::protocol::wl_shm::Format::Argb8888;
+    let buf0 = pool.create_buffer(
+        0,
+        width.cast_signed(),
+        height.cast_signed(),
+        stride_i32,
+        fmt,
+        (),
+        qh,
+    );
+    let buf1 = pool.create_buffer(
+        stride.cast_signed(),
+        width.cast_signed(),
+        height.cast_signed(),
+        stride_i32,
+        fmt,
+        (),
+        qh,
+    );
+    (buf0, buf1)
+}
+
+/// Calloop dispatch callback for the screensaver wakeup pipe.
+/// Delegates to [`WaylandState::on_mpv_wakeup`] for the actual work.
+/// Returns `Ok(PostAction)` (never an `Err`) — the calloop source's
+/// error type is fixed as `std::io::Error` but our callback never
+/// produces one; `Result` wrapping is required by the `EventSource`
+/// contract on `Generic`.
+#[allow(clippy::unnecessary_wraps)] // calloop's EventSource contract mandates Result
+fn screensaver_wakeup_cb(
+    _readiness: calloop::Readiness,
+    _meta: &mut calloop::generic::NoIoDrop<BorrowedFd<'_>>,
+    state: &mut WaylandState,
+) -> Result<PostAction, std::io::Error> {
+    state.on_mpv_wakeup();
+    Ok(PostAction::Continue)
+}
+
 pub(super) struct PendingShow {
     /// Stage generation counter — forwarded to the log on completion.
     pub(super) r#gen: u64,
+    /// What stage is being shown — remembered so the configure handler
+    /// can pick the right buffer-attachment strategy (single-pixel black
+    /// vs shm pool for screensaver).
+    pub(super) kind: StageKind,
+    /// Optional screensaver payload (only set for `RenderScreensaver`).
+    pub(super) screensaver: Option<ScreensaverSettings>,
     /// The layer surface created by the Show command (still in
     /// pre-configure state — no buffer attached yet).
     pub(super) layer_surface: LayerSurface,
     /// Reply channel — resolved by the configure handler or the timer.
     pub(super) reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
+}
+
+/// Active screensaver overlay — owned by the wayland thread, drives a
+/// [`MpvPlayer`] into a double-buffered shm pool and registers the mpv
+/// wakeup pipe read end as a calloop source.  The `wl_buffer`s live in
+/// the SAME `RawPool` at offsets 0 and `stride * height` so the
+/// compositor never reads the buffer mpv is currently writing.
+///
+/// Field `next_render_idx` is the index of the buffer we'll render
+/// into on the next mpv wakeup — after each render we attach the
+/// written buffer to the surface and flip the index.
+pub(super) struct ScreensaverSession {
+    pub(super) player: MpvPlayer,
+    /// Owned single `RawPool` covering both buffers (`2 * stride * height` bytes).
+    pub(super) pool: smithay_client_toolkit::shm::raw::RawPool,
+    /// `buffers[0]` lives at offset 0, `buffers[1]` at offset `stride * height`.
+    pub(super) buffers: [WlBuffer; 2],
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) stride: u32,
+    pub(super) next_render_idx: usize,
+    /// Read end of the mpv wakeup pipe — owned by the session and
+    /// closed when the session is dropped (calloop doesn't close the
+    /// fd when a source is removed).  The matching write end lives
+    /// inside the `MpvPlayer`.
+    pub(super) read_fd: RawFd,
 }
 
 /// All Wayland-side state owned by the dedicated thread.  Holds every
@@ -158,6 +271,28 @@ pub(super) struct WaylandState {
     /// arrives (every sender has dropped).  [`crate::linux::connection::run_loop`]
     /// polls this between dispatch ticks and exits cleanly when true.
     pub(super) loop_should_exit: Arc<AtomicBool>,
+
+    // ── Screensaver session (RenderScreensaver stage) ─────────────────────
+    /// Active screensaver overlay — `Some` while a screensaver surface is
+    /// live.  Owns the [`MpvPlayer`], the double-buffered shm pool, and
+    /// (via the `screensaver_wakeup_token` below) the calloop registration
+    /// of the mpv wakeup pipe read end.
+    pub(super) screensaver_session: Option<ScreensaverSession>,
+
+    /// calloop `RegistrationToken` for the mpv wakeup pipe read end —
+    /// used to unregister the Generic source when the screensaver
+    /// session is torn down (calloop's `Generic::drop` does NOT
+    /// unregister; the caller must explicitly `loop_handle.remove(token)`).
+    pub(super) screensaver_wakeup_token: Option<calloop::RegistrationToken>,
+
+    // ── Loop handle (kept on state so screensaver install can register
+    //    its wakeup source mid-flight) ─────────────────────────────────
+    /// Clone of the loop's `LoopHandle` — cheap to clone (`Rc` inside),
+    /// stable for the loop's lifetime.  Needed so the screensaver
+    /// install path (called from inside the configure handler) can
+    /// `insert_source` for the mpv wakeup pipe.
+    #[allow(dead_code)] // installed + consumed inside complete_screensaver_show
+    pub(super) loop_handle: Option<calloop::LoopHandle<'static, WaylandState>>,
 }
 
 impl WaylandState {
@@ -203,7 +338,20 @@ impl WaylandState {
             input_latch,
             queue_handle,
             loop_should_exit,
+            screensaver_session: None,
+            screensaver_wakeup_token: None,
+            loop_handle: None,
         }
+    }
+
+    /// Inject the loop handle (called from `connection::init` after the
+    /// `EventLoop` is built).  Must be called exactly once before any
+    /// screensaver install.
+    pub(super) fn install_loop_handle(
+        &mut self,
+        handle: calloop::LoopHandle<'static, WaylandState>,
+    ) {
+        self.loop_handle = Some(handle);
     }
 
     /// Resolve any in-flight pending show with `Err`.  Used by teardown,
@@ -292,6 +440,30 @@ impl WaylandState {
             return;
         };
 
+        // Screensaver Show: build the player + shm pool, install the
+        // wakeup pipe as a calloop source, and commit the back buffer.
+        // On any pre-first-frame failure here, the show resolves as Err
+        // and the engine falls through (the surface was just created so
+        // there's nothing to revert to).
+        if pending.kind == StageKind::RenderScreensaver {
+            let Some(settings) = pending.screensaver else {
+                let _ = pending.reply.send(Err(CmdFailure {
+                    controller: "render-screensaver".into(),
+                    error: format!("{E_RENDER_UNAVAILABLE}: screensaver show without settings"),
+                }));
+                return;
+            };
+            match self.complete_screensaver_show(pending.layer_surface, configured_size, settings) {
+                Ok(()) => {
+                    let _ = pending.reply.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = pending.reply.send(Err(e));
+                }
+            }
+            return;
+        }
+
         // Attach the buffer now that we know the configured size.
         let (buffer, viewport): (WlBuffer, Option<WpViewport>) =
             match (&self.single_pixel_manager, &self.viewporter) {
@@ -347,6 +519,263 @@ impl WaylandState {
         let _ = pending.reply.send(Ok(()));
     }
 
+    /// Screensaver Show: assemble the [`MpvPlayer`], build a double-
+    /// buffered shm pool, register the mpv wakeup pipe as a calloop
+    /// source, and attach + commit the first back buffer.  On failure
+    /// at this stage (mpv init / pipe2 / shm pool), returns
+    /// `Err(CmdFailure)` — the caller resolves the pending show with it.
+    fn complete_screensaver_show(
+        &mut self,
+        layer_surface: LayerSurface,
+        configured_size: (u32, u32),
+        settings: ScreensaverSettings,
+    ) -> Result<(), CmdFailure> {
+        // Tear down any pre-existing screensaver session (the dispatcher
+        // shouldn't reach here twice without a teardown in between, but
+        // be defensive: e.g. the same surface inherited a stale mpv
+        // player from a prior show that wasn't fully cleaned up).
+        self.destroy_screensaver_session();
+
+        let width = configured_size.0;
+        let height = configured_size.1;
+        let stride = width
+            .checked_mul(4)
+            .ok_or_else(|| cmd_failure("screensaver", "stride overflow"))?;
+
+        // ── mpv wakeup pipe ─────────────────────────────────────────
+        // The write fd is consumed by the player; the read fd is owned
+        // by `self` and registered as a calloop source below.
+        let (read_fd, write_fd) = make_wakeup_pipe()?;
+
+        // ── mpv player ──────────────────────────────────────────────
+        let player = MpvPlayer::new(
+            settings.items,
+            settings.image_duration,
+            settings.audio,
+            width,
+            height,
+            write_fd,
+        )
+        .map_err(|e| {
+            // SAFETY: pipe was created; close both ends on early failure.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            cmd_failure("screensaver", &format!("{e}"))
+        })?;
+
+        // ── double-buffered shm pool ────────────────────────────────
+        let pool_byte_len = (stride as usize)
+            .checked_mul(height as usize)
+            .and_then(|x| x.checked_mul(2))
+            .ok_or_else(|| cmd_failure("screensaver", "shm pool size overflow"))?;
+        let mut pool =
+            smithay_client_toolkit::shm::raw::RawPool::new(pool_byte_len, &self.shm_state)
+                .map_err(|e| cmd_failure("screensaver", &format!("RawPool::new: {e}")))?;
+        let qh = self.queue_handle.clone();
+        let (buf0, buf1) = create_dual_buffers(&mut pool, &qh, width, height, stride);
+
+        // Attach the first back buffer (all zeros — i.e. opaque black
+        // since the format is XRGB8888 byte-order) and commit.  mpv's
+        // first wakeup will follow shortly and overwrite it.
+        let wl_surface = layer_surface.wl_surface();
+        wl_surface.attach(Some(&buf0), 0, 0);
+        wl_surface.damage_buffer(0, 0, width.cast_signed(), height.cast_signed());
+        wl_surface.commit();
+
+        // ── calloop wakeup source ───────────────────────────────────
+        // SAFETY: read_fd was created by `make_wakeup_pipe` above; we
+        // own it until `destroy_screensaver_session` closes it.
+        let borrowed_read_fd = unsafe { BorrowedFd::borrow_raw(read_fd) };
+        let source = Generic::new(borrowed_read_fd, Interest::READ, Mode::Level);
+
+        let Some(loop_handle) = self.loop_handle.as_ref() else {
+            // SAFETY: pipe was created; close both ends on early failure.
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+            return Err(cmd_failure(
+                "screensaver",
+                "loop handle not installed on state",
+            ));
+        };
+        let token = match loop_handle.insert_source(source, screensaver_wakeup_cb) {
+            Ok(t) => t,
+            Err(e) => {
+                // SAFETY: pipe was created; close both ends on early failure.
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+                return Err(cmd_failure("screensaver", &format!("insert_source: {e}")));
+            }
+        };
+
+        // Install the session now that the source is registered.
+        self.screensaver_session = Some(ScreensaverSession {
+            player,
+            pool,
+            buffers: [buf0, buf1],
+            width,
+            height,
+            stride,
+            next_render_idx: 1,
+            read_fd,
+        });
+        // The wakeup slot holds the token so we can later remove the
+        // source via `loop_handle.remove(token)` from
+        // `destroy_screensaver_session`.  (Storing the Generic itself
+        // works for Drop — calloop's Generic::drop doesn't unregister,
+        // so we need the explicit token-based remove.)
+        self.screensaver_wakeup_token = Some(token);
+        self.layer_surface = Some(layer_surface);
+        self.configured_size = configured_size;
+        self.surface_up = true;
+
+        tracing::info!(
+            event = "render_screensaver_up",
+            display_id = %self.display_id,
+            output = %self.output_name,
+            width,
+            height,
+        );
+        Ok(())
+    }
+
+    /// mpv wakeup callback: drain the pipe, render one frame into the
+    /// back buffer, attach + damage + commit, swap indices.  Called
+    /// from the calloop thread when the Generic source signals.
+    fn on_mpv_wakeup(&mut self) {
+        let Some(session) = self.screensaver_session.as_mut() else {
+            return;
+        };
+
+        // Drain the pipe (non-blocking; multiple wakeups may have queued).
+        let mut drain_buf = [0u8; 256];
+        loop {
+            // SAFETY: kernel writes to the buffer; partial reads are fine
+            // for non-blocking pipes.
+            let n = unsafe {
+                libc::read(
+                    session.read_fd,
+                    drain_buf.as_mut_ptr().cast(),
+                    drain_buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+        }
+
+        // Render into the back buffer.
+        let back_idx = session.next_render_idx;
+        let stride = session.stride as usize;
+        let buf_len = stride * (session.height as usize);
+        let back_offset = back_idx * buf_len;
+        {
+            let mmap = session.pool.mmap();
+            // SAFETY: the offset is within the pool (we built it with
+            // 2 * stride * height bytes) and the slice length matches.
+            let back_slice = unsafe {
+                std::slice::from_raw_parts_mut(mmap.as_ptr().cast_mut().add(back_offset), buf_len)
+            };
+            // Zero the back buffer first so leftover content from a prior
+            // pass doesn't bleed into partially-written mpv output.
+            back_slice.fill(0);
+            if let Err(e) = session.player.render_frame_into(back_slice) {
+                self.fail_screensaver_to_black(&format!("{e}"));
+                return;
+            }
+        }
+
+        // Attach + damage + commit.
+        let wl_surface = match &self.layer_surface {
+            Some(s) => s.wl_surface().clone(),
+            None => return,
+        };
+        wl_surface.attach(Some(&session.buffers[back_idx]), 0, 0);
+        wl_surface.damage_buffer(
+            0,
+            0,
+            session.width.cast_signed(),
+            session.height.cast_signed(),
+        );
+        wl_surface.commit();
+
+        // Swap so the next render writes to the buffer the compositor
+        // has finished with.
+        session.next_render_idx = 1 - back_idx;
+    }
+
+    /// Post-first-frame failure: tear down the session, fall back to
+    /// the opaque-black buffer on the SAME surface, and log.
+    fn fail_screensaver_to_black(&mut self, reason: &str) {
+        tracing::warn!(
+            event = "screensaver_failed_to_black",
+            display_id = %self.display_id,
+            reason = reason,
+        );
+        // Destroy the session first — frees the mpv player + the shm pool
+        // and removes the wakeup source.
+        self.destroy_screensaver_session();
+
+        // Re-attach the existing black buffer (if any) and commit.
+        if let (Some(surface), Some(black)) = (&self.layer_surface, &self.black_buffer) {
+            let wl_surface = surface.wl_surface();
+            wl_surface.attach(Some(black), 0, 0);
+            wl_surface.commit();
+        }
+    }
+
+    /// Tear down the active screensaver session (if any).  Drops the
+    /// `MpvPlayer` (which closes the mpv wakeup write fd), drops the
+    /// shm pool (which closes the underlying `wl_shm_pool`), and removes
+    /// the wakeup calloop source (which closes the pipe read fd).
+    fn destroy_screensaver_session(&mut self) {
+        // Remove the calloop source FIRST so no further callbacks fire
+        // against a session that's about to be dropped.
+        if let (Some(token), Some(handle)) = (
+            self.screensaver_wakeup_token.take(),
+            self.loop_handle.as_ref(),
+        ) {
+            // `remove` on calloop's LoopHandle takes the source by
+            // value (drops it) — we can't do that without owning the
+            // source.  Instead, disable the source by removing its
+            // registration token.  The Generic itself is stored on
+            // the session so its Drop runs on session destroy.
+            handle.remove(token);
+        }
+        // Then drop the session — its Drop closes the read fd (the pipe
+        // half not owned by mpv), the player closes the write fd, and the
+        // pool destroys the wl_shm_pool.
+        if let Some(session) = self.screensaver_session.take() {
+            let ScreensaverSession {
+                player,
+                read_fd,
+                pool,
+                buffers,
+                width: _,
+                height: _,
+                stride: _,
+                next_render_idx: _,
+            } = session;
+            // player.destroy() unregisters the mpv wakeup callback and
+            // closes the write fd.
+            player.destroy();
+            // SAFETY: read_fd was created via pipe2 and is owned by the
+            // session; closing once here after the player destroy.
+            unsafe {
+                libc::close(read_fd);
+            }
+            // pool + buffers drop here; RawPool's Drop destroys the
+            // wl_shm_pool, which in turn releases the WlBuffers.
+            drop(pool);
+            drop(buffers);
+        }
+    }
+
     /// Locate the target output by connector name (called after the
     /// initial roundtrip has populated output info).
     pub(super) fn locate_target_output(&mut self) -> Result<(), CmdFailure> {
@@ -371,6 +800,10 @@ impl WaylandState {
     /// pending show with a soft error — the daemon may legitimately
     /// teardown before configure arrives.
     pub(super) fn destroy_surface(&mut self) {
+        // Destroy any active screensaver session first — frees mpv + shm.
+        // If we destroy the surface without this, the player keeps running
+        // and the wakeup pipe keeps firing on a dead surface.
+        self.destroy_screensaver_session();
         if let Some(pending) = self.pending_show.take() {
             let _ = pending.reply.send(Err(CmdFailure {
                 controller: "render-black".into(),
@@ -413,6 +846,13 @@ impl WaylandState {
                 reply,
             } => self.handle_show(r#gen, idx, kind, reply),
             RenderCommand::Teardown { r#gen, reply } => self.handle_teardown(r#gen, reply),
+            #[cfg(target_os = "linux")]
+            RenderCommand::ShowScreensaver {
+                r#gen,
+                idx,
+                settings,
+                reply,
+            } => self.handle_show_screensaver(r#gen, idx, settings, reply),
         }
     }
 
@@ -453,6 +893,8 @@ impl WaylandState {
                 );
                 self.pending_show = Some(PendingShow {
                     r#gen,
+                    kind: StageKind::RenderBlack,
+                    screensaver: None,
                     layer_surface,
                     reply,
                 });
@@ -482,6 +924,63 @@ impl WaylandState {
         if let (Some(display_id), Some(tx)) = (self.input_latch.on_input(), &self.input_wake_tx) {
             let _ = tx.send(display_id);
         }
+    }
+
+    /// `ShowScreensaver` command entry — build (or reuse) the layer
+    /// surface, package a `PendingShow { kind: RenderScreensaver, ... }`,
+    /// and commit.  The actual screensaver install happens in
+    /// [`Self::complete_pending_show`] once the compositor configures
+    /// the surface.
+    fn handle_show_screensaver(
+        &mut self,
+        r#gen: u64,
+        _idx: usize,
+        settings: ScreensaverSettings,
+        reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
+    ) {
+        self.input_latch.reset();
+
+        let Some(target_output) = self.target_output.clone() else {
+            let _ = reply.send(Err(cmd_failure(
+                "render-screensaver",
+                "no target output bound",
+            )));
+            return;
+        };
+
+        // If the surface is already configured + live (from a prior
+        // black stage), install the screensaver directly on it.  This
+        // is the "adjacent render stages swap CONTENT, no destroy /
+        // flicker" path described in the design phase.
+        if let Some(existing) = &self.layer_surface
+            && self.surface_up
+        {
+            match self.complete_screensaver_show(existing.clone(), self.configured_size, settings) {
+                Ok(()) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+            return;
+        }
+
+        // No surface up yet (or not configured) — create one and go
+        // through the pending-show → configure → install flow.
+        let layer_surface = crate::linux::surface::create_layer_surface(
+            &self.layer_shell,
+            &self.compositor_state,
+            &target_output,
+            self,
+        );
+        self.pending_show = Some(PendingShow {
+            r#gen,
+            kind: StageKind::RenderScreensaver,
+            screensaver: Some(settings),
+            layer_surface,
+            reply,
+        });
     }
 }
 

@@ -12,6 +12,7 @@ dormant-core = { path = "../dormant-core" }
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
+libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # smithay-client-toolkit brings in the calloop / Wayland / shm helpers used
@@ -37,3 +38,10 @@ calloop = "0.14"
 # between commands.  This is the canonical safe shape for a Wayland client
 # inside a calloop-driven thread.
 calloop-wayland-source = "0.4.1"
+# libmpv screensaver overlay — see `src/screensaver.rs` for the sandbox
+# flag rationale.  libmpv2-sys is the raw binding (used for the SW render
+# params); libmpv2 is the safe handle wrapper.  `render` feature is
+# required because we use `mpv_render_context_*` and the SW format
+# constants.
+libmpv2 = { version = "6.0.0", features = ["render"] }
+libmpv2-sys = "4.0.1"

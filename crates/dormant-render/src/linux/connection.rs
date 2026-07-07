@@ -344,7 +344,7 @@ fn arm_configure_timer(
 
 /// Arm the screensaver first-frame deadline timer.  If no successful
 /// `on_mpv_wakeup` render lands within
-/// [`crate::screensaver::FIRST_FRAME_DEADLINE`], the timer's callback
+/// [`crate::settings::FIRST_FRAME_DEADLINE`], the timer's callback
 /// fails the pending show reply with `Err(E_RENDER_UNAVAILABLE)` and
 /// tears the session down — the engine falls through to the next
 /// ladder stage.  Returned [`calloop::RegistrationToken`] is stored on
@@ -356,7 +356,7 @@ pub(super) fn arm_screensaver_first_frame_timer(
     r#gen: u64,
 ) -> Result<calloop::RegistrationToken, calloop::InsertError<Timer>> {
     let display_id = display_id.clone();
-    let timer = Timer::from_duration(crate::screensaver::FIRST_FRAME_DEADLINE);
+    let timer = Timer::from_duration(crate::settings::FIRST_FRAME_DEADLINE);
     handle.insert_source(
         timer,
         move |_event, _meta: &mut (), state: &mut WaylandState| {

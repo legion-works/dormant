@@ -11,7 +11,7 @@
 use dormant_core::types::{CmdFailure, StageKind};
 
 #[cfg(target_os = "linux")]
-use crate::screensaver::ScreensaverSettings;
+use crate::settings::ScreensaverSettings;
 
 /// A command sent from the async engine task to the dedicated Wayland
 /// thread via a [`calloop::channel`].

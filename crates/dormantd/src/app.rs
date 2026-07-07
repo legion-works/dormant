@@ -92,6 +92,7 @@ type RenderSinkBuilder = Arc<
             DisplayId,
             String,
             Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+            Option<&dormant_render::ScreensaverSettings>,
         ) -> Option<Arc<dyn RenderSink>>
         + Send
         + Sync,
@@ -250,9 +251,10 @@ impl App {
     ///
     /// When set, `assemble_static` calls this factory instead of
     /// building [`LayerShellRenderSink`] directly.  The factory receives
-    /// the display id, output connector name, and an optional
-    /// `UnboundedSender<DisplayId>` (the `InputWake` channel); return
-    /// `None` to skip the sink (fall-through).
+    /// the display id, output connector name, an optional
+    /// `UnboundedSender<DisplayId>` (the `InputWake` channel), and an
+    /// optional [`ScreensaverSettings`]; return `None` to skip the sink
+    /// (fall-through).
     #[cfg(feature = "render")]
     #[must_use]
     pub fn with_render_sink_builder<F>(mut self, factory: F) -> Self
@@ -261,6 +263,7 @@ impl App {
                 DisplayId,
                 String,
                 Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+                Option<&dormant_render::ScreensaverSettings>,
             ) -> Option<Arc<dyn RenderSink>>
             + Send
             + Sync
@@ -1164,6 +1167,12 @@ fn activity_rules(cfg: &Config) -> (Vec<ActivityRule>, Option<Duration>) {
 ///
 /// Called from both [`assemble_static`] (fresh config) and [`rebuild_old`]
 /// (rejected-reload rollback) so every generation gets live `InputWake` routing.
+///
+/// ## Screensaver playlist assembly
+///
+/// The playlist is built at assembly time (startup/reload), not per-show —
+/// this keeps FS scanning off the wayland thread and matches the generation
+/// model where a config reload rebuilds it.  Fresh-per-show is future work.
 #[cfg(feature = "render")]
 fn build_render_sinks(
     cfg: &Config,
@@ -1172,6 +1181,9 @@ fn build_render_sinks(
     HashMap<DisplayId, Arc<dyn RenderSink>>,
     tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
 ) {
+    use dormant_render::ScreensaverSettings;
+    use dormant_render::playlist;
+
     let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
     let (input_wake_tx, input_wake_rx) = tokio::sync::mpsc::unbounded_channel::<DisplayId>();
 
@@ -1181,16 +1193,46 @@ fn build_render_sinks(
         if !ladder.iter().any(|s| s.kind.is_render()) {
             continue;
         }
+
+        // Build ScreensaverSettings at assembly time so FS scanning
+        // stays off the wayland thread.
+        let screensaver_settings: Option<ScreensaverSettings> = if ladder
+            .iter()
+            .any(|s| s.kind == dormant_core::types::StageKind::RenderScreensaver)
+        {
+            dc.screensaver.as_ref().map(|ss| {
+                let items = playlist::build_playlist(&ss.source, None);
+                ScreensaverSettings {
+                    items,
+                    image_duration: ScreensaverSettings::default().image_duration,
+                    audio: ss.audio,
+                }
+            })
+        } else {
+            None
+        };
+
         if let Some(output_name) = &dc.output {
+            let ss_ref = screensaver_settings.as_ref();
             let sink: Option<Arc<dyn RenderSink>> = if let Some(builder) = render_sink_builder {
-                (builder)(did.clone(), output_name.clone(), Some(&input_wake_tx))
+                (builder)(
+                    did.clone(),
+                    output_name.clone(),
+                    Some(&input_wake_tx),
+                    ss_ref,
+                )
             } else {
                 match LayerShellRenderSink::new(
                     did.clone(),
                     output_name.clone(),
                     Some(&input_wake_tx),
                 ) {
-                    Ok(sink) => Some(Arc::new(sink)),
+                    Ok(sink) => {
+                        if let Some(ref settings) = screensaver_settings {
+                            sink.set_screensaver(settings.clone());
+                        }
+                        Some(Arc::new(sink))
+                    }
                     Err(e) => {
                         tracing::warn!(
                             event = "render_sink_build_failed",
@@ -1582,7 +1624,7 @@ mod render_tests {
 
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx| {
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, _ss| {
             Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
         });
 

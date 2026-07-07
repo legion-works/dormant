@@ -44,6 +44,7 @@ mod command;
 mod latch;
 
 pub mod playlist;
+pub mod settings;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -55,10 +56,9 @@ mod stub;
 
 // Re-export the screensaver settings type so the daemon can build one
 // from a `dormant_core::config::ScreensaverConfig` and pass it into
-// the sink.  Only available on Linux — non-Linux builds never have a
-// compositor to display on, and the stub sink can't show anything.
-#[cfg(target_os = "linux")]
-pub use screensaver::ScreensaverSettings;
+// the sink.  Available on all platforms — the stub sink just ignores
+// the settings.
+pub use settings::ScreensaverSettings;
 
 // Linux uses the real Wayland backend; non-Linux uses the stub.  Both
 // expose a `LayerShellRenderSink` with the same surface so consumers

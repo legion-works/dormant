@@ -20,7 +20,7 @@ use dormant_core::traits::RenderSink;
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 use crate::command::RenderCommand;
-use crate::screensaver::ScreensaverSettings;
+use crate::settings::ScreensaverSettings;
 
 /// Per-display handle that ships [`RenderSink`] commands across the
 /// async-tokio → sync-calloop boundary to a dedicated wayland thread.

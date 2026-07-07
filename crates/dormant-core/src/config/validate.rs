@@ -579,6 +579,18 @@ fn validate_display(
         }
 
         // Feature-gate check.
+        // Output required for render stages: a wayland layer-shell overlay
+        // needs a wl_output connector name.
+        if dc.output.is_none() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' has a render stage but no 'output' field — \
+                     render stages need the wl_output connector (e.g. output = \"DP-1\")"
+                ),
+            });
+        }
+
         #[cfg(not(feature = "render"))]
         {
             errors.push(ValidationError {
@@ -1644,6 +1656,7 @@ kind = "power_off"
 config_version = 1
 [displays.d]
 controllers = ["ddcci"]
+output = "DP-1"
 [[displays.d.ladder]]
 kind = "render_black"
 dwell = "5s"
@@ -1809,6 +1822,7 @@ bogus = true
 config_version = 1
 [displays.d]
 controllers = ["ddcci"]
+output = "DP-1"
 [[displays.d.ladder]]
 kind = "render_screensaver"
 [displays.d.screensaver]
@@ -1842,6 +1856,7 @@ path = "/tmp/pics"
 config_version = 1
 [displays.d]
 controllers = ["ddcci"]
+output = "DP-1"
 [[displays.d.ladder]]
 kind = "render_screensaver"
 [displays.d.screensaver]
@@ -1871,6 +1886,7 @@ kind = "render_screensaver"
 config_version = 1
 [displays.d]
 controllers = ["ddcci"]
+output = "DP-1"
 [[displays.d.ladder]]
 kind = "render_screensaver"
 [displays.d.screensaver]
@@ -1889,6 +1905,95 @@ urls = ["https://example.com/img.jpg"]
             }),
             "expected E_SCREENSAVER_SOURCE path-urls conflict error, got: {:?}",
             errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_stage_without_output_errors() {
+        let dir = std::env::temp_dir().join("dormant-test-render-no-out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("no_output.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "render_black"
+dwell = "5s"
+[[displays.d.ladder]]
+kind = "power_off"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        let errs: Vec<_> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter().any(|e| {
+                e.contains(crate::error::E_CONFIG_INVALID)
+                    && e.contains('d')
+                    && e.contains("output")
+            }),
+            "expected E_CONFIG_INVALID output-missing error, got: {:?}",
+            errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn render_stage_with_output_validates_ok() {
+        let dir = std::env::temp_dir().join("dormant-test-render-with-out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("with_output.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_black"
+dwell = "5s"
+[[displays.d.ladder]]
+kind = "power_off"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        assert!(
+            errors.is_empty(),
+            "expected no errors on render black with output, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn controller_only_ladder_without_output_ok() {
+        let dir = std::env::temp_dir().join("dormant-test-ctl-no-out");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ctl_no_out.toml");
+        std::fs::write(
+            &path,
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[[displays.d.ladder]]
+kind = "power_off"
+"#,
+        )
+        .unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        assert!(
+            errors.is_empty(),
+            "expected no errors on controller-only ladder without output, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
     }
 

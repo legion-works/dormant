@@ -58,6 +58,8 @@ const { mocks, SAMPLE_CONFIG, SAMPLE_STATE } = vi.hoisted(() => {
       },
       validation: { ok: true, warnings: [], errors: [] },
       display_rules: {},
+      fingerprint: "abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+      redacted_paths: [],
     },
     SAMPLE_STATE: {
       sensors: [],
@@ -79,9 +81,18 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+/** Switch from the default Settings tab to the Raw TOML tab. */
+async function openRawToml() {
+  await waitFor(() => {
+    expect(screen.getByText("Raw TOML")).toBeInTheDocument();
+  });
+  fireEvent.click(screen.getByText("Raw TOML"));
+}
+
 describe("Config", () => {
   it("renders config path in the file viewer header", async () => {
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText("/home/user/.config/dormant/config.toml")).toBeInTheDocument();
@@ -90,6 +101,7 @@ describe("Config", () => {
 
   it("renders raw TOML line-by-line in the file body", async () => {
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText('[daemon]')).toBeInTheDocument();
@@ -103,6 +115,7 @@ describe("Config", () => {
 
   it("renders validation OK message when config is valid", async () => {
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText(/Configuration parsed with no unknown keys/)).toBeInTheDocument();
@@ -111,6 +124,7 @@ describe("Config", () => {
 
   it("renders parsed inventory with sensor/zone/rule counts", async () => {
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
@@ -124,6 +138,7 @@ describe("Config", () => {
 
   it("renders a reload button that calls postReload", async () => {
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText("↻ Reload config")).toBeInTheDocument();
@@ -149,6 +164,7 @@ describe("Config", () => {
     });
 
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText(/unknown_key/)).toBeInTheDocument();
@@ -174,6 +190,7 @@ describe("Config", () => {
     });
 
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText(/sensors.old-pir.topic/)).toBeInTheDocument();
@@ -197,6 +214,7 @@ describe("Config", () => {
     });
 
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText(/TOML parse error/)).toBeInTheDocument();
@@ -212,6 +230,7 @@ describe("Config", () => {
     });
 
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText(/Config reload pending — validating new config…/)).toBeInTheDocument();
@@ -225,6 +244,7 @@ describe("Config", () => {
     });
 
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText(/Config source: on_disk \(not yet applied\)/)).toBeInTheDocument();
@@ -234,6 +254,7 @@ describe("Config", () => {
 
   it("renders ladder and screensaver summary when displays have them configured", async () => {
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText("Ladder & Screensaver")).toBeInTheDocument();
@@ -263,6 +284,7 @@ describe("Config", () => {
     });
 
     render(<Config />);
+    await openRawToml();
 
     await waitFor(() => {
       expect(screen.getByText("Parsed inventory")).toBeInTheDocument();

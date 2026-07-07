@@ -15,6 +15,7 @@
 //! compiled and the daemon binary is byte-identical to M1.
 
 mod assets;
+mod config_patch;
 mod error;
 mod routes;
 mod security;
@@ -43,6 +44,11 @@ pub async fn spawn(
     bind: SocketAddr,
     state: WebState,
 ) -> std::io::Result<(JoinHandle<()>, SocketAddr)> {
+    // ── Startup hygiene: prune stale temp files ─────────────────────────────
+    // config.toml.tmp.* files older than 1 hour are leftovers from a
+    // previous apply that crashed before it could clean up.
+    prune_stale_temps(&state.inner.config_path);
+
     let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
 
     let handle = tokio::spawn(async move {
@@ -64,6 +70,43 @@ pub async fn spawn(
     Ok((handle, addr))
 }
 
+/// Remove `config.toml.tmp.*` files older than 1 hour from the config
+/// directory.  These are leftovers from a previous apply that crashed
+/// before it could clean up its temp file; they are safe to delete
+/// because any apply writing them is long dead.
+pub(crate) fn prune_stale_temps(config_path: &std::path::Path) {
+    let Some(dir) = config_path.parent() else {
+        return;
+    };
+
+    let Some(cutoff) =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(3600))
+    else {
+        return;
+    };
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("config.toml.tmp.") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -75,6 +118,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::{broadcast, mpsc, watch};
     use tokio_util::sync::CancellationToken;
 
@@ -130,12 +174,15 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: PathBuf::from("/dev/null"),
+            creds_path: PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 8080,
             ),
             cancel: cancel.clone(),
+            reload_timeout: Duration::from_secs(10),
         });
 
         (state, cancel)

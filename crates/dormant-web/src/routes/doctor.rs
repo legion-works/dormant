@@ -25,6 +25,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     use tokio_util::sync::CancellationToken;
 
@@ -58,9 +59,12 @@ mod tests {
             config_rx,
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
+            creds_path: std::path::PathBuf::from("/dev/null"),
+            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
+            reload_timeout: Duration::from_secs(10),
         })
     }
 

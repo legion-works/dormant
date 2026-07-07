@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dormant-tray
+GenericName=Display blanking indicator
+Comment=Status icon and pause/blank/wake controls for dormantd
+Exec=dormant-tray
+Icon=dormant
+Terminal=false
+Categories=Utility;Monitor;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

@@ -31,6 +31,21 @@ install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 
 Binaries land in `~/.local/bin/` — make sure this is on your `PATH`.
 
+### Tray applet (M3, Linux only)
+
+`dormant-tray` is a KDE `StatusNotifierItem` applet: status glance +
+pause/resume + blank/wake controls, riding the daemon's Unix socket in
+the background.
+
+```bash
+install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
+```
+
+The `Exec=` line in `dormant-tray.desktop` resolves `dormant-tray` via
+`$PATH` (no `%h` expansion in `.desktop` Exec keys) — make sure
+`~/.local/bin/` is on `PATH` for the user session, or copy the binary
+into a directory that already is.
+
 ## From release (planned)
 
 Once M1 ships, releases will include a shell installer:
@@ -90,3 +105,17 @@ Set permissions to `600` — dormant will refuse to load a credentials file read
 ```bash
 chmod 600 ~/.config/dormant/credentials.toml
 ```
+
+## Tray autostart
+
+To launch `dormant-tray` automatically on every graphical session, drop
+the bundled `.desktop` file into `~/.config/autostart/`:
+
+```bash
+cp crates/dormant-tray/assets/dormant-tray.desktop ~/.config/autostart/
+```
+
+It runs as a normal desktop application (not a D-Bus service) — the
+session manager picks it up after login. The `.desktop` file's `Exec=`
+resolves `dormant-tray` from `PATH`, so `~/.local/bin/` must be on
+`PATH` for the user session.

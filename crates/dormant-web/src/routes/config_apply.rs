@@ -342,10 +342,6 @@ mod tests {
         }
     }
 
-    /// Minimal valid TOML with a [daemon] section so daemon-key patches work.
-    #[allow(dead_code)]
-    const MINIMAL_DAEMON_TOML: &str = "config_version = 1\n[daemon]\n";
-
     /// Build a [`WebState`] suitable for testing the apply handler.
     fn test_state(config_dir: &std::path::Path, config: Config, bind_port: u16) -> WebState {
         let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<dormant_core::rules::ControlMsg>(8);
@@ -706,7 +702,7 @@ field = "/val"
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    // ── Create missing structural tables (M2) ───────────────────────────────
+    // ── Create missing structural tables ───────────────────────────────────
 
     #[tokio::test]
     async fn set_daemon_log_level_on_minimal_config_creates_table() {

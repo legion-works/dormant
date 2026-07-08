@@ -357,6 +357,28 @@ pub fn validate(
         validate_rule(rule_id, rc, &zone_names, &cfg.displays, &mut errors);
     }
 
+    // ── Cross-reference: ladder on rule-less display ───────────────────
+    // A ladder is an auto-escalation sequence that needs a rule to drive
+    // it — it could never fire without one.  A rule-less display with
+    // just blank_mode is fine (manual-only control).
+    let ruled: HashSet<&str> = cfg
+        .rules
+        .values()
+        .flat_map(|r| r.displays.iter().map(String::as_str))
+        .collect();
+    for (display_id, dc) in &cfg.displays {
+        if !dc.ladder.is_empty() && !ruled.contains(display_id.as_str()) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: format!(
+                    "display '{display_id}' has a ladder but is in no rule; a ladder is an \
+                     auto-escalation that needs a rule to drive it — use blank_mode for \
+                     manual-only control, or add a rule"
+                ),
+            });
+        }
+    }
+
     // ── Cross-field web-UI validation ───────────────────────────────────
     if !cfg.daemon.web_bind.is_loopback() && !cfg.daemon.web_allow_nonloopback {
         errors.push(ValidationError {
@@ -1024,7 +1046,7 @@ mod tests {
     use super::*;
     use crate::config::DaemonConfig;
     use crate::config::Strictness;
-    use crate::config::schema::ZoneConfig;
+    use crate::config::schema::{RuleConfig, ZoneConfig};
     use crate::types::BlankMode;
     use indexmap::IndexMap;
     use std::path::Path;
@@ -1390,6 +1412,113 @@ gracee_period = "60s"
 
     use crate::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
     use crate::types::{LadderStage, StageKind};
+
+    // ── Ladder on rule-less display ─────────────────────────────────
+
+    #[test]
+    fn validate_rejects_ladder_on_ruleless_display() {
+        let mut cfg = valid_full_config();
+        let ladder = vec![LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: Some(Duration::from_secs(5)),
+        }];
+        // Display with a ladder but NOT referenced by any rule.
+        cfg.displays.insert(
+            "orphaned".into(),
+            DisplayConfig {
+                ladder,
+                controllers: vec!["ddcci".into()],
+                ..base_display_cfg()
+            },
+        );
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let ladder_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| {
+                e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("orphaned")
+                    && e.detail.contains("ladder")
+            })
+            .collect();
+        assert_eq!(
+            ladder_errors.len(),
+            1,
+            "expected exactly one ladder-without-rule error, got: {:?}",
+            errors
+                .iter()
+                .map(|e| format!("{}: {}", e.what, e.detail))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ruleless_display_with_blank_mode() {
+        let mut cfg = valid_full_config();
+        // Display with blank_mode, empty ladder, not in any rule — valid manual-only.
+        cfg.displays.insert(
+            "manual_only".into(),
+            DisplayConfig {
+                blank_mode: Some(BlankMode::PowerOff),
+                ladder: vec![],
+                controllers: vec!["ddcci".into()],
+                ..base_display_cfg()
+            },
+        );
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let manual_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.detail.contains("manual_only") && e.detail.contains("ladder"))
+            .collect();
+        assert!(
+            manual_errors.is_empty(),
+            "expected no ladder-without-rule error for manual_only, got: {:?}",
+            manual_errors.iter().map(|e| &e.detail).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ruleful_display_with_ladder() {
+        let mut cfg = valid_full_config();
+        let ladder = vec![LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: Some(Duration::from_secs(5)),
+        }];
+        // Display with ladder AND a rule referencing it.
+        cfg.displays.insert(
+            "office_tv".into(),
+            DisplayConfig {
+                ladder,
+                controllers: vec!["ddcci".into()],
+                ..base_display_cfg()
+            },
+        );
+        cfg.rules.insert(
+            "office_tv_rule".into(),
+            RuleConfig {
+                zone: "office".into(),
+                displays: vec!["office_tv".into()],
+                grace_period: Duration::from_secs(60),
+                min_blank_time: Duration::from_secs(1),
+                min_wake_time: Duration::from_secs(1),
+                inhibitors: vec![],
+                activity_idle_threshold: Duration::from_secs(300),
+                activity_poll_interval: Duration::from_secs(5),
+                wake_retries: 3,
+                wake_retry_backoff: Duration::from_secs(1),
+                wake_retry_interval: Duration::from_secs(2),
+            },
+        );
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let tv_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.detail.contains("office_tv") && e.detail.contains("ladder"))
+            .collect();
+        assert!(
+            tv_errors.is_empty(),
+            "expected no ladder-without-rule error for office_tv, got: {:?}",
+            tv_errors.iter().map(|e| &e.detail).collect::<Vec<_>>()
+        );
+    }
 
     /// Build a render-eligible display with a `[controller, render_screensaver]`
     /// ladder and the given `scale_mode` value.  Used by the `scale_mode`
@@ -2271,6 +2400,16 @@ kind = "power_off"
             &path,
             r#"
 config_version = 1
+[sensors.s]
+type = "mqtt"
+broker_url = "tcp://mqtt.local:1883"
+topic = "sensors/test"
+[zones.z]
+mode = "any"
+members = ["s"]
+[rules.r]
+zone = "z"
+displays = ["d"]
 [displays.d]
 controllers = ["ddcci"]
 output = "DP-1"
@@ -2675,6 +2814,16 @@ image_duration = "0s"
             &path,
             r#"
 config_version = 1
+[sensors.s]
+type = "mqtt"
+broker_url = "tcp://mqtt.local:1883"
+topic = "sensors/test"
+[zones.z]
+mode = "any"
+members = ["s"]
+[rules.r]
+zone = "z"
+displays = ["d"]
 [displays.d]
 controllers = ["ddcci"]
 output = "DP-1"
@@ -2747,6 +2896,16 @@ kind = "power_off"
             &path,
             r#"
 config_version = 1
+[sensors.s]
+type = "mqtt"
+broker_url = "tcp://mqtt.local:1883"
+topic = "sensors/test"
+[zones.z]
+mode = "any"
+members = ["s"]
+[rules.r]
+zone = "z"
+displays = ["d"]
 [displays.d]
 controllers = ["ddcci"]
 output = "DP-1"
@@ -2776,6 +2935,16 @@ kind = "power_off"
             &path,
             r#"
 config_version = 1
+[sensors.s]
+type = "mqtt"
+broker_url = "tcp://mqtt.local:1883"
+topic = "sensors/test"
+[zones.z]
+mode = "any"
+members = ["s"]
+[rules.r]
+zone = "z"
+displays = ["d"]
 [displays.d]
 controllers = ["ddcci"]
 [[displays.d.ladder]]

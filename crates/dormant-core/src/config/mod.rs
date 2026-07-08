@@ -160,3 +160,200 @@ pub fn load_credentials(path: &Path) -> Result<Credentials, DormantError> {
 
     Ok(creds)
 }
+
+/// Atomically upsert a Samsung TV pairing token into `credentials.toml`.
+///
+/// Adds or replaces the entry `[samsung]."<host>" = "<token>"` while preserving
+/// every other table, key, and comment in the file. If `creds_path` does not
+/// exist, a new file is created with only the samsung entry.
+///
+/// The write is atomic (temp file in the same directory + rename) and the file
+/// is created with mode `0o600` on Unix. The temp file is cleaned up on error.
+///
+/// # Errors
+///
+/// Returns [`DormantError::ConfigInvalid`] on I/O or parse errors.
+pub fn upsert_samsung_token(
+    creds_path: &Path,
+    host: &str,
+    token: &str,
+) -> Result<(), DormantError> {
+    use std::io::Write as _;
+
+    let mut doc: toml_edit::DocumentMut = if creds_path.exists() {
+        let raw = std::fs::read_to_string(creds_path).map_err(|e| DormantError::ConfigInvalid {
+            detail: format!(
+                "cannot read credentials file '{}': {e}",
+                creds_path.display()
+            ),
+        })?;
+        raw.parse().map_err(|e| DormantError::ConfigInvalid {
+            detail: format!("credentials TOML error: {e}"),
+        })?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    // Ensure the [samsung] table is an explicit table (not inline), so
+    // dotted-IP keys are quoted correctly and the format matches what
+    // load_credentials expects.
+    if doc.get("samsung").is_none() {
+        let mut tbl = toml_edit::Table::new();
+        tbl.set_implicit(false);
+        doc["samsung"] = toml_edit::Item::Table(tbl);
+    }
+    doc["samsung"][host] = toml_edit::value(token);
+
+    let serialized = doc.to_string();
+
+    // Write to a sibling temp file in the same directory for atomic rename.
+    let dir = creds_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let tmp_path = dir.join(".credentials.toml.tmp");
+
+    let write_result = (|| -> Result<(), DormantError> {
+        // Create with 0o600 before writing secret bytes.
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|e| DormantError::ConfigInvalid {
+                    detail: format!("cannot create temp credentials file: {e}"),
+                })?
+        };
+
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot create temp credentials file: {e}"),
+            })?;
+
+        f.write_all(serialized.as_bytes())
+            .map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot write temp credentials file: {e}"),
+            })?;
+        f.flush().map_err(|e| DormantError::ConfigInvalid {
+            detail: format!("cannot flush temp credentials file: {e}"),
+        })?;
+        f.sync_all().map_err(|e| DormantError::ConfigInvalid {
+            detail: format!("cannot sync temp credentials file: {e}"),
+        })?;
+
+        Ok(())
+    })();
+
+    match write_result {
+        Ok(()) => {
+            std::fs::rename(&tmp_path, creds_path).map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot rename temp to credentials file: {e}"),
+            })?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort cleanup of the temp file.
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_creds(path: &Path) {
+        let content = r#"
+# credentials for dormant — KEEP THIS FILE 0600
+
+[mqtt."mqtt://x:1883"]
+username = "sensor1"
+password = "secret"
+
+# existing samsung tokens
+[samsung]
+"1.2.3.4" = "old"
+"#;
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn upsert_samsung_token_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("credentials.toml");
+        seed_creds(&creds_path);
+
+        upsert_samsung_token(&creds_path, "10.1.1.7", "37148082").unwrap();
+
+        let raw = std::fs::read_to_string(&creds_path).unwrap();
+        // (a) mqtt entry survives
+        assert!(raw.contains("mqtt.\"mqtt://x:1883\""), "mqtt entry removed");
+        // (b) comment survives
+        assert!(
+            raw.contains("# credentials for dormant"),
+            "header comment removed"
+        );
+        assert!(raw.contains("# existing samsung tokens"), "comment removed");
+        // (c) old samsung host survives
+        assert!(raw.contains("\"1.2.3.4\""), "old samsung host removed");
+        assert!(raw.contains("\"old\""), "old samsung token removed");
+        // (d) new host present and quoted
+        assert!(
+            raw.contains("\"10.1.1.7\""),
+            "new host not quoted — dotted IP would parse as nested table"
+        );
+        assert!(raw.contains("\"37148082\""), "new token missing");
+        // (e) re-parsing via real Credentials deser yields both samsung hosts
+        let creds: Credentials = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            creds.samsung.get("1.2.3.4").map(String::as_str),
+            Some("old")
+        );
+        assert_eq!(
+            creds.samsung.get("10.1.1.7").map(String::as_str),
+            Some("37148082")
+        );
+        // (f) file mode is 0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&creds_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "file mode is not 0600");
+        }
+    }
+
+    #[test]
+    fn upsert_samsung_token_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("credentials.toml");
+
+        upsert_samsung_token(&creds_path, "10.0.0.1", "abc123").unwrap();
+
+        let raw = std::fs::read_to_string(&creds_path).unwrap();
+        assert!(raw.contains("[samsung]"), "missing [samsung] section");
+        assert!(raw.contains("\"10.0.0.1\""), "host not quoted");
+        assert!(raw.contains("\"abc123\""), "token missing");
+
+        let creds: Credentials = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            creds.samsung.get("10.0.0.1").map(String::as_str),
+            Some("abc123")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&creds_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "file mode is not 0600");
+        }
+    }
+}

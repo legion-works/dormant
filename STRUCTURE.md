@@ -10,8 +10,10 @@ oled-proximity/
 │   ├── dormant-displays/     # Display controllers: command, ddcci, kwin-dpms, samsung-tizen, ha-passthrough + executor/registry
 │   ├── dormant-doctor/       # Offline + live coalesced hardware/connectivity probes
 │   ├── dormant-web/          # Loopback-only axum HTTP/WS bridge + SPA (webui/)
-│   ├── dormantd/             # Daemon binary: App, event loop, IPC server, inhibit-activity, reload watcher, logging
-│   └── dormantctl/           # CLI binary: status/pause/resume/blank/wake/reload/validate/watch/doctor
+│   ├── dormant-render/       # Local Wayland layer-shell render sink (black overlay + libmpv screensaver); Linux-only I/O
+│   ├── dormantd/             # Daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, logging
+│   ├── dormantctl/           # CLI binary + library re-exporting the IPC client (status/pause/resume/blank/wake/reload/validate/watch/doctor)
+│   └── dormant-tray/         # KDE StatusNotifierItem tray applet (ksni): icon, menu, tooltip, reconnecting event stream; Linux-only
 ├── docs/                     # mdBook source (src/) + built site (book/) + research notes (research/)
 ├── design/                   # Design-system assets used by the web UI
 ├── examples/                 # Reference config.toml, credentials.toml, and ESPHome sensor configs
@@ -50,13 +52,23 @@ oled-proximity/
 
 **`crates/dormantd/`**
 - Purpose: The daemon binary — wires config → sensors → zones → rules → displays, with hot reload, inhibit-activity, IPC, optional web UI.
-- Contains: `app.rs` (`App`, `AppHandle`, generation assembly + reload + teardown), `inhibit_activity.rs`, `idle_source.rs`, `ipc.rs`, `reload.rs`, `logging.rs`, `lib.rs`, `main.rs`. Also: `systemd/dormant.service` (unit file), `tests/` (`daemon_smoke.rs`, `ipc_roundtrip.rs`).
+- Contains: `app.rs` (`App`, `AppHandle`, generation assembly + reload + teardown), `inhibit_activity.rs`, `idle_source.rs`, `ipc.rs`, `single_instance.rs` (per-user-session `flock` guard — non-config-overridable), `reload.rs`, `logging.rs`, `lib.rs`, `main.rs`. Also: `systemd/dormant.service` (unit file), `tests/` (`daemon_smoke.rs`, `ipc_roundtrip.rs`, `web_config_apply.rs`).
 - Key files: `crates/dormantd/src/main.rs` (binary entry), `crates/dormantd/src/app.rs` (runtime assembly).
 
 **`crates/dormantctl/`**
-- Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor).
-- Contains: `main.rs` (clap dispatch), `client.rs` (IPC client), `cmd_blank.rs`, `cmd_doctor.rs`, `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
+- Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor). Also exposes an IPC `client` library entry for out-of-binary consumers (e.g. `dormant-tray`).
+- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs`, `cmd_doctor.rs`, `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
 - Key files: `crates/dormantctl/src/main.rs` (register new subcommands here).
+
+**`crates/dormant-render/`**
+- Purpose: Local Wayland layer-shell `RenderSink` — software-blank black overlay (final ladder fallback) and libmpv-driven screensaver overlay. Linux-only Wayland I/O; non-Linux stub exposes the same surface so `use dormant_render::LayerShellRenderSink` compiles everywhere.
+- Contains: `lib.rs` (cross-platform re-export), `command.rs` (async→sync bridge encode), `latch.rs` (T7 first-input-event latch), `playlist.rs` (screensaver item list), `settings.rs` (`ScreensaverSettings`, `ScaleMode`, `TransitionMode` — re-exported), `screensaver.rs` (Linux-only libmpv backend), `linux/` (real Wayland layer-shell impl: `blend.rs`, …), `stub.rs` (non-Linux no-op sink), `examples/`.
+- Key files: `crates/dormant-render/src/lib.rs` (entry points `LayerShellRenderSink` + `ScreensaverSettings`), `crates/dormant-render/src/settings.rs` (config-mirror types).
+
+**`crates/dormant-tray/`**
+- Purpose: KDE `StatusNotifierItem` tray applet (`ksni`). Linux-only; non-Linux bins print a notice and exit 1.
+- Contains (cross-platform): `lib.rs` (re-exports + `DEFAULT_WEB_PORT`), `state.rs` (pure icon-state derivation), `tooltip.rs` (pure tooltip build), `menu.rs` (pure menu model — testable without D-Bus), `icon.rs` (pixmap construction + runtime overlays). Linux-only: `tray.rs` (ksni `Tray` impl), `ipc_loop.rs` (reconnecting event-stream reader). `assets/` (SVG glyphs), `systemd/` (`dormant-tray.service` user unit), `build.rs` (compile-time SVG → PNG embedding), `tests/` (`event_pump_shutdown.rs`, `ipc_roundtrip.rs`).
+- Key files: `crates/dormant-tray/src/main.rs` (binary entry — gates on `target_os = "linux"`), `crates/dormant-tray/src/state.rs` (testable pure logic), `crates/dormant-tray/src/lib.rs` (module surface + `DEFAULT_WEB_PORT`).
 
 ## Key File Locations
 
@@ -64,7 +76,9 @@ oled-proximity/
 **Entry points:**
 - `crates/dormantd/src/main.rs` — daemon binary entry.
 - `crates/dormantctl/src/main.rs` — CLI binary entry.
+- `crates/dormantctl/src/lib.rs` — library entry; re-exports the IPC `client` module so `dormant-tray` (or any out-of-process consumer) drives the same protocol.
 - `crates/dormant-web/src/lib.rs` — `spawn(bind, state) → JoinHandle` — daemon calls this when `web-ui` is enabled.
+- `crates/dormant-tray/src/main.rs` — tray binary entry (Linux-only; non-Linux prints a notice and exits 1).
 
 **Configuration:**
 - `crates/dormant-core/src/config/schema.rs` — TOML-mirroring structs (`Config`, `DaemonConfig`, `SensorConfig`, `DisplayConfig`, `RuleConfig`, `Credentials`, …).
@@ -79,7 +93,10 @@ oled-proximity/
 **Sensor source registry:** `crates/dormant-sensors/src/registry.rs`.
 **Display controller registry:** `crates/dormant-displays/src/registry.rs`.
 **Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,usb}.rs`.
-**Web routes:** `crates/dormant-web/src/routes/{command,config,doctor,events}.rs`.
+**Web routes:** `crates/dormant-web/src/routes/{command,config,config_apply,doctor,events}.rs`.
+**Web config-patch module:** `crates/dormant-web/src/config_patch.rs` — pure patch hygiene / allowlist / `toml_edit` application; the `config_apply.rs` route is the only consumer.
+**Render entry:** `crates/dormant-render/src/lib.rs` (re-exports `LayerShellRenderSink` + `ScreensaverSettings`).
+**Tray entry:** `crates/dormant-tray/src/main.rs` (binary) and `crates/dormant-tray/src/lib.rs` (library surface).
 **Tests:**
 - Co-located `#[cfg(test)] mod tests` in every source file.
 - Integration tests: `crates/dormant-core/tests/`, `crates/dormant-sensors/tests/`, `crates/dormantd/tests/`, `crates/dormant-web/webui/src/__tests__/`.
@@ -114,6 +131,10 @@ oled-proximity/
 **New web route:** Create `crates/dormant-web/src/routes/<name>.rs`, mount in `crates/dormant-web/src/routes/mod.rs`, register in the router at `crates/dormant-web/src/server.rs`. SPA view goes under `crates/dormant-web/webui/src/app/views/` with a matching route in `App.tsx`.
 
 **New CLI subcommand:** Add `cmd_<name>.rs` (or co-locate with a sibling in an existing `cmd_*.rs`), declare the variant in `crates/dormantctl/src/main.rs` (`enum Command`), and dispatch it in the same file's `fn main`.
+
+**New tray state/menu piece:** Add a pure-logic module under `crates/dormant-tray/src/<name>.rs` (derive icon state, build tooltip, model menu) so it can be unit-tested without a D-Bus session bus. Wire the Linux-only glue into `crates/dormant-tray/src/tray.rs` and `crates/dormant-tray/src/ipc_loop.rs`. Add new SVG glyphs to `crates/dormant-tray/assets/glyphs/` — `build.rs` embeds them at compile time.
+
+**New render ladder stage:** Add the shared pure logic to `crates/dormant-render/src/<module>.rs` (so it compiles on every platform), implement the Linux-only Wayland glue under `crates/dormant-render/src/linux/`, and update the non-Linux stub at `crates/dormant-render/src/stub.rs` to keep the unconditional `use dormant_render::…` working.
 
 **New web SPA component:** `crates/dormant-web/webui/src/app/components/<Name>.tsx` (pure) or `crates/dormant-web/webui/src/app/views/<View>.tsx` (routed). Hooks go in `crates/dormant-web/webui/src/app/hooks/`. Tests co-locate as `__tests__/<Name>.test.tsx`.
 

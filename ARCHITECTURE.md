@@ -11,8 +11,10 @@ Crate map, data flow, and where-to-find-it guide for the dormant codebase.
 | `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), VCP operations (`vcp_ops.rs`), Home Assistant passthrough (`ha_passthrough.rs`), execution engine with fallback/retry (`executor.rs`), static registry | No |
 | `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI; live coalesced `DoctorService` for the daemon + web UI. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
 | `dormant-web` | Loopback-only web dashboard: axum HTTP/WS bridge that reads live engine state and serves a SPA (`crates/dormant-web/webui/`). Optional dependency of `dormantd`, gated behind the `web-ui` Cargo feature — when off, zero web code is compiled | No |
-| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, reload handling, optional web UI spawn, logging | **Yes** — `dormantd` |
-| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `doctor` subcommands | **Yes** — `dormantctl` |
+| `dormant-render` | Local Wayland layer-shell `RenderSink`: software-blank black overlay (final ladder fallback when every display controller failed) and libmpv-driven screensaver overlay (last-resort idle surface). Wayland I/O is `target_os = "linux"`-gated; non-Linux builds expose a no-op stub with the same `LayerShellRenderSink` surface so callers compile unconditionally | No |
+| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, single-instance flock, reload handling, optional web UI spawn, logging | **Yes** — `dormantd` |
+| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `doctor` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
+| `dormant-tray` | KDE `StatusNotifierItem` tray applet (`ksni`): live icon (Normal / Attention / Paused / Unreachable), pause/resume/blank/wake menu items, tooltip, reconnecting IPC event-stream reader. Linux-only — non-Linux bin prints a notice and exits 1 so cross-platform `cargo check` stays green | **Yes** — `dormant-tray` |
 
 Each crate follows the convention: one module per concept, one file per sensor/controller, explicit static registry with no proc-macro magic.
 
@@ -60,6 +62,9 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 | Wire doctor into the daemon | `dormantd/src/app.rs` (construct one `DoctorService` shared by IPC + web UI) + `dormant-doctor/src/service.rs` (coalesced singleflight logic) |
 | Add a web route | `dormant-web/src/routes/<name>.rs` (new module) + `dormant-web/src/routes/mod.rs` (mount) + `dormant-web/src/server.rs` (router) |
 | Add a CLI subcommand | `dormantctl/src/cmd_<name>.rs` (new file) + register variant + dispatch in `dormantctl/src/main.rs`. Short commands that share a handler (e.g. `pause`+`resume`, `blank`+`wake`) co-locate in one `cmd_*.rs` |
+| Add a render ladder stage | `dormant-render/src/<module>.rs` (shared pure logic — `command`, `latch`, `settings`, `playlist`) + `dormant-render/src/linux/<impl>.rs` for the Wayland implementation (Linux-only). The cross-platform `LayerShellRenderSink` re-export is in `dormant-render/src/lib.rs` |
+| Add a tray menu/state piece | `dormant-tray/src/<module>.rs` (pure logic — `state`, `tooltip`, `menu`, `icon`; unit-tested without D-Bus); Linux-only glue lives in `dormant-tray/src/tray.rs` and `dormant-tray/src/ipc_loop.rs` |
+| Drive the daemon from another binary | Reuse `dormantctl::client` (re-exported via `crates/dormantctl/src/lib.rs`) — `dormant-tray` is the canonical example |
 
 ## Event and error-code grep anchors
 

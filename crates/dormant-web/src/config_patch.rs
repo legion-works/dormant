@@ -913,6 +913,29 @@ grace_period = "30s"
         check_ok(&[set(&["daemon", "web_port"], json!(8080))], &cur, &[]);
     }
 
+    #[test]
+    fn daemon_new_enum_and_duration_fields_accepted() {
+        let cur = minimal_config();
+        // idle_time_unit — enum (auto/ms/s), added to known-keys tree at daemon level.
+        check_ok(
+            &[set(&["daemon", "idle_time_unit"], json!("ms"))],
+            &cur,
+            &[],
+        );
+        // idle_source — enum (auto/wayland/dbus), also at daemon level.
+        check_ok(
+            &[set(&["daemon", "idle_source"], json!("wayland"))],
+            &cur,
+            &[],
+        );
+        // stale_sensor_timeout — duration, already in known-keys tree.
+        check_ok(
+            &[set(&["daemon", "stale_sensor_timeout"], json!("600s"))],
+            &cur,
+            &[],
+        );
+    }
+
     // ==================================================================
     // 3. Editable-subset tests
     // ==================================================================
@@ -991,6 +1014,23 @@ grace_period = "30s"
                 "0",
                 "order",
             ])],
+            &cur,
+            &[],
+        );
+    }
+
+    #[test]
+    fn set_order_sequential_accepted() {
+        let cur = minimal_config();
+        // Only "sequential" is valid per validate.rs — the form must not offer
+        // "random" or "shuffle_playlist".  This test asserts the offered option
+        // passes the structural patch pipeline (value validation happens at
+        // daemon reload, not here).
+        check_ok(
+            &[set(
+                &["displays", "tv", "screensaver", "source", "0", "order"],
+                json!("sequential"),
+            )],
             &cur,
             &[],
         );

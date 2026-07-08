@@ -11,6 +11,15 @@ import type { FieldProps } from "./fields";
 import type { PatchStore } from "./patch";
 import type { RuleConfig } from "../../api/types";
 
+/** Per-key help for rule scalar fields — accurate to the real config semantics. */
+const RULE_HELP: Record<string, string> = {
+  min_blank_time: "Minimum time a display must stay blanked before it can be woken.",
+  min_wake_time: "Minimum time a display must stay awake before it can be blanked again.",
+  activity_idle_threshold: "No keyboard/mouse events for this long means the user is inactive.",
+  activity_poll_interval: "How often to poll user-activity state while an activity inhibitor is active.",
+  wake_retry_backoff: "Backoff between the immediate wake attempt and the first retry.",
+};
+
 interface RulesSectionProps {
   rules: Record<string, RuleConfig>;
   store: PatchStore;
@@ -29,7 +38,7 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
         const cfg = rules[id];
         const basePath = ["rules", id];
 
-        const makeShared = (key: string, value: unknown): FieldProps => ({
+        const makeShared = (key: string, value: unknown, extra?: Partial<FieldProps>): FieldProps => ({
           path: [...basePath, key],
           label: key,
           value,
@@ -40,6 +49,7 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
             store.trackEdit(p, v);
             onDirty();
           },
+          ...extra,
         });
 
         return (
@@ -71,17 +81,17 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
 
               {/* grace_period — duration */}
               {cfg.grace_period !== undefined && (
-                <DurationField {...makeShared("grace_period", cfg.grace_period)} />
+                <DurationField {...makeShared("grace_period", cfg.grace_period, { help: "Zone must stay present or absent this long before a rule acts (debounce).", placeholder: "60s" })} />
               )}
 
               {/* wake_retry_interval — duration */}
               {cfg.wake_retry_interval !== undefined && (
-                <DurationField {...makeShared("wake_retry_interval", cfg.wake_retry_interval)} />
+                <DurationField {...makeShared("wake_retry_interval", cfg.wake_retry_interval, { help: "Interval between successive wake retries after the initial backoff.", placeholder: "60s" })} />
               )}
 
               {/* wake_retries — number */}
               {cfg.wake_retries !== undefined && (
-                <NumberField {...makeShared("wake_retries", cfg.wake_retries)} />
+                <NumberField {...makeShared("wake_retries", cfg.wake_retries, { help: "Number of wake retries before escalating to the next controller or failing.", placeholder: "3" })} />
               )}
 
               {/* inhibitors — read-only in T7 */}
@@ -102,15 +112,16 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
                 .filter((k) => !["zone", "displays", "grace_period", "wake_retry_interval", "wake_retries", "inhibitors"].includes(k))
                 .map((key) => {
                   const value = (cfg as unknown as Record<string, unknown>)[key];
+                  const extra = RULE_HELP[key] ? { help: RULE_HELP[key] } : {};
                   if (typeof value === "number") {
-                    return <NumberField key={key} {...makeShared(key, value)} />;
+                    return <NumberField key={key} {...makeShared(key, value, extra)} />;
                   }
                   if (typeof value === "string") {
                     // Heuristic: keys ending in _time, _period, _interval, _backoff are durations
                     if (/_time$|_period$|_interval$|_backoff$/.test(key)) {
-                      return <DurationField key={key} {...makeShared(key, value)} />;
+                      return <DurationField key={key} {...makeShared(key, value, extra)} />;
                     }
-                    return <TextField key={key} {...makeShared(key, value)} />;
+                    return <TextField key={key} {...makeShared(key, value, extra)} />;
                   }
                   return null;
                 })}

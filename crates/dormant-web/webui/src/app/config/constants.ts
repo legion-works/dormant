@@ -6,3 +6,9 @@ export const FUSION_MODES = ["any", "all", "quorum", "weighted"] as const;
 
 /** Unavailable-policy options. */
 export const UNAVAILABLE_POLICIES = ["present", "absent"] as const;
+
+/** daemon.idle_time_unit options. */
+export const IDLE_TIME_UNITS = ["auto", "ms", "s"] as const;
+
+/** daemon.idle_source options. */
+export const IDLE_SOURCES = ["auto", "wayland", "dbus"] as const;

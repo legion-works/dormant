@@ -26,6 +26,21 @@ const SENSOR_SCALAR_KEYS: string[] = [
   "hold_time", "stale_timeout",
 ];
 
+/** Per-field help and placeholder — accurate to the real config semantics. */
+const HELP: Record<string, string> = {
+  kind: "presence = continuous occupancy; motion = pulse, stretched by hold_time.",
+  hold_time: "How long a motion pulse is treated as present.",
+  stale_timeout: "A sensor silent this long becomes unavailable.",
+};
+
+const PLACEHOLDER: Record<string, string> = {
+  broker_url: "mqtt://host:1883",
+  url: "ws://ha.local:8123/api/websocket",
+  port: "/dev/ttyUSB0",
+  hold_time: "2s",
+  stale_timeout: "300s",
+};
+
 export default function SensorsSection({ sensors, store, redactedPaths, onDirty, fieldErrors }: SensorsSectionProps) {
   const ids = Object.keys(sensors);
   if (ids.length === 0) return null;
@@ -66,6 +81,8 @@ export default function SensorsSection({ sensors, store, redactedPaths, onDirty,
                   locked,
                   lockedReason,
                   error,
+                  help: HELP[key],
+                  placeholder: PLACEHOLDER[key],
                   onEdit: (p, v) => {
                     store.trackEdit(p, v);
                     onDirty();

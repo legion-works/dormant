@@ -143,6 +143,7 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
                     onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
                     options={BLANK_MODE_OPTIONS}
                     error={fieldErrors[[...basePath, "blank_mode"].join(".")]}
+                    help="power_off = full display power-off (DDC VCP D6 or DPMS); audio survives only over DDC. screen_off_audio_on = panel off, audio keeps playing (Samsung Picture-Off). brightness_zero = brightness to zero; instant but pixels may stay faintly lit."
                   />
                   <EnumField
                     path={[...basePath, "degraded_mode"]}
@@ -152,6 +153,7 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
                     onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
                     options={BLANK_MODE_OPTIONS}
                     error={fieldErrors[[...basePath, "degraded_mode"].join(".")]}
+                    help="Used when the primary mode isn't supported by the display. power_off = full display power-off (DDC VCP D6 or DPMS); audio survives only over DDC. screen_off_audio_on = panel off, audio keeps playing (Samsung Picture-Off). brightness_zero = brightness to zero; instant but pixels may stay faintly lit."
                   />
                 </>
               )}

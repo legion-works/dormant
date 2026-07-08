@@ -34,11 +34,14 @@
 //!
 //! ## Socket lifecycle
 //!
-//! The TV silently drops idle WebSocket connections during picture-off,
-//! causing `BrokenPipe` on the next send with no prior error. The controller
-//! uses a cached persistent connection with reconnect-on-send-failure: every
-//! `send_key` first tries the cached socket, and on failure reconnects and
-//! retries once. This is load-bearing — a send without retry silently fails.
+//! The TV silently drops idle WebSocket connections during picture-off.
+//! The first write on a stale socket returns `Ok` at the TCP level (the
+//! frame is lost, the RST arrives later), so a send-only error check
+//! misses the failure. The controller uses a WebSocket ping→pong liveness
+//! check before writing a key to a cached socket; if no pong arrives
+//! within 2 s the socket is treated as dead and replaced. As a further
+//! backstop, a send error after a passed liveness check still triggers
+//! one reconnect-and-retry.
 //!
 //! ## Unreachable policy
 //!
@@ -110,6 +113,9 @@ const REST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default seconds for a WebSocket connect timeout.
 const WS_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum time to wait for a WebSocket pong during the liveness check.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ── TvTransport trait — network boundary for test injection ─────────────────────
 
@@ -250,6 +256,12 @@ impl RealTvTransport {
     }
 
     /// Send a single text frame over the cached WebSocket, reconnecting if needed.
+    ///
+    /// Before writing a key to a cached socket, a WebSocket ping→pong
+    /// liveness check proves the connection is still alive. Samsung TVs
+    /// silently drop idle sockets during picture-off; writing to a stale
+    /// socket returns `Ok` at the TCP level (the frame is lost, the RST
+    /// arrives later), so a send-only error check is not sufficient.
     async fn ws_send_with_retry(
         &self,
         host: &str,
@@ -265,21 +277,25 @@ impl RealTvTransport {
             }
         }
 
-        // Try the cached socket.
+        // Try the cached socket — but first verify it is alive.
         let mut guard = self.ws.lock().await;
-        let send_result = if let Some(ref mut ws) = *guard {
-            ws.send(Message::Text(payload.to_string())).await
-        } else {
-            return Err("no cached WS connection after connect".to_string());
-        };
-
-        match send_result {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                // Socket broken — clear it and fall through to reconnect.
+        if let Some(ref mut ws) = *guard {
+            if Self::ws_is_live(ws).await {
+                // Socket passed liveness check — send the real payload.
+                match ws.send(Message::Text(payload.to_string())).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        tracing::info!(
+                            controller = SamsungTizenController::NAME,
+                            "WS send failed ({e}), reconnecting"
+                        );
+                        *guard = None;
+                    }
+                }
+            } else {
                 tracing::info!(
                     controller = SamsungTizenController::NAME,
-                    "WS send failed ({e}), reconnecting"
+                    "WS liveness check failed, reconnecting"
                 );
                 *guard = None;
             }
@@ -296,6 +312,25 @@ impl RealTvTransport {
                 .map_err(|e| format!("WS send after reconnect failed: {e}"))
         } else {
             Err("WS connection lost after reconnect".to_string())
+        }
+    }
+
+    /// Verify a cached WebSocket is still alive with a ping→pong roundtrip.
+    ///
+    /// Sends a WebSocket Ping and waits up to `PING_TIMEOUT` for the
+    /// matching Pong. On a half-open socket (peer sent TCP FIN but the
+    /// local write buffer still accepts data) the ping send succeeds but no
+    /// pong ever arrives, so the timeout catches the stale connection.
+    async fn ws_is_live(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> bool {
+        if ws.send(Message::Ping(vec![])).await.is_err() {
+            return false;
+        }
+        loop {
+            match tokio::time::timeout(PING_TIMEOUT, ws.next()).await {
+                Ok(Some(Ok(Message::Pong(_)))) => return true,
+                Ok(Some(Err(_)) | None) | Err(_) => return false,
+                _ => {} // skip data / other frames — wait for the matching Pong
+            }
         }
     }
 }
@@ -1314,19 +1349,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // Server: accept, read one frame, echo back (so client sees a
-        // successful send — the TV doesn't actually reply, but we want the
-        // send to succeed, not the response).
+        // The liveness check sends a Ping before the key — read both frames.
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
+            // Skip the liveness-check Ping (tungstenite auto-pongs it).
+            let _ping = ws.next().await;
             // Read the incoming key-press frame.
             let msg = ws.next().await;
             assert!(msg.is_some(), "server should receive a frame");
         });
 
         let transport = RealTvTransport::for_test(port);
-        // First call on a cold cache — must connect and send successfully.
+        // First call on a cold cache — must connect, pass liveness, and send.
         let result = transport
             .send_key("127.0.0.1", "test-token", KEY_RETURN)
             .await;
@@ -1351,14 +1386,16 @@ mod tests {
 
         // Server accepts two connections.
         let server = tokio::spawn(async move {
-            // Connection 1: accept, read one frame.
+            // Connection 1: accept, skip Ping, read the priming key.
             {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
-                let msg = ws.next().await;
+                let _ping = ws.next().await; // liveness-check Ping
+                let msg = ws.next().await; // priming key
                 assert!(msg.is_some(), "connection 1 should receive a frame");
             }
             // Connection 2: accept, read the retry frame.
+            // The reconnect path sends text directly (no Ping — socket is fresh).
             {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
@@ -1381,8 +1418,9 @@ mod tests {
         // → reconnect → retry" path.
         transport.close_cached_for_test().await;
 
-        // Second send: tries the dead cached socket → send fails →
-        // reconnect on connection 2 → retry succeeds.
+        // Second send: tries the dead cached socket → liveness check
+        // fails (Ping → error on closed socket) → reconnect →
+        // retry succeeds on connection 2.
         let result = transport
             .send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF)
             .await;
@@ -1458,5 +1496,79 @@ mod tests {
     async fn pair_timeout_fails_fast() {
         let result = pair("192.0.2.1", Duration::from_millis(50)).await;
         assert!(result.is_err(), "expected Err against unreachable host");
+    }
+
+    // ── Stale-socket liveness check ──────────────────────────────────────────
+
+    /// When the TV silently drops an idle WebSocket (half-open socket where
+    /// `send` still returns `Ok` but data is lost), the liveness check must
+    /// detect the dead connection and trigger a reconnect BEFORE the real
+    /// key is sent. Without this check, `send_key` reports success but the
+    /// key never reaches the TV.
+    #[tokio::test]
+    async fn stale_socket_liveness_check_detects_dead_connection() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Server: connection 1 stays alive at TCP level but stops reading,
+        // simulating the TV's zombie-socket behavior during picture-off.
+        // Connection 2 is the fresh reconnect.
+        let server = tokio::spawn(async move {
+            // Connection 1 — accept, read Ping + priming key, then go silent.
+            let (stream1, _) = listener.accept().await.unwrap();
+            let mut ws1 = accept_async(stream1).await.unwrap();
+            let _ping = ws1.next().await; // liveness-check Ping (auto-ponged)
+            let msg1 = ws1.next().await; // priming key (KEY_RETURN)
+            assert!(msg1.is_some(), "conn1 should receive priming frame");
+
+            // Keep ws1 alive but stop reading — the next liveness-check
+            // Ping sits in the kernel buffer with no application-level
+            // auto-pong, so the client times out and reconnects.
+            let _zombie = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                drop(ws1);
+            });
+
+            // Connection 2 — the reconnect after liveness check fails.
+            let (stream2, _) = listener.accept().await.unwrap();
+            let mut ws2 = accept_async(stream2).await.unwrap();
+            let msg2 = ws2.next().await;
+            assert!(msg2.is_some(), "conn2 should receive key after reconnect");
+            // Verify the key arrived on connection 2 (not lost on conn1).
+            if let Some(Ok(Message::Text(text))) = msg2 {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    parsed["params"]["DataOfCmd"].as_str().unwrap(),
+                    KEY_PICTURE_OFF,
+                    "key should be KEY_PICTURE_OFF on the reconnected socket"
+                );
+            } else {
+                panic!("expected text frame with key payload on conn2");
+            }
+        });
+
+        let transport = RealTvTransport::for_test(port);
+
+        // Prime the cache.
+        transport
+            .send_key("127.0.0.1", "test-token", KEY_RETURN)
+            .await
+            .unwrap();
+
+        // Send a key on the now-zombie cached socket. The liveness check
+        // must timeout (no pong from the silent server), reconnect, and
+        // deliver the key on connection 2.
+        let result = transport
+            .send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF)
+            .await;
+        assert!(
+            result.is_ok(),
+            "stale-socket send should reconnect and succeed: {result:?}"
+        );
+
+        server.await.unwrap();
     }
 }

@@ -38,7 +38,7 @@ const PLACEHOLDER: Record<string, string> = {
   url: "ws://ha.local:8123/api/websocket",
   port: "/dev/ttyUSB0",
   hold_time: "2s",
-  stale_timeout: "60s",
+  stale_timeout: "300s",
 };
 
 export default function SensorsSection({ sensors, store, redactedPaths, onDirty, fieldErrors }: SensorsSectionProps) {

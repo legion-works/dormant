@@ -1020,6 +1020,23 @@ grace_period = "30s"
     }
 
     #[test]
+    fn set_order_sequential_accepted() {
+        let cur = minimal_config();
+        // Only "sequential" is valid per validate.rs — the form must not offer
+        // "random" or "shuffle_playlist".  This test asserts the offered option
+        // passes the structural patch pipeline (value validation happens at
+        // daemon reload, not here).
+        check_ok(
+            &[set(
+                &["displays", "tv", "screensaver", "source", "0", "order"],
+                json!("sequential"),
+            )],
+            &cur,
+            &[],
+        );
+    }
+
+    #[test]
     fn remove_image_duration_is_allowed() {
         let cur = minimal_config();
         check_ok(

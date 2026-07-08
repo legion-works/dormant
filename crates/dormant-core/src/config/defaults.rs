@@ -54,6 +54,13 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// 80 is a sane daytime default that doesn't require per-display tuning.
 pub const RESTORE_BRIGHTNESS: u8 = 80;
 
+/// Backlight to restore on wake for Samsung IP Control G2 (`backlightControl`)
+/// when the saved value is missing (daemon restart, reload, or first wake).
+/// Scale 0–50 (the TV's panel-backlight range). 50 is the max — the
+/// fail-safe-toward-screens-on doctrine accepts a too-bright panel; a
+/// stuck-dim one is not acceptable.
+pub const SAMSUNG_RESTORE_BACKLIGHT: u8 = 50;
+
 /// Which idle source to use for the activity inhibitor (`"auto"` | `"wayland"` |
 /// `"dbus"`). `"auto"` prefers Wayland when available, falling back to `DBus`.
 pub const IDLE_SOURCE: &str = "auto";

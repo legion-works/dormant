@@ -123,6 +123,12 @@ Two blank modes are audio-safe:
   it on wake (first-blank-wins: a re-blank while already dimmed does not
   clobber the saved value).
 
+The optional `samsung_restore_backlight` per-display config key (0–50,
+defaults to 50) sets the backlight value restored on wake when no saved
+value is available — daemon restart, reload, or first wake. The default
+50 (the max on the 0–50 scale) is the fail-safe-toward-screens-on
+fallback: a too-bright panel is acceptable, a stuck-dim one is not.
+
 `brightness_zero` is a softer panel-state change than `screen_off_audio_on`
 and may be preferable for OLED longevity in the long run (no panel power
 cycling), but it does not produce a true pixel-off — it only dims.

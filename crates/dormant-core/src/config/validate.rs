@@ -126,6 +126,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "wake_data",
             "command_timeout",
             "restore_brightness",
+            "samsung_restore_backlight",
             "treat_unreachable_as_blanked",
         ],
     ),
@@ -908,6 +909,22 @@ fn validate_display(
             _ => {}
         }
     }
+
+    // ── Samsung backlight restore range ─────────────────────────────────
+    // The TV's IP-Control panel-backlight range is 0–50; values outside it
+    // would be silently clipped by the TV or rejected as an invalid
+    // JSON-RPC param. Reject at config-validate so the operator finds out
+    // at startup, not at the first wake after a restart.
+    if dc.samsung_restore_backlight > 50 {
+        errors.push(ValidationError {
+            what: "invalid samsung_restore_backlight".into(),
+            detail: format!(
+                "display '{display_id}' samsung_restore_backlight {} is out of \
+                 range — allowed: 0..=50 (Samsung IP-Control backlight scale)",
+                dc.samsung_restore_backlight
+            ),
+        });
+    }
 }
 
 /// Validate a single rule: zone exists, displays exist, valid inhibitors, sane
@@ -1589,6 +1606,7 @@ gracee_period = "60s"
             wake_data: None,
             command_timeout: defaults::COMMAND_TIMEOUT,
             restore_brightness: defaults::RESTORE_BRIGHTNESS,
+            samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
         }
     }
@@ -2074,6 +2092,7 @@ password = "test-pass"
     fn capability_union_kwin_dpms_ddcci_power_off_passes() {
         // kwin-dpms has NO modes, ddcci has PowerOff.
         // Per-controller check would fail on kwin-dpms; union must succeed.
+        use crate::config::defaults;
         let caps: HashMap<String, Vec<BlankMode>> = HashMap::from([
             ("kwin-dpms".into(), vec![]),
             ("ddcci".into(), vec![BlankMode::PowerOff]),
@@ -2105,6 +2124,7 @@ password = "test-pass"
                     wake_data: None,
                     command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
                     restore_brightness: 80,
+                    samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                     treat_unreachable_as_blanked: true,
                 },
             )]),
@@ -2125,6 +2145,7 @@ password = "test-pass"
         // union; validate_display must produce a "blank-incapable display"
         // ValidationError (the operator-facing symptom) alongside the
         // per-controller "missing or empty 'modes'" check.
+        use crate::config::defaults;
         let caps = test_capabilities();
         let creds = test_creds();
         let cfg = Config {
@@ -2155,6 +2176,7 @@ password = "test-pass"
                     wake_data: None,
                     command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
                     restore_brightness: 80,
+                    samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                     treat_unreachable_as_blanked: true,
                 },
             )]),
@@ -2262,6 +2284,7 @@ password = "test-pass"
 
     #[test]
     fn ladder_desugar_blank_mode_power_off() {
+        use crate::config::defaults;
         let dc = DisplayConfig {
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -2282,6 +2305,7 @@ password = "test-pass"
             wake_data: None,
             command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
             restore_brightness: 80,
+            samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
         };
         let ladder = dc.normalized_ladder();
@@ -2315,6 +2339,57 @@ password = "test-pass"
         assert_eq!(
             ladder[0].kind,
             StageKind::Controller(BlankMode::BrightnessZero)
+        );
+    }
+
+    #[test]
+    fn samsung_restore_backlight_in_range_accepted() {
+        let mut dc = blank_display_config();
+        dc.samsung_restore_backlight = 50;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.what != "invalid samsung_restore_backlight"),
+            "in-range samsung_restore_backlight=50 should not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn samsung_restore_backlight_out_of_range_rejected() {
+        let mut dc = blank_display_config();
+        dc.samsung_restore_backlight = 51;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "invalid samsung_restore_backlight"),
+            "out-of-range samsung_restore_backlight=51 must error"
+        );
+        let detail = errors
+            .iter()
+            .find(|e| e.what == "invalid samsung_restore_backlight")
+            .map(|e| e.detail.clone())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("0..=50"),
+            "error detail should describe the 0..=50 scale: {detail}"
         );
     }
 
@@ -2970,6 +3045,7 @@ kind = "power_off"
     /// Minimal `DisplayConfig` with all defaults filled in, for use in
     /// desugar tests where only `blank_mode` varies.
     fn blank_display_config() -> DisplayConfig {
+        use crate::config::defaults;
         DisplayConfig {
             blank_mode: None,
             degraded_mode: None,
@@ -2988,8 +3064,9 @@ kind = "power_off"
             blank_data: None,
             wake_service: None,
             wake_data: None,
-            command_timeout: crate::config::defaults::COMMAND_TIMEOUT,
+            command_timeout: defaults::COMMAND_TIMEOUT,
             restore_brightness: 80,
+            samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
         }
     }

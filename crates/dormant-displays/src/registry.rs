@@ -208,7 +208,8 @@ pub fn build_controllers(
                     token.clone(),
                     cfg.wol_mac.clone(),
                     cfg.treat_unreachable_as_blanked,
-                    cfg.blank_mode.unwrap_or(BlankMode::ScreenOffAudioOn),
+                    cfg.primary_blank_mode(),
+                    cfg.samsung_restore_backlight,
                 )));
             }
             other => {
@@ -238,7 +239,7 @@ fn config_invalid_cmd(display_name: &str, detail: &str) -> DormantError {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
-    use dormant_core::config::defaults::COMMAND_TIMEOUT;
+    use dormant_core::config::defaults::{COMMAND_TIMEOUT, SAMSUNG_RESTORE_BACKLIGHT};
     use std::time::Duration;
 
     /// Minimal valid `command` display config — used by the happy-path test
@@ -264,6 +265,7 @@ mod tests {
             wake_data: None,
             command_timeout: COMMAND_TIMEOUT,
             restore_brightness: 80,
+            samsung_restore_backlight: SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
         }
     }

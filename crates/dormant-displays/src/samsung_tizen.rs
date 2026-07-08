@@ -131,12 +131,10 @@ const TV_UNREACHABLE_NOOP: &str = "tv_unreachable_noop";
 /// `WoL` broadcast address.
 const WOL_BROADCAST: &str = "255.255.255.255:9";
 
-/// Maximum backlight value when restoring a `BrightnessZero` blank whose
-/// saved value is missing (daemon restart, reload, or first-ever wake).
-///
-/// The TV's IP-Control backlight scale is 0–50; 50 is the max. Per the
-/// fail-safe-toward-screens-on doctrine, a too-bright panel is acceptable
-/// — a stuck-dim one is not — so this is the conservative default.
+/// Fallback restore backlight when the saved value is missing AND the
+/// per-display override is also absent. Exposed as a const so tests and
+/// the (rare) code that needs a sentinel value can refer to the same
+/// number; production code reads the per-display override at construction.
 pub const DEFAULT_RESTORE_BACKLIGHT: u8 = 50;
 
 /// Maximum time to wait for a TCP connect probe.
@@ -722,12 +720,29 @@ pub struct SamsungTizenController {
     /// restore so a transient set failure leaves the value intact for
     /// retry.
     saved_backlight: StdMutex<Option<u8>>,
-    /// Effective blank mode for this display — set at construction from the
-    /// config's `blank_mode`. Used by `wake()` to pick the correct wake
-    /// path: `BrightnessZero` always restores via backlight (defaulting to
-    /// [`DEFAULT_RESTORE_BACKLIGHT`] when no value is saved), while
-    /// `ScreenOffAudioOn` / `PowerOff` send `KEY_RETURN`.
-    effective_mode: BlankMode,
+    /// Configured primary blank mode — sourced from
+    /// [`dormant_core::config::schema::DisplayConfig::primary_blank_mode`],
+    /// which traverses the normalised ladder and returns the first
+    /// `Controller(mode)` stage (defaulting to `PowerOff` for render-only
+    /// ladders). Used by `wake()` as the fallback when
+    /// [`Self::last_blank_mode`] is `None` (daemon restart / reload).
+    configured_primary_mode: BlankMode,
+    /// Per-display override for the backlight value restored on wake when
+    /// no saved value is available. Operator-tuned via the
+    /// `samsung_restore_backlight` config key (validated 0–50 by
+    /// `dormant_core::config::validate`).
+    restore_backlight: u8,
+    /// The actual blank mode of the LAST successful blank — recorded by
+    /// `blank()` after success, read by `wake()` to reverse whatever the
+    /// last blank actually did. Together with
+    /// [`Self::configured_primary_mode`], this makes wake correct for
+    /// every config shape: a `blank_mode = "brightness_zero"` display
+    /// wakes via backlight; a ladder whose primary stage is
+    /// `BrightnessZero` also wakes via backlight; a `ScreenOffAudioOn`
+    /// display wakes via `KEY_RETURN`; and a display that just came up
+    /// after a restart (no blank yet) falls through to
+    /// `configured_primary_mode`.
+    last_blank_mode: StdMutex<Option<BlankMode>>,
 }
 
 impl std::fmt::Debug for SamsungTizenController {
@@ -743,7 +758,9 @@ impl std::fmt::Debug for SamsungTizenController {
             .field("transport", &"dyn TvTransport")
             .field("backlight", &"dyn BacklightTransport")
             .field("saved_backlight", &"Option<u8>")
-            .field("effective_mode", &self.effective_mode)
+            .field("configured_primary_mode", &self.configured_primary_mode)
+            .field("restore_backlight", &self.restore_backlight)
+            .field("last_blank_mode", &"Option<BlankMode>")
             .finish()
     }
 }
@@ -754,15 +771,22 @@ impl SamsungTizenController {
 
     /// Build a new controller with the real network transports.
     ///
-    /// `effective_mode` is the display's configured `blank_mode` — it
-    /// drives the `wake()` path (see [`Self::effective_mode`]).
+    /// `configured_primary_mode` is the display's configured primary
+    /// blank mode — derived from the normalised ladder by
+    /// [`dormant_core::config::schema::DisplayConfig::primary_blank_mode`].
+    /// Used by `wake()` as the fallback when
+    /// [`Self::last_blank_mode`] is `None`.
+    /// `restore_backlight` is the per-display backlight restore value
+    /// (operator-tuned via the `samsung_restore_backlight` config key,
+    /// validated 0–50).
     #[must_use]
     pub fn new(
         host: String,
         token: String,
         wol_mac: Option<String>,
         treat_unreachable_as_blanked: bool,
-        effective_mode: BlankMode,
+        configured_primary_mode: BlankMode,
+        restore_backlight: u8,
     ) -> Self {
         Self {
             host,
@@ -772,15 +796,18 @@ impl SamsungTizenController {
             transport: Arc::new(RealTvTransport::new()),
             backlight: Arc::new(RealBacklightTransport::new()),
             saved_backlight: StdMutex::new(None),
-            effective_mode,
+            configured_primary_mode,
+            restore_backlight,
+            last_blank_mode: StdMutex::new(None),
         }
     }
 
     /// Build a controller with custom transports (used by tests).
     ///
-    /// `effective_mode` defaults to [`BlankMode::ScreenOffAudioOn`] so
-    /// pre-existing call sites that pre-date the constructor signature
+    /// `configured_primary_mode` defaults to [`BlankMode::ScreenOffAudioOn`]
+    /// so pre-existing call sites that pre-date the constructor signature
     /// change keep working — the picture-off wake path is unchanged.
+    /// `restore_backlight` defaults to [`DEFAULT_RESTORE_BACKLIGHT`].
     #[must_use]
     pub fn with_transport(
         host: String,
@@ -797,16 +824,19 @@ impl SamsungTizenController {
             transport,
             backlight: Arc::new(RealBacklightTransport::new()),
             saved_backlight: StdMutex::new(None),
-            effective_mode: BlankMode::ScreenOffAudioOn,
+            configured_primary_mode: BlankMode::ScreenOffAudioOn,
+            restore_backlight: DEFAULT_RESTORE_BACKLIGHT,
+            last_blank_mode: StdMutex::new(None),
         }
     }
 
     /// Build a controller with BOTH transports injected (used by tests).
     ///
-    /// `effective_mode` defaults to [`BlankMode::ScreenOffAudioOn`] — tests
-    /// that need the brightness-zero wake path should use
+    /// `configured_primary_mode` defaults to [`BlankMode::ScreenOffAudioOn`]
+    /// — tests that need the brightness-zero wake path should use
     /// [`Self::with_transports_mode`] (or override the field directly via
-    /// the public `effective_mode` accessor below).
+    /// the public `configured_primary_mode` accessor below).
+    /// `restore_backlight` defaults to [`DEFAULT_RESTORE_BACKLIGHT`].
     #[must_use]
     pub fn with_transports(
         host: String,
@@ -824,13 +854,17 @@ impl SamsungTizenController {
             transport,
             backlight,
             saved_backlight: StdMutex::new(None),
-            effective_mode: BlankMode::ScreenOffAudioOn,
+            configured_primary_mode: BlankMode::ScreenOffAudioOn,
+            restore_backlight: DEFAULT_RESTORE_BACKLIGHT,
+            last_blank_mode: StdMutex::new(None),
         }
     }
 
-    /// Build a controller with both transports AND an explicit effective
-    /// mode. Tests for the `BrightnessZero` wake path use this.
+    /// Build a controller with both transports, an explicit primary mode,
+    /// and an explicit per-display restore backlight. Tests for the
+    /// `BrightnessZero` wake path use this.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_transports_mode(
         host: String,
         token: String,
@@ -838,7 +872,8 @@ impl SamsungTizenController {
         treat_unreachable_as_blanked: bool,
         transport: Arc<dyn TvTransport>,
         backlight: Arc<dyn BacklightTransport>,
-        effective_mode: BlankMode,
+        configured_primary_mode: BlankMode,
+        restore_backlight: u8,
     ) -> Self {
         Self {
             host,
@@ -848,7 +883,9 @@ impl SamsungTizenController {
             transport,
             backlight,
             saved_backlight: StdMutex::new(None),
-            effective_mode,
+            configured_primary_mode,
+            restore_backlight,
+            last_blank_mode: StdMutex::new(None),
         }
     }
 
@@ -914,9 +951,10 @@ impl SamsungTizenController {
 
     /// Wake via backlight restore for a `BrightnessZero`-configured display.
     ///
-    /// Uses the saved value if present, otherwise falls back to
-    /// [`DEFAULT_RESTORE_BACKLIGHT`] (the max on the 0–50 scale). The
-    /// default is conservative — per the fail-safe-toward-screens-on
+    /// Uses the saved value if present, otherwise falls back to the
+    /// per-display `restore_backlight` override (operator-tuned via the
+    /// `samsung_restore_backlight` config key, validated 0–50). The
+    /// default is the same value — per the fail-safe-toward-screens-on
     /// doctrine a too-bright panel is acceptable; a stuck-dim one is not.
     ///
     /// The set is always attempted (never short-circuits to `KEY_RETURN`)
@@ -930,7 +968,7 @@ impl SamsungTizenController {
                 .saved_backlight
                 .lock()
                 .expect("saved_backlight poisoned");
-            saved.unwrap_or(DEFAULT_RESTORE_BACKLIGHT)
+            saved.unwrap_or(self.restore_backlight)
         };
 
         let token = self
@@ -977,7 +1015,7 @@ impl DisplayController for SamsungTizenController {
     }
 
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
-        match mode {
+        let result = match mode {
             BlankMode::BrightnessZero => {
                 // Treat unreachable the same as the WebSocket path — an off
                 // TV has no panel to dim, succeed as a no-op.
@@ -1005,7 +1043,17 @@ impl DisplayController for SamsungTizenController {
                         error: format!("{E_DISPLAY_IO}: {e}"),
                     })
             }
+        };
+        // Record the actual blank that succeeded — `wake()` reads this
+        // to pick the right wake path. Recording AFTER success means a
+        // failed blank doesn't poison the wake path for the next attempt.
+        if result.is_ok() {
+            *self
+                .last_blank_mode
+                .lock()
+                .expect("last_blank_mode poisoned") = Some(mode);
         }
+        result
     }
 
     async fn wake(&self) -> Result<(), CmdFailure> {
@@ -1026,19 +1074,30 @@ impl DisplayController for SamsungTizenController {
             return self.unreachable_noop("wake");
         }
 
-        // Branch on the display's effective blank mode:
+        // Wake reverse whatever the LAST successful blank actually did — this
+        // works regardless of config shape (plain `blank_mode = "..."` or
+        // a ladder whose primary is a different mode):
         //
-        // - `BrightnessZero` ALWAYS restores via backlight — even when
-        //   `saved_backlight` is `None` (daemon restart / reload / first
-        //   wake). The default fallback is `DEFAULT_RESTORE_BACKLIGHT`
-        //   (50, the max on the 0–50 scale) so a too-bright panel is
-        //   acceptable — a stuck-dim one is not. `KEY_RETURN` would NOT
-        //   raise the port-1516 backlight, so falling through to it would
-        //   leave the panel dimmed while the daemon thinks it woke.
-        // - `ScreenOffAudioOn` (and `PowerOff`) sends `KEY_RETURN` —
-        //   picture-off's wake key (verified non-toggle on S90D; safe even
-        //   if daemon state has drifted).
-        if self.effective_mode == BlankMode::BrightnessZero {
+        // - `last_blank_mode == Some(BrightnessZero)` — restore via backlight
+        //   (saved value if present, else `restore_backlight` override).
+        // - `last_blank_mode == Some(ScreenOffAudioOn | PowerOff)` — send
+        //   `KEY_RETURN` (the verified wake key for picture-off on S90D).
+        // - `last_blank_mode == None` — daemon just started / reloaded and no
+        //   blank has run yet; fall back to the CONFIGURED primary mode.
+        //   A ladder whose first stage is `BrightnessZero` builds with
+        //   `configured_primary_mode = BrightnessZero` and so still wakes
+        //   via backlight; a `blank_mode = "screen_off_audio_on"` display
+        //   falls through to `KEY_RETURN`.
+        let mode = {
+            let last = self
+                .last_blank_mode
+                .lock()
+                .expect("last_blank_mode poisoned");
+            *last
+        }
+        .unwrap_or(self.configured_primary_mode);
+
+        if mode == BlankMode::BrightnessZero {
             return self.restore_backlight_with_default().await;
         }
 
@@ -1617,6 +1676,7 @@ mod tests {
             tv_fake.clone(),
             bl_fake.clone(),
             BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
         );
 
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
@@ -2356,14 +2416,11 @@ mod tests {
         assert!(result.is_err(), "expected Err against unreachable host");
     }
 
-    // ── MUST 1 reverse-apply: transient set failure leaves saved intact ───
+    // ── Wake-safety regressions ───────────────────────────────────────────────
 
-    /// After a transient `set_backlight` failure, `saved_backlight` is
-    /// STILL `Some(N)` so a subsequent wake attempt can retry the restore.
-    /// Pins the clear-before-success bug: the pre-fix ordering took the
-    /// saved value before calling `set_backlight`, so a transient failure
-    /// (network blip, TV busy) would lose the value and leave the panel
-    /// stuck dim while the daemon thinks it woke.
+    /// `restore_backlight` must keep `saved_backlight` intact across a
+    /// transient `set_backlight` failure — otherwise a single network blip
+    /// loses the only restore value and the next wake has nothing to set.
     #[tokio::test]
     async fn restore_backlight_preserves_saved_on_set_failure() {
         let tv_fake = Arc::new(FakeTvTransport::new());
@@ -2395,6 +2452,7 @@ mod tests {
             tv_fake,
             bl_fake.clone(),
             BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
         );
 
         // Blank: saves 33.
@@ -2411,8 +2469,6 @@ mod tests {
             "transient set failure must preserve saved_backlight for retry"
         );
     }
-
-    // ── MUST 2 reverse-apply: missing saved → restore to default, not KEY_RETURN
 
     /// A `BrightnessZero` controller with `saved_backlight = None` (e.g.
     /// after daemon restart) must wake by SETTING backlight to
@@ -2439,6 +2495,7 @@ mod tests {
             tv_fake.clone(),
             bl_fake.clone(),
             BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
         );
 
         // saved_backlight starts at None (no blank yet, or restart).
@@ -2458,12 +2515,11 @@ mod tests {
         );
     }
 
-    // ── MUST 3 reverse-apply: dropping the transport cancels the reader task
+    // ── Lifecycle regression ────────────────────────────────────────────────────
 
-    /// When the transport is dropped (controller removed / daemon reload),
-    /// the final reader task's `CancellationToken` is fired — without
-    /// this, the reader task would outlive the transport and keep its
-    /// socket half open past the daemon's lifetime.
+    /// `RealTvTransport::drop` must cancel the final reader state's
+    /// `CancellationToken` — otherwise the reader task outlives the
+    /// transport and keeps its socket half open past the daemon's lifetime.
     #[test]
     fn drop_transport_cancels_final_reader_state_token() {
         let transport = RealTvTransport::for_test_with_silence(
@@ -2481,6 +2537,115 @@ mod tests {
             state.cancel.is_cancelled(),
             "dropping RealTvTransport must cancel the current reader_state's \
              CancellationToken so the reader task exits"
+        );
+    }
+
+    // ── Ladder-config wedge regression ──────────────────────────────────────
+
+    /// A Samsung display wired with `blank_mode = None` and a ladder whose
+    /// primary stage is `BrightnessZero` — `DisplayConfig::primary_blank_mode()`
+    /// returns `BrightnessZero`, and the registry wires that into
+    /// `configured_primary_mode`. After a daemon restart with no blank yet
+    /// recorded (`last_blank_mode == None`, `saved_backlight == None`),
+    /// `wake()` must restore via backlight, NOT fall through to `KEY_RETURN`.
+    /// The pre-fix wiring (`cfg.blank_mode.unwrap_or(ScreenOffAudioOn)` for
+    /// ladder configs) would have built the controller as `ScreenOffAudioOn`
+    /// and the next wake would send `KEY_RETURN` — panel stuck dim.
+    #[tokio::test]
+    async fn ladder_primary_brightness_zero_wake_restores_backlight_after_restart() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        // Simulate the registry's wiring for a ladder whose primary stage
+        // is BrightnessZero: configured_primary_mode = BrightnessZero.
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
+        );
+
+        // Post-restart state: no blank has run yet.
+        assert!(ctrl.saved_backlight.lock().unwrap().is_none());
+        assert!(ctrl.last_blank_mode.lock().unwrap().is_none());
+
+        ctrl.wake().await.unwrap();
+
+        // Backlight was restored to the operator-configured default.
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("192.0.2.7".to_string(), DEFAULT_RESTORE_BACKLIGHT)]
+        );
+        // KEY_RETURN was NOT sent.
+        assert!(
+            tv_fake.take_sent_keys().is_empty(),
+            "ladder-primary BrightnessZero wake must NOT fall through to KEY_RETURN"
+        );
+    }
+
+    /// Plain `blank_mode = "screen_off_audio_on"` controller with no recorded
+    /// blank must still wake via `KEY_RETURN` — the `last_blank_mode` /
+    /// `configured_primary_mode` change must not break the picture-off path.
+    #[tokio::test]
+    async fn screen_off_audio_on_wake_sends_key_return() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+
+        // Registry wiring for `blank_mode = "screen_off_audio_on"`.
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake,
+            BlankMode::ScreenOffAudioOn,
+            DEFAULT_RESTORE_BACKLIGHT,
+        );
+
+        ctrl.wake().await.unwrap();
+        assert_eq!(tv_fake.take_sent_keys(), vec![KEY_RETURN]);
+    }
+
+    /// The per-display `restore_backlight` override is honoured — operators
+    /// can tune the post-restart wake brightness away from the 50 default.
+    #[tokio::test]
+    async fn custom_restore_backlight_override_is_used_when_no_saved() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            25, // operator override — dimmer than the fail-safe-default 50
+        );
+
+        // No saved value — fall back to the override.
+        ctrl.wake().await.unwrap();
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("192.0.2.7".to_string(), 25)]
         );
     }
 }

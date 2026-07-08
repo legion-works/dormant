@@ -602,9 +602,10 @@ impl Runner {
 
     /// Reload the config, restarting the runtime in place. See the module
     /// docs for the full state machine.
+    #[allow(clippy::too_many_lines)]
     async fn reload(&mut self) {
         let old_ctl = self.engine_ctl.borrow().clone();
-        let snapshot = request_snapshot(&old_ctl).await;
+        let preliminary = request_snapshot(&old_ctl).await;
 
         // Validate + assemble the NEW config BEFORE touching the running
         // generation. An invalid or un-assemblable config only flags
@@ -622,9 +623,95 @@ impl Runner {
             }
         };
 
+        // Build the set of rule-driven displays from the NEW config.
+        // Rule-less (manual-only) displays are those in [displays] but NOT
+        // referenced by any rule.
+        let ruled: HashSet<DisplayId> = index_display_rules(&new_assembly.cfg)
+            .keys()
+            .cloned()
+            .collect();
+
+        // ── Quiesce rule-less displays caught mid-blank ──────────────────────
+        // A rule-less display with phase "blanking" has no result driver after
+        // teardown.  Samsung KEY_PICTURE_OFF is a TOGGLE (re-issuing could
+        // invert the panel), so we must NOT restore a naked Blanking.  Instead,
+        // poll the still-live engine until the phase reaches a terminal state
+        // ("blanked" / "active") or the deadline passes.
+        let quiesce_deadline =
+            tokio::time::Instant::now() + dormant_core::config::defaults::COMMAND_TIMEOUT;
+        let mut snapshot = preliminary;
+        if let Some(ref snap) = snapshot {
+            let need_quiesce: HashSet<String> = snap
+                .displays
+                .iter()
+                .filter(|(id, d)| {
+                    let did = DisplayId((*id).clone());
+                    classify_transient(&d.phase, !ruled.contains(&did)) == TransientClass::Quiesce
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !need_quiesce.is_empty() {
+                tracing::info!(
+                    event = "reload_quiesce_blanking",
+                    count = need_quiesce.len(),
+                    "rule-less display(s) caught mid-blank; polling until terminal"
+                );
+                loop {
+                    let all_terminal = if let Some(ref s) = snapshot {
+                        need_quiesce.iter().all(|id| {
+                            s.displays
+                                .iter()
+                                .find(|(did, _)| did == id)
+                                .is_none_or(|(_, d)| {
+                                    matches!(d.phase.as_str(), "blanked" | "active")
+                                })
+                        })
+                    } else {
+                        false
+                    };
+                    if all_terminal {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= quiesce_deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if let Some(s) = request_snapshot(&old_ctl).await {
+                        snapshot = Some(s);
+                    }
+                }
+                // Identify displays still stuck in "blanking" at the deadline —
+                // these cannot be restored naked and will be defensive-woken.
+                let stuck_blanking: Vec<DisplayId> = snapshot
+                    .as_ref()
+                    .map(|s| {
+                        need_quiesce
+                            .iter()
+                            .filter(|id| {
+                                s.displays
+                                    .iter()
+                                    .find(|(did, _)| did == *id)
+                                    .is_some_and(|(_, d)| d.phase.as_str() == "blanking")
+                            })
+                            .map(|id| DisplayId(id.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !stuck_blanking.is_empty() {
+                    tracing::warn!(
+                        event = "reload_quiesce_timeout",
+                        count = stuck_blanking.len(),
+                        "rule-less display(s) still blanking at deadline; defensive-waking"
+                    );
+                }
+                // stuck_blanking will be appended to the defensive-wake list
+                // after the new generation spawns.
+            }
+        }
+
         let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
         let retained_dark =
-            retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
+            retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors, &ruled);
 
         // Capture the new config for watch updates + bind change detection
         // BEFORE new_assembly is consumed by spawn_generation.
@@ -664,7 +751,36 @@ impl Runner {
         match spawn_generation(&self.root, new_assembly, snapshot.as_ref(), None) {
             Ok(spawn) => {
                 self.install_generation(spawn);
-                self.defensive_wake(retained_dark);
+                // Combine retained rule-driven dark displays with stuck rule-less
+                // blanking displays — both need a physical wake because the new
+                // machines start Active.  Retained and stuck are disjoint sets
+                // (retained excludes rule-less, stuck is only rule-less), but
+                // dedup defensively anyway.
+                let mut wake_list = retained_dark;
+                // Re-derive stuck from the final snapshot (the quiesce loop may
+                // have advanced some to terminal, but any still-blanking ones
+                // need waking).
+                if let Some(ref snap) = snapshot {
+                    let stuck: Vec<DisplayId> = snap
+                        .displays
+                        .iter()
+                        .filter(|(id, d)| {
+                            let did = DisplayId((*id).clone());
+                            d.phase.as_str() == "blanking" && !ruled.contains(&did)
+                        })
+                        .map(|(id, _)| DisplayId(id.clone()))
+                        .collect();
+                    // Dedup: retained_dark only contains rule-driven displays;
+                    // stuck only contains rule-less displays.  Still, filter
+                    // just in case.
+                    let retained_set: HashSet<&DisplayId> = wake_list.iter().collect();
+                    let to_add: Vec<DisplayId> = stuck
+                        .into_iter()
+                        .filter(|s| !retained_set.contains(s))
+                        .collect();
+                    wake_list.extend(to_add);
+                }
+                self.defensive_wake(wake_list);
                 self.config_tx.send_replace(Arc::new(new_cfg));
                 self.creds_tx.send_replace(Arc::new(new_creds));
                 tracing::info!(event = "config_reloaded");
@@ -1401,32 +1517,51 @@ fn spawn_generation(
     })
 }
 
-/// Replay the scheduling effects a restored phase would emit. See the module
-/// docs for the M1 restore limitation.
+/// Restore display phases across a reload.
+///
+/// Rule-driven displays replay only the scheduling effects (M1 behavior —
+/// the new state machine starts `Active` and the engine re-converges from
+/// live presence).  Rule-less displays get their full phase preserved via
+/// [`RulesEngine::install_restored_machine`] (M2).
+///
+/// Transient `"blanking"` phases are skipped defensively — the reload
+/// quiesce should prevent a naked `Blanking` from reaching here, but
+/// restoring a display mid-toggle (e.g. Samsung `KEY_PICTURE_OFF` which
+/// toggles) would be incorrect, so `continue` is the safe default.
 fn apply_restore(
     engine: &mut RulesEngine,
     snapshot: &StateSnapshot,
     engine_cfg: &RulesEngineConfig,
 ) {
     let now = Tick::now();
+    // Displays referenced by any rule are rule-driven; all others in
+    // [displays] are manual-only (rule-less).
+    let ruled: HashSet<&DisplayId> = engine_cfg.rules.iter().flat_map(|r| &r.displays).collect();
     for (display, dsnap) in &snapshot.displays {
         let did = DisplayId(display.clone());
         let Some(dcfg) = engine_cfg.displays.iter().find(|d| d.display == did) else {
             continue;
         };
+        #[allow(clippy::match_same_arms)]
         let phase = match dsnap.phase.as_str() {
             "waking" => Phase::Waking,
             "blanked" => Phase::Blanked,
+            "blanking" => continue, // never restore a naked Blanking
             _ => continue,
         };
-        let (_sm, effects) = DisplayStateMachine::restore(
+        let (sm, effects) = DisplayStateMachine::restore(
             dcfg.timings.clone(),
             dcfg.ladder.clone(),
             phase,
             dsnap.cmd_gen,
             now,
         );
-        engine.apply_restore_effects(&did, effects);
+        if ruled.contains(&did) {
+            let _ = sm; // unused in the effects-only path
+            engine.apply_restore_effects(&did, effects);
+        } else {
+            engine.install_restored_machine(&did, sm, effects, now);
+        }
     }
 }
 
@@ -1466,9 +1601,14 @@ fn removed_dark_displays(
 /// generation — these get a defensive physical wake after the new generation
 /// spawns (state machines restart `Active`, so a dark panel would otherwise
 /// linger until the next edge).
+///
+/// Rule-less (manual-only) displays are excluded — a dark manual-only display
+/// reflects operator intent, not a wedge, and its phase is preserved across
+/// reload by [`apply_restore`].
 fn retained_dark_displays(
     snapshot: Option<&StateSnapshot>,
     new_executors: &HashMap<DisplayId, Arc<DisplayExecutor>>,
+    ruled: &HashSet<DisplayId>,
 ) -> Vec<DisplayId> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
@@ -1477,7 +1617,11 @@ fn retained_dark_displays(
     snapshot
         .displays
         .iter()
-        .filter(|(id, d)| present.contains(id.as_str()) && phase_is_dark(&d.phase))
+        .filter(|(id, d)| {
+            present.contains(id.as_str())
+                && phase_is_dark(&d.phase)
+                && ruled.contains(&DisplayId((*id).clone()))
+        })
         .map(|(id, _)| DisplayId(id.clone()))
         .collect()
 }
@@ -1531,6 +1675,84 @@ async fn forward_events(
                 None => break,
             },
         }
+    }
+}
+
+// ── Reload-time transient classification ──────────────────────────────────────
+
+/// A rule-less display mid-blank must be quiesced (polled to terminal) before
+/// restore; terminal dark phases restore directly; everything else is ignored.
+#[derive(Debug, PartialEq, Eq)]
+enum TransientClass {
+    /// Poll the still-live engine until the phase reaches a terminal state or
+    /// the deadline passes.
+    Quiesce,
+    /// Restore the display's phase directly (no quiesce needed).
+    RestoreDirect,
+    /// No special handling needed — the display is not rule-less or its phase
+    /// is not dark.
+    Ignore,
+}
+
+/// Classify a display snapshot at reload time based on its current phase and
+/// whether it is rule-less.  Only rule-less displays in dark phases need
+/// handling: `"blanking"` needs quiesce (poll to terminal), `"blanked"` and
+/// `"waking"` restore directly, and everything else is ignored.
+fn classify_transient(phase: &str, ruleless: bool) -> TransientClass {
+    match (phase, ruleless) {
+        ("blanking", true) => TransientClass::Quiesce,
+        ("blanked" | "waking", true) => TransientClass::RestoreDirect,
+        _ => TransientClass::Ignore,
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    #[test]
+    fn classify_transient_all_combos() {
+        // Rule-less, blanking → quiesce
+        assert_eq!(
+            classify_transient("blanking", true),
+            TransientClass::Quiesce
+        );
+        // Rule-less, blanked → restore directly
+        assert_eq!(
+            classify_transient("blanked", true),
+            TransientClass::RestoreDirect
+        );
+        // Rule-less, waking → restore directly
+        assert_eq!(
+            classify_transient("waking", true),
+            TransientClass::RestoreDirect
+        );
+        // Rule-less, active → ignore
+        assert_eq!(classify_transient("active", true), TransientClass::Ignore);
+        // Rule-less, staged → ignore
+        assert_eq!(classify_transient("staged", true), TransientClass::Ignore);
+        // Rule-less, render_pending → ignore
+        assert_eq!(
+            classify_transient("render_pending", true),
+            TransientClass::Ignore
+        );
+
+        // Rule-driven, blanking → ignore (not transient)
+        assert_eq!(
+            classify_transient("blanking", false),
+            TransientClass::Ignore
+        );
+        // Rule-driven, blanked → ignore (handled by existing defensive-wake)
+        assert_eq!(classify_transient("blanked", false), TransientClass::Ignore);
+        // Rule-driven, waking → ignore
+        assert_eq!(classify_transient("waking", false), TransientClass::Ignore);
+        // Rule-driven, active → ignore
+        assert_eq!(classify_transient("active", false), TransientClass::Ignore);
+
+        // Unknown phase, rule-less → ignore
+        assert_eq!(classify_transient("garbage", true), TransientClass::Ignore);
+        // Unknown phase, rule-driven → ignore
+        assert_eq!(classify_transient("garbage", false), TransientClass::Ignore);
     }
 }
 

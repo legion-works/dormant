@@ -1,6 +1,6 @@
 [Unit]
 Description=dormant — proximity-driven display blanking daemon
-Documentation=https://github.com/icetea/dormant
+Documentation=https://github.com/legion-works/dormant
 After=graphical-session.target
 PartOf=graphical-session.target
 

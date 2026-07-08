@@ -22,7 +22,7 @@ is off by default. To enable it:
 ## From source (current, pre-release)
 
 ```bash
-git clone https://github.com/icetea/dormant.git
+git clone https://github.com/legion-works/dormant.git
 cd dormant
 cargo build --release
 install -Dm755 target/release/dormantd ~/.local/bin/dormantd
@@ -48,8 +48,8 @@ See [Tray autostart](#tray-autostart) below to run it on every login.
 Once M1 ships, releases will include a shell installer:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/icetea/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/icetea/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
 ```
 
 Checksums are provided for every release artifact. Verify before running:

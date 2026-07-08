@@ -1,6 +1,6 @@
 [Unit]
 Description=dormant tray — StatusNotifierItem indicator for dormantd
-Documentation=https://github.com/iceteaSA/dormant
+Documentation=https://github.com/legion-works/dormant
 After=graphical-session.target dormant.service
 PartOf=graphical-session.target
 

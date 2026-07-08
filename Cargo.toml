@@ -16,7 +16,7 @@ members = [
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/icetea/dormant"
+repository = "https://github.com/legion-works/dormant"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

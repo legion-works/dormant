@@ -242,7 +242,7 @@ persistence to disk is not implemented in v1).
 **Known limitation:** a manual blank or wake command issued in the brief
 window while a config reload is in progress may be lost (the new generation
 restores the pre-command state).  Re-issue the command after the reload
-settles.  Tracked in [issue #9](https://github.com/iceteaSA/dormant/issues/9).
+settles.  Tracked in [issue #9](https://github.com/legion-works/dormant/issues/9).
 
 ```toml
 # A Samsung Tizen TV controlled entirely by hand.

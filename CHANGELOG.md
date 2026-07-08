@@ -32,4 +32,4 @@ Pre-`0.1.0`. Everything below is built and validated but not yet tagged for rele
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/iceteaSA/dormant/commits/dev
+[Unreleased]: https://github.com/legion-works/dormant/commits/dev

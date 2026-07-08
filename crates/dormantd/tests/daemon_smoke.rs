@@ -1489,3 +1489,102 @@ wake_retry_interval = "1s"
         );
     }
 }
+
+// ── 13: manual-only (rule-less) display boots and is present in snapshot ─────────
+
+/// Config with a rule-less display "manual" (in [displays] but no rule),
+/// plus a rule-referenced display "mon" so the daemon has something to
+/// drive.  The test asserts the manual display appears in the snapshot
+/// with phase "active" (before the change it was skipped as inert).
+fn manual_only_config(mon_marker: &Path, manual_marker: &Path) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m1}'"
+wake_command = "printf W >> '{m1}'"
+modes = ["power_off"]
+
+[displays.manual]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m2}'"
+wake_command = "printf W >> '{m2}'"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "300ms"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        m1 = mon_marker.display(),
+        m2 = manual_marker.display(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_only_display_present_in_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let mon_marker = dir.path().join("mon");
+    let manual_marker = dir.path().join("manual");
+    let cfg = manual_only_config(&mon_marker, &manual_marker);
+    let cfg_path = write_file(dir.path(), "config.toml", &cfg);
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    // Snapshot via control channel.
+    let ctl = handle.control_sender();
+    let (tx, rx) = oneshot::channel();
+    ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
+    let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("snapshot in time")
+        .expect("snapshot reply");
+
+    // Find the manual display.
+    let manual = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "manual")
+        .map(|(_, ds)| ds);
+
+    shutdown(handle, join).await;
+
+    assert!(
+        manual.is_some(),
+        "rule-less display 'manual' must be present in snapshot"
+    );
+    let manual = manual.unwrap();
+    assert_eq!(
+        manual.phase, "active",
+        "rule-less display must start in active phase, got {:?}",
+        manual.phase
+    );
+}

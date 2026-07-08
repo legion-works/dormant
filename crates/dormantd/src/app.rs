@@ -986,21 +986,30 @@ async fn assemble_static(
 
     for (name, dc) in &cfg.displays {
         let did = DisplayId(name.clone());
-        // Displays not referenced by any rule are inert — skip them.
-        let Some(rc) = display_rule.get(&did) else {
-            continue;
-        };
-
-        let retry = RetrySettings {
-            wake_retries: rc.wake_retries,
-            wake_retry_backoff: rc.wake_retry_backoff,
-        };
-        let timings = SmTimings {
-            grace_period: rc.grace_period,
-            min_blank_time: rc.min_blank_time,
-            min_wake_time: rc.min_wake_time,
-            startup_holdoff: cfg.daemon.startup_holdoff,
-            wake_retry_interval: rc.wake_retry_interval,
+        // A display named by no rule is MANUAL-ONLY: build it so
+        // it is controllable by hand; no zone drives it.  (Was: skipped
+        // as inert.)
+        let (retry, timings) = match display_rule.get(&did) {
+            Some(rc) => (
+                RetrySettings {
+                    wake_retries: rc.wake_retries,
+                    wake_retry_backoff: rc.wake_retry_backoff,
+                },
+                SmTimings {
+                    grace_period: rc.grace_period,
+                    min_blank_time: rc.min_blank_time,
+                    min_wake_time: rc.min_wake_time,
+                    startup_holdoff: cfg.daemon.startup_holdoff,
+                    wake_retry_interval: rc.wake_retry_interval,
+                },
+            ),
+            None => (
+                RetrySettings {
+                    wake_retries: dormant_core::config::defaults::WAKE_RETRIES,
+                    wake_retry_backoff: dormant_core::config::defaults::WAKE_RETRY_BACKOFF,
+                },
+                DisplayRuntimeCfg::manual_defaults(cfg.daemon.startup_holdoff),
+            ),
         };
 
         let controllers = build_controllers(name, dc, &creds)

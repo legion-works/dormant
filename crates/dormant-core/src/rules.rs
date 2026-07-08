@@ -244,6 +244,23 @@ pub struct DisplayRuntimeCfg {
     pub timings: SmTimings,
 }
 
+impl DisplayRuntimeCfg {
+    /// Timing defaults for a manual-only (rule-less) display.  `grace` and
+    /// `min_*` times are moot without a zone; wake-retry is preserved — a
+    /// failed manual wake must self-heal (the wake-wedge invariant).
+    #[must_use]
+    pub fn manual_defaults(startup_holdoff: std::time::Duration) -> SmTimings {
+        use crate::config::defaults;
+        SmTimings {
+            grace_period: defaults::GRACE_PERIOD,
+            min_blank_time: defaults::MIN_BLANK_TIME,
+            min_wake_time: defaults::MIN_WAKE_TIME,
+            startup_holdoff,
+            wake_retry_interval: defaults::WAKE_RETRY_INTERVAL,
+        }
+    }
+}
+
 /// Per-rule runtime configuration for the engine.
 #[derive(Debug, Clone)]
 pub struct RuleRuntimeCfg {
@@ -1268,5 +1285,19 @@ mod tests {
         ];
         assert_eq!(h[0].role, ControllerRole::Primary);
         assert_eq!(h[1].role, ControllerRole::Fallback);
+    }
+
+    #[test]
+    fn manual_defaults_returns_default_consts() {
+        let holdoff = Duration::from_secs(30);
+        let t = DisplayRuntimeCfg::manual_defaults(holdoff);
+        assert_eq!(t.grace_period, crate::config::defaults::GRACE_PERIOD);
+        assert_eq!(t.min_blank_time, crate::config::defaults::MIN_BLANK_TIME);
+        assert_eq!(t.min_wake_time, crate::config::defaults::MIN_WAKE_TIME);
+        assert_eq!(t.startup_holdoff, holdoff);
+        assert_eq!(
+            t.wake_retry_interval,
+            crate::config::defaults::WAKE_RETRY_INTERVAL
+        );
     }
 }

@@ -702,6 +702,28 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
     })?
 }
 
+// ── Doctor shims — best-effort network probes exposed for dormant-doctor ─────────
+
+/// Best-effort TCP reachability probe for a Samsung TV port (doctor use).
+///
+/// Returns `true` if `host:port` accepts a TCP connection within
+/// [`REST_TIMEOUT`]; otherwise `false`.
+#[must_use]
+pub async fn probe_reachable(host: &str, port: u16) -> bool {
+    RealTvTransport::new()
+        .tcp_connect_ok(host, port, REST_TIMEOUT)
+        .await
+}
+
+/// Best-effort power-state read via the REST device-info endpoint (doctor use).
+///
+/// Returns `Some("on")` or `Some("standby")` if the TV responds, or `None` if
+/// unreachable.
+#[must_use]
+pub async fn probe_power_state(host: &str) -> Option<String> {
+    RealTvTransport::new().get_power_state(host).await
+}
+
 /// Extract the pairing token from a WebSocket text message.
 ///
 /// The TV returns JSON with a `"data"` field containing a `"token"` string

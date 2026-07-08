@@ -24,3 +24,5 @@ tokio-serial = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "time", "macros", "rt"] }
+
+tempfile.workspace = true

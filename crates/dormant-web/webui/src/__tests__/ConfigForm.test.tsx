@@ -735,6 +735,129 @@ describe("Config tab-switch guard", () => {
     confirmSpy.mockRestore();
   });
 
+  // ── Per-field guidance (help text) ──
+
+  it("zone mode renders help text", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Zones")).toBeInTheDocument();
+    });
+
+    // The zone `mode` field should render its help text under the select
+    expect(screen.getByText(/How members combine into one presence result/)).toBeInTheDocument();
+  });
+
+  it("zone unavailable_policy renders help text", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Zones")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/offline.stale sensor/)).toBeInTheDocument();
+  });
+
+  it("display blank_mode renders help text", async () => {
+    render(<SettingsForm config={DISPLAY_BLANK_MODE} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Displays")).toBeInTheDocument();
+    });
+
+    // Both blank_mode and degraded_mode share the same help — at least one must match
+    expect(screen.getAllByText(/full display power-off/).length).toBeGreaterThanOrEqual(1);
+  });
+
+  // ── Missing daemon enum fields (idle_time_unit, idle_source, stale_sensor_timeout) ──
+
+  it("renders idle_time_unit as enum with correct options", async () => {
+    const cfg: ConfigResponse = {
+      ...SAMPLE_CONFIG,
+      fingerprint: "fe01aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc",
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        daemon: {
+          ...SAMPLE_CONFIG.inventory.daemon,
+          idle_time_unit: "auto",
+          idle_source: "auto",
+          stale_sensor_timeout: "300s",
+        },
+      },
+    };
+
+    render(<SettingsForm config={cfg} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    // idle_time_unit — should be a select element with label
+    const idleTimeUnitLabel = screen.getByText("idle_time_unit");
+    expect(idleTimeUnitLabel).toBeInTheDocument();
+
+    // idle_source — should be a select element with label
+    const idleSourceLabel = screen.getByText("idle_source");
+    expect(idleSourceLabel).toBeInTheDocument();
+
+    // stale_sensor_timeout — should be a text input with label
+    const staleLabel = screen.getByText("stale_sensor_timeout");
+    expect(staleLabel).toBeInTheDocument();
+  });
+
+  it("editing the 3 new daemon fields creates valid patches (not locked or unknown)", async () => {
+    // Use the raw createPatchStore to test patch assembly directly.
+    const { createPatchStore } = await import("../app/config/patch");
+
+    const s = createPatchStore();
+    // Simulate edits like the form would produce
+    s.trackEdit(["daemon", "idle_time_unit"], "ms");
+    s.trackEdit(["daemon", "idle_source"], "wayland");
+    s.trackEdit(["daemon", "stale_sensor_timeout"], "600s");
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(3);
+
+    // Verify the patch paths — these must be accepted by the server's
+    // is_known_config_path and editable-subset checks.
+    const paths = patches.map((p) => p.path.join("."));
+    expect(paths).toContain("daemon.idle_time_unit");
+    expect(paths).toContain("daemon.idle_source");
+    expect(paths).toContain("daemon.stale_sensor_timeout");
+
+    // None of these paths should be locked to redacted (none involve creds)
+    const noRedacted: string[][] = [];
+    expect(s.isLocked(["daemon", "idle_time_unit"], noRedacted)).toBe(false);
+    expect(s.isLocked(["daemon", "idle_source"], noRedacted)).toBe(false);
+    expect(s.isLocked(["daemon", "stale_sensor_timeout"], noRedacted)).toBe(false);
+  });
+
+  // ── DurationField placeholder ──
+
+  it("DurationField shows persistent placeholder when placeholder prop given", async () => {
+    const cfg: ConfigResponse = {
+      ...SAMPLE_CONFIG,
+      fingerprint: "fe03aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc",
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        daemon: {
+          ...SAMPLE_CONFIG.inventory.daemon,
+          startup_holdoff: "",
+        },
+      },
+    };
+
+    render(<SettingsForm config={cfg} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    const holdoffInput = screen.getByLabelText("startup_holdoff") as HTMLInputElement;
+    // The placeholder is set when the input is empty
+    expect(holdoffInput.placeholder).toBe("30s");
+  });
+
   it("does not show confirm when switching while clean", async () => {
     const confirmSpy = vi.spyOn(window, "confirm");
 

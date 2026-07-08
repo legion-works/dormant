@@ -109,6 +109,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
           locked={store.isLocked([...basePath, "audio"], redactedPaths)}
           onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
           error={fieldErrors[[...basePath, "audio"].join(".")]}
+          help="Play the screensaver's audio track. Off by default (muted)."
         />
 
         <EnumField
@@ -119,6 +120,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
           onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
           options={SCALE_MODES}
           error={fieldErrors[[...basePath, "scale_mode"].join(".")]}
+          help="fill = crop to fill the screen; fit = letterbox, no crop; stretch = distort to fill; center = native size, centered."
         />
 
         <EnumField
@@ -129,6 +131,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
           onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
           options={TRANSITIONS}
           error={fieldErrors[[...basePath, "transition"].join(".")]}
+          help="none = hard cut between images; crossfade = fade between them."
         />
 
         <DurationField
@@ -219,6 +222,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                     emitSources(next);
                   }}
                   error={fieldErrors[[...srcBase, "shuffle"].join(".")]}
+                  help="Shuffle this source's items. Mutually exclusive with order."
                 />
 
                 <EnumField
@@ -234,6 +238,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   }}
                   options={SOURCE_ORDERS}
                   error={fieldErrors[[...srcBase, "order"].join(".")]}
+                  help="sequential = in directory order; random = independent random pick each time; shuffle_playlist = shuffled once, then cycles."
                 />
 
                 <DurationField

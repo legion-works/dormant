@@ -17,5 +17,6 @@ pub mod executor;
 pub mod ha_passthrough;
 pub mod kwin_dpms;
 pub mod registry;
+pub mod samsung_ip;
 pub mod samsung_tizen;
 pub mod vcp_ops;

@@ -75,7 +75,11 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
     m.insert("ha-passthrough".to_string(), Vec::new());
     m.insert(
         "samsung-tizen".to_string(),
-        vec![BlankMode::ScreenOffAudioOn, BlankMode::PowerOff],
+        vec![
+            BlankMode::ScreenOffAudioOn,
+            BlankMode::BrightnessZero,
+            BlankMode::PowerOff,
+        ],
     );
     m
 }

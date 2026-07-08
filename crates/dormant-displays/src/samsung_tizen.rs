@@ -68,6 +68,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 // ── Constants ───────────────────────────────────────────────────────────────────
 
@@ -213,12 +214,9 @@ impl RealTvTransport {
         // functions return different opaque future types, so we can't use
         // a single `if/else` with Box::pin here.
         if self.ws_scheme == "wss" {
-            let uri = url
-                .parse::<tokio_tungstenite::tungstenite::http::Uri>()
-                .map_err(|e| format!("invalid WS URL: {e}"))?;
-            let request = tokio_tungstenite::tungstenite::http::Request::builder()
-                .uri(uri)
-                .body(())
+            let request = url
+                .as_str()
+                .into_client_request()
                 .map_err(|e| format!("failed to build WS request: {e}"))?;
 
             let connector = tokio_tungstenite::Connector::Rustls(Self::tls_config());
@@ -641,14 +639,8 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
         );
 
         let request = url
-            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
-            .map_err(|e| DormantError::DisplayIo {
-                controller: SamsungTizenController::NAME.into(),
-                detail: format!("invalid pair URL: {e}"),
-            })?;
-        let request = tokio_tungstenite::tungstenite::http::Request::builder()
-            .uri(request)
-            .body(())
+            .as_str()
+            .into_client_request()
             .map_err(|e| DormantError::DisplayIo {
                 controller: SamsungTizenController::NAME.into(),
                 detail: format!("failed to build pair request: {e}"),
@@ -854,6 +846,76 @@ mod tests {
             "URL missing base64 device name: {url}"
         );
         assert!(url.contains("token=abc123"), "URL missing token: {url}");
+    }
+
+    // ── WebSocket handshake headers (regression: sec-websocket-key) ─────────
+
+    /// RED-first proof: the OLD bare-`Request::builder().uri().body(())` pattern
+    /// produces a request with NO `sec-websocket-key` header. The `IntoClientRequest`
+    /// trait generates it automatically. This guard pins the real bug — a WSS
+    /// connect against a real Samsung TV without this header fails with
+    /// "Missing, duplicated or incorrect header sec-websocket-key".
+    #[test]
+    fn old_builder_missing_sec_websocket_key_proof() {
+        // Construct the URL the same way the real code does.
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode("dormant");
+        let url = format!("wss://192.0.2.7:8002{WS_PATH}?name={name_b64}&token=abc123");
+
+        // OLD pattern — exactly what the broken code used.
+        let uri = url
+            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
+            .unwrap();
+        let old_request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap();
+
+        // RED: the old construction does NOT generate a Sec-WebSocket-Key header.
+        assert!(
+            !old_request.headers().contains_key("sec-websocket-key"),
+            "OLD construction MUST lack sec-websocket-key — otherwise the bug never existed"
+        );
+    }
+
+    /// The FIXED construction via `IntoClientRequest` generates all mandatory
+    /// WebSocket handshake headers.
+    #[test]
+    fn into_client_request_generates_handshake_headers() {
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode("dormant");
+        let url = format!("wss://192.0.2.7:8002{WS_PATH}?name={name_b64}&token=abc123");
+
+        let request = url.as_str().into_client_request().unwrap();
+        let headers = request.headers();
+
+        assert!(
+            headers.contains_key("sec-websocket-key"),
+            "fixed request must carry a sec-websocket-key header"
+        );
+
+        let upgrade = headers
+            .get("upgrade")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            upgrade.to_lowercase(),
+            "websocket",
+            "Upgrade header must be 'websocket' (case-insensitive)"
+        );
+
+        let connection = headers
+            .get("connection")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            connection.to_lowercase().contains("upgrade"),
+            "Connection header must contain 'Upgrade'"
+        );
+
+        let version = headers
+            .get("sec-websocket-version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(version, "13", "Sec-WebSocket-Version must be 13");
     }
 
     // ── JSON payload construction ───────────────────────────────────────────

@@ -1257,7 +1257,11 @@ gracee_period = "60s"
             ),
             (
                 "samsung-tizen".into(),
-                vec![BlankMode::ScreenOffAudioOn, BlankMode::PowerOff],
+                vec![
+                    BlankMode::ScreenOffAudioOn,
+                    BlankMode::BrightnessZero,
+                    BlankMode::PowerOff,
+                ],
             ),
             ("ha-passthrough".into(), vec![]),
             ("command".into(), vec![]),
@@ -1286,8 +1290,10 @@ gracee_period = "60s"
     #[test]
     fn validate_detects_unsupported_blank_mode() {
         let mut cfg = valid_full_config();
-        // Change tv to use PowerOff with samsung-tizen (it supports it, so use
-        // BrightnessZero which samsung-tizen does NOT support).
+        // Change tv to use BrightnessZero with a controller chain that
+        // doesn't support it.  samsung-tizen now supports BrightnessZero,
+        // so we point tv at kwin-dpms (which only supports PowerOff).
+        cfg.displays.get_mut("tv").unwrap().controllers = vec!["kwin-dpms".into()];
         cfg.displays.get_mut("tv").unwrap().blank_mode = Some(BlankMode::BrightnessZero);
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(

@@ -21,27 +21,47 @@
 //!
 //! ## Blank modes
 //!
-//! | Mode | Key | Effect |
+//! | Mode | Key / transport | Effect |
 //! |---|---|---|
-//! | `ScreenOffAudioOn` | `KEY_PICTURE_OFF` | Panel dark, audio continues; toggle |
+//! | `ScreenOffAudioOn` | `KEY_PICTURE_OFF` (port 8002) | Panel dark, audio continues; toggle |
 //! | `PowerOff` | `KEY_POWER` | Full power-off |
+//! | `BrightnessZero` | `backlightControl` (port 1516) | Panel dimmed to 0 via IP Control; source + audio keep running |
 //!
 //! ## Wake
 //!
 //! `KEY_RETURN` wakes the TV from picture-off (verified on S90D — not a
 //! toggle, safe to send when state is uncertain). When `wol_mac` is set,
 //! a Wake-on-LAN magic packet is broadcast before the WS wake attempt.
+//! For `BrightnessZero`, wake restores the previously-saved backlight
+//! value (see [the IP Control section](#samsung-ip-control-g2-backlight)).
 //!
 //! ## Socket lifecycle
 //!
 //! The TV silently drops idle WebSocket connections during picture-off.
 //! The first write on a stale socket returns `Ok` at the TCP level (the
 //! frame is lost, the RST arrives later), so a send-only error check
-//! misses the failure. The controller uses a WebSocket ping→pong liveness
-//! check before writing a key to a cached socket; if no pong arrives
-//! within 2 s the socket is treated as dead and replaced. As a further
-//! backstop, a send error after a passed liveness check still triggers
-//! one reconnect-and-retry.
+//! misses the failure. The robust liveness signal is **time since the TV
+//! last sent ANY frame** — Samsung drives the heartbeat by sending
+//! WebSocket pings/frames roughly every ~10 s. A background reader task
+//! (spawned at connect time, cancelled at replace time) continuously
+//! drains incoming frames and updates a shared `last_seen` timestamp;
+//! `tungstenite` auto-responds to pings with pongs. Before sending a key,
+//! the controller checks `now - last_seen > MAX_WS_SILENCE` and treats
+//! the socket as stale → reconnect. As a further backstop, a send error
+//! after a passed freshness check still triggers one reconnect-and-retry.
+//! This is the proven `ollo69/ha-samsungtv-smart` pattern — the client
+//! no longer relies on its own ping→pong round-trip; the TV is the
+//! authoritative heartbeat.
+//!
+//! ## Samsung IP Control G2 (backlight)
+//!
+//! `BrightnessZero` blanks via Samsung IP Control G2 (HTTPS port 1516,
+//! JSON-RPC 2.0, `backlightControl` method). This is the audio-safe
+//! alternative to `KEY_PICTURE_OFF` — the panel backlight goes to 0
+//! (near-black dim, not true-off) while the HDMI source and audio keep
+//! running. Implementation lives in [`crate::samsung_ip`]; the controller
+//! here holds a [`samsung_ip::BacklightTransport`] and an in-controller
+//! `saved_backlight` value following the ddcci first-blank-wins pattern.
 //!
 //! ## Unreachable policy
 //!
@@ -53,9 +73,12 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -65,6 +88,7 @@ use dormant_core::traits::DisplayController;
 use dormant_core::types::{BlankMode, CmdFailure};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use futures_util::stream::{SplitSink, SplitStream};
 use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -72,6 +96,8 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+use crate::samsung_ip::{self, BacklightTransport, RealBacklightTransport};
 
 // ── Constants ───────────────────────────────────────────────────────────────────
 
@@ -114,8 +140,11 @@ const REST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default seconds for a WebSocket connect timeout.
 const WS_CONNECT_TIMEOUT_SECS: u64 = 5;
 
-/// Maximum time to wait for a WebSocket pong during the liveness check.
-const PING_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum time to wait since the TV last sent any frame before treating
+/// the cached WebSocket as stale and reconnecting. Samsung TVs drive the
+/// heartbeat — they send a WebSocket ping (or data frame) roughly every
+/// ~10 s. Anything beyond that means the silent-drop happened.
+const MAX_WS_SILENCE: Duration = Duration::from_secs(10);
 
 // ── TvTransport trait — network boundary for test injection ─────────────────────
 
@@ -146,26 +175,118 @@ pub trait TvTransport: Send + Sync {
 
 // ── Real transport ──────────────────────────────────────────────────────────────
 
+/// Alias for the cached WebSocket write half.
+type TvWsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+/// Shared state owned by a single [`RealTvTransport`] instance.
+///
+/// The reader task (spawned at connect time) updates `last_seen` on every
+/// received frame; the sender reads it to decide whether the cached socket
+/// is still worth talking to. `cancel` signals the reader task to exit when
+/// a fresh connection replaces the cached socket — without this the old
+/// reader would keep polling its dead half of a torn-down stream.
+struct WsReaderState {
+    /// Instant of the most recently received frame from the TV.
+    last_seen: StdMutex<Instant>,
+    /// Set to `true` when the reader exits because the peer closed the
+    /// connection or sent an error frame. The sender checks this before
+    /// dispatching a fresh send.
+    dead: AtomicBool,
+    /// Fires when the transport replaces the cached socket. The reader
+    /// selects on `cancel.cancelled()` alongside `stream.next()` so it can
+    /// exit promptly instead of leaking across reconnects.
+    cancel: CancellationToken,
+}
+
+impl WsReaderState {
+    fn fresh() -> Arc<Self> {
+        Arc::new(Self {
+            // `last_seen` starts at construction time. A socket that never
+            // sees a frame is still considered fresh for MAX_WS_SILENCE
+            // from this anchor, which is correct: the connect just happened.
+            last_seen: StdMutex::new(Instant::now()),
+            dead: AtomicBool::new(false),
+            cancel: CancellationToken::new(),
+        })
+    }
+
+    fn touch(&self) {
+        if let Ok(mut t) = self.last_seen.lock() {
+            *t = Instant::now();
+        }
+    }
+
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    fn is_stale(&self, max_silence: Duration) -> bool {
+        match self.last_seen.lock() {
+            Ok(t) => t.elapsed() > max_silence,
+            Err(_) => true, // poisoned → treat as stale, force reconnect
+        }
+    }
+}
+
+/// Background reader task: continuously drains incoming frames from the
+/// WebSocket read half, updating `last_seen` on every frame.
+///
+/// `tungstenite` auto-responds to incoming pings with pongs, so this task
+/// does not need to inspect frame types — any incoming byte means the
+/// socket is alive from the TV's side. On peer close or read error the
+/// task flips the `dead` flag so the sender reconnects on the next send.
+async fn run_ws_reader(
+    mut read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    state: Arc<WsReaderState>,
+) {
+    loop {
+        tokio::select! {
+            // Biased so a cancellation is observed promptly even if a frame
+            // is already waiting in the stream's internal buffer.
+            biased;
+            () = state.cancel.cancelled() => break,
+            next = read.next() => {
+                if let Some(Ok(_)) = next {
+                    state.touch();
+                } else {
+                    state.dead.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Production transport: persistent TLS WebSocket, REST HTTP, `WoL` UDP.
 ///
 /// When testing, can be constructed with a plain `ws://` scheme so that
 /// local tokio-tungstenite servers (no TLS) can exercise the reconnect logic.
 struct RealTvTransport {
-    /// Cached WebSocket connection, protected by a mutex so that concurrent
-    /// blank/wake calls don't race on reconnection.
-    ws: Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    /// Cached WebSocket **write half** — the read half is owned by the
+    /// background reader task. Holding only the sink lets the reader task
+    /// poll frames without contending with the sender.
+    ws: Mutex<Option<TvWsSink>>,
+    /// Shared reader state; replaced under a std-mutex when the cached
+    /// socket is replaced. The std-mutex is sufficient because the critical
+    /// section is a few atomic operations and connect-replacement runs
+    /// rarely (every reconnect).
+    reader_state: StdMutex<Arc<WsReaderState>>,
     /// URL scheme — `"wss"` in production, `"ws"` for plain-TCP tests.
     ws_scheme: &'static str,
     /// WebSocket port — 8002 in production, overridden in tests.
     ws_port: u16,
+    /// Maximum silence before treating the cached socket as stale.
+    max_ws_silence: Duration,
 }
 
 impl RealTvTransport {
     fn new() -> Self {
         Self {
             ws: Mutex::new(None),
+            reader_state: StdMutex::new(WsReaderState::fresh()),
             ws_scheme: "wss",
             ws_port: WS_PORT,
+            max_ws_silence: MAX_WS_SILENCE,
         }
     }
 
@@ -175,8 +296,9 @@ impl RealTvTransport {
     #[cfg(test)]
     async fn close_cached_for_test(&self) {
         let mut guard = self.ws.lock().await;
-        if let Some(ref mut ws) = *guard {
-            let _ = ws.close(None).await;
+        if let Some(sink) = guard.as_mut() {
+            let _ = sink.send(Message::Close(None)).await;
+            let _ = sink.close().await;
         }
         drop(guard);
         // Brief yield to let the close propagate through the stream.
@@ -188,10 +310,43 @@ impl RealTvTransport {
     /// server.
     #[cfg(test)]
     fn for_test(port: u16) -> Self {
+        Self::for_test_with_silence(port, MAX_WS_SILENCE)
+    }
+
+    /// Build a test transport with a custom freshness threshold — lets
+    /// stale-socket tests use a sub-second window instead of waiting 10 s.
+    #[cfg(test)]
+    fn for_test_with_silence(port: u16, max_ws_silence: Duration) -> Self {
         Self {
             ws: Mutex::new(None),
+            reader_state: StdMutex::new(WsReaderState::fresh()),
             ws_scheme: "ws",
             ws_port: port,
+            max_ws_silence,
+        }
+    }
+
+    /// Test helper: clone the current reader-state Arc so tests can poll
+    /// `last_seen` / `dead` from outside the transport.
+    #[cfg(test)]
+    fn reader_state_for_test(&self) -> Arc<WsReaderState> {
+        Arc::clone(&*self.reader_state.lock().expect("reader_state poisoned"))
+    }
+
+    /// Test helper: rewind `last_seen` so the freshness check considers
+    /// the cached socket stale immediately.
+    #[cfg(test)]
+    fn age_last_seen_for_test(&self, age: Duration) {
+        let state = self.reader_state.lock().expect("reader_state poisoned");
+        if let Ok(mut t) = state.last_seen.lock() {
+            *t = Instant::now().checked_sub(age).unwrap_or_else(|| {
+                // `Instant::now() - 1ns` is well-defined on every platform
+                // (monotonic clock, smallest representable step), but
+                // clippy flags it as a subtraction. Wrap in `checked_sub`
+                // and fall back to the saturating variant.
+                let now = Instant::now();
+                now.checked_sub(Duration::from_nanos(1)).unwrap_or(now)
+            });
         }
     }
 
@@ -208,8 +363,38 @@ impl RealTvTransport {
         )
     }
 
-    /// Connect (or reconnect) a WebSocket to the TV, replacing the cached socket.
+    /// Connect (or reconnect) a WebSocket to the TV, replacing the cached
+    /// socket and spawning a fresh reader task.
+    ///
+    /// The old reader task is cancelled BEFORE the new connection starts
+    /// so it cannot observe a half-torn-down stream. A short yield gives
+    /// it a chance to exit before we proceed (the cancellation is observed
+    /// on the next select! poll).
     async fn connect_ws(&self, host: &str, token: &str) -> Result<(), String> {
+        // 1. Drop the cached sink — this signals EOF on the read half, but
+        //    we also cancel the reader task explicitly so it cannot race
+        //    with our state replacement.
+        {
+            let mut guard = self.ws.lock().await;
+            let _ = (*guard).take();
+        }
+
+        // 2. Cancel the prior reader state and swap in a fresh one. The
+        //    std-mutex covers the brief window where the new reader could
+        //    otherwise race the cancel signal.
+        let new_state = WsReaderState::fresh();
+        let old_state = {
+            let mut guard = self.reader_state.lock().expect("reader_state poisoned");
+            let old = std::mem::replace(&mut *guard, new_state);
+            drop(guard);
+            old
+        };
+        old_state.cancel.cancel();
+        // We deliberately do not block waiting for the old reader to exit;
+        // its select! loop observes `cancel` on the next poll and drops the
+        // read half, which closes the TCP socket when the prior sink is
+        // already gone.
+
         let name_b64 = base64::engine::general_purpose::STANDARD.encode(DEVICE_NAME);
         let url = format!(
             "{}://{host}:{}{WS_PATH}?name={name_b64}&token={token}",
@@ -219,7 +404,7 @@ impl RealTvTransport {
         // Branch at compile-like level: TLS vs plain. The two connect
         // functions return different opaque future types, so we can't use
         // a single `if/else` with Box::pin here.
-        if self.ws_scheme == "wss" {
+        let (sink, read) = if self.ws_scheme == "wss" {
             let request = url
                 .as_str()
                 .into_client_request()
@@ -233,35 +418,42 @@ impl RealTvTransport {
                 Some(connector),
             );
             match timeout(Duration::from_secs(WS_CONNECT_TIMEOUT_SECS), connect_fut).await {
-                Ok(Ok((ws, _response))) => {
-                    let mut guard = self.ws.lock().await;
-                    *guard = Some(ws);
-                    Ok(())
-                }
-                Ok(Err(e)) => Err(format!("WebSocket connect failed: {e}")),
-                Err(_) => Err("WebSocket connect timed out".to_string()),
+                Ok(Ok((ws, _response))) => ws.split(),
+                Ok(Err(e)) => return Err(format!("WebSocket connect failed: {e}")),
+                Err(_) => return Err("WebSocket connect timed out".to_string()),
             }
         } else {
             let connect_fut = tokio_tungstenite::connect_async(&url);
             match timeout(Duration::from_secs(WS_CONNECT_TIMEOUT_SECS), connect_fut).await {
-                Ok(Ok((ws, _response))) => {
-                    let mut guard = self.ws.lock().await;
-                    *guard = Some(ws);
-                    Ok(())
-                }
-                Ok(Err(e)) => Err(format!("WebSocket connect failed: {e}")),
-                Err(_) => Err("WebSocket connect timed out".to_string()),
+                Ok(Ok((ws, _response))) => ws.split(),
+                Ok(Err(e)) => return Err(format!("WebSocket connect failed: {e}")),
+                Err(_) => return Err("WebSocket connect timed out".to_string()),
             }
-        }
+        };
+
+        // 3. Install the new sink and spawn the reader task BEFORE returning
+        //    so the caller can immediately send without a window where a
+        //    fresh socket exists but no reader is watching it.
+        let reader_state = Arc::clone(&*self.reader_state.lock().expect("reader_state poisoned"));
+        tokio::spawn(run_ws_reader(read, reader_state));
+
+        let mut guard = self.ws.lock().await;
+        *guard = Some(sink);
+        Ok(())
     }
 
     /// Send a single text frame over the cached WebSocket, reconnecting if needed.
     ///
-    /// Before writing a key to a cached socket, a WebSocket ping→pong
-    /// liveness check proves the connection is still alive. Samsung TVs
-    /// silently drop idle sockets during picture-off; writing to a stale
-    /// socket returns `Ok` at the TCP level (the frame is lost, the RST
-    /// arrives later), so a send-only error check is not sufficient.
+    /// Two stale-socket guards run before the send:
+    ///
+    /// 1. The reader's `dead` flag (set when the peer closed the connection
+    ///    or the reader hit an error frame).
+    /// 2. The freshness check (`now - last_seen > MAX_WS_SILENCE`). Samsung
+    ///    drives the heartbeat by pinging roughly every ~10 s; silence
+    ///    beyond that means the silent-drop happened.
+    ///
+    /// As a backstop, a send error after a passed freshness check still
+    /// triggers one reconnect-and-retry.
     async fn ws_send_with_retry(
         &self,
         host: &str,
@@ -277,60 +469,52 @@ impl RealTvTransport {
             }
         }
 
-        // Try the cached socket — but first verify it is alive.
-        let mut guard = self.ws.lock().await;
-        if let Some(ref mut ws) = *guard {
-            if Self::ws_is_live(ws).await {
-                // Socket passed liveness check — send the real payload.
-                match ws.send(Message::Text(payload.to_string())).await {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        tracing::info!(
-                            controller = SamsungTizenController::NAME,
-                            "WS send failed ({e}), reconnecting"
-                        );
-                        *guard = None;
+        // Try the cached socket — but first verify it is alive via the
+        // TV-driven heartbeat signal.
+        let current_state = Arc::clone(&*self.reader_state.lock().expect("reader_state poisoned"));
+        let mut needs_reconnect = false;
+        {
+            let mut guard = self.ws.lock().await;
+            if guard.is_some() {
+                if current_state.is_dead() || current_state.is_stale(self.max_ws_silence) {
+                    tracing::info!(
+                        controller = SamsungTizenController::NAME,
+                        "WS freshness check failed (dead or stale), reconnecting"
+                    );
+                    *guard = None;
+                    needs_reconnect = true;
+                } else {
+                    match guard
+                        .as_mut()
+                        .expect("just checked")
+                        .send(Message::Text(payload.to_string()))
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            tracing::info!(
+                                controller = SamsungTizenController::NAME,
+                                "WS send failed ({e}), reconnecting"
+                            );
+                            *guard = None;
+                            needs_reconnect = true;
+                        }
                     }
                 }
-            } else {
-                tracing::info!(
-                    controller = SamsungTizenController::NAME,
-                    "WS liveness check failed, reconnecting"
-                );
-                *guard = None;
             }
         }
-        drop(guard);
+        let _ = needs_reconnect; // only used to document intent below
 
         // Reconnect and retry once.
         self.connect_ws(host, token).await?;
 
         let mut guard = self.ws.lock().await;
-        if let Some(ref mut ws) = *guard {
-            ws.send(Message::Text(payload.to_string()))
+        match guard.as_mut() {
+            Some(sink) => sink
+                .send(Message::Text(payload.to_string()))
                 .await
-                .map_err(|e| format!("WS send after reconnect failed: {e}"))
-        } else {
-            Err("WS connection lost after reconnect".to_string())
-        }
-    }
-
-    /// Verify a cached WebSocket is still alive with a ping→pong roundtrip.
-    ///
-    /// Sends a WebSocket Ping and waits up to `PING_TIMEOUT` for the
-    /// matching Pong. On a half-open socket (peer sent TCP FIN but the
-    /// local write buffer still accepts data) the ping send succeeds but no
-    /// pong ever arrives, so the timeout catches the stale connection.
-    async fn ws_is_live(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> bool {
-        if ws.send(Message::Ping(vec![])).await.is_err() {
-            return false;
-        }
-        loop {
-            match tokio::time::timeout(PING_TIMEOUT, ws.next()).await {
-                Ok(Some(Ok(Message::Pong(_)))) => return true,
-                Ok(Some(Err(_)) | None) | Err(_) => return false,
-                _ => {} // skip data / other frames — wait for the matching Pong
-            }
+                .map_err(|e| format!("WS send after reconnect failed: {e}")),
+            None => Err("WS connection lost after reconnect".to_string()),
         }
     }
 }
@@ -487,7 +671,8 @@ fn build_magic_packet(mac: &str) -> Result<Vec<u8>, String> {
 /// Display controller for Samsung Tizen TVs (S90D and similar).
 ///
 /// Communicates over the TV's WebSocket remote-control channel (port 8002)
-/// and queries panel state via the REST device-info endpoint (port 8001).
+/// for `KEY_*` blank/wake and over Samsung IP Control G2 (HTTPS port 1516,
+/// JSON-RPC) for the `BrightnessZero` audio-safe blank mode.
 ///
 /// Constructed by [`crate::registry::build_controllers`] from a
 /// [`dormant_core::config::schema::DisplayConfig`] that names `samsung-tizen`
@@ -503,6 +688,15 @@ pub struct SamsungTizenController {
     treat_unreachable_as_blanked: bool,
     /// Transport layer — real network in production, fake in tests.
     transport: Arc<dyn TvTransport>,
+    /// Port-1516 backlight transport for the audio-safe `BrightnessZero`
+    /// blank mode. Real in production, fake in tests.
+    backlight: Arc<dyn BacklightTransport>,
+    /// Backlight value at the time of the first `BrightnessZero` blank.
+    /// First-blank-wins pattern: a second blank while already at 0 reads
+    /// `current=0` and must NOT clobber the real saved value, or wake
+    /// would restore 0 (stuck-dark). Cleared on wake so the next cycle
+    /// re-saves whatever the user has since set.
+    saved_backlight: StdMutex<Option<u8>>,
 }
 
 impl std::fmt::Debug for SamsungTizenController {
@@ -516,6 +710,8 @@ impl std::fmt::Debug for SamsungTizenController {
                 &self.treat_unreachable_as_blanked,
             )
             .field("transport", &"dyn TvTransport")
+            .field("backlight", &"dyn BacklightTransport")
+            .field("saved_backlight", &"Option<u8>")
             .finish()
     }
 }
@@ -524,7 +720,7 @@ impl SamsungTizenController {
     /// Literal controller name — grep-stable, matches the `samsung-tizen` config type.
     const NAME: &'static str = "samsung-tizen";
 
-    /// Build a new controller with the real network transport.
+    /// Build a new controller with the real network transports.
     #[must_use]
     pub fn new(
         host: String,
@@ -538,10 +734,12 @@ impl SamsungTizenController {
             wol_mac,
             treat_unreachable_as_blanked,
             transport: Arc::new(RealTvTransport::new()),
+            backlight: Arc::new(RealBacklightTransport::new()),
+            saved_backlight: StdMutex::new(None),
         }
     }
 
-    /// Build a controller with a custom transport (used by tests).
+    /// Build a controller with custom transports (used by tests).
     #[must_use]
     pub fn with_transport(
         host: String,
@@ -556,6 +754,29 @@ impl SamsungTizenController {
             wol_mac,
             treat_unreachable_as_blanked,
             transport,
+            backlight: Arc::new(RealBacklightTransport::new()),
+            saved_backlight: StdMutex::new(None),
+        }
+    }
+
+    /// Build a controller with BOTH transports injected (used by tests).
+    #[must_use]
+    pub fn with_transports(
+        host: String,
+        token: String,
+        wol_mac: Option<String>,
+        treat_unreachable_as_blanked: bool,
+        transport: Arc<dyn TvTransport>,
+        backlight: Arc<dyn BacklightTransport>,
+    ) -> Self {
+        Self {
+            host,
+            token,
+            wol_mac,
+            treat_unreachable_as_blanked,
+            transport,
+            backlight,
+            saved_backlight: StdMutex::new(None),
         }
     }
 
@@ -578,6 +799,78 @@ impl SamsungTizenController {
         );
         Ok(())
     }
+
+    /// Blank via Samsung IP Control G2 backlight.
+    ///
+    /// On the first blank: read the current backlight, save it, set to 0.
+    /// On subsequent blanks (already at 0): read returns 0, but the saved
+    /// value is NOT overwritten — first-blank-wins prevents the wake from
+    /// restoring 0 (stuck-dark).
+    async fn blank_backlight(&self) -> Result<(), CmdFailure> {
+        let token = self
+            .backlight
+            .acquire_token(&self.host)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+
+        let current = self
+            .backlight
+            .get_backlight(&self.host, &token)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+
+        self.backlight
+            .set_backlight(&self.host, &token, 0)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+
+        let mut saved = self
+            .saved_backlight
+            .lock()
+            .expect("saved_backlight poisoned");
+        if saved.is_none() {
+            *saved = Some(current);
+        }
+        Ok(())
+    }
+
+    /// Wake via backlight restore. Returns `true` if a backlight restore
+    /// was performed (caller should NOT then send `KEY_RETURN`); `false`
+    /// if there was nothing to restore (caller should fall through to the
+    /// picture-off wake path).
+    async fn restore_backlight(&self) -> Result<bool, CmdFailure> {
+        let restore_to = {
+            let mut saved = self
+                .saved_backlight
+                .lock()
+                .expect("saved_backlight poisoned");
+            saved.take()
+        };
+        let Some(target) = restore_to else {
+            return Ok(false);
+        };
+
+        let token = self
+            .backlight
+            .acquire_token(&self.host)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+        self.backlight
+            .set_backlight(&self.host, &token, target)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -587,7 +880,11 @@ impl DisplayController for SamsungTizenController {
     }
 
     fn supported_modes(&self) -> Vec<BlankMode> {
-        vec![BlankMode::ScreenOffAudioOn, BlankMode::PowerOff]
+        vec![
+            BlankMode::ScreenOffAudioOn,
+            BlankMode::BrightnessZero,
+            BlankMode::PowerOff,
+        ]
     }
 
     async fn is_available(&self) -> bool {
@@ -595,36 +892,39 @@ impl DisplayController for SamsungTizenController {
     }
 
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
-        // If the TV is unreachable and the policy says to treat it as blanked,
-        // succeed silently. An off TV has no picture to protect.
-        if !self.is_tv_reachable().await && self.treat_unreachable_as_blanked {
-            return self.unreachable_noop("blank");
-        }
-
-        let key = match mode {
-            BlankMode::ScreenOffAudioOn => KEY_PICTURE_OFF,
-            BlankMode::PowerOff => KEY_POWER,
+        match mode {
             BlankMode::BrightnessZero => {
-                return Err(CmdFailure {
-                    controller: Self::NAME.to_string(),
-                    error: format!(
-                        "{E_DISPLAY_IO}: unsupported blank mode {mode:?} for samsung-tizen"
-                    ),
-                });
+                // Treat unreachable the same as the WebSocket path — an off
+                // TV has no panel to dim, succeed as a no-op.
+                if !self.is_tv_reachable().await && self.treat_unreachable_as_blanked {
+                    return self.unreachable_noop("blank");
+                }
+                self.blank_backlight().await
             }
-        };
+            BlankMode::ScreenOffAudioOn | BlankMode::PowerOff => {
+                if !self.is_tv_reachable().await && self.treat_unreachable_as_blanked {
+                    return self.unreachable_noop("blank");
+                }
 
-        self.transport
-            .send_key(&self.host, &self.token, key)
-            .await
-            .map_err(|e| CmdFailure {
-                controller: Self::NAME.to_string(),
-                error: format!("{E_DISPLAY_IO}: {e}"),
-            })
+                let key = match mode {
+                    BlankMode::ScreenOffAudioOn => KEY_PICTURE_OFF,
+                    BlankMode::PowerOff => KEY_POWER,
+                    BlankMode::BrightnessZero => unreachable!(),
+                };
+
+                self.transport
+                    .send_key(&self.host, &self.token, key)
+                    .await
+                    .map_err(|e| CmdFailure {
+                        controller: Self::NAME.to_string(),
+                        error: format!("{E_DISPLAY_IO}: {e}"),
+                    })
+            }
+        }
     }
 
     async fn wake(&self) -> Result<(), CmdFailure> {
-        // Best-effort WoL for deep-standby TVs.
+        // Best-effort WoL for deep-standby TVs (same as before).
         if let Some(ref mac) = self.wol_mac
             && let Err(e) = self.transport.send_wol(mac).await
         {
@@ -639,6 +939,15 @@ impl DisplayController for SamsungTizenController {
         // succeed silently after the WoL attempt.
         if !self.is_tv_reachable().await && self.treat_unreachable_as_blanked {
             return self.unreachable_noop("wake");
+        }
+
+        // If a backlight restore is pending (from a BrightnessZero blank),
+        // perform it and skip the KEY_RETURN path. The two paths are
+        // mutually exclusive because a single TV is configured with one
+        // blank_mode; saved_backlight being Some means the TV was dimmed
+        // (not picture-off'd) and the audio path is what we need to keep.
+        if self.restore_backlight().await? {
+            return Ok(());
         }
 
         // KEY_RETURN wakes from picture-off and is not a toggle — safe even
@@ -861,6 +1170,7 @@ impl TvTransport for FakeTvTransport {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+    use crate::samsung_ip::FakeBacklightTransport;
     use dormant_core::error::E_DISPLAY_IO;
 
     // ── URL construction ────────────────────────────────────────────────────
@@ -1091,14 +1401,261 @@ mod tests {
         assert_eq!(keys, vec!["KEY_RETURN"]);
     }
 
+    /// `BrightnessZero` is supported by samsung-tizen (via port-1516 backlight).
+    /// The fake `TvTransport` is irrelevant — blank goes through the backlight
+    /// transport, which the test wires below.
     #[tokio::test]
-    async fn blank_brightness_zero_rejected() {
-        let fake = Arc::new(FakeTvTransport::new());
-        let ctrl = test_controller(fake.clone());
+    async fn blank_brightness_zero_acquires_reads_sets_via_backlight_transport() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // Program: acquire → "tok", get_backlight → 35, set_backlight → ok.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-1".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(35));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+
+        // No WS key was sent — BrightnessZero uses the backlight path only.
+        assert!(
+            tv_fake.take_sent_keys().is_empty(),
+            "BrightnessZero must not send WS keys"
+        );
+
+        // Acquire was called once with the right host.
+        assert_eq!(*bl_fake.acquire_hosts.lock().unwrap(), vec!["10.1.1.7"]);
+        // Get was called with the acquired token.
+        assert_eq!(
+            *bl_fake.get_calls.lock().unwrap(),
+            vec![("10.1.1.7".to_string(), "tok-1".to_string())]
+        );
+        // Set was called once with backlight=0 and the acquired token
+        // (recorded as value, token comes through get_calls).
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("10.1.1.7".to_string(), 0)]
+        );
+
+        // First-blank-wins: saved_backlight is the read value (35), so a
+        // second blank reads 0 but does NOT overwrite the saved value.
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(35));
+    }
+
+    /// First-blank-wins: a second blank while already at backlight 0 must
+    /// NOT clobber the saved value with 0, or wake would restore 0
+    /// (stuck-dark panel).
+    #[tokio::test]
+    async fn blank_brightness_zero_twice_does_not_overwrite_saved() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(42));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(42));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(
+            *ctrl.saved_backlight.lock().unwrap(),
+            Some(42),
+            "second blank must NOT clobber saved value with 0"
+        );
+
+        // Two set_backlight calls happened, both to 0.
+        assert_eq!(bl_fake.set_calls.lock().unwrap().len(), 2);
+    }
+
+    /// Wake after `BrightnessZero`: restore the saved backlight value, then
+    /// clear saved so the next cycle re-saves fresh.
+    #[tokio::test]
+    async fn wake_after_brightness_zero_restores_saved_and_clears() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(28));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // For wake: acquire + set_backlight(28)
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(28));
+
+        ctrl.wake().await.unwrap();
+        // Wake restored to 28 and cleared saved.
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("10.1.1.7".to_string(), 0), ("10.1.1.7".to_string(), 28)]
+        );
+        assert!(
+            ctrl.saved_backlight.lock().unwrap().is_none(),
+            "wake must clear saved_backlight so the next cycle re-saves"
+        );
+        // KEY_RETURN was NOT sent — backlight restore is the wake.
+        assert!(
+            tv_fake.take_sent_keys().is_empty(),
+            "wake after BrightnessZero must not send KEY_RETURN"
+        );
+    }
+
+    /// Wake after picture-off (no saved backlight) must still send `KEY_RETURN`.
+    #[tokio::test]
+    async fn wake_without_saved_backlight_sends_key_return() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake,
+        );
+
+        ctrl.wake().await.unwrap();
+        assert_eq!(tv_fake.take_sent_keys(), vec![KEY_RETURN]);
+    }
+
+    /// `BrightnessZero` blank when the TV is unreachable (and the policy says
+    /// to treat unreachable as blanked) must succeed as a no-op — same
+    /// contract as the WebSocket path.
+    #[tokio::test]
+    async fn blank_brightness_zero_unreachable_noops_when_policy_enabled() {
+        let tv_fake = Arc::new(FakeTvTransport::with_connect_results(vec![false]));
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true, // treat_unreachable_as_blanked = true
+            tv_fake,
+            bl_fake.clone(),
+        );
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        // Backlight transport was not touched.
+        assert!(bl_fake.acquire_hosts.lock().unwrap().is_empty());
+        assert!(bl_fake.set_calls.lock().unwrap().is_empty());
+    }
+
+    /// `BrightnessZero` backlight errors must surface as `CmdFailure` with the
+    /// `E_DISPLAY_IO` prefix and a JSON-RPC code anchor.
+    #[tokio::test]
+    async fn blank_brightness_zero_failure_maps_to_e_display_io() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Err("-32601 boom".into()));
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake,
+        );
         let err = ctrl.blank(BlankMode::BrightnessZero).await.unwrap_err();
-        assert_eq!(err.controller, SamsungTizenController::NAME);
+        assert_eq!(err.controller, "samsung-tizen");
         assert!(err.error.starts_with(E_DISPLAY_IO));
-        assert!(err.error.contains("unsupported"));
+        assert!(err.error.contains(samsung_ip::E_JSONRPC_METHOD_NOT_FOUND));
+    }
+
+    /// A -32010 unauthorized response from set/get must invalidate the
+    /// cached token so the controller's next call re-acquires.
+    #[tokio::test]
+    async fn blank_brightness_zero_unauthorized_invalidates_token() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("stale-tok".into()));
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("fresh-tok".into()));
+        // First get returns the unauthorized error.
+        bl_fake
+            .get_results
+            .lock()
+            .unwrap()
+            .push(Err("-32010 bad token".into()));
+        // Second acquire succeeds, then get+set succeed.
+        bl_fake.get_results.lock().unwrap().push(Ok(20));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+        );
+
+        // The first blank fails — but map_transport_error calls invalidate
+        // which is wired into the fake's `acquire_hosts` push marker.
+        let _ = ctrl.blank(BlankMode::BrightnessZero).await;
+        // The map helper was hit, recording an invalidate marker.
+        let hosts = bl_fake.acquire_hosts.lock().unwrap();
+        assert!(
+            hosts.iter().any(|h| h == "invalidate:10.1.1.7"),
+            "invalidate_token should have been called on -32010; hosts={hosts:?}"
+        );
     }
 
     // ── Unreachable no-op policy ────────────────────────────────────────────
@@ -1249,13 +1806,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supported_modes_includes_screen_off_and_power_off() {
+    async fn supported_modes_includes_screen_off_power_off_and_brightness_zero() {
         let fake = Arc::new(FakeTvTransport::new());
         let ctrl = test_controller(fake);
         let modes = ctrl.supported_modes();
         assert!(modes.contains(&BlankMode::ScreenOffAudioOn));
         assert!(modes.contains(&BlankMode::PowerOff));
-        assert!(!modes.contains(&BlankMode::BrightnessZero));
+        assert!(
+            modes.contains(&BlankMode::BrightnessZero),
+            "BrightnessZero (audio-safe dim via port 1516) is supported"
+        );
     }
 
     #[tokio::test]
@@ -1349,19 +1909,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // The liveness check sends a Ping before the key — read both frames.
+        // New design: no client-side Ping before the key. The server reads
+        // exactly one frame (the key). The reader task is spawned on
+        // connect; it sits in `select!` waiting for frames and does not
+        // block the send path.
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
-            // Skip the liveness-check Ping (tungstenite auto-pongs it).
-            let _liveness_ping = ws.next().await;
-            // Read the incoming key-press frame.
             let msg = ws.next().await;
             assert!(msg.is_some(), "server should receive a frame");
         });
 
         let transport = RealTvTransport::for_test(port);
-        // First call on a cold cache — must connect, pass liveness, and send.
         let result = transport
             .send_key("127.0.0.1", "test-token", KEY_RETURN)
             .await;
@@ -1386,16 +1945,14 @@ mod tests {
 
         // Server accepts two connections.
         let server = tokio::spawn(async move {
-            // Connection 1: accept, skip Ping, read the priming key.
+            // Connection 1: accept, read the priming key.
             {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
-                let _liveness_ping = ws.next().await; // liveness-check Ping
                 let msg = ws.next().await; // priming key
                 assert!(msg.is_some(), "connection 1 should receive a frame");
             }
             // Connection 2: accept, read the retry frame.
-            // The reconnect path sends text directly (no Ping — socket is fresh).
             {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
@@ -1413,14 +1970,13 @@ mod tests {
             .unwrap();
 
         // Explicitly close the cached socket — this simulates the TV
-        // dropping the connection after picture-off. The cached socket
-        // is now dead but still present, forcing the "try-cached → fail
-        // → reconnect → retry" path.
+        // dropping the connection after picture-off. The reader task on
+        // the dead read half flips the `dead` flag and exits; the next
+        // `send_key` sees dead=true and reconnects.
         transport.close_cached_for_test().await;
 
-        // Second send: tries the dead cached socket → liveness check
-        // fails (Ping → error on closed socket) → reconnect →
-        // retry succeeds on connection 2.
+        // Second send: sees dead cached socket → reconnect → retry succeeds
+        // on connection 2.
         let result = transport
             .send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF)
             .await;
@@ -1430,6 +1986,219 @@ mod tests {
         );
 
         server.await.unwrap();
+    }
+
+    // ── Reader-task lifecycle (cancellation token) ──────────────────────────
+
+    /// When the transport replaces its cached socket (reconnect), the old
+    /// reader task MUST be cancelled — otherwise it leaks across
+    /// reconnects, holding dead stream halves and logging spurious errors.
+    ///
+    /// The test forces a reconnect via the freshness check and verifies
+    /// that the `reader_state` Arc is swapped to a fresh instance (so the
+    /// prior reader's `CancellationToken` is no longer the active one).
+    /// The prior reader task is observing a `CancellationToken` that has
+    /// been fired; its `select!` loop exits on the next poll.
+    #[tokio::test]
+    async fn old_reader_task_is_cancelled_on_reconnect() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Server accepts TWO connections. Conn 1 stays alive but silent
+        // (no frames sent — simulates the silent-drop scenario); conn 2
+        // receives the retry key after freshness-driven reconnect.
+        let server = tokio::spawn(async move {
+            // Conn 1: read priming key, then stay silent (no Close, no
+            // pings — the kernel TCP socket stays open so the client's
+            // reader task sees no EOF and does not mark itself dead; only
+            // the freshness timer fires).
+            let (s1, _) = listener.accept().await.unwrap();
+            let mut ws1 = accept_async(s1).await.unwrap();
+            let _priming = ws1.next().await;
+            // Hold the WS open long enough for the client's freshness
+            // check to fire and the reconnect to land on conn 2.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(ws1);
+
+            // Conn 2: receives the key sent after freshness-driven reconnect.
+            let (s2, _) = listener.accept().await.unwrap();
+            let mut ws2 = accept_async(s2).await.unwrap();
+            let msg = ws2.next().await;
+            assert!(
+                msg.is_some(),
+                "conn2 should receive frame after freshness reconnect"
+            );
+        });
+
+        // Tight silence window so the test doesn't wait 10 s.
+        let transport = Arc::new(RealTvTransport::for_test_with_silence(
+            port,
+            Duration::from_millis(100),
+        ));
+
+        // First send: cold cache → connect, priming key lands on conn 1.
+        transport
+            .send_key("127.0.0.1", "test-token", KEY_RETURN)
+            .await
+            .unwrap();
+
+        // Capture the pre-reconnect reader_state Arc — held by the reader
+        // task spawned on connect. After reconnect, a fresh Arc replaces
+        // it; the prior Arc remains alive only because the prior reader
+        // task still holds a clone (and our `state_before` clone), but its
+        // CancellationToken has been fired.
+        let state_before = transport.reader_state_for_test();
+
+        // Wait past the freshness window — the silent server never sent a
+        // frame, so `last_seen` is stale by now. (We don't care if
+        // state_before is_dead — the silent-drop scenario keeps the socket
+        // alive but uneventful.)
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Second send: freshness check fires → reconnect → fresh reader
+        // task spawned with the swapped Arc.
+        let result = transport
+            .send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF)
+            .await;
+        assert!(
+            result.is_ok(),
+            "send after stale should reconnect: {result:?}"
+        );
+
+        let state_after = transport.reader_state_for_test();
+        assert!(
+            !Arc::ptr_eq(&state_before, &state_after),
+            "reader_state Arc should be swapped on reconnect"
+        );
+
+        // The prior CancellationToken must be cancelled (so the prior
+        // reader task will exit on its next select! poll).
+        assert!(
+            state_before.cancel.is_cancelled(),
+            "prior reader_state's CancellationToken must be fired"
+        );
+        // The fresh CancellationToken must NOT be cancelled (the new
+        // reader task is still running).
+        assert!(
+            !state_after.cancel.is_cancelled(),
+            "fresh reader_state's CancellationToken must NOT be fired"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// RED-first proof for the durability fix: a fresh socket whose reader
+    /// has not seen any frame (because the server is silent — simulating
+    /// the silent-drop scenario) must be detected as STALE on the next
+    /// send. With the OLD ping→pong check, a single frame on the wire
+    /// would silently land on a dead socket. With the new design, the
+    /// `now - last_seen > MAX_WS_SILENCE` check fires and triggers a
+    /// reconnect.
+    #[tokio::test]
+    async fn silent_drop_triggers_reconnect_via_last_seen() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            // Conn 1: accept the priming key, then go silent — NO frame
+            // is sent back. The client's reader task never observes a
+            // frame, so `last_seen` stays at connect time.
+            let (s1, _) = listener.accept().await.unwrap();
+            let mut ws1 = accept_async(s1).await.unwrap();
+            let _priming = ws1.next().await;
+
+            // Hold ws1 alive long enough for the client's freshness check
+            // to fire and the reconnect to land on conn 2.
+            let _keepalive = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(ws1);
+            });
+
+            // Conn 2: receive the retry key (after freshness check fired).
+            let (s2, _) = listener.accept().await.unwrap();
+            let mut ws2 = accept_async(s2).await.unwrap();
+            let msg = ws2.next().await;
+            assert!(
+                msg.is_some(),
+                "conn2 should receive retry key after freshness reconnect"
+            );
+            if let Some(Ok(Message::Text(text))) = msg {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    parsed["params"]["DataOfCmd"].as_str().unwrap(),
+                    KEY_PICTURE_OFF,
+                    "retry key should be KEY_PICTURE_OFF on the reconnected socket"
+                );
+            } else {
+                panic!("expected text frame with key payload on conn2");
+            }
+        });
+
+        // Tight silence window so the test doesn't wait 10 s.
+        let transport = RealTvTransport::for_test_with_silence(port, Duration::from_millis(150));
+
+        // First send: cold cache → connect (priming key lands on conn 1).
+        transport
+            .send_key("127.0.0.1", "test-token", KEY_RETURN)
+            .await
+            .unwrap();
+
+        // Wait past the freshness window — the silent server never sent a
+        // frame, so `last_seen` is stale by now.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Second send: freshness check fires (dead=false, stale=true) →
+        // reconnect → retry key lands on conn 2 within 3 s.
+        let timed = tokio::time::timeout(
+            Duration::from_secs(3),
+            transport.send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF),
+        )
+        .await;
+        assert!(
+            timed.is_ok(),
+            "send_key did not reconnect+deliver within 3s (silent-drop not detected): {timed:?}"
+        );
+        assert!(
+            timed.unwrap().is_ok(),
+            "silent-drop send should reconnect and succeed"
+        );
+
+        server.await.unwrap();
+    }
+
+    /// RED-first proof for the pre-fix behavior: the OLD client-side ping
+    /// would have failed to detect a silent-drop scenario where the kernel
+    /// still accepts writes. The new design uses the TV's heartbeat
+    /// (`last_seen`) instead. This test asserts that the freshness check
+    /// fires immediately when `last_seen` is rewound — proving the new
+    /// check is the gate, not the Ping/Pong round-trip.
+    #[tokio::test]
+    async fn freshness_check_is_the_gate_not_ping() {
+        let transport = RealTvTransport::for_test_with_silence(
+            // Port unused — we don't actually connect in this test.
+            1,
+            Duration::from_millis(500),
+        );
+        // Pre-fix invariant: an unwarmed `last_seen` (recently constructed)
+        // is NOT yet stale. The reader task starts with `last_seen = now()`.
+        let state = transport.reader_state_for_test();
+        assert!(
+            !state.is_stale(Duration::from_millis(500)),
+            "fresh reader_state should not be stale immediately"
+        );
+        // After rewinding `last_seen` into the past, the freshness check
+        // fires immediately.
+        transport.age_last_seen_for_test(Duration::from_secs(60));
+        assert!(
+            state.is_stale(Duration::from_millis(500)),
+            "after rewinding last_seen 60s, freshness check must report stale"
+        );
     }
 
     // ── Pairing handshake ────────────────────────────────────────────────────
@@ -1496,85 +2265,5 @@ mod tests {
     async fn pair_timeout_fails_fast() {
         let result = pair("192.0.2.1", Duration::from_millis(50)).await;
         assert!(result.is_err(), "expected Err against unreachable host");
-    }
-
-    // ── Stale-socket liveness check ──────────────────────────────────────────
-
-    /// When the TV silently drops an idle WebSocket (half-open socket where
-    /// `send` still returns `Ok` but data is lost), the liveness check must
-    /// detect the dead connection and trigger a reconnect BEFORE the real
-    /// key is sent. Without this check, `send_key` reports success but the
-    /// key never reaches the TV.
-    #[tokio::test]
-    async fn stale_socket_liveness_check_detects_dead_connection() {
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_async;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Server: connection 1 stays alive at TCP level but stops reading,
-        // simulating the TV's zombie-socket behavior during picture-off.
-        // Connection 2 is the fresh reconnect.
-        let server = tokio::spawn(async move {
-            // Connection 1 — accept, read Ping + priming key, then go silent.
-            let (stream1, _) = listener.accept().await.unwrap();
-            let mut ws1 = accept_async(stream1).await.unwrap();
-            let _liveness_ping = ws1.next().await; // liveness-check Ping (auto-ponged)
-            let msg1 = ws1.next().await; // priming key (KEY_RETURN)
-            assert!(msg1.is_some(), "conn1 should receive priming frame");
-
-            // Keep ws1 alive but stop reading — the next liveness-check
-            // Ping sits in the kernel buffer with no application-level
-            // auto-pong, so the client times out and reconnects.
-            let _zombie = tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                drop(ws1);
-            });
-
-            // Connection 2 — the reconnect after liveness check fails.
-            let (stream2, _) = listener.accept().await.unwrap();
-            let mut ws2 = accept_async(stream2).await.unwrap();
-            let msg2 = ws2.next().await;
-            assert!(msg2.is_some(), "conn2 should receive key after reconnect");
-            // Verify the key arrived on connection 2 (not lost on conn1).
-            if let Some(Ok(Message::Text(text))) = msg2 {
-                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(
-                    parsed["params"]["DataOfCmd"].as_str().unwrap(),
-                    KEY_PICTURE_OFF,
-                    "key should be KEY_PICTURE_OFF on the reconnected socket"
-                );
-            } else {
-                panic!("expected text frame with key payload on conn2");
-            }
-        });
-
-        let transport = RealTvTransport::for_test(port);
-
-        // Prime the cache.
-        transport
-            .send_key("127.0.0.1", "test-token", KEY_RETURN)
-            .await
-            .unwrap();
-
-        // Send a key on the now-zombie cached socket. The liveness check
-        // must timeout (no pong from the silent server), reconnect, and
-        // deliver the key on connection 2 within 3 s.
-        let timed = tokio::time::timeout(
-            Duration::from_secs(3),
-            transport.send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF),
-        )
-        .await;
-        assert!(
-            timed.is_ok(),
-            "send_key did not reconnect+deliver within 3s (stale socket not detected): {timed:?}"
-        );
-        assert!(
-            timed.unwrap().is_ok(),
-            "stale-socket send should reconnect and succeed"
-        );
-
-        server.await.unwrap();
     }
 }

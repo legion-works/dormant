@@ -68,7 +68,7 @@ pub enum DoctorSubcommand {
     Config,
     /// Probe `KWin` DPMS (not yet supported).
     Kwin,
-    /// Probe Samsung Tizen display (not yet supported).
+    /// Probe Samsung Tizen displays (reachability, power state, token).
     Samsung,
 }
 
@@ -130,7 +130,15 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Kwin) => Ok(DoctorOutcome::NotSupported("kwin-dpms".into())),
-        Some(DoctorSubcommand::Samsung) => Ok(DoctorOutcome::NotSupported("samsung-tizen".into())),
+        Some(DoctorSubcommand::Samsung) => {
+            let (cfg, creds, note) = load_config_and_creds(args)?;
+            if let Some(n) = &note {
+                println!("{n}");
+            }
+            let results = dormant_doctor::probe_samsung(&cfg, &creds).await;
+            print_table(&results);
+            Ok(outcome(&results))
+        }
         None => {
             // Bare doctor: delegate to the single-source orchestration.
             let (cfg, creds, note) = load_config_and_creds(args)?;

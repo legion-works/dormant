@@ -244,6 +244,23 @@ pub struct DisplayRuntimeCfg {
     pub timings: SmTimings,
 }
 
+impl DisplayRuntimeCfg {
+    /// Timing defaults for a manual-only (rule-less) display.  `grace` and
+    /// `min_*` times are moot without a zone; wake-retry is preserved — a
+    /// failed manual wake must self-heal (the wake-wedge invariant).
+    #[must_use]
+    pub fn manual_defaults(startup_holdoff: std::time::Duration) -> SmTimings {
+        use crate::config::defaults;
+        SmTimings {
+            grace_period: defaults::GRACE_PERIOD,
+            min_blank_time: defaults::MIN_BLANK_TIME,
+            min_wake_time: defaults::MIN_WAKE_TIME,
+            startup_holdoff,
+            wake_retry_interval: defaults::WAKE_RETRY_INTERVAL,
+        }
+    }
+}
+
 /// Per-rule runtime configuration for the engine.
 #[derive(Debug, Clone)]
 pub struct RuleRuntimeCfg {
@@ -509,6 +526,38 @@ impl RulesEngine {
     /// [`RulesEngine::run`] starts.
     pub fn apply_restore_effects(&mut self, display: &DisplayId, effects: Vec<Effect>) {
         self.pending_restore.push((display.clone(), effects));
+    }
+
+    /// Replace a display's state machine with a restored one, re-seed its
+    /// ownership from the gate (keeps `last_owned` in sync — the restored
+    /// machine defaults `owned: true`), and queue its initial scheduling
+    /// effects.
+    ///
+    /// Used by the daemon's reload path to preserve a manual-only display's
+    /// phase across reload (M1 deferred this seam).  Call only for a display
+    /// present in `self.machines`; a no-op otherwise.
+    pub fn install_restored_machine(
+        &mut self,
+        display: &DisplayId,
+        machine: DisplayStateMachine,
+        effects: Vec<Effect>,
+        now: Tick,
+    ) {
+        if let Some(slot) = self.machines.get_mut(display) {
+            *slot = machine;
+            let owns = self.ownership.owns(display);
+            let refeed = slot.step(Input::OwnershipChanged(owns), now);
+            self.last_owned.insert(display.clone(), owns);
+            // Queue restore-phase-entry effects first, then the
+            // ownership-edge effects — both drain via process_effect at
+            // run() start.  The re-feed is NOT a no-op for every
+            // (phase, owns) pair; an owns:false restore into Blanked/
+            // Staged/RenderPending emits TeardownRender / LogTransition
+            // that must reach dispatch.
+            let mut queued = effects;
+            queued.extend(refeed);
+            self.pending_restore.push((display.clone(), queued));
+        }
     }
 
     /// Drive the engine until `cancel` is triggered or both inbound channels
@@ -1269,4 +1318,204 @@ mod tests {
         assert_eq!(h[0].role, ControllerRole::Primary);
         assert_eq!(h[1].role, ControllerRole::Fallback);
     }
+
+    #[test]
+    fn manual_defaults_returns_default_consts() {
+        let holdoff = Duration::from_secs(30);
+        let t = DisplayRuntimeCfg::manual_defaults(holdoff);
+        assert_eq!(t.grace_period, crate::config::defaults::GRACE_PERIOD);
+        assert_eq!(t.min_blank_time, crate::config::defaults::MIN_BLANK_TIME);
+        assert_eq!(t.min_wake_time, crate::config::defaults::MIN_WAKE_TIME);
+        assert_eq!(t.startup_holdoff, holdoff);
+        assert_eq!(
+            t.wake_retry_interval,
+            crate::config::defaults::WAKE_RETRY_INTERVAL
+        );
+    }
+}
+
+/// Restoring a manual-only display's phase into the engine must carry
+/// the restored machine and its scheduling effects into the engine's
+/// internal structures — no phantoms, no dropped machines.
+#[test]
+fn install_restored_machine_replaces_phase_and_queues_effects() {
+    use crate::ownership::AlwaysOwned;
+    use crate::state_machine::Phase;
+    use std::collections::BinaryHeap;
+
+    let display_id = DisplayId("test-disp".into());
+    let now = Tick::now();
+    let timings = SmTimings {
+        grace_period: Duration::from_secs(60),
+        min_blank_time: Duration::from_secs(0),
+        min_wake_time: Duration::from_secs(0),
+        startup_holdoff: Duration::from_secs(10),
+        wake_retry_interval: Duration::from_secs(60),
+    };
+    let ladder = vec![LadderStage {
+        kind: StageKind::Controller(BlankMode::PowerOff),
+        dwell: None,
+    }];
+
+    // Build a minimal RulesEngine with one Active machine.
+    let machine = DisplayStateMachine::new(timings.clone(), ladder.clone(), now);
+    let mut machines = HashMap::new();
+    machines.insert(display_id.clone(), machine);
+    let zone_engine = ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid");
+    let (results_tx, results_rx) = mpsc::unbounded_channel();
+    let (event_tx, _) = broadcast::channel(256);
+
+    let mut engine = RulesEngine {
+        cfg: RulesEngineConfig {
+            rules: vec![],
+            displays: vec![],
+            sensors: vec![],
+        },
+        zone_engine,
+        machines,
+        executors: HashMap::new(),
+        render_sinks: HashMap::new(),
+        ownership: Arc::new(AlwaysOwned),
+        last_owned: HashMap::new(),
+        rule_displays: HashMap::new(),
+        zone_rules: HashMap::new(),
+        paused_rules: HashSet::new(),
+        holds: HashMap::new(),
+        wake_attempts: HashMap::new(),
+        sensor_last_seen_virtual: HashMap::new(),
+        timers: BinaryHeap::new(),
+        results_rx,
+        results_tx,
+        event_tx,
+        pending_reload: None,
+        pending_restore: Vec::new(),
+    };
+
+    // Restore a machine to Blanked — a manual-only display's phase
+    // from before a reload.
+    let (restored, effects) = DisplayStateMachine::restore(timings, ladder, Phase::Blanked, 1, now);
+    // Phase::Blanked restore emits no scheduling effects.
+    assert!(effects.is_empty());
+
+    // Act — install the restored machine.
+    engine.install_restored_machine(&display_id, restored, effects, now);
+
+    // Assert: the engine's machine is now Blanked (not the original Active).
+    let machine = engine.machines.get(&display_id).unwrap();
+    assert_eq!(*machine.phase(), Phase::Blanked);
+
+    // Assert: the restore was queued — one entry keyed to our display.
+    assert_eq!(engine.pending_restore.len(), 1);
+    assert_eq!(engine.pending_restore[0].0, display_id);
+    // Restoring to Blanked emits no IssueWake or IssueBlank effects.
+    for effect in &engine.pending_restore[0].1 {
+        assert!(
+            !matches!(effect, Effect::IssueBlank { .. } | Effect::IssueWake { .. }),
+            "Blanked restore must not emit blank/wake effects, got {effect:?}"
+        );
+    }
+
+    // Assert: ownership was re-seeded (AlwaysOwned returns true).
+    assert_eq!(engine.last_owned.get(&display_id), Some(&true));
+}
+
+/// Pins that the ownership re-feed in `install_restored_machine` runs and
+/// its effects are routed into `pending_restore` (not dropped).  With a
+/// `NeverOwned` gate, restoring a Blanked machine must yield ownership →
+/// enter Active (phase change proves the re-feed ran) and emit a
+/// `LogTransition` (effect-queued proves effects weren't dropped).
+#[test]
+fn install_restored_never_owned_refeed_not_dropped() {
+    use crate::ownership::OwnershipGate;
+    use crate::state_machine::Phase;
+    use std::collections::BinaryHeap;
+
+    // Test-only gate that never claims ownership.
+    struct NeverOwned;
+    impl OwnershipGate for NeverOwned {
+        fn owns(&self, _display: &DisplayId) -> bool {
+            false
+        }
+    }
+
+    let display_id = DisplayId("test-disp".into());
+    let now = Tick::now();
+    let timings = SmTimings {
+        grace_period: Duration::from_secs(60),
+        min_blank_time: Duration::from_secs(0),
+        min_wake_time: Duration::from_secs(0),
+        startup_holdoff: Duration::from_secs(10),
+        wake_retry_interval: Duration::from_secs(60),
+    };
+    let ladder = vec![LadderStage {
+        kind: StageKind::Controller(BlankMode::PowerOff),
+        dwell: None,
+    }];
+
+    // Build a minimal RulesEngine with one Active machine.
+    let machine = DisplayStateMachine::new(timings.clone(), ladder.clone(), now);
+    let mut machines = HashMap::new();
+    machines.insert(display_id.clone(), machine);
+    let zone_engine = ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid");
+    let (results_tx, results_rx) = mpsc::unbounded_channel();
+    let (event_tx, _) = broadcast::channel(256);
+
+    let mut engine = RulesEngine {
+        cfg: RulesEngineConfig {
+            rules: vec![],
+            displays: vec![],
+            sensors: vec![],
+        },
+        zone_engine,
+        machines,
+        executors: HashMap::new(),
+        render_sinks: HashMap::new(),
+        ownership: Arc::new(NeverOwned),
+        last_owned: HashMap::new(),
+        rule_displays: HashMap::new(),
+        zone_rules: HashMap::new(),
+        paused_rules: HashSet::new(),
+        holds: HashMap::new(),
+        wake_attempts: HashMap::new(),
+        sensor_last_seen_virtual: HashMap::new(),
+        timers: BinaryHeap::new(),
+        results_rx,
+        results_tx,
+        event_tx,
+        pending_reload: None,
+        pending_restore: Vec::new(),
+    };
+
+    // Restore a machine to Blanked — a manual-only display's phase
+    // from before a reload.
+    let (restored, restore_effects) =
+        DisplayStateMachine::restore(timings, ladder, Phase::Blanked, 1, now);
+    assert!(restore_effects.is_empty());
+
+    // Act — install the restored machine.
+    engine.install_restored_machine(&display_id, restored, restore_effects, now);
+
+    // Assert: the re-feed RAN — owns:false on Blanked transitions to Active
+    // via enter_active("ownership_yielded").
+    let machine = engine.machines.get(&display_id).unwrap();
+    assert_eq!(
+        *machine.phase(),
+        Phase::Active,
+        "owns:false on Blanked must yield ownership → Active (re-feed ran)"
+    );
+
+    // Assert: the re-feed effects are queued (NOT dropped).
+    // Blanked + OwnershipChanged(false) emits LogTransition via enter_active.
+    assert_eq!(engine.pending_restore.len(), 1);
+    let queued = &engine.pending_restore[0].1;
+    let has_transition = queued
+        .iter()
+        .any(|e| matches!(e, Effect::LogTransition { .. }));
+    assert!(
+        has_transition,
+        "refeed LogTransition must be queued, got {queued:?}"
+    );
+
+    // Assert: ownership was re-seeded (NeverOwned returns false).
+    assert_eq!(engine.last_owned.get(&display_id), Some(&false));
 }

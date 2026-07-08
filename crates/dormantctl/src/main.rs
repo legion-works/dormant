@@ -8,6 +8,7 @@
 
 mod cmd_blank;
 mod cmd_doctor;
+mod cmd_pair;
 mod cmd_pause;
 mod cmd_status;
 mod cmd_validate;
@@ -33,6 +34,16 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// Pairing target device.
+#[derive(clap::Subcommand, Debug)]
+enum PairTarget {
+    /// Pair a Samsung Tizen TV.
+    Samsung {
+        /// TV hostname or IP address.
+        host: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -90,6 +101,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Pair with a device that needs an auth token (e.g. a Samsung TV).
+    Pair {
+        #[command(subcommand)]
+        target: PairTarget,
+
+        /// Path to the config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Path to the credentials file.
+        #[arg(long)]
+        credentials: Option<PathBuf>,
+    },
     /// Diagnose hardware and connectivity.
     Doctor {
         /// Path to the config file.
@@ -144,6 +168,17 @@ fn main() -> ExitCode {
             cmd_validate::run(&args)
         }
         Command::Watch { json } => cmd_watch::run(&socket_path, json),
+        Command::Pair {
+            target,
+            config,
+            credentials,
+        } => match target {
+            PairTarget::Samsung { host } => cmd_pair::run(&cmd_pair::PairArgs {
+                config,
+                credentials,
+                host,
+            }),
+        },
         Command::Doctor {
             config,
             credentials,
@@ -185,6 +220,24 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::FAILURE
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_pair_samsung() {
+        let cli = Cli::try_parse_from(["dormantctl", "pair", "samsung", "192.0.2.7"]).unwrap();
+        match cli.command {
+            Command::Pair {
+                target: PairTarget::Samsung { host },
+                ..
+            } => assert_eq!(host, "192.0.2.7"),
+            _ => panic!("expected Pair command"),
         }
     }
 }

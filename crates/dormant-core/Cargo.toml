@@ -15,12 +15,14 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
 tokio-util.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 dormant-core = { path = ".", features = ["test-fakes"] }
 proptest.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

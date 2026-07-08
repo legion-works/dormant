@@ -18,7 +18,7 @@ import type { PatchStore } from "./patch";
 
 const SCALE_MODES = ["fill", "fit", "stretch", "center"] as const;
 const TRANSITIONS = ["none", "crossfade"] as const;
-const SOURCE_ORDERS = ["sequential", "random", "shuffle_playlist"] as const;
+const SOURCE_ORDERS = ["sequential"] as const;
 
 /** Default source appended when "Add Source" is clicked. */
 const DEFAULT_SOURCE: ScreensaverSource = {
@@ -238,7 +238,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   }}
                   options={SOURCE_ORDERS}
                   error={fieldErrors[[...srcBase, "order"].join(".")]}
-                  help="sequential = in directory order; random = independent random pick each time; shuffle_playlist = shuffled once, then cycles."
+                  help="sequential = in directory order. For random playback, use the shuffle flag instead."
                 />
 
                 <DurationField

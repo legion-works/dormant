@@ -792,17 +792,22 @@ describe("Config tab-switch guard", () => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
     });
 
-    // idle_time_unit — should be a select element with label
-    const idleTimeUnitLabel = screen.getByText("idle_time_unit");
-    expect(idleTimeUnitLabel).toBeInTheDocument();
+    // idle_time_unit — must render as a select with auto/ms/s options
+    const ituSelect = screen.getByLabelText("idle_time_unit") as HTMLSelectElement;
+    expect(ituSelect.tagName).toBe("SELECT");
+    const ituOptions = Array.from(ituSelect.options).map((o) => o.value);
+    expect(ituOptions).toEqual(["auto", "ms", "s"]);
 
-    // idle_source — should be a select element with label
-    const idleSourceLabel = screen.getByText("idle_source");
-    expect(idleSourceLabel).toBeInTheDocument();
+    // idle_source — must render as a select with auto/wayland/dbus options
+    const isSelect = screen.getByLabelText("idle_source") as HTMLSelectElement;
+    expect(isSelect.tagName).toBe("SELECT");
+    const isOptions = Array.from(isSelect.options).map((o) => o.value);
+    expect(isOptions).toEqual(["auto", "wayland", "dbus"]);
 
-    // stale_sensor_timeout — should be a text input with label
-    const staleLabel = screen.getByText("stale_sensor_timeout");
-    expect(staleLabel).toBeInTheDocument();
+    // stale_sensor_timeout — must render as a duration input
+    const staleInput = screen.getByLabelText("stale_sensor_timeout") as HTMLInputElement;
+    expect(staleInput.tagName).toBe("INPUT");
+    expect(staleInput.type).toBe("text"); // DurationField is a text input
   });
 
   it("editing the 3 new daemon fields creates valid patches (not locked or unknown)", async () => {

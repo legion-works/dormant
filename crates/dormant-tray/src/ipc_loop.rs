@@ -30,6 +30,19 @@ use crate::tray::TrayState;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Compute the next backoff duration from a tick outcome.
+///
+/// A tick that successfully connected (published ≥1 snapshot and reached the
+/// event loop) resets to [`BACKOFF_MIN`] for a prompt reconnect; cold-connect
+/// failures escalate exponentially and are capped at [`BACKOFF_MAX`].
+fn next_backoff(current: Duration, connected_this_tick: bool) -> Duration {
+    if connected_this_tick {
+        BACKOFF_MIN
+    } else {
+        (current * 2).min(BACKOFF_MAX)
+    }
+}
+
 /// Drop-guard that fires [`client::EventShutdown::shutdown`] on every
 /// exit path so the pump thread's blocked `read_line` returns and the
 /// thread exits cleanly.  Holding this guard in `tick` is what stops
@@ -101,16 +114,21 @@ pub async fn run(
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        let tick_result = tick(&socket_path, &state, &cancel).await;
-        match tick_result {
-            Ok(TickExit::Cancelled) => return,
-            Ok(TickExit::Closed) => {
-                // Daemon closed the stream cleanly — back off and retry.
+        let outcome = tick(&socket_path, &state, &cancel).await;
+        let connected = match &outcome {
+            TickOutcome::Cancelled => return,
+            TickOutcome::Closed => {
+                backoff = BACKOFF_MIN;
+                true
             }
-            Err(e) => {
-                warn!(error = %e, "ipc tick failed; will retry");
+            TickOutcome::Errored { connected, error } => {
+                warn!(error = %error, "ipc tick failed; will retry");
+                if *connected {
+                    backoff = BACKOFF_MIN;
+                }
+                *connected
             }
-        }
+        };
         {
             let mut s = state.lock().await;
             if !s.unreachable {
@@ -124,16 +142,24 @@ pub async fn run(
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(backoff) => {}
         }
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        backoff = next_backoff(backoff, connected);
     }
 }
 
-/// Why one `tick` returned.
-enum TickExit {
+/// The result of one connection attempt.
+enum TickOutcome {
     /// The cancel token fired.
     Cancelled,
-    /// The daemon closed the event stream (EOF).
+    /// The daemon closed the event stream cleanly.
+    /// Reaching this variant implies the connection was healthy.
     Closed,
+    /// An error occurred.  `connected` indicates whether the tick had
+    /// already fetched the initial snapshot and entered the event loop
+    /// (healthy connection) before the error arrived.
+    Errored {
+        connected: bool,
+        error: anyhow::Error,
+    },
 }
 
 /// One connection's lifetime: fetch the initial snapshot, then loop on
@@ -142,27 +168,44 @@ async fn tick(
     socket_path: &Path,
     state: &Arc<Mutex<TrayState>>,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<TickExit> {
-    let snapshot = fetch_status(socket_path).await.context("initial Status")?;
+) -> TickOutcome {
+    let mut connected = false;
+
+    // 1. Fetch initial snapshot.  Failure here is a cold-connect error.
+    let snapshot = match fetch_status(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return TickOutcome::Errored {
+                connected,
+                error: e.context("initial Status"),
+            };
+        }
+    };
     publish_snapshot(state, snapshot).await;
     info!("ipc: connected, snapshot published");
+    connected = true;
 
-    // Subscribe to events.  Wrap the synchronous iterator in a
-    // blocking-thread → tokio-mpsc pump so we can `select!` on it.
-    // The `TickShutdown` guard calls `shutdown(Both)` on the cloned
-    // socket FD on every exit path (normal return, `?` error, panic
-    // unwind) — that unblocks the pump thread's `read_line` so it
-    // exits instead of leaking across reconnects.
-    let (stream, shutdown) = client::connect_events(socket_path).context("subscribe Events")?;
+    // 2. Subscribe to events.  Connect failure AFTER a successful fetch + publish
+    //    is a healthy-tick error — we already proved the socket works.
+    let (stream, shutdown) = match client::connect_events(socket_path) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return TickOutcome::Errored {
+                connected,
+                error: e.context("subscribe Events"),
+            };
+        }
+    };
     // Per-tick exit flag — tests assert on this; production drops the
     // handle on every iteration so the value is meaningless here, but
     // allocating once per tick is fine (it's a single AtomicBool).
     let pump_exited = Arc::new(AtomicBool::new(false));
     let (mut rx, _shutdown_guard) = spawn_event_pump(stream, shutdown, pump_exited);
 
+    // 3. Event loop.
     loop {
         tokio::select! {
-            () = cancel.cancelled() => return Ok(TickExit::Cancelled),
+            () = cancel.cancelled() => return TickOutcome::Cancelled,
             ev = rx.recv() => {
                 match ev {
                     Some(Ok(_event)) => {
@@ -172,17 +215,17 @@ async fn tick(
                             Ok(snap) => publish_snapshot(state, snap).await,
                             Err(e) => {
                                 debug!(error = %e, "post-event Status failed");
-                                return Err(e);
+                                return TickOutcome::Errored { connected, error: e };
                             }
                         }
                     }
                     Some(Err(e)) => {
                         warn!(error = %e, "event stream error");
-                        return Err(e);
+                        return TickOutcome::Errored { connected, error: e };
                     }
                     None => {
                         info!("event stream closed by daemon");
-                        return Ok(TickExit::Closed);
+                        return TickOutcome::Closed;
                     }
                 }
             }
@@ -218,4 +261,72 @@ async fn publish_snapshot(state: &Arc<Mutex<TrayState>>, snap: StateSnapshot) {
     s.snapshot = Some(snap);
     s.unreachable = false;
     s.icon_state = new_icon_state;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Existing tests (updated to new signature) ---
+
+    #[test]
+    fn closed_resets_to_min_even_from_max() {
+        let result = next_backoff(BACKOFF_MAX, true);
+        assert_eq!(
+            result, BACKOFF_MIN,
+            "RED: Closed should reset to BACKOFF_MIN, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn error_escalates_and_caps() {
+        let result = next_backoff(BACKOFF_MIN, false);
+        assert_eq!(result, Duration::from_secs(2), "1s → 2s");
+
+        let result = next_backoff(Duration::from_secs(16), false);
+        assert_eq!(result, BACKOFF_MAX, "16s → caps at 30s");
+
+        let result = next_backoff(BACKOFF_MAX, false);
+        assert_eq!(result, BACKOFF_MAX, "already at cap stays capped");
+    }
+
+    #[test]
+    fn sequence_closed_resets_after_errors() {
+        // Simulate: Err(1s) → Err(2s) → Closed → next should be BACKOFF_MIN
+        let b1 = next_backoff(BACKOFF_MIN, false);
+        assert_eq!(b1, Duration::from_secs(2));
+
+        let b2 = next_backoff(b1, false);
+        assert_eq!(b2, Duration::from_secs(4));
+
+        // After errors, a clean close must reset to BACKOFF_MIN.
+        let b3 = next_backoff(b2, true);
+        assert_eq!(
+            b3, BACKOFF_MIN,
+            "RED: after Err→Err→Closed, backoff should be BACKOFF_MIN, got {b3:?}"
+        );
+    }
+
+    // --- New tests for the review Should ---
+
+    #[test]
+    fn errored_after_connect_resets_to_min() {
+        // A healthy-then-Err tick (connected=true) must reset to BACKOFF_MIN.
+        let result = next_backoff(BACKOFF_MAX, true);
+        assert_eq!(
+            result, BACKOFF_MIN,
+            "healthy connection resets to BACKOFF_MIN, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn errored_before_connect_escalates() {
+        // A cold-connect failure (connected=false) must still escalate.
+        let result = next_backoff(Duration::from_secs(4), false);
+        assert_eq!(
+            result,
+            Duration::from_secs(8),
+            "cold-connect failure escalates 4s → 8s"
+        );
+    }
 }

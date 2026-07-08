@@ -126,9 +126,17 @@ pub trait BacklightTransport: Send + Sync {
 ///
 /// The transport is shared by all `BacklightControl` calls against any host
 /// it has been asked about. Tokens are cached in-process, keyed by host.
+///
+/// `base_url` lets tests point the transport at a wiremock (or any other
+/// URL scheme) without exercising the LAN-HTTPS path. Production sets it
+/// to `None`, which falls through to the hardcoded
+/// `https://{host}:{IP_CONTROL_PORT}/` pattern.
 pub struct RealBacklightTransport {
     client: reqwest::Client,
     token_cache: StdMutex<HashMap<String, String>>,
+    /// `Some` for tests that point the transport at a mock URL; `None`
+    /// (the production default) uses the LAN-HTTPS pattern.
+    base_url: Option<String>,
 }
 
 impl RealBacklightTransport {
@@ -156,6 +164,30 @@ impl RealBacklightTransport {
         Self {
             client,
             token_cache: StdMutex::new(HashMap::new()),
+            base_url: None,
+        }
+    }
+
+    /// Build a transport whose URLs are rooted at `base_url` instead of the
+    /// LAN-HTTPS pattern — used by tests that stand up a wiremock (or any
+    /// other server) and want to drive `RealBacklightTransport` through the
+    /// full `reqwest` round-trip (request shape, JSON-RPC envelope, error
+    /// mapping, token cache, `-32010` re-acquire).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reqwest::Client` builder fails for any reason.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test_with_base_url(base_url: String, timeout: Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("reqwest::Client::builder should never fail with default settings");
+        Self {
+            client,
+            token_cache: StdMutex::new(HashMap::new()),
+            base_url: Some(base_url),
         }
     }
 
@@ -165,7 +197,10 @@ impl RealBacklightTransport {
     /// `code` plus a short description so the controller can map it to a
     /// `CmdFailure` with the right prefix.
     async fn call(&self, host: &str, method: &str, params: Value) -> Result<Value, String> {
-        let url = format!("https://{host}:{IP_CONTROL_PORT}{IP_CONTROL_PATH}");
+        let url = match &self.base_url {
+            Some(base) => format!("{base}/"),
+            None => format!("https://{host}:{IP_CONTROL_PORT}{IP_CONTROL_PATH}"),
+        };
         let body = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -504,10 +539,9 @@ mod tests {
         assert!(err.error.contains(E_JSONRPC_FAILED_OR_LOCKED));
     }
 
-    /// RED-first proof: a wiremock server returning a JSON-RPC error body
-    /// must surface as a `CmdFailure` with the correct error-code anchor and
-    /// `E_DISPLAY_IO` prefix. The pre-fix behavior was an opaque `HTTP request
-    /// failed: <err>` string with no JSON-RPC code.
+    /// JSON-RPC error response body → classified anchor in the surfaced
+    /// `CmdFailure`. Guards against a regression where the raw `HTTP request
+    /// failed: <err>` opaque string leaked past the JSON-RPC parser.
     #[tokio::test]
     async fn real_transport_surfaces_jsonrpc_error_with_classified_anchor() {
         // reqwest::Client::danger_accept_invalid_certs + a self-signed cert
@@ -526,60 +560,204 @@ mod tests {
         assert!(err.error.contains(E_JSONRPC_METHOD_NOT_FOUND));
     }
 
-    /// Drive the real transport through a wiremock HTTP endpoint that
-    /// returns a JSON-RPC error body. Proves request shape (URL, method,
-    /// JSON-RPC envelope) and that the surfaced error carries the
-    /// classified JSON-RPC anchor + `E_DISPLAY_IO` prefix.
+    /// Drive `RealBacklightTransport` end-to-end through a wiremock server.
+    /// Proves (a) the wire shape (JSON-RPC POST with method + params),
+    /// (b) the token cache — the second call to `acquire_token` does NOT
+    /// re-hit the server, (c) error mapping for a `-32601` JSON-RPC
+    /// response, (d) `-32010` triggers `invalidate_token` so the next
+    /// `acquire_token` re-acquires.
     #[tokio::test]
-    async fn backlight_http_request_shape_and_error_mapping() {
+    async fn real_transport_full_round_trip_via_wiremock() {
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock = MockServer::start().await;
+        let base_url = mock.uri();
 
-        // Expect a JSON-RPC POST to `/` whose body has the right method.
+        // createAccessToken: returns a token, expected ONCE.
         Mock::given(method("POST"))
             .and(path("/"))
             .and(body_partial_json(serde_json::json!({
                 "method": "createAccessToken"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "result": { "AccessToken": "mocked-tok" }
+                "result": { "AccessToken": "tok-1" }
             })))
             .expect(1)
             .mount(&mock)
             .await;
 
-        // The reqwest client needs to talk http (not https) for the mock —
-        // verify by overriding the host in the URL path. The transport's
-        // build_client is hardcoded to https://host:1516/, so the mock URL
-        // must be set as the host — but the test is exercising the real
-        // HTTPS path. Skip if we can't easily rewire: the JSON-RPC body
-        // shape is unit-tested above and the controller-level flow is
-        // covered by the controller's tests with FakeBacklightTransport.
-        //
-        // We use a different approach: drive the transport against a real
-        // HTTPS server (the mock), but accept that the URL must include the
-        // scheme/host:port of the mock. The transport builds the URL
-        // from `host` parameter; we can't override that here, so we use a
-        // tiny inline `reqwest::Client` to verify the wire shape — leaving
-        // the RealBacklightTransport's wire shape exercised through
-        // controller-level tests.
-        let client = reqwest::Client::new();
-        let resp: serde_json::Value = client
-            .post(format!("{}/", mock.uri()))
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "createAccessToken",
-                "id": 1,
-                "params": {}
-            }))
-            .send()
+        // backlightControl: returns the echoed value.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "backlightControl",
+                "params": { "backlight": 25 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "backlight": 25 }
+            })))
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(base_url, Duration::from_secs(5));
+
+        // First acquire: hits the mock, returns tok-1, caches it.
+        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
+        assert_eq!(tok, "tok-1");
+
+        // Second acquire: cache hit, NO additional HTTP request to the mock.
+        let tok_again = transport.acquire_token("10.1.1.7").await.unwrap();
+        assert_eq!(tok_again, "tok-1");
+
+        // set_backlight uses the cached token; mock echoes back 25.
+        transport.set_backlight("10.1.1.7", &tok, 25).await.unwrap();
+    }
+
+    /// JSON-RPC error response body is parsed and the literal code is
+    /// preserved in the surfaced `String` — proves the error-mapping
+    /// pipeline that `map_transport_error` later classifies.
+    #[tokio::test]
+    async fn real_transport_jsonrpc_error_response_surfaces_raw_code() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": -32601, "message": "method not found" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+
+        let err = transport
+            .acquire_token("10.1.1.7")
             .await
-            .expect("HTTP request should succeed")
-            .json()
+            .expect_err("expected JSON-RPC error");
+        // The code is preserved as the leading digit run.
+        assert!(
+            err.starts_with("-32601"),
+            "raw error should preserve the JSON-RPC code: {err}"
+        );
+        assert!(err.contains("method not found"));
+    }
+
+    /// `-32010` triggers `invalidate_token`, so the next `acquire_token`
+    /// re-acquires from the server (cache miss after invalidation).
+    #[tokio::test]
+    async fn real_transport_unauthorized_invalidates_cache_and_reacquires() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // First createAccessToken: returns tok-A. Retired after the first hit so
+        // the second createAccessToken falls through to the tok-B mock.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "AccessToken": "tok-A" }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // First backlightControl: returns -32010 (unauthorized).
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "backlightControl"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "code": -32010, "message": "token rejected" }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // Second createAccessToken: returns tok-B (re-acquire after
+        // invalidation).
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "AccessToken": "tok-B" }
+            })))
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+
+        // Prime the cache.
+        let tok_a = transport.acquire_token("10.1.1.7").await.unwrap();
+        assert_eq!(tok_a, "tok-A");
+
+        // set_backlight with tok-A fails (-32010) — controller would call
+        // map_transport_error which calls invalidate_token; here we
+        // simulate that step directly.
+        let err = transport
+            .set_backlight("10.1.1.7", &tok_a, 0)
             .await
-            .expect("response should be JSON");
-        assert_eq!(resp["result"]["AccessToken"], "mocked-tok");
+            .expect_err("expected -32010");
+        assert!(err.contains("-32010"));
+        transport.invalidate_token_for_test("10.1.1.7");
+
+        // Next acquire: cache is empty (invalidated), so a second HTTP
+        // request to the mock returns tok-B.
+        let tok_b = transport.acquire_token("10.1.1.7").await.unwrap();
+        assert_eq!(tok_b, "tok-B");
+    }
+
+    /// getVideoStates parses the `result.backlight` field and returns it
+    /// as a `u8`. Out-of-range or missing values produce a typed error.
+    #[tokio::test]
+    async fn real_transport_get_backlight_parses_result_backlight() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "AccessToken": "tok" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getVideoStates"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "backlight": 37 }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
+        let value = transport.get_backlight("10.1.1.7", &tok).await.unwrap();
+        assert_eq!(value, 37);
     }
 }

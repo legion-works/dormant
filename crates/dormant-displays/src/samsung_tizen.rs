@@ -734,7 +734,7 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
 /// Best-effort TCP reachability probe for a Samsung TV port (doctor use).
 ///
 /// Returns `true` if `host:port` accepts a TCP connection within
-/// [`REST_TIMEOUT`]; otherwise `false`.
+/// `REST_TIMEOUT`; otherwise `false`.
 #[must_use]
 pub async fn probe_reachable(host: &str, port: u16) -> bool {
     RealTvTransport::new()
@@ -1354,7 +1354,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             // Skip the liveness-check Ping (tungstenite auto-pongs it).
-            let _ping = ws.next().await;
+            let _liveness_ping = ws.next().await;
             // Read the incoming key-press frame.
             let msg = ws.next().await;
             assert!(msg.is_some(), "server should receive a frame");
@@ -1390,7 +1390,7 @@ mod tests {
             {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut ws = accept_async(stream).await.unwrap();
-                let _ping = ws.next().await; // liveness-check Ping
+                let _liveness_ping = ws.next().await; // liveness-check Ping
                 let msg = ws.next().await; // priming key
                 assert!(msg.is_some(), "connection 1 should receive a frame");
             }
@@ -1520,7 +1520,7 @@ mod tests {
             // Connection 1 — accept, read Ping + priming key, then go silent.
             let (stream1, _) = listener.accept().await.unwrap();
             let mut ws1 = accept_async(stream1).await.unwrap();
-            let _ping = ws1.next().await; // liveness-check Ping (auto-ponged)
+            let _liveness_ping = ws1.next().await; // liveness-check Ping (auto-ponged)
             let msg1 = ws1.next().await; // priming key (KEY_RETURN)
             assert!(msg1.is_some(), "conn1 should receive priming frame");
 
@@ -1560,13 +1560,19 @@ mod tests {
 
         // Send a key on the now-zombie cached socket. The liveness check
         // must timeout (no pong from the silent server), reconnect, and
-        // deliver the key on connection 2.
-        let result = transport
-            .send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF)
-            .await;
+        // deliver the key on connection 2 within 3 s.
+        let timed = tokio::time::timeout(
+            Duration::from_secs(3),
+            transport.send_key("127.0.0.1", "test-token", KEY_PICTURE_OFF),
+        )
+        .await;
         assert!(
-            result.is_ok(),
-            "stale-socket send should reconnect and succeed: {result:?}"
+            timed.is_ok(),
+            "send_key did not reconnect+deliver within 3s (stale socket not detected): {timed:?}"
+        );
+        assert!(
+            timed.unwrap().is_ok(),
+            "stale-socket send should reconnect and succeed"
         );
 
         server.await.unwrap();

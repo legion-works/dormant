@@ -1792,6 +1792,7 @@ mod render_tests {
             wake_data: None,
             command_timeout: Duration::from_secs(5),
             restore_brightness: 100,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
         }
     }
@@ -1878,6 +1879,8 @@ mod render_tests {
                         wake_data: None,
                         command_timeout: Duration::from_secs(5),
                         restore_brightness: 100,
+                        samsung_restore_backlight:
+                            dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
                         treat_unreachable_as_blanked: true,
                     },
                 );

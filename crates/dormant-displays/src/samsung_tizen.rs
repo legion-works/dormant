@@ -670,25 +670,11 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
 
         // The TV sends back JSON events during pairing. The token arrives in
         // the "data" field of a message with event "ms.channel.connect" or
-        // similar. We wait up to 60s for the user to accept on the TV.
-        let pair_timeout = Duration::from_secs(60);
-        let deadline = tokio::time::Instant::now() + pair_timeout;
-
+        // similar. The caller-supplied `timeout_dur` bounds the entire handshake.
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(DormantError::DisplayIo {
-                    controller: SamsungTizenController::NAME.into(),
-                    detail: "pairing timed out waiting for user acceptance on TV".into(),
-                });
-            }
-
-            let msg = timeout(remaining, ws.next())
+            let msg = ws
+                .next()
                 .await
-                .map_err(|_| DormantError::DisplayIo {
-                    controller: SamsungTizenController::NAME.into(),
-                    detail: "pairing read timed out".into(),
-                })?
                 .ok_or_else(|| DormantError::DisplayIo {
                     controller: SamsungTizenController::NAME.into(),
                     detail: "pairing WebSocket closed before token received".into(),

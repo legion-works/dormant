@@ -626,83 +626,94 @@ impl DisplayController for SamsungTizenController {
 ///
 /// Connects to the TV without a token, waits for the user to accept the
 /// pairing request on the TV, and returns the token for future authenticated
-/// connections.
+/// connections.  The caller supplies a [`Duration`] timeout bounding the
+/// entire connect+handshake; a typical interactive pairing uses 60–120 s.
 ///
 /// # Errors
 ///
 /// Returns a [`DormantError`] if the connection fails or the pairing
 /// handshake times out.
-pub async fn pair(host: &str) -> Result<String, DormantError> {
-    let url = format!(
-        "wss://{host}:{WS_PORT}{WS_PATH}?name={}",
-        base64::engine::general_purpose::STANDARD.encode(DEVICE_NAME)
-    );
+pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantError> {
+    tokio::time::timeout(timeout_dur, async {
+        let url = format!(
+            "wss://{host}:{WS_PORT}{WS_PATH}?name={}",
+            base64::engine::general_purpose::STANDARD.encode(DEVICE_NAME)
+        );
 
-    let request = url
-        .parse::<tokio_tungstenite::tungstenite::http::Uri>()
-        .map_err(|e| DormantError::DisplayIo {
-            controller: SamsungTizenController::NAME.into(),
-            detail: format!("invalid pair URL: {e}"),
-        })?;
-    let request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(request)
-        .body(())
-        .map_err(|e| DormantError::DisplayIo {
-            controller: SamsungTizenController::NAME.into(),
-            detail: format!("failed to build pair request: {e}"),
-        })?;
-
-    let connector = tokio_tungstenite::Connector::Rustls(RealTvTransport::tls_config());
-
-    let (mut ws, _response) = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        None,  // WebSocketConfig — use defaults
-        false, // disable_nagle
-        Some(connector),
-    )
-    .await
-    .map_err(|e| DormantError::DisplayIo {
-        controller: SamsungTizenController::NAME.into(),
-        detail: format!("pair connect failed: {e}"),
-    })?;
-
-    // The TV sends back JSON events during pairing. The token arrives in
-    // the "data" field of a message with event "ms.channel.connect" or
-    // similar. We wait up to 60s for the user to accept on the TV.
-    let pair_timeout = Duration::from_secs(60);
-    let deadline = tokio::time::Instant::now() + pair_timeout;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(DormantError::DisplayIo {
-                controller: SamsungTizenController::NAME.into(),
-                detail: "pairing timed out waiting for user acceptance on TV".into(),
-            });
-        }
-
-        let msg = timeout(remaining, ws.next())
-            .await
-            .map_err(|_| DormantError::DisplayIo {
-                controller: SamsungTizenController::NAME.into(),
-                detail: "pairing read timed out".into(),
-            })?
-            .ok_or_else(|| DormantError::DisplayIo {
-                controller: SamsungTizenController::NAME.into(),
-                detail: "pairing WebSocket closed before token received".into(),
-            })?
+        let request = url
+            .parse::<tokio_tungstenite::tungstenite::http::Uri>()
             .map_err(|e| DormantError::DisplayIo {
                 controller: SamsungTizenController::NAME.into(),
-                detail: format!("pairing read error: {e}"),
+                detail: format!("invalid pair URL: {e}"),
+            })?;
+        let request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(request)
+            .body(())
+            .map_err(|e| DormantError::DisplayIo {
+                controller: SamsungTizenController::NAME.into(),
+                detail: format!("failed to build pair request: {e}"),
             })?;
 
-        if let Message::Text(text) = msg {
-            let text = text.clone();
-            if let Some(token) = extract_pair_token(&text) {
-                return Ok(token);
+        let connector = tokio_tungstenite::Connector::Rustls(RealTvTransport::tls_config());
+
+        let (mut ws, _response) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,  // WebSocketConfig — use defaults
+            false, // disable_nagle
+            Some(connector),
+        )
+        .await
+        .map_err(|e| DormantError::DisplayIo {
+            controller: SamsungTizenController::NAME.into(),
+            detail: format!("pair connect failed: {e}"),
+        })?;
+
+        // The TV sends back JSON events during pairing. The token arrives in
+        // the "data" field of a message with event "ms.channel.connect" or
+        // similar. We wait up to 60s for the user to accept on the TV.
+        let pair_timeout = Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + pair_timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(DormantError::DisplayIo {
+                    controller: SamsungTizenController::NAME.into(),
+                    detail: "pairing timed out waiting for user acceptance on TV".into(),
+                });
+            }
+
+            let msg = timeout(remaining, ws.next())
+                .await
+                .map_err(|_| DormantError::DisplayIo {
+                    controller: SamsungTizenController::NAME.into(),
+                    detail: "pairing read timed out".into(),
+                })?
+                .ok_or_else(|| DormantError::DisplayIo {
+                    controller: SamsungTizenController::NAME.into(),
+                    detail: "pairing WebSocket closed before token received".into(),
+                })?
+                .map_err(|e| DormantError::DisplayIo {
+                    controller: SamsungTizenController::NAME.into(),
+                    detail: format!("pairing read error: {e}"),
+                })?;
+
+            if let Message::Text(text) = msg {
+                let text = text.clone();
+                if let Some(token) = extract_pair_token(&text) {
+                    return Ok(token);
+                }
             }
         }
-    }
+    })
+    .await
+    .map_err(|_| DormantError::DisplayIo {
+        controller: SamsungTizenController::NAME.into(),
+        detail: format!(
+            "no response from TV within {timeout_dur:?} — \
+             accept the 'Allow' prompt on the TV?"
+        ),
+    })?
 }
 
 /// Extract the pairing token from a WebSocket text message.
@@ -1369,5 +1380,13 @@ mod tests {
         assert_eq!(token, Some("granted-token-42".to_string()));
 
         server.await.unwrap();
+    }
+
+    /// `pair()` with a short timeout against an unreachable host returns
+    /// quickly — not 60s.
+    #[tokio::test]
+    async fn pair_timeout_fails_fast() {
+        let result = pair("192.0.2.1", Duration::from_millis(50)).await;
+        assert!(result.is_err(), "expected Err against unreachable host");
     }
 }

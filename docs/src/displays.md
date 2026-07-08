@@ -214,3 +214,40 @@ cargo build --release --features render
 Without the `render` feature, configs containing a render stage are rejected
 at startup with error `E_RENDER_UNAVAILABLE`. On Linux, the render backend
 also requires `libwayland-dev` at build time.
+
+## Manual-only displays
+
+A display listed in `[displays]` that no `[rules]` entry references is
+**manual-only**: the daemon builds a full executor and controller chain for it,
+and it appears in `dormantctl status` / the web UI / the tray app, but no zone
+or rule drives it. It responds exclusively to manual control commands
+(`dormantctl blank <id>`, `dormantctl wake <id>`) and the web/tray interfaces.
+
+A `ladder` requires a rule.  Validation rejects a `ladder` on a rule-less
+display with `E_CONFIG_INVALID`:
+
+```
+display 'tv' has a ladder but is in no rule; a ladder is an auto-escalation
+that needs a rule to drive it — use blank_mode for manual-only control,
+or add a rule
+```
+
+Use `blank_mode` (or `blank_mode` + `degraded_mode`) for manual-only displays.
+
+Manual-only phase is preserved across config reloads (SIGHUP /
+`dormantctl reload`).  A display you blanked stays blanked.  However, a full
+daemon **restart** loses state — the display starts `active` (phase
+persistence to disk is not implemented in v1).
+
+**Known limitation:** a manual blank or wake command issued in the brief
+window while a config reload is in progress may be lost (the new generation
+restores the pre-command state).  Re-issue the command after the reload
+settles.  Tracked in [issue #9](https://github.com/iceTream89/oled-proximity/issues/9).
+
+```toml
+# A Samsung Tizen TV controlled entirely by hand.
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "screen_off_audio_on"
+host = "192.168.1.50"
+```

@@ -41,10 +41,7 @@ the background.
 install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 ```
 
-The `Exec=` line in `dormant-tray.desktop` resolves `dormant-tray` via
-`$PATH` (no `%h` expansion in `.desktop` Exec keys) — make sure
-`~/.local/bin/` is on `PATH` for the user session, or copy the binary
-into a directory that already is.
+See [Tray autostart](#tray-autostart) below to run it on every login.
 
 ## From release (planned)
 
@@ -108,14 +105,19 @@ chmod 600 ~/.config/dormant/credentials.toml
 
 ## Tray autostart
 
-To launch `dormant-tray` automatically on every graphical session, drop
-the bundled `.desktop` file into `~/.config/autostart/`:
+Run `dormant-tray` on every graphical session with the provided user
+unit — the same mechanism as the daemon:
 
 ```bash
-cp crates/dormant-tray/assets/dormant-tray.desktop ~/.config/autostart/
+mkdir -p ~/.config/systemd/user
+cp crates/dormant-tray/systemd/dormant-tray.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now dormant-tray
 ```
 
-It runs as a normal desktop application (not a D-Bus service) — the
-session manager picks it up after login. The `.desktop` file's `Exec=`
-resolves `dormant-tray` from `PATH`, so `~/.local/bin/` must be on
-`PATH` for the user session.
+The unit uses `ExecStart=%h/.local/bin/dormant-tray`, so systemd expands
+the path from your home directory at launch — no reliance on `PATH`. It
+starts after `dormant.service` and restarts on failure. A plain XDG
+`.desktop` autostart does not work here: the systemd autostart generator
+resolves a relative `Exec=` against a minimal boot `PATH` that excludes
+`~/.local/bin`, so no unit gets generated.

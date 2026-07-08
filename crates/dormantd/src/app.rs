@@ -680,32 +680,24 @@ impl Runner {
                         snapshot = Some(s);
                     }
                 }
-                // Identify displays still stuck in "blanking" at the deadline —
-                // these cannot be restored naked and will be defensive-woken.
-                let stuck_blanking: Vec<DisplayId> = snapshot
-                    .as_ref()
-                    .map(|s| {
-                        need_quiesce
-                            .iter()
-                            .filter(|id| {
-                                s.displays
-                                    .iter()
-                                    .find(|(did, _)| did == *id)
-                                    .is_some_and(|(_, d)| d.phase.as_str() == "blanking")
-                            })
-                            .map(|id| DisplayId(id.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !stuck_blanking.is_empty() {
+                let stuck_count = snapshot.as_ref().map_or(0, |s| {
+                    need_quiesce
+                        .iter()
+                        .filter(|id| {
+                            s.displays
+                                .iter()
+                                .find(|(did, _)| did == *id)
+                                .is_some_and(|(_, d)| d.phase.as_str() == "blanking")
+                        })
+                        .count()
+                });
+                if stuck_count > 0 {
                     tracing::warn!(
                         event = "reload_quiesce_timeout",
-                        count = stuck_blanking.len(),
+                        count = stuck_count,
                         "rule-less display(s) still blanking at deadline; defensive-waking"
                     );
                 }
-                // stuck_blanking will be appended to the defensive-wake list
-                // after the new generation spawns.
             }
         }
 
@@ -753,9 +745,7 @@ impl Runner {
                 self.install_generation(spawn);
                 // Combine retained rule-driven dark displays with stuck rule-less
                 // blanking displays — both need a physical wake because the new
-                // machines start Active.  Retained and stuck are disjoint sets
-                // (retained excludes rule-less, stuck is only rule-less), but
-                // dedup defensively anyway.
+                // machines start Active.
                 let mut wake_list = retained_dark;
                 // Re-derive stuck from the final snapshot (the quiesce loop may
                 // have advanced some to terminal, but any still-blanking ones
@@ -770,15 +760,9 @@ impl Runner {
                         })
                         .map(|(id, _)| DisplayId(id.clone()))
                         .collect();
-                    // Dedup: retained_dark only contains rule-driven displays;
-                    // stuck only contains rule-less displays.  Still, filter
-                    // just in case.
-                    let retained_set: HashSet<&DisplayId> = wake_list.iter().collect();
-                    let to_add: Vec<DisplayId> = stuck
-                        .into_iter()
-                        .filter(|s| !retained_set.contains(s))
-                        .collect();
-                    wake_list.extend(to_add);
+                    // Retained (ruled) and stuck (!ruled) are disjoint by
+                    // construction — no dedup needed.
+                    wake_list.extend(stuck);
                 }
                 self.defensive_wake(wake_list);
                 self.config_tx.send_replace(Arc::new(new_cfg));
@@ -1578,9 +1562,9 @@ fn phase_is_dark(phase: &str) -> bool {
 }
 
 /// Displays that were dark and have **no executor** in the newly assembled
-/// generation (dropped from `[displays]` *or* left in `[displays]` but removed
-/// from every rule, which makes them inert) — these get a verified physical
-/// wake via their OLD executor before the new generation starts.
+/// generation (dropped from `[displays]` entirely — its executor no longer
+/// exists in the new generation) — these get a verified physical wake via
+/// their OLD executor before the new generation starts.
 fn removed_dark_displays(
     snapshot: Option<&StateSnapshot>,
     new_executors: &HashMap<DisplayId, Arc<DisplayExecutor>>,

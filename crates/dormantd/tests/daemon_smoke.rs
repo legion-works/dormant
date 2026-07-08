@@ -1845,3 +1845,167 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
 
     shutdown(handle, join).await;
 }
+
+// ── 16: manual-only display full lifecycle across reload ─────────────────────────
+
+/// A manual-only display survives a full `ForceBlank` → reload → `ForceWake`
+/// cycle.  Composes T1 (built), T4 (phase preserved across reload), and
+/// manual control (`ForceBlank` / `ForceWake`).
+///
+/// Drives a single watcher reload (the real production path — `fs::write`
+/// triggers the config-file watcher).  Do NOT also call `trigger_reload()`:
+/// a concurrent double reload races the generation swap and can lose a
+/// manual command (tracked in issue #9).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_only_display_full_lifecycle_across_reload() {
+    let dir = TempDir::new().unwrap();
+    let mon_marker = dir.path().join("mon");
+    let manual_marker = dir.path().join("manual");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &manual_and_ruled_config(&mon_marker, &manual_marker, "300ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    // No sensor events — the manual display starts active (no rule drives
+    // it).  The rule-driven "mon" will blank after its 300ms grace, but
+    // that is irrelevant to the manual-only lifecycle under test.
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", vec![]),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+    let ctl = handle.control_sender();
+
+    // ── 1. ForceBlank the manual-only display ──────────────────────────
+    ctl.send(ControlMsg::ForceBlank(DisplayId("manual".into())))
+        .await
+        .unwrap();
+    assert!(
+        wait_for(|| count(&manual_marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "manual display must blank after ForceBlank, marker={:?}",
+        read(&manual_marker)
+    );
+
+    // Verify phase is "blanked" in the snapshot.
+    {
+        let (tx, rx) = oneshot::channel();
+        ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
+        let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("snapshot in time")
+            .expect("snapshot reply");
+        let manual_snap = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "manual")
+            .map(|(_, ds)| ds)
+            .unwrap();
+        assert_eq!(
+            manual_snap.phase, "blanked",
+            "phase must be blanked after ForceBlank, got {:?}",
+            manual_snap.phase
+        );
+    }
+
+    let manual_wake_before = count(&manual_marker, 'W');
+
+    // ── 3. Reload via the config-file watcher ──────────────────────────
+    // Changing the grace triggers a real reload (not a no-op).  Only
+    // `fs::write` — the watcher arm fires the reload.  Calling
+    // `trigger_reload()` as well would create two concurrent reloads that
+    // race the generation swap (issue #9).
+    fs::write(
+        &cfg_path,
+        manual_and_ruled_config(&mon_marker, &manual_marker, "150ms"),
+    )
+    .unwrap();
+    // Drain reload outcomes until the bus is quiet, then assert the last
+    // one was Reloaded.  The watcher debounce is 500ms; a 1s settle window
+    // is tight but sufficient for a single deterministic reload.
+    let settle = Duration::from_secs(1);
+    let mut last_outcome = None;
+    while let Ok(Ok(o)) = tokio::time::timeout(settle, reloads.recv()).await {
+        last_outcome = Some(o);
+    }
+    assert_eq!(
+        last_outcome,
+        Some(ReloadOutcome::Reloaded),
+        "reload must settle as Reloaded"
+    );
+
+    // ── 4. Assert across reload: NO wake, phase preserved ──────────────
+    let manual_w_after = count(&manual_marker, 'W');
+    assert_eq!(
+        manual_w_after,
+        manual_wake_before,
+        "manual-only display must NOT be defensive-woken on reload, \
+         got {manual_w_after} W (was {manual_wake_before} W before), marker={:?}",
+        read(&manual_marker)
+    );
+
+    {
+        let (tx, rx) = oneshot::channel();
+        ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
+        let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("snapshot in time")
+            .expect("snapshot reply");
+        let manual_snap = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "manual")
+            .map(|(_, ds)| ds)
+            .unwrap();
+        assert_eq!(
+            manual_snap.phase, "blanked",
+            "manual-only display must preserve blanked phase after reload, got {:?}",
+            manual_snap.phase
+        );
+    }
+
+    // ── 5. ForceWake the manual-only display ───────────────────────────
+    ctl.send(ControlMsg::ForceWake(DisplayId("manual".into())))
+        .await
+        .unwrap();
+    assert!(
+        wait_for(
+            || count(&manual_marker, 'W') > manual_wake_before,
+            Duration::from_secs(3)
+        )
+        .await,
+        "manual display must wake after ForceWake, marker={:?}",
+        read(&manual_marker)
+    );
+
+    // Poll until the snapshot reflects the phase transition (the wake
+    // command writes the marker before the engine processes WakeResult).
+    let mut final_phase = String::new();
+    for _ in 0..100 {
+        // ~5s bounded
+        let (tx, rx) = oneshot::channel();
+        if ctl.send(ControlMsg::Snapshot(tx)).await.is_ok()
+            && let Ok(Ok(snap)) = tokio::time::timeout(Duration::from_millis(200), rx).await
+            && let Some((_, d)) = snap.displays.iter().find(|(id, _)| id == "manual")
+        {
+            final_phase = d.phase.clone();
+            if final_phase == "active" {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        final_phase, "active",
+        "manual-only display must be active after ForceWake, got {final_phase:?}"
+    );
+
+    shutdown(handle, join).await;
+}

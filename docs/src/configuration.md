@@ -150,6 +150,31 @@ Each display has a user-chosen `id`. The `controllers` list is an ordered fallba
 | `restore_brightness` | integer | `80` | Brightness level to restore on wake (0–100) |
 | `treat_unreachable_as_blanked` | boolean | `true` | If controller is unreachable, assume display is blanked (fail-safe) |
 
+### Manual-only displays
+
+A display in `[displays]` referenced by **no rule** is **manual-only**: the
+daemon builds it and it responds to `dormantctl blank` / `dormantctl wake`, the
+web UI, and the tray app, but no zone or rule ever auto-blanks or auto-wakes it.
+
+A `ladder` on a rule-less display is rejected at validation time with error
+`E_CONFIG_INVALID` — a ladder is an auto-escalation that requires a rule to
+drive it.  Use `blank_mode` (or `blank_mode` + `degraded_mode`) for
+manual-only displays.
+
+Manual-only phase survives a config reload: if you blanked a manual-only
+display via `dormantctl blank` and then edit the config, it stays blanked
+(not defensive-woken).  Across a full daemon **restart** (not reload) there
+is no persisted state, so a manual-only display starts `active`.
+
+Example — a Samsung Tizen TV controlled by hand:
+
+```toml
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "screen_off_audio_on"
+host = "192.168.1.50"
+```
+
 ### Escalation ladder
 
 Instead of `blank_mode` and `degraded_mode`, a display can define an ordered

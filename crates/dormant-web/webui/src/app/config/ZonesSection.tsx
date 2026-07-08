@@ -29,7 +29,7 @@ export default function ZonesSection({ zones, store, redactedPaths, onDirty, fie
         const cfg = zones[id];
         const basePath = ["zones", id];
 
-        const makeShared = (key: string, value: unknown): FieldProps => ({
+        const makeShared = (key: string, value: unknown, extra?: Partial<FieldProps>): FieldProps => ({
           path: [...basePath, key],
           label: key,
           value,
@@ -40,6 +40,7 @@ export default function ZonesSection({ zones, store, redactedPaths, onDirty, fie
             store.trackEdit(p, v);
             onDirty();
           },
+          ...extra,
         });
 
         return (
@@ -49,9 +50,9 @@ export default function ZonesSection({ zones, store, redactedPaths, onDirty, fie
             </div>
 
             <div className="cf-card__fields">
-              <EnumField {...makeShared("mode", cfg.mode)} options={FUSION_MODES} />
+              <EnumField {...makeShared("mode", cfg.mode, { help: "How members combine into one presence result. any = present if any member is; all = only if every member is; quorum = at least N members; weighted = present members' weight fraction meets the threshold." })} options={FUSION_MODES} />
 
-              <EnumField {...makeShared("unavailable_policy", cfg.unavailable_policy)} options={UNAVAILABLE_POLICIES} />
+              <EnumField {...makeShared("unavailable_policy", cfg.unavailable_policy, { help: "How an offline/stale sensor is treated. present (default) is fail-safe — never blanks a room it can't see. absent will blank when sensors drop out; use with care." })} options={UNAVAILABLE_POLICIES} />
 
               {/* Members — read-only in T7 */}
               <div className="cf-field cf-field--locked">
@@ -65,10 +66,10 @@ export default function ZonesSection({ zones, store, redactedPaths, onDirty, fie
               </div>
 
               {cfg.quorum !== undefined && (
-                <NumberField {...makeShared("quorum", cfg.quorum)} />
+                <NumberField {...makeShared("quorum", cfg.quorum, { help: "Minimum number of members that must report present." })} />
               )}
               {cfg.threshold !== undefined && (
-                <NumberField {...makeShared("threshold", cfg.threshold)} />
+                <NumberField {...makeShared("threshold", cfg.threshold, { help: "Present-weight fraction required, 0.0–1.0." })} />
               )}
 
               {/* Weights — read-only in T7 */}

@@ -6,7 +6,7 @@
  * `error` (inline 422 validation detail rendered below the input).
  */
 
-export { LOG_LEVELS, FUSION_MODES, UNAVAILABLE_POLICIES } from "./constants";
+export { LOG_LEVELS, FUSION_MODES, UNAVAILABLE_POLICIES, IDLE_TIME_UNITS, IDLE_SOURCES } from "./constants";
 
 export interface FieldProps {
   path: string[];
@@ -17,6 +17,10 @@ export interface FieldProps {
   onEdit: (path: string[], value: unknown) => void;
   /** Inline 422 validation error detail for this field. */
   error?: string;
+  /** Guidance text shown below the control. */
+  help?: string;
+  /** Placeholder attribute for text/number/duration inputs. */
+  placeholder?: string;
 }
 
 /* ── shared locked-input shell ── */
@@ -45,7 +49,7 @@ function fieldClassName(locked: boolean, error: boolean): string {
  * ultimate authority; the client only shows a hint for obviously
  * invalid input.
  */
-export function DurationField({ path, label, value, locked, lockedReason, onEdit, error }: FieldProps) {
+export function DurationField({ path, label, value, locked, lockedReason, onEdit, error, help, placeholder }: FieldProps) {
   const raw = typeof value === "string" ? value : String(value ?? "");
   const durRx = /^\d+(ms|s|m|h)( \d+(ms|s|m|h))*$/;
 
@@ -59,6 +63,7 @@ export function DurationField({ path, label, value, locked, lockedReason, onEdit
           className="cf-field__input"
           value={raw}
           disabled={locked}
+          placeholder={placeholder}
           onChange={(e) => onEdit(path, e.target.value)}
         />
         {locked && <LockIcon reason={lockedReason} />}
@@ -66,13 +71,14 @@ export function DurationField({ path, label, value, locked, lockedReason, onEdit
       {!locked && raw.length > 0 && !durRx.test(raw) && (
         <span className="cf-field__hint">expected: 5s, 1m 30s, 2h</span>
       )}
+      {help && <span className="cf-field__hint">{help}</span>}
       {error && <span className="cf-field__error">{error}</span>}
     </div>
   );
 }
 
 /** Enum field — <select> with a fixed set of options. */
-export function EnumField({ path, label, value, locked, lockedReason, onEdit, error, options }: FieldProps & { options: readonly string[] }) {
+export function EnumField({ path, label, value, locked, lockedReason, onEdit, error, help, options }: FieldProps & { options: readonly string[] }) {
   const current = typeof value === "string" ? value : String(value ?? "");
 
   return (
@@ -92,13 +98,14 @@ export function EnumField({ path, label, value, locked, lockedReason, onEdit, er
         </select>
         {locked && <LockIcon reason={lockedReason} />}
       </div>
+      {help && <span className="cf-field__hint">{help}</span>}
       {error && <span className="cf-field__error">{error}</span>}
     </div>
   );
 }
 
 /** Boolean field — checkbox toggle. */
-export function BoolField({ path, label, value, locked, lockedReason, onEdit, error }: FieldProps) {
+export function BoolField({ path, label, value, locked, lockedReason, onEdit, error, help }: FieldProps) {
   const checked = Boolean(value);
 
   return (
@@ -114,13 +121,14 @@ export function BoolField({ path, label, value, locked, lockedReason, onEdit, er
         <span>{label}</span>
       </label>
       {locked && <LockIcon reason={lockedReason} />}
+      {help && <span className="cf-field__hint">{help}</span>}
       {error && <span className="cf-field__error">{error}</span>}
     </div>
   );
 }
 
 /** Number field — numeric input. */
-export function NumberField({ path, label, value, locked, lockedReason, onEdit, error }: FieldProps) {
+export function NumberField({ path, label, value, locked, lockedReason, onEdit, error, help, placeholder }: FieldProps) {
   const raw = typeof value === "number" ? String(value) : String(value ?? "");
 
   return (
@@ -133,6 +141,7 @@ export function NumberField({ path, label, value, locked, lockedReason, onEdit, 
           className="cf-field__input"
           value={raw}
           disabled={locked}
+          placeholder={placeholder}
           onChange={(e) => {
             const n = Number(e.target.value);
             if (!Number.isNaN(n)) onEdit(path, n);
@@ -140,13 +149,14 @@ export function NumberField({ path, label, value, locked, lockedReason, onEdit, 
         />
         {locked && <LockIcon reason={lockedReason} />}
       </div>
+      {help && <span className="cf-field__hint">{help}</span>}
       {error && <span className="cf-field__error">{error}</span>}
     </div>
   );
 }
 
 /** Plain text field. */
-export function TextField({ path, label, value, locked, lockedReason, onEdit, error }: FieldProps) {
+export function TextField({ path, label, value, locked, lockedReason, onEdit, error, help, placeholder }: FieldProps) {
   const raw = typeof value === "string" ? value : String(value ?? "");
 
   return (
@@ -159,10 +169,12 @@ export function TextField({ path, label, value, locked, lockedReason, onEdit, er
           className="cf-field__input"
           value={raw}
           disabled={locked}
+          placeholder={placeholder}
           onChange={(e) => onEdit(path, e.target.value)}
         />
         {locked && <LockIcon reason={lockedReason} />}
       </div>
+      {help && <span className="cf-field__hint">{help}</span>}
       {error && <span className="cf-field__error">{error}</span>}
     </div>
   );

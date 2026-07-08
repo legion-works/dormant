@@ -30,6 +30,19 @@ use crate::tray::TrayState;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Compute the next backoff duration from a tick outcome.
+///
+/// Clean closes (the daemon shut down or reloaded the generation) reset to
+/// [`BACKOFF_MIN`] for a prompt reconnect; hard errors escalate exponentially
+/// and are capped at [`BACKOFF_MAX`].
+fn next_backoff(current: Duration, was_closed: bool) -> Duration {
+    if was_closed {
+        BACKOFF_MIN
+    } else {
+        (current * 2).min(BACKOFF_MAX)
+    }
+}
+
 /// Drop-guard that fires [`client::EventShutdown::shutdown`] on every
 /// exit path so the pump thread's blocked `read_line` returns and the
 /// thread exits cleanly.  Holding this guard in `tick` is what stops
@@ -102,10 +115,13 @@ pub async fn run(
     let mut backoff = BACKOFF_MIN;
     loop {
         let tick_result = tick(&socket_path, &state, &cancel).await;
-        match tick_result {
+        match &tick_result {
             Ok(TickExit::Cancelled) => return,
             Ok(TickExit::Closed) => {
-                // Daemon closed the stream cleanly — back off and retry.
+                // Clean close (daemon reload or shutdown) — reconnect promptly.
+                // A Closed exit proves the connection was healthy (fetch_status +
+                // connect_events + event loop all succeeded), so reset the backoff.
+                backoff = BACKOFF_MIN;
             }
             Err(e) => {
                 warn!(error = %e, "ipc tick failed; will retry");
@@ -124,7 +140,7 @@ pub async fn run(
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(backoff) => {}
         }
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        backoff = next_backoff(backoff, matches!(&tick_result, Ok(TickExit::Closed)));
     }
 }
 
@@ -218,4 +234,49 @@ async fn publish_snapshot(state: &Arc<Mutex<TrayState>>, snap: StateSnapshot) {
     s.snapshot = Some(snap);
     s.unreachable = false;
     s.icon_state = new_icon_state;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- RED-first: these tests ASSERT the CORRECT behaviour ---
+
+    #[test]
+    fn closed_resets_to_min_even_from_max() {
+        let result = next_backoff(BACKOFF_MAX, true);
+        assert_eq!(
+            result, BACKOFF_MIN,
+            "RED: Closed should reset to BACKOFF_MIN, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn error_escalates_and_caps() {
+        let result = next_backoff(BACKOFF_MIN, false);
+        assert_eq!(result, Duration::from_secs(2), "1s → 2s");
+
+        let result = next_backoff(Duration::from_secs(16), false);
+        assert_eq!(result, BACKOFF_MAX, "16s → caps at 30s");
+
+        let result = next_backoff(BACKOFF_MAX, false);
+        assert_eq!(result, BACKOFF_MAX, "already at cap stays capped");
+    }
+
+    #[test]
+    fn sequence_closed_resets_after_errors() {
+        // Simulate: Err(1s) → Err(2s) → Closed → next should be BACKOFF_MIN
+        let b1 = next_backoff(BACKOFF_MIN, false);
+        assert_eq!(b1, Duration::from_secs(2));
+
+        let b2 = next_backoff(b1, false);
+        assert_eq!(b2, Duration::from_secs(4));
+
+        // After errors, a clean close must reset to BACKOFF_MIN.
+        let b3 = next_backoff(b2, true);
+        assert_eq!(
+            b3, BACKOFF_MIN,
+            "RED: after Err→Err→Closed, backoff should be BACKOFF_MIN, got {b3:?}"
+        );
+    }
 }

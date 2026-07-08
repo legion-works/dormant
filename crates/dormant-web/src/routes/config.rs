@@ -345,6 +345,7 @@ fn redact_url(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dormant_core::config::defaults;
     use dormant_core::config::schema::{
         DaemonConfig, ScreensaverConfig, ScreensaverSource, SensorConfig,
     };
@@ -598,6 +599,7 @@ mod tests {
                 wake_data: None,
                 command_timeout: std::time::Duration::from_secs(5),
                 restore_brightness: 100,
+                samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                 treat_unreachable_as_blanked: false,
             },
         );

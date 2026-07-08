@@ -996,6 +996,26 @@ impl SamsungTizenController {
     }
 }
 
+/// Test-only inherent accessors for the registry-path test that asserts the
+/// actual wiring of `configured_primary_mode` and `restore_backlight` from
+/// the config into the controller. The trait object is downcast to the
+/// concrete type via `Any`, so the accessor is reached after the downcast
+/// — no test-only methods on the public trait.
+#[cfg(test)]
+impl SamsungTizenController {
+    /// Read the configured primary mode — sourced at construction from
+    /// [`dormant_core::config::schema::DisplayConfig::primary_blank_mode`].
+    pub(crate) fn configured_primary_mode(&self) -> BlankMode {
+        self.configured_primary_mode
+    }
+
+    /// Read the per-display `restore_backlight` override — paired with
+    /// [`Self::configured_primary_mode`] for the registry-path test.
+    pub(crate) fn restore_backlight_for_test(&self) -> u8 {
+        self.restore_backlight
+    }
+}
+
 #[async_trait]
 impl DisplayController for SamsungTizenController {
     fn name(&self) -> &'static str {

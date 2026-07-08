@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/iceteaSA/dormant/actions/workflows/ci.yml"><img src="https://github.com/iceteaSA/dormant/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/legion-works/dormant/actions/workflows/ci.yml"><img src="https://github.com/legion-works/dormant/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="MSRV 1.88">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux">
@@ -71,7 +71,7 @@ The `dormant-tray` applet puts per-display status and blank/wake/pause controls 
 Build from source (Linux, Rust 1.88+):
 
 ```bash
-git clone https://github.com/iceteaSA/dormant.git
+git clone https://github.com/legion-works/dormant.git
 cd dormant
 cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd  ~/.local/bin/dormantd

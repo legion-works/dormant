@@ -415,7 +415,7 @@ mark** (dormant = asleep) in **dormant green `#C3E88D`** with a small **Legion-c
 Grotesk** 600. See `Brand Assets.dc.html` for the full board (logo lockups
 dark/light, favicon/app-icon sizes, the Legion palette with dormant-green
 highlighted, Space Grotesk / Geist / JetBrains Mono specimens, a 12-icon set, a
-1232×340 README hero, and a 1200×630 GitHub OG card — `github.com/iceteaSA/dormant`).
+1232×340 README hero, and a 1200×630 GitHub OG card — `github.com/legion-works/dormant`).
 
 Ready-to-use vector files are in `assets/`:
 - `assets/mark.svg` — crescent (green, transparent via SVG mask) + cyan node; drops

@@ -18,7 +18,7 @@
 3. For the MQTT integration test, install Docker (the CI test uses `eclipse-mosquitto`).
 4. Clone the repo:
    ```bash
-   git clone https://github.com/icetea/dormant.git
+   git clone https://github.com/legion-works/dormant.git
    cd dormant
    ```
 

@@ -18,7 +18,7 @@ Status: pre-`0.1.0`. The core daemon, all three control surfaces, and the audio-
 
 ## Near-term — toward `0.1.0`
 
-- **Reload-concurrency hardening** ([#9](https://github.com/iceteaSA/dormant/issues/9)) — a manual command issued in the narrow window during a config reload can be dropped. Narrow and self-correcting today; the fix removes the lost-command window in the reload generation swap.
+- **Reload-concurrency hardening** ([#9](https://github.com/legion-works/dormant/issues/9)) — a manual command issued in the narrow window during a config reload can be dropped. Narrow and self-correcting today; the fix removes the lost-command window in the reload generation swap.
 - **TV control reliability** — harden the Samsung control WebSocket against the TV silently dropping idle sockets (liveness check before send). In validation.
 - **Footprint validation** — confirm a flat resource footprint (no RSS creep) across real blank/wake/screensaver/reload cycles before calling the daemon production-stable.
 - **First tagged release** — cut `0.1.0` once the above land: promote `dev` → `master`, tag, ship installers.

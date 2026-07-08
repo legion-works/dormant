@@ -208,6 +208,7 @@ pub fn build_controllers(
                     token.clone(),
                     cfg.wol_mac.clone(),
                     cfg.treat_unreachable_as_blanked,
+                    cfg.blank_mode.unwrap_or(BlankMode::ScreenOffAudioOn),
                 )));
             }
             other => {

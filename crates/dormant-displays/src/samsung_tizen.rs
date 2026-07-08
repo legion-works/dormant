@@ -131,6 +131,14 @@ const TV_UNREACHABLE_NOOP: &str = "tv_unreachable_noop";
 /// `WoL` broadcast address.
 const WOL_BROADCAST: &str = "255.255.255.255:9";
 
+/// Maximum backlight value when restoring a `BrightnessZero` blank whose
+/// saved value is missing (daemon restart, reload, or first-ever wake).
+///
+/// The TV's IP-Control backlight scale is 0–50; 50 is the max. Per the
+/// fail-safe-toward-screens-on doctrine, a too-bright panel is acceptable
+/// — a stuck-dim one is not — so this is the conservative default.
+pub const DEFAULT_RESTORE_BACKLIGHT: u8 = 50;
+
 /// Maximum time to wait for a TCP connect probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -519,6 +527,22 @@ impl RealTvTransport {
     }
 }
 
+/// On transport drop, cancel the current reader task so it exits its
+/// `select!` loop and drops the read half — otherwise the spawned task
+/// lives on with its socket and the underlying TCP connection stays open
+/// past the daemon's lifecycle.
+///
+/// Reconnect swaps the `reader_state` under its std-mutex and fires the
+/// prior token's cancel; the `Drop` impl handles the LAST state when no
+/// more reconnects are coming.
+impl Drop for RealTvTransport {
+    fn drop(&mut self) {
+        if let Ok(state) = self.reader_state.lock() {
+            state.cancel.cancel();
+        }
+    }
+}
+
 #[async_trait]
 impl TvTransport for RealTvTransport {
     async fn send_key(&self, host: &str, token: &str, key: &str) -> Result<(), String> {
@@ -694,9 +718,16 @@ pub struct SamsungTizenController {
     /// Backlight value at the time of the first `BrightnessZero` blank.
     /// First-blank-wins pattern: a second blank while already at 0 reads
     /// `current=0` and must NOT clobber the real saved value, or wake
-    /// would restore 0 (stuck-dark). Cleared on wake so the next cycle
-    /// re-saves whatever the user has since set.
+    /// would restore 0 (stuck-dark). Cleared on wake AFTER a successful
+    /// restore so a transient set failure leaves the value intact for
+    /// retry.
     saved_backlight: StdMutex<Option<u8>>,
+    /// Effective blank mode for this display — set at construction from the
+    /// config's `blank_mode`. Used by `wake()` to pick the correct wake
+    /// path: `BrightnessZero` always restores via backlight (defaulting to
+    /// [`DEFAULT_RESTORE_BACKLIGHT`] when no value is saved), while
+    /// `ScreenOffAudioOn` / `PowerOff` send `KEY_RETURN`.
+    effective_mode: BlankMode,
 }
 
 impl std::fmt::Debug for SamsungTizenController {
@@ -712,6 +743,7 @@ impl std::fmt::Debug for SamsungTizenController {
             .field("transport", &"dyn TvTransport")
             .field("backlight", &"dyn BacklightTransport")
             .field("saved_backlight", &"Option<u8>")
+            .field("effective_mode", &self.effective_mode)
             .finish()
     }
 }
@@ -721,12 +753,16 @@ impl SamsungTizenController {
     const NAME: &'static str = "samsung-tizen";
 
     /// Build a new controller with the real network transports.
+    ///
+    /// `effective_mode` is the display's configured `blank_mode` — it
+    /// drives the `wake()` path (see [`Self::effective_mode`]).
     #[must_use]
     pub fn new(
         host: String,
         token: String,
         wol_mac: Option<String>,
         treat_unreachable_as_blanked: bool,
+        effective_mode: BlankMode,
     ) -> Self {
         Self {
             host,
@@ -736,10 +772,15 @@ impl SamsungTizenController {
             transport: Arc::new(RealTvTransport::new()),
             backlight: Arc::new(RealBacklightTransport::new()),
             saved_backlight: StdMutex::new(None),
+            effective_mode,
         }
     }
 
     /// Build a controller with custom transports (used by tests).
+    ///
+    /// `effective_mode` defaults to [`BlankMode::ScreenOffAudioOn`] so
+    /// pre-existing call sites that pre-date the constructor signature
+    /// change keep working — the picture-off wake path is unchanged.
     #[must_use]
     pub fn with_transport(
         host: String,
@@ -756,10 +797,16 @@ impl SamsungTizenController {
             transport,
             backlight: Arc::new(RealBacklightTransport::new()),
             saved_backlight: StdMutex::new(None),
+            effective_mode: BlankMode::ScreenOffAudioOn,
         }
     }
 
     /// Build a controller with BOTH transports injected (used by tests).
+    ///
+    /// `effective_mode` defaults to [`BlankMode::ScreenOffAudioOn`] — tests
+    /// that need the brightness-zero wake path should use
+    /// [`Self::with_transports_mode`] (or override the field directly via
+    /// the public `effective_mode` accessor below).
     #[must_use]
     pub fn with_transports(
         host: String,
@@ -777,6 +824,31 @@ impl SamsungTizenController {
             transport,
             backlight,
             saved_backlight: StdMutex::new(None),
+            effective_mode: BlankMode::ScreenOffAudioOn,
+        }
+    }
+
+    /// Build a controller with both transports AND an explicit effective
+    /// mode. Tests for the `BrightnessZero` wake path use this.
+    #[must_use]
+    pub fn with_transports_mode(
+        host: String,
+        token: String,
+        wol_mac: Option<String>,
+        treat_unreachable_as_blanked: bool,
+        transport: Arc<dyn TvTransport>,
+        backlight: Arc<dyn BacklightTransport>,
+        effective_mode: BlankMode,
+    ) -> Self {
+        Self {
+            host,
+            token,
+            wol_mac,
+            treat_unreachable_as_blanked,
+            transport,
+            backlight,
+            saved_backlight: StdMutex::new(None),
+            effective_mode,
         }
     }
 
@@ -840,20 +912,25 @@ impl SamsungTizenController {
         Ok(())
     }
 
-    /// Wake via backlight restore. Returns `true` if a backlight restore
-    /// was performed (caller should NOT then send `KEY_RETURN`); `false`
-    /// if there was nothing to restore (caller should fall through to the
-    /// picture-off wake path).
-    async fn restore_backlight(&self) -> Result<bool, CmdFailure> {
-        let restore_to = {
-            let mut saved = self
+    /// Wake via backlight restore for a `BrightnessZero`-configured display.
+    ///
+    /// Uses the saved value if present, otherwise falls back to
+    /// [`DEFAULT_RESTORE_BACKLIGHT`] (the max on the 0–50 scale). The
+    /// default is conservative — per the fail-safe-toward-screens-on
+    /// doctrine a too-bright panel is acceptable; a stuck-dim one is not.
+    ///
+    /// The set is always attempted (never short-circuits to `KEY_RETURN`)
+    /// because `KEY_RETURN` does NOT raise the port-1516 backlight — it
+    /// only dismisses picture-off. Without this guarantee, a daemon
+    /// restart that loses `saved_backlight` would leave the panel dimmed
+    /// while the daemon thinks it woke.
+    async fn restore_backlight_with_default(&self) -> Result<(), CmdFailure> {
+        let target = {
+            let saved = self
                 .saved_backlight
                 .lock()
                 .expect("saved_backlight poisoned");
-            saved.take()
-        };
-        let Some(target) = restore_to else {
-            return Ok(false);
+            saved.unwrap_or(DEFAULT_RESTORE_BACKLIGHT)
         };
 
         let token = self
@@ -869,7 +946,15 @@ impl SamsungTizenController {
             .map_err(|e| {
                 samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
             })?;
-        Ok(true)
+
+        // set_backlight succeeded — clear the saved value so the next
+        // blank cycle starts fresh.
+        let mut saved = self
+            .saved_backlight
+            .lock()
+            .expect("saved_backlight poisoned");
+        *saved = None;
+        Ok(())
     }
 }
 
@@ -941,17 +1026,22 @@ impl DisplayController for SamsungTizenController {
             return self.unreachable_noop("wake");
         }
 
-        // If a backlight restore is pending (from a BrightnessZero blank),
-        // perform it and skip the KEY_RETURN path. The two paths are
-        // mutually exclusive because a single TV is configured with one
-        // blank_mode; saved_backlight being Some means the TV was dimmed
-        // (not picture-off'd) and the audio path is what we need to keep.
-        if self.restore_backlight().await? {
-            return Ok(());
+        // Branch on the display's effective blank mode:
+        //
+        // - `BrightnessZero` ALWAYS restores via backlight — even when
+        //   `saved_backlight` is `None` (daemon restart / reload / first
+        //   wake). The default fallback is `DEFAULT_RESTORE_BACKLIGHT`
+        //   (50, the max on the 0–50 scale) so a too-bright panel is
+        //   acceptable — a stuck-dim one is not. `KEY_RETURN` would NOT
+        //   raise the port-1516 backlight, so falling through to it would
+        //   leave the panel dimmed while the daemon thinks it woke.
+        // - `ScreenOffAudioOn` (and `PowerOff`) sends `KEY_RETURN` —
+        //   picture-off's wake key (verified non-toggle on S90D; safe even
+        //   if daemon state has drifted).
+        if self.effective_mode == BlankMode::BrightnessZero {
+            return self.restore_backlight_with_default().await;
         }
 
-        // KEY_RETURN wakes from picture-off and is not a toggle — safe even
-        // if the daemon's state has drifted.
         self.transport
             .send_key(&self.host, &self.token, KEY_RETURN)
             .await
@@ -1195,11 +1285,12 @@ mod tests {
 
     // ── WebSocket handshake headers (regression: sec-websocket-key) ─────────
 
-    /// RED-first proof: the OLD bare-`Request::builder().uri().body(())` pattern
-    /// produces a request with NO `sec-websocket-key` header. The `IntoClientRequest`
-    /// trait generates it automatically. This guard pins the real bug — a WSS
-    /// connect against a real Samsung TV without this header fails with
-    /// "Missing, duplicated or incorrect header sec-websocket-key".
+    /// Regression guard: the old bare `Request::builder().uri().body(())`
+    /// pattern produces a request with NO `sec-websocket-key` header — a
+    /// WSS connect against a real Samsung TV fails with "Missing, duplicated
+    /// or incorrect header sec-websocket-key". Pins the real bug so a
+    /// regression to the older request-construction path is caught here
+    /// rather than at the live TV.
     #[test]
     fn old_builder_missing_sec_websocket_key_proof() {
         // Construct the URL the same way the real code does.
@@ -1518,13 +1609,14 @@ mod tests {
             .push(Ok("tok".into()));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
 
-        let ctrl = SamsungTizenController::with_transports(
+        let ctrl = SamsungTizenController::with_transports_mode(
             "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
             tv_fake.clone(),
             bl_fake.clone(),
+            BlankMode::BrightnessZero,
         );
 
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
@@ -2090,13 +2182,12 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// RED-first proof for the durability fix: a fresh socket whose reader
-    /// has not seen any frame (because the server is silent — simulating
-    /// the silent-drop scenario) must be detected as STALE on the next
-    /// send. With the OLD ping→pong check, a single frame on the wire
-    /// would silently land on a dead socket. With the new design, the
-    /// `now - last_seen > MAX_WS_SILENCE` check fires and triggers a
-    /// reconnect.
+    /// Silent-drop scenario: a fresh socket whose reader task has not observed
+    /// any frame (the TV is silent — TCP alive but no frames) must be
+    /// detected as STALE on the next send, triggering a reconnect that
+    /// delivers the key on a fresh connection. Guards against the original
+    /// silent-drop bug where a half-open socket silently accepted the write
+    /// and reported success while the key vanished.
     #[tokio::test]
     async fn silent_drop_triggers_reconnect_via_last_seen() {
         use tokio::net::TcpListener;
@@ -2172,12 +2263,10 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// RED-first proof for the pre-fix behavior: the OLD client-side ping
-    /// would have failed to detect a silent-drop scenario where the kernel
-    /// still accepts writes. The new design uses the TV's heartbeat
-    /// (`last_seen`) instead. This test asserts that the freshness check
-    /// fires immediately when `last_seen` is rewound — proving the new
-    /// check is the gate, not the Ping/Pong round-trip.
+    /// Freshness check (not Ping/Pong) is the liveness gate. When `last_seen`
+    /// is rewound past the silence window, the freshness check fires
+    /// immediately — proving that the liveness decision is driven by the
+    /// TV-driven heartbeat signal, not by a client-initiated round-trip.
     #[tokio::test]
     async fn freshness_check_is_the_gate_not_ping() {
         let transport = RealTvTransport::for_test_with_silence(
@@ -2265,5 +2354,133 @@ mod tests {
     async fn pair_timeout_fails_fast() {
         let result = pair("192.0.2.1", Duration::from_millis(50)).await;
         assert!(result.is_err(), "expected Err against unreachable host");
+    }
+
+    // ── MUST 1 reverse-apply: transient set failure leaves saved intact ───
+
+    /// After a transient `set_backlight` failure, `saved_backlight` is
+    /// STILL `Some(N)` so a subsequent wake attempt can retry the restore.
+    /// Pins the clear-before-success bug: the pre-fix ordering took the
+    /// saved value before calling `set_backlight`, so a transient failure
+    /// (network blip, TV busy) would lose the value and leave the panel
+    /// stuck dim while the daemon thinks it woke.
+    #[tokio::test]
+    async fn restore_backlight_preserves_saved_on_set_failure() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-1".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(33));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // For wake: acquire succeeds, but set_backlight fails.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-1".into()));
+        bl_fake
+            .set_results
+            .lock()
+            .unwrap()
+            .push(Err("network blip".into()));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+        );
+
+        // Blank: saves 33.
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(33));
+
+        // Wake attempt 1: set fails — Err returned. saved_backlight
+        // must NOT have been cleared.
+        let err = ctrl.wake().await.unwrap_err();
+        assert_eq!(err.controller, "samsung-tizen");
+        assert_eq!(
+            *ctrl.saved_backlight.lock().unwrap(),
+            Some(33),
+            "transient set failure must preserve saved_backlight for retry"
+        );
+    }
+
+    // ── MUST 2 reverse-apply: missing saved → restore to default, not KEY_RETURN
+
+    /// A `BrightnessZero` controller with `saved_backlight = None` (e.g.
+    /// after daemon restart) must wake by SETTING backlight to
+    /// [`DEFAULT_RESTORE_BACKLIGHT`], NOT by sending `KEY_RETURN` — the
+    /// latter does not raise port-1516 backlight and would leave the
+    /// panel dim while the daemon thinks it woke.
+    #[tokio::test]
+    async fn brightness_zero_wake_with_no_saved_restores_to_default() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // For wake: acquire + set_backlight(DEFAULT_RESTORE_BACKLIGHT).
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+        );
+
+        // saved_backlight starts at None (no blank yet, or restart).
+        assert!(ctrl.saved_backlight.lock().unwrap().is_none());
+
+        ctrl.wake().await.unwrap();
+
+        // Backlight was restored to DEFAULT_RESTORE_BACKLIGHT.
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("192.0.2.7".to_string(), DEFAULT_RESTORE_BACKLIGHT)]
+        );
+        // KEY_RETURN was NOT sent — backlight restore is the wake.
+        assert!(
+            tv_fake.take_sent_keys().is_empty(),
+            "BrightnessZero wake must not fall through to KEY_RETURN"
+        );
+    }
+
+    // ── MUST 3 reverse-apply: dropping the transport cancels the reader task
+
+    /// When the transport is dropped (controller removed / daemon reload),
+    /// the final reader task's `CancellationToken` is fired — without
+    /// this, the reader task would outlive the transport and keep its
+    /// socket half open past the daemon's lifetime.
+    #[test]
+    fn drop_transport_cancels_final_reader_state_token() {
+        let transport = RealTvTransport::for_test_with_silence(
+            // Port unused — we never connect in this test.
+            1,
+            Duration::from_secs(60),
+        );
+        let state = transport.reader_state_for_test();
+        assert!(
+            !state.cancel.is_cancelled(),
+            "fresh reader_state must NOT be cancelled"
+        );
+        drop(transport);
+        assert!(
+            state.cancel.is_cancelled(),
+            "dropping RealTvTransport must cancel the current reader_state's \
+             CancellationToken so the reader task exits"
+        );
     }
 }

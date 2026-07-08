@@ -871,10 +871,12 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
 ]
 

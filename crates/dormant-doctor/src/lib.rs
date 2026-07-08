@@ -22,6 +22,7 @@ pub use probes::config::probe_config_inner;
 pub use probes::ddcci::probe_ddcci;
 pub use probes::ha::probe_ha_all;
 pub use probes::mqtt::probe_mqtt_all;
+pub use probes::samsung::probe_samsung;
 pub use probes::usb::probe_usb;
 
 use dormant_core::config::Config;

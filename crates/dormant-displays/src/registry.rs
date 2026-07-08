@@ -316,6 +316,79 @@ mod tests {
         assert_eq!(chain[0].supported_modes(), vec![BlankMode::PowerOff]);
     }
 
+    /// A Samsung display wired with `blank_mode = None` and a ladder whose
+    /// first `Controller` stage is `BrightnessZero` — `DisplayConfig::primary_blank_mode()`
+    /// returns `BrightnessZero`, and the registry must thread that into
+    /// `SamsungTizenController::configured_primary_mode`. Pre-fix wiring
+    /// (`cfg.blank_mode.unwrap_or(ScreenOffAudioOn)`) built the controller
+    /// as `ScreenOffAudioOn` and wake fell through to `KEY_RETURN`, leaving
+    /// the panel dim after a backlight blank. This test pins the registry
+    /// path end-to-end — bypassed by the direct-construction test in
+    /// `samsung_tizen.rs::ladder_primary_brightness_zero_wake_restores_backlight_after_restart`,
+    /// which only exercises `SamsungTizenController::wake()` in isolation.
+    #[test]
+    fn build_samsung_ladder_primary_brightness_zero_wires_configured_primary_mode() {
+        use crate::samsung_tizen::SamsungTizenController;
+        use dormant_core::types::{LadderStage, StageKind};
+
+        let cfg = DisplayConfig {
+            controllers: vec!["samsung-tizen".into()],
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::BrightnessZero),
+                dwell: None,
+            }],
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: Some("192.0.2.7".into()),
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: COMMAND_TIMEOUT,
+            restore_brightness: 80,
+            samsung_restore_backlight: 42, // operator-tuned override
+            treat_unreachable_as_blanked: true,
+        };
+        let mut creds = Credentials::default();
+        creds.samsung.insert("192.0.2.7".into(), "test-token".into());
+
+        let chain = build_controllers("tv", &cfg, &creds).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name(), "samsung-tizen");
+
+        // Downcast to inspect the registry-wired controller. `DisplayController`
+        // is `Any` so the trait object can be coerced to `Box<dyn Any>` for
+        // downcasting — without exposing test-only methods on the trait.
+        let boxed = chain.into_iter().next().expect("one controller");
+        let ctrl: Box<SamsungTizenController> = (boxed as Box<dyn std::any::Any>)
+            .downcast()
+            .expect("samsung-tizen controller downcast");
+
+        assert_eq!(
+            ctrl.configured_primary_mode(),
+            BlankMode::BrightnessZero,
+            "registry must thread DisplayConfig::primary_blank_mode() — \
+             which walks the ladder and finds the BrightnessZero stage — \
+             into the controller's configured_primary_mode field. \
+             Pre-fix `cfg.blank_mode.unwrap_or(ScreenOffAudioOn)` would \
+             leave it as ScreenOffAudioOn and the wake() path would send \
+             KEY_RETURN instead of restoring port-1516 backlight."
+        );
+        assert_eq!(
+            ctrl.restore_backlight_for_test(),
+            42,
+            "registry must thread the per-display samsung_restore_backlight override"
+        );
+    }
+
     #[test]
     fn build_unknown_controller_name_fails() {
         let mut cfg = command_cfg();

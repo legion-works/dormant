@@ -5,6 +5,8 @@
 //! `dormant-sensors` and `dormant-displays`; this crate only defines the
 //! contract so that [`crate::rules::RulesEngine`] stays free of concrete I/O.
 
+use std::any::Any;
+
 use crate::error::DormantError;
 use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 
@@ -30,8 +32,15 @@ pub trait SensorSource: Send {
 
 /// A display controller: local (`KWin` DPMS, DDC/CI) or network (Samsung Tizen,
 /// LG webOS, HA passthrough, arbitrary command).
+///
+/// `Any` is a supertrait so trait objects can be downcast to the concrete
+/// controller type in tests (registry construction-path assertions) without
+/// exposing test-only accessor methods on the trait itself. Every
+/// `DisplayController` impl is `'static` by construction (concrete types
+/// stored in `Box<dyn DisplayController>`), so `Any` is satisfied
+/// automatically — no per-impl boilerplate required.
 #[async_trait::async_trait]
-pub trait DisplayController: Send + Sync {
+pub trait DisplayController: Any + Send + Sync {
     /// Literal name of this controller (grep-stable, matches config `type`).
     fn name(&self) -> &'static str;
 

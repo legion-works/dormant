@@ -27,6 +27,10 @@ tokio-serial = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 
+[features]
+default = ["render"]
+render = ["dormant-core/render"]
+
 [package.metadata.dist]
 dist = true
 

@@ -28,6 +28,7 @@ Status: pre-`0.1.0`. The core daemon, all three control surfaces, and the audio-
 - **Packaging** — `.deb` / `.rpm` alongside the shell installers; distro-friendly systemd units.
 - **Config ergonomics** — full entity CRUD in the web editor (add/remove sensors, zones, displays, rules), a device-pairing wizard, and `dormantctl validate` that understands render-feature configs.
 - **Doctor-assisted issue drafting** — `dormantctl doctor` already gathers the exact hardware, environment, and probe output the issue templates require. Let it write a ready-to-file bug report or feature request to disk (pre-filled with display model + connection, OS/compositor/session, controller, and probe results), captured at the moment something fails so it can be filed later without hand-reconstructing the context. A `doctor --report-issue` / `--draft-feature` that emits the filled template.
+- **Global hotkeys** — bind a key to blank, wake, or pause a display (or all of them) without reaching for the tray or a terminal. On Wayland this can't be a raw global grab; it goes through the compositor's shortcut path (the XDG desktop `GlobalShortcuts` portal, or KDE's KGlobalAccel). Users can already bind their own shortcuts to `dormantctl blank`/`wake`/`pause` today — this makes it first-class, with the daemon registering the shortcuts and a config block to declare them.
 
 ## Exploratory — not committed
 

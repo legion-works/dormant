@@ -7,6 +7,10 @@ extend-ignore-re = [
   "(?i)Mosquitto",
   # ESPresense is a proper name (ESP32 presence detection project)
   "ESPresense",
+  # ABL = Automatic Brightness Limiting (OLED term); NDA = non-disclosure agreement —
+  # real acronyms in the OLED research notes, not misspellings
+  "ABL",
+  "NDAs?",
 ]
 
 # Intentional typo in an is_known_config_path test (verifying wrong key

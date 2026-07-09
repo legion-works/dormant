@@ -1,39 +1,111 @@
 name: Feature Request
-description: Propose a new feature or enhancement
+description: Propose a new feature, display controller, or sensor
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Feature requests are welcome. Describe the use case clearly — the *why* matters more than the *how*.
+        dormant controls real hardware — monitors, TVs, presence sensors — so a feature request we can actually research and build has to name the hardware and the environment it runs in. A request like "support my TV" with no model, no connection type, and no way to test it is not implementable, and we will ask for all of this before doing anything. The required fields below are what we need up front.
+
+        If you can test on the hardware yourself, say so — hardware control cannot be verified any other way, and a feature for a device nobody can test on will not get built.
   - type: textarea
     id: use-case
     attributes:
       label: Use case
-      description: What problem does this solve? Describe your setup (room layout, sensor types, display models) and what you want dormant to do.
+      description: What problem does this solve? Describe your room, who's in it, and what you want dormant to do — the *why* matters more than the *how*.
+      placeholder: |
+        My living room has the TV and my desk in it. When I sit at the desk the TV should
+        blank but the monitor stay on; when I leave the room both should blank, except when
+        someone's in the kitchen the TV should stay on.
     validations:
       required: true
   - type: textarea
-    id: proposal
+    id: behavior
     attributes:
-      label: Proposal
-      description: How would this work from the user's perspective? Example config snippets help.
+      label: Proposed behavior
+      description: What should dormant do, from your point of view? Config sketches help — write what you'd want the TOML to look like.
       render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: displays
+    attributes:
+      label: Displays involved
+      description: |
+        Exact make and model of every display this touches, the panel technology, and **how each one connects**. Guessed or partial info wastes a round-trip. Include:
+        - Make + model (e.g. "AOC AGON AG326UZD", "Samsung QA65S90D")
+        - Panel: OLED / QD-OLED / LCD / other
+        - Connection to the PC: DisplayPort / HDMI / none (network-only)
+        - Network address if it's a smart TV controlled over the LAN
+        - Any control path you know works: DDC/CI, LG webOS, Samsung Tizen, HDMI-CEC, vendor app
+      placeholder: |
+        - Samsung QA65S90DAKXXA (S90D, QD-OLED), HDMI-A-1 from the PC AND on the LAN at 192.0.2.7
+        - Controlled today via Tizen over WebSocket; no DDC/CI (ddcutil reports "Invalid display")
+    validations:
+      required: true
+  - type: textarea
+    id: sensors
+    attributes:
+      label: Sensors involved
+      description: |
+        If the feature touches presence sensing, name the sensor make/model and how it reaches dormant (Zigbee → Z2M → MQTT, Home Assistant, USB-serial, ESPHome). Write "none" if this feature is display-only.
+      placeholder: |
+        - Sonoff SNZB-06P (mmWave), Zigbee → Zigbee2MQTT → MQTT topic zigbee2mqtt/Living Room
+        - HLK-LD2410C on an ESP32-C6 running ESPHome, published over MQTT
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        The software environment dormant runs in. All of it — display control is tightly coupled to the compositor and driver.
+        - OS + version (e.g. "Arch Linux", "Ubuntu 24.04")
+        - Desktop environment + version (e.g. "KDE Plasma 6.7.2")
+        - Session type: **Wayland or X11**
+        - GPU + driver if the feature touches local display control (e.g. "RTX 5090, proprietary nvidia")
+      placeholder: |
+        Arch Linux, KDE Plasma 6.7.2, Wayland session, RTX 5090 proprietary driver
+    validations:
+      required: true
+  - type: textarea
+    id: research
+    attributes:
+      label: Control path and prior art
+      description: |
+        Anything that helps us research the implementation — this is often the difference between a feature we can build in a day and one we can't build at all:
+        - Protocol / API docs for the device (links)
+        - Other projects that already control this device (Home Assistant integration, a GitHub repo, a script) — a working example to pattern-match beats a spec
+        - Tool output you've captured: `ddcutil detect` / `ddcutil capabilities`, an app's network API, `nmap` of the device, etc.
+      placeholder: |
+        LG webOS: ssap://com.webos.applicationManager/getForegroundAppInfo (used by ColorControl)
+        ddcutil capabilities output attached; VCP 0x60 (input source) responds on this monitor.
+  - type: dropdown
+    id: testability
+    attributes:
+      label: Can you test on this hardware?
+      description: Hardware control can only be verified on the device. If you can run a build and report back (or capture protocol traces), features for your hardware move far faster.
+      options:
+        - "Yes — I have the hardware and can run test builds / capture traces"
+        - "Yes — I have the hardware but can only run released binaries"
+        - "No — I'm requesting this for hardware I don't have"
+    validations:
+      required: true
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: What workarounds have you tried? Why don't they work well enough?
+      description: What workarounds have you tried (the generic `command` controller, an existing controller, a Home Assistant automation)? Why don't they work well enough?
   - type: dropdown
     id: scope
     attributes:
-      label: Scope
-      description: Does this affect the core logic, sensors, displays, CLI, or docs?
+      label: Area
+      description: Which part of dormant does this touch?
       multiple: true
       options:
         - Core (config, zones, rules, state machine)
-        - Sensors (MQTT, HA, USB-LD2410)
-        - Displays (DDC/CI, command, HA passthrough, KWin, Samsung)
+        - Sensors (MQTT, HA, USB-LD2410, ESPHome)
+        - Displays (DDC/CI, Samsung, command, HA passthrough, KWin, render)
+        - Render (Wayland overlay, screensaver)
         - CLI (dormantctl)
-        - Daemon (dormantd)
+        - Web UI
+        - Tray
         - Documentation

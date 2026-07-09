@@ -204,6 +204,15 @@ impl CommandSink for RecordingSink {
         g.wake_results.pop_front().unwrap_or(Ok(()))
     }
 
+    async fn wake_once(&self) -> Result<(), CmdFailure> {
+        // RecordingSink has no retry semantics, so wake_once == wake.
+        // Override anyway — the default forwards to wake, which is fine, but
+        // a direct override makes the relationship explicit and lets tests
+        // assert per-call counts against the wake_once path independently
+        // should a future implementation diverge.
+        self.wake().await
+    }
+
     fn controller_health(&self) -> Vec<crate::rules::ControllerHealth> {
         self.inner
             .lock()

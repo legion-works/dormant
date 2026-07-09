@@ -76,6 +76,24 @@ Shows active inhibitors. Use `dormantctl pause off` to force-resume blanking.
 
 After a wake, the display cannot be blanked again for `min_wake_time` (default 10 s). This prevents rapid blank/wake thrashing if someone briefly leaves and returns.
 
+## Emergency wake
+
+When a display stays blank and pressing keys on a presence-mapped keyboard shortcut doesn't help (no sensors in the room, or someone manually blanked the panel and left), `dormantctl emergency-wake` is the panic-recovery command: it force-wakes every configured display regardless of the rules engine's state.
+
+```bash
+dormantctl emergency-wake
+```
+
+The command tries the daemon's IPC first (2-second timeout). If the daemon is healthy, it pauses every rule indefinitely alongside the wake so nothing re-blanks until you run `dormantctl resume`. If the daemon is wedged or unreachable (the very failure mode this command exists for), `dormantctl` falls back to constructing display controllers directly from your `config.toml` + `credentials.toml` and sending the wake command itself — best-effort, one attempt per display.
+
+For a one-keystroke recovery, bind the command to a global shortcut:
+
+- **KDE Plasma**: System Settings → Shortcuts → Custom Shortcuts → Edit → New → Global Shortcut → Command. Command: `dormantctl emergency-wake`. Trigger: your key.
+- **GNOME**: Settings → Keyboard → View and Customise Shortcuts → Custom Shortcuts. Command: `dormantctl emergency-wake`.
+- **Sway / wlroots**: bind in `~/.config/sway/config`: `bindsym $mod+grave exec dormantctl emergency-wake`.
+
+First-class daemon-registered shortcuts (no compositor setup) are a separate roadmap item.
+
 ## Logging
 
 Set `log_level = "debug"` in the daemon config for detailed logs:

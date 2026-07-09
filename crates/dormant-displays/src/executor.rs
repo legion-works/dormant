@@ -278,6 +278,33 @@ impl CommandSink for DisplayExecutor {
         })
     }
 
+    async fn wake_once(&self) -> Result<(), CmdFailure> {
+        // Single round through the chain — no retries, no backoff. Used by
+        // the emergency-wake path so a panic-recovery command returns fast.
+        let _supersede_token = self.rotate_supersede();
+
+        if self.chain.is_empty() {
+            return Err(CmdFailure {
+                controller: "none-eligible".into(),
+                error: format!("{E_WAKE_FAILED}: empty controller chain"),
+            });
+        }
+
+        for controller in &self.chain {
+            if !controller.is_available().await {
+                continue;
+            }
+            if controller.wake().await.is_ok() {
+                return Ok(());
+            }
+        }
+
+        Err(CmdFailure {
+            controller: "exhausted".into(),
+            error: format!("{E_WAKE_FAILED}: no controller succeeded in single attempt"),
+        })
+    }
+
     async fn wake(&self) -> Result<(), CmdFailure> {
         let supersede_token = self.rotate_supersede();
 

@@ -1623,21 +1623,88 @@ async fn request_snapshot(ctl: &mpsc::Sender<ControlMsg>) -> Option<StateSnapsho
 }
 
 /// Forward control messages to the current generation's engine.
+///
+/// During a config reload the engine is torn down and rebuilt; there is a
+/// brief window between dropping the old `ControlMsg` receiver and writing
+/// the new generation's sender into the watch. A message forwarded in that
+/// window hits a dead sender and would be lost without retry — the canonical
+/// failure for a manual-only (rule-less) display is a dropped `ForceWake`
+/// leaving the screen dark with nothing to re-converge it.
+///
+/// On `SendError` we recover the message (`SendError(m)` gives it back),
+/// wait for the next watch write via `target.changed()`, and re-send —
+/// bounded by `MAX_SWAP_WAITS` to cover the pathological case where the
+/// reload stalls and no new generation ever arrives. Single-task sequential
+/// processing preserves ordering: each `rx.recv()` and its full retry loop
+/// complete before the next receive.
 async fn forward_ctl(
     mut rx: mpsc::Receiver<ControlMsg>,
-    target: watch::Receiver<mpsc::Sender<ControlMsg>>,
+    mut target: watch::Receiver<mpsc::Sender<ControlMsg>>,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
             msg = rx.recv() => match msg {
-                Some(m) => {
-                    let sender = target.borrow().clone();
-                    let _ = sender.send(m).await;
-                }
                 None => break,
+                Some(m) => {
+                    if !deliver_or_drop(m, &mut target, &cancel).await {
+                        break;
+                    }
+                }
             },
+        }
+    }
+}
+
+/// Deliver a single control message to the current generation's engine,
+/// retrying across a reload swap on `SendError`. Returns `false` when the
+/// forwarder should exit (cancellation observed, watch sender dropped, or
+/// `MAX_SWAP_WAITS` exceeded — all logged as `ctl_forward_dropped`).
+async fn deliver_or_drop(
+    msg: ControlMsg,
+    target: &mut watch::Receiver<mpsc::Sender<ControlMsg>>,
+    cancel: &CancellationToken,
+) -> bool {
+    const MAX_SWAP_WAITS: usize = 2;
+    let mut pending = msg;
+    let mut waits: usize = 0;
+    loop {
+        let sender = target.borrow().clone();
+        match sender.send(pending).await {
+            Ok(()) => return true,
+            Err(e) => {
+                pending = e.0;
+                if waits >= MAX_SWAP_WAITS {
+                    tracing::warn!(
+                        event = "ctl_forward_dropped",
+                        waits,
+                        "control message dropped: no live engine generation within retry bound"
+                    );
+                    return false;
+                }
+                waits += 1;
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        tracing::warn!(
+                            event = "ctl_forward_dropped",
+                            waits,
+                            "control message dropped: cancellation observed while awaiting new generation"
+                        );
+                        return false;
+                    }
+                    r = target.changed() => {
+                        if r.is_err() {
+                            tracing::warn!(
+                                event = "ctl_forward_dropped",
+                                waits,
+                                "control message dropped: control watch sender dropped (shutdown)"
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2286,5 +2353,160 @@ mod render_tests {
             dormant_render::TransitionMode::Crossfade,
             "absent transition must default to Crossfade at the build_render_sinks hop"
         );
+    }
+}
+
+// ── forward_ctl reload-window tests (#9) ─────────────────────────────────────
+
+#[cfg(test)]
+mod forward_ctl_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Build a watch seeded with a `ControlMsg` sender whose receiver has been
+    /// dropped — exactly the state of the engine watch between
+    /// `teardown(old)` and `install_generation(new)` during a reload.
+    fn dead_watch() -> (
+        watch::Sender<mpsc::Sender<ControlMsg>>,
+        watch::Receiver<mpsc::Sender<ControlMsg>>,
+        mpsc::Sender<ControlMsg>,
+    ) {
+        let (dead_tx, dead_rx) = mpsc::channel::<ControlMsg>(1);
+        drop(dead_rx);
+        let (watch_tx, watch_rx) = watch::channel(dead_tx.clone());
+        (watch_tx, watch_rx, dead_tx)
+    }
+
+    /// RED-FIRST crux (#9): a control message forwarded during the reload
+    /// window — when the watch still points at the dead old-generation sender
+    /// — must arrive on the NEW live receiver once `install_generation`
+    /// writes the replacement sender. With the unfixed
+    /// `let _ = sender.send(m).await` the message is dropped and the
+    /// assertion times out.
+    #[tokio::test]
+    async fn forward_ctl_retries_across_generation_swap() {
+        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
+        let cancel = CancellationToken::new();
+        let (front_tx, front_rx) = mpsc::channel::<ControlMsg>(1);
+
+        let handle = tokio::spawn(forward_ctl(front_rx, watch_rx, cancel.clone()));
+
+        // Send a ForceWake into the front channel. forward_ctl will try the
+        // dead sender, get SendError, and start waiting on changed().
+        front_tx
+            .send(ControlMsg::ForceWake(DisplayId("manual-only".into())))
+            .await
+            .expect("front channel send");
+
+        // Install the new generation's live sender — simulates install_generation.
+        let (new_tx, mut new_rx) = mpsc::channel::<ControlMsg>(1);
+        watch_tx.send(new_tx).expect("watch send");
+
+        // The fixed forward_ctl must re-deliver the pending message to the
+        // NEW receiver. Timeout-bound so a hang becomes a clean assert.
+        let received = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .expect("forward_ctl did not deliver to the new generation within 2s")
+            .expect("new generation channel closed unexpectedly");
+
+        match received {
+            ControlMsg::ForceWake(d) => assert_eq!(d.0, "manual-only"),
+            other => panic!("expected ForceWake(manual-only), got {other:?}"),
+        }
+
+        cancel.cancel();
+        // Drop the front sender so the spawn can exit.
+        drop(front_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// Bounded-retry path: with no live generation ever arriving (a
+    /// pathological non-shutdown stall), the message is dropped after
+    /// `MAX_SWAP_WAITS` wait cycles and `forward_ctl` exits cleanly. Each
+    /// `changed()` wait is resolved by writing another dead sender to the
+    /// watch, so the retry loop completes and `forward_ctl` logs
+    /// `ctl_forward_dropped` rather than hanging. Crucially, the front
+    /// channel is NOT closed and cancellation is NOT triggered — the exit
+    /// must come from the `MAX_SWAP_WAITS` bound, not from rx recv / cancel.
+    /// Against the unfixed code this test would hang on the next
+    /// `rx.recv()` after the dropped message.
+    #[tokio::test]
+    async fn forward_ctl_drops_after_max_swap_waits_when_no_new_generation() {
+        // Mirror the constant bound inside `deliver_or_drop`. Each write
+        // lets one `changed()` resolution complete; without a live sender
+        // every retry fails and the bound is hit.
+        const MAX_SWAP_WAITS: usize = 2;
+        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
+        let cancel = CancellationToken::new();
+        let (front_tx, front_rx) = mpsc::channel::<ControlMsg>(1);
+
+        let handle = tokio::spawn(forward_ctl(front_rx, watch_rx, cancel.clone()));
+
+        front_tx
+            .send(ControlMsg::ForceWake(DisplayId("doomed".into())))
+            .await
+            .expect("front channel send");
+
+        // Yield so forward_ctl processes the front message and parks on
+        // its first `changed()` await before we start writing to the watch.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        for _ in 0..MAX_SWAP_WAITS {
+            let (extra_dead_tx, extra_dead_rx) = mpsc::channel::<ControlMsg>(1);
+            drop(extra_dead_rx);
+            watch_tx.send(extra_dead_tx).expect("watch send");
+            // Yield so forward_ctl processes the changed() resolution,
+            // re-borrow the dead sender, fail to send, and re-arm the wait.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        // No cancellation, front_tx still alive — forward_ctl must still
+        // exit because `deliver_or_drop` returns false at the bound and
+        // the outer loop breaks. Bound the wait so an unbounded retry
+        // loop (regression) or the unfixed "swallow then await forever"
+        // path becomes a clean test failure.
+        let join = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("forward_ctl did not exit within 2s — MAX_SWAP_WAITS bound was not honored");
+        assert!(join.is_ok(), "forward_ctl task panicked: {join:?}");
+    }
+
+    /// Cancel mid-wait: while `forward_ctl` is blocked on `changed()` waiting
+    /// for the next generation, cancelling the token must break the inner
+    /// retry loop and the outer `forward_ctl` cleanly — no hang, no panic.
+    #[tokio::test]
+    async fn forward_ctl_breaks_cleanly_on_cancel_during_swap_wait() {
+        let (_watch_tx, watch_rx, _dead_tx) = dead_watch();
+        let cancel = CancellationToken::new();
+        let (front_tx, front_rx) = mpsc::channel::<ControlMsg>(1);
+
+        let handle = tokio::spawn(forward_ctl(front_rx, watch_rx, cancel.clone()));
+
+        // Trigger the dead-sender path so forward_ctl parks on changed().
+        front_tx
+            .send(ControlMsg::ForceWake(DisplayId("cancelled".into())))
+            .await
+            .expect("front channel send");
+
+        // Yield so forward_ctl reaches its `changed()` await before we cancel.
+        // Without this, on a multi-thread runtime the cancel may race ahead of
+        // the task ever entering the changed() wait.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Now cancel — forward_ctl must exit cleanly without ever writing
+        // to the watch.
+        cancel.cancel();
+        drop(front_tx);
+
+        let join = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("forward_ctl did not exit within 1s after cancel");
+        assert!(join.is_ok(), "forward_ctl task panicked on cancel");
     }
 }

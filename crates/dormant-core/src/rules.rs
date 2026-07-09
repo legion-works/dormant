@@ -94,6 +94,47 @@ pub enum ControlMsg {
     /// Input-wake event from the render surface — route to the display
     /// machine's [`Input::InputWake`].
     InputWake(DisplayId),
+    /// Force-wake EVERY display and pause every rule indefinitely, regardless
+    /// of the per-display state machine's current phase.  Used by
+    /// `dormantctl emergency-wake` as a one-shot panic-recovery command.
+    ///
+    /// The handler bypasses the normal `ForceWake` (per-display) flow so a
+    /// wedged state machine (deadlocked in `Blanked` after a wake-retry
+    /// storm) does not prevent the wake from going out — it calls
+    /// [`CommandSink::wake_once`] directly on every display's executor,
+    /// then forwards a [`Self::Pause`] with no `rule` and no `until` so the
+    /// engine does not blank anything until the operator resumes.
+    ///
+    /// The reply carries a point-in-time view of what actually happened
+    /// (per-display ok/err) so callers see partial-failure detail rather
+    /// than a binary success bit.
+    EmergencyWake {
+        /// One-shot reply channel for the emergency report.
+        reply: oneshot::Sender<EmergencyWakeReport>,
+    },
+}
+
+/// Per-display outcome of an [`ControlMsg::EmergencyWake`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmergencyWakeResult {
+    /// The display this result applies to.
+    pub display: DisplayId,
+    /// Whether [`CommandSink::wake_once`] returned `Ok`.
+    pub ok: bool,
+    /// Failure detail (controller + error) when `ok` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Aggregated report returned by an [`ControlMsg::EmergencyWake`] handler.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmergencyWakeReport {
+    /// Whether every rule was paused.  `true` on success; `false` if the
+    /// global pause fan-out encountered an error (very rare — rules set
+    /// + `Input::Pause` step per display, so this is mostly diagnostic).
+    pub paused: bool,
+    /// Per-display wake results, one entry per display the engine owns.
+    pub displays: Vec<EmergencyWakeResult>,
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
@@ -772,6 +813,7 @@ impl RulesEngine {
                 self.handle_set_inhibited(rule.as_ref(), inhibited);
             }
             ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
+            ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
         }
     }
 
@@ -835,6 +877,106 @@ impl RulesEngine {
         for d in targets {
             self.step_one(&d, Input::Resume);
         }
+    }
+
+    /// Handle [`ControlMsg::EmergencyWake`]: pause every rule indefinitely
+    /// via the existing pause fan-out, then spawn **one task per display**
+    /// (genuine concurrency — not a serial loop) that calls
+    /// [`CommandSink::wake_once`] on its executor.  Results aggregate into
+    /// a [`EmergencyWakeReport`] the handler sends back through the
+    /// oneshot.
+    ///
+    /// Parallelism is the entire point of the panic-recovery path: under
+    /// the IPC 2-second budget a slow network wake on one display (Samsung
+    /// Tizen, HA-passthrough) must not starve the remaining displays of
+    /// their wake.  Spawning one task per `Arc<dyn CommandSink>`, then
+    /// awaiting the `JoinHandle`s in the outer task, mirrors the
+    /// `direct_hardware_fallback` shape in `dormantctl`.
+    ///
+    /// The wake execution runs **outside** the engine run loop so a
+    /// stalled wake does not block other control messages.  The IPC
+    /// server wraps this call in its own 2-second timeout (see
+    /// `dormantd::ipc::handle_emergency_wake`); the `dormantctl` client
+    /// falls back to direct-hardware construction when that window
+    /// elapses.
+    fn handle_emergency_wake(&mut self, reply: oneshot::Sender<EmergencyWakeReport>) {
+        // Pause every rule indefinitely — reuse the existing pause path so
+        // the state-machine overlays route the same way as a normal
+        // global pause.  Without this an absent-zone would re-trigger
+        // blanking on the very next sensor event.
+        self.handle_pause(None, None);
+
+        // Snapshot executor handles so the spawned task does not hold a
+        // borrow on `self`.  Per the spec, wake EVERY display the engine
+        // owns — that includes manual-only displays (no rule bound).
+        let executors: Vec<(DisplayId, Arc<dyn CommandSink>)> = self
+            .executors
+            .iter()
+            .map(|(id, sink)| (id.clone(), Arc::clone(sink)))
+            .collect();
+
+        tracing::info!(
+            event = "emergency_wake",
+            display_count = executors.len(),
+            "emergency-wake: paused all rules, dispatching one wake_once per display (concurrent)",
+        );
+
+        tokio::spawn(async move {
+            // Spawn ALL per-display wake tasks up front, THEN await them.
+            // Awaiting inside the same loop would force serial execution
+            // and let one slow controller (Tizen, HA-passthrough) block
+            // every other display under the IPC 2-second budget.
+            let handles: Vec<tokio::task::JoinHandle<(DisplayId, Result<(), CmdFailure>)>> =
+                executors
+                    .into_iter()
+                    .map(|(display_id, sink)| {
+                        tokio::spawn(async move { (display_id, sink.wake_once().await) })
+                    })
+                    .collect();
+
+            let mut results: Vec<EmergencyWakeResult> = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.await {
+                    Ok((display_id, Ok(()))) => results.push(EmergencyWakeResult {
+                        display: display_id,
+                        ok: true,
+                        error: None,
+                    }),
+                    Ok((display_id, Err(failure))) => {
+                        tracing::warn!(
+                            event = "emergency_wake_display_failed",
+                            display_id = %display_id,
+                            controller = failure.controller.as_str(),
+                            error = %failure.error,
+                            "emergency-wake: wake_once failed for one display",
+                        );
+                        results.push(EmergencyWakeResult {
+                            display: display_id,
+                            ok: false,
+                            error: Some(failure.error),
+                        });
+                    }
+                    Err(join_err) => {
+                        // A spawned per-display task panicked.  Match the
+                        // CLI fallback's tolerance: log + continue, do
+                        // not abort the report.  The row is dropped —
+                        // the report still ships so the operator gets a
+                        // structured view of the survivors.
+                        tracing::warn!(
+                            event = "emergency_wake_task_panicked",
+                            error = %join_err,
+                            "emergency-wake: spawned wake task panicked",
+                        );
+                    }
+                }
+            }
+
+            let report = EmergencyWakeReport {
+                paused: true,
+                displays: results,
+            };
+            let _ = reply.send(report);
+        });
     }
 
     /// Step a single display machine and process its effects.

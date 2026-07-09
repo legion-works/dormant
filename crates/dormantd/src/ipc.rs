@@ -246,6 +246,10 @@ async fn handle_connection(
                 let resp = IpcResponse::doctor(report);
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::EmergencyWake => {
+                let resp = handle_emergency_wake(&ctl_tx).await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
     }
 }
@@ -318,6 +322,28 @@ async fn handle_wake(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> IpcRes
         return IpcResponse::error("engine not available");
     }
     IpcResponse::ok(None)
+}
+
+/// Bounded-wait wrapper around `ControlMsg::EmergencyWake`.
+///
+/// The CLI's `emergency-wake` path uses this as the IPC fast-path.  The
+/// 2-second window is the budget for "the daemon is healthy and we should
+/// route through it" — beyond it the CLI falls back to constructing display
+/// controllers directly from the loaded config + credentials (so a wedged
+/// daemon never blocks recovery).
+async fn handle_emergency_wake(ctl_tx: &mpsc::Sender<ControlMsg>) -> IpcResponse {
+    const EMERGENCY_WAKE_IPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let (tx, rx) = oneshot::channel();
+    let msg = ControlMsg::EmergencyWake { reply: tx };
+    if ctl_tx.send(msg).await.is_err() {
+        return IpcResponse::error("engine not available");
+    }
+    match tokio::time::timeout(EMERGENCY_WAKE_IPC_TIMEOUT, rx).await {
+        Ok(Ok(report)) => IpcResponse::emergency(report),
+        Ok(Err(_recv_dropped)) => IpcResponse::error("emergency_wake: engine dropped reply"),
+        Err(_elapsed) => IpcResponse::error("emergency_wake: timed out"),
+    }
 }
 
 /// Subscribe to the event stream and write events as JSON lines until the

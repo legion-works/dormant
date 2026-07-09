@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::doctor::DoctorReport;
-use crate::rules::StateSnapshot;
+use crate::rules::{EmergencyWakeReport, StateSnapshot};
 
 // ── IpcRequest ────────────────────────────────────────────────────────────────
 
@@ -50,6 +50,11 @@ pub enum IpcRequest {
     /// Run the doctor: report live daemon health from owned state + active
     /// network-service probes.  Replied via [`IpcResponse::doctor_report`].
     Doctor,
+    /// `dormantctl emergency-wake` — panic-recovery. Force-wake every
+    /// display and pause every rule indefinitely, regardless of the
+    /// per-display state machine's phase.  Replied with an
+    /// [`EmergencyWakeReport`] via [`IpcResponse::emergency_report`].
+    EmergencyWake,
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -68,6 +73,10 @@ pub struct IpcResponse {
     /// A [`DoctorReport`] (present only for `Doctor` responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor_report: Option<DoctorReport>,
+    /// An [`EmergencyWakeReport`] (present only for `EmergencyWake`
+    /// responses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emergency_report: Option<EmergencyWakeReport>,
 }
 
 impl IpcResponse {
@@ -79,6 +88,7 @@ impl IpcResponse {
             error: None,
             snapshot,
             doctor_report: None,
+            emergency_report: None,
         }
     }
 
@@ -90,6 +100,7 @@ impl IpcResponse {
             error: Some(msg.into()),
             snapshot: None,
             doctor_report: None,
+            emergency_report: None,
         }
     }
 
@@ -101,6 +112,19 @@ impl IpcResponse {
             error: None,
             snapshot: None,
             doctor_report: Some(report),
+            emergency_report: None,
+        }
+    }
+
+    /// Build a response carrying an emergency-wake report.
+    #[must_use]
+    pub fn emergency(report: EmergencyWakeReport) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: Some(report),
         }
     }
 }
@@ -239,6 +263,15 @@ mod tests {
         assert!(matches!(back, IpcRequest::Doctor));
     }
 
+    #[test]
+    fn request_emergency_wake_serde() {
+        let req = IpcRequest::EmergencyWake;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"emergency_wake"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, IpcRequest::EmergencyWake));
+    }
+
     // ── IpcResponse serde round-trips ──────────────────────────────────────
 
     #[test]
@@ -328,5 +361,47 @@ mod tests {
         let resp: IpcResponse = serde_json::from_str(json).unwrap();
         assert!(resp.ok);
         assert!(resp.doctor_report.is_none());
+    }
+
+    #[test]
+    fn response_emergency_serializes_report() {
+        // Verify the wire shape: emergency_wake responses carry an
+        // emergency_report object keyed "emergency_report", and the other
+        // slots are absent.
+        let report = EmergencyWakeReport {
+            paused: true,
+            displays: vec![],
+        };
+        let resp = IpcResponse::emergency(report);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""emergency_report""#));
+        assert!(!json.contains(r#""snapshot""#));
+        assert!(!json.contains(r#""doctor_report""#));
+        let back: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert!(back.snapshot.is_none());
+        assert!(back.doctor_report.is_none());
+        assert!(back.emergency_report.is_some());
+    }
+
+    #[test]
+    fn response_emergency_back_compat_pre_emergency_daemon() {
+        // A pre-emergency daemon reply has no emergency_report key — the new
+        // client must still parse it (serde-default + skip_serializing_if).
+        let json = r#"{"ok":true,"snapshot":null}"#;
+        let resp: IpcResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.emergency_report.is_none());
+    }
+
+    #[test]
+    fn response_emergency_omits_field_when_none() {
+        // `IpcResponse::ok(None)` must keep its byte-identical wire shape so
+        // old clients see exactly the same JSON as before the field was
+        // added. The skip_serializing_if guard enforces this.
+        let resp = IpcResponse::ok(None);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"ok":true}"#);
+        assert!(!json.contains("emergency_report"));
     }
 }

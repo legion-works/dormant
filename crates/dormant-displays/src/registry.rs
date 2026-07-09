@@ -113,6 +113,7 @@ pub fn build_controllers(
                 chain.push(Box::new(DdcciController::new(
                     matcher,
                     cfg.restore_brightness,
+                    cfg.primary_blank_mode(),
                 )));
             }
             #[cfg(target_os = "linux")]
@@ -388,6 +389,47 @@ mod tests {
             ctrl.restore_backlight_for_test(),
             42,
             "registry must thread the per-display samsung_restore_backlight override"
+        );
+    }
+
+    /// A DDC/CI display wired with `blank_mode = None` and a ladder whose
+    /// first `Controller` stage is `PowerOff` — the registry must thread
+    /// `DisplayConfig::primary_blank_mode()` into
+    /// `DdcciController::configured_primary_mode` (mirrors
+    /// `build_samsung_ladder_primary_brightness_zero_wires_configured_primary_mode`
+    /// above). Pre-fix wiring left the field unset (compile error, since the
+    /// constructor requires it) — this pins the registry path end-to-end so
+    /// a `PowerOff`-primary display wakes via D6-on only before any blank
+    /// has run (e.g. right after a daemon restart).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn build_ddcci_ladder_primary_power_off_wires_configured_primary_mode() {
+        use dormant_core::types::{LadderStage, StageKind};
+
+        let mut cfg = command_cfg();
+        cfg.controllers = vec!["ddcci".into()];
+        cfg.blank_mode = None;
+        cfg.ladder = vec![LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: None,
+        }];
+        cfg.ddc_display = Some("DELL".into());
+
+        let creds = Credentials::default();
+        let chain = build_controllers("main", &cfg, &creds).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name(), "ddcci");
+
+        let boxed = chain.into_iter().next().expect("one controller");
+        let ctrl: Box<DdcciController> = (boxed as Box<dyn std::any::Any>)
+            .downcast()
+            .expect("ddcci controller downcast");
+
+        assert_eq!(
+            ctrl.configured_primary_mode(),
+            BlankMode::PowerOff,
+            "registry must thread DisplayConfig::primary_blank_mode() into \
+             DdcciController::configured_primary_mode"
         );
     }
 

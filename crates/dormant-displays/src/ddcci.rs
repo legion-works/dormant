@@ -43,7 +43,7 @@ const D6_OFF: u16 = 0x05;
 // ── DdcciController ────────────────────────────────────────────────────────────
 
 /// Internal mutable state discovered during [`probe`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct DdcState {
     /// The ident string of the matched display (set during probe).
     matched_ident: Option<String>,
@@ -52,6 +52,13 @@ struct DdcState {
     /// Saved brightness value from the first `blank(BrightnessZero)` call.
     /// `None` means no blank has happened yet (wake uses config default).
     saved_brightness: Option<u16>,
+    /// The actual blank mode of the last successful `blank()` — read by
+    /// `wake()` to decide whether to restore brightness. Recorded AFTER
+    /// success so a failed blank doesn't poison the wake path.
+    ///
+    /// `None` means no blank has happened yet (daemon just started /
+    /// reloaded); wake falls through to [`DdcciController::configured_primary_mode`].
+    last_blank_mode: Option<BlankMode>,
 }
 
 /// Display controller that blanks/wakes monitors via DDC/CI VCP commands.
@@ -73,6 +80,13 @@ struct DdcState {
 pub struct DdcciController {
     matcher: Option<String>,
     restore_brightness: u8,
+    /// Configured primary blank mode — sourced from
+    /// [`dormant_core::config::schema::DisplayConfig::primary_blank_mode`].
+    /// Used by `wake()` as the fallback when `last_blank_mode` is `None`
+    /// (daemon restart / reload). A `PowerOff`-primary display that wakes
+    /// before any blank has run must still hit the D6-on path, not the
+    /// brightness-restore path.
+    configured_primary_mode: BlankMode,
     ops: Arc<dyn VcpOps>,
     state: StdMutex<DdcState>,
 }
@@ -83,10 +97,15 @@ impl DdcciController {
     /// Only available on Linux — DDC/CI requires platform I²C support.
     #[cfg(target_os = "linux")]
     #[must_use]
-    pub fn new(matcher: Option<String>, restore_brightness: u8) -> Self {
+    pub fn new(
+        matcher: Option<String>,
+        restore_brightness: u8,
+        configured_primary_mode: BlankMode,
+    ) -> Self {
         Self {
             matcher,
             restore_brightness,
+            configured_primary_mode,
             ops: Arc::new(RealVcp),
             state: StdMutex::new(DdcState::default()),
         }
@@ -95,13 +114,27 @@ impl DdcciController {
     /// Build a `DdcciController` with a custom `VcpOps` implementation
     /// (used by tests to inject a fake).
     #[must_use]
-    pub fn with_ops(matcher: Option<String>, restore_brightness: u8, ops: Arc<dyn VcpOps>) -> Self {
+    pub fn with_ops(
+        matcher: Option<String>,
+        restore_brightness: u8,
+        configured_primary_mode: BlankMode,
+        ops: Arc<dyn VcpOps>,
+    ) -> Self {
         Self {
             matcher,
             restore_brightness,
+            configured_primary_mode,
             ops,
             state: StdMutex::new(DdcState::default()),
         }
+    }
+
+    /// Test-only accessor: read the configured primary mode the registry
+    /// wired in. Used by the registry-path test that asserts end-to-end
+    /// config → controller wiring (mirrors `SamsungTizenController::configured_primary_mode`).
+    #[cfg(test)]
+    pub(crate) fn configured_primary_mode(&self) -> BlankMode {
+        self.configured_primary_mode
     }
 
     /// Find the matching display from an enumerated list.
@@ -232,7 +265,7 @@ impl DisplayController for DdcciController {
             (ident, state.d6_supported)
         };
 
-        match mode {
+        let result = match mode {
             BlankMode::BrightnessZero => {
                 // Save current brightness, then set to 0.
                 let current = self
@@ -284,11 +317,21 @@ impl DisplayController for DdcciController {
                 controller: Self::NAME.to_string(),
                 error: format!("{E_DISPLAY_IO}: unsupported blank mode {mode:?}"),
             }),
+        };
+
+        // Record the actual blank that succeeded — `wake()` reads this to
+        // decide whether to write brightness. Recording AFTER success means
+        // a failed blank doesn't poison the wake path (mirrors the
+        // samsung-tizen pattern).
+        if result.is_ok() {
+            let mut state = self.state.lock().unwrap();
+            state.last_blank_mode = Some(mode);
         }
+        result
     }
 
     async fn wake(&self) -> Result<(), CmdFailure> {
-        let (ident, d6_supported, restore) = {
+        let (ident, d6_supported, effective_mode) = {
             let state = self.state.lock().unwrap();
             let ident = match &state.matched_ident {
                 Some(id) => id.clone(),
@@ -299,36 +342,80 @@ impl DisplayController for DdcciController {
                     });
                 }
             };
-            let saved = state.saved_brightness;
-            (
-                ident,
-                state.d6_supported,
-                saved.unwrap_or(u16::from(self.restore_brightness)),
-            )
+            // Reverse whatever the LAST successful blank actually did.
+            // `last_blank_mode.or(Some(configured_primary_mode))` means a
+            // fresh daemon (no blank yet) still takes the configured
+            // primary path; once any blank runs, that one is authoritative.
+            let mode = state
+                .last_blank_mode
+                .unwrap_or(self.configured_primary_mode);
+            (ident, state.d6_supported, mode)
         };
 
-        // If D6 is supported, try to power on first (ignore error — the
-        // brightness restore is the primary wake mechanism).
-        if d6_supported {
-            let _ = self.ops.set_vcp(&ident, VCP_POWER, D6_ON).await;
-        }
+        match effective_mode {
+            BlankMode::PowerOff => {
+                // A `PowerOff` blank never touched brightness — the panel
+                // retained it across the power cycle. Wake does D6-on ONLY
+                // and does NOT write brightness, so a user who tuned
+                // brightness to e.g. 100 keeps 100 after every wake. (Live-
+                // confirmed: this was clobbering brightness to the
+                // config default — the operator's monitor resets to the
+                // `restore_brightness` value on every presence-driven
+                // wake.)
+                if d6_supported {
+                    self.ops
+                        .set_vcp(&ident, VCP_POWER, D6_ON)
+                        .await
+                        .map_err(|e| CmdFailure {
+                            controller: Self::NAME.to_string(),
+                            error: format!("{E_DISPLAY_IO}: failed to set power on: {e}"),
+                        })?;
+                }
+                Ok(())
+            }
+            BlankMode::BrightnessZero => {
+                // Brightness restore + the restart-safety-net fallback to
+                // `restore_brightness` (operator-tuned config default)
+                // when the saved value was lost across a restart.
+                let restore = {
+                    let state = self.state.lock().unwrap();
+                    state
+                        .saved_brightness
+                        .unwrap_or(u16::from(self.restore_brightness))
+                };
 
-        // Restore brightness.
-        self.ops
-            .set_vcp(&ident, VCP_BRIGHTNESS, restore)
-            .await
-            .map_err(|e| CmdFailure {
+                // If D6 is supported, try to power on first (ignore error
+                // — the brightness restore is the primary wake mechanism
+                // for a brightness-zero blanked display).
+                if d6_supported {
+                    let _ = self.ops.set_vcp(&ident, VCP_POWER, D6_ON).await;
+                }
+
+                // Restore brightness.
+                self.ops
+                    .set_vcp(&ident, VCP_BRIGHTNESS, restore)
+                    .await
+                    .map_err(|e| CmdFailure {
+                        controller: Self::NAME.to_string(),
+                        error: format!("{E_DISPLAY_IO}: failed to restore brightness: {e}"),
+                    })?;
+
+                // Clear saved_brightness so the NEXT blank cycle re-saves
+                // fresh. Without this, a user who manually raises
+                // brightness between cycles gets a stale restore.
+                let mut state = self.state.lock().unwrap();
+                state.saved_brightness = None;
+
+                Ok(())
+            }
+            BlankMode::ScreenOffAudioOn => Err(CmdFailure {
                 controller: Self::NAME.to_string(),
-                error: format!("{E_DISPLAY_IO}: failed to restore brightness: {e}"),
-            })?;
-
-        // Clear saved_brightness so the NEXT blank cycle re-saves fresh.
-        // Without this, a user who manually raises brightness between cycles
-        // gets a stale restore.
-        let mut state = self.state.lock().unwrap();
-        state.saved_brightness = None;
-
-        Ok(())
+                error: format!(
+                    "{E_DISPLAY_IO}: wake does not support blank mode {effective_mode:?} \
+                     for this controller"
+                ),
+            }),
+        }
     }
 
     /// Read the panel state — brightness (VCP `0x10`, 0–100) and power
@@ -410,7 +497,12 @@ mod tests {
     #[tokio::test]
     async fn probe_single_display_auto_match() {
         let fake = Arc::new(single_display_vcp());
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         let state = ctrl.state.lock().unwrap();
@@ -426,6 +518,7 @@ mod tests {
         let mut ctrl = DdcciController::with_ops(
             Some("DELL".into()),
             80,
+            BlankMode::PowerOff,
             Arc::clone(&fake) as Arc<dyn VcpOps>,
         );
         ctrl.probe().await.unwrap();
@@ -443,6 +536,7 @@ mod tests {
         let mut ctrl = DdcciController::with_ops(
             Some("NONEXISTENT".into()),
             80,
+            BlankMode::PowerOff,
             Arc::clone(&fake) as Arc<dyn VcpOps>,
         );
         let err = ctrl.probe().await.unwrap_err();
@@ -455,7 +549,12 @@ mod tests {
     #[tokio::test]
     async fn probe_multiple_without_matcher_errs() {
         let fake = Arc::new(two_display_vcp());
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         let err = ctrl.probe().await.unwrap_err();
         assert!(
             err.to_string().contains("set ddc_display"),
@@ -471,7 +570,12 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
         {
             let state = ctrl.state.lock().unwrap();
@@ -492,7 +596,12 @@ mod tests {
             );
             f
         });
-        let mut ctrl2 = DdcciController::with_ops(None, 80, Arc::clone(&fake2) as Arc<dyn VcpOps>);
+        let mut ctrl2 = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake2) as Arc<dyn VcpOps>,
+        );
         ctrl2.probe().await.unwrap();
         {
             let state = ctrl2.state.lock().unwrap();
@@ -514,7 +623,12 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         // Now blank with BrightnessZero — needs get(0x10) then set(0x10, 0)
@@ -525,6 +639,9 @@ mod tests {
 
         let state = ctrl.state.lock().unwrap();
         assert_eq!(state.saved_brightness, Some(75));
+        // last_blank_mode must be recorded on success so `wake()` can pick
+        // the brightness-restore path.
+        assert_eq!(state.last_blank_mode, Some(BlankMode::BrightnessZero));
 
         let log = fake.take_call_log();
         assert!(
@@ -548,7 +665,12 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         // First blank at 75 → saves 75, sets to 0.
@@ -583,7 +705,12 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         // Blank to save brightness
@@ -611,7 +738,12 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         // First blank at 75.
@@ -639,6 +771,10 @@ mod tests {
         );
     }
 
+    /// After a daemon restart the saved brightness is gone (in-memory
+    /// state is lost). For a `BrightnessZero`-primary display, the wake
+    /// path must still bring the panel to the operator-tuned
+    /// `restore_brightness` config default (restart-safety-net).
     #[tokio::test]
     async fn wake_without_saved_uses_config_default() {
         let fake = Arc::new({
@@ -646,10 +782,17 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 55, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            55,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
-        // Wake without any blank first — should use restore_brightness (55)
+        // Wake without any blank first — last_blank_mode is None, primary
+        // is BrightnessZero, saved_brightness is None → fall through to
+        // restore_brightness (55).
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 55, Ok(()));
         ctrl.wake().await.unwrap();
 
@@ -668,7 +811,12 @@ mod tests {
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         let err = ctrl.blank(BlankMode::PowerOff).await.unwrap_err();
@@ -679,38 +827,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wake_tries_d6_on_then_brightness() {
+    async fn wake_after_power_off_sends_d6_on_only() {
         let fake = Arc::new({
             let f = single_display_vcp();
             f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
             f
         });
-        let mut ctrl = DdcciController::with_ops(None, 80, Arc::clone(&fake) as Arc<dyn VcpOps>);
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
         ctrl.probe().await.unwrap();
 
         // Blank with PowerOff
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
         ctrl.blank(BlankMode::PowerOff).await.unwrap();
 
-        // Wake — D6_ON first (ignored if err), then brightness restore
+        // Wake — D6_ON only. A PowerOff blank never touched brightness, so
+        // wake must not write VCP 0x10 (that write clobbers whatever
+        // brightness the operator set between blank and wake — the
+        // live-caught bug this fix addresses).
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
-        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 80, Ok(()));
         ctrl.wake().await.unwrap();
 
         let log = fake.take_call_log();
-        let d6_idx = log
-            .iter()
-            .position(|l| l.contains("set_vcp") && l.contains("0xD6") && l.contains('1'));
-        let br_idx = log
-            .iter()
-            .position(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("80"));
         assert!(
-            d6_idx.is_some() && br_idx.is_some(),
-            "wake should call both D6_ON and brightness restore: {log:?}"
+            log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0xD6") && l.contains('1')),
+            "wake should call D6_ON: {log:?}"
         );
         assert!(
-            d6_idx < br_idx,
-            "D6_ON should come before brightness restore: {log:?}"
+            !log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10")),
+            "wake after a PowerOff blank must NOT write brightness (0x10): {log:?}"
+        );
+    }
+
+    /// RED-first regression for the live-caught bug: `wake()` used to
+    /// unconditionally restore brightness even when the preceding blank
+    /// was `PowerOff` (which never touched brightness), silently
+    /// clobbering the operator's brightness (e.g. 100 → 80 config
+    /// default) on every presence-driven wake of a power-off display.
+    #[tokio::test]
+    async fn power_off_wake_does_not_write_brightness() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10")),
+            "power-off wake must not write brightness VCP 0x10: {log:?}"
+        );
+    }
+
+    /// Restart-fallback: a fresh controller (no `last_blank_mode` yet)
+    /// whose configured primary mode is `PowerOff` must wake via D6-on
+    /// only — the same as an in-session `PowerOff` blank/wake cycle.
+    #[tokio::test]
+    async fn restart_fallback_power_off_primary_wake_does_not_write_brightness() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
+        ctrl.probe().await.unwrap();
+
+        // No blank() call — simulates a daemon restart mid-blank.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10")),
+            "restart fallback to PowerOff primary must not write brightness: {log:?}"
+        );
+    }
+
+    /// Restart-fallback: a fresh controller (no `last_blank_mode` yet)
+    /// whose configured primary mode is `BrightnessZero` must still wake
+    /// via the config-default brightness restore.
+    #[tokio::test]
+    async fn restart_fallback_brightness_zero_primary_wake_restores_config_default() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            62,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+        );
+        ctrl.probe().await.unwrap();
+
+        // No blank() call — simulates a daemon restart mid-blank.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 62, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("62")),
+            "restart fallback to BrightnessZero primary should restore config default 62: {log:?}"
         );
     }
 }

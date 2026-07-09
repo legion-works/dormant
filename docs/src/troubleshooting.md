@@ -94,6 +94,36 @@ For a one-keystroke recovery, bind the command to a global shortcut:
 
 First-class daemon-registered shortcuts (no compositor setup) are a separate roadmap item.
 
+## Control-path verification — `dormantctl doctor --exercise <display>`
+
+Confirms that a blank/wake **actually moved the panel** — the systemic guard against the failure mode where a controller logs `blank_succeeded` while the panel never changed (the samsung stale-socket + port-1516 400s both did exactly this).
+
+```bash
+dormantctl doctor --exercise mon
+```
+
+The command routes through the daemon over IPC: the daemon pauses the target's rule(s) for the exercise window, runs `blank → read → wake → read → restore` on its live controllers, and replies with a per-step report. Exit code is non-zero only when at least one step verdict is `Failed` — a confirmable panel that did not move despite the controller returning `Ok`. The wake path is sacred: the restore step guarantees a final wake regardless of any earlier failure, so an exercise can never leave a display dark.
+
+### Verdicts
+
+- `Confirmed` (✓, green) — the panel state moved as expected (blank step: state changed from baseline; wake step: state returned to baseline).
+- `Unconfirmable` (~, yellow) — the controller has no readback for the panel. The command was issued but the panel could not be observed. Exit 0 (honest, not a fake pass).
+- `Failed` (✗, red) — the controller can read the panel but the state did NOT move as expected. Exit non-zero.
+
+### Confirmability by controller
+
+| Controller | Confirms via |
+|---|---|
+| `ddcci` | VCP `0x10` (brightness, 0–100) + VCP `0xD6` (power: `0x01` → On, otherwise → Standby) |
+| `samsung-tizen` | REST `PowerState` (`"on"` / `"standby"`); port-1516 backlight when configured for `BrightnessZero` |
+| `command` / `kwin-dpms` / `ha-passthrough` | none — every step is `Unconfirmable` |
+
+### Operational notes
+
+- The exercise causes a brief blank → wake blink on a display currently in use (the wake step + the defensive restore wake).
+- The command is per-display only (`--exercise <name>`); there is no `--all` or default target.
+- `command` / `kwin-dpms` / `ha-passthrough` controllers report `Unconfirmable` for every step because they cannot observe the panel — exit 0, but no verification was possible.
+
 ## Logging
 
 Set `log_level = "debug"` in the daemon config for detailed logs:

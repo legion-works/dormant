@@ -208,6 +208,42 @@ fn main() -> ExitCode {
             credentials,
             subcommand,
         } => {
+            // The Exercise subcommand needs the resolved socket path (the
+            // global `--socket` flag), so we dispatch it directly from
+            // here instead of round-tripping through `cmd_doctor::run`.
+            // Every other subcommand flows through the regular `run` path.
+            if let Some(cmd_doctor::DoctorSubcommand::Exercise { display }) = subcommand.as_ref() {
+                let display = display.clone();
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let result = rt.block_on(async {
+                    cmd_doctor::run_exercise_with_socket(&socket_path, &display)
+                });
+                return match result {
+                    Ok(cmd_doctor::DoctorOutcome::AllOk) => ExitCode::SUCCESS,
+                    Ok(cmd_doctor::DoctorOutcome::SomeFailed) => {
+                        eprintln!("some probes failed");
+                        ExitCode::FAILURE
+                    }
+                    Ok(cmd_doctor::DoctorOutcome::NotSupported(controller)) => {
+                        eprintln!(
+                            "not yet supported: requires the {controller} controller \
+                             (pending hardware verification milestone)"
+                        );
+                        ExitCode::from(3)
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+
             let args = cmd_doctor::DoctorArgs {
                 config,
                 credentials,

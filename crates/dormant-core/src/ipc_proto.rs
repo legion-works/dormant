@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::doctor::DoctorReport;
-use crate::rules::{EmergencyWakeReport, StateSnapshot};
+use crate::rules::{EmergencyWakeReport, ExerciseReport, StateSnapshot};
 
 // ── IpcRequest ────────────────────────────────────────────────────────────────
 
@@ -55,6 +55,14 @@ pub enum IpcRequest {
     /// per-display state machine's phase.  Replied with an
     /// [`EmergencyWakeReport`] via [`IpcResponse::emergency_report`].
     EmergencyWake,
+    /// `dormantctl doctor --exercise <display>` — control-path
+    /// verification. Run the blank → read → wake → read → restore sequence
+    /// on the named display and reply with an [`ExerciseReport`] via
+    /// [`IpcResponse::exercise_report`].
+    Exercise {
+        /// Display id to exercise.
+        display: String,
+    },
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -77,6 +85,12 @@ pub struct IpcResponse {
     /// responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emergency_report: Option<EmergencyWakeReport>,
+    /// An [`ExerciseReport`] (present only for `Exercise` responses).
+    /// `serde(default) + skip_serializing_if` keeps the byte shape of
+    /// every other response variant unchanged — pre-exercise clients see
+    /// exactly the same JSON as before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exercise_report: Option<ExerciseReport>,
 }
 
 impl IpcResponse {
@@ -89,6 +103,7 @@ impl IpcResponse {
             snapshot,
             doctor_report: None,
             emergency_report: None,
+            exercise_report: None,
         }
     }
 
@@ -101,6 +116,7 @@ impl IpcResponse {
             snapshot: None,
             doctor_report: None,
             emergency_report: None,
+            exercise_report: None,
         }
     }
 
@@ -113,6 +129,7 @@ impl IpcResponse {
             snapshot: None,
             doctor_report: Some(report),
             emergency_report: None,
+            exercise_report: None,
         }
     }
 
@@ -125,6 +142,20 @@ impl IpcResponse {
             snapshot: None,
             doctor_report: None,
             emergency_report: Some(report),
+            exercise_report: None,
+        }
+    }
+
+    /// Build a response carrying an exercise report.
+    #[must_use]
+    pub fn exercise(report: ExerciseReport) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: Some(report),
         }
     }
 }
@@ -134,6 +165,7 @@ impl IpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DisplayId;
 
     // ── IpcRequest serde round-trips ───────────────────────────────────────
 
@@ -272,6 +304,20 @@ mod tests {
         assert!(matches!(back, IpcRequest::EmergencyWake));
     }
 
+    #[test]
+    fn request_exercise_serde() {
+        let req = IpcRequest::Exercise {
+            display: "mon".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"exercise","display":"mon"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::Exercise { display } => assert_eq!(display, "mon"),
+            _ => panic!("expected Exercise"),
+        }
+    }
+
     // ── IpcResponse serde round-trips ──────────────────────────────────────
 
     #[test]
@@ -403,5 +449,74 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, r#"{"ok":true}"#);
         assert!(!json.contains("emergency_report"));
+    }
+
+    #[test]
+    fn response_exercise_serializes_report() {
+        // Verify the wire shape: exercise responses carry an
+        // exercise_report object keyed "exercise_report", and the other
+        // slots are absent.
+        let report = crate::rules::ExerciseReport {
+            display: DisplayId("mon".into()),
+            pre_phase: "active".into(),
+            paused_rules: vec![],
+            steps: vec![],
+        };
+        let resp = IpcResponse::exercise(report);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""exercise_report""#));
+        assert!(!json.contains(r#""snapshot""#));
+        assert!(!json.contains(r#""doctor_report""#));
+        assert!(!json.contains(r#""emergency_report""#));
+        let back: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert!(back.snapshot.is_none());
+        assert!(back.doctor_report.is_none());
+        assert!(back.emergency_report.is_none());
+        assert!(back.exercise_report.is_some());
+    }
+
+    #[test]
+    fn response_exercise_back_compat_pre_exercise_daemon() {
+        // A pre-exercise daemon reply has no exercise_report key — the
+        // new client must still parse it (serde-default +
+        // skip_serializing_if).
+        let json = r#"{"ok":true,"snapshot":null}"#;
+        let resp: IpcResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.exercise_report.is_none());
+    }
+
+    #[test]
+    fn response_exercise_omits_field_when_none() {
+        // `IpcResponse::ok(None)` must keep its byte-identical wire shape
+        // so old clients see exactly the same JSON as before the field
+        // was added. The skip_serializing_if guard enforces this.
+        let resp = IpcResponse::ok(None);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"ok":true}"#);
+        assert!(!json.contains("exercise_report"));
+    }
+
+    #[test]
+    fn response_exercise_does_not_perturb_other_variants() {
+        // The doctor / emergency / ok variants must keep their existing
+        // JSON shapes after the exercise_report field is added — the
+        // back-compat contract for every pre-exercise client.
+        assert!(
+            !serde_json::to_string(&IpcResponse::doctor(crate::doctor::DoctorReport {
+                checks: vec![]
+            }))
+            .unwrap()
+            .contains("exercise_report")
+        );
+        assert!(
+            !serde_json::to_string(&IpcResponse::emergency(crate::rules::EmergencyWakeReport {
+                paused: true,
+                displays: vec![],
+            }))
+            .unwrap()
+            .contains("exercise_report")
+        );
     }
 }

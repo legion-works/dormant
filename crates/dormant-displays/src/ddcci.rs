@@ -330,6 +330,51 @@ impl DisplayController for DdcciController {
 
         Ok(())
     }
+
+    /// Read the panel state — brightness (VCP `0x10`, 0–100) and power
+    /// (VCP `0xD6`, `0x01` → On, anything else → Standby).
+    ///
+    /// Returns `None` when the controller has not been probed (no matched
+    /// ident) — the exercise handler treats `None` as `Unconfirmable`
+    /// rather than guessing at a state.  VCP read errors propagate as
+    /// `None` (the same honest answer) so the exercise surfaces a
+    /// readback failure rather than fabricating a state.
+    async fn read_state(&self) -> Option<dormant_core::traits::PanelState> {
+        use dormant_core::traits::{PanelState, PowerState};
+
+        let ident = {
+            let state = self.state.lock().unwrap();
+            state.matched_ident.clone()
+        }?;
+
+        // Brightness: 0x10 is continuous 0–100 on every DDC/CI monitor.
+        let brightness = self.ops.get_vcp(&ident, VCP_BRIGHTNESS).await.ok();
+
+        // Power: 0xD6 only exists on displays that advertised D6 support
+        // during probe.  Reading on a non-D6 display returns an error; we
+        // surface the `power` field as `None` in that case so the
+        // brightness read still ships in the report.
+        //
+        // Map the VCP value to `PowerState`:
+        // - 0x01 → On
+        // - any other readable value → Standby (0x02 standby, 0x03 suspend,
+        //   0x04 off-soft, 0x05 off-hard — all "panel not in use" family)
+        // - read error / unsupported → None
+        let power = match self.ops.get_vcp(&ident, VCP_POWER).await {
+            Ok(D6_ON) => Some(PowerState::On),
+            Ok(_) => Some(PowerState::Standby),
+            Err(_) => None,
+        };
+
+        // Return Some only when at least one read succeeded; an empty
+        // PanelState would defeat the exercise's "did anything change?"
+        // comparison.
+        if brightness.is_none() && power.is_none() {
+            None
+        } else {
+            Some(PanelState { power, brightness })
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

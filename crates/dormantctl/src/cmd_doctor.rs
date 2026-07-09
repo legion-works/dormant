@@ -15,8 +15,12 @@ use comfy_table::ContentArrangement;
 use comfy_table::{Cell, Row, Table};
 use dormant_core::config::schema::Credentials;
 use dormant_core::config::{Strictness, load_config, load_credentials};
+use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::paths;
+use dormant_core::rules::{ExerciseReport, ExerciseStep, ExerciseVerdict};
 use dormant_doctor::{ProbeResult, ProbeStatus};
+
+use dormantctl::client;
 
 // ── DoctorOutcome ───────────────────────────────────────────────────────────────
 
@@ -70,6 +74,21 @@ pub enum DoctorSubcommand {
     Kwin,
     /// Probe Samsung Tizen displays (reachability, power state, token).
     Samsung,
+    /// Control-path verification: blank → read → wake → read → restore a
+    /// single display and report whether each step demonstrably moved the
+    /// panel.
+    ///
+    /// Routes through the daemon (Option B per the design doc). The
+    /// daemon pauses the target's rule(s) for the exercise window, runs
+    /// the sequence on its live controllers, and replies with a per-step
+    /// report. Exit code is non-zero only when at least one step verdict
+    /// is `Failed` — a confirmable panel that did not move despite the
+    /// command returning `Ok`.
+    Exercise {
+        /// Display id to exercise (must match a `[displays.<id>]` key in
+        /// the daemon's loaded config).
+        display: String,
+    },
 }
 
 // ── Run ─────────────────────────────────────────────────────────────────────────
@@ -138,6 +157,14 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             let results = dormant_doctor::probe_samsung(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
+        }
+        Some(DoctorSubcommand::Exercise { display: _ }) => {
+            // The doctor's CLI shape doesn't surface `--socket` (that's a
+            // global on the parent `dormantctl` parser), so the exercise
+            // subcommand is handled in `main.rs` after the socket path is
+            // resolved.  Any path that reaches here means the parser was
+            // wired up wrong.
+            unreachable!("doctor exercise is dispatched by main.rs with the resolved socket path")
         }
         None => {
             // Bare doctor: delegate to the single-source orchestration.
@@ -254,6 +281,126 @@ fn outcome(results: &[ProbeResult]) -> DoctorOutcome {
     } else {
         DoctorOutcome::AllOk
     }
+}
+
+// ── Exercise subcommand (control-path verification) ───────────────────────────
+
+/// Run `dormantctl doctor --exercise <display>` — IPC-only in v1 (per the
+/// design doc's Option B).  Sends `IpcRequest::Exercise` to the daemon and
+/// prints the per-step report.
+///
+/// Exit semantics:
+/// - `SomeFailed` (CLI exits 1) when ANY step's verdict is `Failed` —
+///   a confirmable panel that did not move despite the command returning
+///   `Ok`.  This is the systemic guard against the samsung stale-socket /
+///   port-1516 400s failure shape.
+/// - `AllOk` (CLI exits 0) for any combination of `Confirmed` and
+///   `Unconfirmable` — a `Confirmed` panel moved as expected, an
+///   `Unconfirmable` panel has no readback (command / kwin-dpms /
+///   ha-passthrough controllers) so the test honestly says "issued, can't
+///   observe" rather than fabricating a pass.
+pub fn run_exercise_with_socket(
+    socket_path: &std::path::Path,
+    display: &str,
+) -> Result<DoctorOutcome> {
+    let resp = client::send_request(
+        socket_path,
+        &IpcRequest::Exercise {
+            display: display.to_string(),
+        },
+    )?;
+    if !resp.ok {
+        eprintln!(
+            "error: exercise failed: {}",
+            resp.error.as_deref().unwrap_or("unknown")
+        );
+        return Ok(DoctorOutcome::SomeFailed);
+    }
+    match resp.exercise_report {
+        Some(report) => Ok(present_exercise_report(&report)),
+        None => Ok(report_no_exercise()),
+    }
+}
+
+/// Print the per-step exercise report and return the doctor outcome.
+///
+/// Glyph mapping (consistent with the rest of the CLI; mirrors the
+/// `print_table` glyphs so an operator reading `doctor` output sees the
+/// same vocabulary):
+/// - ✓ Confirmed (green)
+/// - ~ Unconfirmable (yellow)
+/// - ✗ Failed (red)
+fn present_exercise_report(report: &ExerciseReport) -> DoctorOutcome {
+    println!(
+        "exercise: display={} pre_phase={} paused_rules={}",
+        report.display,
+        report.pre_phase,
+        if report.paused_rules.is_empty() {
+            "none".to_string()
+        } else {
+            report
+                .paused_rules
+                .iter()
+                .map(|r| r.0.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["Step", "Verdict", "Detail"]);
+    let mut any_failed = false;
+    for step in &report.steps {
+        let (glyph, color) = match step.verdict {
+            ExerciseVerdict::Confirmed => ("✓", Color::Green),
+            ExerciseVerdict::Unconfirmable => ("~", Color::Yellow),
+            ExerciseVerdict::Failed => {
+                any_failed = true;
+                ("✗", Color::Red)
+            }
+        };
+        let detail = step_detail(step);
+        table.add_row(Row::from(vec![
+            Cell::new(&step.command).fg(color),
+            Cell::new(glyph).fg(color),
+            Cell::new(detail),
+        ]));
+    }
+    println!("{table}");
+    if any_failed {
+        DoctorOutcome::SomeFailed
+    } else {
+        DoctorOutcome::AllOk
+    }
+}
+
+/// Emit the operator-facing diagnostic when the daemon returned
+/// `ok: true` with no `exercise_report` — the wire shape implies a daemon
+/// regression (the response field is `serde(default)` + `skip_serializing_if`,
+/// so a missing field means the daemon's `IpcResponse` serialisation broke).
+fn report_no_exercise() -> DoctorOutcome {
+    eprintln!("error: daemon returned ok but no exercise_report");
+    DoctorOutcome::SomeFailed
+}
+
+/// Compose a one-line description of a step for the report table.
+fn step_detail(step: &ExerciseStep) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(mode) = step.blank_mode {
+        parts.push(format!("mode={mode:?}"));
+    }
+    parts.push(format!("cmd_ok={}", step.returned_ok));
+    if let Some(before) = &step.state_before {
+        parts.push(format!("before={before:?}"));
+    }
+    if let Some(after) = &step.state_after {
+        parts.push(format!("after={after:?}"));
+    }
+    if let Some(err) = &step.error {
+        parts.push(format!("err={err}"));
+    }
+    parts.join(" ")
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────
@@ -436,5 +583,122 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Exercise report rendering ──────────────────────────────────────────
+
+    /// Decisive test: a report with one `Failed` step must produce
+    /// `SomeFailed` (CLI exits 1) — the operator-facing signal that the
+    /// panel did not move despite the controller reporting `Ok`.  The
+    /// other two steps are `Confirmed` and `Unconfirmable` to confirm
+    /// mixed reports still surface the failure.
+    #[test]
+    fn present_exercise_report_with_failed_step_returns_some_failed() {
+        use dormant_core::types::{BlankMode, DisplayId, RuleId};
+
+        let report = ExerciseReport {
+            display: DisplayId("mon".into()),
+            pre_phase: "active".into(),
+            paused_rules: vec![RuleId("office".into())],
+            steps: vec![
+                ExerciseStep {
+                    command: "read".into(),
+                    blank_mode: None,
+                    returned_ok: true,
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Unconfirmable,
+                    error: None,
+                },
+                ExerciseStep {
+                    command: "blank".into(),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    returned_ok: true, // controller lied
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Failed, // panel didn't move
+                    error: None,
+                },
+                ExerciseStep {
+                    command: "wake".into(),
+                    blank_mode: None,
+                    returned_ok: true,
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Confirmed,
+                    error: None,
+                },
+            ],
+        };
+        let outcome = present_exercise_report(&report);
+        assert_eq!(
+            outcome,
+            DoctorOutcome::SomeFailed,
+            "a Failed step must produce SomeFailed (CLI exit 1)"
+        );
+    }
+
+    /// Counterpart: a report with no `Failed` steps returns `AllOk`
+    /// regardless of how many `Unconfirmable` rows appear.  This is the
+    /// honest "issued, can't observe" path the design doc calls out.
+    #[test]
+    fn present_exercise_report_without_failed_returns_all_ok() {
+        use dormant_core::types::{BlankMode, DisplayId};
+
+        let report = ExerciseReport {
+            display: DisplayId("manual".into()),
+            pre_phase: "active".into(),
+            paused_rules: vec![],
+            steps: vec![
+                ExerciseStep {
+                    command: "blank".into(),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    returned_ok: true,
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Unconfirmable,
+                    error: None,
+                },
+                ExerciseStep {
+                    command: "wake".into(),
+                    blank_mode: None,
+                    returned_ok: true,
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Unconfirmable,
+                    error: None,
+                },
+            ],
+        };
+        let outcome = present_exercise_report(&report);
+        assert_eq!(
+            outcome,
+            DoctorOutcome::AllOk,
+            "no Failed step → AllOk (CLI exit 0) even with Unconfirmable rows"
+        );
+    }
+
+    /// Parse the `--exercise <display>` subcommand from the CLI argv
+    /// surface — confirms the parser wiring is correct (the handler is
+    /// dispatched by `main.rs`, but the parse must still classify the
+    /// subcommand into `DoctorSubcommand::Exercise`).
+    #[test]
+    fn parse_doctor_exercise_subcommand() {
+        // The DoctorArgs struct itself can't be parsed in isolation
+        // without the parent `dormantctl` argv surface; test the inner
+        // enum's `FromArgMatches`-style classification via a direct
+        // `clap::Parser::try_parse_from` invocation that omits the
+        // outer wrapper.  This proves the subcommand is recognised.
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            sub: DoctorSubcommand,
+        }
+        let cli = Wrapper::try_parse_from(["dormantctl", "exercise", "mon"]).expect("parse");
+        match cli.sub {
+            DoctorSubcommand::Exercise { display } => assert_eq!(display, "mon"),
+            other => panic!("expected Exercise, got {other:?}"),
+        }
     }
 }

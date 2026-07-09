@@ -29,7 +29,13 @@ The whole point is protecting OLEDs *without* the usual trade-offs — no black 
 | `power_off` | Full | No | ~1s standby |
 | `brightness_zero` | Partial — pixels stay lit | Yes | Instant |
 
-On Linux the only audio-safe way to truly darken a panel is DDC/CI: `power_off` writes VCP `0xD6` straight to the monitor, so the OS output — and its audio sink — stay up. Every DPMS path (`kwin-dpms` included) tears the output down and takes the audio with it, which is why it's a documented fallback, not a default. For a Samsung TV, `samsung-tizen` sends `KEY_PICTURE_OFF` and the panel goes dark while the sound plays on.
+Three display paths leave the OS output alone, so audio keeps playing:
+
+- **`ddcci` `power_off`** writes VCP `0xD6` straight to the monitor's internal controller. The panel blanks; the OS output — and its audio sink — stay up.
+- **`samsung-tizen` `screen_off_audio_on`** sends `KEY_PICTURE_OFF` over WebSocket. The TV cuts its backlight; the HDMI source keeps running and the audio plays on.
+- **`samsung-tizen` `brightness_zero`** drives the TV's backlight to zero over Samsung IP Control G2 on port 1516 — a near-black dim rather than a true off, but the only mode that leaves the source's audio uninterrupted on a 2024 Samsung OLED.
+
+Every DPMS path (`kwin-dpms` included) tears the output down and takes the audio with it, which is why it's a documented fallback, not a default.
 
 ## What's in the box
 
@@ -57,6 +63,8 @@ Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A 
 | `command` — arbitrary blank/wake shell commands | Ready |
 
 Each display gets an ordered controller chain with automatic fallback and bounded wake-retry. A wake that fails on the first controller escalates to the next; wake is unconditional and never gives up on a dark screen.
+
+A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. This is the way a TV joins dormant without a keep-awake dummy zone.
 
 ### Web dashboard and tray
 
@@ -125,7 +133,9 @@ Configuration reference, sensor and controller guides, and the `doctor` command 
 
 ## Status
 
-Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows. It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
+Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows. The daemon's idle RSS is held flat by capped tokio workers (`worker_threads = 2`) and a `malloc_trim` after every screensaver teardown; the libmpv crossfade buffers do not leak across cycles.
+
+It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
 
 ## License
 

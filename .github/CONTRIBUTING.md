@@ -1,5 +1,10 @@
 # Contributing
 
+## Branch model
+
+- **All pull requests target `dev`.** The CI workflow at `.github/workflows/ci.yml` is configured to run on push to `dev` and on pull requests *into* `dev`. PRs against `master` will not trigger CI and will not be merged.
+- `master` is release-only — it advances via a tag push that triggers the cargo-dist release pipeline. Do not commit day-to-day work there directly.
+
 ## Development setup
 
 1. Install Rust via [rustup](https://rustup.rs) — the MSRV is 1.88.
@@ -24,19 +29,18 @@
 
 ## Gate commands
 
-Run these before committing. All must pass. They mirror CI exactly.
+Run these before committing. All must pass. They mirror the CI workflow exactly — what runs locally is what runs on the PR.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
+cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
 cargo test --workspace --all-features
-cargo build --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 mdbook build docs     # if mdbook installed
 ```
 
-CI also enforces `taplo fmt --check`, `typos`, and `cargo audit`. Run `cargo deny check` locally; the others run automatically on PRs.
+CI also enforces `taplo fmt --check`, `typos`, and `cargo audit`, plus the webui gate (`npm ci && npm run lint && npm run build && npx vitest run`), the portability gate (`cargo check --workspace` on Windows + macOS), the MSRV gate (`cargo check --workspace` on Rust 1.88), and the render-feature gate (Linux-only build of `dormant-render` and `dormantd --features render`). Run `cargo deny check` locally; the rest run automatically on PRs.
 
 ## TDD expectation
 

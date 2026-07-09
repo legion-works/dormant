@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or setup help
+    url: https://github.com/legion-works/dormant/discussions
+    about: For "how do I configure X" and general questions, start a Discussion. Bug reports and feature requests use the templates below.
+  - name: Documentation
+    url: https://github.com/legion-works/dormant/tree/master/docs
+    about: Installation, configuration, sensors, displays, and troubleshooting.

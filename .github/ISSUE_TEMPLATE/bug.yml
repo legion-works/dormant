@@ -1,79 +1,116 @@
 name: Bug Report
-description: File a bug report
+description: Report something dormant does wrong — a screen that won't blank or wake, a sensor misread, a crash
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to file a bug report. Include as much detail as you can.
+        dormant drives real hardware, so a bug we can act on names the hardware, the environment, and what the daemon logged. The required fields below are the minimum we need to reproduce or diagnose — a report without the config, version, environment, and exact display model will get all of these asked back before anyone can help.
+
+        A screen that won't wake is the worst failure mode dormant has; if that's what you're reporting, say so plainly and include the daemon logs from the moment it happened.
   - type: textarea
     id: summary
     attributes:
       label: Summary
-      description: What happened? What did you expect to happen?
+      description: What happened, and what did you expect instead?
+      placeholder: |
+        I left the room, the monitor blanked, but on returning the TV stayed dark and I
+        had to power it on by hand.
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
       label: Steps to reproduce
-      description: Exact steps that trigger the bug.
+      description: The exact sequence that triggers it. If it's intermittent, say how often and what seems to correlate.
       placeholder: |
-        1. Start dormantd with config ...
-        2. Leave the room for N minutes
-        3. Return and observe ...
+        1. Start dormantd with the config below
+        2. Leave the room for ~6 minutes (screensaver comes up, then panel off)
+        3. Return and observe the TV does not re-light
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your dormant TOML config. Sanitize credentials — do not paste tokens or passwords.
+      render: toml
+      placeholder: |
+        config_version = 1
+        [displays.tv]
+        controllers = ["samsung-tizen"]
+        host = "10.1.1.7"
+        blank_mode = "brightness_zero"
+    validations:
+      required: true
+  - type: textarea
+    id: displays
+    attributes:
+      label: Displays involved
+      description: |
+        Exact make + model, panel technology, and how each connects. This is not optional for a display bug — the failure is almost always specific to the model and connection.
+        - Make + model (e.g. "AOC AGON AG326UZD", "Samsung QA65S90D")
+        - Panel: OLED / QD-OLED / LCD / other
+        - Connection to the PC: DisplayPort / HDMI / none (network-only)
+        - Network address if controlled over the LAN, and which controller (`ddcci`, `samsung-tizen`, `kwin-dpms`, `ha-passthrough`, `command`)
+      placeholder: |
+        - AOC AGON AG326UZD (OLED), DisplayPort → ddcci
+        - Samsung QA65S90D (QD-OLED), on the LAN at 10.1.1.7 → samsung-tizen (brightness_zero)
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        - OS + version (e.g. "Arch Linux", "Ubuntu 24.04")
+        - Desktop environment + version (e.g. "KDE Plasma 6.7.2")
+        - Session type: **Wayland or X11**
+        - GPU + driver if the bug involves local display control (e.g. "RTX 5090, proprietary nvidia")
+      placeholder: |
+        Arch Linux, KDE Plasma 6.7.2, Wayland, RTX 5090 proprietary driver
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dormant version
+      description: Output of `dormantd --version` (or `dormantctl --version`), or the commit SHA if you built from source.
+      placeholder: "dormant 0.1.0 (or dev @ 837442c)"
     validations:
       required: true
   - type: textarea
     id: status
     attributes:
       label: dormantctl status output
-      description: Paste the output of `dormantctl status` while the bug is present.
+      description: Paste `dormantctl status` while the bug is present — it shows each display's phase.
       render: text
   - type: textarea
     id: doctor
     attributes:
       label: dormantctl doctor output
-      description: Paste the output of `dormantctl doctor` for the relevant sensor and display.
+      description: Paste `dormantctl doctor` for the affected sensor and display (e.g. `dormantctl doctor samsung 10.1.1.7`). This probes reachability, power state, and credentials.
       render: text
-  - type: textarea
-    id: config
-    attributes:
-      label: Configuration
-      description: Paste your dormant TOML config (sanitize credentials).
-      render: toml
-      placeholder: |
-        config_version = 1
-        [sensors.desk]
-        type = "mqtt"
-        ...
-    validations:
-      required: true
   - type: textarea
     id: logs
     attributes:
-      label: Relevant logs
-      description: Include daemon logs showing the bug (set `log_level = "debug"` for more detail).
+      label: Relevant daemon logs
+      description: Daemon logs around the failure. Set `log_level = "debug"` and reproduce for the useful detail — include the literal event names (e.g. `blank_succeeded`, `wake_failed`, `E_DISPLAY_IO`).
       render: text
-  - type: input
-    id: version
-    attributes:
-      label: dormant version
-      description: Output of `dormantctl --version` or `dormantd --version`.
-      placeholder: "dormant 0.1.0"
-  - type: input
-    id: os
-    attributes:
-      label: OS and desktop environment
-      description: e.g. "Ubuntu 24.04, KDE Plasma 6.3, Wayland"
-      placeholder: "Ubuntu 24.04, KDE Plasma 6.3, Wayland"
+    validations:
+      required: true
   - type: dropdown
-    id: display
+    id: area
     attributes:
-      label: Display type
+      label: Area
+      description: Best guess at which part of dormant is involved.
+      multiple: true
       options:
-        - OLED PC monitor
-        - OLED TV
-        - LCD PC monitor
-        - LCD TV
-        - Other
+        - Core (config, zones, rules, state machine)
+        - Sensors (MQTT, HA, USB-LD2410, ESPHome)
+        - Displays (DDC/CI, Samsung, command, HA passthrough, KWin)
+        - Render (Wayland overlay, screensaver)
+        - CLI (dormantctl)
+        - Web UI
+        - Tray
+        - Reload / hot config

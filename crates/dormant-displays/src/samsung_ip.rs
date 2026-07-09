@@ -958,7 +958,10 @@ mod tests {
         assert_eq!(tok_again, "tok-1");
 
         // set_backlight uses the cached token; mock echoes back 25.
-        transport.set_backlight("192.0.2.7", &tok, 25).await.unwrap();
+        transport
+            .set_backlight("192.0.2.7", &tok, 25)
+            .await
+            .unwrap();
     }
 
     /// JSON-RPC error response body is parsed and the literal code is
@@ -1285,7 +1288,10 @@ mod tests {
         let transport =
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
         let tok = transport.acquire_token("192.0.2.7").await.unwrap();
-        transport.set_backlight("192.0.2.7", &tok, 17).await.unwrap();
+        transport
+            .set_backlight("192.0.2.7", &tok, 17)
+            .await
+            .unwrap();
     }
 
     // ── TOKEN-PERSISTENCE TESTS — re-acquiring the token on every daemon

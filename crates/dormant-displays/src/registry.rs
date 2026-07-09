@@ -358,7 +358,9 @@ mod tests {
             treat_unreachable_as_blanked: true,
         };
         let mut creds = Credentials::default();
-        creds.samsung.insert("192.0.2.7".into(), "test-token".into());
+        creds
+            .samsung
+            .insert("192.0.2.7".into(), "test-token".into());
 
         let chain = build_controllers("tv", &cfg, &creds).unwrap();
         assert_eq!(chain.len(), 1);

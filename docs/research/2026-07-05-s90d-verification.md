@@ -51,7 +51,7 @@ The TV has two off-states with different socket behavior:
 - `KEY_PICTURE_OFF` toggles picture on/off — safe as a wake from picture-off,
   but would blank an awake panel if daemon state drifts.
 - WoL magic packet woke the TV from deep standby (verified on this TV).
-  The TV has two MACs: ethernet `00:00:5E:00:53:01`, Wi-Fi `00:00:5E:00:53:02`.
+  The TV has two MACs: ethernet `<ethernet-mac>`, Wi-Fi `<wifi-mac>`.
   Send WoL to the ethernet MAC for best reliability.
 
 ## Panel state discrimination

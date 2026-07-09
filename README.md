@@ -76,7 +76,16 @@ The `dormant-tray` applet puts per-display status and blank/wake/pause controls 
 
 ## Quickstart
 
-Build from source (Linux, Rust 1.88+):
+### Install from release (Linux x86_64 / aarch64)
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
+```
+
+`dormant-tray-installer.sh` is also available in the same directory. Checksums are published alongside every artifact; verify with `sha256sum -c <artifact>.sha256`.
+
+### Build from source (Linux, Rust 1.88+)
 
 ```bash
 git clone https://github.com/legion-works/dormant.git

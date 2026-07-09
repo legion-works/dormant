@@ -10,7 +10,7 @@ Binaries: **`dormantd`** (daemon) · **`dormantctl`** (CLI + library) · **`dorm
 
 ## Current state
 
-Shipped: **M1** (daemon + sensors + 5 controllers), **M2** (Web UI + config editor), **M3** (KDE tray + render ladder + libmpv screensaver + doctor). The CI matrix is green, the daemon is running on the maintainer's hardware (AOC AGON AG326UZD over DisplayPort, Samsung S90D over the network), and all display controllers have been verified end-to-end. No release is tagged yet — see [ROADMAP.md](./ROADMAP.md) for the near-term plan.
+Shipped: **M1** (daemon + sensors + 5 controllers), **M2** (Web UI + config editor), **M3** (KDE tray + render ladder + libmpv screensaver + doctor). The CI matrix is green, the daemon is running on the maintainer's hardware (AOC AGON AG326UZD over DisplayPort, Samsung S90D over the network), and all display controllers have been verified end-to-end. **v0.1.0 is released** — see [ROADMAP.md](./ROADMAP.md) for what's next.
 
 ### Branch model
 

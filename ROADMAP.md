@@ -2,7 +2,7 @@
 
 Direction for `dormant` — the OLED-preserving presence daemon. Grouped by state, not by date, and within each group ordered by priority (highest first). Items move down as they ship; nothing here is a dated promise.
 
-Status: pre-`0.1.0`. The core daemon, all three control surfaces, and the audio-safe blanking path are built, cross-reviewed, and validated on the maintainer's hardware (AOC AGON AG326UZD over DisplayPort, Samsung S90D over the network). The resource footprint is flat across real cycles and the config-reload path no longer drops in-flight commands. No release is tagged yet — `master` holds the last validated state, `dev` is the integration branch.
+**v0.1.0 shipped 2026-07-09.** The core daemon, all three control surfaces, and the audio-safe blanking path are built, cross-reviewed, and validated on the maintainer's hardware (AOC AGON AG326UZD over DisplayPort, Samsung S90D over the network). The resource footprint is flat across real cycles and the config-reload path no longer drops in-flight commands. `master` holds the last validated state, `dev` is the integration branch.
 
 ## Shipped
 
@@ -18,11 +18,10 @@ Status: pre-`0.1.0`. The core daemon, all three control surfaces, and the audio-
 - **Reload-window integrity** — control messages and presence events forwarded during a config-reload generation swap are retried across the swap instead of being dropped into the torn-down generation. Closes the narrow lost-command window on both the control and presence paths ([#9](https://github.com/legion-works/dormant/issues/9)).
 - **Delivery** — 15-job CI matrix (fmt, clippy pedantic, tests, MSRV, Linux/macOS/Windows portability, deny, audit, taplo, typos, docs, mdBook), cargo-dist release pipeline, mdBook manual.
 
-## Near-term — toward `0.1.0`
+## Near-term
 
 - **Emergency recovery hotkey** — one command that force-wakes every display and pauses the daemon, no matter what state it thinks it's in. The direct answer to dormant's worst failure mode: if a controller bug, a wedged reload, or a dead network path ever leaves a panel dark, there is a guaranteed way back to a lit screen. It tries the daemon first (fast, no contention when healthy) and falls back to driving every controller directly when the daemon is unresponsive — recovery must not depend on the daemon being alive. Bind it to a compositor global shortcut. In progress.
 - **Control-path verification** — a doctor mode that actually *exercises* blank → wake on a named display and confirms the panel changed, reading state back where the controller can (DDC/CI brightness, Samsung power/backlight), rather than trusting that a command which returned success did anything. The systemic guard against the failure that has cost the most time here: a controller reporting `blank_succeeded` while the panel never moved. Runs through the daemon so it never second-opens hardware the daemon owns, and pauses the target's rule for the exercise window. `dormantctl doctor --exercise <display>`. In progress.
-- **First tagged release** — cut `0.1.0` once the above land: promote `dev` → `master`, tag, ship installers.
 
 ## Planned
 

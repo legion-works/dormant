@@ -19,7 +19,7 @@ is off by default. To enable it:
   `E_RENDER_UNAVAILABLE`; the daemon, CLI, and non-render sensors/displays still
   build and run normally.
 
-## From source (current, pre-release)
+## From source
 
 ```bash
 git clone https://github.com/legion-works/dormant.git
@@ -43,16 +43,16 @@ install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 
 See [Tray autostart](#tray-autostart) below to run it on every login.
 
-## From release (pre-`0.1.0`)
+## From release
 
-No tagged release yet — everything is built and validated but shipping awaits the next milestone on the roadmap. When the first tag lands, the cargo-dist pipeline will publish shell installers and tarballs for each binary:
+The cargo-dist pipeline publishes shell installers and tarballs for each binary on every release. Install the latest release (Linux x86_64 / aarch64):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/<tag>/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/<tag>/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
 ```
 
-Replace `<tag>` with the release tag (e.g. `v0.1.0`). Checksums are published alongside every artifact; verify with:
+`dormant-tray-installer.sh` is also available in the same directory. Checksums are published alongside every artifact; verify with:
 
 ```bash
 sha256sum -c dormantd-x86_64-unknown-linux-gnu.tar.xz.sha256

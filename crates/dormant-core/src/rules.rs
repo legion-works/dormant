@@ -224,10 +224,10 @@ pub struct ExerciseStep {
 ///
 /// The CLI maps this to per-step ✓ / ~ / ✗ glyphs and exits non-zero if any
 /// step verdict is `Failed`.  `paused_rules` carries the literal rule ids
-/// the handler paused for the exercise window — the IPC dispatch layer
-/// forwards a matching [`ControlMsg::Resume`] for each id after the report
-/// ships so the engine re-converges from live sensors without an explicit
-/// operator step.
+/// the handler paused for the exercise window.  The pause release is
+/// guaranteed engine-side via the internal `ExerciseResume` result — the
+/// field here is informational so the CLI can show which rules were
+/// affected.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExerciseReport {
     /// The display the exercise ran on.
@@ -2270,8 +2270,9 @@ mod tests {
         );
     }
 
-    /// `paused_rules` plumbed through the report so the IPC dispatch layer
-    /// can resume the right rules after the exercise.
+    /// `paused_rules` threaded through the report so callers can
+    /// surface which rules were paused (engine-side resume via
+    /// `ExerciseResume` guarantees the release regardless).
     #[tokio::test]
     async fn exercise_sequence_threads_paused_rules_into_report() {
         use crate::fakes::ExerciseSink;

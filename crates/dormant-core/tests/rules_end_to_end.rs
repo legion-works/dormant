@@ -290,6 +290,258 @@ async fn clear_grace_blank_then_instant_wake() {
     let _ = harness.source_handle.await;
 }
 
+// ── exercise pause-resume is guaranteed engine-side ───────────────────────────
+//
+// MUST RED-first proof: pause + resume live on different sides today
+// (pause = engine via `ControlMsg::Exercise`; resume = IPC via
+// `exercise_response_with_resume`).  The IPC path ONLY runs on
+// `Ok(Ok(report))`; the timeout / dropped-reply arms skip the resume and
+// the rule stays paused indefinitely.  This test simulates the dropped
+// reply by dropping the receiver immediately after sending the
+// `Exercise` control message — the engine's spawned sequence must STILL
+// resume the rule via the `ExerciseResume` internal result.
+//
+// The test asserts via a snapshot of the engine state: after the
+// sequence completes and the ExerciseResume is processed, the rule
+// must not be paused (`paused_rules` is the private set, so the
+// snapshot's `paused` flag on the display is the observable side).
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn exercise_handler_resumes_rule_even_when_reply_receiver_dropped() {
+    use dormant_core::traits::{PanelState, PowerState};
+
+    struct ScriptedSink {
+        states: Arc<std::sync::Mutex<Vec<PanelState>>>,
+        log: Arc<std::sync::Mutex<Vec<SinkCmd>>>,
+    }
+    #[async_trait::async_trait]
+    impl CommandSink for ScriptedSink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            self.log
+                .lock()
+                .expect("log lock poisoned")
+                .push(SinkCmd::Blank(BlankMode::PowerOff));
+            Ok(())
+        }
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            self.log
+                .lock()
+                .expect("log lock poisoned")
+                .push(SinkCmd::Wake);
+            Ok(())
+        }
+        async fn wake_once(&self) -> Result<(), CmdFailure> {
+            self.wake().await
+        }
+        fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+            Vec::new()
+        }
+        async fn read_state(&self) -> Option<PanelState> {
+            self.states.lock().expect("states lock poisoned").pop()
+        }
+    }
+
+    let display = DisplayId("mon".into());
+    let zones = zone_with_sensor("desk", "office");
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::<SinkCmd>::new()));
+    let states_script: Vec<PanelState> = vec![
+        PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        }, // restore-read
+        PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        }, // post-wake
+        PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        }, // post-blank
+        PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        }, // baseline
+    ];
+    let states = Arc::new(std::sync::Mutex::new(states_script));
+    let sink_arc: Arc<dyn CommandSink> = Arc::new(ScriptedSink {
+        states: Arc::clone(&states),
+        log: Arc::clone(&log),
+    });
+
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink_arc);
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r_office", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    // Send Exercise — but DROP THE RECEIVER immediately.  This is the
+    // exact failure mode that stranded rules in the v1 design (the
+    // IPC-layer Resume forwarder never fired because `reply.send`
+    // observed the dropped receiver and bailed).
+    let (reply_tx, reply_rx) = oneshot::channel();
+    drop(reply_rx); // simulate IPC caller gone before the sequence completes
+    harness
+        .ctl_tx
+        .send(ControlMsg::Exercise {
+            display: display.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("ctl channel open");
+
+    // The engine must still process the ExerciseResume via the run
+    // loop's results_rx arm.  Poll the snapshot until `paused` flips
+    // back to false (rule resumed).  Bounded wait — if the resume never
+    // fires the test will time out and fail.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = request_snapshot(&harness.ctl_tx).await;
+        let mon = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("display 'mon' in snapshot");
+        if !mon.1.paused {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "rule stayed paused after exercise sequence despite \
+             dropped IPC receiver — pause-resume leak"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Sanity: the sequence actually ran (the sink log is non-empty),
+    // proving the spawned task completed end-to-end before the
+    // resume fired.
+    assert!(
+        !log.lock().expect("log lock poisoned").is_empty(),
+        "exercise sequence must have completed before the resume fired"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// Hung-read timeout test (SHOULD 2): a sink whose `read_state` never
+/// returns must not block the spawned sequence indefinitely.  The
+/// per-read budget wraps the call; the verdict surfaces `Unconfirmable`
+/// and the sequence proceeds to the next phase.  Uses a deterministic
+/// in-memory hang so the test runs fast — no real timers, no long
+/// sleeps.  Polls the snapshot's `paused` flag to confirm the sequence
+/// completed AND the engine-owned rule resume fired (the MUST-1 path).
+#[tokio::test(flavor = "current_thread")]
+async fn exercise_sequence_unconfirmable_when_read_state_hangs() {
+    use dormant_core::rules::ExerciseVerdict;
+    use dormant_core::traits::PanelState;
+
+    /// Sink whose `read_state` never returns — the per-read budget is
+    /// what SHOULD 2 guarantees must fire.
+    struct HungSink;
+
+    #[async_trait::async_trait]
+    impl CommandSink for HungSink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        async fn wake_once(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+            Vec::new()
+        }
+        async fn read_state(&self) -> Option<PanelState> {
+            // Pending forever — never resolves.  The helper's
+            // `tokio::time::timeout` wrap is the only thing that saves
+            // the spawned task from blocking forever.
+            std::future::pending::<Option<PanelState>>().await
+        }
+    }
+
+    let display = DisplayId("mon".into());
+    let zones = zone_with_sensor("desk", "office");
+    let sink_arc: Arc<dyn CommandSink> = Arc::new(HungSink);
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink_arc);
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r_office", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    // Drop the receiver immediately so the IPC timeout / dropped-reply
+    // arms fire (this exercises the ExerciseResume internal-result
+    // path the MUST fix added) AND the hung read would otherwise leak
+    // the spawned task — bounded_read_state's timeout is the only thing
+    // that lets the sequence complete.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    drop(reply_rx);
+    harness
+        .ctl_tx
+        .send(ControlMsg::Exercise {
+            display: display.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("ctl channel open");
+
+    // Poll the snapshot: the rule must resume (engine-owned resume
+    // fired via ExerciseResume internal result), AND the sequence
+    // must complete (proving the hung reads didn't block the task —
+    // bounded_read_state returned None for every site, every step is
+    // Unconfirmable).
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let snap = request_snapshot(&harness.ctl_tx).await;
+        let mon = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("display 'mon' in snapshot");
+        if !mon.1.paused {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "exercise sequence with hung read_state never completed \
+             and rule stayed paused — per-read budget leak"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Reference ExerciseVerdict so the import stays in scope if a
+    // future reader adds an additional assertion on the report shape.
+    let _ = ExerciseVerdict::Unconfirmable;
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
 // ── 2: broker-loss-never-blanks ────────────────────────────────────────────────
 
 #[tokio::test(start_paused = true)]

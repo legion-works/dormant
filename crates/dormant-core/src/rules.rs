@@ -491,6 +491,18 @@ enum InternalResult {
         /// Outcome.
         result: Result<(), CmdFailure>,
     },
+    /// Resume the listed rules — sent by the off-run-loop exercise
+    /// sequence so the pause window is released ENGINE-SIDE, independent
+    /// of whether the IPC caller is still listening.  Routes through
+    /// the internal results channel so the run loop applies the resume
+    /// with `&mut self` — guaranteed as long as the engine is alive
+    /// (the IPC timeout / dropped-reply paths can no longer strand a
+    /// paused rule).  See `RulesEngine::handle_exercise`.
+    ExerciseResume {
+        /// Rule ids to resume (any that were paused for the exercise
+        /// window).  Empty Vec is a no-op.
+        rules: Vec<RuleId>,
+    },
 }
 
 /// Motion-sensor hold state — one entry per sensor with `kind == Motion` and
@@ -1186,6 +1198,17 @@ impl RulesEngine {
         );
 
         let rules_to_resume: Vec<RuleId> = rules_for_target.clone();
+
+        // Clone the internal results sender so the spawned task can
+        // guarantee the rule-pause window is released ENGINE-SIDE — the
+        // IPC layer may be gone (caller dropped the receiver, or hit
+        // EXERCISE_IPC_TIMEOUT) by the time the sequence completes, so
+        // routing the resume through the run loop's &mut self is the
+        // only path that doesn't depend on the IPC caller still being
+        // alive.  This mirrors how `process_effect` clones `results_tx`
+        // for spawned blank/wake tasks.
+        let results_tx = self.results_tx.clone();
+
         tokio::spawn(async move {
             let report = run_exercise_sequence(
                 &sink,
@@ -1201,17 +1224,22 @@ impl RulesEngine {
                 display = %report.display,
                 step_count = report.steps.len(),
                 paused_rules = report.paused_rules.len(),
-                "exercise: complete; IPC dispatch will issue Resume for paused rules",
+                "exercise: complete; releasing rule pause via results channel",
             );
-            let _ = reply.send(report);
+            // Unconditional engine-side resume: the run loop's
+            // `handle_internal_result` arm fires on the very next drain,
+            // independent of whether `reply.send` succeeds.  A timed-out
+            // or disconnected IPC caller can no longer strand a paused
+            // rule.  Empty Vec is a no-op (manual-only display path).
+            let _ = results_tx.send(InternalResult::ExerciseResume {
+                rules: rules_to_resume,
+            });
 
-            // `rules_to_resume` is now captured in `report.paused_rules` —
-            // the IPC dispatch layer reads it to forward matching
-            // `ControlMsg::Resume`s after the report ships.  Keeping the
-            // local variable here means the report is the single source of
-            // truth for the rule list, and a future "automatic un-pause
-            // inline" change does not need to re-discover it.
-            let _ = rules_to_resume;
+            // `reply.send` is best-effort: the caller may have timed out
+            // or disconnected, in which case the report is dropped on the
+            // floor — the engine's rule pause was already released above,
+            // which is the load-bearing invariant.
+            let _ = reply.send(report);
         });
     }
 
@@ -1363,6 +1391,16 @@ impl RulesEngine {
                     for effect in effects {
                         self.process_effect(&display, effect);
                     }
+                }
+            }
+            InternalResult::ExerciseResume { rules } => {
+                // Off-run-loop exercise sequence completed (possibly
+                // successfully, possibly with the IPC caller having
+                // timed out or dropped its receiver).  Resume every
+                // rule the exercise paused so the engine can resume
+                // blanking the moment the result is processed.
+                for rule in &rules {
+                    self.handle_resume(Some(rule));
                 }
             }
         }
@@ -1613,6 +1651,31 @@ fn to_tokio_instant(t: std::time::Instant) -> tokio::time::Instant {
 
 // ── Exercise sequence (helper, off the run loop) ──────────────────────────────
 
+/// Per-`read_state` budget.  A hung transport (Samsung network partition,
+/// DDC bus lockup) would otherwise block the spawned task indefinitely —
+/// leaking the task, holding the sink `Arc`, and stalling the rule-pause
+/// release.  3s is conservative: healthy DDC VCP reads return in
+/// ~200 ms, Samsung REST `PowerState` reads return in ~500 ms.
+const READ_STATE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Wrap a `read_state()` call with the per-read budget.  A timeout
+/// returns `None`, which the caller renders as `Unconfirmable` rather
+/// than a hung-read `Failed` (the panel may have moved; we just can't
+/// observe it in time).
+async fn bounded_read_state(sink: Arc<dyn CommandSink>) -> Option<PanelState> {
+    match tokio::time::timeout(READ_STATE_TIMEOUT, sink.read_state()).await {
+        Ok(state) => state,
+        Err(_elapsed) => {
+            tracing::warn!(
+                event = "control_path_exercise",
+                timeout_s = READ_STATE_TIMEOUT.as_secs(),
+                "read_state() exceeded per-read budget; treating as Unconfirmable",
+            );
+            None
+        }
+    }
+}
+
 /// Drive the [`ControlMsg::Exercise`] sequence against `sink` and return the
 /// aggregated [`ExerciseReport`].
 ///
@@ -1635,8 +1698,9 @@ async fn run_exercise_sequence(
     let mode = effective_mode.unwrap_or(BlankMode::PowerOff);
     let mut steps: Vec<ExerciseStep> = Vec::new();
 
-    // 1. Baseline read — None means the executor has no readback.
-    let baseline = sink.read_state().await;
+    // 1. Baseline read — None means the executor has no readback (or hit
+    //    the per-read budget — both surface the same `Unconfirmable`).
+    let baseline = bounded_read_state(sink.clone()).await;
     steps.push(ExerciseStep {
         command: "read".into(),
         blank_mode: None,
@@ -1651,7 +1715,7 @@ async fn run_exercise_sequence(
     //    baseline; Failed iff it didn't (panel didn't move despite the
     //    command returning Ok).
     let blank_result = sink.blank(mode).await;
-    let state_after_blank = sink.read_state().await;
+    let state_after_blank = bounded_read_state(sink.clone()).await;
     let blank_verdict = blank_verdict(&blank_result, baseline.as_ref(), state_after_blank.as_ref());
     steps.push(ExerciseStep {
         command: "blank".into(),
@@ -1666,7 +1730,7 @@ async fn run_exercise_sequence(
     // 3. wake() → read.  Confirmed iff the panel state returned to the
     //    ORIGINAL baseline — the wake-path restoration check.
     let wake_result = sink.wake().await;
-    let state_after_wake = sink.read_state().await;
+    let state_after_wake = bounded_read_state(sink.clone()).await;
     let wake_verdict = restore_verdict(
         &wake_result,
         baseline.as_ref(),
@@ -1691,7 +1755,7 @@ async fn run_exercise_sequence(
     //    wake (e.g. unreachable TV) never strands the panel dark.
     let restore_step = if is_blanked_family_phase(&pre_phase) {
         let result = sink.blank(mode).await;
-        let after = sink.read_state().await;
+        let after = bounded_read_state(sink.clone()).await;
         // Restore-via-blank: pre-restore state was post-wake; we expect
         // after == post-wake (the panel stays in a blanked-family state)
         // OR after == baseline (the panel came back awake).  Either way
@@ -1713,7 +1777,7 @@ async fn run_exercise_sequence(
         }
     } else {
         let result = sink.wake_once().await;
-        let after = sink.read_state().await;
+        let after = bounded_read_state(sink.clone()).await;
         // Defensive restore-wake verdict: the wake step already verified
         // the panel state returned to baseline.  The defensive wake's
         // only job is to guarantee the panel is awake — its own state

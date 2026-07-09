@@ -1,0 +1,21 @@
+# Local git hooks via lefthook (https://lefthook.dev). Install once: `lefthook install`.
+# These are the fast local mirrors of CI's gates — CI remains the enforcement gate.
+# Skip in an emergency with `git commit --no-verify` / `LEFTHOOK=0 git push`.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: fmt
+      run: cargo fmt --all -- --check
+    - name: typos
+      run: /home/icetea/.cargo/bin/typos
+    - name: taplo
+      run: /home/icetea/.cargo/bin/taplo fmt --check
+
+pre-push:
+  parallel: true
+  jobs:
+    - name: clippy
+      run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
+    - name: rustdoc
+      run: RUSTDOCFLAGS="-D warnings" PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo doc --workspace --no-deps --all-features

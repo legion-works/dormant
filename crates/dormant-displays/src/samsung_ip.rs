@@ -210,6 +210,9 @@ impl RealBacklightTransport {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(true)
+            // The TV's HTTP parser 400s on lowercase header names;
+            // reqwest lowercases by default — force title-case on the wire.
+            .http1_title_case_headers()
             .build()
             .expect("reqwest::Client::builder should never fail with default settings");
         Self {

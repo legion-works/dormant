@@ -161,6 +161,24 @@ jobs:
       - uses: uncenter/setup-taplo@v1
       - run: taplo fmt --check
 
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.2/gitleaks_8.24.2_linux_x64.tar.gz \
+            -o /tmp/gitleaks.tar.gz
+          echo "fa0500f6b7e41d28791ebc680f5dd9899cd42b58629218a5f041efa899151a8e  /tmp/gitleaks.tar.gz" \
+            > /tmp/gitleaks.sha256
+          sha256sum -c /tmp/gitleaks.sha256
+          tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin/ gitleaks
+          chmod +x /usr/local/bin/gitleaks
+      - name: Run gitleaks
+        run: gitleaks git --no-banner --redact
+
   typos:
     runs-on: ubuntu-latest
     steps:

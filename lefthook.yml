@@ -11,6 +11,8 @@ pre-commit:
       run: PATH="$HOME/.cargo/bin:$PATH" typos
     - name: taplo
       run: PATH="$HOME/.cargo/bin:$PATH" taplo fmt --check
+    - name: gitleaks
+      run: PATH="$HOME/go/bin:$HOME/.cargo/bin:$PATH" gitleaks git --staged --no-banner --redact
 
 pre-push:
   parallel: true

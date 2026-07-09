@@ -1,0 +1,17 @@
+# gitleaks config for dormant
+# Extends default rules — add project-specific allowlists below.
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+
+[extend]
+useDefault = true
+
+[allowlist]
+# Allowlist for known false positives.
+# Each entry targets the specific secret pattern, not the whole file —
+# future real secrets in the same file will still be caught.
+regexes = [
+  # Test fixture: mock Samsung Tizen token "abc123granted" in
+  # crates/dormant-displays/src/samsung_tizen.rs #[cfg(test)] block.
+  # This is a deliberate test value, not a real credential.
+  "abc123granted",
+]

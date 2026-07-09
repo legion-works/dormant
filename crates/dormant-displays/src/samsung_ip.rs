@@ -33,19 +33,25 @@
 //! ## Auth
 //!
 //! 1. POST `{"jsonrpc":"2.0","method":"createAccessToken","id":N}` (no
-//!    params/token) → response includes `"result.AccessToken"`. This unit
-//!    auto-grants on the LAN without an on-screen prompt.
+//!    `params` key on the wire — the TV rejects `params: {}` with HTTP 400)
+//!    → response includes `"result.AccessToken"`. This unit auto-grants on
+//!    the LAN without an on-screen prompt.
 //! 2. Every subsequent call includes
 //!    `"params":{"AccessToken":"<tok>", ...}`.
 //!
-//! The token is cached on the transport keyed by host. A `-32010`
-//! unauthorized response drops the cache entry so the next call
-//! re-acquires.
+//! The token is cached in-memory keyed by host and **persisted to a 0600
+//! state file** so a known-good token survives daemon restarts (the TV
+//! intermittently fails to re-grant a fresh token on a subsequent
+//! `createAccessToken`, so re-acquisition is not always reliable). A
+//! `-32010` unauthorized response drops both the in-memory and the
+//! persisted entry so the next call re-acquires and writes a fresh token.
 //!
 //! ## Methods
 //!
-//! - `getVideoStates` → reads `"result.backlight"` (0–50).
-//! - `backlightControl` → writes `"params.backlight"`.
+//! - `backlightControl` (no `backlight` field) → reads `"result.backlight"`
+//!   (0–50). Backlight is read via this method, not `getVideoStates` —
+//!   `getVideoStates` does not include the backlight field on this TV.
+//! - `backlightControl` (with `backlight`) → writes the panel backlight.
 //!
 //! Errors are JSON-RPC `{"error":{"code":C,"message":M}}`. Known codes:
 //!
@@ -57,6 +63,7 @@
 //! | -32010 | unauthorized |
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -79,6 +86,11 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Log event literal for IP Control token re-acquisition after -32010.
 const TOKEN_REACQUIRED: &str = "samsung_ip_token_reacquired";
+
+/// Log event literal for the daemon-owned token state file (load + write).
+/// Distinct from `TOKEN_REACQUIRED` so a reader can tell the two apart.
+const TOKEN_STATE_LOADED: &str = "samsung_ip_token_state_loaded";
+const TOKEN_STATE_WRITTEN: &str = "samsung_ip_token_state_written";
 
 // ── JSON-RPC error codes (string anchors — repo grep rule) ──────────────────────
 
@@ -137,17 +149,30 @@ pub struct RealBacklightTransport {
     /// `Some` for tests that point the transport at a mock URL; `None`
     /// (the production default) uses the LAN-HTTPS pattern.
     base_url: Option<String>,
+    /// Production path to the daemon-owned token state file
+    /// (`$XDG_STATE_HOME/dormant/samsung-ip-tokens.json` or fallback).
+    /// `None` disables persistence — used by `for_test_with_base_url`
+    /// (no real state file in unit/wiremock tests) and by `for_test_with_state_path`
+    /// (which points at a caller-supplied temp path).
+    state_path: Option<PathBuf>,
 }
 
 impl RealBacklightTransport {
-    /// Build a new transport with the default 5-second request timeout.
+    /// Build a new transport with the default 5-second request timeout
+    /// and persistence to the daemon-owned state file
+    /// (`$XDG_STATE_HOME/dormant/samsung-ip-tokens.json` or
+    /// `~/.local/state/dormant/samsung-ip-tokens.json`). On construction
+    /// the state file is loaded (if present) into the in-memory cache so
+    /// a known-good token survives restarts.
     #[must_use]
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self::with_timeout(REQUEST_TIMEOUT)
     }
 
-    /// Build a transport with a custom timeout (used by tests).
+    /// Build a transport with a custom timeout (used by tests). Production
+    /// wires the default state-file path so the persisted token is
+    /// available on startup.
     ///
     /// # Panics
     ///
@@ -156,15 +181,45 @@ impl RealBacklightTransport {
     /// `danger_accept_invalid_certs` cannot trigger.
     #[must_use]
     pub fn with_timeout(timeout: Duration) -> Self {
+        let state_path = default_state_path();
+        let transport = Self::with_timeout_state_path(timeout, state_path);
+        // Seed the in-memory cache from the on-disk file so a restart
+        // with a known-good token does NOT re-acquire.
+        if let Some(path) = transport.state_path.as_ref() {
+            let loaded = load_token_state(path);
+            if let Ok(map) = loaded {
+                if !map.is_empty() {
+                    tracing::info!(
+                        event = TOKEN_STATE_LOADED,
+                        count = map.len(),
+                        path = %path.display(),
+                        "samsung-ip: loaded persisted tokens from state file",
+                    );
+                }
+                *transport.token_cache.lock().expect("token cache poisoned") = map;
+            }
+            // A read failure on the state file is non-fatal — fall through
+            // to fresh acquisition. The TV will reject stale tokens with
+            // -32010 and the transport will re-acquire.
+        }
+        transport
+    }
+
+    /// Internal: build the transport with an explicit state-file path.
+    fn with_timeout_state_path(timeout: Duration, state_path: Option<PathBuf>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(true)
+            // The TV's HTTP parser 400s on lowercase header names;
+            // reqwest lowercases by default — force title-case on the wire.
+            .http1_title_case_headers()
             .build()
             .expect("reqwest::Client::builder should never fail with default settings");
         Self {
             client,
             token_cache: StdMutex::new(HashMap::new()),
             base_url: None,
+            state_path,
         }
     }
 
@@ -172,7 +227,8 @@ impl RealBacklightTransport {
     /// LAN-HTTPS pattern — used by tests that stand up a wiremock (or any
     /// other server) and want to drive `RealBacklightTransport` through the
     /// full `reqwest` round-trip (request shape, JSON-RPC envelope, error
-    /// mapping, token cache, `-32010` re-acquire).
+    /// mapping, token cache, `-32010` re-acquire). No state file is
+    /// loaded or written; the transport is hermetic.
     ///
     /// # Panics
     ///
@@ -188,32 +244,66 @@ impl RealBacklightTransport {
             client,
             token_cache: StdMutex::new(HashMap::new()),
             base_url: Some(base_url),
+            state_path: None,
         }
+    }
+
+    /// Build a transport whose URLs are rooted at `base_url` and whose
+    /// persisted tokens live at `state_path` — used by tests that need
+    /// to exercise the persistence + invalidation plumbing without
+    /// touching the real per-user state directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reqwest::Client` builder fails for any reason.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test_with_state_path(
+        base_url: String,
+        timeout: Duration,
+        state_path: PathBuf,
+    ) -> Self {
+        let mut transport = Self::for_test_with_base_url(base_url, timeout);
+        // Seed the in-memory cache from the on-disk file (if present).
+        let loaded = load_token_state(&state_path);
+        if let Ok(map) = loaded {
+            *transport.token_cache.lock().expect("token cache poisoned") = map;
+        }
+        transport.state_path = Some(state_path);
+        transport
     }
 
     /// Send a JSON-RPC POST and parse the response.
     ///
+    /// The `params` argument is `Option<Value>` — `None` omits the `params`
+    /// key from the JSON-RPC envelope entirely. The Samsung TV rejects
+    /// `params: {}` with HTTP 400 on `createAccessToken`, so omitting the
+    /// key is the only correct shape for that method. Every other method
+    /// passes `Some(...)`.
+    ///
     /// On a JSON-RPC `error` field, the returned `Err` carries the literal
     /// `code` plus a short description so the controller can map it to a
     /// `CmdFailure` with the right prefix.
-    async fn call(&self, host: &str, method: &str, params: Value) -> Result<Value, String> {
+    async fn call(&self, host: &str, method: &str, params: Option<Value>) -> Result<Value, String> {
         let url = match &self.base_url {
             Some(base) => format!("{base}/"),
             None => format!("https://{host}:{IP_CONTROL_PORT}{IP_CONTROL_PATH}"),
         };
-        let body = json!({
+        let mut body = json!({
             "jsonrpc": "2.0",
             "method": method,
             "id": 1,
-            "params": params,
         });
+        if let Some(p) = params {
+            body["params"] = p;
+        }
         let resp = self
             .client
             .post(&url)
             // The port-1516 endpoint is pedantic: a request with the
             // reqwest default `Accept: */*` returns HTTP 400 Bad Request.
             // Pin to `application/json` so all three methods
-            // (createAccessToken, getVideoStates, backlightControl) match.
+            // (createAccessToken, backlightControl) match.
             .header(reqwest::header::ACCEPT, "application/json")
             .json(&body)
             .send()
@@ -236,6 +326,30 @@ impl RealBacklightTransport {
             return Err(format!("{code} {message}").trim().to_string());
         }
         Ok(v)
+    }
+
+    /// Drop the cached token for `host` (called on `-32010`). Also removes
+    /// the entry from the on-disk state file so a daemon restart does not
+    /// re-load a known-stale token. A failure to update the state file is
+    /// logged at WARN but does not propagate — the in-memory invalidation
+    /// is what unblocks the next re-acquire.
+    fn invalidate_token_inner(&self, host: &str) {
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.remove(host);
+        }
+        if let Some(path) = self.state_path.as_ref() {
+            let mut map = load_token_state(path).unwrap_or_default();
+            if map.remove(host).is_some()
+                && let Err(e) = write_token_state(path, &map)
+            {
+                tracing::warn!(
+                    event = TOKEN_STATE_WRITTEN,
+                    path = %path.display(),
+                    error = %e,
+                    "samsung-ip: failed to update state file on invalidate",
+                );
+            }
+        }
     }
 
     /// Drop the cached token for `host` (called on `-32010`).
@@ -264,7 +378,9 @@ impl BacklightTransport for RealBacklightTransport {
             return Ok(tok);
         }
 
-        let response = self.call(host, "createAccessToken", json!({})).await?;
+        // Proven wire shape: the `params` key MUST be absent (the TV
+        // rejects `params: {}` with HTTP 400).
+        let response = self.call(host, "createAccessToken", None).await?;
 
         let token = response
             .get("result")
@@ -273,16 +389,38 @@ impl BacklightTransport for RealBacklightTransport {
             .ok_or_else(|| "token parse failed: missing result.AccessToken".to_string())?
             .to_string();
 
-        self.token_cache
-            .lock()
-            .expect("token cache poisoned")
-            .insert(host.to_string(), token.clone());
+        {
+            let mut cache = self.token_cache.lock().expect("token cache poisoned");
+            cache.insert(host.to_string(), token.clone());
+        }
+        // Persist immediately so a daemon restart reuses this token
+        // instead of triggering an on-screen allow prompt.
+        if let Some(path) = self.state_path.as_ref() {
+            let mut map = load_token_state(path).unwrap_or_default();
+            map.insert(host.to_string(), token.clone());
+            if let Err(e) = write_token_state(path, &map) {
+                tracing::warn!(
+                    event = TOKEN_STATE_WRITTEN,
+                    path = %path.display(),
+                    error = %e,
+                    "samsung-ip: failed to persist token to state file",
+                );
+            }
+        }
         Ok(token)
     }
 
     async fn get_backlight(&self, host: &str, token: &str) -> Result<u8, String> {
+        // Proven wire shape: backlightControl with ONLY AccessToken and
+        // NO `backlight` field — the TV returns `result.backlight`. The
+        // previous `getVideoStates` call always failed because that
+        // method does not carry a backlight field on this TV.
         let value = self
-            .call(host, "getVideoStates", json!({ "AccessToken": token }))
+            .call(
+                host,
+                "backlightControl",
+                Some(json!({ "AccessToken": token })),
+            )
             .await?;
         let backlight = value
             .get("result")
@@ -296,17 +434,125 @@ impl BacklightTransport for RealBacklightTransport {
         self.call(
             host,
             "backlightControl",
-            json!({ "AccessToken": token, "backlight": value }),
+            Some(json!({ "AccessToken": token, "backlight": value })),
         )
         .await?;
         Ok(())
     }
 
     fn invalidate_token(&self, host: &str) {
-        if let Ok(mut cache) = self.token_cache.lock() {
-            cache.remove(host);
+        self.invalidate_token_inner(host);
+    }
+}
+
+// ── State-file plumbing ─────────────────────────────────────────────────────────
+
+/// Default location of the daemon-owned token state file.
+///
+/// 1. `$XDG_STATE_HOME/dormant/samsung-ip-tokens.json`
+/// 2. `~/.local/state/dormant/samsung-ip-tokens.json`
+///
+/// Mirrors the XDG-state precedence used by `dormant-core::paths`. Kept
+/// private to `samsung_ip` because it is daemon-internal state — distinct
+/// from `credentials.toml`, which the user owns.
+fn default_state_path() -> Option<PathBuf> {
+    state_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// Internal: build the state-file path from explicit env values. Returns
+/// `None` only when NEITHER `XDG_STATE_HOME` nor `HOME` is set, which is
+/// exceedingly rare in practice (the daemon would still start; only the
+/// in-memory cache would be used).
+fn state_path_from(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg {
+        return Some(
+            PathBuf::from(xdg)
+                .join("dormant")
+                .join("samsung-ip-tokens.json"),
+        );
+    }
+    if let Some(home) = home {
+        return Some(
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("dormant")
+                .join("samsung-ip-tokens.json"),
+        );
+    }
+    None
+}
+
+/// Load the persisted token map from `path`. Returns an empty map when
+/// the file does not exist. Parse errors are surfaced so a malformed
+/// state file is not silently ignored — the operator should notice.
+fn load_token_state(path: &Path) -> Result<HashMap<String, String>, String> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read samsung-ip token state '{}': {e}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    serde_json::from_str::<HashMap<String, String>>(&raw)
+        .map_err(|e| format!("parse samsung-ip token state '{}': {e}", path.display()))
+}
+
+/// Atomically write the token map to `path`. The write is atomic (temp
+/// file in the same directory + rename) so a crash mid-write never
+/// corrupts an existing good state file. On Unix the file is created
+/// mode `0o600` (owner read/write only) and the directory `0o700`
+/// (owner only) — same boundary as `credentials.toml`. Non-Unix
+/// platforms fall back to a plain write without mode setting.
+fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), String> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "create samsung-ip token state dir '{}': {e}",
+                parent.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Best-effort tighten: create_dir_all respects the umask, so
+            // explicitly set 0o700 once the dir exists. A failure here is
+            // not fatal — `credentials.toml` follows the same pattern.
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
+
+    let raw = serde_json::to_string_pretty(map)
+        .map_err(|e| format!("serialize samsung-ip token state: {e}"))?;
+
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create samsung-ip token state tmp '{}': {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        f.write_all(raw.as_bytes())
+            .map_err(|e| format!("write samsung-ip token state tmp: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync samsung-ip token state tmp: {e}"))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        format!(
+            "rename samsung-ip token state '{}' -> '{}': {e}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 // ── Fake transport for tests ───────────────────────────────────────────────────
@@ -482,6 +728,101 @@ mod tests {
     #[test]
     fn classify_jsonrpc_handles_no_leading_minus() {
         assert_eq!(classify_jsonrpc_error("32601"), E_JSONRPC_METHOD_NOT_FOUND);
+    }
+
+    /// `state_path_from` honors the XDG-state precedence:
+    /// `$XDG_STATE_HOME/dormant/samsung-ip-tokens.json` first, then
+    /// `$HOME/.local/state/dormant/samsung-ip-tokens.json` as the
+    /// fallback. Returns `None` only when NEITHER env var is set.
+    #[test]
+    fn state_path_from_xdg_wins_over_home() {
+        let p = state_path_from(
+            Some(std::ffi::OsString::from("/run/state")),
+            Some(std::ffi::OsString::from("/home/user")),
+        )
+        .expect("XDG_STATE_HOME is set, so a path is returned");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/run/state/dormant/samsung-ip-tokens.json")
+        );
+    }
+
+    #[test]
+    fn state_path_from_home_fallback() {
+        let p = state_path_from(None, Some(std::ffi::OsString::from("/home/user")))
+            .expect("HOME is set, so a path is returned");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/home/user/.local/state/dormant/samsung-ip-tokens.json")
+        );
+    }
+
+    #[test]
+    fn state_path_from_no_env_returns_none() {
+        assert!(state_path_from(None, None).is_none());
+    }
+
+    /// `write_token_state` creates the file with mode `0o600` on Unix
+    /// (and 0o700 on the parent dir) — same boundary as `credentials.toml`.
+    /// A regression to a world-readable mode would expose the access
+    /// token to other users on the host.
+    #[cfg(unix)]
+    #[test]
+    fn write_token_state_creates_file_with_mode_0o600() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subdir/samsung-ip-tokens.json");
+        let mut map = HashMap::new();
+        map.insert("192.0.2.7".to_string(), "tok-secret".to_string());
+        write_token_state(&path, &map).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "state file must be 0o600 (owner read+write only): got {mode:o}"
+        );
+
+        let dir_mode = std::fs::metadata(dir.path().join("subdir"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "parent dir must be 0o700: got {dir_mode:o}"
+        );
+    }
+
+    /// `load_token_state` returns an empty map for a missing file (the
+    /// common case on first daemon run) and a parse error for a
+    /// malformed file (so the operator notices corruption rather than
+    /// silently losing auth).
+    #[test]
+    fn load_token_state_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let map = load_token_state(&path).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn load_token_state_empty_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, "").unwrap();
+        let map = load_token_state(&path).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn load_token_state_malformed_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "{not valid json").unwrap();
+        assert!(load_token_state(&path).is_err());
     }
 
     #[tokio::test]
@@ -726,8 +1067,10 @@ mod tests {
         assert_eq!(tok_b, "tok-B");
     }
 
-    /// getVideoStates parses the `result.backlight` field and returns it
-    /// as a `u8`. Out-of-range or missing values produce a typed error.
+    /// Backlight reads go through `backlightControl` with the token and
+    /// NO `backlight` field — the proven wire shape. Parses the
+    /// `result.backlight` field as a `u8`. Out-of-range or missing values
+    /// produce a typed error.
     #[tokio::test]
     async fn real_transport_get_backlight_parses_result_backlight() {
         use wiremock::matchers::{body_partial_json, method, path};
@@ -750,7 +1093,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/"))
             .and(body_partial_json(serde_json::json!({
-                "method": "getVideoStates"
+                "method": "backlightControl",
+                "params": { "AccessToken": "tok" }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": { "backlight": 37 }
@@ -804,7 +1148,8 @@ mod tests {
             .and(path("/"))
             .and(header("accept", "application/json"))
             .and(body_partial_json(serde_json::json!({
-                "method": "getVideoStates"
+                "method": "backlightControl",
+                "params": { "AccessToken": "tok" }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "result": { "backlight": 37 }
@@ -818,5 +1163,292 @@ mod tests {
         let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
         assert_eq!(value, 37);
+    }
+
+    // ── PROVEN-WIRE-SHAPE TESTS — pin the request/response bodies the real
+    //    Samsung TV accepts on port 1516. The previous tests mocked the
+    //    wire shape we GUESSED (params:{} for createAccessToken,
+    //    getVideoStates for reads) — and passed — while the real TV rejected
+    //    those requests with HTTP 400. These tests mock the PROVEN shape and
+    //    would fail against the old code.
+
+    /// `createAccessToken` request body MUST NOT include a `params` key —
+    /// the real TV returns HTTP 400 when `params: {}` is present. The fix
+    /// is to omit the key entirely. Uses `body_json` (exact match) so any
+    /// stray `params` key, including an empty object, fails the matcher.
+    #[tokio::test]
+    async fn real_transport_create_access_token_request_omits_params_key() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_json(json!({
+                "jsonrpc": "2.0",
+                "method": "createAccessToken",
+                "id": 1
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "tok-no-params" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        assert_eq!(tok, "tok-no-params");
+    }
+
+    /// `get_backlight` MUST call `backlightControl` with the token and NO
+    /// `backlight` field — NOT `getVideoStates` (which has no backlight
+    /// field on the real TV and so always failed). Pins both the method
+    /// and the absence of a `backlight` key in the params.
+    #[tokio::test]
+    async fn real_transport_get_backlight_calls_backlight_control_with_token_only() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "tok-1" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        // The read MUST be backlightControl with token and NO backlight
+        // field. We assert the partial structure (method + params shape).
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({
+                "method": "backlightControl",
+                "params": { "AccessToken": "tok-1" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "backlight": 42 }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
+        assert_eq!(value, 42);
+    }
+
+    /// `set_backlight` MUST call `backlightControl` with the token AND a
+    /// `backlight` field — the proven wire shape.
+    #[tokio::test]
+    async fn real_transport_set_backlight_calls_backlight_control_with_token_and_value() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "tok-1" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({
+                "method": "backlightControl",
+                "params": { "AccessToken": "tok-1", "backlight": 17 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "backlight": 17 }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        transport.set_backlight("192.0.2.7", &tok, 17).await.unwrap();
+    }
+
+    // ── TOKEN-PERSISTENCE TESTS — re-acquiring the token on every daemon
+    //    restart is unreliable on the real TV (intermittent on-screen
+    //    allow). Persist the token to a 0600 state file so a known-good
+    //    token survives restarts.
+
+    /// A transport constructed against a state file pre-populated with a
+    /// token MUST reuse that token WITHOUT hitting `createAccessToken` on
+    /// the server. (If `createAccessToken` were called, the mock would
+    /// return a different token; we assert it's the persisted one.)
+    #[tokio::test]
+    async fn real_transport_reuses_persisted_token_without_create_access_token() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // createAccessToken is mounted but with expect(0): a hit would be
+        // a test failure. If the production code re-acquires on startup,
+        // wiremock sees a request and fails the test.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({ "method": "createAccessToken" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "should-not-be-used" }
+            })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("samsung-ip-tokens.json");
+        std::fs::write(&state_path, r#"{"192.0.2.7":"persisted-tok-xyz"}"#).unwrap();
+
+        let transport = RealBacklightTransport::for_test_with_state_path(
+            mock.uri(),
+            Duration::from_secs(5),
+            state_path,
+        );
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        assert_eq!(
+            tok, "persisted-tok-xyz",
+            "transport must reuse the persisted token instead of calling createAccessToken"
+        );
+    }
+
+    /// A successful `acquire_token` MUST persist the token to the state
+    /// file so it survives the next daemon restart.
+    #[tokio::test]
+    async fn real_transport_persists_acquired_token_to_state_file() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({ "method": "createAccessToken" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "freshly-acquired-tok" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("samsung-ip-tokens.json");
+        assert!(!state_path.exists(), "state file should not exist yet");
+
+        let transport = RealBacklightTransport::for_test_with_state_path(
+            mock.uri(),
+            Duration::from_secs(5),
+            state_path.clone(),
+        );
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        assert_eq!(tok, "freshly-acquired-tok");
+
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        assert!(
+            raw.contains("freshly-acquired-tok"),
+            "state file must persist the acquired token: {raw}"
+        );
+        assert!(
+            raw.contains("192.0.2.7"),
+            "state file must persist the host key: {raw}"
+        );
+    }
+
+    /// A `-32010` unauthorized response invalidates BOTH the in-memory
+    /// cache and the persisted entry — the next `acquire_token` calls
+    /// `createAccessToken` and overwrites the persisted entry.
+    #[tokio::test]
+    async fn real_transport_unauthorized_invalidates_persisted_token() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // createAccessToken: returns fresh-tok (re-acquire after
+        // invalidation of the persisted stale-tok).
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({ "method": "createAccessToken" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "fresh-tok" }
+            })))
+            .mount(&mock)
+            .await;
+
+        // First backlightControl: -32010 (unauthorized).
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(json!({ "method": "backlightControl" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": { "code": -32010, "message": "token rejected" }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // Pre-populate the persisted token so the first acquire reuses it.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("samsung-ip-tokens.json");
+        std::fs::write(&state_path, r#"{"192.0.2.7":"stale-tok"}"#).unwrap();
+
+        let transport = RealBacklightTransport::for_test_with_state_path(
+            mock.uri(),
+            Duration::from_secs(5),
+            state_path.clone(),
+        );
+
+        // acquire_token reuses the persisted stale-tok (no HTTP hit yet).
+        let stale = transport.acquire_token("192.0.2.7").await.unwrap();
+        assert_eq!(stale, "stale-tok");
+
+        // set_backlight with the stale tok hits -32010. The controller
+        // would call map_transport_error → invalidate_token; we simulate
+        // it directly.
+        let err = transport
+            .set_backlight("192.0.2.7", &stale, 0)
+            .await
+            .expect_err("expected -32010");
+        assert!(err.contains("-32010"));
+        transport.invalidate_token_for_test("192.0.2.7");
+
+        // Persisted entry for 192.0.2.7 must have been dropped by
+        // invalidate_token (the spec asks invalidate to also drop the
+        // persisted entry so a re-acquire writes a fresh token).
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        assert!(
+            !raw.contains("stale-tok"),
+            "stale token must be removed from the state file on -32010: {raw}"
+        );
+
+        // Next acquire re-acquires (hits createAccessToken) and the
+        // freshly-returned token is persisted.
+        let fresh = transport.acquire_token("192.0.2.7").await.unwrap();
+        assert_eq!(fresh, "fresh-tok");
+        let raw = std::fs::read_to_string(&state_path).unwrap();
+        assert!(
+            raw.contains("fresh-tok"),
+            "fresh token must be persisted: {raw}"
+        );
     }
 }

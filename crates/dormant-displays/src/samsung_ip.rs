@@ -775,7 +775,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("subdir/samsung-ip-tokens.json");
         let mut map = HashMap::new();
-        map.insert("10.1.1.7".to_string(), "tok-secret".to_string());
+        map.insert("192.0.2.7".to_string(), "tok-secret".to_string());
         write_token_state(&path, &map).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -837,11 +837,11 @@ mod tests {
             .unwrap()
             .push(Err("nope".into()));
 
-        assert_eq!(fake.acquire_token("10.1.1.7").await.unwrap(), "tok-1");
-        assert!(fake.acquire_token("10.1.1.7").await.is_err());
+        assert_eq!(fake.acquire_token("192.0.2.7").await.unwrap(), "tok-1");
+        assert!(fake.acquire_token("192.0.2.7").await.is_err());
         assert_eq!(
             *fake.acquire_hosts.lock().unwrap(),
-            vec!["10.1.1.7", "10.1.1.7"]
+            vec!["192.0.2.7", "192.0.2.7"]
         );
     }
 
@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn map_transport_error_unauthorized_includes_code_and_e_display_io() {
         let fake = FakeBacklightTransport::new();
-        let err = map_transport_error("samsung-tizen", &fake, "10.1.1.7", "-32010 token bad");
+        let err = map_transport_error("samsung-tizen", &fake, "192.0.2.7", "-32010 token bad");
         assert_eq!(err.controller, "samsung-tizen");
         assert!(err.error.starts_with(E_DISPLAY_IO));
         assert!(err.error.contains(E_JSONRPC_UNAUTHORIZED));
@@ -899,7 +899,7 @@ mod tests {
         let err = map_transport_error(
             "samsung-tizen",
             &FakeBacklightTransport::new(),
-            "10.1.1.7",
+            "192.0.2.7",
             "-32601 method not found",
         );
         assert!(err.error.starts_with(E_DISPLAY_IO));
@@ -950,15 +950,18 @@ mod tests {
             RealBacklightTransport::for_test_with_base_url(base_url, Duration::from_secs(5));
 
         // First acquire: hits the mock, returns tok-1, caches it.
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok, "tok-1");
 
         // Second acquire: cache hit, NO additional HTTP request to the mock.
-        let tok_again = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok_again = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok_again, "tok-1");
 
         // set_backlight uses the cached token; mock echoes back 25.
-        transport.set_backlight("10.1.1.7", &tok, 25).await.unwrap();
+        transport
+            .set_backlight("192.0.2.7", &tok, 25)
+            .await
+            .unwrap();
     }
 
     /// JSON-RPC error response body is parsed and the literal code is
@@ -984,7 +987,7 @@ mod tests {
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
 
         let err = transport
-            .acquire_token("10.1.1.7")
+            .acquire_token("192.0.2.7")
             .await
             .expect_err("expected JSON-RPC error");
         // The code is preserved as the leading digit run.
@@ -1048,22 +1051,22 @@ mod tests {
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
 
         // Prime the cache.
-        let tok_a = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok_a = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok_a, "tok-A");
 
         // set_backlight with tok-A fails (-32010) — controller would call
         // map_transport_error which calls invalidate_token; here we
         // simulate that step directly.
         let err = transport
-            .set_backlight("10.1.1.7", &tok_a, 0)
+            .set_backlight("192.0.2.7", &tok_a, 0)
             .await
             .expect_err("expected -32010");
         assert!(err.contains("-32010"));
-        transport.invalidate_token_for_test("10.1.1.7");
+        transport.invalidate_token_for_test("192.0.2.7");
 
         // Next acquire: cache is empty (invalidated), so a second HTTP
         // request to the mock returns tok-B.
-        let tok_b = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok_b = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok_b, "tok-B");
     }
 
@@ -1105,8 +1108,8 @@ mod tests {
 
         let transport =
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
-        let value = transport.get_backlight("10.1.1.7", &tok).await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
         assert_eq!(value, 37);
     }
 
@@ -1160,8 +1163,8 @@ mod tests {
 
         let transport =
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
-        let value = transport.get_backlight("10.1.1.7", &tok).await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
         assert_eq!(value, 37);
     }
 
@@ -1199,7 +1202,7 @@ mod tests {
 
         let transport =
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok, "tok-no-params");
     }
 
@@ -1243,8 +1246,8 @@ mod tests {
 
         let transport =
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
-        let value = transport.get_backlight("10.1.1.7", &tok).await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
         assert_eq!(value, 42);
     }
 
@@ -1284,8 +1287,11 @@ mod tests {
 
         let transport =
             RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
-        transport.set_backlight("10.1.1.7", &tok, 17).await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        transport
+            .set_backlight("192.0.2.7", &tok, 17)
+            .await
+            .unwrap();
     }
 
     // ── TOKEN-PERSISTENCE TESTS — re-acquiring the token on every daemon
@@ -1319,14 +1325,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("samsung-ip-tokens.json");
-        std::fs::write(&state_path, r#"{"10.1.1.7":"persisted-tok-xyz"}"#).unwrap();
+        std::fs::write(&state_path, r#"{"192.0.2.7":"persisted-tok-xyz"}"#).unwrap();
 
         let transport = RealBacklightTransport::for_test_with_state_path(
             mock.uri(),
             Duration::from_secs(5),
             state_path,
         );
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(
             tok, "persisted-tok-xyz",
             "transport must reuse the persisted token instead of calling createAccessToken"
@@ -1361,7 +1367,7 @@ mod tests {
             Duration::from_secs(5),
             state_path.clone(),
         );
-        let tok = transport.acquire_token("10.1.1.7").await.unwrap();
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok, "freshly-acquired-tok");
 
         let raw = std::fs::read_to_string(&state_path).unwrap();
@@ -1370,7 +1376,7 @@ mod tests {
             "state file must persist the acquired token: {raw}"
         );
         assert!(
-            raw.contains("10.1.1.7"),
+            raw.contains("192.0.2.7"),
             "state file must persist the host key: {raw}"
         );
     }
@@ -1410,7 +1416,7 @@ mod tests {
         // Pre-populate the persisted token so the first acquire reuses it.
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("samsung-ip-tokens.json");
-        std::fs::write(&state_path, r#"{"10.1.1.7":"stale-tok"}"#).unwrap();
+        std::fs::write(&state_path, r#"{"192.0.2.7":"stale-tok"}"#).unwrap();
 
         let transport = RealBacklightTransport::for_test_with_state_path(
             mock.uri(),
@@ -1419,20 +1425,20 @@ mod tests {
         );
 
         // acquire_token reuses the persisted stale-tok (no HTTP hit yet).
-        let stale = transport.acquire_token("10.1.1.7").await.unwrap();
+        let stale = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(stale, "stale-tok");
 
         // set_backlight with the stale tok hits -32010. The controller
         // would call map_transport_error → invalidate_token; we simulate
         // it directly.
         let err = transport
-            .set_backlight("10.1.1.7", &stale, 0)
+            .set_backlight("192.0.2.7", &stale, 0)
             .await
             .expect_err("expected -32010");
         assert!(err.contains("-32010"));
-        transport.invalidate_token_for_test("10.1.1.7");
+        transport.invalidate_token_for_test("192.0.2.7");
 
-        // Persisted entry for 10.1.1.7 must have been dropped by
+        // Persisted entry for 192.0.2.7 must have been dropped by
         // invalidate_token (the spec asks invalidate to also drop the
         // persisted entry so a re-acquire writes a fresh token).
         let raw = std::fs::read_to_string(&state_path).unwrap();
@@ -1443,7 +1449,7 @@ mod tests {
 
         // Next acquire re-acquires (hits createAccessToken) and the
         // freshly-returned token is persisted.
-        let fresh = transport.acquire_token("10.1.1.7").await.unwrap();
+        let fresh = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(fresh, "fresh-tok");
         let raw = std::fs::read_to_string(&state_path).unwrap();
         assert!(

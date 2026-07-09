@@ -76,7 +76,7 @@ mod tests {
     fn store_token_writes_samsung_entry() {
         let dir = tempfile::tempdir().unwrap();
         let creds_path = dir.path().join("credentials.toml");
-        let host = "10.1.1.7";
+        let host = "192.0.2.7";
         let token = "abc123-token";
 
         store_token(&creds_path, host, token).unwrap();
@@ -87,7 +87,7 @@ mod tests {
             "credentials file should contain samsung table: {raw}"
         );
         assert!(
-            raw.contains("10.1.1.7"),
+            raw.contains("192.0.2.7"),
             "credentials file should contain host key: {raw}"
         );
         assert!(

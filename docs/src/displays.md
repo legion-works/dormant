@@ -138,7 +138,7 @@ The token goes in the credentials file:
 ```toml
 [credentials]
 [samsung]
-"10.1.1.7" = "eyJ..."
+"192.0.2.7" = "eyJ..."
 ```
 
 See `docs/research/2026-07-05-s90d-verification.md` for the full spike data

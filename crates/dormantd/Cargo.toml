@@ -1,5 +1,6 @@
 [package]
 name = "dormantd"
+description = "Daemon binary for proximity-driven display blanking and wake control."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

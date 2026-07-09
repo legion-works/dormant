@@ -125,8 +125,8 @@ blank_mode = "screen_off_audio_on"
 
     #[tokio::test]
     async fn probe_samsung_with_token_emits_expected_checks() {
-        let cfg = test_config_with_samsung("10.1.1.7");
-        let creds = test_creds_with_token("10.1.1.7", "test-token-abc");
+        let cfg = test_config_with_samsung("192.0.2.7");
+        let creds = test_creds_with_token("192.0.2.7", "test-token-abc");
 
         let results = probe_samsung(&cfg, &creds).await;
 
@@ -150,7 +150,7 @@ blank_mode = "screen_off_audio_on"
 
     #[tokio::test]
     async fn probe_samsung_missing_token_warns() {
-        let cfg = test_config_with_samsung("10.1.1.8");
+        let cfg = test_config_with_samsung("192.0.2.8");
         let creds = test_creds_empty();
 
         let results = probe_samsung(&cfg, &creds).await;
@@ -167,7 +167,7 @@ blank_mode = "screen_off_audio_on"
         assert!(
             token_check
                 .detail
-                .contains("credentials.samsung.\"10.1.1.8\""),
+                .contains("credentials.samsung.\"192.0.2.8\""),
             "detail should name the creds key; got: {}",
             token_check.detail
         );
@@ -175,7 +175,7 @@ blank_mode = "screen_off_audio_on"
 
     #[tokio::test]
     async fn probe_samsung_no_displays_skips() {
-        let mut cfg = test_config_with_samsung("10.1.1.7");
+        let mut cfg = test_config_with_samsung("192.0.2.7");
         cfg.displays.clear();
         let creds = test_creds_empty();
 

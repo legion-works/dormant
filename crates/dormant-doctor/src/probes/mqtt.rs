@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn probe_options_applies_credentials_when_present() {
-        let broker = "tcp://10.1.0.5:1883";
+        let broker = "tcp://192.0.2.5:1883";
         let cfg = test_mqtt_cfg(broker);
         let creds = test_creds(IndexMap::from([(
             broker.into(),
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn probe_options_does_not_apply_credentials_when_absent() {
-        let broker = "tcp://10.1.0.5:1883";
+        let broker = "tcp://192.0.2.5:1883";
         let cfg = test_mqtt_cfg(broker);
         let creds = test_creds(IndexMap::new());
 
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn probe_options_ignores_non_matching_broker_url() {
-        let cfg = test_mqtt_cfg("tcp://10.1.0.5:1883");
+        let cfg = test_mqtt_cfg("tcp://192.0.2.5:1883");
         let creds = test_creds(IndexMap::from([(
             "tcp://other-broker:1883".into(),
             MqttCredential {
@@ -284,17 +284,17 @@ mod tests {
 
     #[test]
     fn not_authorized_detail_no_matching_entry() {
-        let detail = not_authorized_detail("tcp://10.1.0.5:1883", None);
+        let detail = not_authorized_detail("tcp://192.0.2.5:1883", None);
         assert!(
             detail.contains("broker requires auth and no credentials entry matches"),
             "detail should contain the grep-stable prefix; got: {detail}"
         );
         assert!(
-            detail.contains("tcp://10.1.0.5:1883"),
+            detail.contains("tcp://192.0.2.5:1883"),
             "detail should name the broker URL; got: {detail}"
         );
         assert!(
-            detail.contains("add [mqtt.\"tcp://10.1.0.5:1883\"]"),
+            detail.contains("add [mqtt.\"tcp://192.0.2.5:1883\"]"),
             "detail should include actionable fix; got: {detail}"
         );
     }
@@ -305,7 +305,7 @@ mod tests {
             username: "icetea".into(),
             password: "wrong".into(),
         };
-        let detail = not_authorized_detail("tcp://10.1.0.5:1883", Some(&cred));
+        let detail = not_authorized_detail("tcp://192.0.2.5:1883", Some(&cred));
         assert_eq!(detail, "authentication rejected for user 'icetea'");
     }
 }

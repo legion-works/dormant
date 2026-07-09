@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -43,18 +47,14 @@ jobs:
           path: crates/dormant-web/webui/dist/
 
   clippy:
-    needs: webui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
-      - uses: actions/download-artifact@v4
-        with:
-          name: webui-dist
-          path: crates/dormant-web/webui/dist/
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
 
   test:
@@ -63,7 +63,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev libmpv-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config
       - uses: actions/download-artifact@v4
         with:
           name: webui-dist
@@ -71,16 +72,12 @@ jobs:
       - run: cargo test --workspace --all-features
 
   render:
-    needs: webui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev libmpv-dev pkg-config ffmpeg libavcodec-extra
-      - uses: actions/download-artifact@v4
-        with:
-          name: webui-dist
-          path: crates/dormant-web/webui/dist/
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config ffmpeg libavcodec-extra
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo build -p dormant-render
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo build -p dormantd --features render
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo test -p dormant-core --features render
@@ -95,6 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 
   deny:
@@ -119,7 +117,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
       - run: cargo check --workspace
 
   mqtt-integration:
@@ -127,11 +126,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
       - name: Start Mosquitto broker
         run: |
           docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
-          for i in $(seq 1 10); do nc -z localhost 1883 && break; sleep 1; done
+          for _ in $(seq 1 10); do nc -z localhost 1883 && break; sleep 1; done
       - run: DORMANT_TEST_MQTT=1 cargo test -p dormant-sensors -- --ignored mqtt_round_trip_publishes_presence_event
 
   docs:
@@ -141,7 +141,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libwayland-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
       - run: cargo doc --workspace --no-deps
 
   mdbook:

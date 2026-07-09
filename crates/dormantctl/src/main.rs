@@ -8,6 +8,7 @@
 
 mod cmd_blank;
 mod cmd_doctor;
+mod cmd_emergency_wake;
 mod cmd_pair;
 mod cmd_pause;
 mod cmd_status;
@@ -127,8 +128,31 @@ enum Command {
         #[command(subcommand)]
         subcommand: Option<cmd_doctor::DoctorSubcommand>,
     },
+    /// Force-wake every display — one-command panic recovery.  Bypasses
+    /// sensor logic and the rules engine to send a wake command to every
+    /// configured display.  Bind to a global shortcut (KDE `KGlobalAccel`
+    /// / XDG `GlobalShortcuts` portal) for an emergency "screens on now"
+    /// key.
+    ///
+    /// Routes through the IPC fast path first; if the daemon is wedged or
+    /// unreachable, falls back to constructing display controllers
+    /// directly from the loaded config and credentials.
+    EmergencyWake {
+        /// Path to the config file (used for the direct-hardware fallback).
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Path to the credentials file (used for the direct-hardware fallback).
+        #[arg(long)]
+        credentials: Option<PathBuf>,
+
+        /// Treat unknown config keys as warnings instead of errors.
+        #[arg(long)]
+        lenient_keys: bool,
+    },
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let socket_path = paths::resolve_socket_path(cli.socket.as_deref());
@@ -204,6 +228,22 @@ fn main() -> ExitCode {
                         return ExitCode::from(3);
                     }
                 },
+                Err(e) => Err(e),
+            }
+        }
+        Command::EmergencyWake {
+            config,
+            credentials,
+            lenient_keys,
+        } => {
+            let args = cmd_emergency_wake::EmergencyWakeArgs {
+                socket: cli.socket.clone(),
+                config,
+                credentials,
+                lenient_keys,
+            };
+            match cmd_emergency_wake::run(&args) {
+                Ok(_) => Ok(()),
                 Err(e) => Err(e),
             }
         }

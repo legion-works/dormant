@@ -1911,3 +1911,342 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;
 }
+
+// ── emergency-wake handler ────────────────────────────────────────────────────
+//
+// RED-first pin for `ControlMsg::EmergencyWake`: both halves of the contract
+// — wake EVERY display directly, and pause EVERY rule indefinitely — must
+// hold.  A version that only wakes (without pausing) or only pauses (without
+// waking each display) fails this test.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn emergency_wake_handler_wakes_every_display_and_pauses_all_rules() {
+    use dormant_core::rules::EmergencyWakeResult;
+
+    let desk = DisplayId("desk".into());
+    let wall = DisplayId("wall".into());
+
+    // Two sensors, two zones, two rules → three displays total (the third
+    // is manual-only, no rule).  All three must wake; all rules must pause.
+    let desk_zone_sensor = SensorId("s_desk".into());
+    let wall_zone_sensor = SensorId("s_wall".into());
+
+    let zones = ZoneEngine::new(
+        vec![
+            ZoneSpec {
+                id: ZoneId("desk_z".into()),
+                mode: FusionMode::Any,
+                members: vec![ZoneMember::Sensor(desk_zone_sensor.clone())],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            },
+            ZoneSpec {
+                id: ZoneId("wall_z".into()),
+                mode: FusionMode::Any,
+                members: vec![ZoneMember::Sensor(wall_zone_sensor.clone())],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            },
+        ],
+        &[desk_zone_sensor, wall_zone_sensor],
+    )
+    .expect("two zones is well-formed");
+
+    let desk_sink = Arc::new(RecordingSink::new());
+    let wall_sink = Arc::new(RecordingSink::new());
+    let manual_sink = Arc::new(RecordingSink::new());
+
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(desk.clone(), desk_sink.clone());
+    execs.insert(wall.clone(), wall_sink.clone());
+    execs.insert(DisplayId("manual".into()), manual_sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![
+            rule_cfg("r_desk", "desk_z", &["desk"]),
+            rule_cfg("r_wall", "wall_z", &["wall"]),
+        ],
+        displays: vec![
+            DisplayRuntimeCfg {
+                display: desk.clone(),
+                blank_mode: BlankMode::PowerOff,
+                ladder: vec![LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                }],
+                timings: timings_grace_60s(),
+            },
+            DisplayRuntimeCfg {
+                display: wall.clone(),
+                blank_mode: BlankMode::PowerOff,
+                ladder: vec![LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                }],
+                timings: timings_grace_60s(),
+            },
+            DisplayRuntimeCfg {
+                display: DisplayId("manual".into()),
+                blank_mode: BlankMode::PowerOff,
+                ladder: vec![LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                }],
+                timings: timings_grace_60s(),
+            },
+        ],
+        sensors: vec![
+            sensor_cfg(
+                "s_desk",
+                SensorKind::Presence,
+                None,
+                Duration::from_secs(3600),
+            ),
+            sensor_cfg(
+                "s_wall",
+                SensorKind::Presence,
+                None,
+                Duration::from_secs(3600),
+            ),
+        ],
+    };
+
+    // Empty event script — engine stays quiet until we send the
+    // emergency-wake control message.
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    // Send EmergencyWake.
+    let (tx, rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::EmergencyWake { reply: tx })
+        .await
+        .expect("ctl channel open");
+    let report = rx.await.expect("reply not dropped");
+
+    // Half 1: paused.
+    assert!(report.paused, "report.paused must be true: {report:?}");
+
+    // Half 2: every executor received a wake_once() call.  The
+    // RecordingSink override calls self.wake(), so we look for any Wake
+    // entry in each sink's log.
+    for (name, sink) in [
+        ("desk", &desk_sink),
+        ("wall", &wall_sink),
+        ("manual", &manual_sink),
+    ] {
+        let wakes = sink
+            .log()
+            .iter()
+            .filter(|(_, c)| matches!(c, SinkCmd::Wake))
+            .count();
+        assert!(
+            wakes >= 1,
+            "emergency-wake must wake {name} (saw {wakes} wake calls in log)",
+        );
+    }
+
+    // Each executor must be invoked EXACTLY once (wake_once, not the
+    // retry-loop wake).  Multiple wake entries would mean the wrong
+    // method was called by the engine.
+    for (name, sink) in [
+        ("desk", &desk_sink),
+        ("wall", &wall_sink),
+        ("manual", &manual_sink),
+    ] {
+        let wakes = sink
+            .log()
+            .iter()
+            .filter(|(_, c)| matches!(c, SinkCmd::Wake))
+            .count();
+        assert_eq!(
+            wakes, 1,
+            "{name} executor must have been wake_once'd exactly once, got {wakes}",
+        );
+    }
+
+    // Verify the per-display rows in the report — one row per display,
+    // every row ok=true.
+    let expected_displays: std::collections::HashSet<DisplayId> =
+        [desk.clone(), wall.clone(), DisplayId("manual".into())]
+            .into_iter()
+            .collect();
+    let report_displays: std::collections::HashSet<DisplayId> = report
+        .displays
+        .iter()
+        .map(|r: &EmergencyWakeResult| r.display.clone())
+        .collect();
+    assert_eq!(
+        expected_displays, report_displays,
+        "report must contain one row per display the engine owns",
+    );
+    for row in &report.displays {
+        assert!(row.ok, "every per-display wake should succeed: {row:?}");
+        assert!(row.error.is_none(), "ok row should have no error: {row:?}");
+    }
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+// ── emergency-wake parallelism barrier pin ─────────────────────────────
+//
+// SERIAL implementation CANNOT pass this test, PARALLEL implementation
+// always passes.  Uses a `tokio::sync::Barrier` so the test is fully
+// deterministic — no `tokio::time::sleep` races, no wall-clock fuzziness.
+//
+// Mechanism:
+// - N=3 fake sinks share a single `Arc<Barrier>` of size 3.
+// - Each sink's `wake_once()` (and `wake()`) awaits the barrier before
+//   returning `Ok(())`.
+// - SERIAL handler: outer task awaits sink[0].wake_once() → blocks on
+//   the barrier because no second task ever runs.  Outer never finishes,
+//   the oneshot never sends, `rx.await` times out — assertion fails.
+// - PARALLEL handler: outer task spawns 3 inner tasks up-front; all 3
+//   hit the barrier together, it releases, all 3 succeed, the report
+//   ships.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines, clippy::match_wild_err_arm)]
+async fn emergency_wake_handler_dispatches_displays_concurrently() {
+    /// Test-only `CommandSink` whose `wake_once` (and `wake`) block on
+    /// a shared `Barrier` before returning `Ok(())`.  Records every
+    /// call so the test can sanity-check that all three sinks reached
+    /// the barrier.
+    struct BarrierSink {
+        barrier: Arc<tokio::sync::Barrier>,
+        started: Arc<std::sync::Mutex<Vec<DisplayId>>>,
+        id: DisplayId,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandSink for BarrierSink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            // Block here too so a serial caller that dispatches the
+            // wrong method (wake, not wake_once) also deadlocks visibly.
+            self.barrier.wait().await;
+            self.started
+                .lock()
+                .expect("started lock poisoned")
+                .push(self.id.clone());
+            Ok(())
+        }
+        async fn wake_once(&self) -> Result<(), CmdFailure> {
+            self.barrier.wait().await;
+            self.started
+                .lock()
+                .expect("started lock poisoned")
+                .push(self.id.clone());
+            Ok(())
+        }
+        fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+            Vec::new()
+        }
+    }
+
+    let n = 3;
+    let barrier = Arc::new(tokio::sync::Barrier::new(n));
+    let started: Arc<std::sync::Mutex<Vec<DisplayId>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let displays: Vec<DisplayId> = (0..n).map(|i| DisplayId(format!("d{i}"))).collect();
+
+    let zone_sensor = SensorId("s".into());
+    let zones = ZoneEngine::new(
+        vec![ZoneSpec {
+            id: ZoneId("z".into()),
+            mode: FusionMode::Any,
+            members: vec![ZoneMember::Sensor(zone_sensor.clone())],
+            weights: HashMap::new(),
+            unavailable_policy: UnavailablePolicy::Present,
+        }],
+        &[zone_sensor],
+    )
+    .expect("one zone is well-formed");
+
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    let mut display_cfgs: Vec<DisplayRuntimeCfg> = Vec::new();
+    for d in &displays {
+        let sink: Arc<dyn CommandSink> = Arc::new(BarrierSink {
+            barrier: Arc::clone(&barrier),
+            started: Arc::clone(&started),
+            id: d.clone(),
+        });
+        execs.insert(d.clone(), sink);
+        display_cfgs.push(DisplayRuntimeCfg {
+            display: d.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            timings: timings_grace_60s(),
+        });
+    }
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r", "z", &["d0", "d1", "d2"])],
+        displays: display_cfgs,
+        sensors: vec![sensor_cfg(
+            "s",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Empty script — engine stays quiet until the EmergencyWake.
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    // Drive the handler.
+    let (tx, rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::EmergencyWake { reply: tx })
+        .await
+        .expect("ctl channel open");
+
+    // Bounded wait for the report. 5 seconds is generous — under a
+    // serial handler this elapses because the barrier deadlocks the
+    // outer task.
+    let report = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_dropped)) => panic!("reply oneshot dropped before sending"),
+        Err(_elapsed) => panic!(
+            "emergency-wake reply did not arrive within 5s — handler is serial, \
+                 not parallel (one slow wake_once is starving the others on the barrier)"
+        ),
+    };
+
+    // Each sink must appear in the report (one wake per display).
+    // The report's row ORDER is non-deterministic — assert set
+    // membership, not Vec equality.
+    let reported: std::collections::HashSet<DisplayId> =
+        report.displays.iter().map(|r| r.display.clone()).collect();
+    let expected: std::collections::HashSet<DisplayId> = displays.iter().cloned().collect();
+    assert_eq!(
+        reported, expected,
+        "every display must appear in the report once"
+    );
+    for row in &report.displays {
+        assert!(row.ok, "row {row:?} should be ok after barrier release");
+        assert!(row.error.is_none(), "ok row should have no error: {row:?}");
+    }
+
+    // Sanity-check: each sink's `wake_once` actually ran (only happens
+    // if its task was spawned and reached the barrier).  The Vec
+    // order is non-deterministic, so assert set membership.
+    let started_ids = started.lock().expect("started lock poisoned").clone();
+    let started_set: std::collections::HashSet<DisplayId> = started_ids.into_iter().collect();
+    assert_eq!(
+        started_set, expected,
+        "every BarrierSink.wake_once must have run — proves the outer \
+             handler reached every display"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}

@@ -182,8 +182,12 @@ async fn send_request_async(socket_path: &Path, request: &IpcRequest) -> Result<
 // ── Direct-hardware fallback ──────────────────────────────────────────────────
 
 /// Build a [`DisplayExecutor`] per configured display (with `wake_retries = 0`)
-/// and call `wake_once()` on each — best-effort, one attempt per display,
-/// aggregates per-display errors without short-circuiting.
+/// and hand them to [`probe_and_wake_all`] — best-effort, one attempt per
+/// display, aggregates per-display errors without short-circuiting.
+///
+/// Config-loading and controller-construction are the only side effects here;
+/// the probe→wake→aggregation logic lives in the testable helper below so it
+/// can be unit-tested without config files or real hardware.
 async fn direct_hardware_fallback(args: &EmergencyWakeArgs) -> Result<EmergencyWakeReport> {
     let config_path =
         paths::resolve_config_path(args.config.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -245,6 +249,43 @@ async fn direct_hardware_fallback(args: &EmergencyWakeArgs) -> Result<EmergencyW
         anyhow::bail!("no displays configured in {}", config_path.display());
     }
 
+    Ok(probe_and_wake_all(executors, build_errors).await)
+}
+
+/// Probe each freshly-built executor, then call `wake_once()` on each.
+/// Best-effort: a per-display probe failure logs and stays in the chain
+/// (mirroring `DisplayExecutor::probe_all`'s contract), and a per-display
+/// wake failure is captured into the report without short-circuiting.
+///
+/// **Probing BEFORE waking is the load-bearing step.** Display controllers
+/// such as [`DdcciController`] gate their `wake()` on state that only
+/// `probe()` populates (matched I²C display, VCP-capability discovery) — a
+/// freshly-built executor in this fallback path has been built from the
+/// config but has never been probed, so without this step every wake
+/// attempt returns `E_DISPLAY_IO: controller not probed` (or the chain
+/// silently skips the unprobed controller via `is_available()`), and the
+/// monitor stays blank. The daemon's `App::start` path probes at startup
+/// (`assemble_static` calls `executor.probe_all()`); this fallback path
+/// must mirror that to be a safe substitute when the daemon is down.
+///
+/// Pure-ish: no config loading, no credential I/O, no filesystem state.
+/// Takes ownership of the pre-built executors so callers can hand vectors
+/// straight from a test.
+///
+/// `build_errors` rows are appended to the report untouched so a per-display
+/// build failure still surfaces to the operator.
+pub(crate) async fn probe_and_wake_all(
+    mut executors: Vec<(DisplayId, DisplayExecutor)>,
+    build_errors: HashMap<DisplayId, String>,
+) -> EmergencyWakeReport {
+    // Probe each executor first — the controllers that need a prior probe
+    // (ddcci, kwin-dpms) won't wake() reliably otherwise. probe_all logs
+    // failures internally and keeps the controller in the chain, so a
+    // probe error never blocks the wake attempt below.
+    for (_display_id, exec) in &mut executors {
+        let _ = exec.probe_all().await;
+    }
+
     let mut handles = Vec::new();
     for (display_id, exec) in executors {
         let display_for_task = display_id.clone();
@@ -288,10 +329,10 @@ async fn direct_hardware_fallback(args: &EmergencyWakeArgs) -> Result<EmergencyW
         });
     }
 
-    Ok(EmergencyWakeReport {
+    EmergencyWakeReport {
         paused: false, // No engine to pause — the daemon is wedged or absent.
         displays: results,
-    })
+    }
 }
 
 /// Best-effort credentials load: missing or unreadable file → empty
@@ -541,5 +582,273 @@ mod tests {
         // println!/eprintln! and cannot be redirected without refactoring
         // — we limit this test to a smoke check.)
         print_report("ipc", &report);
+    }
+
+    // ── probe-before-wake refactor tests ─────────────────────────────────────
+    //
+    // `probe_and_wake_all` is the testable seam extracted from the original
+    // `direct_hardware_fallback` so the probe-before-wake contract can be
+    // pinned without config files or real hardware. These tests guard the
+    // sacred-wake-path regression: a freshly-built ddcci (or any
+    // controller whose `wake()` requires a prior `probe()`) was getting
+    // skipped via `is_available()==false` or failing with
+    // "controller not probed", leaving the monitor stuck blank.
+    //
+    // The `ProbeRequiringController` fake faithfully models that contract:
+    // `wake()` errors with "controller not probed" until `probe()` flips an
+    // internal flag, then returns the scripted result. This is the loader
+    // for the RED-first proof — see `probe_and_wake_all_probes_before_waking` below.
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use dormant_core::error::{DormantError, E_DISPLAY_IO};
+    use dormant_core::traits::{DisplayController, PanelState};
+    use dormant_core::types::{BlankMode, CmdFailure};
+
+    /// Scripted [`DisplayController`] whose `wake()` errors with
+    /// "controller not probed" until `probe()` flips an internal flag.
+    /// Mirrors the real `DdcciController` contract that motivated this fix.
+    #[derive(Clone)]
+    struct ProbeRequiringController {
+        inner: Arc<Mutex<ProbeRequiringInner>>,
+    }
+
+    #[derive(Default)]
+    struct ProbeRequiringInner {
+        probed: bool,
+        wake_results: VecDeque<Result<(), CmdFailure>>,
+        probe_calls: usize,
+        wake_calls: usize,
+    }
+
+    impl ProbeRequiringController {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(ProbeRequiringInner::default())),
+            }
+        }
+
+        fn push_wake_result(&self, r: Result<(), CmdFailure>) {
+            self.inner.lock().unwrap().wake_results.push_back(r);
+        }
+
+        #[allow(dead_code)]
+        fn probe_calls(&self) -> usize {
+            self.inner.lock().unwrap().probe_calls
+        }
+
+        #[allow(dead_code)]
+        fn wake_calls(&self) -> usize {
+            self.inner.lock().unwrap().wake_calls
+        }
+    }
+
+    #[async_trait]
+    impl DisplayController for ProbeRequiringController {
+        fn name(&self) -> &'static str {
+            "probe-requiring"
+        }
+
+        fn supported_modes(&self) -> Vec<BlankMode> {
+            vec![BlankMode::PowerOff]
+        }
+
+        async fn probe(&mut self) -> Result<(), DormantError> {
+            let mut g = self.inner.lock().unwrap();
+            g.probe_calls += 1;
+            g.probed = true;
+            Ok(())
+        }
+
+        async fn is_available(&self) -> bool {
+            // Return true unconditionally so `wake_once` actually reaches
+            // `wake()` — the test is asserting the wake-vs-probe contract,
+            // not the is_available gating.
+            true
+        }
+
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Err(CmdFailure {
+                controller: "probe-requiring".into(),
+                error: "blank not exercised by these tests".into(),
+            })
+        }
+
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            let mut g = self.inner.lock().unwrap();
+            g.wake_calls += 1;
+            if !g.probed {
+                return Err(CmdFailure {
+                    controller: "probe-requiring".into(),
+                    error: format!("{E_DISPLAY_IO}: controller not probed"),
+                });
+            }
+            g.wake_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        async fn read_state(&self) -> Option<PanelState> {
+            None
+        }
+    }
+
+    fn executor_with_controller(
+        display_id: DisplayId,
+        controller: ProbeRequiringController,
+    ) -> (DisplayId, DisplayExecutor) {
+        let boxed: Vec<Box<dyn DisplayController>> =
+            vec![Box::new(controller) as Box<dyn DisplayController>];
+        let exec = DisplayExecutor::new(
+            display_id.clone(),
+            boxed,
+            BlankMode::PowerOff,
+            RetrySettings {
+                wake_retries: 0,
+                wake_retry_backoff: Duration::from_millis(0),
+            },
+        );
+        (display_id, exec)
+    }
+
+    /// RED-first proof (positive direction): when the helper probes before
+    /// waking, the wake succeeds. A fake that errors "controller not probed"
+    /// until probed gives a green iff (and only if) the helper actually
+    /// called `probe()` first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_and_wake_all_probes_before_waking() {
+        let ctrl = ProbeRequiringController::new();
+        ctrl.push_wake_result(Ok(()));
+        let did = DisplayId("mon".into());
+        let exec = executor_with_controller(did.clone(), ctrl.clone());
+
+        let report = probe_and_wake_all(vec![exec], HashMap::new()).await;
+
+        assert_eq!(report.displays.len(), 1);
+        let row = &report.displays[0];
+        assert_eq!(row.display, did);
+        assert!(
+            row.ok,
+            "wake must succeed — but failed with: {:?}\n\
+             (this only happens if the helper called probe() before wake())",
+            row.error
+        );
+        assert_eq!(ctrl.probe_calls(), 1, "probe() must run exactly once");
+        assert_eq!(ctrl.wake_calls(), 1, "wake() must run exactly once");
+    }
+
+    /// Helper passes `build_errors` through to the report untouched —
+    /// surfaces operator-visible build failures alongside wake outcomes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_and_wake_all_surfaces_build_errors() {
+        let did_built = DisplayId("built".into());
+        let did_failed = DisplayId("build-failed".into());
+        let ctrl = ProbeRequiringController::new();
+        ctrl.push_wake_result(Ok(()));
+        let exec = executor_with_controller(did_built.clone(), ctrl);
+
+        let mut build_errors = HashMap::new();
+        build_errors.insert(did_failed.clone(), "test build error".into());
+
+        let report = probe_and_wake_all(vec![exec], build_errors).await;
+
+        let mut by_id: HashMap<&str, &EmergencyWakeResult> = HashMap::new();
+        for r in &report.displays {
+            by_id.insert(r.display.0.as_str(), r);
+        }
+        assert_eq!(report.displays.len(), 2);
+        let ok_row = by_id.get("built").expect("built must be in report");
+        assert!(ok_row.ok, "the probed-wake display succeeds");
+        let err_row = by_id
+            .get("build-failed")
+            .expect("build-failed must be in report");
+        assert!(!err_row.ok);
+        assert_eq!(err_row.error.as_deref(), Some("test build error"));
+    }
+
+    /// Per-display probe failure must not block the wake attempt: the
+    /// helper must still call `wake_once` on the chain, mirroring the
+    /// daemon's `assemble_static` behavior.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_and_wake_all_continues_when_probe_fails() {
+        // A controller whose probe() always errors but wake() succeeds
+        // once it's been "probed" anyway — exercise the
+        // probe-logs-keeps-controller contract.
+        #[derive(Clone)]
+        struct ProbeFailsButWakeOk {
+            inner: Arc<Mutex<ProbeFailsInner>>,
+        }
+        #[derive(Default)]
+        struct ProbeFailsInner {
+            wake_calls: usize,
+            probe_calls: usize,
+        }
+
+        #[async_trait]
+        impl DisplayController for ProbeFailsButWakeOk {
+            fn name(&self) -> &'static str {
+                "probe-fails-but-wake-ok"
+            }
+            fn supported_modes(&self) -> Vec<BlankMode> {
+                vec![BlankMode::PowerOff]
+            }
+            async fn probe(&mut self) -> Result<(), DormantError> {
+                self.inner.lock().unwrap().probe_calls += 1;
+                Err(DormantError::DisplayIo {
+                    controller: "probe-fails-but-wake-ok".into(),
+                    detail: "scripted probe failure".into(),
+                })
+            }
+            async fn is_available(&self) -> bool {
+                true
+            }
+            async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+                Err(CmdFailure {
+                    controller: "probe-fails-but-wake-ok".into(),
+                    error: "blank not exercised".into(),
+                })
+            }
+            async fn wake(&self) -> Result<(), CmdFailure> {
+                self.inner.lock().unwrap().wake_calls += 1;
+                Ok(())
+            }
+        }
+
+        let ctrl = ProbeFailsButWakeOk {
+            inner: Arc::new(Mutex::new(ProbeFailsInner::default())),
+        };
+        let inner_for_assert = Arc::clone(&ctrl.inner);
+        let did = DisplayId("mon".into());
+        let boxed: Vec<Box<dyn DisplayController>> = vec![Box::new(ctrl)];
+        let exec = DisplayExecutor::new(
+            did.clone(),
+            boxed,
+            BlankMode::PowerOff,
+            RetrySettings {
+                wake_retries: 0,
+                wake_retry_backoff: Duration::from_millis(0),
+            },
+        );
+
+        let report = probe_and_wake_all(vec![(did, exec)], HashMap::new()).await;
+
+        assert_eq!(report.displays.len(), 1);
+        let row = &report.displays[0];
+        assert!(
+            row.ok,
+            "wake must still run and succeed even though probe failed: {:?}",
+            row.error
+        );
+        assert_eq!(inner_for_assert.lock().unwrap().probe_calls, 1);
+        assert_eq!(inner_for_assert.lock().unwrap().wake_calls, 1);
+    }
+
+    /// The `paused` flag stays `false` — the fallback has no engine to
+    /// pause, distinct from the IPC `paused: true` report.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_and_wake_all_paused_is_false() {
+        let report = probe_and_wake_all(Vec::new(), HashMap::new()).await;
+        assert!(!report.paused, "fallback path sets paused=false");
+        assert!(report.displays.is_empty());
     }
 }

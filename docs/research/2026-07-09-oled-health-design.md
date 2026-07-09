@@ -126,14 +126,18 @@ diagnostic, not an alarm; no red "WARNING").
 
 ## Unknowns — VERIFY ON HARDWARE before/early in build
 
-The single most important next step is a DDC/CI probe on the AOC AGON AG326UZD —
-the brightness-sampling design depends on it:
+### Resolved 2026-07-09 — DDC/CI probe on the AOC AG326UZD (DP-1, `/dev/i2c-4`, VCP 2.2, daemon live during probe)
 
-- **VCP `0x10`** — real nits or abstract 0–100? (attribution scale)
-- **VCP `0xC0` (Display Usage Time)** — exposed? If yes, **seed the ledger from the panel's own counter** on first startup instead of zero.
-- **VCP `0xB6` (Display Type)** — confirms OLED / panel type.
-- **I2C bus contention** — loop `getvcp 0x10` while issuing `setvcp 0xD6` (DPMS off/on); measure added latency. If >50 ms, the sampler needs a mutex / single-connection multiplexer, not a secondary handle.
-- **Samsung S90D IP Control `0x08` Maintenance Control** — does it return burn-protection timer data? `0x25` brightness read via `samsung_ip.rs`.
+- **VCP `0x10` (Brightness) → abstract 0–100, NOT nits.** `current = 100, max = 100`. The attribution scale is a 0–100 fraction, not absolute luminance. ✓ resolved.
+- **VCP `0xC0` (Display Usage Time) → SUPPORTED, reads `966 hours`.** The ledger CAN seed from the panel's own power-on-hours counter on first startup instead of zero. ✓ resolved — a real win.
+- **VCP `0xB6` (Display Type) → reports `LCD (active matrix)` (sl=0x03), NOT OLED.** Do NOT rely on `0xB6` to identify panel type on this unit — it either mis-reports (common firmware laziness) or the AG326UZD is genuinely not an OLED panel (see the note below; this needs an independent confirm). Panel type must come from EDID heuristics / model lookup / config override, not `0xB6`. Adjacent codes present that may help: `0xB2` (flat-panel sub-pixel layout), `0xC8` (display controller type). ✓ resolved (as "don't trust 0xB6").
+- **I2C bus contention → NEEDS a shared mutex / single DDC multiplexer, NOT an independent secondary handle.** Baseline `getvcp 0x10` ×15 (daemon idle): min 243 / median 245 / max 251 ms, 0 errors. During ONE concurrent `setvcp 0xD6 0x05`→wait→`0x01` write: median 267 ms but spikes to **2370 ms** (plus 1100/651/626 ms), 0 errors. No read errors, but write-window latency blows far past the 50 ms threshold — a wear-sampler reading brightness must share the daemon's DDC connection/mutex so its reads don't collide with power-mode writes. ✓ resolved.
+- **Note — baseline DDC read latency is ~245 ms** even idle on this monitor. Cheap enough for a 30–60 s sampler, but the exercise sequence's ~6 reads cost ~1.5 s of the read budget; factor it into any per-read timeout.
+
+### Still open
+
+- **Is the AG326UZD actually an OLED?** `0xB6` says LCD, and the operator previously observed that brightness-0 only *dims* (emission floor) rather than going near-black — both signals are LCD-like. If the desk monitor is genuinely LCD/MiniLED, wear-tracking IT is moot (LCDs don't burn in) and OLED-health's real target on this setup is the Samsung S90D. Does not invalidate the feature (the S90D and other users' OLED monitors are valid targets) — it's a targeting nuance. NEEDS operator confirmation of the actual panel technology.
+- **Samsung S90D IP Control `0x08` Maintenance Control** — does it return burn-protection timer data? `0x25` brightness read via `samsung_ip.rs`. (Not probed yet — TV may be off.)
 - **Real brightness-to-wear curve** — the linear `brightness × hours` model is the Steam-Deck back-of-envelope; leave a pluggable `WearModel` trait for a better curve later (published T95-at-nits curves are typically under NDA).
 - **libmpv panning smoothness** and **4K image pre-scan cost** (>100 ms → background task) — gate the v2 macro-steering paths.
 

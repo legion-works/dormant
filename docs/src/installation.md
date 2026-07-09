@@ -31,7 +31,7 @@ install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 
 Binaries land in `~/.local/bin/` — make sure this is on your `PATH`.
 
-### Tray applet (M3, Linux only)
+### Tray applet (Linux only)
 
 `dormant-tray` is a KDE `StatusNotifierItem` applet: status glance +
 pause/resume + blank/wake controls, riding the daemon's Unix socket in
@@ -43,16 +43,16 @@ install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 
 See [Tray autostart](#tray-autostart) below to run it on every login.
 
-## From release (planned)
+## From release (pre-`0.1.0`)
 
-Once M1 ships, releases will include a shell installer:
+No tagged release yet — everything is built and validated but shipping awaits the next milestone on the roadmap. When the first tag lands, the cargo-dist pipeline will publish shell installers and tarballs for each binary:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/<tag>/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/<tag>/dormantctl-installer.sh | sh
 ```
 
-Checksums are provided for every release artifact. Verify before running:
+Replace `<tag>` with the release tag (e.g. `v0.1.0`). Checksums are published alongside every artifact; verify with:
 
 ```bash
 sha256sum -c dormantd-x86_64-unknown-linux-gnu.tar.xz.sha256

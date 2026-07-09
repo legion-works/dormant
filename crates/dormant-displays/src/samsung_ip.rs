@@ -210,6 +210,11 @@ impl RealBacklightTransport {
         let resp = self
             .client
             .post(&url)
+            // The port-1516 endpoint is pedantic: a request with the
+            // reqwest default `Accept: */*` returns HTTP 400 Bad Request.
+            // Pin to `application/json` so all three methods
+            // (createAccessToken, getVideoStates, backlightControl) match.
+            .header(reqwest::header::ACCEPT, "application/json")
             .json(&body)
             .send()
             .await
@@ -744,6 +749,60 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "getVideoStates"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "backlight": 37 }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+        let tok = transport.acquire_token("192.0.2.7").await.unwrap();
+        let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
+        assert_eq!(value, 37);
+    }
+
+    /// Pin the `Accept: application/json` header on every port-1516 POST.
+    ///
+    /// The real Samsung TV returns HTTP 400 unless the request carries
+    /// `Accept: application/json` — reqwest's default `Accept: */*` is
+    /// rejected. The other round-trip tests use wiremock mocks that match
+    /// any Accept, so they passed before this regression was caught and
+    /// would silently pass again if the header were dropped.
+    ///
+    /// This test guards both mocks with
+    /// `wiremock::matchers::header("accept", "application/json")` (wiremock
+    /// matches header names case-insensitively, hence the lowercase) and
+    /// mounts NO fallback. With the fix in place the mocks match and the
+    /// round-trip returns 37; without it wiremock returns its default 404,
+    /// `call()` surfaces `HTTP 404 Bad Request`, and `unwrap()` panics.
+    #[tokio::test]
+    async fn real_transport_pins_accept_application_json_header() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("accept", "application/json"))
+            .and(body_partial_json(serde_json::json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": { "AccessToken": "tok" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("accept", "application/json"))
             .and(body_partial_json(serde_json::json!({
                 "method": "getVideoStates"
             })))

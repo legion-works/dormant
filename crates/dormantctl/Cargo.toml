@@ -35,4 +35,5 @@ render = ["dormant-core/render"]
 dist = true
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile.workspace = true

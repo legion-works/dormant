@@ -27,6 +27,21 @@
    cd dormant
    ```
 
+## Local hooks (lefthook)
+
+[lefthook](https://lefthook.dev) runs fast local gates on every commit and push.
+Install once after cloning:
+
+```bash
+lefthook install
+```
+
+- **pre-commit** — `cargo fmt`, `typos`, `taplo fmt --check` (seconds).
+- **pre-push** — `cargo clippy -- -D warnings -W clippy::pedantic`, `cargo doc` (the two gates that most often fail CI).
+
+Skip in an emergency with `git commit --no-verify` or `LEFTHOOK=0 git push`.
+CI remains the authoritative gate — these are local mirrors, not replacements.
+
 ## Gate commands
 
 Run these before committing. All must pass. They mirror the CI workflow exactly — what runs locally is what runs on the PR.

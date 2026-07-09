@@ -75,6 +75,19 @@ pub trait CommandSink: Send + Sync {
     /// Wake the display.
     async fn wake(&self) -> Result<(), CmdFailure>;
 
+    /// One-shot wake: a single attempt through the controller chain, no retries,
+    /// no exponential backoff.  Used by [`crate::rules::ControlMsg::EmergencyWake`]
+    /// and the `dormantctl emergency-wake` direct-hardware fallback — the
+    /// panic-recovery path that needs a fast, best-effort wake command out of
+    /// the door.
+    ///
+    /// The default implementation delegates to [`Self::wake`] for compatibility
+    /// with simple sink implementations (e.g. test doubles that don't model
+    /// retries).  Production sinks should override with a bounded variant.
+    async fn wake_once(&self) -> Result<(), CmdFailure> {
+        self.wake().await
+    }
+
     /// Per-controller health from the LAST blank/wake attempt (never
     /// re-probes).  Empty until the first attempt.
     fn controller_health(&self) -> Vec<crate::rules::ControllerHealth>;

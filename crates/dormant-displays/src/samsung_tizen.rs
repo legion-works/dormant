@@ -2143,7 +2143,12 @@ mod tests {
             result.err()
         );
 
-        server.await.unwrap();
+        // Bound the mock server join: a hang here would otherwise stall CI
+        // past the job timeout instead of failing as a clean assertion.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock TLS server did not observe the expected handshake within 5s")
+            .expect("mock TLS server task panicked");
     }
 
     // ── Cold-start socket priming ────────────────────────────────────────────
@@ -2175,7 +2180,12 @@ mod tests {
             .await;
         assert!(result.is_ok(), "cold-start send should succeed: {result:?}");
 
-        server.await.unwrap();
+        // Bound the mock server join so a regression fails as a clean
+        // assertion rather than hanging the test runner.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock WS server did not observe the cold-start send_key within 5s")
+            .expect("mock WS server task panicked");
     }
 
     // ── Reconnect on send failure ────────────────────────────────────────────
@@ -2234,7 +2244,12 @@ mod tests {
             "retry after broken pipe should succeed: {result:?}"
         );
 
-        server.await.unwrap();
+        // Bound the mock server join: it expects two connections (priming
+        // + reconnect); a hang here would otherwise stall CI.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock WS server did not observe priming + reconnect within 5s")
+            .expect("mock WS server task panicked");
     }
 
     // ── Reader-task lifecycle (cancellation token) ──────────────────────────
@@ -2336,7 +2351,12 @@ mod tests {
             "fresh reader_state's CancellationToken must NOT be fired"
         );
 
-        server.await.unwrap();
+        // The server task holds conn 1 open for ~5s before accepting conn 2,
+        // so the bound must clear that internal sleep with headroom.
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("mock WS server did not observe priming + freshness reconnect within 10s")
+            .expect("mock WS server task panicked");
     }
 
     /// Silent-drop scenario: a fresh socket whose reader task has not observed
@@ -2417,7 +2437,13 @@ mod tests {
             "silent-drop send should reconnect and succeed"
         );
 
-        server.await.unwrap();
+        // The server task holds conn 1 open for ~5s before accepting conn 2
+        // (a spawned keepalive drops it), so the bound must clear that
+        // internal sleep with headroom.
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("mock WS server did not observe priming + freshness reconnect within 10s")
+            .expect("mock WS server task panicked");
     }
 
     /// Freshness check (not Ping/Pong) is the liveness gate. When `last_seen`
@@ -2502,7 +2528,12 @@ mod tests {
         }
         assert_eq!(token, Some("granted-token-42".to_string()));
 
-        server.await.unwrap();
+        // Bound the mock server join: a hang here would stall CI instead
+        // of failing as a clean assertion.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock pairing WS server did not deliver the token frame within 5s")
+            .expect("mock pairing WS server task panicked");
     }
 
     /// `pair()` with a short timeout against an unreachable host returns

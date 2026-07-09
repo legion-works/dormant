@@ -1626,6 +1626,16 @@ impl WaylandState {
             // lifetime reasoning easier.
             drop(pool);
             drop(buffers);
+            // Hand the just-freed screensaver heap back to the OS.
+            // `malloc_trim(0)` releases free memory at the top of every
+            // glibc arena; without it the arenas retain the ~21 MiB
+            // crossfade buffers mpv just dropped, inflating idle RSS
+            // until the arenas are reused.  Returned int is non-zero
+            // when memory was actually released; we don't need it.
+            #[cfg(target_os = "linux")]
+            {
+                let _ = unsafe { libc::malloc_trim(0) };
+            }
         }
     }
 

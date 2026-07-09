@@ -102,11 +102,36 @@ See `docs/research/2026-07-05-kwin-dpms-verification.md` for the spike data.
 ### `samsung-tizen` — Samsung Tizen TV
 
 Controls Samsung Tizen (OLED) TVs via `KEY_PICTURE_OFF` remote key over
-WebSocket. **Audio-safe:** blanks the panel while audio continues. Verified on
-S90D (QA65S90DAKXXA). Requires a persistent socket with keepalive — the TV
-silently drops idle connections. Use REST `/api/v2/` PowerState for real panel
-state, not socket liveness. Two standby depths exist (warm network-standby /
-deep standby); see the spike doc for the wake matrix.
+WebSocket (port 8002) and via Samsung IP Control G2 JSON-RPC (HTTPS port
+1516, `backlightControl`) for the audio-safe `brightness_zero` mode.
+Verified on S90D (QA65S90DAKXXA). Requires a persistent socket with
+keepalive — the TV silently drops idle connections. Use REST `/api/v2/`
+PowerState for real panel state, not socket liveness. Two standby depths
+exist (warm network-standby / deep standby); see the spike doc for the
+wake matrix.
+
+Two blank modes are audio-safe:
+
+- `screen_off_audio_on` (default): `KEY_PICTURE_OFF` — true picture-off.
+  Audio continues on the TV speakers but the HDMI source is paused and the
+  panel is dark. Verified end-to-end on S90D.
+- `brightness_zero`: Samsung IP Control G2 `backlightControl` → 0.
+  Near-black **dim**, not true-off — the HDMI source keeps running and
+  audio plays uninterrupted. Use this when the operator wants audio
+  playing while the panel is unreadable. The TV's backlight range is
+  0–50; dormant saves the current value on the first blank and restores
+  it on wake (first-blank-wins: a re-blank while already dimmed does not
+  clobber the saved value).
+
+The optional `samsung_restore_backlight` per-display config key (0–50,
+defaults to 50) sets the backlight value restored on wake when no saved
+value is available — daemon restart, reload, or first wake. The default
+50 (the max on the 0–50 scale) is the fail-safe-toward-screens-on
+fallback: a too-bright panel is acceptable, a stuck-dim one is not.
+
+`brightness_zero` is a softer panel-state change than `screen_off_audio_on`
+and may be preferable for OLED longevity in the long run (no panel power
+cycling), but it does not produce a true pixel-off — it only dims.
 
 The token goes in the credentials file:
 
@@ -147,7 +172,7 @@ Two controllers blank without touching the output, preserving audio:
 | Controller | Mechanism | Audio-safe because |
 |---|---|---|
 | `ddcci` | VCP `0xD6` (monitor-internal command over I2C) | Panel blanks internally; OS output stays active |
-| `samsung-tizen` | `KEY_PICTURE_OFF` (TV-internal command over WebSocket) | TV blanks panel; HDMI output stays active |
+| `samsung-tizen` | `KEY_PICTURE_OFF` (TV-internal command over WebSocket) or IP-Control `backlightControl` (dim, near-black) | TV blanks/dims panel; HDMI output stays active |
 
 **Per-display strategy:**
 

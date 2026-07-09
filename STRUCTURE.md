@@ -7,8 +7,8 @@ oled-proximity/
 ├── crates/
 │   ├── dormant-core/         # Pure domain logic: types, traits, config, rules, state machine, IPC, reload, doctor wire types
 │   ├── dormant-sensors/      # Sensor sources: MQTT, HA WebSocket, USB LD2410 + registry
-│   ├── dormant-displays/     # Display controllers: command, ddcci, kwin-dpms, samsung-tizen, ha-passthrough + executor/registry
-│   ├── dormant-doctor/       # Offline + live coalesced hardware/connectivity probes
+│   ├── dormant-displays/     # Display controllers: command, ddcci, kwin-dpms, samsung-tizen (+ samsung_ip IP-Control-G2 transport), ha-passthrough + executor/registry
+│   ├── dormant-doctor/       # Offline + live coalesced hardware/connectivity probes (config, mqtt, ha, usb, ddcci, samsung)
 │   ├── dormant-web/          # Loopback-only axum HTTP/WS bridge + SPA (webui/)
 │   ├── dormant-render/       # Local Wayland layer-shell render sink (black overlay + libmpv screensaver); Linux-only I/O
 │   ├── dormantd/             # Daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, logging
@@ -36,13 +36,13 @@ oled-proximity/
 
 **`crates/dormant-displays/`**
 - Purpose: Display controllers that turn rules-engine `CommandSink` calls into real blank/wake operations.
-- Contains: `command.rs`, `ddcci.rs` (Linux-only), `kwin_dpms.rs` (Linux-only), `samsung_tizen.rs`, `ha_passthrough.rs`, `vcp_ops.rs`, `executor.rs` (per-display fallback chain + retry), `registry.rs`.
+- Contains: `command.rs`, `ddcci.rs` (Linux-only), `kwin_dpms.rs` (Linux-only), `samsung_tizen.rs` (port 8002 WebSocket remote control + Wake-on-LAN + network pairing), `samsung_ip.rs` (port 1516 IP Control G2 JSON-RPC — `backlightControl` for the audio-safe `brightness_zero` blank path), `ha_passthrough.rs`, `vcp_ops.rs`, `executor.rs` (per-display fallback chain + retry), `registry.rs`.
 - Key files: `crates/dormant-displays/src/registry.rs` (`CONTROLLER_TYPES`, `capabilities()`, `build_controllers()`).
 
 **`crates/dormant-doctor/`**
 - Purpose: Probe logic + live coalesced `DoctorService`. Re-exports the wire types from `dormant_core::doctor`.
-- Contains: `probes/` (config, ddcci, ha, mqtt, usb — one file per probe), `service.rs` (singleflight `DoctorService`), `types.rs` (`ProbeResult`/`ProbeStatus`).
-- Key files: `crates/dormant-doctor/src/lib.rs` (`probe_all_offline` is the bare-doctor entry point used by `dormantctl doctor`).
+- Contains: `probes/` (config, ddcci, ha, mqtt, samsung, usb — one file per probe; `samsung.rs` covers reachability on ports 8001/8002, REST power-state, and `credentials.samsung.<host>` token presence), `service.rs` (singleflight `DoctorService`), `types.rs` (`ProbeResult`/`ProbeStatus`).
+- Key files: `crates/dormant-doctor/src/lib.rs` (`probe_all_offline` is the bare-doctor entry point used by `dormantctl doctor`; `probe_samsung` is the per-target dispatch).
 
 **`crates/dormant-web/`**
 - Purpose: Optional loopback-only web dashboard. Gated behind the `web-ui` Cargo feature of `dormantd`; when off, zero web code compiles.
@@ -57,7 +57,7 @@ oled-proximity/
 
 **`crates/dormantctl/`**
 - Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor). Also exposes an IPC `client` library entry for out-of-binary consumers (e.g. `dormant-tray`).
-- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs`, `cmd_doctor.rs`, `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
+- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs`, `cmd_doctor.rs`, `cmd_pair.rs` (`dormantctl pair samsung <host>` — connects to the TV, prompts the on-screen allow, and stores the returned token via `dormant_core::config::upsert_samsung_token`), `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
 - Key files: `crates/dormantctl/src/main.rs` (register new subcommands here).
 
 **`crates/dormant-render/`**
@@ -92,7 +92,7 @@ oled-proximity/
 **Display executor (fallback + retry):** `crates/dormant-displays/src/executor.rs`.
 **Sensor source registry:** `crates/dormant-sensors/src/registry.rs`.
 **Display controller registry:** `crates/dormant-displays/src/registry.rs`.
-**Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,usb}.rs`.
+**Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,samsung,usb}.rs`.
 **Web routes:** `crates/dormant-web/src/routes/{command,config,config_apply,doctor,events}.rs`.
 **Web config-patch module:** `crates/dormant-web/src/config_patch.rs` — pure patch hygiene / allowlist / `toml_edit` application; the `config_apply.rs` route is the only consumer.
 **Render entry:** `crates/dormant-render/src/lib.rs` (re-exports `LayerShellRenderSink` + `ScreensaverSettings`).

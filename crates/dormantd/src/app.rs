@@ -1648,7 +1648,7 @@ async fn forward_ctl(
             msg = rx.recv() => match msg {
                 None => break,
                 Some(m) => {
-                    if !deliver_or_drop(m, &mut target, &cancel).await {
+                    if !deliver_or_drop(m, &mut target, &cancel, "ctl_forward_dropped").await {
                         break;
                     }
                 }
@@ -1657,14 +1657,23 @@ async fn forward_ctl(
     }
 }
 
-/// Deliver a single control message to the current generation's engine,
-/// retrying across a reload swap on `SendError`. Returns `false` when the
-/// forwarder should exit (cancellation observed, watch sender dropped, or
-/// `MAX_SWAP_WAITS` exceeded — all logged as `ctl_forward_dropped`).
-async fn deliver_or_drop(
-    msg: ControlMsg,
-    target: &mut watch::Receiver<mpsc::Sender<ControlMsg>>,
+/// Deliver a single message to the current generation's engine, retrying
+/// across a reload swap on `SendError`. Returns `false` when the forwarder
+/// should exit (cancellation observed, watch sender dropped, or
+/// `MAX_SWAP_WAITS` exceeded — all logged under `drop_event`).
+///
+/// Generic over the message type so the control and presence forwarders
+/// share one implementation. Each call site passes its own `drop_event`
+/// literal (AGENTS.md rule 3 — grep-stable anchors at the definition site):
+/// `"ctl_forward_dropped"` for control messages, `"event_forward_dropped"`
+/// for presence events. `T` carries no explicit bound — the `Send`
+/// requirement comes implicitly from `mpsc::Sender<T>::send(T)` at the
+/// call site.
+async fn deliver_or_drop<T>(
+    msg: T,
+    target: &mut watch::Receiver<mpsc::Sender<T>>,
     cancel: &CancellationToken,
+    drop_event: &'static str,
 ) -> bool {
     const MAX_SWAP_WAITS: usize = 2;
     let mut pending = msg;
@@ -1677,9 +1686,9 @@ async fn deliver_or_drop(
                 pending = e.0;
                 if waits >= MAX_SWAP_WAITS {
                     tracing::warn!(
-                        event = "ctl_forward_dropped",
+                        event = drop_event,
                         waits,
-                        "control message dropped: no live engine generation within retry bound"
+                        "message dropped: no live engine generation within retry bound"
                     );
                     return false;
                 }
@@ -1687,18 +1696,18 @@ async fn deliver_or_drop(
                 tokio::select! {
                     () = cancel.cancelled() => {
                         tracing::warn!(
-                            event = "ctl_forward_dropped",
+                            event = drop_event,
                             waits,
-                            "control message dropped: cancellation observed while awaiting new generation"
+                            "message dropped: cancellation observed while awaiting new generation"
                         );
                         return false;
                     }
                     r = target.changed() => {
                         if r.is_err() {
                             tracing::warn!(
-                                event = "ctl_forward_dropped",
+                                event = drop_event,
                                 waits,
-                                "control message dropped: control watch sender dropped (shutdown)"
+                                "message dropped: watch sender dropped (shutdown)"
                             );
                             return false;
                         }
@@ -1710,20 +1719,27 @@ async fn deliver_or_drop(
 }
 
 /// Forward injected presence events to the current generation's engine.
+///
+/// Same reload-window drop risk as [`forward_ctl`]: between
+/// `teardown(old)` and `install_generation(new)` the watch still points at
+/// the dead old-generation sender, and a presence event forwarded in that
+/// window would be silently swallowed by `SendError`. Retry the same way
+/// — see [`deliver_or_drop`] — bounded by `MAX_SWAP_WAITS`.
 async fn forward_events(
     mut rx: mpsc::Receiver<PresenceEvent>,
-    target: watch::Receiver<mpsc::Sender<PresenceEvent>>,
+    mut target: watch::Receiver<mpsc::Sender<PresenceEvent>>,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
             msg = rx.recv() => match msg {
-                Some(m) => {
-                    let sender = target.borrow().clone();
-                    let _ = sender.send(m).await;
-                }
                 None => break,
+                Some(m) => {
+                    if !deliver_or_drop(m, &mut target, &cancel, "event_forward_dropped").await {
+                        break;
+                    }
+                }
             },
         }
     }
@@ -2519,5 +2535,175 @@ mod forward_ctl_tests {
             .await
             .expect("forward_ctl did not exit within 1s after cancel");
         assert!(join.is_ok(), "forward_ctl task panicked on cancel");
+    }
+}
+
+#[cfg(test)]
+mod forward_events_tests {
+    use super::*;
+    use dormant_core::types::{SensorState, Timestamp};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Build a watch seeded with a `PresenceEvent` sender whose receiver has
+    /// been dropped — the same state `forward_events` would observe between
+    /// `teardown(old)` and `install_generation(new)` during a reload.
+    fn dead_watch() -> (
+        watch::Sender<mpsc::Sender<PresenceEvent>>,
+        watch::Receiver<mpsc::Sender<PresenceEvent>>,
+        mpsc::Sender<PresenceEvent>,
+    ) {
+        let (dead_tx, dead_rx) = mpsc::channel::<PresenceEvent>(1);
+        drop(dead_rx);
+        let (watch_tx, watch_rx) = watch::channel(dead_tx.clone());
+        (watch_tx, watch_rx, dead_tx)
+    }
+
+    /// RED-FIRST crux: a presence event forwarded during the reload window —
+    /// when the watch still points at the dead old-generation sender — must
+    /// arrive on the NEW live receiver once `install_generation` writes the
+    /// replacement sender. With the unfixed `let _ = sender.send(m).await`
+    /// the message is dropped and the assertion times out.
+    #[tokio::test]
+    async fn forward_events_retries_across_generation_swap() {
+        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
+        let cancel = CancellationToken::new();
+        let (front_tx, front_rx) = mpsc::channel::<PresenceEvent>(1);
+
+        let handle = tokio::spawn(forward_events(front_rx, watch_rx, cancel.clone()));
+
+        // Send a Present event into the front channel. forward_events will try
+        // the dead sender, get SendError, and start waiting on changed().
+        let event = PresenceEvent::new(
+            SensorId("test-sensor".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        );
+        front_tx
+            .send(event.clone())
+            .await
+            .expect("front channel send");
+
+        // Force a scheduler hand-off so forward_events is guaranteed to
+        // consume the front-channel message, attempt the dead-sender send,
+        // and park on `changed()` BEFORE we update the watch. Without this
+        // yield the multi-thread test runtime can race the watch write ahead
+        // of forward_events' first `borrow()`, letting the unfixed
+        // `let _ = sender.send(m).await` see the new live sender and
+        // deliver the message trivially — a polite test that doesn't guard
+        // the fix.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Install the new generation's live sender — simulates install_generation.
+        let (new_tx, mut new_rx) = mpsc::channel::<PresenceEvent>(1);
+        watch_tx.send(new_tx).expect("watch send");
+
+        // The fixed forward_events must re-deliver the pending event to the
+        // NEW receiver. Timeout-bound so a hang becomes a clean assert.
+        let received = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+            .await
+            .expect("forward_events did not deliver to the new generation within 2s")
+            .expect("new generation channel closed unexpectedly");
+
+        assert_eq!(received.sensor_id, event.sensor_id);
+        assert_eq!(received.state, event.state);
+
+        cancel.cancel();
+        // Drop the front sender so the spawn can exit.
+        drop(front_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    }
+
+    /// Bounded-retry path: with no live generation ever arriving (a
+    /// pathological non-shutdown stall), the message is dropped after
+    /// `MAX_SWAP_WAITS` wait cycles and `forward_events` exits cleanly. Each
+    /// `changed()` wait is resolved by writing another dead sender to the
+    /// watch, so the retry loop completes and `forward_events` logs
+    /// `event_forward_dropped` rather than hanging. Crucially, the front
+    /// channel is NOT closed and cancellation is NOT triggered — the exit
+    /// must come from the `MAX_SWAP_WAITS` bound, not from rx recv / cancel.
+    #[tokio::test]
+    async fn forward_events_drops_after_max_swap_waits_when_no_new_generation() {
+        // Mirror the constant bound inside `deliver_or_drop`. Each write
+        // lets one `changed()` resolution complete; without a live sender
+        // every retry fails and the bound is hit.
+        const MAX_SWAP_WAITS: usize = 2;
+        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
+        let cancel = CancellationToken::new();
+        let (front_tx, front_rx) = mpsc::channel::<PresenceEvent>(1);
+
+        let handle = tokio::spawn(forward_events(front_rx, watch_rx, cancel.clone()));
+
+        let event = PresenceEvent::new(
+            SensorId("doomed".into()),
+            SensorState::Absent,
+            Timestamp::now(),
+        );
+        front_tx.send(event).await.expect("front channel send");
+
+        // Yield so forward_events processes the front message and parks on
+        // its first `changed()` await before we start writing to the watch.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        for _ in 0..MAX_SWAP_WAITS {
+            let (extra_dead_tx, extra_dead_rx) = mpsc::channel::<PresenceEvent>(1);
+            drop(extra_dead_rx);
+            watch_tx.send(extra_dead_tx).expect("watch send");
+            // Yield so forward_events processes the changed() resolution,
+            // re-borrow the dead sender, fail to send, and re-arm the wait.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
+
+        // No cancellation, front_tx still alive — forward_events must still
+        // exit because `deliver_or_drop` returns false at the bound and
+        // the outer loop breaks. Bound the wait so an unbounded retry
+        // loop (regression) or the unfixed "swallow then await forever"
+        // path becomes a clean test failure.
+        let join = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("forward_events did not exit within 2s — MAX_SWAP_WAITS bound was not honored");
+        assert!(join.is_ok(), "forward_events task panicked: {join:?}");
+    }
+
+    /// Cancel mid-wait: while `forward_events` is blocked on `changed()`
+    /// waiting for the next generation, cancelling the token must break the
+    /// inner retry loop and the outer `forward_events` cleanly — no hang, no
+    /// panic.
+    #[tokio::test]
+    async fn forward_events_breaks_cleanly_on_cancel_during_swap_wait() {
+        let (_watch_tx, watch_rx, _dead_tx) = dead_watch();
+        let cancel = CancellationToken::new();
+        let (front_tx, front_rx) = mpsc::channel::<PresenceEvent>(1);
+
+        let handle = tokio::spawn(forward_events(front_rx, watch_rx, cancel.clone()));
+
+        // Trigger the dead-sender path so forward_events parks on changed().
+        let event = PresenceEvent::new(
+            SensorId("cancelled".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        );
+        front_tx.send(event).await.expect("front channel send");
+
+        // Yield so forward_events reaches its `changed()` await before we
+        // cancel. Without this, on a multi-thread runtime the cancel may
+        // race ahead of the task ever entering the changed() wait.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Now cancel — forward_events must exit cleanly without ever writing
+        // to the watch.
+        cancel.cancel();
+        drop(front_tx);
+
+        let join = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("forward_events did not exit within 1s after cancel");
+        assert!(join.is_ok(), "forward_events task panicked on cancel");
     }
 }

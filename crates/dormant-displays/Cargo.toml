@@ -38,3 +38,4 @@ rcgen-test = ["dep:rcgen"]
 tokio = { workspace = true, features = ["test-util", "time", "macros", "rt"] }
 wiremock = "0.6"
 tokio-rustls = "0.26"
+tempfile = { workspace = true }

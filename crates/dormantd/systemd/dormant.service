@@ -6,6 +6,10 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+# Cap glibc malloc arenas so freed screensaver/render heap is returned to the OS
+# instead of retained per-thread (pairs with the daemon's worker_threads=2 and the
+# malloc_trim after screensaver teardown — see crates/dormantd/src/main.rs).
+Environment=MALLOC_ARENA_MAX=2
 ExecStart=%h/.local/bin/dormantd
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

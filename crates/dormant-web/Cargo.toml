@@ -1,5 +1,6 @@
 [package]
 name = "dormant-web"
+version.workspace = true
 description = "Loopback-only web dashboard and config editor for dormant."
 edition.workspace = true
 license.workspace = true

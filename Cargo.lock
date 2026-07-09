@@ -861,7 +861,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-displays"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-doctor"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "dormant-core",
  "dormant-displays",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-render"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "calloop",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-sensors"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-tray"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "dormant-core",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "dormant-web"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "dormant-core",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "dormantctl"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "dormantd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",

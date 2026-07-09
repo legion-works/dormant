@@ -1,5 +1,6 @@
 [package]
 name = "dormantctl"
+version.workspace = true
 description = "CLI and IPC client library for controlling and diagnosing dormant."
 edition.workspace = true
 license.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "dormant-doctor"
+version.workspace = true
 description = "Hardware and connectivity probes for dormant sensors, displays, and credentials."
 edition.workspace = true
 license.workspace = true

@@ -69,7 +69,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_BLANK_FAILED, E_WAKE_FAILED};
 use dormant_core::rules::{ControllerHealth, ControllerRole};
-use dormant_core::traits::{CommandSink, DisplayController};
+use dormant_core::traits::{CommandSink, DisplayController, PanelState};
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
 use tokio_util::sync::CancellationToken;
 
@@ -436,6 +436,26 @@ impl CommandSink for DisplayExecutor {
             .lock()
             .expect("DisplayExecutor health lock poisoned")
             .clone()
+    }
+
+    /// Walk the configured chain and return the first non-`None` panel
+    /// state reported by a controller's [`DisplayController::read_state`].
+    ///
+    /// Mirrors the chain semantics used by `blank` / `wake`: the first
+    /// controller that can read the panel wins.  Used by the
+    /// `ControlMsg::Exercise` handler so a chain with a primary controller
+    /// that has no readback falls through to a fallback that does
+    /// (e.g. a `samsung-tizen` primary that has no port-1516 backlight
+    /// paired with a `ddcci` fallback that does).  Returns `None` if no
+    /// controller in the chain supports readback — the honest answer that
+    /// the exercise handler renders as `Unconfirmable`.
+    async fn read_state(&self) -> Option<PanelState> {
+        for controller in &self.chain {
+            if let Some(state) = controller.read_state().await {
+                return Some(state);
+            }
+        }
+        None
     }
 }
 

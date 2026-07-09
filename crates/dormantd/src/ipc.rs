@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
-use dormant_core::rules::{ControlMsg, StateSnapshot};
+use dormant_core::rules::{ControlMsg, ExerciseReport, StateSnapshot};
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -250,6 +250,10 @@ async fn handle_connection(
                 let resp = handle_emergency_wake(&ctl_tx).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::Exercise { display } => {
+                let resp = handle_exercise(&ctl_tx, &display).await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
     }
 }
@@ -344,6 +348,81 @@ async fn handle_emergency_wake(ctl_tx: &mpsc::Sender<ControlMsg>) -> IpcResponse
         Ok(Err(_recv_dropped)) => IpcResponse::error("emergency_wake: engine dropped reply"),
         Err(_elapsed) => IpcResponse::error("emergency_wake: timed out"),
     }
+}
+
+/// Bounded-wait wrapper around `ControlMsg::Exercise`.
+///
+/// The 15-second window is generous on purpose: a `dormantctl doctor
+/// --exercise` blank → read → wake → read → restore sequence on a slow
+/// Samsung Tizen TV or a flaky DDC/CI bus can run 3–5 seconds end-to-end
+/// (each Tizen WS round-trip + read = ~1 s in degraded network conditions),
+/// and the restore step MUST complete — leaving the display dark is the
+/// cardinal failure mode.  The CLI surfaces a `timed out` error so the
+/// operator can investigate rather than the daemon silently truncating the
+/// restore step.
+/// Bound on how long the IPC server waits for an `Exercise` reply from the
+/// engine.  Generous on purpose: a blank → read → wake → read → restore
+/// sequence on a slow Samsung Tizen TV or a flaky DDC/CI bus can run 3–5
+/// seconds end-to-end (each Tizen WS round-trip + read ≈ 1 s in degraded
+/// network conditions), and the restore step MUST complete — leaving the
+/// display dark is the cardinal failure mode.  The CLI surfaces a
+/// `timed out` error so the operator can investigate rather than the
+/// daemon silently truncating the restore step.
+const EXERCISE_IPC_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn handle_exercise(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> IpcResponse {
+    if let Some(err) = validate_display_name(ctl_tx, display).await {
+        return err;
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let msg = ControlMsg::Exercise {
+        display: dormant_core::types::DisplayId(display.to_string()),
+        reply: tx,
+    };
+    if ctl_tx.send(msg).await.is_err() {
+        return IpcResponse::error("engine not available");
+    }
+    match tokio::time::timeout(EXERCISE_IPC_TIMEOUT, rx).await {
+        Ok(Ok(report)) => exercise_response_with_resume(report, ctl_tx).await,
+        Ok(Err(_recv_dropped)) => IpcResponse::error("exercise: engine dropped reply"),
+        Err(_elapsed) => IpcResponse::error("exercise: timed out"),
+    }
+}
+
+/// Forward the exercise report to the client and (if the handler paused
+/// any rules) issue a matching `Resume` for each paused rule so the
+/// engine can resume blanking once the operator is satisfied with the
+/// report.  Splitting this off keeps `handle_exercise` short and
+/// centralises the pause-window release.
+async fn exercise_response_with_resume(
+    report: ExerciseReport,
+    ctl_tx: &mpsc::Sender<ControlMsg>,
+) -> IpcResponse {
+    if !report.paused_rules.is_empty() {
+        let resumed: Vec<String> = report.paused_rules.iter().map(|r| r.0.clone()).collect();
+        for rule in &report.paused_rules {
+            let msg = ControlMsg::Resume {
+                rule: Some(rule.clone()),
+            };
+            if ctl_tx.send(msg).await.is_err() {
+                tracing::warn!(
+                    event = "control_path_exercise",
+                    display = %report.display,
+                    rule = %rule,
+                    "exercise: failed to forward Resume for paused rule",
+                );
+            }
+        }
+        tracing::info!(
+            event = "control_path_exercise",
+            display = %report.display,
+            step_count = report.steps.len(),
+            resumed_rules = ?resumed,
+            "exercise: report shipped; resumed paused rule(s) automatically",
+        );
+    }
+    IpcResponse::exercise(report)
 }
 
 /// Subscribe to the event stream and write events as JSON lines until the

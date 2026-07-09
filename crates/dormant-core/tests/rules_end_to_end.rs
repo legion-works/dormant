@@ -2250,3 +2250,247 @@ async fn emergency_wake_handler_dispatches_displays_concurrently() {
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;
 }
+
+// ── exercise handler ───────────────────────────────────────────────────────────
+//
+// RED-first pin for `ControlMsg::Exercise`: the handler must
+// (a) pause the target display's rule(s) BEFORE running the sequence and
+//     un-pause them after, so a presence edge cannot race the test;
+// (b) skip cleanly for a manual-only display (no rule bound) — the
+//     `paused_rules` list is empty and the sequence still runs;
+// (c) build a per-step report with one row per phase (read / blank /
+//     wake / restore) and surface `Confirmed` / `Unconfirmable` verdicts
+//     from the read_state comparison;
+// (d) ALWAYS wake the display (the cardinal fail-safe), even when the
+//     blank command itself fails — the report's `Failed` verdict on the
+//     blank step is the operator's signal, not a stranded-dark panel.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn exercise_handler_pauses_target_rule_and_unpauses_after() {
+    use dormant_core::rules::{ExerciseReport, ExerciseVerdict};
+    use dormant_core::traits::{PanelState, PowerState};
+
+    // A scripted sink that returns a panel state which moves on every
+    // read → every step is `Confirmed` → exercise exits cleanly with the
+    // operator's report.
+    struct ScriptedSink {
+        #[allow(dead_code)]
+        id: DisplayId,
+        states: Arc<std::sync::Mutex<Vec<PanelState>>>,
+        log: Arc<std::sync::Mutex<Vec<SinkCmd>>>,
+    }
+    #[async_trait::async_trait]
+    impl CommandSink for ScriptedSink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            self.log
+                .lock()
+                .expect("log lock poisoned")
+                .push(SinkCmd::Blank(BlankMode::PowerOff));
+            Ok(())
+        }
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            self.log
+                .lock()
+                .expect("log lock poisoned")
+                .push(SinkCmd::Wake);
+            Ok(())
+        }
+        async fn wake_once(&self) -> Result<(), CmdFailure> {
+            self.wake().await
+        }
+        fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+            Vec::new()
+        }
+        async fn read_state(&self) -> Option<PanelState> {
+            self.states.lock().expect("states lock poisoned").pop()
+        }
+    }
+
+    let display = DisplayId("mon".into());
+    let zones = zone_with_sensor("desk", "office");
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::<SinkCmd>::new()));
+    // Script: reads return On, then Standby, then On, then On.  The
+    // final "On" is the defensive restore-step read; it's already at
+    // baseline, so the wake step's verdict is `Confirmed` (it moved
+    // the panel back from Standby → On).
+    let states_script: Vec<PanelState> = vec![
+        PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        }, // restore-read
+        PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        }, // post-wake
+        PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        }, // post-blank
+        PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        }, // baseline
+    ];
+    let states = Arc::new(std::sync::Mutex::new(states_script));
+    let sink_arc: Arc<dyn CommandSink> = Arc::new(ScriptedSink {
+        id: display.clone(),
+        states: Arc::clone(&states),
+        log: Arc::clone(&log),
+    });
+
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink_arc);
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r_office", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    let (tx, rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::Exercise {
+            display: display.clone(),
+            reply: tx,
+        })
+        .await
+        .expect("ctl channel open");
+    let report: ExerciseReport = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_dropped)) => panic!("exercise reply oneshot dropped"),
+        Err(elapsed) => panic!("exercise reply did not arrive within 5s: {elapsed:?}"),
+    };
+
+    // Rule is reported as paused.
+    assert_eq!(
+        report.paused_rules,
+        vec![RuleId("r_office".into())],
+        "exercise must report the rule it paused for the window"
+    );
+
+    // Every step in the report is present.  The initial "read" is the
+    // baseline capture (always `Unconfirmable` — the read itself doesn't
+    // verify a transition, it just records a snapshot).  The blank /
+    // wake / restore steps are `Confirmed` because the scripted reads
+    // make every comparison succeed.
+    let commands: Vec<&str> = report.steps.iter().map(|s| s.command.as_str()).collect();
+    assert_eq!(
+        commands,
+        vec!["read", "blank", "wake", "restore"],
+        "expected exactly one row per exercise phase"
+    );
+    assert_eq!(
+        report.steps[0].verdict,
+        ExerciseVerdict::Unconfirmable,
+        "the baseline read step is informational, not a verification"
+    );
+    for step in report.steps.iter().skip(1) {
+        assert_eq!(
+            step.verdict,
+            ExerciseVerdict::Confirmed,
+            "scripted reads should yield Confirmed for every step: {step:?}"
+        );
+    }
+
+    // The sink log shows the full sequence: blank, wake, wake (defensive).
+    let log_snapshot = log.lock().expect("log lock poisoned").clone();
+    assert_eq!(
+        log_snapshot,
+        vec![
+            SinkCmd::Blank(BlankMode::PowerOff),
+            SinkCmd::Wake,
+            SinkCmd::Wake,
+        ],
+        "exercise must run blank → wake → defensive wake (in that order)"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// Manual-only display path: a display with no rule bound must still be
+/// exercisable (the `paused_rules` list is empty), and the per-step
+/// report must still ship every phase.  This is the "skip cleanly" branch
+/// the design doc calls out.
+#[tokio::test(flavor = "current_thread")]
+async fn exercise_handler_runs_for_manual_only_display_with_empty_paused_rules() {
+    use dormant_core::rules::{ExerciseReport, ExerciseVerdict};
+    use dormant_core::traits::PanelState;
+
+    struct EmptySink;
+    #[async_trait::async_trait]
+    impl CommandSink for EmptySink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        async fn wake_once(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+            Vec::new()
+        }
+        async fn read_state(&self) -> Option<PanelState> {
+            None // unconfirmable
+        }
+    }
+
+    let display = DisplayId("manual_only".into());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), Arc::new(EmptySink));
+
+    // No rules at all — manual-only display.
+    let cfg = RulesEngineConfig {
+        rules: vec![],
+        displays: vec![display_cfg("manual_only")],
+        sensors: vec![],
+    };
+    let zones = ZoneEngine::new(Vec::new(), &[]).expect("empty zone engine");
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    let (tx, rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::Exercise {
+            display: display.clone(),
+            reply: tx,
+        })
+        .await
+        .expect("ctl channel open");
+    let report: ExerciseReport = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_dropped)) => panic!("exercise reply oneshot dropped"),
+        Err(elapsed) => panic!("exercise reply did not arrive within 5s: {elapsed:?}"),
+    };
+
+    assert!(
+        report.paused_rules.is_empty(),
+        "manual-only display must not pause any rule: {:?}",
+        report.paused_rules
+    );
+    // Every step ran and is `Unconfirmable` (no readback).
+    assert_eq!(report.steps.len(), 4);
+    for step in &report.steps {
+        assert_eq!(
+            step.verdict,
+            ExerciseVerdict::Unconfirmable,
+            "no readback → every step is Unconfirmable: {step:?}"
+        );
+    }
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}

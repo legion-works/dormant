@@ -43,7 +43,7 @@ use crate::config::SensorKind;
 use crate::error::DormantError;
 use crate::ownership::OwnershipGate;
 use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
-use crate::traits::{CommandSink, RenderSink};
+use crate::traits::{CommandSink, PanelState, RenderSink};
 use crate::types::{
     BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
     StageKind, Tick, Timestamp, ZoneId,
@@ -112,6 +112,28 @@ pub enum ControlMsg {
         /// One-shot reply channel for the emergency report.
         reply: oneshot::Sender<EmergencyWakeReport>,
     },
+    /// Run a control-path verification on a single display — blank, read,
+    /// wake, read, restore — and return a per-step report.
+    ///
+    /// Used by `dormantctl doctor --exercise <display>` to confirm that a
+    /// blank/wake command actually moved the panel, not just that the
+    /// controller returned `Ok`.  The handler pauses every rule that drives
+    /// the target display for the exercise window (so a presence edge cannot
+    /// race the test commands), runs the exercise sequence on the
+    /// display's executor, restores the pre-exercise phase, and un-pauses
+    /// the rules.  The reply carries an [`ExerciseReport`] with one
+    /// [`ExerciseStep`] per phase and a per-step
+    /// [`ExerciseVerdict`] (`Confirmed` / `Unconfirmable` / `Failed`).
+    ///
+    /// The wake path is sacred: the restore step guarantees a final wake
+    /// regardless of any earlier failure, so an exercise can never leave a
+    /// display dark.
+    Exercise {
+        /// The display to exercise.
+        display: DisplayId,
+        /// One-shot reply channel for the exercise report.
+        reply: oneshot::Sender<ExerciseReport>,
+    },
 }
 
 /// Per-display outcome of an [`ControlMsg::EmergencyWake`].
@@ -135,6 +157,90 @@ pub struct EmergencyWakeReport {
     pub paused: bool,
     /// Per-display wake results, one entry per display the engine owns.
     pub displays: Vec<EmergencyWakeResult>,
+}
+
+/// Verdict for a single step in a [`ControlMsg::Exercise`] sequence.
+///
+/// `Unconfirmable` and `Confirmed` are exit-zero verdicts for the CLI
+/// (`dormantctl doctor --exercise` returns 0); `Failed` is the
+/// exit-non-zero verdict — a panel that the controller can read but that
+/// did not move in response to the test command.  That is the exact
+/// failure shape `doctor --exercise` exists to surface (a controller that
+/// logged `Ok` while the panel never changed), so the CLI maps it to a
+/// non-zero exit code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExerciseVerdict {
+    /// The controller reported the panel moved in the expected direction
+    /// (blank step: state changed from baseline; wake step: state returned
+    /// to baseline).
+    Confirmed,
+    /// The controller has no readback for this step — the command was
+    /// issued but the panel could not be observed.  Exit 0 (honest, not
+    /// a fake pass).
+    Unconfirmable,
+    /// The controller can read the panel but the state did NOT move as
+    /// expected — the command returned `Ok` but the panel did not change.
+    /// Exit non-zero.
+    Failed,
+}
+
+/// One phase of a [`ControlMsg::Exercise`] sequence: the command issued, the
+/// pre/post [`PanelState`] snapshot, and the [`ExerciseVerdict`] the engine
+/// derived from the comparison.
+///
+/// The wire form carries a small, grep-stable `command` string
+/// (`"blank"`, `"wake"`, `"read"`, `"restore"`) rather than the full blank
+/// mode so the CLI can render it without re-deriving the mode from the
+/// display's runtime config.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExerciseStep {
+    /// Stable verb describing this step (`"blank"`, `"wake"`, `"restore"`,
+    /// `"read"`).
+    pub command: String,
+    /// The blank mode that was used for the `blank` step (when applicable);
+    /// `None` for `wake`, `read`, and `restore` steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blank_mode: Option<BlankMode>,
+    /// Whether the controller's command call returned `Ok`.  Even a
+    /// `returned_ok == true` step can be `Failed` if the panel-state
+    /// comparison disagrees — that is the whole point of this report.
+    pub returned_ok: bool,
+    /// Panel state observed before the command (when a read was possible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_before: Option<PanelState>,
+    /// Panel state observed after the command (when a read was possible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_after: Option<PanelState>,
+    /// Verdict for this step.
+    pub verdict: ExerciseVerdict,
+    /// Optional error detail (controller + error string) for the `Ok`-but-
+    /// not-really case or for the read that failed before the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Aggregated report returned by [`ControlMsg::Exercise`].
+///
+/// The CLI maps this to per-step ✓ / ~ / ✗ glyphs and exits non-zero if any
+/// step verdict is `Failed`.  `paused_rules` carries the literal rule ids
+/// the handler paused for the exercise window — the IPC dispatch layer
+/// forwards a matching [`ControlMsg::Resume`] for each id after the report
+/// ships so the engine re-converges from live sensors without an explicit
+/// operator step.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExerciseReport {
+    /// The display the exercise ran on.
+    pub display: DisplayId,
+    /// The phase the display was in before the exercise started (so the
+    /// operator can confirm the restore target was the right one).
+    pub pre_phase: String,
+    /// Rule ids the handler paused for the exercise window.  Empty for
+    /// manual-only displays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paused_rules: Vec<RuleId>,
+    /// Per-step outcomes.
+    pub steps: Vec<ExerciseStep>,
 }
 
 /// Outbound events emitted by the engine for downstream consumers.
@@ -814,6 +920,7 @@ impl RulesEngine {
             }
             ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
             ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
+            ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply),
         }
     }
 
@@ -976,6 +1083,135 @@ impl RulesEngine {
                 displays: results,
             };
             let _ = reply.send(report);
+        });
+    }
+
+    /// Handle [`ControlMsg::Exercise`]: pause every rule that drives the
+    /// target display, record the pre-exercise phase, run the blank → read
+    /// → wake → read → restore sequence on the executor, and reply with an
+    /// [`ExerciseReport`].
+    ///
+    /// The exercise runs **outside** the engine run loop (mirroring
+    /// [`Self::handle_emergency_wake`]) so a slow wake or blank on the
+    /// target display does not block other control messages.  The handler
+    /// reads its inputs from `self`, snapshots everything it needs, and
+    /// moves the executor handle into the spawned task via `Arc::clone` —
+    /// the run loop keeps a `HashMap<DisplayId, Arc<dyn CommandSink>>` it
+    /// can read, but cannot hand out mutable references, so the spawned
+    /// task takes the cloned `Arc<dyn CommandSink>` and calls
+    /// [`CommandSink::blank`] / [`CommandSink::wake`] /
+    /// [`CommandSink::read_state`] directly.
+    ///
+    /// **Wake-path safety (cardinal rule)**: the restore step ALWAYS issues
+    /// a final `wake()` if the pre-exercise phase was active or a
+    /// blank-equivalent step if the pre-exercise phase was already a
+    /// blanked-family phase.  Even if any earlier step panicked or errored
+    /// mid-exercise, the restore step's blanket invocation of the wake path
+    /// means an exercise cannot leave a panel dark.
+    fn handle_exercise(&mut self, target: DisplayId, reply: oneshot::Sender<ExerciseReport>) {
+        // Snapshot the rules bound to this display so the spawned task can
+        // un-pause them without holding a borrow on `self`.
+        let rules_for_target: Vec<RuleId> = self
+            .rule_displays
+            .iter()
+            .filter_map(|(rule, displays)| {
+                if displays.contains(&target) {
+                    Some(rule.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Pause every rule bound to this display — reuse the existing
+        // pause path so the state-machine overlays route identically to a
+        // normal operator pause.  Without this an absent-zone could re-
+        // trigger blanking on the very next sensor event and fight the
+        // exercise.
+        for r in &rules_for_target {
+            self.handle_pause(Some(r), None);
+        }
+
+        // Record pre-exercise phase (one of the literals from
+        // [`DisplayStateMachine::phase_name`] — `active`, `grace`,
+        // `blanking`, `blanked`, `waking`, `render_pending`, `staged`).
+        let pre_phase = self
+            .machines
+            .get(&target)
+            .map_or_else(|| "unknown".to_string(), |m| m.phase_name().to_string());
+
+        // Pull the effective blank mode the display would normally be
+        // blanked with — the exercise issues the same command the rules
+        // engine would, so the test reads back the panel in the same
+        // state the production path expects.
+        let effective_mode = self
+            .cfg
+            .displays
+            .iter()
+            .find(|d| d.display == target)
+            .map(|d| d.blank_mode);
+
+        let Some(sink) = self.executors.get(&target).cloned() else {
+            // No executor — surface an empty report and un-pause what we
+            // paused (nothing for a display that has no executor at all,
+            // but be defensive).
+            for r in &rules_for_target {
+                self.handle_resume(Some(r));
+            }
+            let _ = reply.send(ExerciseReport {
+                display: target,
+                pre_phase,
+                paused_rules: Vec::new(),
+                steps: vec![ExerciseStep {
+                    command: "no_executor".into(),
+                    blank_mode: None,
+                    returned_ok: false,
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Failed,
+                    error: Some("E_DISPLAY_IO: no executor registered".into()),
+                }],
+            });
+            return;
+        };
+
+        let paused_count = rules_for_target.len();
+        tracing::info!(
+            event = "control_path_exercise",
+            display = %target,
+            pre_phase = %pre_phase,
+            paused_rules = paused_count,
+            effective_mode = ?effective_mode,
+            "exercise: paused rule(s); running blank → read → wake → read → restore",
+        );
+
+        let rules_to_resume: Vec<RuleId> = rules_for_target.clone();
+        tokio::spawn(async move {
+            let report = run_exercise_sequence(
+                &sink,
+                effective_mode,
+                pre_phase,
+                rules_to_resume.clone(),
+                target,
+            )
+            .await;
+
+            tracing::info!(
+                event = "control_path_exercise",
+                display = %report.display,
+                step_count = report.steps.len(),
+                paused_rules = report.paused_rules.len(),
+                "exercise: complete; IPC dispatch will issue Resume for paused rules",
+            );
+            let _ = reply.send(report);
+
+            // `rules_to_resume` is now captured in `report.paused_rules` —
+            // the IPC dispatch layer reads it to forward matching
+            // `ControlMsg::Resume`s after the report ships.  Keeping the
+            // local variable here means the report is the single source of
+            // truth for the rule list, and a future "automatic un-pause
+            // inline" change does not need to re-discover it.
+            let _ = rules_to_resume;
         });
     }
 
@@ -1375,11 +1611,622 @@ fn to_tokio_instant(t: std::time::Instant) -> tokio::time::Instant {
     tokio::time::Instant::from_std(t)
 }
 
+// ── Exercise sequence (helper, off the run loop) ──────────────────────────────
+
+/// Drive the [`ControlMsg::Exercise`] sequence against `sink` and return the
+/// aggregated [`ExerciseReport`].
+///
+/// Factored out of [`RulesEngine::handle_exercise`] so the engine-side
+/// handler stays short (mirrors how `handle_emergency_wake` itself was
+/// extracted).  Runs **off** the engine run loop — the executor handle is
+/// `Arc<dyn CommandSink>`, safe to share with a spawned task.
+///
+/// **Wake-path safety (cardinal rule)**: this function MUST end with a
+/// panel that is awake when `pre_phase` was an active phase.  The restore
+/// step issues a defensive `wake_once()` for active pre-phases so a
+/// partially-failed exercise cannot strand a display dark.
+async fn run_exercise_sequence(
+    sink: &Arc<dyn CommandSink>,
+    effective_mode: Option<BlankMode>,
+    pre_phase: String,
+    paused_rules: Vec<RuleId>,
+    display: DisplayId,
+) -> ExerciseReport {
+    let mode = effective_mode.unwrap_or(BlankMode::PowerOff);
+    let mut steps: Vec<ExerciseStep> = Vec::new();
+
+    // 1. Baseline read — None means the executor has no readback.
+    let baseline = sink.read_state().await;
+    steps.push(ExerciseStep {
+        command: "read".into(),
+        blank_mode: None,
+        returned_ok: true,
+        state_before: None,
+        state_after: baseline.clone(),
+        verdict: ExerciseVerdict::Unconfirmable,
+        error: None,
+    });
+
+    // 2. blank(mode) → read.  Confirmed iff the panel state moved from
+    //    baseline; Failed iff it didn't (panel didn't move despite the
+    //    command returning Ok).
+    let blank_result = sink.blank(mode).await;
+    let state_after_blank = sink.read_state().await;
+    let blank_verdict = blank_verdict(&blank_result, baseline.as_ref(), state_after_blank.as_ref());
+    steps.push(ExerciseStep {
+        command: "blank".into(),
+        blank_mode: Some(mode),
+        returned_ok: blank_result.is_ok(),
+        state_before: baseline.clone(),
+        state_after: state_after_blank.clone(),
+        verdict: blank_verdict,
+        error: blank_result.err().map(|f| f.error),
+    });
+
+    // 3. wake() → read.  Confirmed iff the panel state returned to the
+    //    ORIGINAL baseline — the wake-path restoration check.
+    let wake_result = sink.wake().await;
+    let state_after_wake = sink.read_state().await;
+    let wake_verdict = restore_verdict(
+        &wake_result,
+        baseline.as_ref(),
+        state_after_blank.as_ref(),
+        state_after_wake.as_ref(),
+    );
+    let state_before_restore = state_after_wake.clone();
+    steps.push(ExerciseStep {
+        command: "wake".into(),
+        blank_mode: None,
+        returned_ok: wake_result.is_ok(),
+        state_before: state_after_blank,
+        state_after: state_after_wake,
+        verdict: wake_verdict,
+        error: wake_result.err().map(|f| f.error),
+    });
+
+    // 4. RESTORE — wake-path-sacred.  If the pre-exercise phase was a
+    //    blanked-family phase, re-issue the blank so the display returns to
+    //    its starting state.  Otherwise the wake in step 3 already left it
+    //    awake — still send a defensive wake so a step-3 silently-no-op'd
+    //    wake (e.g. unreachable TV) never strands the panel dark.
+    let restore_step = if is_blanked_family_phase(&pre_phase) {
+        let result = sink.blank(mode).await;
+        let after = sink.read_state().await;
+        // Restore-via-blank: pre-restore state was post-wake; we expect
+        // after == post-wake (the panel stays in a blanked-family state)
+        // OR after == baseline (the panel came back awake).  Either way
+        // the command succeeding is the operationally interesting fact —
+        // mark `Confirmed` on success.
+        let verdict = if result.is_ok() {
+            ExerciseVerdict::Confirmed
+        } else {
+            ExerciseVerdict::Failed
+        };
+        ExerciseStep {
+            command: "restore".into(),
+            blank_mode: Some(mode),
+            returned_ok: result.is_ok(),
+            state_before: state_before_restore,
+            state_after: after,
+            verdict,
+            error: result.err().map(|f| f.error),
+        }
+    } else {
+        let result = sink.wake_once().await;
+        let after = sink.read_state().await;
+        // Defensive restore-wake verdict: the wake step already verified
+        // the panel state returned to baseline.  The defensive wake's
+        // only job is to guarantee the panel is awake — its own state
+        // movement is incidental.
+        // - No readback → Unconfirmable (honest: we can't observe whether
+        //   the defensive wake actually did anything).
+        // - Command succeeded → Confirmed (the panel is awake).
+        // - Command failed → Failed (the defensive wake errored AND a
+        //   step-3 silently-no-op'd wake is suspected).
+        let verdict = match (&result, after.is_none()) {
+            (Err(_), _) => ExerciseVerdict::Failed,
+            (Ok(()), true) => ExerciseVerdict::Unconfirmable,
+            (Ok(()), false) => ExerciseVerdict::Confirmed,
+        };
+        ExerciseStep {
+            command: "restore".into(),
+            blank_mode: None,
+            returned_ok: result.is_ok(),
+            state_before: state_before_restore,
+            state_after: after,
+            verdict,
+            error: result.err().map(|f| f.error),
+        }
+    };
+    steps.push(restore_step);
+
+    ExerciseReport {
+        display,
+        pre_phase,
+        paused_rules,
+        steps,
+    }
+}
+
+/// Verdict for the blank step: did the panel state move from baseline?
+///
+/// Order matters: a command error is `Failed` regardless of readback
+/// availability (the command itself failed), and a missing readback is
+/// `Unconfirmable` even when the command returned `Ok`.  Only when the
+/// command succeeded AND both observations are present do we compare
+/// states — the case the feature exists to catch is "Ok but the panel
+/// didn't move", which is `Failed`.
+fn blank_verdict(
+    result: &Result<(), CmdFailure>,
+    baseline: Option<&PanelState>,
+    after: Option<&PanelState>,
+) -> ExerciseVerdict {
+    if result.is_err() {
+        return ExerciseVerdict::Failed;
+    }
+    if baseline.is_none() || after.is_none() {
+        return ExerciseVerdict::Unconfirmable;
+    }
+    if baseline == after {
+        ExerciseVerdict::Failed
+    } else {
+        ExerciseVerdict::Confirmed
+    }
+}
+
+/// Verdict for the wake / restore step: did the wake command actually
+/// move the panel AND restore it to baseline?
+///
+/// Requires THREE observations: baseline, post-blank (so we can tell
+/// whether the wake itself changed anything), and post-wake.  The
+/// "panel never moved at all" failure shape — where baseline ==
+/// post-blank == post-wake — would otherwise score Confirmed on a wake
+/// verdict that did nothing; requiring the wake to have moved the
+/// panel catches that case as `Failed`.
+fn restore_verdict(
+    result: &Result<(), CmdFailure>,
+    baseline: Option<&PanelState>,
+    post_blank: Option<&PanelState>,
+    post_wake: Option<&PanelState>,
+) -> ExerciseVerdict {
+    if result.is_err() {
+        return ExerciseVerdict::Failed;
+    }
+    if baseline.is_none() || post_blank.is_none() || post_wake.is_none() {
+        return ExerciseVerdict::Unconfirmable;
+    }
+    // Wake should have moved the panel from its post-blank state.
+    if post_wake == post_blank {
+        return ExerciseVerdict::Failed;
+    }
+    // Wake should have returned the panel to baseline.
+    if post_wake != baseline {
+        return ExerciseVerdict::Failed;
+    }
+    ExerciseVerdict::Confirmed
+}
+
+/// True for phases where the display is blanked (or in the process of
+/// being blanked / staged) — the restore step must re-issue the blank so
+/// the display returns to its pre-exercise state.
+fn is_blanked_family_phase(phase: &str) -> bool {
+    matches!(phase, "blanked" | "blanking" | "staged" | "render_pending")
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::{PanelState, PowerState};
+
+    // ── Verdict logic (pure functions) ─────────────────────────────────────
+
+    /// The decisive test for the blank step: a controller that returns Ok
+    /// but whose `read_state()` reports the SAME panel state before and
+    /// after the blank must surface `Failed`.  RED-first proof: if the
+    /// verdict were computed from `returned_ok` only (instead of comparing
+    /// `state_before` vs `state_after`), this test would mark `Confirmed`
+    /// incorrectly.  The shape below — `Ok(())` + identical state before/
+    /// after — is the exact failure mode the feature exists to catch.
+    #[test]
+    fn blank_verdict_marks_panel_unchanged_as_failed() {
+        let same = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let verdict = blank_verdict(&Ok(()), same.as_ref(), same.as_ref());
+        assert_eq!(
+            verdict,
+            ExerciseVerdict::Failed,
+            "blank step must mark a no-move panel as Failed even when the command returned Ok"
+        );
+    }
+
+    /// Sibling to the test above: when state DOES move, the blank step is
+    /// `Confirmed`.  RED-first: a version that ignored the state comparison
+    /// would also mark this Confirmed (correct here, but can't distinguish
+    /// from the failure case) — the previous test is the discriminator.
+    #[test]
+    fn blank_verdict_marks_state_change_as_confirmed() {
+        let before = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let after = Some(PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        });
+        let verdict = blank_verdict(&Ok(()), before.as_ref(), after.as_ref());
+        assert_eq!(verdict, ExerciseVerdict::Confirmed);
+    }
+
+    /// If the controller reports `read_state() = None` for either baseline
+    /// or post-blank, the verdict is `Unconfirmable` even when the command
+    /// returned Ok.  Honest, not a fake pass.
+    #[test]
+    fn blank_verdict_unconfirmable_when_read_state_none() {
+        let none: Option<PanelState> = None;
+        assert_eq!(
+            blank_verdict(&Ok(()), None, Some(PanelState::default()).as_ref()),
+            ExerciseVerdict::Unconfirmable,
+        );
+        assert_eq!(
+            blank_verdict(&Ok(()), Some(PanelState::default()).as_ref(), none.as_ref()),
+            ExerciseVerdict::Unconfirmable,
+        );
+    }
+
+    /// Blank command itself errored → `Failed` (the command failed AND we
+    /// can't observe the panel; the failure mode is the command, not the
+    /// observability).
+    #[test]
+    fn blank_verdict_failed_when_command_errored() {
+        let verdict = blank_verdict(
+            &Err(CmdFailure {
+                controller: "fake".into(),
+                error: "E_DISPLAY_IO: scripted".into(),
+            }),
+            Some(PanelState::default()).as_ref(),
+            Some(PanelState::default()).as_ref(),
+        );
+        assert_eq!(verdict, ExerciseVerdict::Failed);
+    }
+
+    /// Sibling for the wake step: state changed (post-blank → baseline)
+    /// AND equals baseline → `Confirmed`.
+    #[test]
+    fn restore_verdict_marks_state_returned_as_confirmed() {
+        let baseline = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let post_blank = Some(PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        });
+        let post_wake = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let verdict = restore_verdict(
+            &Ok(()),
+            baseline.as_ref(),
+            post_blank.as_ref(),
+            post_wake.as_ref(),
+        );
+        assert_eq!(verdict, ExerciseVerdict::Confirmed);
+    }
+
+    /// Wake step: state changed but did NOT return to baseline → `Failed`.
+    #[test]
+    fn restore_verdict_marks_panel_not_returned_as_failed() {
+        let baseline = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let post_blank = Some(PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(20),
+        });
+        let post_wake = Some(PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(40),
+        });
+        let verdict = restore_verdict(
+            &Ok(()),
+            baseline.as_ref(),
+            post_blank.as_ref(),
+            post_wake.as_ref(),
+        );
+        assert_eq!(verdict, ExerciseVerdict::Failed);
+    }
+
+    /// The "panel never moved" failure shape: baseline == post-blank ==
+    /// post-wake.  Even though the wake step's post-wake state equals the
+    /// baseline (which by itself would be Confirmed), the wake itself
+    /// did nothing — the verdict is `Failed` because the wake should
+    /// have moved the panel from its post-blank state.
+    #[test]
+    fn restore_verdict_marks_panel_never_moved_as_failed() {
+        let frozen = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let verdict = restore_verdict(&Ok(()), frozen.as_ref(), frozen.as_ref(), frozen.as_ref());
+        assert_eq!(
+            verdict,
+            ExerciseVerdict::Failed,
+            "wake step must catch the panel-never-moved failure"
+        );
+    }
+
+    // ── run_exercise_sequence end-to-end (off run loop) ────────────────────
+
+    /// The full sequence end-to-end with a scripted read-state script:
+    /// baseline → blank → wake → restore.  Each verdict is asserted
+    /// individually so a regression in any step is loud.
+    #[tokio::test]
+    async fn exercise_sequence_confirmed_when_state_moves_and_returns() {
+        use crate::fakes::{ExerciseSink, SinkCmd};
+
+        let sink = Arc::new(ExerciseSink::new());
+        // baseline = On/80, post-blank = Standby/0, post-wake = On/80.
+        // Plus one extra read for the defensive restore step (returns to
+        // baseline again, no-op for the verdict).
+        let on_80 = PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        };
+        let standby_0 = PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        };
+        // read-state script: baseline, post-blank, post-wake, restore-read
+        sink.push_read_state(Some(on_80.clone()));
+        sink.push_read_state(Some(standby_0.clone()));
+        sink.push_read_state(Some(on_80.clone()));
+        sink.push_read_state(Some(on_80.clone()));
+
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let report = run_exercise_sequence(
+            &sink_dyn,
+            Some(BlankMode::PowerOff),
+            "active".to_string(),
+            Vec::new(),
+            DisplayId("mon".into()),
+        )
+        .await;
+
+        assert_eq!(
+            report.steps.len(),
+            4,
+            "expected read/blank/wake/restore steps"
+        );
+        assert_eq!(
+            report.steps[0].command, "read",
+            "first step is the baseline read"
+        );
+        assert_eq!(
+            report.steps[1].verdict,
+            ExerciseVerdict::Confirmed,
+            "blank step: state moved On→Standby"
+        );
+        assert_eq!(
+            report.steps[2].verdict,
+            ExerciseVerdict::Confirmed,
+            "wake step: state returned to On"
+        );
+        // Restore step: pre-exercise was "active" (defensive wake path).
+        assert_eq!(report.steps[3].command, "restore");
+
+        // The sink log should show: blank, wake, wake (the defensive
+        // restore wake). Three calls total — one of each kind in
+        // production order: blank → wake (the test wake) → wake_once
+        // (the defensive restore).
+        let log = sink.log();
+        assert_eq!(
+            log,
+            vec![
+                SinkCmd::Blank(BlankMode::PowerOff),
+                SinkCmd::Wake,
+                SinkCmd::Wake,
+            ],
+        );
+    }
+
+    /// Decisive test: a controller that returns Ok but whose panel state
+    /// does NOT change across the blank → wake sequence.  The blank
+    /// step's verdict is `Failed` and the restore step is also `Failed`
+    /// (the wake did not move the panel back either).  RED-first: if the
+    /// verdict were computed from `returned_ok` alone, both would be
+    /// `Confirmed` and the test would fail — this pins the real behavior.
+    #[tokio::test]
+    async fn exercise_sequence_marks_panel_unchanged_as_failed() {
+        use crate::fakes::ExerciseSink;
+
+        let sink = Arc::new(ExerciseSink::new());
+        // All reads return the SAME panel state — the panel never moves.
+        let frozen = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        for _ in 0..6 {
+            sink.push_read_state(frozen.clone());
+        }
+
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let report = run_exercise_sequence(
+            &sink_dyn,
+            Some(BlankMode::PowerOff),
+            "active".to_string(),
+            Vec::new(),
+            DisplayId("mon".into()),
+        )
+        .await;
+
+        assert_eq!(report.steps[1].command, "blank");
+        assert_eq!(
+            report.steps[1].verdict,
+            ExerciseVerdict::Failed,
+            "blank step: state did not change despite Ok return"
+        );
+        assert_eq!(report.steps[2].command, "wake");
+        assert_eq!(
+            report.steps[2].verdict,
+            ExerciseVerdict::Failed,
+            "wake step: state did not return to baseline"
+        );
+    }
+
+    /// Unconfirmable path: a sink that returns None from `read_state()`.
+    /// Every read is missing; commands still run; verdicts are
+    /// `Unconfirmable` (not `Failed` — we have no readback, so we can't
+    /// confirm OR fail the panel).
+    #[tokio::test]
+    async fn exercise_sequence_marks_no_readback_as_unconfirmable() {
+        use crate::fakes::ExerciseSink;
+
+        let sink = Arc::new(ExerciseSink::new());
+        // No read_state pushed → all reads return None.
+
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let report = run_exercise_sequence(
+            &sink_dyn,
+            Some(BlankMode::PowerOff),
+            "active".to_string(),
+            Vec::new(),
+            DisplayId("mon".into()),
+        )
+        .await;
+
+        assert_eq!(report.steps[1].verdict, ExerciseVerdict::Unconfirmable);
+        assert_eq!(report.steps[2].verdict, ExerciseVerdict::Unconfirmable);
+        // The restore step is also Unconfirmable (no observation).
+        assert_eq!(report.steps[3].verdict, ExerciseVerdict::Unconfirmable);
+        // But every command still ran (the sink log shows them).
+        assert!(!sink.log().is_empty());
+    }
+
+    /// Fail-safe / wake-path-sacred: an error MID-exercise still ends with
+    /// a wake.  This is the cardinal rule — an exercise that catches an
+    /// internal error must not leave the panel dark.  We assert on
+    /// `wakes_issued` AND on the last log entry being a Wake.
+    #[tokio::test]
+    async fn exercise_sequence_always_wakes_even_when_blank_errors() {
+        use crate::fakes::{ExerciseSink, SinkCmd};
+
+        let sink = Arc::new(ExerciseSink::new());
+        // Script: blank command itself errors, then wake succeeds, then
+        // read_state returns None.  The exercise MUST still issue the
+        // wake step + the defensive restore wake.
+        sink.push_blank_result(Err(CmdFailure {
+            controller: "fake".into(),
+            error: "E_DISPLAY_IO: scripted".into(),
+        }));
+        // Wake results: empty queue → Ok(()).
+
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let report = run_exercise_sequence(
+            &sink_dyn,
+            Some(BlankMode::PowerOff),
+            "active".to_string(),
+            Vec::new(),
+            DisplayId("mon".into()),
+        )
+        .await;
+
+        // Blank step verdict is Failed (the command errored).
+        assert_eq!(report.steps[1].verdict, ExerciseVerdict::Failed);
+        assert!(!report.steps[1].returned_ok);
+
+        // The wake + defensive wake both ran — the wake-path is sacred.
+        let log = sink.log();
+        assert_eq!(log.len(), 3, "expected blank + wake + restore wake");
+        assert!(matches!(log[0], SinkCmd::Blank(_)));
+        assert!(matches!(log[1], SinkCmd::Wake));
+        assert!(matches!(log[2], SinkCmd::Wake), "restore step must wake");
+
+        // And `wakes_issued` reports at least one wake (the test asserts
+        // wake count, not log order — both wake calls happened).
+        assert!(sink.wakes_issued() >= 1);
+    }
+
+    /// Manual-only display path: when the pre-exercise phase is `active`
+    /// the restore step is a defensive wake (no re-blank).  When the
+    /// pre-exercise phase is `blanked`, the restore step re-issues the
+    /// blank.  Pin both with scripted reads so the choice is visible in
+    /// the log.
+    #[tokio::test]
+    async fn exercise_sequence_restore_reblank_for_blanked_pre_phase() {
+        use crate::fakes::{ExerciseSink, SinkCmd};
+
+        let sink = Arc::new(ExerciseSink::new());
+        // Five reads: baseline, post-blank, post-wake, restore-read,
+        // restore-read.
+        let on = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let standby = Some(PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        });
+        sink.push_read_state(on.clone());
+        sink.push_read_state(standby.clone());
+        sink.push_read_state(on.clone());
+        sink.push_read_state(standby.clone());
+
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let report = run_exercise_sequence(
+            &sink_dyn,
+            Some(BlankMode::PowerOff),
+            "blanked".to_string(), // restore must re-blank
+            Vec::new(),
+            DisplayId("mon".into()),
+        )
+        .await;
+
+        assert_eq!(report.steps[3].command, "restore");
+        assert_eq!(
+            report.steps[3].blank_mode,
+            Some(BlankMode::PowerOff),
+            "restore for blanked pre-phase must re-issue the blank"
+        );
+
+        // Log: blank (the exercise), wake (the test), blank (the restore).
+        let log = sink.log();
+        assert_eq!(log.len(), 3);
+        assert!(matches!(log[0], SinkCmd::Blank(BlankMode::PowerOff)));
+        assert!(matches!(log[1], SinkCmd::Wake));
+        assert!(
+            matches!(log[2], SinkCmd::Blank(BlankMode::PowerOff)),
+            "restore for blanked pre-phase must issue a blank command, got {:?}",
+            log[2]
+        );
+    }
+
+    /// `paused_rules` plumbed through the report so the IPC dispatch layer
+    /// can resume the right rules after the exercise.
+    #[tokio::test]
+    async fn exercise_sequence_threads_paused_rules_into_report() {
+        use crate::fakes::ExerciseSink;
+
+        let sink = Arc::new(ExerciseSink::new());
+        let rules = vec![RuleId("office".into()), RuleId("lounge".into())];
+
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let report = run_exercise_sequence(
+            &sink_dyn,
+            Some(BlankMode::PowerOff),
+            "active".to_string(),
+            rules.clone(),
+            DisplayId("mon".into()),
+        )
+        .await;
+
+        assert_eq!(report.paused_rules, rules);
+    }
 
     #[test]
     fn display_snapshot_deserializes_legacy_without_controllers() {

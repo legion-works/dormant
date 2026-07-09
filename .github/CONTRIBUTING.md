@@ -36,7 +36,7 @@ Install once after cloning:
 lefthook install
 ```
 
-- **pre-commit** — `cargo fmt`, `typos`, `taplo fmt --check` (seconds).
+- **pre-commit** — `cargo fmt`, `typos`, `taplo fmt --check`, `gitleaks` (staged-only secret scan).
 - **pre-push** — `cargo clippy -- -D warnings -W clippy::pedantic`, `cargo doc` (the two gates that most often fail CI).
 
 Skip in an emergency with `git commit --no-verify` or `LEFTHOOK=0 git push`.

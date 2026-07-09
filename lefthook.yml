@@ -8,9 +8,9 @@ pre-commit:
     - name: fmt
       run: cargo fmt --all -- --check
     - name: typos
-      run: /home/icetea/.cargo/bin/typos
+      run: PATH="$HOME/.cargo/bin:$PATH" typos
     - name: taplo
-      run: /home/icetea/.cargo/bin/taplo fmt --check
+      run: PATH="$HOME/.cargo/bin:$PATH" taplo fmt --check
 
 pre-push:
   parallel: true

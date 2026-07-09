@@ -2400,6 +2400,17 @@ mod forward_ctl_tests {
             .await
             .expect("front channel send");
 
+        // Force a scheduler hand-off so forward_ctl's task is guaranteed to
+        // run, consume the front-channel message, attempt the dead-sender
+        // send, and park on `changed()` BEFORE we update the watch. Without
+        // this yield the multi-thread test runtime can race the watch write
+        // ahead of forward_ctl's first `borrow()`, letting the unfixed
+        // `let _ = sender.send(m).await` see the new live sender and
+        // deliver the message trivially — a polite test that doesn't guard
+        // the fix.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
         // Install the new generation's live sender — simulates install_generation.
         let (new_tx, mut new_rx) = mpsc::channel::<ControlMsg>(1);
         watch_tx.send(new_tx).expect("watch send");

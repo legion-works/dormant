@@ -27,4 +27,4 @@ checksums = true
 # The github-build-setup snippet handles Node + npm ci + npm run build.
 features = ["web-ui"]
 all-features = false
-github-build-setup = ".github/dist-build-setup.yml"
+github-build-setup = "../dist-build-setup.yml"

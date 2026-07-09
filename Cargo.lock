@@ -894,6 +894,7 @@ dependencies = [
  "reqwest",
  "rustls 0.23.41",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-tungstenite 0.24.0",

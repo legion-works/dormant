@@ -911,7 +911,15 @@ impl SamsungTizenController {
 
     /// Blank via Samsung IP Control G2 backlight.
     ///
-    /// On the first blank: read the current backlight, save it, set to 0.
+    /// On the first blank: read the current backlight, save it, set to 0,
+    /// then **read the backlight back** to confirm the panel actually
+    /// accepted the set. A transient mismatch (e.g. the TV briefly
+    /// returning the pre-set value while applying) self-heals via a
+    /// single retry of the set. A persistent mismatch returns
+    /// [`CmdFailure`] with the `E_DISPLAY_IO` prefix — the operator's
+    /// core requirement: "says blanked but isn't" must become an honest
+    /// failure, never a false success.
+    ///
     /// On subsequent blanks (already at 0): read returns 0, but the saved
     /// value is NOT overwritten — first-blank-wins prevents the wake from
     /// restoring 0 (stuck-dark).
@@ -932,12 +940,7 @@ impl SamsungTizenController {
                 samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
             })?;
 
-        self.backlight
-            .set_backlight(&self.host, &token, 0)
-            .await
-            .map_err(|e| {
-                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
-            })?;
+        self.set_and_confirm_backlight(&token, 0).await?;
 
         let mut saved = self
             .saved_backlight
@@ -962,6 +965,11 @@ impl SamsungTizenController {
     /// only dismisses picture-off. Without this guarantee, a daemon
     /// restart that loses `saved_backlight` would leave the panel dimmed
     /// while the daemon thinks it woke.
+    ///
+    /// Readback-confirm: after the set, the backlight is read back; a
+    /// transient mismatch self-heals via a single retry, a persistent
+    /// mismatch returns [`CmdFailure`] so the daemon surfaces the truth
+    /// instead of silently leaving the panel dim.
     async fn restore_backlight_with_default(&self) -> Result<(), CmdFailure> {
         let target = {
             let saved = self
@@ -978,14 +986,9 @@ impl SamsungTizenController {
             .map_err(|e| {
                 samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
             })?;
-        self.backlight
-            .set_backlight(&self.host, &token, target)
-            .await
-            .map_err(|e| {
-                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
-            })?;
+        self.set_and_confirm_backlight(&token, target).await?;
 
-        // set_backlight succeeded — clear the saved value so the next
+        // set_and_confirm succeeded — clear the saved value so the next
         // blank cycle starts fresh.
         let mut saved = self
             .saved_backlight
@@ -993,6 +996,66 @@ impl SamsungTizenController {
             .expect("saved_backlight poisoned");
         *saved = None;
         Ok(())
+    }
+
+    /// Set the backlight to `target` and read it back. Retries the set
+    /// ONCE if the first readback does not match `target` (transient
+    /// misses self-heal). Returns [`CmdFailure`] (`E_DISPLAY_IO`) if the
+    /// second readback still does not match — "says blanked but isn't"
+    /// becomes an honest failure rather than a false success.
+    ///
+    /// Errors from the set or readback are mapped through
+    /// [`samsung_ip::map_transport_error`] so a `-32010` mid-set
+    /// invalidates the token (the controller's caller can then re-acquire
+    /// and retry the operation from `blank_backlight` or
+    /// `restore_backlight_with_default`).
+    async fn set_and_confirm_backlight(&self, token: &str, target: u8) -> Result<(), CmdFailure> {
+        self.backlight
+            .set_backlight(&self.host, token, target)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+
+        let first_readback = self
+            .backlight
+            .get_backlight(&self.host, token)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+        if first_readback == target {
+            return Ok(());
+        }
+
+        // Transient miss — retry the set once and re-check.
+        self.backlight
+            .set_backlight(&self.host, token, target)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+        let second_readback = self
+            .backlight
+            .get_backlight(&self.host, token)
+            .await
+            .map_err(|e| {
+                samsung_ip::map_transport_error(Self::NAME, &*self.backlight, &self.host, &e)
+            })?;
+        if second_readback == target {
+            return Ok(());
+        }
+
+        // Persistent miss — the panel did not accept the set. Surface
+        // this as a real failure (wake-safety: a wake that can't confirm
+        // must err toward the panel being ON, not silently dim).
+        Err(CmdFailure {
+            controller: Self::NAME.to_string(),
+            error: format!(
+                "{E_DISPLAY_IO}: samsung-ip backlight readback mismatch after retry \
+                 (target={target}, first={first_readback}, second={second_readback})"
+            ),
+        })
     }
 }
 
@@ -1586,6 +1649,9 @@ mod tests {
             .push(Ok("tok-1".into()));
         bl_fake.get_results.lock().unwrap().push(Ok(35));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm: the controller reads the backlight back
+        // after the set and expects 0. The fake returns the success path.
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
 
         let ctrl = SamsungTizenController::with_transports(
             "10.1.1.7".into(),
@@ -1606,10 +1672,14 @@ mod tests {
 
         // Acquire was called once with the right host.
         assert_eq!(*bl_fake.acquire_hosts.lock().unwrap(), vec!["10.1.1.7"]);
-        // Get was called with the acquired token.
+        // Get was called twice — the initial read (saves current) and the
+        // readback-confirm after the set.
         assert_eq!(
             *bl_fake.get_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), "tok-1".to_string())]
+            vec![
+                ("10.1.1.7".to_string(), "tok-1".to_string()),
+                ("10.1.1.7".to_string(), "tok-1".to_string()),
+            ]
         );
         // Set was called once with backlight=0 and the acquired token
         // (recorded as value, token comes through get_calls).
@@ -1641,6 +1711,9 @@ mod tests {
             .unwrap()
             .push(Ok("tok".into()));
         bl_fake.get_results.lock().unwrap().push(Ok(42));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        // Two confirm reads — one per blank.
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
         bl_fake.get_results.lock().unwrap().push(Ok(0));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
@@ -1680,6 +1753,8 @@ mod tests {
             .push(Ok("tok".into()));
         bl_fake.get_results.lock().unwrap().push(Ok(28));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm after the blank → 0.
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
         // For wake: acquire + set_backlight(28)
         bl_fake
             .acquire_results
@@ -1687,6 +1762,8 @@ mod tests {
             .unwrap()
             .push(Ok("tok".into()));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm after the wake → 28.
+        bl_fake.get_results.lock().unwrap().push(Ok(28));
 
         let ctrl = SamsungTizenController::with_transports_mode(
             "10.1.1.7".into(),
@@ -2452,6 +2529,8 @@ mod tests {
             .push(Ok("tok-1".into()));
         bl_fake.get_results.lock().unwrap().push(Ok(33));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm after the blank → 0.
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
         // For wake: acquire succeeds, but set_backlight fails.
         bl_fake
             .acquire_results
@@ -2506,6 +2585,12 @@ mod tests {
             .unwrap()
             .push(Ok("tok".into()));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm after the wake → DEFAULT_RESTORE_BACKLIGHT.
+        bl_fake
+            .get_results
+            .lock()
+            .unwrap()
+            .push(Ok(DEFAULT_RESTORE_BACKLIGHT));
 
         let ctrl = SamsungTizenController::with_transports_mode(
             "10.1.1.7".into(),
@@ -2581,6 +2666,12 @@ mod tests {
             .unwrap()
             .push(Ok("tok".into()));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm after the wake → DEFAULT_RESTORE_BACKLIGHT.
+        bl_fake
+            .get_results
+            .lock()
+            .unwrap()
+            .push(Ok(DEFAULT_RESTORE_BACKLIGHT));
 
         // Simulate the registry's wiring for a ladder whose primary stage
         // is BrightnessZero: configured_primary_mode = BrightnessZero.
@@ -2649,6 +2740,8 @@ mod tests {
             .unwrap()
             .push(Ok("tok".into()));
         bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Readback-confirm after the wake → 25.
+        bl_fake.get_results.lock().unwrap().push(Ok(25));
 
         let ctrl = SamsungTizenController::with_transports_mode(
             "10.1.1.7".into(),
@@ -2667,5 +2760,231 @@ mod tests {
             *bl_fake.set_calls.lock().unwrap(),
             vec![("10.1.1.7".to_string(), 25)]
         );
+    }
+
+    // ── READBACK-CONFIRM TESTS — pin that the controller verifies the
+    //    blank/restore actually took effect on the panel before claiming
+    //    success. The transport's `get_backlight` is the source of truth.
+    //    A transient mismatch retries the set once; a persistent mismatch
+    //    surfaces as `CmdFailure` so the daemon reports truth instead of
+    //    "false success".
+
+    /// Blank: set returns ok and the readback confirms 0 — no retry, the
+    /// single set is accepted. (Happy-path baseline for the readback gate.)
+    #[tokio::test]
+    async fn brightness_zero_blank_succeeds_when_readback_confirms_zero() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        // Initial read → 40, confirm-after-set → 0.
+        bl_fake.get_results.lock().unwrap().push(Ok(40));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("10.1.1.7".to_string(), 0)]
+        );
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(40));
+    }
+
+    /// Blank: the FIRST readback after the set does NOT equal the target
+    /// (the panel is still at 25 — a transient miss). The controller must
+    /// retry the set ONCE and re-check. If the second readback confirms 0,
+    /// the blank succeeds. This guards against single-shot false negatives
+    /// without weakening the readback-confirm contract.
+    #[tokio::test]
+    async fn brightness_zero_blank_retries_when_first_readback_mismatches() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        // Initial read → 40. First confirm-after-set → 25 (didn't take).
+        // Second confirm-after-retry → 0 (now correct).
+        bl_fake.get_results.lock().unwrap().push(Ok(40));
+        bl_fake.get_results.lock().unwrap().push(Ok(25));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        // Two set calls (initial + retry) — both with target 0.
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("10.1.1.7".to_string(), 0), ("10.1.1.7".to_string(), 0)]
+        );
+        // Saved value still 40 (pre-blank), first-blank-wins preserved.
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(40));
+    }
+
+    /// Blank: BOTH the first and second readbacks do NOT equal the target.
+    /// The controller MUST surface a `CmdFailure` carrying the
+    /// `E_DISPLAY_IO` prefix — "says blanked but isn't" must become an
+    /// honest failure. `saved_backlight` is NOT set in this case (the
+    /// blank is not confirmed; restoring from a confirmed-pre-blank
+    /// value would be moot).
+    #[tokio::test]
+    async fn brightness_zero_blank_fails_when_readback_persistently_mismatches() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        // Initial read → 40. First confirm-after-set → 25. Second
+        // confirm-after-retry → 25 again. Persistent miss.
+        bl_fake.get_results.lock().unwrap().push(Ok(40));
+        bl_fake.get_results.lock().unwrap().push(Ok(25));
+        bl_fake.get_results.lock().unwrap().push(Ok(25));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+
+        let ctrl = SamsungTizenController::with_transports(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+        );
+
+        let err = ctrl.blank(BlankMode::BrightnessZero).await.unwrap_err();
+        assert_eq!(err.controller, "samsung-tizen");
+        assert!(
+            err.error.starts_with(E_DISPLAY_IO),
+            "readback failure must carry E_DISPLAY_IO: {}",
+            err.error
+        );
+        // Two set calls (initial + retry) — both with target 0.
+        assert_eq!(bl_fake.set_calls.lock().unwrap().len(), 2);
+        // The blank is NOT confirmed; saved_backlight is left untouched
+        // so a wake attempt can still recover.
+        assert!(
+            ctrl.saved_backlight.lock().unwrap().is_none(),
+            "unconfirmed blank must not stash a saved value (it would be moot)"
+        );
+    }
+
+    /// Wake (restore): set returns ok and the readback confirms the
+    /// target — no retry, the single set is accepted.
+    #[tokio::test]
+    async fn brightness_zero_wake_succeeds_when_readback_confirms_target() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // Blank: acquire + initial read (40) + confirm-after-set (0).
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(40));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Wake: acquire + set + confirm-after-set (40 = restored).
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(40));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        ctrl.wake().await.unwrap();
+        // Two set calls (blank to 0, wake to 40). No retry.
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("10.1.1.7".to_string(), 0), ("10.1.1.7".to_string(), 40)]
+        );
+    }
+
+    /// Wake: readback does NOT confirm the target → retry set once → still
+    /// doesn't confirm → return `CmdFailure` (`E_DISPLAY_IO`). Wake safety:
+    /// better to surface the failure to the operator than silently leave
+    /// the panel dim.
+    #[tokio::test]
+    async fn brightness_zero_wake_fails_when_readback_persistently_mismatches() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // Blank: acquire + initial read (40) + confirm-after-set (0).
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(40));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Wake: acquire + set + confirm-after-set (0, didn't take) + retry
+        // set + confirm-after-retry (0 again, persistent miss).
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "10.1.1.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake,
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        let err = ctrl.wake().await.unwrap_err();
+        assert_eq!(err.controller, "samsung-tizen");
+        assert!(
+            err.error.starts_with(E_DISPLAY_IO),
+            "wake readback failure must carry E_DISPLAY_IO: {}",
+            err.error
+        );
+        // Three set calls (blank to 0, wake to 40, wake retry to 40).
+        assert_eq!(bl_fake.set_calls.lock().unwrap().len(), 3);
     }
 }

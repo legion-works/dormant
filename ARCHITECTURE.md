@@ -8,12 +8,12 @@ Crate map, data flow, and where-to-find-it guide for the dormant codebase.
 |---|---|---|
 | `dormant-core` | Domain types, traits, config schema/validation, zone fusion engine, rules engine, state machine, IPC protocol, reload types, doctor wire types (`DoctorReport`/`Check`/`CheckStatus`) — pure logic, no I/O | No |
 | `dormant-sensors` | Sensor sources: MQTT (`mqtt.rs`), Home Assistant WebSocket (`ha_ws.rs`), USB-serial LD2410 radar (`usb_ld2410.rs`), plus a shared backoff helper and a static registry | No |
-| `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), VCP operations (`vcp_ops.rs`), Home Assistant passthrough (`ha_passthrough.rs`), execution engine with fallback/retry (`executor.rs`), static registry | No |
-| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI; live coalesced `DoctorService` for the daemon + web UI. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
+| `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), VCP operations (`vcp_ops.rs`), Home Assistant passthrough (`ha_passthrough.rs`), Samsung Tizen (`samsung_tizen.rs` — port 8002 WebSocket + Wake-on-LAN + pairing) plus its audio-safe IP Control G2 JSON-RPC transport (`samsung_ip.rs` — port 1516 `backlightControl` for `brightness_zero`), execution engine with fallback/retry (`executor.rs`), static registry | No |
+| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI, Samsung Tizen (reachability + power state + token presence); live coalesced `DoctorService` for the daemon + web UI. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
 | `dormant-web` | Loopback-only web dashboard: axum HTTP/WS bridge that reads live engine state and serves a SPA (`crates/dormant-web/webui/`). Optional dependency of `dormantd`, gated behind the `web-ui` Cargo feature — when off, zero web code is compiled | No |
 | `dormant-render` | Local Wayland layer-shell `RenderSink`: software-blank black overlay (final ladder fallback when every display controller failed) and libmpv-driven screensaver overlay (last-resort idle surface). Wayland I/O is `target_os = "linux"`-gated; non-Linux builds expose a no-op stub with the same `LayerShellRenderSink` surface so callers compile unconditionally | No |
 | `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, single-instance flock, reload handling, optional web UI spawn, logging | **Yes** — `dormantd` |
-| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `doctor` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
+| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `doctor` (per-target subcommands including `samsung`), `pair samsung <host>` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
 | `dormant-tray` | KDE `StatusNotifierItem` tray applet (`ksni`): live icon (Normal / Attention / Paused / Unreachable), pause/resume/blank/wake menu items, tooltip, reconnecting IPC event-stream reader. Linux-only — non-Linux bin prints a notice and exits 1 so cross-platform `cargo check` stays green | **Yes** — `dormant-tray` |
 
 Each crate follows the convention: one module per concept, one file per sensor/controller, explicit static registry with no proc-macro magic.
@@ -81,17 +81,25 @@ DPMS-based blanking (including `kwin-dpms`) disables the DRM/KMS output,
 which tears down the associated ALSA audio sink — audio dies along with the
 picture. This is architectural, not a config setting.
 
-Two display controllers blank without touching the output, preserving audio:
+Three display-controller modes blank without tearing down the output,
+preserving audio:
 
 - **`ddcci`** — VCP `0xD6` sends a "display power off" command over I2C.
   The monitor blanks its panel internally; the OS output and ALSA device
   remain active. Only works on DDC/CI-capable monitors that support D6.
 - **`samsung-tizen`** — `KEY_PICTURE_OFF` blanks the TV panel over WebSocket.
   The TV continues rendering audio; the HDMI output remains active.
+- **`samsung-tizen`** (`brightness_zero`) — Samsung IP Control G2 JSON-RPC on
+  port 1516 calls `backlightControl` to dim the panel to 0 via `samsung_ip`.
+  Source and audio keep running; the HDMI output stays active. Used when
+  `KEY_PICTURE_OFF` would cut the source or pause media.
 
 Per-display strategy:
 - DDC/CI monitor → `ddcci` power_off (audio-safe, verified on AOC AG326UZD)
 - Samsung Tizen TV → `samsung-tizen` picture-off (audio-safe, verified on S90D)
+- Samsung Tizen TV where the source must keep running → `samsung-tizen`
+  `brightness_zero` via port 1516 IP Control G2 (audio-safe, softer panel
+  change — does not pause media)
 - Outputs with no DDC/CI and no audio → `kwin-dpms` is acceptable (no audio to kill)
 - Outputs with audio but no DDC/CI → Tizen passthrough or `command` with an
   audio-safe external command; otherwise live with the audio loss

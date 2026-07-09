@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::config::{Strictness, load_credentials};
+use dormant_core::config::{Strictness, load_config, load_credentials};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::paths;
 use dormant_core::rules::{EmergencyWakeReport, EmergencyWakeResult};
@@ -32,9 +32,6 @@ use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry;
-
-#[cfg(unix)]
-use dormant_core::config::load_config;
 
 // ── CLI surface ────────────────────────────────────────────────────────────────
 

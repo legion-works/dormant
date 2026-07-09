@@ -2321,9 +2321,7 @@ impl Dispatch<WlPointer, ()> for WaylandState {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            wayland_client::protocol::wl_pointer::Event::Enter {
-                serial, surface: _, ..
-            } => {
+            wayland_client::protocol::wl_pointer::Event::Enter { serial, .. } => {
                 // Cursor hide: a null surface makes the compositor stop
                 // drawing one.  Surface receive pointer input because we
                 // never set an input region.
@@ -2332,9 +2330,7 @@ impl Dispatch<WlPointer, ()> for WaylandState {
                 }
                 state.last_pointer_serial = Some(serial);
             }
-            wayland_client::protocol::wl_pointer::Event::Button {
-                serial, button: _, ..
-            } => {
+            wayland_client::protocol::wl_pointer::Event::Button { serial, .. } => {
                 state.last_pointer_serial = Some(serial);
                 state.on_input_event();
             }

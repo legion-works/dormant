@@ -19,10 +19,42 @@ use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{App, ReloadOutcome, validate_only};
 use tempfile::TempDir;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Resilient snapshot: retries across the reload generation-switch window.
+///
+/// After a successful reload the reload outcome is signalled before
+/// `forward_ctl`'s watch switches to the new generation's sender.  A
+/// [`ControlMsg::Snapshot`] sent in that window lands on the old (now
+/// closed) sender and its embedded oneshot is dropped → `RecvError`.
+/// Retrying until the new generation is serving reflects real IPC-client
+/// behavior (issue #9 — a documented, accepted v1 limitation). The daemon
+/// is behaving correctly; the test must tolerate the transient window.
+async fn snapshot_with_retry(ctl: &mpsc::Sender<ControlMsg>) -> StateSnapshot {
+    const ATTEMPTS: usize = 10;
+    const SLEEP: Duration = Duration::from_millis(100);
+    const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+
+    for remaining in (0..ATTEMPTS).rev() {
+        let (tx, rx) = oneshot::channel();
+        if ctl.send(ControlMsg::Snapshot(tx)).await.is_err() {
+            tokio::time::sleep(SLEEP).await;
+            continue;
+        }
+        match tokio::time::timeout(RECV_TIMEOUT, rx).await {
+            Ok(Ok(snap)) => return snap,
+            _ => {
+                if remaining > 0 {
+                    tokio::time::sleep(SLEEP).await;
+                }
+            }
+        }
+    }
+    panic!("snapshot_with_retry: all {ATTEMPTS} attempts exhausted");
+}
 
 fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
@@ -684,13 +716,8 @@ async fn ruleless_display_preserves_phase_on_reload() {
     );
 
     // Verify mon2 phase is still "blanked" in the snapshot.
-    let ctl = handle.control_sender();
-    let (tx, rx) = oneshot::channel();
-    ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
-    let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
-        .await
-        .expect("snapshot in time")
-        .expect("snapshot reply");
+    // Retry across the reload generation-switch window (issue #9).
+    let snap = snapshot_with_retry(&handle.control_sender()).await;
     let m2_snap = snap
         .displays
         .iter()
@@ -1753,12 +1780,8 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     );
 
     // The manual display's phase should still be "blanked" in the snapshot.
-    let (tx, rx) = oneshot::channel();
-    ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
-    let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
-        .await
-        .expect("snapshot in time")
-        .expect("snapshot reply");
+    // Retry across the reload generation-switch window (issue #9).
+    let snap = snapshot_with_retry(&handle.control_sender()).await;
     let manual_snap = snap
         .displays
         .iter()
@@ -1952,12 +1975,8 @@ async fn manual_only_display_full_lifecycle_across_reload() {
     );
 
     {
-        let (tx, rx) = oneshot::channel();
-        ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
-        let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
-            .await
-            .expect("snapshot in time")
-            .expect("snapshot reply");
+        // Retry across the reload generation-switch window (issue #9).
+        let snap = snapshot_with_retry(&handle.control_sender()).await;
         let manual_snap = snap
             .displays
             .iter()

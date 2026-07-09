@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::traits::{CommandSink, RenderSink, SensorSource};
+use crate::traits::{CommandSink, DisplayController, PanelState, RenderSink, SensorSource};
 use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 
 // ── FakeSensorSource ───────────────────────────────────────────────────────────
@@ -336,5 +336,264 @@ impl RenderSink for RecordingRenderSink {
             .expect("RecordingRenderSink lock poisoned");
         let now = tokio::time::Instant::now().duration_since(g.created_at);
         g.log.push((now, RenderCmd::Teardown { r#gen }));
+    }
+}
+
+// ── ExerciseSink — scriptable read_state for ControlMsg::Exercise tests ────────
+
+/// A [`CommandSink`] test double for the control-path verification
+/// feature. Records every blank/wake call and lets each test program a
+/// script of [`PanelState`] snapshots that `read_state()` returns in
+/// sequence.
+///
+/// Why not extend `RecordingSink`?  The exercise semantics are qualitatively
+/// different (we care about state transitions across commands, not just
+/// command counts), and keeping the readback script on its own surface
+/// makes the test fakes easier to read — the `RecordingSink` log stays
+/// command-only, the `ExerciseSink` log carries every panel observation.
+///
+/// Three semantics the tests pin:
+/// 1. State-script exhaustion ⇒ `None` (we have no further observation,
+///    so the next step reads "Unconfirmable" rather than fabricating a
+///    state).
+/// 2. Every blank/wake call is recorded regardless of the readback —
+///    the test asserts command count independently of state changes.
+/// 3. The wake-path-sacred guarantee is enforced by `wakes_issued`
+///    (count of wake calls) which the fail-safe test asserts on.
+#[derive(Debug, Clone)]
+pub struct ExerciseSink {
+    inner: Arc<Mutex<ExerciseInner>>,
+}
+
+#[derive(Debug)]
+struct ExerciseInner {
+    /// Every blank/wake call, oldest first (so a fail-safe test can
+    /// assert the last entry was a wake).
+    log: Vec<SinkCmd>,
+    /// Scripted `read_state()` responses — popped FIFO. Empty ⇒ `None`.
+    read_states: VecDeque<Option<PanelState>>,
+    /// Scripted blank results — popped FIFO. Empty ⇒ `Ok(())`.
+    blank_results: VecDeque<Result<(), CmdFailure>>,
+    /// Scripted wake results — popped FIFO. Empty ⇒ `Ok(())`.
+    wake_results: VecDeque<Result<(), CmdFailure>>,
+    /// Monotonic instant captured at construction for log timestamps.
+    #[allow(dead_code)]
+    created_at: tokio::time::Instant,
+    /// Monotonic instant captured when [`Self::wake`] was last called.
+    /// Tests assert on this to confirm the final step in an error-mid-
+    /// exercise scenario was a wake.
+    last_wake_at: Option<tokio::time::Instant>,
+}
+
+impl ExerciseSink {
+    /// Construct an empty [`ExerciseSink`] — no scripted reads or
+    /// command results, every `read_state()` returns `None` and every
+    /// blank/wake command returns `Ok(())` (the queue-empty default).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ExerciseInner {
+                log: Vec::new(),
+                read_states: VecDeque::new(),
+                blank_results: VecDeque::new(),
+                wake_results: VecDeque::new(),
+                created_at: tokio::time::Instant::now(),
+                last_wake_at: None,
+            })),
+        }
+    }
+
+    /// Append one scripted `read_state()` response. `None` means "the
+    /// controller has no readback for this call" — the exercise handler
+    /// surfaces that as `Unconfirmable`.
+    pub fn push_read_state(&self, state: Option<PanelState>) {
+        self.inner
+            .lock()
+            .expect("ExerciseSink lock poisoned")
+            .read_states
+            .push_back(state);
+    }
+
+    /// Append one scripted `blank()` result. Default when the queue is
+    /// empty is `Ok(())`.
+    pub fn push_blank_result(&self, result: Result<(), CmdFailure>) {
+        self.inner
+            .lock()
+            .expect("ExerciseSink lock poisoned")
+            .blank_results
+            .push_back(result);
+    }
+
+    /// Append one scripted `wake()` result. Default when the queue is
+    /// empty is `Ok(())`.
+    pub fn push_wake_result(&self, result: Result<(), CmdFailure>) {
+        self.inner
+            .lock()
+            .expect("ExerciseSink lock poisoned")
+            .wake_results
+            .push_back(result);
+    }
+
+    /// Snapshot of every blank/wake call, oldest first.
+    #[must_use]
+    pub fn log(&self) -> Vec<SinkCmd> {
+        self.inner
+            .lock()
+            .expect("ExerciseSink lock poisoned")
+            .log
+            .clone()
+    }
+
+    /// Number of `wake()` calls recorded (success or failure — the count
+    /// matters for the fail-safe test).
+    #[must_use]
+    pub fn wakes_issued(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("ExerciseSink lock poisoned")
+            .log
+            .iter()
+            .filter(|c| matches!(c, SinkCmd::Wake))
+            .count()
+    }
+}
+
+impl Default for ExerciseSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl CommandSink for ExerciseSink {
+    async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
+        let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
+        g.log.push(SinkCmd::Blank(mode));
+        g.blank_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    async fn wake(&self) -> Result<(), CmdFailure> {
+        let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
+        let now = tokio::time::Instant::now();
+        g.log.push(SinkCmd::Wake);
+        g.last_wake_at = Some(now);
+        g.wake_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    async fn wake_once(&self) -> Result<(), CmdFailure> {
+        // wake_once == wake for the exercise semantics — the executor's
+        // bounded-retry variant doesn't matter for the control-path test.
+        self.wake().await
+    }
+
+    fn controller_health(&self) -> Vec<crate::rules::ControllerHealth> {
+        Vec::new()
+    }
+
+    async fn read_state(&self) -> Option<PanelState> {
+        let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
+        g.read_states.pop_front().unwrap_or(None)
+    }
+}
+
+// ── ProgrammableController — DisplayController read_state override for tests ────
+
+/// A scripted [`DisplayController`] for tests that want to verify the
+/// per-controller `read_state` override path (rather than the
+/// `CommandSink` chain-walk the executor provides).  Not used by the
+/// exercise end-to-end tests directly — those use [`ExerciseSink`], a
+/// `CommandSink` — but documented here because it is the canonical
+/// `DisplayController` read-state fake and shows up in the controller-
+/// override tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ProgrammableController {
+    name: &'static str,
+    supported_modes: Vec<BlankMode>,
+    read_state_script: Arc<Mutex<Vec<Option<PanelState>>>>,
+    blank_result: Arc<Mutex<Result<(), CmdFailure>>>,
+    wake_result: Arc<Mutex<Result<(), CmdFailure>>>,
+}
+
+#[allow(dead_code)]
+impl ProgrammableController {
+    /// Construct a controller with `Ok(())` defaults for every command
+    /// and an empty `read_state` script (so `read_state()` returns
+    /// `None`).
+    #[must_use]
+    pub fn new(name: &'static str, supported_modes: Vec<BlankMode>) -> Self {
+        Self {
+            name,
+            supported_modes,
+            read_state_script: Arc::new(Mutex::new(Vec::new())),
+            blank_result: Arc::new(Mutex::new(Ok(()))),
+            wake_result: Arc::new(Mutex::new(Ok(()))),
+        }
+    }
+
+    /// Append one scripted `read_state()` response.  Drained FIFO.
+    pub fn push_read_state(&self, state: Option<PanelState>) {
+        self.read_state_script
+            .lock()
+            .expect("ProgrammableController lock poisoned")
+            .push(state);
+    }
+
+    /// Override the result returned by [`Self::blank`].
+    pub fn set_blank_result(&self, result: Result<(), CmdFailure>) {
+        *self
+            .blank_result
+            .lock()
+            .expect("ProgrammableController lock poisoned") = result;
+    }
+
+    /// Override the result returned by [`Self::wake`].
+    pub fn set_wake_result(&self, result: Result<(), CmdFailure>) {
+        *self
+            .wake_result
+            .lock()
+            .expect("ProgrammableController lock poisoned") = result;
+    }
+}
+
+#[async_trait]
+#[allow(dead_code)]
+impl DisplayController for ProgrammableController {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_modes(&self) -> Vec<BlankMode> {
+        self.supported_modes.clone()
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+        self.blank_result
+            .lock()
+            .expect("ProgrammableController lock poisoned")
+            .clone()
+    }
+
+    async fn wake(&self) -> Result<(), CmdFailure> {
+        self.wake_result
+            .lock()
+            .expect("ProgrammableController lock poisoned")
+            .clone()
+    }
+
+    async fn read_state(&self) -> Option<PanelState> {
+        let mut script = self
+            .read_state_script
+            .lock()
+            .expect("ProgrammableController lock poisoned");
+        if script.is_empty() {
+            None
+        } else {
+            script.remove(0)
+        }
     }
 }

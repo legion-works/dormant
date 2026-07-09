@@ -1192,6 +1192,54 @@ impl DisplayController for SamsungTizenController {
                 error: format!("{E_DISPLAY_IO}: {e}"),
             })
     }
+
+    /// Read the panel state — REST `PowerState` (on/standby) plus the
+    /// port-1516 backlight value when the controller has a [`BacklightTransport`]
+    /// and is configured for `BrightnessZero`.
+    ///
+    /// The REST call goes through the same [`TvTransport`] the controller
+    /// uses for `KEY_*` commands, so the read survives in the same
+    /// network conditions as the actual blank/wake commands.  The port-1516
+    /// readback only fires when the controller's `configured_primary_mode`
+    /// is `BrightnessZero` — reading it for a `ScreenOffAudioOn` display
+    /// would waste a token acquire and put `0..=50` brightness into a
+    /// report whose native blank mode is picture-off.
+    ///
+    /// Returns `None` when neither the REST readback nor a backlight read
+    /// succeeded (or when the controller is in a blanked-mode that has no
+    /// native readback).
+    async fn read_state(&self) -> Option<dormant_core::traits::PanelState> {
+        use dormant_core::traits::{PanelState, PowerState};
+
+        let power = match self.transport.get_power_state(&self.host).await.as_deref() {
+            Some("on") => Some(PowerState::On),
+            Some("standby") => Some(PowerState::Standby),
+            _ => None,
+        };
+
+        // Backlight readback is only meaningful when the controller is in
+        // the audio-safe `BrightnessZero` mode — that path actually moves
+        // the backlight value (picture-off uses the TV's panel relay).
+        let brightness = if self.configured_primary_mode == BlankMode::BrightnessZero {
+            match self.backlight.acquire_token(&self.host).await {
+                Ok(token) => self
+                    .backlight
+                    .get_backlight(&self.host, &token)
+                    .await
+                    .ok()
+                    .map(u16::from),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if power.is_none() && brightness.is_none() {
+            None
+        } else {
+            Some(PanelState { power, brightness })
+        }
+    }
 }
 
 // ── Pairing ─────────────────────────────────────────────────────────────────────

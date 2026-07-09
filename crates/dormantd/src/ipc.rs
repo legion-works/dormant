@@ -250,6 +250,10 @@ async fn handle_connection(
                 let resp = handle_emergency_wake(&ctl_tx).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::Exercise { display } => {
+                let resp = handle_exercise(&ctl_tx, &display).await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
     }
 }
@@ -343,6 +347,40 @@ async fn handle_emergency_wake(ctl_tx: &mpsc::Sender<ControlMsg>) -> IpcResponse
         Ok(Ok(report)) => IpcResponse::emergency(report),
         Ok(Err(_recv_dropped)) => IpcResponse::error("emergency_wake: engine dropped reply"),
         Err(_elapsed) => IpcResponse::error("emergency_wake: timed out"),
+    }
+}
+
+/// Bound on how long the IPC server waits for an `Exercise` reply from the
+/// engine.  The engine's actual work (blank → read → wake → read → restore)
+/// is bounded internally by per-read timeouts on `read_state`, so this
+/// window only bounds the IPC wait — the rule-pause release is guaranteed
+/// engine-side regardless (see `ExerciseResume` in the internal results
+/// channel), so a timeout here CANNOT strand a paused rule.
+const EXERCISE_IPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Dispatch `ControlMsg::Exercise` and wait for the engine's
+/// [`ExerciseReport`] reply.  Waits up to [`EXERCISE_IPC_TIMEOUT`].
+/// The engine owns the rule-pause window — the IPC layer does not
+/// forward a `Resume` (that would strand the pause if this caller
+/// timed out or disconnected); the resume fires from the engine's
+/// internal results channel as soon as the spawned sequence completes.
+async fn handle_exercise(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> IpcResponse {
+    if let Some(err) = validate_display_name(ctl_tx, display).await {
+        return err;
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let msg = ControlMsg::Exercise {
+        display: dormant_core::types::DisplayId(display.to_string()),
+        reply: tx,
+    };
+    if ctl_tx.send(msg).await.is_err() {
+        return IpcResponse::error("engine not available");
+    }
+    match tokio::time::timeout(EXERCISE_IPC_TIMEOUT, rx).await {
+        Ok(Ok(report)) => IpcResponse::exercise(report),
+        Ok(Err(_recv_dropped)) => IpcResponse::error("exercise: engine dropped reply"),
+        Err(_elapsed) => IpcResponse::error("exercise: timed out"),
     }
 }
 

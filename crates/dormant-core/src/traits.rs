@@ -7,8 +7,53 @@
 
 use std::any::Any;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::DormantError;
 use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
+
+/// A coarse power state observed by [`PanelState`] readback.
+///
+/// Models the two values the control-path verification feature
+/// (`dormantctl doctor --exercise`) cares about: was the panel *on* before
+/// the test command, was it *off / standby* afterwards.  Controllers map
+/// their native readback to these variants (DDC/CI VCP `0xD6`, Samsung REST
+/// `PowerState`, …) — the enum is intentionally coarse so adding a new
+/// readback source does not have to invent a new wire vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerState {
+    /// Panel is powered on (DDC/CI VCP `0xD6` = `0x01`, Samsung `PowerState` = `"on"`).
+    On,
+    /// Panel is in standby / off (DDC/CI `0xD6` ∈ `0x02..=0x05`,
+    /// Samsung `PowerState` = `"standby"`).
+    Standby,
+}
+
+/// A point-in-time snapshot of what a display controller can observe about
+/// the panel it drives.
+///
+/// Every field is `Option<…>` because not every controller exposes every
+/// readback (DDC/CI has no backlight read in the `0x10..=0x50` range the
+/// daemon uses; Samsung Tizen has no brightness read outside the
+/// `BrightnessZero` path; command/kwin-dpms/ha-passthrough expose neither).
+/// `PartialEq` is derived so the exercise handler can ask "did this change?"
+/// by a direct comparison — no tolerance logic, no clamping; controllers
+/// report in their own scale and the engine compares end-to-end.
+///
+/// Lives in the traits module so `DisplayController::read_state` /
+/// `CommandSink::read_state` can name it without a cross-module import.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PanelState {
+    /// Current power state, if the controller can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerState>,
+    /// Current brightness value, in the controller's native scale
+    /// (DDC/CI `0x10` reports 0–100; Samsung port-1516 `backlightControl`
+    /// reports 0–50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<u16>,
+}
 
 /// A source of presence observations for one or more sensors (MQTT, Home
 /// Assistant WebSocket, USB-serial radar, ...).
@@ -62,6 +107,24 @@ pub trait DisplayController: Any + Send + Sync {
 
     /// Wake the display.
     async fn wake(&self) -> Result<(), CmdFailure>;
+
+    /// Read the current panel state — `power` and/or `brightness`, in the
+    /// controller's native scale.
+    ///
+    /// Default returns `None` (the controller has no readback surface — the
+    /// honest answer for `command`, `kwin-dpms`, `ha-passthrough`, and any
+    /// future controller that only issues commands without observing the
+    /// panel).  DDC/CI and Samsung Tizen override with concrete reads
+    /// (VCP `0x10`/`0xD6`, REST `PowerState`, port-1516 backlight).
+    ///
+    /// Called by `dormantctl doctor --exercise` to confirm a blank/wake
+    /// *actually moved the panel* — the systemic guard against the
+    /// samsung stale-socket + port-1516 400s failure shape (command returned
+    /// `Ok`, panel never changed).  When the result is `None` the exercise
+    /// surfaces `Unconfirmable` rather than a fake `Confirmed`.
+    async fn read_state(&self) -> Option<PanelState> {
+        None
+    }
 }
 
 /// The narrow interface [`crate::rules::RulesEngine`] uses to issue commands to
@@ -91,6 +154,20 @@ pub trait CommandSink: Send + Sync {
     /// Per-controller health from the LAST blank/wake attempt (never
     /// re-probes).  Empty until the first attempt.
     fn controller_health(&self) -> Vec<crate::rules::ControllerHealth>;
+
+    /// Read the current panel state through whichever controller in the
+    /// chain can report it.
+    ///
+    /// Default returns `None` (the sink has no readback — every test double
+    /// and every sink that does not compose controllers inherits this).
+    /// The production executor (in `dormant-displays`) overrides this to
+    /// walk the configured chain and surface the first non-`None` result,
+    /// so the engine can ask the sink without knowing how many controllers
+    /// sit behind it.  See [`DisplayController::read_state`] for the
+    /// per-controller contract.
+    async fn read_state(&self) -> Option<PanelState> {
+        None
+    }
 }
 
 /// The narrow interface [`crate::rules::RulesEngine`] uses to show and tear

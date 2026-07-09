@@ -39,6 +39,20 @@ struct Cli {
     log_json: bool,
 }
 
+/// Number of tokio worker threads.
+///
+/// dormant is I/O-bound (MQTT, HA WebSocket, Unix-socket IPC, the axum
+/// web server, the reload watcher, and forwarder tasks) and not
+/// CPU-bound, so two async workers is ample.  Capping the worker count
+/// also caps the number of glibc malloc arenas — each worker thread is
+/// a fresh arena — which complements the systemd
+/// `MALLOC_ARENA_MAX=2` setting by shrinking in-process baseline RSS.
+/// Deliberately a constant, not a config key: the runtime is built
+/// before the config file is parsed (`App::build` runs inside
+/// `block_on`), so a config-driven value would need a pre-parse and
+/// isn't worth that complexity here.
+const WORKER_THREADS: usize = 2;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let strictness = if cli.lenient_keys {
@@ -73,7 +87,11 @@ fn main() -> ExitCode {
         return ExitCode::from(u8::try_from(report.exit_code()).unwrap_or(1));
     }
 
-    let runtime = match tokio::runtime::Runtime::new() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKER_THREADS)
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             tracing::error!(event = "runtime_init_failed", error = %e);

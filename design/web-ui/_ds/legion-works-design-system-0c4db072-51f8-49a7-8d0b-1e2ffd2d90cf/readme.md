@@ -1,8 +1,8 @@
 # Legion Works — Design System
 
-The personal design system for **IceTea / Legion Works** and its AI system, **Legion (The Geth Collective)**. It covers web assets, light + dark themes, a full color system, reusable UI components, five product surfaces, and a terminal/TUI design system spanning **Ghostty** and **OpenCode** themes.
+The design system for **Legion Works** and its AI system, **Legion (The Geth Collective)**. It covers web assets, light + dark themes, a full color system, reusable UI components, five product surfaces, and a terminal/TUI design system spanning **Ghostty** and **OpenCode** themes.
 
-> The core idea is a **duality** grounded in the owner's OpenCode themes (Tokyo Night / Night Owl): the cool synthetic mind (Legion / Geth) in **Legion Cyan** `#86E1FC` and **Signal Blue** `#82AAFF` over a deep navy night, balanced by the warm hand of **IceTea Amber** `#FF966C`, used sparingly. The signature surface is **Liquid Glass** — translucent, blurred, refractive panels floating over an aurora field, with subtle, tasteful motion (slow aurora drift, quick fades — never bounce).
+> The core idea is a **duality** grounded in Tokyo Night / Night Owl: the cool synthetic mind (Legion / Geth) in **Legion Cyan** `#86E1FC` and **Signal Blue** `#82AAFF` over a deep navy night, balanced by the warm hand of **IceTea Amber** `#FF966C`, used sparingly. The signature surface is **Liquid Glass** — translucent, blurred, refractive panels floating over an aurora field, with subtle, tasteful motion (slow aurora drift, quick fades — never bounce).
 
 > **Vibe:** clean, precise, useful. Machine-grade but never campy. No "vibe-coded" clutter.
 
@@ -10,12 +10,12 @@ The personal design system for **IceTea / Legion Works** and its AI system, **Le
 
 ## Sources
 
-- **GitHub org:** https://github.com/iceteaSA (connected). A mix of infrastructure daemons (`dormant`, `unifi-fan-control`, `unifi-ptz-better-patrol`, `HyperTizen`), OpenCode/Pi auth packages (`anthropic-auth`, `openai-auth`, `antigravity-auth`), and an `opencode` fork. Read at build time for the owner's **writing voice**, not visuals: terse, technical, confident; analogy-led openings; punchy declarative taglines ("Increase productivity. Decrease token usage.").
-- **The OpenCode terminal theme is the foundation.** The owner currently runs **Tokyo Night** and **Night Owl** in OpenCode (`iceteaSA/opencode`). This design system is **re-based on Tokyo Night** (with Night Owl as a sibling `[data-theme="nightowl"]`): web tokens, the ANSI palette, the Ghostty theme, and the Legion OpenCode theme all share one palette. Legion Cyan = Tokyo Night cyan `#86E1FC`; Signal Blue = `#82AAFF`; Geth Purple = `#C099FF`; IceTea Amber = `#FF966C`/`#FFC777`. The neutral ramp is Tokyo Night's `darkStep1–12`; the base is extended *downward* into a deeper navy (`#16161E`) so Liquid Glass has real depth. Light mode follows Tokyo Night Day. The two source themes are vendored for reference at `themes/opencode/reference/`.
-- **Logo / marks are original** to this brand, generated for Legion Works (the owner authorized generated marks). No third-party mark was reproduced.
-- **Legion / The Geth Collective** is the owner's personal name for their AI setup; it is treated here as the identity of the design system's AI-facing surfaces.
-- **GrammarForge** (`iceteaSA/grammar-forge`, private) already ships a Liquid Glass UI — validating this system's direction. Only the **functional** parts were adopted: the grammar-category + quality-band color scales (now `tokens/annotations.css`) and the specular-rim glass recipe (`--glass-rim`). Its louder/blue accent and campier flourishes were **not** carried over; the popup is recreated in the restrained Legion glass instead.
-- **Domains:** `legionworks.dev` (Legion / product surfaces) and `iceteasa.dev` (the owner's personal site). Use `legionworks.dev` on Legion product UI; `iceteasa.dev` for personal/portfolio contexts.
+- **Reference surfaces:** infrastructure daemons, OpenCode-adjacent tools, and terminal UI work informed the writing voice: terse, technical, confident; analogy-led openings; punchy declarative taglines ("Increase productivity. Decrease token usage.").
+- **The OpenCode terminal theme is the foundation.** This design system is **re-based on Tokyo Night** (with Night Owl as a sibling `[data-theme="nightowl"]`): web tokens, the ANSI palette, the Ghostty theme, and the Legion OpenCode theme all share one palette. Legion Cyan = Tokyo Night cyan `#86E1FC`; Signal Blue = `#82AAFF`; Geth Purple = `#C099FF`; IceTea Amber = `#FF966C`/`#FFC777`. The neutral ramp is Tokyo Night's `darkStep1–12`; the base is extended *downward* into a deeper navy (`#16161E`) so Liquid Glass has real depth. Light mode follows Tokyo Night Day. The two source themes are vendored for reference at `themes/opencode/reference/`.
+- **Logo / marks are original** to this brand, generated for Legion Works. No third-party mark was reproduced.
+- **Legion / The Geth Collective** is treated here as the identity of the design system's AI-facing surfaces.
+- **Liquid Glass precedent:** existing glass UI work validated this system's direction. Only the **functional** parts were adopted: the grammar-category + quality-band color scales (now `tokens/annotations.css`) and the specular-rim glass recipe (`--glass-rim`). Louder accents and campier flourishes were **not** carried over; the popup is recreated in the restrained Legion glass instead.
+- **Domains:** `legionworks.dev` is for Legion product UI; `iceteasa.dev` is for personal/portfolio contexts.
 
 ---
 
@@ -44,7 +44,7 @@ The personal design system for **IceTea / Legion Works** and its AI system, **Le
 
 ## Visual Foundations
 
-**Color.** Tokyo Night-based (grounded in the owner's OpenCode themes). Deep-navy ground (`--bg-base` #16161E dark / Tokyo Day #E6E7ED light). Primary accent **Legion Cyan** (`--accent`, #86E1FC dark / #2F7D9C light). Warm counter-accent **IceTea Amber** (`--accent-warm`, #FF966C) — one human touch per view, never co-equal. **Signal Blue** #82AAFF for links/focus; **Geth Purple** #C099FF as a tertiary synthetic accent. Neutrals are Tokyo Night's blue-grays (`darkStep1–12`). Semantic: green #C3E88D, warning yellow #FFC777, danger red #FF757F, info cyan. The ANSI-16 palette in `tokens/ansi.css` is canonical Tokyo Night and drives Ghostty + OpenCode + TUI mocks in lockstep. A `[data-theme="nightowl"]` sibling retints everything to Night Owl (#011627 ground, #7FDBCA cyan).
+**Color.** Tokyo Night-based. Deep-navy ground (`--bg-base` #16161E dark / Tokyo Day #E6E7ED light). Primary accent **Legion Cyan** (`--accent`, #86E1FC dark / #2F7D9C light). Warm counter-accent **IceTea Amber** (`--accent-warm`, #FF966C) — one human touch per view, never co-equal. **Signal Blue** #82AAFF for links/focus; **Geth Purple** #C099FF as a tertiary synthetic accent. Neutrals are Tokyo Night's blue-grays (`darkStep1–12`). Semantic: green #C3E88D, warning yellow #FFC777, danger red #FF757F, info cyan. The ANSI-16 palette in `tokens/ansi.css` is canonical Tokyo Night and drives Ghostty + OpenCode + TUI mocks in lockstep. A `[data-theme="nightowl"]` sibling retints everything to Night Owl (#011627 ground, #7FDBCA cyan).
 
 **Type.** Display **Space Grotesk** (technical geometric, headings + wordmark). UI/body **Geist** (clean neo-grotesk — precise, neutral, not Inter). Mono **JetBrains Mono** for all machine data, code, and terminal. Minor-third scale, base 16px. Tight tracking on display; wide caps tracking on eyebrows.
 

@@ -1589,10 +1589,6 @@ impl RulesEngine {
                     // No render backend — render stage fails fall-through
                     // so the machine never wedges in RenderPending.
                     //
-                    // TODO(Task 8): this engine-level path is covered at the
-                    // SM level (render_only_total_cascade_returns_active) but
-                    // not engine-level until a real/fake RenderSink is wired
-                    // into rules_end_to_end.
                     let display = display_id.clone();
                     let tx = self.results_tx.clone();
                     tokio::spawn(async move {

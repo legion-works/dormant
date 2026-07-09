@@ -6,9 +6,6 @@
 //! before they ever touch a parsed document; [`apply_patches`] applies
 //! a pre-checked batch to a [`toml_edit::DocumentMut`].
 
-// TODO: remove after wiring into routes module (T4).
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 use dormant_core::config::is_known_config_path;

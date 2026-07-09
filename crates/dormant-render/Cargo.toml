@@ -1,5 +1,6 @@
 [package]
 name = "dormant-render"
+description = "Local Wayland render backends for dormant software blanking overlays."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

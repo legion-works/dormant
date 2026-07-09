@@ -1,5 +1,6 @@
 [package]
 name = "dormantctl"
+description = "CLI and IPC client library for controlling and diagnosing dormant."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

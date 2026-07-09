@@ -1,5 +1,6 @@
 [package]
 name = "dormant-displays"
+version.workspace = true
 description = "Display-controller implementations and fallback execution for dormant."
 edition.workspace = true
 license.workspace = true

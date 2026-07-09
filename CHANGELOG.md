@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-Pre-`0.1.0`. Everything below is built and validated but not yet tagged for release.
+## [0.1.0] - 2026-07-09
 
 ### Added
 
@@ -39,4 +39,5 @@ Pre-`0.1.0`. Everything below is built and validated but not yet tagged for rele
 - CI runs on the `dev` integration branch; `master` is release-only.
 - Runtime footprint: tokio worker pool capped to `worker_threads = 2` (down from the default `num_cpus`), `malloc_trim` runs after every screensaver teardown to release the libmpv crossfade buffers, and the systemd unit sets `MALLOC_ARENA_MAX=2` so freed render heap is returned to the OS instead of retained per-thread — the post-screensaver RSS floor drops from ~265 MB to ~90 MB and idle RSS stays flat across blank/wake/screensaver/reload cycles (#16).
 
-[Unreleased]: https://github.com/legion-works/dormant/commits/dev
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/legion-works/dormant/releases/tag/v0.1.0

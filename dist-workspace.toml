@@ -28,3 +28,9 @@ checksums = true
 features = ["web-ui"]
 all-features = false
 github-build-setup = "../dist-build-setup.yml"
+# Release builds (features = ["web-ui"]) need system libraries for tokio-serial
+# → libudev-sys on Linux.  libudev-dev + pkg-config cover both x86_64 and
+# aarch64 GNU targets (native ubuntu-24.04-arm runners).
+[dist.dependencies.apt]
+libudev-dev = '*'
+pkg-config = '*'

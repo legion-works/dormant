@@ -1,5 +1,6 @@
 [package]
 name = "dormant-sensors"
+version.workspace = true
 description = "Sensor-source implementations for MQTT, Home Assistant, and USB mmWave presence input."
 edition.workspace = true
 license.workspace = true

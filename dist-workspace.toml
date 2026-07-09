@@ -28,9 +28,13 @@ checksums = true
 features = ["web-ui"]
 all-features = false
 github-build-setup = "../dist-build-setup.yml"
-# Release builds (features = ["web-ui"]) need system libraries for tokio-serial
-# → libudev-sys on Linux.  libudev-dev + pkg-config cover both x86_64 and
-# aarch64 GNU targets (native ubuntu-24.04-arm runners).
+# Release builds need system libraries:
+# - libudev-dev: tokio-serial → libudev-sys
+# - libwayland-dev: dormant-render → wayland-sys (wayland-client.pc)
+# - libmpv-dev: dormant-render screensaver → libmpv2
+# - pkg-config: build-script probes for the above
 [dist.dependencies.apt]
 libudev-dev = '*'
+libwayland-dev = '*'
+libmpv-dev = '*'
 pkg-config = '*'

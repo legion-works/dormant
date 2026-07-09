@@ -775,7 +775,7 @@ impl SamsungTizenController {
     /// blank mode — derived from the normalised ladder by
     /// [`dormant_core::config::schema::DisplayConfig::primary_blank_mode`].
     /// Used by `wake()` as the fallback when
-    /// [`Self::last_blank_mode`] is `None`.
+    /// `last_blank_mode` is `None`.
     /// `restore_backlight` is the per-display backlight restore value
     /// (operator-tuned via the `samsung_restore_backlight` config key,
     /// validated 0–50).

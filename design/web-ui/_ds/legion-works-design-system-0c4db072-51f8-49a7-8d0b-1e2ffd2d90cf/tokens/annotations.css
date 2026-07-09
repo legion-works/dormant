@@ -1,11 +1,10 @@
 /* ============================================================
-   Legion Works — Annotation palette  (from GrammarForge)
+   Legion Works — Annotation palette
    ------------------------------------------------------------
-   The owner's GrammarForge product defines a category + quality
-   scale for inline writing annotations (underlines, legend dots,
-   score bands). Lifted verbatim from its shared tokens so any
-   Legion Works surface that marks up text agrees with the
-   composer. Source: grammar-forge/clients/browser popup.css.
+   Category + quality scales for inline writing annotations
+   (underlines, legend dots, score bands). Shared tokens keep
+   Legion Works surfaces that mark up text aligned with the
+   composer.
    These are editorial semantics — distinct from the UI --accent.
    ============================================================ */
 :root {
@@ -22,8 +21,7 @@
   --band-fair:       #d97706;
   --band-needswork:  #dc2626;
 
-  /* GrammarForge glass parity: its specular rim recipe, exposed for
-     surfaces that want the exact GrammarForge material. */
+  /* Specular rim recipe for glass annotation surfaces. */
   --glass-rim:
     inset 0 1px 1.5px rgba(255,255,255,0.5),
     inset 0 0 0 1px rgba(255,255,255,0.1),

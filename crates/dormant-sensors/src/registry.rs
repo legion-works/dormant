@@ -336,7 +336,7 @@ mod tests {
     fn build_wires_mqtt_credential_by_broker_url() {
         use dormant_core::config::schema::MqttCredential;
 
-        let broker = "mqtt://10.1.0.5:1883";
+        let broker = "mqtt://192.0.2.5:1883";
         let creds = Credentials {
             ha_token: None,
             samsung: IndexMap::new(),

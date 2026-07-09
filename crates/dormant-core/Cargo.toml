@@ -1,5 +1,6 @@
 [package]
 name = "dormant-core"
+description = "Core domain types, config, rules, and state machines for dormant."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

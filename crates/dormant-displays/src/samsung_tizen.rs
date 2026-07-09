@@ -1458,12 +1458,12 @@ mod tests {
     #[test]
     fn build_ws_url_includes_base64_name_and_token() {
         let url = format!(
-            "wss://10.1.1.7:8002/api/v2/channels/samsung.remote.control?name={expected_name}&token=abc123",
+            "wss://192.0.2.7:8002/api/v2/channels/samsung.remote.control?name={expected_name}&token=abc123",
             expected_name = base64::engine::general_purpose::STANDARD.encode("dormant")
         );
         let expected_name = base64::engine::general_purpose::STANDARD.encode("dormant");
         assert!(
-            url.starts_with("wss://10.1.1.7:8002/api/v2/channels/samsung.remote.control?name="),
+            url.starts_with("wss://192.0.2.7:8002/api/v2/channels/samsung.remote.control?name="),
             "URL prefix wrong: {url}"
         );
         assert!(
@@ -1485,7 +1485,7 @@ mod tests {
     fn old_builder_missing_sec_websocket_key_proof() {
         // Construct the URL the same way the real code does.
         let name_b64 = base64::engine::general_purpose::STANDARD.encode("dormant");
-        let url = format!("wss://10.1.1.7:8002{WS_PATH}?name={name_b64}&token=abc123");
+        let url = format!("wss://192.0.2.7:8002{WS_PATH}?name={name_b64}&token=abc123");
 
         // OLD pattern — exactly what the broken code used.
         let uri = url
@@ -1508,7 +1508,7 @@ mod tests {
     #[test]
     fn into_client_request_generates_handshake_headers() {
         let name_b64 = base64::engine::general_purpose::STANDARD.encode("dormant");
-        let url = format!("wss://10.1.1.7:8002{WS_PATH}?name={name_b64}&token=abc123");
+        let url = format!("wss://192.0.2.7:8002{WS_PATH}?name={name_b64}&token=abc123");
 
         let request = url.as_str().into_client_request().unwrap();
         let headers = request.headers();
@@ -1630,7 +1630,7 @@ mod tests {
 
     fn test_controller(transport: Arc<FakeTvTransport>) -> SamsungTizenController {
         SamsungTizenController::with_transport(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "test-token".into(),
             None,
             true,
@@ -1669,7 +1669,7 @@ mod tests {
     async fn wake_with_wol_mac_sends_wol_before_key() {
         let fake = Arc::new(FakeTvTransport::new());
         let ctrl = SamsungTizenController::with_transport(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "tok".into(),
             Some("aa:bb:cc:dd:ee:ff".into()),
             true,
@@ -1702,7 +1702,7 @@ mod tests {
         bl_fake.get_results.lock().unwrap().push(Ok(0));
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -1719,21 +1719,21 @@ mod tests {
         );
 
         // Acquire was called once with the right host.
-        assert_eq!(*bl_fake.acquire_hosts.lock().unwrap(), vec!["10.1.1.7"]);
+        assert_eq!(*bl_fake.acquire_hosts.lock().unwrap(), vec!["192.0.2.7"]);
         // Get was called twice — the initial read (saves current) and the
         // readback-confirm after the set.
         assert_eq!(
             *bl_fake.get_calls.lock().unwrap(),
             vec![
-                ("10.1.1.7".to_string(), "tok-1".to_string()),
-                ("10.1.1.7".to_string(), "tok-1".to_string()),
+                ("192.0.2.7".to_string(), "tok-1".to_string()),
+                ("192.0.2.7".to_string(), "tok-1".to_string()),
             ]
         );
         // Set was called once with backlight=0 and the acquired token
         // (recorded as value, token comes through get_calls).
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), 0)]
+            vec![("192.0.2.7".to_string(), 0)]
         );
 
         // First-blank-wins: saved_backlight is the read value (35), so a
@@ -1767,7 +1767,7 @@ mod tests {
         bl_fake.set_results.lock().unwrap().push(Ok(()));
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -1814,7 +1814,7 @@ mod tests {
         bl_fake.get_results.lock().unwrap().push(Ok(28));
 
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -1831,7 +1831,7 @@ mod tests {
         // Wake restored to 28 and cleared saved.
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), 0), ("10.1.1.7".to_string(), 28)]
+            vec![("192.0.2.7".to_string(), 0), ("192.0.2.7".to_string(), 28)]
         );
         assert!(
             ctrl.saved_backlight.lock().unwrap().is_none(),
@@ -1851,7 +1851,7 @@ mod tests {
         let bl_fake = Arc::new(FakeBacklightTransport::new());
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -1871,7 +1871,7 @@ mod tests {
         let tv_fake = Arc::new(FakeTvTransport::with_connect_results(vec![false]));
         let bl_fake = Arc::new(FakeBacklightTransport::new());
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true, // treat_unreachable_as_blanked = true
@@ -1896,7 +1896,7 @@ mod tests {
             .unwrap()
             .push(Err("-32601 boom".into()));
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -1936,7 +1936,7 @@ mod tests {
         bl_fake.set_results.lock().unwrap().push(Ok(()));
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -1950,7 +1950,7 @@ mod tests {
         // The map helper was hit, recording an invalidate marker.
         let hosts = bl_fake.acquire_hosts.lock().unwrap();
         assert!(
-            hosts.iter().any(|h| h == "invalidate:10.1.1.7"),
+            hosts.iter().any(|h| h == "invalidate:192.0.2.7"),
             "invalidate_token should have been called on -32010; hosts={hosts:?}"
         );
     }
@@ -1961,7 +1961,7 @@ mod tests {
     async fn blank_unreachable_noop_when_policy_enabled() {
         let fake = Arc::new(FakeTvTransport::with_connect_results(vec![false]));
         let ctrl = SamsungTizenController::with_transport(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "tok".into(),
             None,
             true, // treat_unreachable_as_blanked = true
@@ -1977,7 +1977,7 @@ mod tests {
     async fn wake_unreachable_noop_when_policy_enabled() {
         let fake = Arc::new(FakeTvTransport::with_connect_results(vec![false]));
         let ctrl = SamsungTizenController::with_transport(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "tok".into(),
             None,
             true,
@@ -1995,7 +1995,7 @@ mod tests {
             ..FakeTvTransport::default()
         });
         let ctrl = SamsungTizenController::with_transport(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "tok".into(),
             Some("aa:bb:cc:dd:ee:ff".into()),
             true,
@@ -2018,7 +2018,7 @@ mod tests {
             ..FakeTvTransport::default()
         });
         let ctrl = SamsungTizenController::with_transport(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "tok".into(),
             None,
             false, // treat_unreachable_as_blanked = false
@@ -2623,7 +2623,7 @@ mod tests {
             .push(Err("network blip".into()));
 
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2672,7 +2672,7 @@ mod tests {
             .push(Ok(DEFAULT_RESTORE_BACKLIGHT));
 
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2690,7 +2690,7 @@ mod tests {
         // Backlight was restored to DEFAULT_RESTORE_BACKLIGHT.
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), DEFAULT_RESTORE_BACKLIGHT)]
+            vec![("192.0.2.7".to_string(), DEFAULT_RESTORE_BACKLIGHT)]
         );
         // KEY_RETURN was NOT sent — backlight restore is the wake.
         assert!(
@@ -2755,7 +2755,7 @@ mod tests {
         // Simulate the registry's wiring for a ladder whose primary stage
         // is BrightnessZero: configured_primary_mode = BrightnessZero.
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2774,7 +2774,7 @@ mod tests {
         // Backlight was restored to the operator-configured default.
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), DEFAULT_RESTORE_BACKLIGHT)]
+            vec![("192.0.2.7".to_string(), DEFAULT_RESTORE_BACKLIGHT)]
         );
         // KEY_RETURN was NOT sent.
         assert!(
@@ -2793,7 +2793,7 @@ mod tests {
 
         // Registry wiring for `blank_mode = "screen_off_audio_on"`.
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2823,7 +2823,7 @@ mod tests {
         bl_fake.get_results.lock().unwrap().push(Ok(25));
 
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2837,7 +2837,7 @@ mod tests {
         ctrl.wake().await.unwrap();
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), 25)]
+            vec![("192.0.2.7".to_string(), 25)]
         );
     }
 
@@ -2865,7 +2865,7 @@ mod tests {
         bl_fake.set_results.lock().unwrap().push(Ok(()));
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2876,7 +2876,7 @@ mod tests {
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), 0)]
+            vec![("192.0.2.7".to_string(), 0)]
         );
         assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(40));
     }
@@ -2904,7 +2904,7 @@ mod tests {
         bl_fake.set_results.lock().unwrap().push(Ok(()));
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2916,7 +2916,7 @@ mod tests {
         // Two set calls (initial + retry) — both with target 0.
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), 0), ("10.1.1.7".to_string(), 0)]
+            vec![("192.0.2.7".to_string(), 0), ("192.0.2.7".to_string(), 0)]
         );
         // Saved value still 40 (pre-blank), first-blank-wins preserved.
         assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(40));
@@ -2946,7 +2946,7 @@ mod tests {
         bl_fake.set_results.lock().unwrap().push(Ok(()));
 
         let ctrl = SamsungTizenController::with_transports(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -2996,7 +2996,7 @@ mod tests {
         bl_fake.get_results.lock().unwrap().push(Ok(40));
 
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,
@@ -3011,7 +3011,7 @@ mod tests {
         // Two set calls (blank to 0, wake to 40). No retry.
         assert_eq!(
             *bl_fake.set_calls.lock().unwrap(),
-            vec![("10.1.1.7".to_string(), 0), ("10.1.1.7".to_string(), 40)]
+            vec![("192.0.2.7".to_string(), 0), ("192.0.2.7".to_string(), 40)]
         );
     }
 
@@ -3045,7 +3045,7 @@ mod tests {
         bl_fake.get_results.lock().unwrap().push(Ok(0));
 
         let ctrl = SamsungTizenController::with_transports_mode(
-            "10.1.1.7".into(),
+            "192.0.2.7".into(),
             "ws-token".into(),
             None,
             true,

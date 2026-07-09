@@ -342,7 +342,7 @@ mod tests {
             screensaver: None,
             output: None,
             ddc_display: None,
-            host: Some("10.1.1.7".into()),
+            host: Some("192.0.2.7".into()),
             wol_mac: None,
             blank_command: None,
             wake_command: None,
@@ -358,7 +358,9 @@ mod tests {
             treat_unreachable_as_blanked: true,
         };
         let mut creds = Credentials::default();
-        creds.samsung.insert("10.1.1.7".into(), "test-token".into());
+        creds
+            .samsung
+            .insert("192.0.2.7".into(), "test-token".into());
 
         let chain = build_controllers("tv", &cfg, &creds).unwrap();
         assert_eq!(chain.len(), 1);

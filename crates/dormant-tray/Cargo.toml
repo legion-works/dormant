@@ -1,5 +1,6 @@
 [package]
 name = "dormant-tray"
+description = "KDE StatusNotifierItem tray applet for monitoring and controlling dormantd."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

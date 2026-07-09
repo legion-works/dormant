@@ -292,7 +292,7 @@ password = "secret"
         let creds_path = dir.path().join("credentials.toml");
         seed_creds(&creds_path);
 
-        upsert_samsung_token(&creds_path, "10.1.1.7", "37148082").unwrap();
+        upsert_samsung_token(&creds_path, "192.0.2.7", "example-token-1234").unwrap();
 
         let raw = std::fs::read_to_string(&creds_path).unwrap();
         // (a) mqtt entry survives
@@ -308,10 +308,10 @@ password = "secret"
         assert!(raw.contains("\"old\""), "old samsung token removed");
         // (d) new host present and quoted
         assert!(
-            raw.contains("\"10.1.1.7\""),
+            raw.contains("\"192.0.2.7\""),
             "new host not quoted — dotted IP would parse as nested table"
         );
-        assert!(raw.contains("\"37148082\""), "new token missing");
+        assert!(raw.contains("\"example-token-1234\""), "new token missing");
         // (e) re-parsing via real Credentials deser yields both samsung hosts
         let creds: Credentials = toml::from_str(&raw).unwrap();
         assert_eq!(
@@ -319,8 +319,8 @@ password = "secret"
             Some("old")
         );
         assert_eq!(
-            creds.samsung.get("10.1.1.7").map(String::as_str),
-            Some("37148082")
+            creds.samsung.get("192.0.2.7").map(String::as_str),
+            Some("example-token-1234")
         );
         // (f) file mode is 0600
         #[cfg(unix)]

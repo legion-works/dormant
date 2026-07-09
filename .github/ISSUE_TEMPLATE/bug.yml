@@ -39,7 +39,7 @@ body:
         config_version = 1
         [displays.tv]
         controllers = ["samsung-tizen"]
-        host = "10.1.1.7"
+        host = "192.0.2.7"
         blank_mode = "brightness_zero"
     validations:
       required: true
@@ -55,7 +55,7 @@ body:
         - Network address if controlled over the LAN, and which controller (`ddcci`, `samsung-tizen`, `kwin-dpms`, `ha-passthrough`, `command`)
       placeholder: |
         - AOC AGON AG326UZD (OLED), DisplayPort → ddcci
-        - Samsung QA65S90D (QD-OLED), on the LAN at 10.1.1.7 → samsung-tizen (brightness_zero)
+        - Samsung QA65S90D (QD-OLED), on the LAN at 192.0.2.7 → samsung-tizen (brightness_zero)
     validations:
       required: true
   - type: textarea
@@ -89,7 +89,7 @@ body:
     id: doctor
     attributes:
       label: dormantctl doctor output
-      description: Paste `dormantctl doctor` for the affected sensor and display (e.g. `dormantctl doctor samsung 10.1.1.7`). This probes reachability, power state, and credentials.
+      description: Paste `dormantctl doctor` for the affected sensor and display (e.g. `dormantctl doctor samsung 192.0.2.7`). This probes reachability, power state, and credentials.
       render: text
   - type: textarea
     id: logs

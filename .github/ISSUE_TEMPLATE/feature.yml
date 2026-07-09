@@ -39,7 +39,7 @@ body:
         - Network address if it's a smart TV controlled over the LAN
         - Any control path you know works: DDC/CI, LG webOS, Samsung Tizen, HDMI-CEC, vendor app
       placeholder: |
-        - Samsung QA65S90DAKXXA (S90D, QD-OLED), HDMI-A-1 from the PC AND on the LAN at 10.1.1.7
+        - Samsung QA65S90DAKXXA (S90D, QD-OLED), HDMI-A-1 from the PC AND on the LAN at 192.0.2.7
         - Controlled today via Tizen over WebSocket; no DDC/CI (ddcutil reports "Invalid display")
     validations:
       required: true

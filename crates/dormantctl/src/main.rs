@@ -307,12 +307,12 @@ mod tests {
 
     #[test]
     fn parse_pair_samsung() {
-        let cli = Cli::try_parse_from(["dormantctl", "pair", "samsung", "10.1.1.7"]).unwrap();
+        let cli = Cli::try_parse_from(["dormantctl", "pair", "samsung", "192.0.2.7"]).unwrap();
         match cli.command {
             Command::Pair {
                 target: PairTarget::Samsung { host },
                 ..
-            } => assert_eq!(host, "10.1.1.7"),
+            } => assert_eq!(host, "192.0.2.7"),
             _ => panic!("expected Pair command"),
         }
     }

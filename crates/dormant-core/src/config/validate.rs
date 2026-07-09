@@ -2027,7 +2027,7 @@ stale_timeout = "5m"
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("creds.toml");
         let toml_content = r#"
-[mqtt."mqtt://10.1.0.5:1883"]
+[mqtt."mqtt://192.0.2.5:1883"]
 username = "icetea"
 password = "test-pass"
 "#;
@@ -2041,7 +2041,7 @@ password = "test-pass"
         let creds = crate::config::load_credentials(&path).unwrap();
         let mqtt_cred = creds
             .mqtt
-            .get("mqtt://10.1.0.5:1883")
+            .get("mqtt://192.0.2.5:1883")
             .expect("mqtt creds not found");
         assert_eq!(mqtt_cred.username, "icetea");
         assert_eq!(mqtt_cred.password, "test-pass");

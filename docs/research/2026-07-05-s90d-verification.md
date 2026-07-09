@@ -1,6 +1,6 @@
 # Samsung S90D — Hardware Spike Verification
 
-> Spike conducted 2026-07-05 on host `10.1.1.7` (model QA65S90DAKXXA "Frozen Mirror").
+> Spike conducted 2026-07-05 on host `192.0.2.7` (model QA65S90DAKXXA "Frozen Mirror").
 > Firmware/platform: Tizen OS. Ports tested: 8002 (WSS remote), 8001 (REST device-info).
 
 ## Summary
@@ -51,7 +51,7 @@ The TV has two off-states with different socket behavior:
 - `KEY_PICTURE_OFF` toggles picture on/off — safe as a wake from picture-off,
   but would blank an awake panel if daemon state drifts.
 - WoL magic packet woke the TV from deep standby (verified on this TV).
-  The TV has two MACs: ethernet `28:AF:42:00:F6:27`, Wi-Fi `F4:DD:06:4D:C0:76`.
+  The TV has two MACs: ethernet `<ethernet-mac>`, Wi-Fi `<wifi-mac>`.
   Send WoL to the ethernet MAC for best reliability.
 
 ## Panel state discrimination
@@ -59,7 +59,7 @@ The TV has two off-states with different socket behavior:
 The authoritative panel-state source is the REST endpoint:
 
 ```
-GET http://10.1.1.7:8001/api/v2/
+GET http://192.0.2.7:8001/api/v2/
 ```
 
 Parse `device.PowerState`: `"on"` means the panel is on (picture may be off);

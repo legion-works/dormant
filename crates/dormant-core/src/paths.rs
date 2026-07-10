@@ -137,7 +137,7 @@ fn state_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
         .join("dormant")
 }
 
-/// Public seam onto [`state_dir_from`] for downstream crates that need to
+/// Public seam onto `state_dir_from` for downstream crates that need to
 /// derive the state directory from explicit (test-injected) env values
 /// rather than reading the process environment directly.
 ///

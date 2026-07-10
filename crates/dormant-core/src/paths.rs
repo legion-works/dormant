@@ -137,6 +137,20 @@ fn state_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
         .join("dormant")
 }
 
+/// Public seam onto [`state_dir_from`] for downstream crates that need to
+/// derive the state directory from explicit (test-injected) env values
+/// rather than reading the process environment directly.
+///
+/// `state_dir_from` itself stays private — this is a thin, additive
+/// pass-through so callers like `dormant-displays` can build a pure
+/// "is persistence possible at all" test seam (both env vars absent) on
+/// top of a *single* source of XDG-state-vs-`HOME` precedence truth,
+/// without duplicating that precedence logic at the call site.
+#[must_use]
+pub fn state_dir_from_env(xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    state_dir_from(xdg, home)
+}
+
 /// Return the `wear` subdirectory of the daemon-owned state directory,
 /// where panel-wear tracking data is persisted.
 #[must_use]

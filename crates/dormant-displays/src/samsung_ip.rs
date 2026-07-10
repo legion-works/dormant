@@ -63,6 +63,7 @@
 //! | -32010 | unauthorized |
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -452,25 +453,29 @@ impl BacklightTransport for RealBacklightTransport {
 /// 1. `$XDG_STATE_HOME/dormant/samsung-ip-tokens.json`
 /// 2. `~/.local/state/dormant/samsung-ip-tokens.json`
 ///
-/// Directory precedence is owned by [`dormant_core::paths::state_dir`] —
-/// this function only decides whether persistence is possible at all
-/// (`None` only when NEITHER `XDG_STATE_HOME` nor `HOME` is set, which is
-/// exceedingly rare in practice: the daemon would still start, only the
-/// in-memory cache would be used) and appends the token file name. Kept
-/// private to `samsung_ip` because it is daemon-internal state — distinct
-/// from `credentials.toml`, which the user owns.
+/// Directory precedence is owned by
+/// [`dormant_core::paths::state_dir_from_env`] — this function only
+/// decides whether persistence is possible at all (`None` only when
+/// NEITHER `XDG_STATE_HOME` nor `HOME` is set, which is exceedingly rare
+/// in practice: the daemon would still start, only the in-memory cache
+/// would be used) and appends the token file name. Kept private to
+/// `samsung_ip` because it is daemon-internal state — distinct from
+/// `credentials.toml`, which the user owns.
 fn default_state_path() -> Option<PathBuf> {
-    let has_state_home =
-        std::env::var_os("XDG_STATE_HOME").is_some() || std::env::var_os("HOME").is_some();
-    state_path_from(has_state_home.then(dormant_core::paths::state_dir))
+    state_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
-/// Internal: append the token file name onto a state directory, if any
-/// (test seam). `None` in, `None` out — mirrors `default_state_path`'s
-/// "no state home available" case without re-deriving directory
-/// precedence, which is `dormant-core`'s responsibility.
-fn state_path_from(state_dir: Option<PathBuf>) -> Option<PathBuf> {
-    state_dir.map(|dir| dir.join("samsung-ip-tokens.json"))
+/// Internal: derive the token state path from explicit env values (test
+/// seam). `None` only when BOTH `xdg` and `home` are absent — that is the
+/// only "persistence disabled" case this function decides; everything
+/// else (XDG-state vs. `HOME` fallback precedence) is delegated to
+/// `dormant_core::paths::state_dir_from_env` so precedence logic has a
+/// single source of truth.
+fn state_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    if xdg.is_none() && home.is_none() {
+        return None;
+    }
+    Some(dormant_core::paths::state_dir_from_env(xdg, home).join("samsung-ip-tokens.json"))
 }
 
 /// Load the persisted token map from `path`. Returns an empty map when
@@ -718,22 +723,24 @@ mod tests {
     }
 
     /// `state_path_from` appends the token file name onto whatever state
-    /// directory it is given — directory precedence itself (XDG-state vs.
-    /// `HOME` fallback) is `dormant_core::paths::state_dir`'s
-    /// responsibility and is covered by that crate's own tests.
+    /// directory `dormant_core::paths::state_dir_from_env` derives —
+    /// directory precedence itself (XDG-state vs. `HOME` fallback) is
+    /// `dormant-core`'s responsibility and is covered by that crate's own
+    /// tests. This only checks the filename append plus the "no env at
+    /// all" persistence-disabled branch.
     #[test]
     fn state_path_from_appends_token_filename() {
-        let p = state_path_from(Some(std::path::PathBuf::from("/run/state/dormant")))
-            .expect("Some(dir) in, Some(path) out");
+        let p = state_path_from(Some(OsString::from("/run/state/dormant")), None)
+            .expect("Some(xdg) in, Some(path) out");
         assert_eq!(
             p,
-            std::path::PathBuf::from("/run/state/dormant/samsung-ip-tokens.json")
+            std::path::PathBuf::from("/run/state/dormant/dormant/samsung-ip-tokens.json")
         );
     }
 
     #[test]
-    fn state_path_from_no_dir_returns_none() {
-        assert!(state_path_from(None).is_none());
+    fn state_path_from_no_env_returns_none() {
+        assert!(state_path_from(None, None).is_none());
     }
 
     /// `write_token_state` creates the file with mode `0o600` on Unix

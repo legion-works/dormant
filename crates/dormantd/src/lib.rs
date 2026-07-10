@@ -12,3 +12,4 @@ pub mod ipc;
 pub mod logging;
 pub mod reload;
 pub mod single_instance;
+pub mod wear_tracker;

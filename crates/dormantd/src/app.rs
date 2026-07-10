@@ -354,6 +354,25 @@ impl App {
 
         let spawn = spawn_generation(&root, assembly, None, None)?;
 
+        // Executor-map watch channel for the wear tracker (spec §4.3):
+        // seeded here from the first generation, republished by
+        // `Runner::install_generation` on every subsequent install/rollback,
+        // and emptied (`send_replace(Arc::new(HashMap::new()))`) immediately
+        // before teardown in `Runner::reload` so the tracker never calls
+        // into a dead executor mid-swap.
+        let executors0: HashMap<DisplayId, Arc<dyn CommandSink>> = spawn
+            .generation
+            .display_executors
+            .iter()
+            .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+            .collect();
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors0));
+
+        // The daemon's single wear-ledger map (spec §5) — shared with the
+        // tracker and, in future, IPC/WebUI readers.
+        let wear_handle: dormant_core::wear::WearHandle =
+            Arc::new(std::sync::RwLock::new(HashMap::new()));
+
         // Stable front channels forwarded to the *current* generation.
         let (engine_ctl_tx, engine_ctl_rx) = watch::channel(spawn.ctl_tx.clone());
         let (engine_events_tx, engine_events_rx) = watch::channel(spawn.events_tx.clone());
@@ -372,6 +391,18 @@ impl App {
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
+
+        // Wear tracker: daemon-lifetime, reads config via watch, publishes
+        // over the front ctl channel (rides `forward_ctl`'s
+        // `deliver_or_drop` across generation swaps), sees the current
+        // generation's executors via the watch seeded above.
+        let _wear_tracker = crate::wear_tracker::spawn(crate::wear_tracker::WearTrackerDeps {
+            config_rx: config_rx.clone(),
+            ctl_tx: front_ctl_tx.clone(),
+            executors_rx: executors_rx.clone(),
+            handle: wear_handle.clone(),
+            cancel: root.clone(),
+        });
 
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
@@ -394,6 +425,7 @@ impl App {
             root: root.clone(),
             engine_ctl: engine_ctl_tx,
             engine_events: engine_events_tx,
+            executors_tx,
             reload_tx: reload_tx.clone(),
             config_tx,
             creds_tx,
@@ -593,6 +625,10 @@ struct Runner {
     root: CancellationToken,
     engine_ctl: watch::Sender<mpsc::Sender<ControlMsg>>,
     engine_events: watch::Sender<mpsc::Sender<PresenceEvent>>,
+    /// Current generation's executor map for the wear tracker (spec §4.3).
+    /// Republished on every install/rollback via [`Runner::install_generation`];
+    /// emptied immediately before teardown in [`Runner::reload`].
+    executors_tx: watch::Sender<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     reload_tx: broadcast::Sender<ReloadOutcome>,
     config_tx: watch::Sender<Arc<Config>>,
     creds_tx: watch::Sender<Arc<Credentials>>,
@@ -614,6 +650,13 @@ impl Runner {
     fn install_generation(&mut self, spawn: GenSpawn) {
         let _ = self.engine_ctl.send(spawn.ctl_tx);
         let _ = self.engine_events.send(spawn.events_tx);
+        let executors: HashMap<DisplayId, Arc<dyn CommandSink>> = spawn
+            .generation
+            .display_executors
+            .iter()
+            .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+            .collect();
+        self.executors_tx.send_replace(Arc::new(executors));
         self.generation = spawn.generation;
     }
 
@@ -736,6 +779,12 @@ impl Runner {
                 "web_bind/web_port change requires a daemon restart; keeping the current listener"
             );
         }
+
+        // Fail-closed during the swap: the wear tracker must never call into
+        // an executor that is about to be torn down (spec §4.3). Empty the
+        // watch BEFORE teardown so a tracker tick racing this window sees no
+        // executors (skips its round) rather than a stale/dying one.
+        self.executors_tx.send_replace(Arc::new(HashMap::new()));
 
         teardown(&mut self.generation).await;
 

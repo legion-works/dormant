@@ -1240,6 +1240,18 @@ impl DisplayController for SamsungTizenController {
             Some(PanelState { power, brightness })
         }
     }
+
+    /// Stable panel identity (spec §3 / T7 review M1): `"samsung:<host>"`.
+    /// The TV's hostname/IP is the only stable-across-restarts identifier
+    /// this controller has (no MAC-based or model-string identity — Samsung
+    /// model-string detection is explicitly excluded from v1, spec §1/U12);
+    /// it is panel-derived rather than config-derived in the sense that
+    /// matters: this identity is keyed on the physical network endpoint
+    /// this controller talks to, not on the operator-chosen `[displays.*]`
+    /// section name, so a rename does not orphan the ledger.
+    fn panel_identity(&self) -> Option<String> {
+        Some(format!("samsung:{}", self.host))
+    }
 }
 
 // ── Pairing ─────────────────────────────────────────────────────────────────────
@@ -1663,6 +1675,16 @@ mod tests {
         ctrl.wake().await.unwrap();
         let keys = fake.take_sent_keys();
         assert_eq!(keys, vec!["KEY_RETURN"]);
+    }
+
+    /// T7 fix M1: `panel_identity()` is `"samsung:<host>"` — panel-derived
+    /// (keyed on the TV's network endpoint), not config-derived, so a
+    /// `[displays.*]` rename does not orphan the wear ledger.
+    #[test]
+    fn panel_identity_returns_samsung_host_key() {
+        let fake = Arc::new(FakeTvTransport::new());
+        let ctrl = test_controller(fake);
+        assert_eq!(ctrl.panel_identity().as_deref(), Some("samsung:192.0.2.7"));
     }
 
     #[tokio::test]

@@ -2284,3 +2284,203 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
         ledger.sample_count
     );
 }
+
+/// T7 review M3 (RED-first without the fix): spec §2/§4.2 require a
+/// "final persist" on daemon shutdown, in addition to the periodic
+/// `persist_interval` cadence. `persist_interval` is set far longer than
+/// `sample_interval` here so a sample-only tick accumulates in memory
+/// between periodic persists; shutting down mid-window must flush that
+/// accumulated wear to disk, not leave the file stuck at whatever
+/// `sample_count` the last periodic persist wrote.
+///
+/// **Post-shutdown poll, not an immediate read**: `App::start`'s wear-
+/// tracker `JoinHandle` is intentionally fire-and-forget (never joined —
+/// dropping a `JoinHandle` doesn't abort the task; see `app.rs`'s wiring
+/// notes). `shutdown()` only awaits the daemon's main `run_loop` task, so
+/// it can return before the SEPARATE wear-tracker task has finished
+/// executing its own cancellation-triggered `persist_all_dirty` — reading
+/// the file immediately after `shutdown()` races that fire-and-forget
+/// completion (confirmed via a temporary `tracing`-capture diagnostic run:
+/// the in-memory ledger's `sample_count` climbed correctly tick-by-tick,
+/// but the file still showed the stale pre-shutdown value on the losing
+/// side of the race). A short bounded poll after `shutdown()` accommodates
+/// this without weakening what the test actually proves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "wear_env_lock serializes the wear tests' shared XDG_STATE_HOME env var across \
+              the whole test body (app lifetime included) — the lock is test-local and always \
+              released promptly at test end, so holding it across awaits here cannot deadlock \
+              or starve unrelated tests"
+)]
+async fn wear_shutdown_persists_final_ledger() {
+    let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state_home = TempDir::new().unwrap();
+    let _env = XdgStateHomeGuard::set(state_home.path());
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    // persist_interval is deliberately far longer than sample_interval so
+    // the periodic cadence alone will NOT persist again during this test's
+    // window — only the first (immediate) tick and the final shutdown
+    // flush should ever touch the file.
+    let cfg = one_display_config_with_wear(
+        &marker,
+        "50ms",
+        "[wear]\nenabled = true\nsample_interval = \"5s\"\npersist_interval = \"60s\"\nread_timeout = \"500ms\"\n",
+    );
+    let cfg_path = write_file(dir.path(), "config.toml", &cfg);
+    let creds_path = dir.path().join("credentials.toml");
+
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    let wear_file = state_home
+        .path()
+        .join("dormant")
+        .join("wear")
+        .join("wear-mon.json");
+    assert!(
+        wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
+        "ledger must appear from the first (immediate) tick's persist"
+    );
+    let sample_count_at_first_persist =
+        serde_json::from_str::<dormant_core::wear::WearLedger>(&read(&wear_file))
+            .expect("ledger file must parse")
+            .sample_count;
+
+    // Let at least one more sample_interval tick accumulate wear IN MEMORY
+    // without crossing the 60s persist_interval boundary again.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    shutdown(handle, join).await;
+
+    // Bounded poll (see doc comment above) for the wear tracker's own
+    // fire-and-forget cancellation-triggered flush to land on disk.
+    let ok = wait_for(
+        || {
+            serde_json::from_str::<dormant_core::wear::WearLedger>(&read(&wear_file))
+                .is_ok_and(|l| l.sample_count > sample_count_at_first_persist)
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+
+    let contents = read(&wear_file);
+    let ledger: dormant_core::wear::WearLedger =
+        serde_json::from_str(&contents).expect("ledger file must still parse after shutdown");
+
+    assert!(
+        ok && ledger.sample_count > sample_count_at_first_persist,
+        "shutdown must flush wear accumulated since the last periodic persist \
+         (at first persist={sample_count_at_first_persist}, after shutdown={})",
+        ledger.sample_count
+    );
+}
+
+/// T7 review M3 (RED-first without the fix): spec §2 — "Flipping false
+/// parks it after a final persist." Mirrors
+/// `wear_shutdown_persists_final_ledger` but the trigger is a runtime
+/// `[wear] enabled = false` reload instead of daemon shutdown. Unlike that
+/// test, this one already polls (`wait_for`) rather than reading
+/// immediately after the trigger, so it isn't sensitive to the wear
+/// tracker's fire-and-forget task completion timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "wear_env_lock serializes the wear tests' shared XDG_STATE_HOME env var across \
+              the whole test body (app lifetime included) — the lock is test-local and always \
+              released promptly at test end, so holding it across awaits here cannot deadlock \
+              or starve unrelated tests"
+)]
+async fn wear_park_persists_final_ledger() {
+    let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state_home = TempDir::new().unwrap();
+    let _env = XdgStateHomeGuard::set(state_home.path());
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = dir.path().join("config.toml");
+    let enabled_cfg = one_display_config_with_wear(
+        &marker,
+        "50ms",
+        "[wear]\nenabled = true\nsample_interval = \"5s\"\npersist_interval = \"60s\"\nread_timeout = \"500ms\"\n",
+    );
+    write_file(dir.path(), "config.toml", &enabled_cfg);
+    let creds_path = dir.path().join("credentials.toml");
+
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    let wear_file = state_home
+        .path()
+        .join("dormant")
+        .join("wear")
+        .join("wear-mon.json");
+    assert!(
+        wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
+        "ledger must appear from the first (immediate) tick's persist"
+    );
+    let sample_count_at_first_persist =
+        serde_json::from_str::<dormant_core::wear::WearLedger>(&read(&wear_file))
+            .expect("ledger file must parse")
+            .sample_count;
+
+    // Let at least one more sample_interval tick accumulate wear IN MEMORY
+    // (persist_interval is 60s, so no periodic persist fires again yet).
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Flip [wear].enabled = false on disk and trigger a reload — the
+    // tracker's next tick must detect the park edge and flush before
+    // continuing (T7 review M3), per spec §2.
+    let disabled_cfg = one_display_config_with_wear(
+        &marker,
+        "50ms",
+        "[wear]\nenabled = false\nsample_interval = \"5s\"\npersist_interval = \"60s\"\nread_timeout = \"500ms\"\n",
+    );
+    write_file(dir.path(), "config.toml", &disabled_cfg);
+    assert!(
+        handle.trigger_reload().await,
+        "reload to wear.enabled=false must be accepted"
+    );
+
+    let ok = wait_for(
+        || {
+            serde_json::from_str::<dormant_core::wear::WearLedger>(&read(&wear_file))
+                .is_ok_and(|l| l.sample_count > sample_count_at_first_persist)
+        },
+        Duration::from_secs(8),
+    )
+    .await;
+
+    let contents = read(&wear_file);
+    let ledger: dormant_core::wear::WearLedger =
+        serde_json::from_str(&contents).expect("ledger file must still parse after park");
+
+    shutdown(handle, join).await;
+
+    assert!(
+        ok && ledger.sample_count > sample_count_at_first_persist,
+        "the park edge must flush wear accumulated since the last periodic persist \
+         (at first persist={sample_count_at_first_persist}, after park={})",
+        ledger.sample_count
+    );
+}

@@ -493,6 +493,21 @@ impl CommandSink for DisplayExecutor {
         }
         None
     }
+
+    /// Walk the configured chain and return the first non-`None`
+    /// panel-derived identity — mirrors [`Self::read_usage_hours`]'s
+    /// chain-walk shape exactly (T7 review M1). Used once, at wear-ledger
+    /// creation time, so a chain with a primary controller that has no
+    /// panel identity (e.g. `command`, `kwin-dpms`) falls through to a
+    /// `ddcci`/`samsung-tizen` fallback that does.
+    fn panel_identity(&self) -> Option<String> {
+        for controller in &self.chain {
+            if let Some(id) = controller.panel_identity() {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -531,6 +546,9 @@ mod tests {
         /// Scripted [`DisplayController::read_usage_hours`] response — used
         /// by the T5 chain-walk test (test 2).
         usage_hours: Option<u32>,
+        /// Scripted [`DisplayController::panel_identity`] response — used
+        /// by the T7 chain-walk test.
+        panel_identity: Option<String>,
     }
 
     impl FakeController {
@@ -568,6 +586,10 @@ mod tests {
 
         fn set_usage_hours(&self, hours: Option<u32>) {
             self.inner.lock().unwrap().usage_hours = hours;
+        }
+
+        fn set_panel_identity(&self, id: Option<String>) {
+            self.inner.lock().unwrap().panel_identity = id;
         }
 
         fn count_op(&self, op: &'static str) -> usize {
@@ -627,6 +649,10 @@ mod tests {
 
         async fn read_usage_hours(&self) -> Option<u32> {
             self.inner.lock().unwrap().usage_hours
+        }
+
+        fn panel_identity(&self) -> Option<String> {
+            self.inner.lock().unwrap().panel_identity.clone()
         }
     }
 
@@ -1153,6 +1179,32 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let (exec, _) = executor_with(vec![a], default_retry());
         assert_eq!(exec.read_usage_hours().await, None);
+    }
+
+    // ── T7 fix M1: panel_identity chain-walk ─────────────────────────────────
+
+    #[tokio::test]
+    async fn panel_identity_chain_walk_primary_none_fallback_some() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // A has no panel identity (default None, mirroring a
+        // `kwin-dpms`/`command` primary); B does (mirroring a `ddcci`
+        // fallback that resolved its canonical key during probe).
+        b.set_panel_identity(Some("i2c-dev:56 DEL DELL U2723QE".into()));
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+
+        assert_eq!(
+            exec.panel_identity().as_deref(),
+            Some("i2c-dev:56 DEL DELL U2723QE"),
+            "chain-walk must fall through A's None to B's Some(..)"
+        );
+    }
+
+    #[tokio::test]
+    async fn panel_identity_none_when_no_controller_reports_it() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a], default_retry());
+        assert_eq!(exec.panel_identity(), None);
     }
 
     // ── T5 Step 7 (P1, MANDATORY): trait-boundary priority proof ────────────

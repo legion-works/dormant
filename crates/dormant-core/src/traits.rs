@@ -152,6 +152,21 @@ pub trait DisplayController: Any + Send + Sync {
     async fn read_usage_hours(&self) -> Option<u32> {
         None
     }
+
+    /// Stable, panel-derived identity for this controller's physical panel,
+    /// if one is available (spec §3 `WearIdentity`).
+    ///
+    /// Default returns `None` — the honest answer for every controller with
+    /// no panel-derived identity (`command`, `kwin-dpms`, `ha-passthrough`).
+    /// `DdcciController` overrides with its canonical panel-lock key
+    /// (resolved during `probe`, before any VCP transaction);
+    /// `SamsungTizenController` overrides with `"samsung:<host>"`. Used
+    /// once, at ledger-creation time, so a wear ledger's identity survives a
+    /// `[displays.*]` config rename instead of following the config key —
+    /// the entire reason `WearIdentity` exists (T7 review finding M1).
+    fn panel_identity(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The narrow interface [`crate::rules::RulesEngine`] uses to issue commands to
@@ -218,6 +233,18 @@ pub trait CommandSink: Send + Sync {
     /// contract; see [`DisplayController::read_usage_hours`] for the
     /// per-controller readback.
     async fn read_usage_hours(&self) -> Option<u32> {
+        None
+    }
+
+    /// Read the panel-derived identity through whichever controller in the
+    /// chain can report it — mirrors [`Self::read_state`]'s chain-walk
+    /// contract; see [`DisplayController::panel_identity`] for the
+    /// per-controller contract.
+    ///
+    /// Default returns `None`. The production [`crate::traits::CommandSink`]
+    /// implementation in `dormant-displays` (`DisplayExecutor`) overrides
+    /// this with a chain-walk identical in shape to `read_usage_hours`.
+    fn panel_identity(&self) -> Option<String> {
         None
     }
 }
@@ -313,6 +340,11 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(c.read_usage_hours().await, None);
+        assert_eq!(
+            c.panel_identity(),
+            None,
+            "default panel_identity must be honest None, not a fabricated identity"
+        );
     }
 
     #[tokio::test]
@@ -325,5 +357,10 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(s.read_usage_hours().await, None);
+        assert_eq!(
+            s.panel_identity(),
+            None,
+            "default panel_identity must be honest None, not a fabricated identity"
+        );
     }
 }

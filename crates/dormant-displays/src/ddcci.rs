@@ -537,6 +537,21 @@ impl DisplayController for DdcciController {
             .ok()?;
         Some(decode_usage_hours(raw))
     }
+
+    /// Stable panel identity (spec §3 / T7 review M1): the canonical
+    /// panel-lock key resolved during `probe` — ddc-hi's `Display::info`
+    /// ident string (`backend:id manufacturer model_name`), the same value
+    /// `matched_ident` holds. This is bus-path-derived, NOT the EDID
+    /// mfg/model/serial format the spec's `WearIdentity` doc names as the
+    /// ideal (that would require deeper `ddc-hi` field access this
+    /// controller does not yet parse — out of scope for this fix per the
+    /// T7 review's priority adjudication A); it is nonetheless
+    /// panel-derived rather than config-derived, which is the property
+    /// that matters: a `[displays.*]` rename does not orphan the ledger.
+    /// `None` before `probe()` has run.
+    fn panel_identity(&self) -> Option<String> {
+        self.state.lock().unwrap().matched_ident.clone()
+    }
 }
 
 impl DdcciController {
@@ -1169,6 +1184,50 @@ mod tests {
             &PanelLocks::new(),
         );
         assert_eq!(ctrl.read_usage_hours().await, None);
+    }
+
+    // ── T7 fix M1: panel_identity ────────────────────────────────────────────
+
+    /// RED-first (T7 review M1): before probe, no canonical key has been
+    /// resolved yet — `panel_identity()` must be the honest `None`, not a
+    /// fabricated value.
+    #[tokio::test]
+    async fn panel_identity_none_before_probe() {
+        let fake = Arc::new(single_display_vcp());
+        let ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        assert_eq!(ctrl.panel_identity(), None);
+    }
+
+    /// After probe, `panel_identity()` returns the same canonical
+    /// bus-path-derived key as `matched_ident`/the panel lock — panel-
+    /// derived, not config-derived, so a wear ledger keyed on this survives
+    /// a `[displays.*]` config rename.
+    #[tokio::test]
+    async fn panel_identity_returns_canonical_key_after_probe() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        assert_eq!(
+            ctrl.panel_identity().as_deref(),
+            Some("i2c-dev:56 DEL DELL U2723QE"),
+            "panel_identity must match the canonical key derived during probe"
+        );
     }
 
     // ── T5: canonical key + lock ordering (pin test 4, pin (e)) ─────────────

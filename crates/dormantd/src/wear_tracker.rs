@@ -22,15 +22,30 @@
 //! `load_or_create_ledger`, called by the shell the first time a display is
 //! observed — `tick` itself never touches the filesystem.
 //!
-//! ## Native brightness scale
+//! ## Native brightness scale (T7 review M2)
 //!
 //! [`brightness_norm`] needs the controller's native top-of-scale value
-//! (100 for DDC/CI, 50 for Samsung port-1516). `WearConfig` carries no
-//! per-controller scale (out of scope for this task — see `NATIVE_MAX_DEFAULT`
-//! doc comment), so every controller is normalized against a DDC/CI-shaped
-//! 0..=100 scale. Samsung's narrower 0..=50 readback would read as
-//! under-bright by this heuristic; a follow-up would thread a per-display
-//! native-max through `DisplayConfig`.
+//! (100 for DDC/CI, 50 for Samsung port-1516 `backlightControl`). Per
+//! display, `ensure_ledgers_loaded` derives this from the display's
+//! configured `controllers` list (already in scope — no new `WearConfig`
+//! field or trait method needed) via `native_max_for` and stores it in
+//! `TrackerState::native_max`, which `tick` consults per display instead of
+//! a single hardcoded constant. Without this, a Samsung panel's wear was
+//! systematically halved (`backlight=25` on a 0..=50 scale read as `25/100
+//! = 0.25` instead of `0.5`).
+//!
+//! ## Panel identity (T7 review M1)
+//!
+//! Spec §3's `WearIdentity` exists so a `[displays.*]` config rename or two
+//! differently-named configs for the same panel don't orphan (or collide
+//! with) an existing ledger. `ensure_ledgers_loaded` prefers
+//! `CommandSink::panel_identity()` — ddcci's canonical panel-lock key,
+//! samsung's `"samsung:<host>"` — over the sanitized config display key,
+//! falling back to the config key only for controllers with no panel-
+//! derived identity (`command`, `kwin-dpms`, `ha-passthrough`). The
+//! resolved key is cached in `TrackerState::storage_key` and used
+//! consistently for the ledger filename, `WearIdentity.key`, and the
+//! shared [`WearHandle`] map key.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -48,10 +63,28 @@ use dormant_core::wear::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-/// DDC/CI-shaped native brightness top-of-scale, used for every controller
-/// until a per-display native-max is plumbed through config (see module
-/// docs).
+/// DDC/CI-shaped native brightness top-of-scale — the default for every
+/// display whose controller list does not include `samsung-tizen` (see
+/// `native_max_for` and the module docs, T7 review M2).
 const NATIVE_MAX_DEFAULT: u16 = 100;
+
+/// Samsung port-1516 `backlightControl` native brightness top-of-scale
+/// (T7 review M2 — spec §3's `brightness_norm` doc: "DDC max 100, Samsung
+/// max 50").
+const NATIVE_MAX_SAMSUNG: u16 = 50;
+
+/// Per-display native brightness top-of-scale (T7 review M2): a display
+/// whose configured `controllers` list includes `samsung-tizen` reads its
+/// backlight on the 0..=50 scale; every other controller (DDC/CI `0x10`,
+/// or a controller with no brightness readback at all) uses the DDC/CI-
+/// shaped 0..=100 scale.
+fn native_max_for(controllers: &[String]) -> u16 {
+    if controllers.iter().any(|c| c == "samsung-tizen") {
+        NATIVE_MAX_SAMSUNG
+    } else {
+        NATIVE_MAX_DEFAULT
+    }
+}
 
 /// Dependencies the wear tracker needs, handed in by `app.rs` at daemon
 /// startup.
@@ -93,7 +126,16 @@ async fn run(mut deps: WearTrackerDeps) {
 
     loop {
         tokio::select! {
-            () = deps.cancel.cancelled() => break,
+            () = deps.cancel.cancelled() => {
+                // Final persist on daemon shutdown (spec §2/§4.2: "on
+                // daemon shutdown AND on park") — flush every currently-
+                // loaded, non-readonly ledger before the task stops. In-
+                // memory wear that has accumulated since the last
+                // `persist_interval` boundary would otherwise be silently
+                // lost on every daemon restart (T7 review M3).
+                persist_all_dirty(&state, &dir);
+                break;
+            }
             changed = deps.config_rx.changed() => {
                 if changed.is_err() {
                     break;
@@ -106,6 +148,10 @@ async fn run(mut deps: WearTrackerDeps) {
 
                 if !cfg.wear.enabled {
                     if was_enabled != Some(false) {
+                        // Park EDGE: flush accumulated wear before parking
+                        // — spec §2: "Flipping false parks it after a
+                        // final persist" (T7 review M3).
+                        persist_all_dirty(&state, &dir);
                         tracing::info!(event = "wear_tracker_parked");
                     }
                     was_enabled = Some(false);
@@ -178,12 +224,23 @@ fn ensure_ledgers_loaded(
         }
         state.resolved.insert(display_id.clone());
 
-        let panel_type = cfg
-            .displays
-            .get(&display_id.0)
-            .map(|d| d.panel_type)
-            .unwrap_or_default();
-        let key = sanitize_identity_key(&display_id.0);
+        let display_cfg = cfg.displays.get(&display_id.0);
+        let panel_type = display_cfg.map(|d| d.panel_type).unwrap_or_default();
+        let native_max = display_cfg.map_or(NATIVE_MAX_DEFAULT, |d| native_max_for(&d.controllers));
+        state.native_max.insert(display_id.clone(), native_max);
+
+        // Panel identity (spec §3 / T7 review M1): prefer the controller
+        // chain's own panel-derived identity over the config display name,
+        // so a `[displays.*]` rename never orphans an existing ledger.
+        // Only controllers with no readback (`command`, `kwin-dpms`,
+        // `ha-passthrough`) fall back to the sanitized config key.
+        let identity_source = executors
+            .get(display_id)
+            .and_then(|sink| sink.panel_identity())
+            .unwrap_or_else(|| display_id.0.clone());
+        let key = sanitize_identity_key(&identity_source);
+        state.storage_key.insert(display_id.clone(), key.clone());
+
         let identity = WearIdentity {
             key: key.clone(),
             display_name: display_id.0.clone(),
@@ -207,10 +264,32 @@ fn ensure_ledgers_loaded(
     }
 }
 
+/// Persist every currently-loaded, non-readonly ledger — the "final
+/// persist" spec §2/§4.2 requires on daemon shutdown AND on the
+/// enabled→disabled park edge (T7 review M3). Read-only ledgers (future
+/// schema version, or a corrupt-rename that itself failed) are skipped,
+/// same as the periodic `Persist` action's guard in `apply_actions`.
+fn persist_all_dirty(state: &TrackerState, dir: &Path) {
+    for (display_id, ledger) in &state.ledgers {
+        if state.persist_readonly.contains(display_id) {
+            continue;
+        }
+        let key = state
+            .storage_key
+            .get(display_id)
+            .cloned()
+            .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
+        if let Err(e) = persist_ledger(dir, &key, ledger) {
+            tracing::warn!(event = "wear_persist_failed", display = %display_id, error = %e);
+        }
+    }
+}
+
 /// ASYNC SHELL: sample panel state (sampler priority, bounded by
-/// `cfg.read_timeout`) only for displays currently in the `active` stage —
-/// every other stage uses a fixed attribution factor and needs no hardware
-/// read.
+/// `cfg.read_timeout`) only for displays currently in the `active` OR
+/// `grace` phase (both map to `stage_literal`'s `"active"` — spec §4.2's
+/// attribution table pins them to the same row) — every other stage uses a
+/// fixed attribution factor and needs no hardware read.
 async fn collect_samples(
     snapshot: &StateSnapshot,
     executors: &HashMap<DisplayId, Arc<dyn CommandSink>>,
@@ -259,7 +338,16 @@ async fn apply_actions(
                 let Some(ledger) = state.ledgers.get(&display_id) else {
                     continue;
                 };
-                let key = sanitize_identity_key(&display_id.0);
+                // Use the SAME resolved storage key `ensure_ledgers_loaded`
+                // used to load this ledger (T7 review M1) — recomputing
+                // from `display_id.0` here would silently diverge from the
+                // file this ledger was actually loaded from whenever
+                // `panel_identity()` won over the config key.
+                let key = state
+                    .storage_key
+                    .get(&display_id)
+                    .cloned()
+                    .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
                 if let Err(e) = persist_ledger(dir, &key, ledger) {
                     tracing::warn!(event = "wear_persist_failed", display = %display_id, error = %e);
                 }
@@ -308,13 +396,21 @@ async fn apply_actions(
 }
 
 /// Copy every ledger in `state` into the shared [`WearHandle`] so concurrent
-/// readers (IPC/WebUI) see the latest attribution.
+/// readers (IPC/WebUI) see the latest attribution. Keyed by the same
+/// resolved `storage_key` used for the ledger filename (T7 review M1) — NOT
+/// recomputed from the config display id, which would silently diverge from
+/// the filename whenever `panel_identity()` won.
 fn sync_handle(state: &TrackerState, handle: &WearHandle) {
     let Ok(mut guard) = handle.write() else {
         return;
     };
     for (display_id, ledger) in &state.ledgers {
-        guard.insert(sanitize_identity_key(&display_id.0), ledger.clone());
+        let key = state
+            .storage_key
+            .get(display_id)
+            .cloned()
+            .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
+        guard.insert(key, ledger.clone());
     }
 }
 
@@ -344,6 +440,22 @@ struct TrackerState {
     dwell_start: HashMap<DisplayId, Option<u64>>,
     /// Epoch-seconds of the last successful persist, per display.
     last_persist_epoch_s: HashMap<DisplayId, u64>,
+    /// Resolved on-disk storage key per display (T7 review M1):
+    /// `CommandSink::panel_identity()` when available, else the sanitized
+    /// config key. Used consistently for the ledger filename,
+    /// `WearIdentity.key`, and the `WearHandle` map key so a config rename
+    /// cannot orphan an already-tracked panel's ledger.
+    storage_key: HashMap<DisplayId, String>,
+    /// Per-display native brightness top-of-scale (T7 review M2): 50 for a
+    /// `samsung-tizen`-controlled display, 100 (DDC/CI `0x10` scale)
+    /// otherwise. Populated once per display in `ensure_ledgers_loaded`.
+    native_max: HashMap<DisplayId, u16>,
+    /// True while the `"active"`/`"grace"` phase is currently degrading to
+    /// `fallback_brightness` because no real sample was available; cleared
+    /// the instant a real sample succeeds. Gates `wear_sample_fallback` to
+    /// log once per fallback EPISODE rather than once per tick (T7 review
+    /// S2 — spec §4.3.3's rate-limit note).
+    sample_fallback_active: HashMap<DisplayId, bool>,
 }
 
 /// One action the pure [`tick`] wants the async shell to perform.
@@ -385,7 +497,11 @@ fn stage_literal(phase: &str, stage: Option<&StageInfo>) -> &'static str {
         };
     }
     match phase {
-        "active" => "active",
+        // Spec §4.2's attribution table pins "active OR grace" to the same
+        // row (brightness via read_state(), fallback on a miss) — grace is
+        // the display-still-fully-on countdown window before every blank,
+        // not an unenumerated phase (T7 review M4).
+        "active" | "grace" => "active",
         "blanked" => "blanked",
         _ => "unknown",
     }
@@ -446,12 +562,37 @@ fn tick(
             "render_black" | "blanked" => 0.0,
             "active" => {
                 let sample = samples.get(&display_id).cloned().flatten();
+                // T7 review S2: log `wear_sample_fallback` once per
+                // fallback EPISODE (spec §4.3.3's rate-limit note), not
+                // once per tick — reset the latch the moment a real
+                // sample succeeds again.
                 if sample.is_none() {
-                    tracing::debug!(event = "wear_sample_fallback", display = %display_id);
+                    let already_fallback = state
+                        .sample_fallback_active
+                        .get(&display_id)
+                        .copied()
+                        .unwrap_or(false);
+                    if !already_fallback {
+                        tracing::debug!(event = "wear_sample_fallback", display = %display_id);
+                    }
+                    state
+                        .sample_fallback_active
+                        .insert(display_id.clone(), true);
+                } else {
+                    state
+                        .sample_fallback_active
+                        .insert(display_id.clone(), false);
                 }
+                // T7 review M2: per-display native scale (Samsung port-1516
+                // reports 0..=50; DDC/CI 0x10 reports 0..=100).
+                let native_max = state
+                    .native_max
+                    .get(&display_id)
+                    .copied()
+                    .unwrap_or(NATIVE_MAX_DEFAULT);
                 brightness_norm(
                     &sample.unwrap_or_default(),
-                    NATIVE_MAX_DEFAULT,
+                    native_max,
                     cfg.fallback_brightness,
                 )
             }
@@ -596,7 +737,14 @@ fn load_or_create_ledger(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(event = "wear_persist_failed", display = %display_key, error = %e);
+                    // Spec §5.2 pins `wear_ledger_corrupt` for the WHOLE
+                    // corrupt-handling path — including this rename-itself-
+                    // fails sub-case (T7 review S1). This is arguably the
+                    // more interesting incident (corrupt bytes AND a fresh
+                    // in-memory ledger now coexist, silently) and an
+                    // operator grepping for `wear_ledger_corrupt` must not
+                    // miss it.
+                    tracing::warn!(event = "wear_ledger_corrupt", display = %display_key, error = %e);
                     LoadResult {
                         ledger: WearLedger::new(identity, panel_type, rows, cols, now_epoch_s),
                         needs_seed: false,
@@ -679,6 +827,143 @@ mod tests {
         })
     }
 
+    // ── Test fixtures: minimal Config + fake CommandSink (M1/M2 tests) ───────
+
+    /// A valid but otherwise-empty `Config` — `ensure_ledgers_loaded` only
+    /// reads `.displays` and `.wear` from it.
+    fn minimal_config() -> Config {
+        Config {
+            config_version: 1,
+            daemon: dormant_core::config::schema::DaemonConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::new(),
+            rules: indexmap::IndexMap::new(),
+            wear: WearConfig::default(),
+        }
+    }
+
+    /// A `DisplayConfig` with the given controller chain and otherwise
+    /// harmless defaults — built via struct literal (no `toml` dependency
+    /// needed in this crate) since `DisplayConfig` has no `Default` impl.
+    fn display_config_with_controllers(
+        controllers: &[&str],
+    ) -> dormant_core::config::schema::DisplayConfig {
+        dormant_core::config::schema::DisplayConfig {
+            controllers: controllers.iter().map(|s| (*s).to_string()).collect(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 80,
+            samsung_restore_backlight: 50,
+            treat_unreachable_as_blanked: true,
+            panel_type: PanelType::Unknown,
+        }
+    }
+
+    /// A `CommandSink` test double whose only behavior is a scripted
+    /// `panel_identity()` — everything else is a harmless no-op/empty
+    /// default, since only `ensure_ledgers_loaded`'s identity-resolution
+    /// call site is under test here.
+    struct FakeCommandSink {
+        identity: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandSink for FakeCommandSink {
+        async fn blank(
+            &self,
+            _mode: dormant_core::types::BlankMode,
+        ) -> Result<(), dormant_core::types::CmdFailure> {
+            Ok(())
+        }
+
+        async fn wake(&self) -> Result<(), dormant_core::types::CmdFailure> {
+            Ok(())
+        }
+
+        fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+            Vec::new()
+        }
+
+        fn panel_identity(&self) -> Option<String> {
+            self.identity.clone()
+        }
+    }
+
+    /// Build an executors map from `(display, scripted panel_identity)`
+    /// pairs.
+    fn fake_executors(
+        entries: &[(&DisplayId, Option<&str>)],
+    ) -> HashMap<DisplayId, Arc<dyn CommandSink>> {
+        entries
+            .iter()
+            .map(|(id, ident)| {
+                let sink: Arc<dyn CommandSink> = Arc::new(FakeCommandSink {
+                    identity: ident.map(|s| (*s).to_string()),
+                });
+                ((*id).clone(), sink)
+            })
+            .collect()
+    }
+
+    // ── Tracing-capture helper (S1/S2 log-literal pins) ─────────────────────
+
+    /// A `MakeWriter` + `io::Write` that appends into a shared in-memory
+    /// buffer — used to capture `tracing` output for a single test via
+    /// `tracing::subscriber::with_default` (thread-local, so parallel tests
+    /// in this same process never interfere with each other's capture).
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a scoped `tracing` subscriber and return everything it
+    /// logged, formatted as text. Scoped (not global) so this cannot race
+    /// other tests' `tracing` state under `cargo test`'s default
+    /// multi-threaded runner.
+    fn capture_tracing<F: FnOnce()>(f: F) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            // `wear_sample_fallback` is emitted at `debug!` — the default
+            // max level must be raised explicitly or debug-level events
+            // are silently dropped before ever reaching the writer.
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+
     #[test]
     fn active_phase_attributes_with_read_brightness() {
         let display = DisplayId("mon".into());
@@ -699,6 +984,191 @@ mod tests {
         let actions = tick(&mut state, &snapshot, &samples, &cfg, 1_000_060);
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert!((norm - 0.8).abs() < 1e-9);
+    }
+
+    // ── T7 fix M2: per-display native brightness scale ───────────────────────
+
+    #[test]
+    fn native_max_for_samsung_tizen_is_50() {
+        assert_eq!(native_max_for(&["samsung-tizen".to_string()]), 50);
+        assert_eq!(
+            native_max_for(&["command".to_string(), "samsung-tizen".to_string()]),
+            50,
+            "samsung-tizen anywhere in the controller list selects the 0..=50 scale"
+        );
+    }
+
+    #[test]
+    fn native_max_for_non_samsung_is_100() {
+        assert_eq!(native_max_for(&["ddcci".to_string()]), 100);
+        assert_eq!(native_max_for(&["command".to_string()]), 100);
+        assert_eq!(native_max_for(&[]), 100);
+    }
+
+    /// T7 review priority adjudication B (RED-first without the fix): a
+    /// samsung-shaped display (`native_max=50`) reading `backlight=25` must
+    /// attribute norm 0.5 — spec §3's own worked example
+    /// (`brightness_norm(&samsung, 50, 0.5)` for a sample of 25 → 0.5).
+    /// Before the fix, every controller used the hardcoded DDC/CI 100-scale,
+    /// which would have read this as `25/100 = 0.25` — systematically
+    /// halving every Samsung panel's attributed wear.
+    #[test]
+    fn samsung_shaped_display_attributes_half_scale_correctly() {
+        let display = DisplayId("tv".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        state.native_max.insert(display.clone(), 50);
+        let snapshot = snapshot_with(&display, "active", None);
+        let mut samples = HashMap::new();
+        samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(25),
+            }),
+        );
+        let cfg = WearConfig::default();
+        let actions = tick(&mut state, &snapshot, &samples, &cfg, 1_000_060);
+        let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
+        assert!(
+            (norm - 0.5).abs() < 1e-9,
+            "samsung native_max=50 must normalize 25 -> 0.5, got {norm}"
+        );
+    }
+
+    /// `ensure_ledgers_loaded` must derive `native_max` from the display's
+    /// configured `controllers` list, not just accept an externally-poked
+    /// `TrackerState` field (the test above pins `tick`'s consumption in
+    /// isolation; this one pins the wiring that populates it).
+    #[test]
+    fn ensure_ledgers_loaded_derives_samsung_native_max_from_controllers() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("tv".into());
+        let mut cfg = minimal_config();
+        cfg.displays.insert(
+            "tv".to_string(),
+            display_config_with_controllers(&["samsung-tizen"]),
+        );
+
+        let mut state = TrackerState::default();
+        let executors = fake_executors(&[(&display, None)]);
+        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+
+        assert_eq!(state.native_max.get(&display).copied(), Some(50));
+    }
+
+    // ── T7 fix M1: ledger identity = panel identity, not config key ──────────
+
+    /// T7 review priority adjudication A (RED-first without the fix): when
+    /// the controller chain reports a panel-derived identity,
+    /// `ensure_ledgers_loaded` must key the ledger — and the actual on-disk
+    /// filename, via the real `apply_actions` persist path — on THAT
+    /// identity, not the sanitized config display key. Before the fix
+    /// `identity.key` was always `sanitize_identity_key(&display_id.0)`,
+    /// which is the entire bug M1 exists to fix.
+    #[tokio::test]
+    async fn ledger_filename_and_identity_prefer_panel_identity_over_config_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let cfg = minimal_config();
+        let panel_ident = "ddc:AOC:AG326UZD:XK2R9JA000013";
+        let executors = fake_executors(&[(&display, Some(panel_ident))]);
+
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+
+        let expected_key = sanitize_identity_key(panel_ident);
+        assert_eq!(
+            state.storage_key.get(&display).cloned(),
+            Some(expected_key.clone())
+        );
+        let ledger = state.ledgers.get(&display).unwrap();
+        assert_eq!(ledger.identity.key, expected_key);
+        assert_ne!(
+            ledger.identity.key,
+            sanitize_identity_key(&display.0),
+            "must NOT use the config key when a panel identity is available"
+        );
+        // display_name stays the operator-facing config label (spec §3:
+        // "NOT part of the identity key for ddcci/samsung").
+        assert_eq!(ledger.identity.display_name, "mon");
+
+        // Drive the REAL shell persist path (not a re-implementation of the
+        // key logic) and check the actual file on disk.
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        tokio::spawn(async move { while ctl_rx.recv().await.is_some() {} });
+        let actions = vec![TrackerAction::Persist {
+            display: display.clone(),
+        }];
+        apply_actions(&mut state, actions, &executors, &ctl_tx, dir.path()).await;
+
+        let expected_path = dir.path().join(format!("wear-{expected_key}.json"));
+        assert!(
+            expected_path.exists(),
+            "ledger file must be named from the panel identity, not the config key"
+        );
+        assert!(
+            !dir.path().join("wear-mon.json").exists(),
+            "must NOT also write a config-key-named file"
+        );
+    }
+
+    /// Regression pin: controllers with no panel-derived identity
+    /// (`command`, `kwin-dpms`, `ha-passthrough`) correctly fall back to
+    /// the sanitized config key — the pre-fix behavior for THIS case was
+    /// already right; M1 only changes the ddcci/samsung path.
+    #[test]
+    fn ensure_ledgers_loaded_falls_back_to_config_key_when_no_panel_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let cfg = minimal_config();
+        let executors = fake_executors(&[(&display, None)]);
+
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+
+        let expected_key = sanitize_identity_key(&display.0);
+        assert_eq!(
+            state.storage_key.get(&display).cloned(),
+            Some(expected_key.clone())
+        );
+        assert_eq!(
+            state.ledgers.get(&display).unwrap().identity.key,
+            expected_key
+        );
+    }
+
+    /// The property M1 exists for (spec §3): the SAME physical panel
+    /// identity must resolve to the SAME storage key regardless of which
+    /// config display id names it — so renaming `[displays.mon]` to
+    /// `[displays.monitor2]` (simulated here as two independent
+    /// `TrackerState`s, matching a daemon restart after the rename) does
+    /// NOT orphan the existing ledger.
+    #[test]
+    fn panel_identity_survives_config_display_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_id = DisplayId("mon".into());
+        let new_id = DisplayId("monitor2".into());
+        let cfg = minimal_config();
+        let panel_ident = "ddc:AOC:AG326UZD:XK2R9JA000013";
+
+        let mut state_before = TrackerState::default();
+        let executors_before = fake_executors(&[(&old_id, Some(panel_ident))]);
+        ensure_ledgers_loaded(&mut state_before, &cfg, &executors_before, dir.path(), 0);
+        let key_before = state_before.storage_key.get(&old_id).cloned().unwrap();
+
+        let mut state_after = TrackerState::default();
+        let executors_after = fake_executors(&[(&new_id, Some(panel_ident))]);
+        ensure_ledgers_loaded(&mut state_after, &cfg, &executors_after, dir.path(), 0);
+        let key_after = state_after.storage_key.get(&new_id).cloned().unwrap();
+
+        assert_eq!(
+            key_before, key_after,
+            "the same physical panel must resolve to the SAME storage key \
+             across a config display rename"
+        );
     }
 
     #[test]
@@ -755,6 +1225,56 @@ mod tests {
         assert_eq!(norm2, 0.0);
     }
 
+    /// T7 review S2 (RED-first without the fix): spec §4.3.3's rate-limit
+    /// note ("rate-limited to once per display per hour") — the minimal
+    /// spec-conformant reading implemented here is "once per fallback
+    /// EPISODE, reset on the next successful sample" (cheaper and at least
+    /// as conservative as a fixed hourly window, and testable without a
+    /// fake clock). Two consecutive no-sample ticks must log
+    /// `wear_sample_fallback` only ONCE; a successful sample in between
+    /// resets the latch so a LATER fallback episode logs again.
+    #[test]
+    fn sample_fallback_logs_once_per_episode_and_resets_on_success() {
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let snapshot = snapshot_with(&display, "active", None);
+        let cfg = WearConfig::default();
+
+        let log = capture_tracing(|| {
+            // Episode 1: two consecutive no-sample ticks.
+            let _ = tick(&mut state, &snapshot, &HashMap::new(), &cfg, 1_000_060);
+            let _ = tick(&mut state, &snapshot, &HashMap::new(), &cfg, 1_000_120);
+        });
+        assert_eq!(
+            log.matches("wear_sample_fallback").count(),
+            1,
+            "two consecutive fallback ticks must log only once: {log}"
+        );
+
+        // A successful sample resets the latch...
+        let mut samples = HashMap::new();
+        samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(50),
+            }),
+        );
+        let log2 = capture_tracing(|| {
+            let _ = tick(&mut state, &snapshot, &samples, &cfg, 1_000_180);
+            // ...so a LATER fallback episode logs again.
+            let _ = tick(&mut state, &snapshot, &HashMap::new(), &cfg, 1_000_240);
+        });
+        assert_eq!(
+            log2.matches("wear_sample_fallback").count(),
+            1,
+            "a fallback episode after a successful sample must log again: {log2}"
+        );
+    }
+
     #[test]
     fn unknown_phase_falls_back() {
         let display = DisplayId("mon".into());
@@ -762,11 +1282,51 @@ mod tests {
         state
             .ledgers
             .insert(display.clone(), fresh_ledger(&display, 0));
-        let snapshot = snapshot_with(&display, "grace", None);
+        // A genuinely unenumerated phase (spec §4.2's table names `active`,
+        // `grace`, `staged`, `blanking`/`blanked`/`waking` explicitly —
+        // `waking` IS one of those named phases but has no dedicated
+        // attribution row, so it (like any truly novel phase literal)
+        // falls to the fail-toward-overcounting fallback arm). This must
+        // NOT be `"grace"` — see `grace_phase_attributes_with_read_brightness`
+        // below (T7 review M4): `grace` has its own attribution row.
+        let snapshot = snapshot_with(&display, "waking", None);
         let cfg = WearConfig::default();
         let actions = tick(&mut state, &snapshot, &HashMap::new(), &cfg, 1_000_060);
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert!((norm - cfg.fallback_brightness).abs() < 1e-9);
+    }
+
+    /// T7 review M4 (RED-first): spec §4.2's attribution table pins
+    /// `phase active OR grace` to the SAME row — `span × brightness_norm`
+    /// via a real `read_state()` sample, not the unknown-phase fallback.
+    /// `"grace"` is the display-still-fully-on countdown window before a
+    /// blank; treating it as `unknown` (the pre-fix behavior) silently
+    /// under/over-attributes wear on every single blank cycle. Mirrors
+    /// `active_phase_attributes_with_read_brightness` exactly except for
+    /// the phase literal.
+    #[test]
+    fn grace_phase_attributes_with_read_brightness() {
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let snapshot = snapshot_with(&display, "grace", None);
+        let mut samples = HashMap::new();
+        samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(80),
+            }),
+        );
+        let cfg = WearConfig::default();
+        let actions = tick(&mut state, &snapshot, &samples, &cfg, 1_000_060);
+        let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
+        assert!(
+            (norm - 0.8).abs() < 1e-9,
+            "grace must attribute via the real brightness sample, like active, not fallback: {norm}"
+        );
     }
 
     #[test]
@@ -994,6 +1554,41 @@ mod tests {
         assert!(!result.needs_seed);
     }
 
+    /// T7 review S1 (RED-first): spec §5.2 pins `wear_ledger_corrupt` as the
+    /// log literal for the WHOLE corrupt-handling path, including the
+    /// rename-itself-fails sub-case ("if the rename itself fails (e.g.
+    /// EACCES) ... WARN `wear_ledger_corrupt`, once") — not `wear_persist_failed`
+    /// (that literal is reserved for the unrelated `Persist` action's
+    /// `persist_ledger` I/O failure in `apply_actions`). An operator
+    /// grepping specifically for `wear_ledger_corrupt` to audit corrupt-
+    /// ledger incidents must not miss this sub-case.
+    #[test]
+    fn corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wear-mon.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let now = 999;
+        std::fs::create_dir(dir.path().join(format!("wear-mon.json.corrupt.{now}"))).unwrap();
+        let identity = WearIdentity {
+            key: "mon".into(),
+            display_name: "mon".into(),
+        };
+
+        let log = capture_tracing(|| {
+            let _ =
+                load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, now);
+        });
+
+        assert!(
+            log.contains("wear_ledger_corrupt"),
+            "rename-failure path must log wear_ledger_corrupt: {log}"
+        );
+        assert!(
+            !log.contains("wear_persist_failed"),
+            "rename-failure path must NOT log wear_persist_failed: {log}"
+        );
+    }
+
     #[test]
     fn future_schema_version_loads_read_only_and_never_overwrites() {
         let dir = tempfile::tempdir().unwrap();
@@ -1025,6 +1620,65 @@ mod tests {
         assert_eq!(
             after, original,
             "future-version file must never be overwritten"
+        );
+    }
+
+    /// T7 review S3: the test above (`future_schema_version_loads_read_only_
+    /// and_never_overwrites`) never calls `apply_actions` — it re-implements
+    /// the `if !result.persist_readonly { persist_ledger(...) }` gate
+    /// itself, so it does not exercise the REAL shell-level enforcement
+    /// (the `state.persist_readonly.contains(&display_id) { continue; }`
+    /// guard inside `apply_actions`'s `Persist` handler). This test drives
+    /// `apply_actions` directly with a future-version ledger present and
+    /// asserts the file bytes are byte-identical afterward — closing the
+    /// gap the review proved was invisible to the suite (removing the
+    /// `apply_actions` guard left every existing test green).
+    #[tokio::test]
+    async fn apply_actions_never_persists_a_future_version_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let identity = WearIdentity {
+            key: "mon".into(),
+            display_name: "mon".into(),
+        };
+        let mut future = WearLedger::new(identity.clone(), PanelType::Unknown, 9, 16, 0);
+        future.schema_version = 99;
+        let path = dir.path().join("wear-mon.json");
+        let original = serde_json::to_string(&future).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        // Load through the real path — this is what actually populates
+        // `persist_readonly` in production.
+        let result =
+            load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, 500);
+        assert!(
+            result.persist_readonly,
+            "sanity: must have loaded read-only"
+        );
+
+        let mut state = TrackerState::default();
+        state.storage_key.insert(display.clone(), "mon".to_string());
+        state.persist_readonly.insert(display.clone());
+        // Mutate the in-memory ledger so a persist WOULD be observable on
+        // disk if the guard failed to stop it.
+        let mut ledger = result.ledger;
+        ledger.attribute_uniform(Duration::from_secs(3600), 1.0);
+        state.ledgers.insert(display.clone(), ledger);
+
+        let executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        tokio::spawn(async move { while ctl_rx.recv().await.is_some() {} });
+
+        let actions = vec![TrackerAction::Persist {
+            display: display.clone(),
+        }];
+        // THE REAL PRODUCTION PATH — not a re-implementation of the guard.
+        apply_actions(&mut state, actions, &executors, &ctl_tx, dir.path()).await;
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after, original,
+            "apply_actions must never overwrite a future-version (persist_readonly) ledger"
         );
     }
 

@@ -60,5 +60,25 @@ fn print_event(event: &DaemonEvent) {
         DaemonEvent::WakeRetry { display, attempt } => {
             println!("display {display}: wake retry #{attempt}");
         }
+        DaemonEvent::WearSnapshot {
+            display,
+            total_on_hours,
+            sample_count,
+        } => {
+            println!(
+                "display {display}: wear snapshot ({total_on_hours:.1}h, {sample_count} samples)"
+            );
+        }
+        DaemonEvent::CompensationAdvisory {
+            display,
+            hours_since_long_dwell,
+        } => {
+            println!(
+                "display {display}: compensation advisory ({hours_since_long_dwell}h since long dwell)"
+            );
+        }
+        DaemonEvent::Unknown => {
+            println!("unknown daemon event");
+        }
     }
 }

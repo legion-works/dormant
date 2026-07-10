@@ -94,6 +94,12 @@ pub enum ControlMsg {
     /// Input-wake event from the render surface — route to the display
     /// machine's [`Input::InputWake`].
     InputWake(DisplayId),
+    /// Publish a daemon-side event onto this generation's event bus.
+    /// Debug-asserts the event is not [`DaemonEvent::Unknown`] — the daemon
+    /// never constructs that variant; it exists purely for forward-compat
+    /// deserialization of events an OLDER client doesn't recognize yet.
+    /// Passive — no engine state change beyond the broadcast send.
+    PublishDaemonEvent(DaemonEvent),
     /// Force-wake EVERY display and pause every rule indefinitely, regardless
     /// of the per-display state machine's current phase.  Used by
     /// `dormantctl emergency-wake` as a one-shot panic-recovery command.
@@ -281,6 +287,41 @@ pub enum DaemonEvent {
         /// Monotonically increasing retry attempt counter (per display).
         attempt: u64,
     },
+    /// A wear-tracking sample was taken for a display.  `display` is
+    /// required (a wear event without its display is meaningless);
+    /// `total_on_hours` / `sample_count` are `#[serde(default)]` so a
+    /// future producer can omit them without breaking older consumers.
+    WearSnapshot {
+        /// The display this snapshot applies to.
+        display: DisplayId,
+        /// Cumulative on-hours tracked for this display.
+        #[serde(default)]
+        total_on_hours: f64,
+        /// Number of wear samples folded into `total_on_hours` so far.
+        #[serde(default)]
+        sample_count: u64,
+    },
+    /// Advisory nudge: the display has gone this many hours since its last
+    /// long-dwell static-content window (a hint the WebUI/CLI can use to
+    /// suggest compensation, e.g. a pixel-shift or a brightness nudge).
+    /// `display` is required; `hours_since_long_dwell` is
+    /// `#[serde(default)]` for forward compat.
+    CompensationAdvisory {
+        /// The display this advisory applies to.
+        display: DisplayId,
+        /// Hours elapsed since the display's last long-dwell window.
+        #[serde(default)]
+        hours_since_long_dwell: u64,
+    },
+    /// Wire-tolerance catch-all: any event tag this build does not
+    /// recognize deserializes to this variant instead of failing the whole
+    /// stream.  The daemon never constructs this — see
+    /// [`ControlMsg::PublishDaemonEvent`]'s debug assertion.  `#[doc(hidden)]`
+    /// because it is not a real event kind, just the forward-compat escape
+    /// hatch for older CLIs/WebUI builds talking to a newer daemon.
+    #[doc(hidden)]
+    #[serde(other)]
+    Unknown,
 }
 
 /// A sensor as seen by a [`StateSnapshot`].
@@ -923,6 +964,13 @@ impl RulesEngine {
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
             ControlMsg::InputWake(d) => self.step_one(&d, Input::InputWake),
+            ControlMsg::PublishDaemonEvent(ev) => {
+                debug_assert!(
+                    !matches!(ev, DaemonEvent::Unknown),
+                    "daemon must never construct Unknown"
+                );
+                let _ = self.event_tx.send(ev);
+            }
             ControlMsg::Snapshot(tx) => self.send_snapshot(tx),
             ControlMsg::SubscribeEvents(tx) => {
                 let _ = tx.send(self.event_tx.subscribe());
@@ -2381,6 +2429,118 @@ mod tests {
             t.wake_retry_interval,
             crate::config::defaults::WAKE_RETRY_INTERVAL
         );
+    }
+
+    // ── DaemonEvent wire tolerance / new variants ────────────────────────────
+
+    /// An event tag this build does not recognize must deserialize to
+    /// `Unknown` instead of failing the whole stream — the forward-compat
+    /// contract a rolling daemon-upgrade depends on (an older CLI/WebUI must
+    /// not choke on a newer daemon's events).
+    #[test]
+    fn unknown_event_tag_parses_to_unknown() {
+        let e: DaemonEvent = serde_json::from_str(r#"{"event":"from_the_future","x":1}"#).unwrap();
+        assert!(matches!(e, DaemonEvent::Unknown));
+    }
+
+    /// `WearSnapshot` round-trips through the wire with the expected tag and
+    /// fields.
+    #[test]
+    fn wear_snapshot_round_trips() {
+        // DisplayId is a tuple newtype with no `From<&str>` — construct it
+        // directly (repo convention).
+        let e = DaemonEvent::WearSnapshot {
+            display: DisplayId("m".into()),
+            total_on_hours: 1.5,
+            sample_count: 3,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"event\":\"wear_snapshot\""));
+        assert!(matches!(
+            serde_json::from_str(&s).unwrap(),
+            DaemonEvent::WearSnapshot { .. }
+        ));
+    }
+
+    /// `CompensationAdvisory` round-trips through the wire with the expected
+    /// tag and fields.
+    #[test]
+    fn compensation_advisory_round_trips() {
+        let e = DaemonEvent::CompensationAdvisory {
+            display: DisplayId("m".into()),
+            hours_since_long_dwell: 12,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"event\":\"compensation_advisory\""));
+        assert!(matches!(
+            serde_json::from_str(&s).unwrap(),
+            DaemonEvent::CompensationAdvisory { .. }
+        ));
+    }
+
+    /// Minimal engine used by the `PublishDaemonEvent` tests below — no
+    /// rules/displays/sensors, `AlwaysOwned` gate.  `handle_control` is
+    /// synchronous and self-contained (no `run()` loop needed), so these
+    /// tests drive it directly.
+    fn minimal_engine() -> RulesEngine {
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![],
+                sensors: vec![],
+            },
+            ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("minimal engine config is valid")
+    }
+
+    /// `ControlMsg::PublishDaemonEvent` is the tracker's publish path (P3):
+    /// a daemon-lifetime tracker cannot hold the engine's private
+    /// per-generation `event_tx`, so it publishes through this control
+    /// message instead.  A subscriber attached before the publish must see
+    /// the event verbatim.
+    #[test]
+    fn publish_daemon_event_reaches_subscriber_verbatim() {
+        let mut engine = minimal_engine();
+
+        let (sub_tx, mut sub_rx) = oneshot::channel();
+        engine.handle_control(ControlMsg::SubscribeEvents(sub_tx));
+        let mut sub = sub_rx.try_recv().expect("subscribe reply sent inline");
+
+        let ev = DaemonEvent::WearSnapshot {
+            display: DisplayId("m".into()),
+            total_on_hours: 1.5,
+            sample_count: 3,
+        };
+        engine.handle_control(ControlMsg::PublishDaemonEvent(ev));
+
+        let got = sub.try_recv().expect("published event delivered");
+        match got {
+            DaemonEvent::WearSnapshot {
+                display,
+                total_on_hours,
+                sample_count,
+            } => {
+                assert_eq!(display, DisplayId("m".into()));
+                assert!((total_on_hours - 1.5).abs() < f64::EPSILON);
+                assert_eq!(sample_count, 3);
+            }
+            other => panic!("expected WearSnapshot verbatim, got {other:?}"),
+        }
+    }
+
+    /// The daemon must never construct `DaemonEvent::Unknown` — the ctl
+    /// handler debug-asserts this at the publish seam so a bug that tries
+    /// fails loudly in debug builds instead of silently shipping a
+    /// meaningless event.
+    #[test]
+    #[should_panic(expected = "daemon must never construct Unknown")]
+    fn publish_unknown_event_debug_asserts() {
+        let mut engine = minimal_engine();
+        engine.handle_control(ControlMsg::PublishDaemonEvent(DaemonEvent::Unknown));
     }
 }
 

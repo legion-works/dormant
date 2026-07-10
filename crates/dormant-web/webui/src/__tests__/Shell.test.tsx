@@ -51,6 +51,7 @@ vi.mock("../api/client", () => ({
   getState: vi.fn().mockResolvedValue(SAMPLE_STATE),
   getConfig: vi.fn().mockResolvedValue(SAMPLE_CONFIG),
   postReload: vi.fn().mockResolvedValue(undefined),
+  getWear: vi.fn().mockResolvedValue({ displays: [] }),
 }));
 
 afterEach(() => {

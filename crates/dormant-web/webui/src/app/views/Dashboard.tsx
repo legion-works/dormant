@@ -9,7 +9,7 @@
  */
 import { useNavigate } from "../nav";
 import { useLiveState, useEventLog } from "../hooks/useLiveState";
-import { Card, StatusChip, statusLabel, phaseChipLabel } from "../components";
+import { Card, StatusChip, WearCard, statusLabel, phaseChipLabel } from "../components";
 import { badgeForEvent, messageForEvent } from "./eventFormat";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";
@@ -271,6 +271,11 @@ export default function Dashboard() {
           })}
         </Card>
       </div>
+
+      {/* Panel exposure — WearCard renders its own title + caption. */}
+      <Card opaque>
+        <WearCard />
+      </Card>
 
       {/* Recent activity */}
       <SectionHeader

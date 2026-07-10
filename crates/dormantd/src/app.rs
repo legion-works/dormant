@@ -483,6 +483,7 @@ impl App {
                     creds_path: self.creds_path.clone(),
                     apply_lock: tokio::sync::Mutex::new(()),
                     doctor: doctor_service.clone(),
+                    wear: wear_handle.clone(),
                     web_bind: addr,
                     cancel: root.clone(),
                     reload_timeout: std::time::Duration::from_secs(10),

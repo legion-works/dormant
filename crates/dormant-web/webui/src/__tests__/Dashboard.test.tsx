@@ -82,6 +82,7 @@ vi.mock("../api/client", () => ({
   getConfig: vi.fn().mockResolvedValue(SAMPLE_CONFIG),
   postBlank: vi.fn().mockResolvedValue(undefined),
   postWake: vi.fn().mockResolvedValue(undefined),
+  getWear: vi.fn().mockResolvedValue({ displays: [] }),
 }));
 
 vi.mock("../api/ws", () => ({

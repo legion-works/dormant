@@ -44,6 +44,13 @@ describe("enum arrays match Rust serde wire strings", () => {
       "config_reloaded",
       "wake_retry",
       "config_reload_rejected",
+      "wear_snapshot",
+      "compensation_advisory",
     ]);
+  });
+
+  it("PanelType — serde(rename_all = 'kebab-case')", async () => {
+    const { PANEL_TYPES } = await import("../api/types");
+    expect(PANEL_TYPES).toEqual(["woled", "qd-oled", "unknown"]);
   });
 });

@@ -6,7 +6,7 @@
  * `error` (inline 422 validation detail rendered below the input).
  */
 
-export { LOG_LEVELS, FUSION_MODES, UNAVAILABLE_POLICIES, IDLE_TIME_UNITS, IDLE_SOURCES } from "./constants";
+export { LOG_LEVELS, FUSION_MODES, UNAVAILABLE_POLICIES, IDLE_TIME_UNITS, IDLE_SOURCES, PANEL_TYPES } from "./constants";
 
 export interface FieldProps {
   path: string[];

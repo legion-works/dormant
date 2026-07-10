@@ -417,3 +417,98 @@ describe("LiveStateProvider event-to-state patching", () => {
       );
     });
   });
+
+describe("LiveStateProvider wear events", () => {
+  function WearConsumer() {
+    const { wearSnapshots, wearAdvisories, snapshot } = useLiveState();
+    if (!snapshot) return <span>loading</span>;
+    return (
+      <div>
+        <span data-testid="wear-snap-d1">
+          {wearSnapshots.d1
+            ? `${wearSnapshots.d1.total_on_hours}:${wearSnapshots.d1.sample_count}`
+            : "none"}
+        </span>
+        <span data-testid="wear-adv-d1">
+          {wearAdvisories.d1 !== undefined ? String(wearAdvisories.d1) : "none"}
+        </span>
+      </div>
+    );
+  }
+
+  it("wear_snapshot patches the wearSnapshots map without touching the StateSnapshot", async () => {
+    render(
+      <LiveStateProvider>
+        <WearConsumer />
+        <SensorConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+    });
+    expect(screen.getByTestId("wear-snap-d1")).toHaveTextContent("none");
+
+    act(() => {
+      mocks.onMessage?.({
+        event: "wear_snapshot",
+        display: "d1",
+        total_on_hours: 42.5,
+        sample_count: 10,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("wear-snap-d1")).toHaveTextContent("42.5:10");
+    });
+    // The StateSnapshot itself is untouched by a wear_snapshot event.
+    expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+  });
+
+  it("compensation_advisory patches the wearAdvisories map (best-effort nudge)", async () => {
+    render(
+      <LiveStateProvider>
+        <WearConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("wear-adv-d1")).toHaveTextContent("none");
+    });
+
+    act(() => {
+      mocks.onMessage?.({
+        event: "compensation_advisory",
+        display: "d1",
+        hours_since_long_dwell: 100,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("wear-adv-d1")).toHaveTextContent("100");
+    });
+  });
+
+  it("an unknown WS event tag is a no-op — snapshot, wearSnapshots, and wearAdvisories all unchanged", async () => {
+    render(
+      <LiveStateProvider>
+        <WearConsumer />
+        <SensorConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+    });
+
+    act(() => {
+      mocks.onMessage?.({ event: "some_future_tag", display: "d1", whatever: 1 });
+    });
+
+    // Give any (incorrect) handler a chance to run, then assert nothing moved.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+    expect(screen.getByTestId("wear-snap-d1")).toHaveTextContent("none");
+    expect(screen.getByTestId("wear-adv-d1")).toHaveTextContent("none");
+  });
+});

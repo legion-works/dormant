@@ -11,6 +11,7 @@ import { getConfig, postConfigApply, ApiError } from "../../api/client";
 import { createPatchStore } from "./patch";
 import type { PatchStore } from "./patch";
 import DaemonSection from "./DaemonSection";
+import WearSection from "./WearSection";
 import SensorsSection from "./SensorsSection";
 import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
@@ -204,6 +205,14 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
     <div className="cf-form">
       <DaemonSection
         daemon={inv.daemon}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
+
+      <WearSection
+        wear={inv.wear}
         store={store}
         redactedPaths={config.redacted_paths}
         onDirty={onDirty}

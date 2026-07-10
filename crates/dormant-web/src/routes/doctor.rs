@@ -63,6 +63,7 @@ mod tests {
             creds_path: std::path::PathBuf::from("/dev/null"),
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
             reload_timeout: Duration::from_secs(10),

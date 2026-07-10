@@ -13,7 +13,7 @@
 import FormSection from "./FormSection";
 import LadderEditor from "./LadderEditor";
 import ScreensaverEditor from "./ScreensaverEditor";
-import { EnumField } from "./fields";
+import { EnumField, PANEL_TYPES } from "./fields";
 import { useState } from "react";
 import type { DisplayConfig, LadderStage } from "../../api/types";
 import type { PatchStore } from "./patch";
@@ -131,6 +131,18 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
                   </button>
                 </div>
               </div>
+
+              {/* ── Panel technology (independent of blank/ladder mode) ── */}
+              <EnumField
+                path={[...basePath, "panel_type"]}
+                label="panel_type"
+                value={cfg.panel_type ?? "unknown"}
+                locked={store.isLocked([...basePath, "panel_type"], redactedPaths)}
+                onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                options={PANEL_TYPES}
+                error={fieldErrors[[...basePath, "panel_type"].join(".")]}
+                help="Panel technology — picks technology-appropriate wear heuristics. unknown is always safe; wear tracking works regardless."
+              />
 
               {/* ── Simple blank mode editor ── */}
               {isBlank && (

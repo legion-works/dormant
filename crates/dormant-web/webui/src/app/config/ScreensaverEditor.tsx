@@ -12,7 +12,7 @@
  * so sequential edits on different fields of the same source accumulate
  * instead of overwriting each other.
  */
-import { BoolField, DurationField, EnumField, TextField } from "./fields";
+import { BoolField, DurationField, EnumField, NumberField, TextField } from "./fields";
 import type { ScreensaverConfig, ScreensaverSource } from "../../api/types";
 import type { PatchStore } from "./patch";
 
@@ -141,6 +141,26 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
           locked={store.isLocked([...basePath, "transition_duration"], redactedPaths)}
           onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
           error={fieldErrors[[...basePath, "transition_duration"].join(".")]}
+        />
+
+        <NumberField
+          path={[...basePath, "shift_px"]}
+          label="shift_px"
+          value={screensaver.shift_px ?? 2}
+          locked={store.isLocked([...basePath, "shift_px"], redactedPaths)}
+          onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+          error={fieldErrors[[...basePath, "shift_px"].join(".")]}
+          help="Pixel-shift distance (px) applied periodically while the screensaver is active, to reduce static-image burn-in risk."
+        />
+
+        <DurationField
+          path={[...basePath, "shift_interval"]}
+          label="shift_interval"
+          value={screensaver.shift_interval ?? "120s"}
+          locked={store.isLocked([...basePath, "shift_interval"], redactedPaths)}
+          onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+          error={fieldErrors[[...basePath, "shift_interval"].join(".")]}
+          help="Interval between successive pixel shifts."
         />
       </div>
 

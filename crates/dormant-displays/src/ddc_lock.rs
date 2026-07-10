@@ -154,14 +154,41 @@ impl PanelLock {
     ///
     /// Double-checked per the module docs: a single pre-check cannot close
     /// the race where a command announces itself between the check and the
-    /// `try_lock`.
+    /// `try_lock`. Delegates to `sampler_try_inner`, the single
+    /// implementation of the `check→try_lock→recheck` sequence also exercised
+    /// directly (via a race hook) by the `#[cfg(test)]`
+    /// `sampler_try_with_race` — so the pin test for the R3
+    /// TOCTOU close runs this exact production control flow, not a
+    /// hand-duplicated copy of it.
     #[must_use]
     pub fn sampler_try(&self) -> Option<PanelGuard<'_>> {
+        self.sampler_try_inner(|_stage: &'static str| {})
+    }
+
+    /// Shared core of [`PanelLock::sampler_try`]: (i) fast-path check, (ii)
+    /// `try_lock`, (iii) re-check — with an `on_stage` hook invoked at each
+    /// phase boundary (`"check"`, `"race"`, `"try_lock"`, `"recheck"`).
+    ///
+    /// In the production build (called only from [`PanelLock::sampler_try`]
+    /// with a no-op closure) the hook is inlined away — `impl FnMut` is
+    /// monomorphized per call site, so an empty closure body compiles to no
+    /// extra work. In test builds, `sampler_try_with_race`
+    /// passes a hook that both records the stage log and, at the `"race"`
+    /// stage — strictly between (i) and (ii) — runs an injected closure to
+    /// provoke the R3 TOCTOU. This is the one and only implementation of the
+    /// algorithm; there is no second copy for tests to accidentally diverge
+    /// from.
+    #[cfg_attr(not(test), inline)]
+    fn sampler_try_inner(&self, mut on_stage: impl FnMut(&'static str)) -> Option<PanelGuard<'_>> {
         // (i) fast-path check.
+        on_stage("check");
         if self.command_waiting.load(Ordering::SeqCst) > 0 {
             return None;
         }
+        // Race window: strictly between (i) and (ii).
+        on_stage("race");
         // (ii) try to acquire.
+        on_stage("try_lock");
         let guard = match self.mutex.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -169,6 +196,7 @@ impl PanelLock {
         };
         // (iii) re-check: a command may have announced itself in the
         // window between (i) and (ii).
+        on_stage("recheck");
         if self.command_waiting.load(Ordering::SeqCst) > 0 {
             drop(guard);
             return None;
@@ -181,38 +209,25 @@ impl PanelLock {
     /// the fast-path check (i) and the `try_lock` (ii), and the returned
     /// stage log records each phase so a test can assert the closure ran
     /// where the design claims it does, not merely that the final outcome
-    /// looks right.
+    /// looks right. Calls `sampler_try_inner` — the same
+    /// function `sampler_try` calls — so this exercises production's real
+    /// control flow rather than a parallel reimplementation.
     #[cfg(test)]
     fn sampler_try_with_race(
         &self,
         f: impl FnOnce(),
     ) -> (Option<PanelGuard<'_>>, Vec<&'static str>) {
         let mut stages = Vec::new();
-
-        // (i) fast-path check.
-        let _ = self.command_waiting.load(Ordering::SeqCst);
-        stages.push("check");
-
-        // Race window: strictly between (i) and (ii).
-        stages.push("race");
-        f();
-
-        // (ii) try to acquire.
-        stages.push("try_lock");
-        let guard = match self.mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return (None, stages),
-        };
-
-        // (iii) re-check.
-        stages.push("recheck");
-        if self.command_waiting.load(Ordering::SeqCst) > 0 {
-            drop(guard);
-            return (None, stages);
-        }
-
-        (Some(PanelGuard { _guard: guard }), stages)
+        let mut f = Some(f);
+        let result = self.sampler_try_inner(|stage| {
+            stages.push(stage);
+            if stage == "race"
+                && let Some(f) = f.take()
+            {
+                f();
+            }
+        });
+        (result, stages)
     }
 
     /// Test-only: announce a command-path waiter without blocking on the
@@ -276,7 +291,12 @@ mod tests {
 
     #[test]
     fn sampler_skips_when_command_waiting() {
-        // pin (b)
+        // pin (b) — realistic scenario: a command-path caller is genuinely
+        // blocked on the mutex while announced. Kept alongside the
+        // de-confounded `sampler_fast_path_skips_without_lock_contention`
+        // below because it still exercises the end-to-end interaction
+        // between `command_guard` and `sampler_try` under real contention,
+        // which the isolated test does not.
         let locks = PanelLocks::new();
         let l = locks.get("p");
         let g = l.command_guard(); // holds lock
@@ -285,9 +305,42 @@ mod tests {
             let _g = l2.command_guard();
         }); // blocked, announced
         thread::sleep(Duration::from_millis(50)); // waiter has incremented
-        assert!(l.sampler_try().is_none()); // fast-path skip: command_waiting > 0
+        assert!(l.sampler_try().is_none()); // skip: command_waiting > 0 and/or mutex held
         drop(g);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn sampler_fast_path_skips_without_lock_contention() {
+        // pin (b), de-confounded (T4 review M-2). No thread ever touches
+        // the mutex here, so try_lock() would trivially succeed if step (i)
+        // were absent — and merely asserting `is_none()` would NOT isolate
+        // step (i) from step (iii)'s recheck either: `command_waiting`
+        // stays nonzero for the whole synchronous call either way, so the
+        // (iii) recheck would also yield `None` even with (i) deleted,
+        // masking the mutation. The stage log — recorded by the very same
+        // `sampler_try_inner` that `sampler_try` calls — proves the skip
+        // happens AT the fast-path check itself: execution never reaches
+        // "try_lock"/"recheck" at all.
+        let locks = PanelLocks::new();
+        let l = locks.get("p");
+        l.announce_command_for_test(); // no thread blocked; mutex free
+        let mut stages = Vec::new();
+        let got = l.sampler_try_inner(|stage| stages.push(stage));
+        assert!(
+            got.is_none(),
+            "fast-path check (i) must skip on announcement alone, with the mutex uncontended"
+        );
+        assert_eq!(
+            stages,
+            vec!["check"],
+            "must return at the fast-path check, never reaching try_lock/recheck"
+        );
+        l.retract_command_for_test();
+        assert!(
+            l.sampler_try().is_some(),
+            "sampler proceeds once the announcement is retracted"
+        );
     }
 
     #[test]

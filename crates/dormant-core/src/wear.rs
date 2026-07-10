@@ -196,6 +196,10 @@ impl WearLedger {
             self.grid_rows = rows;
             self.grid_cols = cols;
             self.cells = vec![WearCell { wear_hours: 0.0 }; new_rows * new_cols];
+            // Empty grid ⇒ no wear representable: keep the "cells sum ≈
+            // total" invariant intact rather than leaving a stale total
+            // that no cell can account for.
+            self.total_on_hours = 0.0;
             return;
         }
 
@@ -402,6 +406,15 @@ mod tests {
         // Downsample back to 1×2 restores the original split.
         l.resize_grid(1, 2);
         assert!((l.cells[0].wear_hours - 4.0).abs() < 1e-9 && l.cells[1].wear_hours.abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_grid_to_zero_dimension_resets_total() {
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 2, 2, 0);
+        l.attribute_uniform(Duration::from_secs(7200), 1.0); // 2.0 total
+        l.resize_grid(0, 0);
+        assert!(l.cells.is_empty());
+        assert_eq!(l.total_on_hours, 0.0);
     }
 
     #[test]

@@ -30,6 +30,7 @@ use dormant_core::paths;
 use dormant_core::rules::{EmergencyWakeReport, EmergencyWakeResult};
 use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
+use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry;
 
@@ -214,9 +215,20 @@ async fn direct_hardware_fallback(args: &EmergencyWakeArgs) -> Result<EmergencyW
     let mut executors: Vec<(DisplayId, DisplayExecutor)> = Vec::new();
     let mut build_errors: HashMap<DisplayId, String> = HashMap::new();
 
+    // `dormantctl emergency-wake` is a one-shot, separate process from the
+    // daemon — there is no long-lived registry to share, and no
+    // config-reload generations to keep in sync across. A fresh
+    // `PanelLocks::new()` here is therefore correct (not a shortcut): every
+    // invocation gets its own registry, and within THIS invocation every
+    // display's controller still resolves through the same one, so
+    // multiple displays sharing a physical panel (unusual, but possible)
+    // still serialize correctly against each other for the duration of
+    // this single wake sweep.
+    let panel_locks = PanelLocks::new();
+
     for (display_id_str, dcfg) in &cfg.displays {
         let display_id = DisplayId(display_id_str.clone());
-        match registry::build_controllers(display_id_str, dcfg, &creds) {
+        match registry::build_controllers(display_id_str, dcfg, &creds, &panel_locks) {
             Ok(chain) if chain.is_empty() => {
                 // Empty chain — record as an error so it shows in the report.
                 build_errors.insert(

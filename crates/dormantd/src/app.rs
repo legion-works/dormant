@@ -59,6 +59,7 @@ use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
 use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
 use dormant_core::zone::{ZoneEngine, ZoneSpec};
+use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry::{build_controllers, capabilities};
 use dormant_doctor::DoctorService;
@@ -323,6 +324,13 @@ impl App {
         let socket_path =
             dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
 
+        // The daemon's ONE process-wide panel-lock registry (spec §4.3):
+        // constructed here, threaded into every `assemble_static` call
+        // (this one and every subsequent reload via `Runner`), and never
+        // reconstructed for the life of the process — a physical panel's
+        // lock is the same `Arc<PanelLock>` across every generation swap.
+        let panel_locks = PanelLocks::new();
+
         // Clone before cfg/creds are moved into assemble_static.
         let cfg_clone = cfg.clone();
         let creds_clone = creds.clone();
@@ -335,11 +343,12 @@ impl App {
             creds,
             &self.source_builder,
             self.render_sink_builder.as_ref(),
+            &panel_locks,
         )
         .await
         .context("assemble initial runtime")?;
         #[cfg(not(feature = "render"))]
-        let assembly = assemble_static(cfg, creds, &self.source_builder)
+        let assembly = assemble_static(cfg, creds, &self.source_builder, &panel_locks)
             .await
             .context("assemble initial runtime")?;
 
@@ -391,6 +400,7 @@ impl App {
             generation: spawn.generation,
             started_web_port,
             started_web_bind,
+            panel_locks,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -591,6 +601,13 @@ struct Runner {
     started_web_port: Option<u16>,
     /// Bind address the web UI was started with (for reload change-detection).
     started_web_bind: std::net::IpAddr,
+    /// The daemon's single process-wide panel-lock registry (spec §4.3),
+    /// constructed once in [`App::start`] and carried by `Runner` across
+    /// every reload so `load_and_assemble`'s `assemble_static` call always
+    /// reuses the SAME registry — a physical panel's lock must resolve to
+    /// the same `Arc<PanelLock>` whether it came from the old generation's
+    /// controller or the new one's.
+    panel_locks: Arc<PanelLocks>,
 }
 
 impl Runner {
@@ -822,13 +839,14 @@ impl Runner {
                 creds,
                 &self.source_builder,
                 self.render_sink_builder.as_ref(),
+                &self.panel_locks,
             )
             .await
             .map_err(|e| e.to_string())
         }
         #[cfg(not(feature = "render"))]
         {
-            assemble_static(cfg, creds, &self.source_builder)
+            assemble_static(cfg, creds, &self.source_builder, &self.panel_locks)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1067,12 +1085,19 @@ fn load_cfg_creds(
 }
 
 /// Build controllers + executors (probing each) and derive the engine config.
+///
+/// `locks` is the daemon's single process-wide [`PanelLocks`] registry
+/// (spec §4.3) — constructed once in [`App::start`] and reused, unchanged,
+/// across every reload generation (see [`Runner::panel_locks`]), so a
+/// physical panel's lock is the same `Arc<PanelLock>` before and after a
+/// config reload.
 #[allow(clippy::too_many_lines)]
 async fn assemble_static(
     cfg: Config,
     creds: Credentials,
     source_builder: &SourceBuilder,
     #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
+    locks: &Arc<PanelLocks>,
 ) -> Result<StaticAssembly> {
     // First rule referencing each display drives its retry + timings.
     let display_rule = index_display_rules(&cfg);
@@ -1112,7 +1137,7 @@ async fn assemble_static(
             ),
         };
 
-        let controllers = build_controllers(name, dc, &creds)
+        let controllers = build_controllers(name, dc, &creds, locks)
             .with_context(|| format!("build controllers for display '{name}'"))?;
         let mut executor =
             DisplayExecutor::new(did.clone(), controllers, dc.primary_blank_mode(), retry);

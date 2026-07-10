@@ -125,6 +125,33 @@ pub trait DisplayController: Any + Send + Sync {
     async fn read_state(&self) -> Option<PanelState> {
         None
     }
+
+    /// Read the current panel state at **sampler priority** — used by the
+    /// periodic wear-tracking poll (spec §4.3), which must yield instantly
+    /// to any in-flight or waiting command-path operation rather than make
+    /// one wait.
+    ///
+    /// Default delegates to [`Self::read_state`] (command priority) — the
+    /// honest answer for controllers with no DDC/CI-style bus contention to
+    /// manage (samsung HTTP reads need no priority; `command`/`kwin-dpms`/
+    /// `ha-passthrough` return `None` either way). Only [`crate::traits`]
+    /// implementors backed by a shared physical bus (DDC/CI) need to
+    /// override this with a genuinely lower-priority read.
+    async fn read_state_sampled(&self) -> Option<PanelState> {
+        self.read_state().await
+    }
+
+    /// Read the panel's cumulative usage-hours counter, if the controller
+    /// exposes one (DDC/CI VCP `0xC0`).
+    ///
+    /// Default returns `None` — the honest answer for every controller
+    /// that has no usage-hours readback. Used once, at ledger-creation
+    /// time, to seed [`crate::wear::WearLedger::seeded_usage_hours`] for a
+    /// panel that was not new when tracking started; never polled
+    /// periodically, so no sampler-priority variant is needed.
+    async fn read_usage_hours(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The narrow interface [`crate::rules::RulesEngine`] uses to issue commands to
@@ -168,6 +195,31 @@ pub trait CommandSink: Send + Sync {
     async fn read_state(&self) -> Option<PanelState> {
         None
     }
+
+    /// Read the current panel state at **sampler priority** — see
+    /// [`DisplayController::read_state_sampled`] for the rationale.
+    ///
+    /// Default delegates to [`Self::read_state`], correct for any sink
+    /// that does not compose a DDC/CI-backed controller chain. The
+    /// production [`crate::traits::CommandSink`] implementation in
+    /// `dormant-displays` (`DisplayExecutor`) overrides this with a
+    /// chain-walk identical in shape to its `read_state` override, calling
+    /// each controller's `read_state_sampled()` in turn — the trait
+    /// default alone would silently drop sampler priority at this
+    /// boundary, so that override is mandatory, not cosmetic.
+    async fn read_state_sampled(&self) -> Option<PanelState> {
+        self.read_state().await
+    }
+
+    /// Read the panel's cumulative usage-hours counter through whichever
+    /// controller in the chain can report it.
+    ///
+    /// Default returns `None`. Mirrors [`Self::read_state`]'s chain-walk
+    /// contract; see [`DisplayController::read_usage_hours`] for the
+    /// per-controller readback.
+    async fn read_usage_hours(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// The narrow interface [`crate::rules::RulesEngine`] uses to show and tear
@@ -192,4 +244,86 @@ pub trait RenderSink: Send + Sync {
     /// Infallible: the method has no failure mode — the engine always
     /// considers the surface gone after this call returns.
     async fn teardown(&self, r#gen: u64);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T5 test 1: a minimal `DisplayController` implementing only the
+    /// methods that predate `read_state_sampled` / `read_usage_hours`
+    /// still compiles and inherits honest defaults — proves both new
+    /// methods are additive, not breaking, to every existing implementor.
+    struct BareController;
+
+    #[async_trait::async_trait]
+    impl DisplayController for BareController {
+        fn name(&self) -> &'static str {
+            "bare"
+        }
+
+        fn supported_modes(&self) -> Vec<BlankMode> {
+            Vec::new()
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+        // Deliberately no `read_state`, `read_state_sampled`, or
+        // `read_usage_hours` override.
+    }
+
+    /// T5 test 1 (`CommandSink` half): mirrors `BareController` above.
+    struct BareSink;
+
+    #[async_trait::async_trait]
+    impl CommandSink for BareSink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+
+        fn controller_health(&self) -> Vec<crate::rules::ControllerHealth> {
+            Vec::new()
+        }
+        // Deliberately no `read_state`, `read_state_sampled`, or
+        // `read_usage_hours` override.
+    }
+
+    #[tokio::test]
+    async fn display_controller_new_methods_are_additive_with_honest_defaults() {
+        let c = BareController;
+        assert_eq!(c.read_state().await, None);
+        assert_eq!(
+            c.read_state_sampled().await,
+            None,
+            "default read_state_sampled must delegate to read_state"
+        );
+        assert_eq!(c.read_usage_hours().await, None);
+    }
+
+    #[tokio::test]
+    async fn command_sink_new_methods_are_additive_with_honest_defaults() {
+        let s = BareSink;
+        assert_eq!(s.read_state().await, None);
+        assert_eq!(
+            s.read_state_sampled().await,
+            None,
+            "default read_state_sampled must delegate to read_state"
+        );
+        assert_eq!(s.read_usage_hours().await, None);
+    }
 }

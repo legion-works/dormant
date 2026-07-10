@@ -117,6 +117,7 @@ impl PanelLocks {
 ///
 /// Guards exactly one physical VCP transaction at a time. See the module
 /// docs for the command-priority and poison-recovery rationale.
+#[derive(Debug)]
 pub struct PanelLock {
     mutex: Mutex<()>,
     command_waiting: AtomicUsize,

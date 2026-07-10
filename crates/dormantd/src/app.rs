@@ -1877,6 +1877,7 @@ mod render_tests {
             restore_brightness: 100,
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
         }
     }
 
@@ -1933,6 +1934,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::new(),
             zones: IndexMap::new(),
             displays: {
@@ -1965,6 +1967,7 @@ mod render_tests {
                         samsung_restore_backlight:
                             dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
                         treat_unreachable_as_blanked: true,
+                        panel_type: dormant_core::wear::PanelType::default(),
                     },
                 );
                 m
@@ -2037,6 +2040,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2067,6 +2071,8 @@ mod render_tests {
                         scale_mode: Some("stretch".into()),
                         transition: None,
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -2121,6 +2127,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2153,6 +2160,8 @@ mod render_tests {
                         scale_mode: None,
                         transition: None,
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -2212,6 +2221,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2242,6 +2252,8 @@ mod render_tests {
                         scale_mode: None,
                         transition: Some("none".into()),
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -2294,6 +2306,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2327,6 +2340,8 @@ mod render_tests {
                         // Crossfade (the user asked for transitions).
                         transition: None,
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()

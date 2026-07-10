@@ -199,6 +199,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     let config = Arc::new(Config {
         config_version: 1,
         daemon: DaemonConfig::default(),
+        wear: dormant_core::config::schema::WearConfig::default(),
         sensors: IndexMap::default(),
         zones: IndexMap::default(),
         displays: IndexMap::default(),
@@ -293,6 +294,7 @@ mod tests {
         let config = Arc::new(Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -568,6 +570,7 @@ mod tests {
         let config = Arc::new(Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),

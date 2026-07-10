@@ -111,6 +111,7 @@ fn fake_doctor(ctl_tx: mpsc::Sender<ControlMsg>) -> DoctorService {
     let (config_tx, config_rx) = watch::channel(Arc::new(Config {
         config_version: 1,
         daemon: DaemonConfig::default(),
+        wear: dormant_core::config::schema::WearConfig::default(),
         sensors: IndexMap::default(),
         zones: IndexMap::default(),
         displays: IndexMap::default(),

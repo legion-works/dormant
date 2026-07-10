@@ -103,3 +103,48 @@ pub const TRANSITION_DURATION: Duration = Duration::from_secs(1);
 pub fn default_trigger() -> String {
     SCREENSAVER_TRIGGER.to_string()
 }
+
+// ── [wear] section defaults ─────────────────────────────────────────────────
+
+/// Whether panel-wear tracking is enabled by default.
+pub const WEAR_ENABLED: bool = true;
+
+/// How often the wear tracker samples panel state for attribution.
+pub const WEAR_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the wear tracker persists its ledger to disk.
+pub const WEAR_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Timeout for a single panel-state read during wear sampling.
+pub const WEAR_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default number of rows in the wear-attribution grid.
+pub const WEAR_GRID_ROWS: u16 = 9;
+
+/// Default number of columns in the wear-attribution grid.
+pub const WEAR_GRID_COLS: u16 = 16;
+
+/// Default brightness fraction (0.0–1.0) assumed when the real brightness
+/// can't be read from the panel.
+pub const WEAR_FALLBACK_BRIGHTNESS: f64 = 0.5;
+
+/// Default brightness fraction (0.0–1.0) attributed while the screensaver is
+/// active.
+pub const WEAR_SCREENSAVER_FACTOR: f64 = 0.35;
+
+/// Minimum dwell before a blank/wake cycle counts as a "full" cycle rather
+/// than a short cycle for wear-cycle-count heuristics.
+pub const WEAR_SHORT_CYCLE_DWELL: Duration = Duration::from_secs(10 * 60);
+
+/// Panel age (accumulated on-hours) after which wear advisories start
+/// surfacing to the operator.
+pub const WEAR_ADVISORY_AFTER: Duration = Duration::from_secs(96 * 60 * 60);
+
+// ── Screensaver pixel-shift defaults ────────────────────────────────────────
+
+/// Default pixel-shift distance, in pixels, applied periodically while the
+/// screensaver is active to reduce static-image burn-in risk.
+pub const SHIFT_PX: u8 = 2;
+
+/// Default interval between successive pixel shifts.
+pub const SHIFT_INTERVAL: Duration = Duration::from_secs(120);

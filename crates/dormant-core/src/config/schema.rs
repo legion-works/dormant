@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::defaults;
 use crate::error::DormantError;
 use crate::types::{BlankMode, LadderStage, SensorId, StageKind, ZoneId};
+use crate::wear::PanelType;
 use crate::zone::{FusionMode, UnavailablePolicy, ZoneMember, ZoneSpec};
 
 // ── Strictness / Warning / ValidationError ──────────────────────────────────────
@@ -83,6 +84,10 @@ pub struct Config {
     /// Rule definitions keyed by user-chosen id.
     #[serde(default)]
     pub rules: IndexMap<String, RuleConfig>,
+
+    /// Panel-wear tracking configuration.
+    #[serde(default)]
+    pub wear: WearConfig,
 }
 
 // ── DaemonConfig ────────────────────────────────────────────────────────────────
@@ -190,6 +195,77 @@ pub enum IdleSource {
     /// Force `DBus` screensaver poll.
     #[serde(rename = "dbus")]
     Dbus,
+}
+
+// ── WearConfig ──────────────────────────────────────────────────────────────────
+
+/// Panel-wear tracking configuration (the `[wear]` TOML section).
+///
+/// Governs the pure [`crate::wear::WearLedger`] sampling/persistence cadence
+/// and the heuristics the tracker in `dormantd` uses to attribute
+/// brightness-weighted on-time to grid cells.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WearConfig {
+    /// Enable panel-wear tracking. Enabled by default.
+    #[serde(default = "default_wear_enabled")]
+    pub enabled: bool,
+
+    /// How often to sample panel state for wear attribution.
+    #[serde(default = "default_wear_sample_interval", with = "humantime_serde")]
+    pub sample_interval: Duration,
+
+    /// How often to persist the wear ledger to disk.
+    #[serde(default = "default_wear_persist_interval", with = "humantime_serde")]
+    pub persist_interval: Duration,
+
+    /// Timeout for a single panel-state read during sampling.
+    #[serde(default = "default_wear_read_timeout", with = "humantime_serde")]
+    pub read_timeout: Duration,
+
+    /// Number of rows in the wear-attribution grid.
+    #[serde(default = "default_wear_grid_rows")]
+    pub grid_rows: u16,
+
+    /// Number of columns in the wear-attribution grid.
+    #[serde(default = "default_wear_grid_cols")]
+    pub grid_cols: u16,
+
+    /// Brightness fraction (0.0–1.0) assumed when the real brightness can't
+    /// be read from the panel.
+    #[serde(default = "default_wear_fallback_brightness")]
+    pub fallback_brightness: f64,
+
+    /// Brightness fraction (0.0–1.0) attributed while the screensaver is
+    /// active (screensavers typically dim the panel below full brightness).
+    #[serde(default = "default_wear_screensaver_factor")]
+    pub screensaver_factor: f64,
+
+    /// Minimum dwell before a blank/wake cycle counts as a "full" cycle
+    /// rather than a short cycle for wear-cycle-count heuristics.
+    #[serde(default = "default_wear_short_cycle_dwell", with = "humantime_serde")]
+    pub short_cycle_dwell: Duration,
+
+    /// Panel age (accumulated on-hours) after which wear advisories start
+    /// surfacing to the operator.
+    #[serde(default = "default_wear_advisory_after", with = "humantime_serde")]
+    pub advisory_after: Duration,
+}
+
+impl Default for WearConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::WEAR_ENABLED,
+            sample_interval: defaults::WEAR_SAMPLE_INTERVAL,
+            persist_interval: defaults::WEAR_PERSIST_INTERVAL,
+            read_timeout: defaults::WEAR_READ_TIMEOUT,
+            grid_rows: defaults::WEAR_GRID_ROWS,
+            grid_cols: defaults::WEAR_GRID_COLS,
+            fallback_brightness: defaults::WEAR_FALLBACK_BRIGHTNESS,
+            screensaver_factor: defaults::WEAR_SCREENSAVER_FACTOR,
+            short_cycle_dwell: defaults::WEAR_SHORT_CYCLE_DWELL,
+            advisory_after: defaults::WEAR_ADVISORY_AFTER,
+        }
+    }
 }
 
 // ── SensorKind ──────────────────────────────────────────────────────────────────
@@ -562,6 +638,15 @@ pub struct ScreensaverConfig {
     /// (`"500ms"`, `"1s"`).
     #[serde(default, with = "humantime_serde::option")]
     pub transition_duration: Option<Duration>,
+
+    /// Pixel-shift distance, in pixels, applied periodically while the
+    /// screensaver is active to reduce static-image burn-in risk.
+    #[serde(default = "default_shift_px")]
+    pub shift_px: u8,
+
+    /// Interval between successive pixel shifts.
+    #[serde(default = "default_shift_interval", with = "humantime_serde")]
+    pub shift_interval: Duration,
 }
 
 /// A display definition.
@@ -652,6 +737,14 @@ pub struct DisplayConfig {
     /// (fail-safe — don't leave a screen on when we can't reach it).
     #[serde(default = "default_treat_unreachable_as_blanked")]
     pub treat_unreachable_as_blanked: bool,
+
+    /// Panel technology classification, used to pick technology-appropriate
+    /// wear heuristics (e.g. QD-OLED and W-OLED age differently under the
+    /// same brightness/dwell profile).  Falls back to
+    /// [`PanelType::Unknown`] when absent — a missing classification never
+    /// blocks wear tracking.
+    #[serde(default)]
+    pub panel_type: PanelType,
 }
 
 impl DisplayConfig {
@@ -862,6 +955,42 @@ fn default_trigger() -> String {
 }
 fn default_screensaver_audio() -> bool {
     defaults::SCREENSAVER_AUDIO
+}
+fn default_shift_px() -> u8 {
+    defaults::SHIFT_PX
+}
+fn default_shift_interval() -> Duration {
+    defaults::SHIFT_INTERVAL
+}
+fn default_wear_enabled() -> bool {
+    defaults::WEAR_ENABLED
+}
+fn default_wear_sample_interval() -> Duration {
+    defaults::WEAR_SAMPLE_INTERVAL
+}
+fn default_wear_persist_interval() -> Duration {
+    defaults::WEAR_PERSIST_INTERVAL
+}
+fn default_wear_read_timeout() -> Duration {
+    defaults::WEAR_READ_TIMEOUT
+}
+fn default_wear_grid_rows() -> u16 {
+    defaults::WEAR_GRID_ROWS
+}
+fn default_wear_grid_cols() -> u16 {
+    defaults::WEAR_GRID_COLS
+}
+fn default_wear_fallback_brightness() -> f64 {
+    defaults::WEAR_FALLBACK_BRIGHTNESS
+}
+fn default_wear_screensaver_factor() -> f64 {
+    defaults::WEAR_SCREENSAVER_FACTOR
+}
+fn default_wear_short_cycle_dwell() -> Duration {
+    defaults::WEAR_SHORT_CYCLE_DWELL
+}
+fn default_wear_advisory_after() -> Duration {
+    defaults::WEAR_ADVISORY_AFTER
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1213,5 +1342,139 @@ path = "/tmp/img.png"
             debug_str.contains("<redacted>"),
             "Debug should show <redacted> marker: {debug_str}"
         );
+    }
+
+    // ── [wear] section ────────────────────────────────────────────────────
+
+    #[test]
+    fn wear_defaults_load_from_empty_section() {
+        let toml_str = "config_version = 1\n[wear]\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.wear.enabled);
+        assert_eq!(cfg.wear.grid_rows, 9);
+        assert_eq!(cfg.wear.grid_cols, 16);
+        assert_eq!(cfg.wear.sample_interval, Duration::from_secs(60));
+        assert_eq!(cfg.wear.persist_interval, Duration::from_secs(5 * 60));
+        assert_eq!(cfg.wear.read_timeout, Duration::from_secs(2));
+        assert!((cfg.wear.fallback_brightness - 0.5).abs() < f64::EPSILON);
+        assert!((cfg.wear.screensaver_factor - 0.35).abs() < f64::EPSILON);
+        assert_eq!(cfg.wear.short_cycle_dwell, Duration::from_secs(10 * 60));
+        assert_eq!(cfg.wear.advisory_after, Duration::from_secs(96 * 3600));
+    }
+
+    #[test]
+    fn wear_defaults_when_section_absent() {
+        let toml_str = "config_version = 1\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.wear.enabled);
+        assert_eq!(cfg.wear.grid_rows, 9);
+        assert_eq!(cfg.wear.sample_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn wear_explicit_values_parse() {
+        let toml_str = r#"
+config_version = 1
+
+[wear]
+enabled = false
+sample_interval = "30s"
+persist_interval = "10m"
+read_timeout = "1s"
+grid_rows = 12
+grid_cols = 20
+fallback_brightness = 0.7
+screensaver_factor = 0.2
+short_cycle_dwell = "5m"
+advisory_after = "48h"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.wear.enabled);
+        assert_eq!(cfg.wear.sample_interval, Duration::from_secs(30));
+        assert_eq!(cfg.wear.persist_interval, Duration::from_secs(600));
+        assert_eq!(cfg.wear.read_timeout, Duration::from_secs(1));
+        assert_eq!(cfg.wear.grid_rows, 12);
+        assert_eq!(cfg.wear.grid_cols, 20);
+        assert!((cfg.wear.fallback_brightness - 0.7).abs() < f64::EPSILON);
+        assert!((cfg.wear.screensaver_factor - 0.2).abs() < f64::EPSILON);
+        assert_eq!(cfg.wear.short_cycle_dwell, Duration::from_secs(300));
+        assert_eq!(cfg.wear.advisory_after, Duration::from_secs(48 * 3600));
+    }
+
+    // ── DisplayConfig::panel_type ───────────────────────────────────────────
+
+    #[test]
+    fn panel_type_parses_and_defaults() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.m]
+controllers = ["command"]
+blank_command = "true"
+wake_command = "true"
+modes = ["power_off"]
+panel_type = "qd-oled"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.displays["m"].panel_type, PanelType::QdOled);
+    }
+
+    #[test]
+    fn panel_type_defaults_to_unknown_when_absent() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.m]
+controllers = ["command"]
+blank_command = "true"
+wake_command = "true"
+modes = ["power_off"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.displays["m"].panel_type, PanelType::Unknown);
+    }
+
+    // ── ScreensaverConfig shift_px / shift_interval ─────────────────────────
+
+    #[test]
+    fn shift_keys_parse_explicit_values() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+shift_px = 4
+shift_interval = "90s"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let ss = cfg.displays["d1"].screensaver.as_ref().unwrap();
+        assert_eq!(ss.shift_px, 4);
+        assert_eq!(ss.shift_interval, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn shift_keys_default_when_absent() {
+        let toml_str = r#"
+config_version = 1
+
+[displays.d1]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+
+[displays.d1.screensaver]
+trigger = "vacancy"
+[[displays.d1.screensaver.source]]
+path = "/tmp/img.png"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let ss = cfg.displays["d1"].screensaver.as_ref().unwrap();
+        assert_eq!(ss.shift_px, 2);
+        assert_eq!(ss.shift_interval, Duration::from_secs(120));
     }
 }

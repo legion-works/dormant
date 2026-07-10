@@ -56,8 +56,8 @@ oled-proximity/
 - Key files: `crates/dormantd/src/main.rs` (binary entry), `crates/dormantd/src/app.rs` (runtime assembly).
 
 **`crates/dormantctl/`**
-- Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor). Also exposes an IPC `client` library entry for out-of-binary consumers (e.g. `dormant-tray`).
-- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs`, `cmd_doctor.rs`, `cmd_pair.rs` (`dormantctl pair samsung <host>` — connects to the TV, prompts the on-screen allow, and stores the returned token via `dormant_core::config::upsert_samsung_token`), `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
+- Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor). Also exposes an IPC `client` library entry for out-of-binary consumers (e.g. `dormant-tray`). Emergency-wake falls back to direct-hardware probing + waking through the registry when the daemon is wedged or unreachable.
+- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs` (blank + wake), `cmd_doctor.rs` (per-target subcommands + `exercise` for control-path verification), `cmd_emergency_wake.rs` (`dormantctl emergency-wake` — IPC fast path with a direct-hardware fallback when the daemon is unresponsive; probes each freshly-built executor before waking), `cmd_pair.rs` (`dormantctl pair samsung <host>` — connects to the TV, prompts the on-screen allow, and stores the returned token via `dormant_core::config::upsert_samsung_token`), `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
 - Key files: `crates/dormantctl/src/main.rs` (register new subcommands here).
 
 **`crates/dormant-render/`**

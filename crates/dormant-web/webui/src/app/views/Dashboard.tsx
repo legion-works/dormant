@@ -67,6 +67,16 @@ interface SensorRowProps {
 }
 
 function SensorRow({ sensor, typeLabel }: SensorRowProps) {
+  // "No data since start" hint: this sensor is currently unavailable AND has
+  // never delivered a single event (any state) since the daemon started —
+  // as opposed to an unavailable sensor that has reported before (e.g. it
+  // went stale, or the broker sent a live/retained "offline"). Legacy
+  // snapshots predate `reported` entirely (the key is absent, not `false`);
+  // `?? false` treats that identically to "never reported", so the hint
+  // shows for an unavailable legacy sensor too — see Dashboard.test.tsx's
+  // "legacy snapshot" test for the pinned rationale.
+  const noDataSinceStart = sensor.state === "unavailable" && !(sensor.reported ?? false);
+
   return (
     <div className="sensor-row">
       <span className={`sensor-row__dot sensor-row__dot--${sensor.state}`} />
@@ -78,6 +88,14 @@ function SensorRow({ sensor, typeLabel }: SensorRowProps) {
         <div className={`sensor-row__state-label sensor-row__state-label--${sensor.state}`}>
           {statusLabel(sensor.state)}
         </div>
+        {noDataSinceStart && (
+          <div
+            className="sensor-row__no-data-hint"
+            title="No data has been received for this sensor since the daemon started."
+          >
+            no data since start
+          </div>
+        )}
         <div className="sensor-row__age">{sensor.last_seen_secs_ago}s ago</div>
       </div>
     </div>

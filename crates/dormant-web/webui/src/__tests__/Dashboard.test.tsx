@@ -11,6 +11,8 @@ import Dashboard from "../app/views/Dashboard";
 import { LiveStateProvider } from "../app/state";
 import { EventLogContext } from "../app/hooks/useLiveState";
 import type { StampedEvent } from "../app/hooks/useLiveState";
+import { getState } from "../api/client";
+import type { StateSnapshot } from "../api/types";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
@@ -226,4 +228,104 @@ describe("Dashboard", () => {
     const stageLabels = screen.getAllByText(/render screensaver/);
     // lg-oled chip + possibly the blank_mode in config metadata
     expect(stageLabels.length).toBeGreaterThanOrEqual(1);
+  });
+
+
+// ── "no data since start" sensor hint (spec T6) ──
+
+describe("Dashboard — sensor reported hint", () => {
+  afterEach(() => cleanup());
+
+  it("shows the hint for an unavailable sensor with reported: false", async () => {
+    const state: StateSnapshot = {
+      sensors: [
+        { id: "balcony-mqtt", state: "unavailable", last_seen_secs_ago: 999, reported: false },
+      ],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/no data since start/i)).toBeInTheDocument();
+  });
+
+  it("hides the hint for an unavailable sensor with reported: true", async () => {
+    const state: StateSnapshot = {
+      sensors: [
+        { id: "balcony-mqtt", state: "unavailable", last_seen_secs_ago: 999, reported: true },
+      ],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText(/no data since start/i)).toBeNull();
+  });
+
+  it("never shows the hint for a present or absent sensor, reported or not", async () => {
+    const state: StateSnapshot = {
+      sensors: [
+        { id: "desk-mmwave", state: "present", last_seen_secs_ago: 3, reported: false },
+        { id: "room-pir", state: "absent", last_seen_secs_ago: 45, reported: false },
+      ],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("desk-mmwave")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText(/no data since start/i)).toBeNull();
+  });
+
+  // Legacy wire predates `reported` — the key is entirely absent from the
+  // snapshot object, not merely `false`. `sensor.reported ?? false` treats
+  // that identically to `false`. Pinning what the code actually does: the
+  // hint is NEW, so an unavailable sensor on a legacy snapshot renders it —
+  // there is no prior rendering to preserve for this exact case, since the
+  // hint did not exist before this feature. This is the adjudicated,
+  // intended behavior per spec T6, not a back-compat gap.
+  it("legacy snapshot (no `reported` key at all) — unavailable sensor shows the hint", async () => {
+    const legacySensor: StateSnapshot["sensors"][number] = {
+      id: "balcony-mqtt",
+      state: "unavailable",
+      last_seen_secs_ago: 999,
+    };
+    expect("reported" in legacySensor).toBe(false);
+
+    const state: StateSnapshot = {
+      sensors: [legacySensor],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/no data since start/i)).toBeInTheDocument();
+  });
   });

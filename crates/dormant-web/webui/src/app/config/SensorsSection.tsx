@@ -24,6 +24,7 @@ const SENSOR_SCALAR_KEYS: string[] = [
   "topic", "broker_url", "url", "entity", "port", "baud",
   "payload_on", "payload_off", "field", "kind",
   "hold_time", "stale_timeout",
+  "availability_topic", "availability_payload_online", "availability_payload_offline",
 ];
 
 /** Per-field help and placeholder — accurate to the real config semantics. */
@@ -31,6 +32,9 @@ const HELP: Record<string, string> = {
   kind: "presence = continuous occupancy; motion = pulse, stretched by hold_time.",
   hold_time: "How long a motion pulse is treated as present.",
   stale_timeout: "A sensor silent this long becomes unavailable.",
+  availability_topic: "Optional LWT/availability topic override — defaults to <topic>/availability if unset.",
+  availability_payload_online: "Payload marking the sensor online. Informational only — no event is emitted.",
+  availability_payload_offline: "Payload marking the sensor offline — emits Unavailable for this sensor.",
 };
 
 const PLACEHOLDER: Record<string, string> = {
@@ -39,6 +43,9 @@ const PLACEHOLDER: Record<string, string> = {
   port: "/dev/ttyUSB0",
   hold_time: "2s",
   stale_timeout: "300s",
+  availability_topic: "tele/desk/LWT",
+  availability_payload_online: "online",
+  availability_payload_offline: "offline",
 };
 
 export default function SensorsSection({ sensors, store, redactedPaths, onDirty, fieldErrors }: SensorsSectionProps) {

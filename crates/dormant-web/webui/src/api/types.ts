@@ -66,12 +66,18 @@ export type PanelType = (typeof PANEL_TYPES)[number];
 
 /**
  * rust: rules.rs SensorSnapshot
- * serde: field names match exactly (no rename).
+ * serde: field names match exactly (no rename). `reported` is
+ * `#[serde(default)]` — a cold-start diagnostic ("has this sensor ever
+ * delivered an event since daemon start", any state counts). Modelled as
+ * optional here (`stage?:` precedent) so a pre-this-feature legacy wire
+ * payload that omits the key entirely still deserializes as `undefined`,
+ * not a hard failure.
  */
 export interface SensorSnapshot {
   id: string;
   state: SensorState;
   last_seen_secs_ago: number;
+  reported?: boolean;
 }
 
 /**
@@ -317,6 +323,15 @@ export interface MqttSensorCfg {
   kind?: SensorKind;
   hold_time?: unknown;
   stale_timeout?: unknown;
+  /** Optional LWT/availability topic override; defaults to
+   * `<topic>/availability` (Zigbee2MQTT convention) when absent. */
+  availability_topic?: string;
+  /** Payload literal marking the availability topic "online". Defaults to
+   * `"online"` server-side. */
+  availability_payload_online?: string;
+  /** Payload literal marking the availability topic "offline". Defaults to
+   * `"offline"` server-side. */
+  availability_payload_offline?: string;
 }
 
 /** rust: config/schema.rs HaSensorCfg (fields: url, entity, kind, hold_time, stale_timeout) */

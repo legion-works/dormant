@@ -98,8 +98,16 @@ function PlaybackRolesField({
   function handleToggle(checked: boolean) {
     setIsSet(checked);
     if (checked) {
-      store.trackEdit(path, list);
-    } else {
+      // F16: an empty list is rejected server-side. Track nothing until
+      // the first role is added via handleListChange below.
+      if (list.length > 0) {
+        store.trackEdit(path, list);
+      }
+    } else if (list.length > 0 || fetchedList !== null) {
+      // Only emit a remove when there is something to remove: a
+      // previously-set (fetched or in-progress) list. Checking the box
+      // and unchecking it again with no roles ever added tracked
+      // nothing above, so there's nothing pending to clear here either.
       store.trackRemove(path);
     }
     onDirty();
@@ -107,7 +115,13 @@ function PlaybackRolesField({
 
   function handleListChange(next: string[]) {
     setList(next);
-    store.trackEdit(path, next);
+    if (next.length > 0) {
+      store.trackEdit(path, next);
+    } else if (fetchedList !== null) {
+      // Cleared back to empty after a committed value existed — remove
+      // rather than emit F16's `playback_roles = []`.
+      store.trackRemove(path);
+    }
     onDirty();
   }
 

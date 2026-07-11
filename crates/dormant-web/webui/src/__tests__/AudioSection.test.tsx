@@ -205,6 +205,34 @@ describe("AudioSection — settings form", () => {
     });
   });
 
+  it("checking playback_roles with no roles yet tracks nothing (F16 guard); adding a role then emits the set", () => {
+    const store = createPatchStore();
+    render(
+      <AudioSection
+        audio={AUDIO_INVENTORY}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText(/playback_roles/)); // check, no roles added yet
+
+    expect(
+      store.buildPatches().some((p) => p.path.join(".") === "audio.playback_roles"),
+    ).toBe(false);
+
+    fireEvent.change(screen.getByLabelText("playback_roles"), { target: { value: "Movie" } });
+    fireEvent.click(screen.getByLabelText("Add playback_roles"));
+
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["audio", "playback_roles"],
+      value: ["Movie"],
+    });
+  });
+
   it("setting then clearing playback_roles back to unset emits a remove (not a set)", () => {
     const store = createPatchStore();
     render(

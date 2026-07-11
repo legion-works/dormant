@@ -8,15 +8,17 @@
 //!
 //! `advisory` is **server-derived** here (not merely relayed from a WS
 //! event) so a fresh `GET /api/wear` is always the truth, even if the
-//! browser missed the `compensation_advisory` WS nudge. The formula
-//! mirrors the tracker's own latch condition exactly (`dormantd::
-//! wear_tracker::tick`'s "Advisory (observed vs baseline, ONCE latch)"
-//! section) — `now - max(observed, baseline) > advisory_after` — except
-//! this is a stateless per-request recomputation, not a one-shot latch.
+//! browser missed the `compensation_advisory` WS nudge. The formula is the
+//! SAME shared implementation `dormantd::wear_tracker::tick` calls for its
+//! "Advisory (observed vs baseline, ONCE latch)" check —
+//! [`dormant_core::wear::advisory_active`] / [`hours_since_effective_dwell`]
+//! (`dormant_core::wear::hours_since_effective_dwell`) — not an
+//! independently-derived copy (see review finding W1), except this route
+//! recomputes statelessly per request rather than latching once.
 
 use axum::Json;
 use axum::extract::{Path, State};
-use dormant_core::wear::{PanelType, WearLedger};
+use dormant_core::wear::{PanelType, WearLedger, advisory_active, hours_since_effective_dwell};
 
 use crate::WebState;
 use crate::error::WebError;
@@ -89,27 +91,10 @@ fn now_epoch_s() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `now - max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)`, in
-/// whole seconds — the single shared reference point for both the
-/// `advisory` bool and the `hours_since_long_dwell` count, mirroring
-/// `dormantd::wear_tracker::tick`'s advisory-latch derivation exactly.
-fn since_reference_s(ledger: &WearLedger, now_epoch_s: u64) -> u64 {
-    let baseline = ledger.advisory_baseline_epoch_s;
-    let observed = ledger.last_long_dwell_epoch_s.unwrap_or(0);
-    let reference = observed.max(baseline);
-    now_epoch_s.saturating_sub(reference)
-}
-
-/// Same advisory formula as `dormantd::wear_tracker::tick`'s latch check,
-/// recomputed statelessly: `now - max(observed, baseline) > advisory_after`.
-fn is_advisory(ledger: &WearLedger, advisory_after_s: u64, now_epoch_s: u64) -> bool {
-    since_reference_s(ledger, now_epoch_s) > advisory_after_s
-}
-
 fn summarize(
     key: &str,
     ledger: &WearLedger,
-    advisory_after_s: u64,
+    advisory_after: std::time::Duration,
     now_epoch_s: u64,
 ) -> WearSummary {
     WearSummary {
@@ -121,8 +106,17 @@ fn summarize(
         sample_count: ledger.sample_count,
         last_sample_at_epoch_s: ledger.last_sample_at_epoch_s,
         last_long_dwell_epoch_s: ledger.last_long_dwell_epoch_s,
-        advisory: is_advisory(ledger, advisory_after_s, now_epoch_s),
-        hours_since_long_dwell: since_reference_s(ledger, now_epoch_s) / 3600,
+        advisory: advisory_active(
+            ledger.last_long_dwell_epoch_s,
+            ledger.advisory_baseline_epoch_s,
+            advisory_after,
+            now_epoch_s,
+        ),
+        hours_since_long_dwell: hours_since_effective_dwell(
+            ledger.last_long_dwell_epoch_s,
+            ledger.advisory_baseline_epoch_s,
+            now_epoch_s,
+        ),
     }
 }
 
@@ -134,7 +128,7 @@ fn summarize(
 /// defensive poison path, returns an empty list rather than propagating a
 /// panic into an HTTP 500.
 pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResponse> {
-    let advisory_after_s = state.inner.config_rx.borrow().wear.advisory_after.as_secs();
+    let advisory_after = state.inner.config_rx.borrow().wear.advisory_after;
     let now = now_epoch_s();
 
     let Ok(guard) = state.inner.wear.read() else {
@@ -145,7 +139,7 @@ pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResp
 
     let mut displays: Vec<WearSummary> = guard
         .iter()
-        .map(|(key, ledger)| summarize(key, ledger, advisory_after_s, now))
+        .map(|(key, ledger)| summarize(key, ledger, advisory_after, now))
         .collect();
     // Deterministic ordering for a stable UI list / test assertions.
     displays.sort_by(|a, b| a.display.cmp(&b.display));
@@ -163,7 +157,7 @@ pub(crate) async fn get_wear_detail(
     State(state): State<WebState>,
     Path(display): Path<String>,
 ) -> Result<Json<WearDetail>, WebError> {
-    let advisory_after_s = state.inner.config_rx.borrow().wear.advisory_after.as_secs();
+    let advisory_after = state.inner.config_rx.borrow().wear.advisory_after;
     let now = now_epoch_s();
 
     let Ok(guard) = state.inner.wear.read() else {
@@ -174,7 +168,7 @@ pub(crate) async fn get_wear_detail(
         .get(&display)
         .ok_or_else(|| WebError::UnknownDisplay(display.clone()))?;
 
-    let summary = summarize(&display, ledger, advisory_after_s, now);
+    let summary = summarize(&display, ledger, advisory_after, now);
     let cells = ledger.cells.iter().map(|c| c.wear_hours).collect();
     let heat = ledger.heat_map();
 

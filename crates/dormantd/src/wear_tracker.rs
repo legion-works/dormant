@@ -57,8 +57,8 @@ use dormant_core::rules::{ControlMsg, DaemonEvent, StageInfo, StateSnapshot};
 use dormant_core::traits::{CommandSink, PanelState};
 use dormant_core::types::{DisplayId, StageKind};
 use dormant_core::wear::{
-    PanelType, WEAR_SCHEMA_VERSION, WearHandle, WearIdentity, WearLedger, brightness_norm,
-    sanitize_identity_key,
+    PanelType, WEAR_SCHEMA_VERSION, WearHandle, WearIdentity, WearLedger, advisory_active,
+    brightness_norm, hours_since_effective_dwell, sanitize_identity_key,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -527,7 +527,6 @@ fn tick(
     let max_span_s = sample_interval_s.saturating_mul(2);
     let persist_interval_s = cfg.persist_interval.as_secs().max(1);
     let short_cycle_s = cfg.short_cycle_dwell.as_secs();
-    let advisory_after_s = cfg.advisory_after.as_secs();
 
     for (id_str, dsnap) in &snapshot.displays {
         let display_id = DisplayId(id_str.clone());
@@ -624,20 +623,31 @@ fn tick(
         }
 
         // ── Advisory (observed vs baseline, ONCE latch) ────────────────────
-        let baseline = ledger.advisory_baseline_epoch_s;
-        let observed = ledger.last_long_dwell_epoch_s.unwrap_or(0);
-        let reference = observed.max(baseline);
-        let since_s = now_epoch_s.saturating_sub(reference);
+        // Formula lives in `dormant_core::wear::advisory_active` /
+        // `hours_since_effective_dwell`, shared with
+        // `dormant_web::routes::wear::summarize` (W1 review fix — the two
+        // crates used to duplicate this arithmetic independently).
         let already_active = state
             .advisory_active
             .get(&display_id)
             .copied()
             .unwrap_or(false);
-        if since_s > advisory_after_s && !already_active {
-            tracing::info!(event = "wear_advisory", display = %display_id, hours = since_s / 3600);
+        let is_advisory_now = advisory_active(
+            ledger.last_long_dwell_epoch_s,
+            ledger.advisory_baseline_epoch_s,
+            cfg.advisory_after,
+            now_epoch_s,
+        );
+        if is_advisory_now && !already_active {
+            let hours = hours_since_effective_dwell(
+                ledger.last_long_dwell_epoch_s,
+                ledger.advisory_baseline_epoch_s,
+                now_epoch_s,
+            );
+            tracing::info!(event = "wear_advisory", display = %display_id, hours);
             actions.push(TrackerAction::EmitAdvisory {
                 display: display_id.clone(),
-                hours_since_long_dwell: since_s / 3600,
+                hours_since_long_dwell: hours,
             });
             state.advisory_active.insert(display_id.clone(), true);
         }

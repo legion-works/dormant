@@ -2305,6 +2305,20 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
 /// but the file still showed the stale pre-shutdown value on the losing
 /// side of the race). A short bounded poll after `shutdown()` accommodates
 /// this without weakening what the test actually proves.
+///
+/// **G1 review fix (margin widened)**: the pre-shutdown wait used to be a
+/// fixed `sleep(7s)` against a 5s `sample_interval` — only a ~2s margin
+/// for "at least one more tick landed in memory" to hold. There is no
+/// observable signal to `wait_for`-poll on for that in-memory accumulation
+/// (the file isn't touched again until either the 60s `persist_interval`
+/// boundary or the shutdown flush itself, so polling the file here would
+/// just re-detect the same first-persist write). The only lever available
+/// is wall-clock margin, so it's widened to comfortably cover three tick
+/// periods plus flat slack (`3 * sample_interval + 5s` = 20s, up from 7s)
+/// — enough that a single slipped tick under CPU/scheduler contention
+/// still leaves at least one more tick landed before shutdown fires,
+/// without weakening the assertion itself (still `sample_count >` the
+/// first-persist count).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -2326,10 +2340,14 @@ async fn wear_shutdown_persists_final_ledger() {
     // the periodic cadence alone will NOT persist again during this test's
     // window — only the first (immediate) tick and the final shutdown
     // flush should ever touch the file.
+    let sample_interval = Duration::from_secs(5);
     let cfg = one_display_config_with_wear(
         &marker,
         "50ms",
-        "[wear]\nenabled = true\nsample_interval = \"5s\"\npersist_interval = \"60s\"\nread_timeout = \"500ms\"\n",
+        &format!(
+            "[wear]\nenabled = true\nsample_interval = \"{}s\"\npersist_interval = \"60s\"\nread_timeout = \"500ms\"\n",
+            sample_interval.as_secs()
+        ),
     );
     let cfg_path = write_file(dir.path(), "config.toml", &cfg);
     let creds_path = dir.path().join("credentials.toml");
@@ -2359,19 +2377,26 @@ async fn wear_shutdown_persists_final_ledger() {
             .sample_count;
 
     // Let at least one more sample_interval tick accumulate wear IN MEMORY
-    // without crossing the 60s persist_interval boundary again.
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    // without crossing the 60s persist_interval boundary again. See the
+    // G1 review fix note in this test's doc comment for why this can't be
+    // a `wait_for` poll (no observable signal before the flush) and why
+    // the margin is now `3 * sample_interval + 5s` slack instead of a
+    // fixed 7s.
+    tokio::time::sleep(sample_interval * 3 + Duration::from_secs(5)).await;
 
     shutdown(handle, join).await;
 
     // Bounded poll (see doc comment above) for the wear tracker's own
-    // fire-and-forget cancellation-triggered flush to land on disk.
+    // fire-and-forget cancellation-triggered flush to land on disk. Widened
+    // from 3s to 8s (G1 review fix) — this only costs time on the losing
+    // side (predicate already true returns immediately), so it's a free
+    // safety margin for a loaded CI runner.
     let ok = wait_for(
         || {
             serde_json::from_str::<dormant_core::wear::WearLedger>(&read(&wear_file))
                 .is_ok_and(|l| l.sample_count > sample_count_at_first_persist)
         },
-        Duration::from_secs(3),
+        Duration::from_secs(8),
     )
     .await;
 

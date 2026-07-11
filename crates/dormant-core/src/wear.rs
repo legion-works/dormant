@@ -278,6 +278,70 @@ pub fn brightness_norm(panel: &PanelState, native_max: u16, fallback: f64) -> f6
 /// concurrent read/write access to live ledgers.
 pub type WearHandle = Arc<RwLock<HashMap<String, WearLedger>>>;
 
+/// Seconds elapsed since the "effective dwell reference point":
+/// `now - max(last_long_dwell_epoch_s.unwrap_or(0), advisory_baseline_epoch_s)`.
+///
+/// This is the single source of truth for the compensation-advisory
+/// formula — both [`advisory_active`] and [`hours_since_effective_dwell`]
+/// are defined in terms of it, and both `dormantd::wear_tracker::tick` and
+/// `dormant_web::routes::wear::summarize` call through here instead of
+/// each independently re-deriving the arithmetic (see review finding W1 —
+/// the two crates used to duplicate this formula with no shared
+/// implementation and no cross-crate test proving they agreed).
+fn seconds_since_effective_dwell(
+    last_long_dwell_epoch_s: Option<u64>,
+    advisory_baseline_epoch_s: u64,
+    now_epoch_s: u64,
+) -> u64 {
+    let observed = last_long_dwell_epoch_s.unwrap_or(0);
+    let reference = observed.max(advisory_baseline_epoch_s);
+    now_epoch_s.saturating_sub(reference)
+}
+
+/// Whole hours since the effective dwell reference point — see
+/// `seconds_since_effective_dwell` above. Shared by the daemon's
+/// `CompensationAdvisory` event (`hours_since_long_dwell`) and the web
+/// `WearSummary::hours_since_long_dwell` field, so both are always
+/// computed the same way.
+#[must_use]
+pub fn hours_since_effective_dwell(
+    last_long_dwell_epoch_s: Option<u64>,
+    advisory_baseline_epoch_s: u64,
+    now_epoch_s: u64,
+) -> u64 {
+    seconds_since_effective_dwell(
+        last_long_dwell_epoch_s,
+        advisory_baseline_epoch_s,
+        now_epoch_s,
+    ) / 3600
+}
+
+/// `true` once longer than `advisory_after` has elapsed since the
+/// effective dwell reference point (see `seconds_since_effective_dwell`
+/// above).
+///
+/// The single shared advisory-latch condition: `dormantd::wear_tracker::tick`
+/// uses it to decide when to fire `TrackerAction::EmitAdvisory` (latched —
+/// only fires once per dwell-reset cycle, latch state lives in the
+/// tracker), and `dormant_web::routes::wear::summarize` uses it to
+/// recompute the `advisory` flag statelessly on every `GET /api/wear`
+/// request, independent of whether the client saw the WS event. A future
+/// change to the formula (e.g. a v2 tweak) only has to happen here for
+/// both call sites to follow.
+#[must_use]
+pub fn advisory_active(
+    last_long_dwell_epoch_s: Option<u64>,
+    advisory_baseline_epoch_s: u64,
+    advisory_after: Duration,
+    now_epoch_s: u64,
+) -> bool {
+    seconds_since_effective_dwell(
+        last_long_dwell_epoch_s,
+        advisory_baseline_epoch_s,
+        now_epoch_s,
+    ) > advisory_after.as_secs()
+}
+
 /// Sanitize an arbitrary identity string (e.g. a DDC EDID digest or a
 /// Samsung IP) into a key safe for filenames and config: lowercased,
 /// restricted to `[a-z0-9._-]`, every other character replaced with `-`,
@@ -450,6 +514,69 @@ mod tests {
         let json = serde_json::to_string(&l).unwrap();
         let back: WearLedger = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schema_version, 99); // loader (T7) branches on this — parsing itself succeeds
+    }
+
+    // ── W1 review fix: shared advisory formula ─────────────────────────────
+    // Single-source-of-truth test for `advisory_active`/
+    // `hours_since_effective_dwell` — both `dormantd::wear_tracker::tick`
+    // and `dormant_web::routes::wear::summarize` call through these instead
+    // of independently re-deriving the arithmetic, so this is the one test
+    // that has to hold for both call sites to stay in sync.
+
+    #[test]
+    fn advisory_active_false_when_baseline_recent() {
+        let now = 1_000_000;
+        // Baseline 1h ago, advisory_after = 2h -> not yet advisory.
+        assert!(!advisory_active(
+            None,
+            now - 3600,
+            Duration::from_secs(7200),
+            now
+        ));
+    }
+
+    #[test]
+    fn advisory_active_true_when_baseline_older_than_advisory_after() {
+        let now = 1_000_000;
+        // Baseline 2h ago, advisory_after = 1h -> advisory.
+        assert!(advisory_active(
+            None,
+            now - 7200,
+            Duration::from_secs(3600),
+            now
+        ));
+    }
+
+    #[test]
+    fn advisory_active_uses_observed_dwell_when_more_recent_than_baseline() {
+        let now = 1_000_000;
+        let old_baseline = now - 10 * 3600;
+        let recent_dwell = now - 30 * 60; // 30 min ago
+        // Observed dwell wins over the much-older baseline -> not advisory
+        // even though advisory_after is small.
+        assert!(!advisory_active(
+            Some(recent_dwell),
+            old_baseline,
+            Duration::from_secs(3600),
+            now
+        ));
+    }
+
+    #[test]
+    fn hours_since_effective_dwell_matches_max_of_observed_and_baseline() {
+        let now = 1_000_000;
+        let old_baseline = now - 10 * 3600;
+        let recent_dwell = now - 2 * 3600;
+        assert_eq!(
+            hours_since_effective_dwell(Some(recent_dwell), old_baseline, now),
+            2,
+            "a more-recent observed dwell must win over the older baseline"
+        );
+        assert_eq!(
+            hours_since_effective_dwell(None, old_baseline, now),
+            10,
+            "with no observed dwell, hours are measured from the baseline"
+        );
     }
 
     proptest::proptest! {

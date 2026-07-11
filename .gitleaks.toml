@@ -14,4 +14,10 @@ regexes = [
   # crates/dormant-displays/src/samsung_tizen.rs #[cfg(test)] block.
   # This is a deliberate test value, not a real credential.
   "abc123granted",
+  # docs/src/oled-health.md's example wear-ledger `cat` output: a
+  # sanitized panel-identity key (EDID mfg/model/serial, not a secret —
+  # see the same literal in crates/dormant-core/src/wear.rs's
+  # sanitize_identity_key test). The `"key": "..."` JSON shape trips
+  # gitleaks' generic-api-key heuristic on the field name alone.
+  "ddc-aoc-ag326uzd-xk2r9ja000013",
 ]

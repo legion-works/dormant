@@ -21,6 +21,25 @@
 
 config_version = 1
 
+# ── OLED health (panel-wear tracking) ───────────────────────────────────────
+#
+# Optional: brightness-weighted on-hours tracking + a compensation advisory
+# in the web UI. Local-only measurement, no enforcement — see
+# docs/src/oled-health.md for what is (and is not) tracked. Enabled by
+# default; every key below shows its default, so this section can be
+# omitted entirely.
+# [wear]
+# enabled = true                 # kill-switch; false = tracker parks (no ledger I/O, no panel reads)
+# sample_interval = "60s"        # how often to sample panel brightness (>= 5s)
+# persist_interval = "5m"        # how often to write ledgers to disk (>= sample_interval)
+# read_timeout = "2s"            # per-sample read budget; never blocks a blank/wake (>= 500ms)
+# grid_rows = 9                  # logical wear-grid rows (4..=64; v1 attributes uniformly, see docs)
+# grid_cols = 16                 # logical wear-grid columns (4..=64)
+# fallback_brightness = 0.5      # assumed brightness when a real panel read fails (0.0..=1.0)
+# screensaver_factor = 0.35      # attribution discount while on the render_screensaver stage (0.0..=1.0)
+# short_cycle_dwell = "10m"      # blanked dwell long enough to count as a "rest" window (>= 1m)
+# advisory_after = "96h"         # advise when no qualifying rest window for this long (>= 1h)
+
 [daemon]
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"
@@ -74,6 +93,10 @@ blank_command = "ddcutil --display 1 setvcp 10 0"
 wake_command = "ddcutil --display 1 setvcp 10 80"
 modes = ["brightness_zero", "power_off"]
 command_timeout = "8s"
+# panel_type = "qd-oled"        # optional: "woled" | "qd-oled" | "unknown" (default).
+#                                # Config-declared only — never auto-detected — and, in
+#                                # v1, recorded in the wear ledger but not yet consulted
+#                                # by any attribution heuristic (see docs/src/oled-health.md).
 
 # TV driven through Home Assistant service calls.
 [displays.tv]
@@ -116,6 +139,10 @@ modes = ["power_off"]
 # # transition = "none").  Humantime string; bounded 100ms..=10s by the
 # # validator.  Default: "1s".
 # transition_duration = "500ms"
+# # shift_px / shift_interval — periodic micro pixel-shift on the screensaver
+# # surface only, to even out static-image burn-in. shift_px = 0 disables.
+# shift_px = 2                   # pixels per shift, 0..=8 (default 2)
+# shift_interval = "120s"        # time between shifts, >= 10s (default "120s")
 # [[displays.desktop.screensaver.source]]
 # path = "/home/user/Pictures/screensaver"
 # recurse = false

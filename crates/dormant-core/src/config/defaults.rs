@@ -86,6 +86,17 @@ pub const AVAILABILITY_PAYLOAD_OFFLINE: &str = "offline";
 /// Default web-UI bind address — loopback only (operator tool).
 pub const WEB_BIND_DEFAULT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
+/// Whether the web UI's entity create/delete affordances are enabled by
+/// default.
+pub const ENTITY_CRUD_ENABLED: bool = true;
+
+/// Whether the Samsung pairing wizard route is enabled by default.
+pub const PAIRING_ENABLED: bool = true;
+
+/// Default timeout for a single pairing-wizard attempt (validated to
+/// `30s..=300s` — see [`mod@super::validate`]).
+pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Default duration each screensaver source image is displayed (8 seconds).
 pub const IMAGE_DURATION: Duration = Duration::from_secs(8);
 

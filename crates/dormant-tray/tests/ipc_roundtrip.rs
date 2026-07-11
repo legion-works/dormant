@@ -108,6 +108,33 @@ async fn wait_for_socket(path: &std::path::Path) -> bool {
     false
 }
 
+// ── Notify-sink isolation ───────────────────────────────────────────────────
+
+use dormantd::notifier::{NotifySink, zbus_sink_was_constructed};
+
+struct NoopNotifySink;
+
+#[async_trait::async_trait]
+impl NotifySink for NoopNotifySink {
+    async fn notify(
+        &self,
+        _summary: &str,
+        _body: &str,
+        _urgency: u8,
+        _replaces: u32,
+    ) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    async fn close(&self, _id: u32) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
+    std::sync::Arc::new(NoopNotifySink)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipc_roundtrip_via_dormantctl_client() {
     let dir = TempDir::new().unwrap();
@@ -122,7 +149,8 @@ async fn ipc_roundtrip_via_dormantctl_client() {
         Strictness::Strict,
         fake_factory("desk"),
     )
-    .expect("build app");
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory);
     let (handle, join) = app.start().await.expect("start app");
 
     // Wait for the IPC socket to come up.
@@ -209,4 +237,9 @@ async fn ipc_roundtrip_via_dormantctl_client() {
     // ── Shutdown ──────────────────────────────────────────────────────────
     handle.shutdown();
     let _ = timeout(Duration::from_secs(5), join).await;
+
+    assert!(
+        !zbus_sink_was_constructed(),
+        "ZbusSink must never be constructed — every App construction site must inject a no-op notify sink"
+    );
 }

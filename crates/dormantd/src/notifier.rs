@@ -33,7 +33,36 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+// ── Test-seam guard: tracks ZbusSink construction ──────────────────────────
+
+/// Set to `true` the first time any [`ZbusSink`] is constructed in this
+/// process. Integration tests assert it stays `false` when every App
+/// construction site injects a no-op sink.
+///
+/// Best-effort by construction, not a guarantee: libtest runs a binary's
+/// tests concurrently in one process, so an asserting test only observes
+/// leaks that CONSTRUCTED before its checkpoint — a future uncovered site
+/// trips this only if test timing cooperates. The deterministic protections
+/// are the audited no-op injection at every App construction site and the
+/// dead-bus `DBUS_SESSION_BUS_ADDRESS` prefix on local suite runs; this flag
+/// exists to catch regressions early, not to define the safety boundary.
+static ZBUS_SINK_CONSTRUCTED: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` if a production [`ZbusSink`] was ever constructed.
+#[doc(hidden)]
+#[must_use]
+pub fn zbus_sink_was_constructed() -> bool {
+    ZBUS_SINK_CONSTRUCTED.load(Ordering::SeqCst)
+}
+
+/// Reset the tracker to `false` — call before a representative test.
+#[doc(hidden)]
+pub fn reset_zbus_sink_tracker() {
+    ZBUS_SINK_CONSTRUCTED.store(false, Ordering::SeqCst);
+}
 
 use dormant_core::config::schema::NotificationsConfig;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -700,6 +729,7 @@ impl ZbusSink {
     /// Construct a fresh sink with no cached connection.
     #[must_use]
     pub fn new() -> Self {
+        ZBUS_SINK_CONSTRUCTED.store(true, Ordering::SeqCst);
         Self {
             conn: tokio::sync::Mutex::new(ZbusConnState {
                 conn: None,

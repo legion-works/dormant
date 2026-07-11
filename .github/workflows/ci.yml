@@ -132,7 +132,11 @@ jobs:
         run: |
           docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
           for _ in $(seq 1 10); do nc -z localhost 1883 && break; sleep 1; done
-      - run: DORMANT_TEST_MQTT=1 cargo test -p dormant-sensors -- --ignored mqtt_round_trip_publishes_presence_event
+      - run: |
+          DORMANT_TEST_MQTT=1 cargo test -p dormant-sensors -- --ignored \
+            mqtt_round_trip_publishes_presence_event \
+            mqtt_retained_state_delivered_on_subscribe \
+            mqtt_retained_availability_offline_on_subscribe
 
   docs:
     runs-on: ubuntu-latest

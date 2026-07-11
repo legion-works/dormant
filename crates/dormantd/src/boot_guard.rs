@@ -29,6 +29,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dormant_core::config::{Strictness, load_config};
@@ -462,7 +463,7 @@ pub fn prepare(
     let _ = creds_path;
 
     let now = now_epoch_s();
-    let nonce: u64 = rand::random();
+    let nonce: u64 = generate_nonce();
 
     let discount_nonces = collect_and_sweep_discounts(state_dir, now);
     let mut state = load_crash_loop_state(state_dir);
@@ -613,6 +614,35 @@ fn now_epoch_s() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Process-lifetime tiebreaker for [`generate_nonce`] — folded into the
+/// hash so two `prepare()` calls within the same wall-clock second (e.g.
+/// tests, or a fast restart-loop) still produce distinct nonces.
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// This boot's join key for `discount-<nonce>` files (spec §3 F6) — needs
+/// only to be practically-unique per boot within one `state_dir`, NOT
+/// cryptographically unpredictable (it is never a security boundary, only
+/// a dedup/join key alongside a `Vec<StartEntry>` capped at
+/// [`MAX_STARTS`]). `rand` was previously pulled in for this alone; the
+/// daemon core is otherwise std-only (spec §3 F7 — `rand` was already an
+/// optional, `web-ui`-feature-gated dependency via `dormant-web`, never a
+/// core one), so this hashes wall-clock time + PID + a monotonic counter
+/// through std's `DefaultHasher` instead of adding a real dependency.
+fn generate_nonce() -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    NONCE_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
 // ── crash-loop.json load ────────────────────────────────────────────────
 
 fn load_crash_loop_state(state_dir: &Path) -> CrashLoopState {
@@ -628,7 +658,8 @@ fn load_crash_loop_state(state_dir: &Path) -> CrashLoopState {
 /// Create `state_dir()/discount-<nonce>` — an atomic, uniquely-named create
 /// (`O_EXCL`), never a read-modify-write of the shared `crash-loop.json`
 /// (spec §3 F6). Idempotent: a duplicate call for the same nonce is
-/// harmless.
+/// harmless (the existing file, and its content, are left untouched).
+/// File mode `0o600` on Unix, matching `write_atomic_json`.
 pub fn record_discount(state_dir: &Path, nonce: u64) {
     if std::fs::create_dir_all(state_dir).is_err() {
         return;
@@ -639,18 +670,24 @@ pub fn record_discount(state_dir: &Path, nonce: u64) {
         let _ = std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700));
     }
     let path = state_dir.join(format!("{DISCOUNT_PREFIX}{nonce}"));
-    match std::fs::OpenOptions::new()
+    if std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
+        .is_ok()
     {
-        Ok(_) | Err(_) => {
-            // Ok: created. AlreadyExists: idempotent, another boot (or a
-            // previous call) already discounted this nonce. Any other
-            // error: best-effort, never blocks — discount is a courtesy,
-            // not a safety boundary.
+        // Defense in depth (matches `write_atomic_json`'s file mode):
+        // best-effort, the file was just created 0o644-ish under the
+        // process umask, tighten it to 0o600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
     }
+    // else: AlreadyExists is idempotent (another boot, or a previous call,
+    // already discounted this nonce); any other error is best-effort and
+    // never blocks — discount is a courtesy, not a safety boundary.
 }
 
 /// Collect the live discount-nonce set, sweeping (deleting) any
@@ -801,6 +838,34 @@ mod tests {
     }
 
     #[test]
+    fn window_boundary_is_inclusive() {
+        // Pins today's `same_fingerprint_window_stats` boundary check
+        // (`saturating_sub(e.epoch_s) > window_s`) as INCLUSIVE: a start
+        // whose age is EXACTLY `CRASH_LOOP_WINDOW` (not one second more)
+        // still counts. `two_starts_proceed_three_rolls_back` above
+        // already pins the `window_s + 1` (exclusive) side; this pins the
+        // `window_s` (inclusive) side, so a `>` -> `>=` mutant flips this
+        // assertion (dropping the in-window count from 3 to 2, Proceed
+        // instead of RollBack) and gets killed.
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+        let window_s = CRASH_LOOP_WINDOW.as_secs();
+
+        let boundary = state_with(vec![
+            entry(now - window_s, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        let v = decide(&boundary, &empty, &lkg(true, true, false), fp_a, now, true);
+        assert_eq!(
+            v.action,
+            Action::RollBack,
+            "a start exactly CRASH_LOOP_WINDOW old must still count (inclusive boundary)"
+        );
+    }
+
+    #[test]
     fn mixed_fingerprints_proceed() {
         let fp_a = fingerprint_bytes(b"config-a");
         let fp_b = fingerprint_bytes(b"config-b");
@@ -875,6 +940,50 @@ mod tests {
         // Second call: idempotent, no panic, file still present.
         record_discount(dir.path(), 42);
         assert!(dir.path().join("discount-42").exists());
+
+        // Defense in depth (matches `write_atomic_json`'s file mode):
+        // a freshly-created discount file is 0o600, not umask-default.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file_mode = std::fs::metadata(dir.path().join("discount-42"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn record_discount_does_not_truncate_existing_file() {
+        // `record_discount` must be an `O_EXCL` create (never a
+        // truncating create) so a duplicate call for an already-
+        // discounted nonce is a true no-op on disk, not a silent
+        // content-clobber. A mutant swapping `create_new(true)` for
+        // `truncate(true).create(true)` (or similar) would zero this
+        // file's content on the second call; this test kills it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let path = dir.path().join(format!("{DISCOUNT_PREFIX}77"));
+        std::fs::write(&path, b"sentinel-do-not-truncate").unwrap();
+
+        record_discount(dir.path(), 77);
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(
+            contents, b"sentinel-do-not-truncate",
+            "record_discount must not truncate an existing discount file"
+        );
+
+        // Also pins the finding-5 fix: 0o600 on the (pre-existing) file is
+        // untouched by `record_discount` — it only tightens permissions on
+        // files IT creates, never rewrites permissions of a file that
+        // already existed under a different nonce-holder's umask. The
+        // freshly-created-file permission guarantee is covered by
+        // `record_discount_atomic_and_idempotent`'s sibling assertion
+        // below and by `prepare_records_start_and_writes_crash_loop_state`
+        // for `crash-loop.json` itself.
     }
 
     #[test]
@@ -1176,6 +1285,55 @@ mod tests {
         );
         assert!(state.rollback_active);
         assert_eq!(state.rolled_back_from, Some(fp));
+    }
+
+    #[test]
+    fn prepare_emits_crash_loop_detected_when_bytes_equal_lkg() {
+        // spec §5.2's closing paragraph: a real same-config crash loop
+        // that Proceeds for some other reason (here: bytes_equal_current
+        // is true, so condition (c) fails and RollBack never fires) is
+        // still worth surfacing loudly. This is `prepare`'s own emission
+        // logic (the `Action::Proceed` catchall arm), NOT `decide` — a
+        // `decide`-only test cannot see `deferred_events` at all, so
+        // deleting the emission branch from `prepare` leaves every
+        // decide()-level test green (see RED evidence in the commit
+        // report).
+        let dir = tempfile::tempdir().unwrap();
+        let config_bytes = b"config_version = 1\n";
+        let config = write_config(dir.path(), config_bytes);
+        let creds = dir.path().join("credentials.toml");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Seed two prior same-fingerprint starts within the window; this
+        // boot's `prepare()` call records a third, matching one.
+        let fp = fingerprint_bytes(config_bytes);
+        let now = now_epoch_s();
+        let seeded = CrashLoopState {
+            schema_version: 1,
+            starts: vec![entry(now - 60, fp, 301), entry(now - 30, fp, 302)],
+            rollback_active: false,
+            rolled_back_from: None,
+        };
+        write_atomic_json(&state_dir, CRASH_LOOP_FILE, &seeded).unwrap();
+
+        // LKG bytes IDENTICAL to the current config -> bytes_equal_current
+        // = true -> condition (c) fails -> decide() returns plain Proceed,
+        // never RollBack.
+        std::fs::write(state_dir.join(LKG_FILE), config_bytes).unwrap();
+
+        let plan = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
+
+        assert_eq!(
+            plan.chosen_config, config,
+            "bytes-equal-to-LKG must Proceed with the latest config, not roll back"
+        );
+        assert_eq!(
+            plan.deferred_events,
+            vec![DeferredEvent::CrashLoopDetected { count: 3 }],
+            "3 same-fingerprint in-window starts must still surface \
+             CrashLoopDetected even though the verdict is Proceed"
+        );
     }
 
     #[test]

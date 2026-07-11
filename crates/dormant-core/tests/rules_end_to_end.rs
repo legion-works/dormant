@@ -27,8 +27,8 @@ use dormant_core::fakes::{
     FakeSensorSource, RecordingRenderSink, RecordingSink, RenderCmd, SinkCmd,
 };
 use dormant_core::rules::{
-    ControlMsg, DaemonEvent, DisplayRuntimeCfg, RuleRuntimeCfg, RulesEngine, RulesEngineConfig,
-    SensorRuntimeCfg, StateSnapshot,
+    ControlMsg, DaemonEvent, DisplayRuntimeCfg, InhibitorKind, RuleRuntimeCfg, RulesEngine,
+    RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::SmTimings;
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
@@ -1417,6 +1417,7 @@ async fn set_inhibited_freezes_grace_until_released() {
         .ctl_tx
         .send(ControlMsg::SetInhibited {
             rule: None,
+            kind: InhibitorKind::UserActivity,
             inhibited: true,
         })
         .await
@@ -1437,6 +1438,7 @@ async fn set_inhibited_freezes_grace_until_released() {
         .ctl_tx
         .send(ControlMsg::SetInhibited {
             rule: None,
+            kind: InhibitorKind::UserActivity,
             inhibited: false,
         })
         .await

@@ -50,6 +50,49 @@ use crate::types::{
 };
 use crate::zone::ZoneEngine;
 
+// ── Inhibitor kinds ─────────────────────────────────────────────────────────
+
+/// The category of an inhibitor source that can suppress blanking for a rule.
+///
+/// Multiple inhibitor sources (user activity, audio playback, an active
+/// call) can be engaged concurrently for the same rule; the engine tracks
+/// each kind independently and OR-derives one effective inhibition bit from
+/// them (see [`ControlMsg::SetInhibited`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InhibitorKind {
+    /// User keyboard/mouse/idle-time activity (config literal
+    /// [`INHIBITOR_USER_ACTIVITY`]).
+    UserActivity,
+    /// Active audio playback (config literal [`INHIBITOR_AUDIO_PLAYBACK`]).
+    AudioPlayback,
+    /// An active call (config literal [`INHIBITOR_CALL`]).
+    Call,
+}
+
+/// Config-file literal for [`InhibitorKind::UserActivity`].
+pub const INHIBITOR_USER_ACTIVITY: &str = "user-activity";
+/// Config-file literal for [`InhibitorKind::AudioPlayback`].
+pub const INHIBITOR_AUDIO_PLAYBACK: &str = "audio-playback";
+/// Config-file literal for [`InhibitorKind::Call`].
+pub const INHIBITOR_CALL: &str = "call";
+
+impl InhibitorKind {
+    /// Parse a config-file inhibitor literal into its [`InhibitorKind`].
+    ///
+    /// Returns `None` for any string that isn't one of the three known
+    /// literals. Rejecting unknown inhibitor names at config-validation time
+    /// is a config-layer concern, not this parser's.
+    #[must_use]
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s {
+            INHIBITOR_USER_ACTIVITY => Some(Self::UserActivity),
+            INHIBITOR_AUDIO_PLAYBACK => Some(Self::AudioPlayback),
+            INHIBITOR_CALL => Some(Self::Call),
+            _ => None,
+        }
+    }
+}
+
 // ── Public I/O surfaces ───────────────────────────────────────────────────────
 
 /// Inbound control messages to the engine.
@@ -84,6 +127,8 @@ pub enum ControlMsg {
     SetInhibited {
         /// Target rule (`None` → all rules).
         rule: Option<RuleId>,
+        /// Which inhibitor category this update is for.
+        kind: InhibitorKind,
         /// Whether the inhibitor is now engaged.
         inhibited: bool,
     },
@@ -1089,8 +1134,12 @@ impl RulesEngine {
             ControlMsg::SubscribeEvents(tx) => {
                 let _ = tx.send(self.event_tx.subscribe());
             }
-            ControlMsg::SetInhibited { rule, inhibited } => {
-                self.handle_set_inhibited(rule.as_ref(), inhibited);
+            ControlMsg::SetInhibited {
+                rule,
+                kind,
+                inhibited,
+            } => {
+                self.handle_set_inhibited(rule.as_ref(), kind, inhibited);
             }
             ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
             ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
@@ -1100,7 +1149,16 @@ impl RulesEngine {
 
     /// Route an inhibitor state change to a rule's displays (or every display
     /// when `rule` is `None`), mirroring [`Self::handle_pause`]'s fan-out.
-    fn handle_set_inhibited(&mut self, rule: Option<&RuleId>, inhibited: bool) {
+    ///
+    /// `_kind` is accepted but not yet consulted — per-kind bookkeeping
+    /// lands in a follow-up commit; this overwrite-fan-out behavior is
+    /// unchanged from before `kind` existed on [`ControlMsg::SetInhibited`].
+    fn handle_set_inhibited(
+        &mut self,
+        rule: Option<&RuleId>,
+        _kind: InhibitorKind,
+        inhibited: bool,
+    ) {
         let targets: Vec<DisplayId> = match rule {
             Some(r) => self.rule_displays.get(r).cloned().unwrap_or_default(),
             None => self
@@ -2070,6 +2128,31 @@ fn is_blanked_family_phase(phase: &str) -> bool {
 mod tests {
     use super::*;
     use crate::traits::{PanelState, PowerState};
+
+    // ── InhibitorKind::from_config literal pin ──────────────────────────────
+
+    /// Each `INHIBITOR_*` const must round-trip through `from_config` to the
+    /// matching [`InhibitorKind`] variant, and an unrecognized literal must
+    /// yield `None`. Pins the config-string ⇄ enum mapping so a typo'd
+    /// literal fails loudly here instead of silently at config-validation
+    /// time (Task 2's `VALID_INHIBITORS` is a separate, config-layer
+    /// concern — not referenced by this test).
+    #[test]
+    fn inhibitor_kind_from_config_round_trips_known_literals() {
+        assert_eq!(
+            InhibitorKind::from_config(INHIBITOR_USER_ACTIVITY),
+            Some(InhibitorKind::UserActivity)
+        );
+        assert_eq!(
+            InhibitorKind::from_config(INHIBITOR_AUDIO_PLAYBACK),
+            Some(InhibitorKind::AudioPlayback)
+        );
+        assert_eq!(
+            InhibitorKind::from_config(INHIBITOR_CALL),
+            Some(InhibitorKind::Call)
+        );
+        assert_eq!(InhibitorKind::from_config("not-a-real-inhibitor"), None);
+    }
 
     // ── Verdict logic (pure functions) ─────────────────────────────────────
 

@@ -22,7 +22,7 @@ use dormant_core::error::E_RENDER_UNAVAILABLE;
 use dormant_core::traits::RenderSink;
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
-use crate::settings::ScreensaverSettings;
+use crate::settings::{ScreensaverSettings, ShiftSettings};
 
 /// Cross-platform placeholder for the Wayland layer-shell backend.
 ///
@@ -72,6 +72,14 @@ impl LayerShellRenderSink {
     /// platform — the stub can never show a screensaver overlay.
     /// Kept so callers can invoke it unconditionally.
     pub fn set_screensaver(&self, _settings: ScreensaverSettings) {
+        // No compositor → no-op.
+    }
+
+    /// Register the per-display pixel-shift config.  No-op on this
+    /// platform — mirrors [`Self::set_screensaver`]; kept so callers
+    /// (`dormantd::app::build_render_sinks`) can invoke it
+    /// unconditionally regardless of target OS.
+    pub fn set_shift(&self, _shift: ShiftSettings) {
         // No compositor → no-op.
     }
 }

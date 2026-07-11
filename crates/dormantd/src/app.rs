@@ -93,6 +93,15 @@ type SourceBuilder =
 /// passed to [`LayerShellRenderSink::new`] so test factories can
 /// capture it and simulate `InputWake` events.  Return `None` to skip
 /// the sink (fall-through path).
+///
+/// The 5th parameter is the OLED-health T10 pixel-shift settings —
+/// see [`dormant_render::ShiftSettings`] for why it's a SEPARATE
+/// parameter from the `ScreensaverSettings` one rather than a field on
+/// it: shift applies to BOTH the black overlay and the screensaver
+/// surface, so it's derived from `dc.screensaver` independently of
+/// whether the display's ladder ever reaches `RenderScreensaver`
+/// (see `build_render_sinks` below).  `None` means the display has no
+/// `[displays.<id>.screensaver]` table at all — shift stays disabled.
 #[cfg(feature = "render")]
 type RenderSinkBuilder = Arc<
     dyn Fn(
@@ -100,6 +109,7 @@ type RenderSinkBuilder = Arc<
             String,
             Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
             Option<&dormant_render::ScreensaverSettings>,
+            Option<&dormant_render::ShiftSettings>,
         ) -> Option<Arc<dyn RenderSink>>
         + Send
         + Sync,
@@ -268,9 +278,12 @@ impl App {
     /// When set, `assemble_static` calls this factory instead of
     /// building [`LayerShellRenderSink`] directly.  The factory receives
     /// the display id, output connector name, an optional
-    /// `UnboundedSender<DisplayId>` (the `InputWake` channel), and an
-    /// optional [`dormant_render::ScreensaverSettings`]; return `None` to skip the sink
-    /// (fall-through).
+    /// `UnboundedSender<DisplayId>` (the `InputWake` channel), an
+    /// optional [`dormant_render::ScreensaverSettings`], and an
+    /// optional [`dormant_render::ShiftSettings`] (OLED-health T10 —
+    /// derived independently of the ladder's `RenderScreensaver`
+    /// stage; see `build_render_sinks`'s shift-settings assembly);
+    /// return `None` to skip the sink (fall-through).
     #[cfg(feature = "render")]
     #[must_use]
     pub fn with_render_sink_builder<F>(mut self, factory: F) -> Self
@@ -280,6 +293,7 @@ impl App {
                 String,
                 Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
                 Option<&dormant_render::ScreensaverSettings>,
+                Option<&dormant_render::ShiftSettings>,
             ) -> Option<Arc<dyn RenderSink>>
             + Send
             + Sync
@@ -1478,6 +1492,7 @@ fn activity_rules(cfg: &Config) -> (Vec<ActivityRule>, Option<Duration>) {
 /// this keeps FS scanning off the wayland thread and matches the generation
 /// model where a config reload rebuilds it.  Fresh-per-show is future work.
 #[cfg(feature = "render")]
+#[allow(clippy::too_many_lines)] // ScreensaverSettings + ShiftSettings assembly, both documented inline
 fn build_render_sinks(
     cfg: &Config,
     render_sink_builder: Option<&RenderSinkBuilder>,
@@ -1552,14 +1567,31 @@ fn build_render_sinks(
             None
         };
 
+        // Shift settings (OLED-health T10): derived DIRECTLY from
+        // `dc.screensaver`, independent of whether the ladder reaches
+        // `RenderScreensaver` — both the black overlay and the
+        // screensaver surface shift.  A display with no
+        // `[displays.<id>.screensaver]` table at all gets `None` here
+        // (never a `set_shift` call), so the sink's shift stays fully
+        // disabled (`ShiftSettings::default`).
+        let shift_settings: Option<dormant_render::ShiftSettings> =
+            dc.screensaver
+                .as_ref()
+                .map(|ss| dormant_render::ShiftSettings {
+                    shift_px: ss.shift_px,
+                    shift_interval: ss.shift_interval,
+                });
+
         if let Some(output_name) = &dc.output {
             let ss_ref = screensaver_settings.as_ref();
+            let shift_ref = shift_settings.as_ref();
             let sink: Option<Arc<dyn RenderSink>> = if let Some(builder) = render_sink_builder {
                 (builder)(
                     did.clone(),
                     output_name.clone(),
                     Some(&input_wake_tx),
                     ss_ref,
+                    shift_ref,
                 )
             } else {
                 match LayerShellRenderSink::new(
@@ -1570,6 +1602,9 @@ fn build_render_sinks(
                     Ok(sink) => {
                         if let Some(ref settings) = screensaver_settings {
                             sink.set_screensaver(settings.clone());
+                        }
+                        if let Some(shift) = shift_settings {
+                            sink.set_shift(shift);
                         }
                         Some(Arc::new(sink))
                     }
@@ -2235,7 +2270,7 @@ mod render_tests {
 
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, _ss| {
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, _ss, _shift| {
             Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
         });
 
@@ -2257,6 +2292,162 @@ mod render_tests {
         // path through the real LayerShellRenderSink which clones the
         // sender.
         drop(input_wake_rx);
+    }
+
+    /// OLED-health T10, core adjudicated decision: pixel-shift settings
+    /// must reach the sink even when the display's ladder is
+    /// black-only (no `RenderScreensaver` stage) — BOTH the black
+    /// overlay and the screensaver surface shift, and shift is derived
+    /// from `dc.screensaver` independently of the ladder.  This is the
+    /// scenario `ScreensaverSettings` deliberately does NOT cover (it's
+    /// only built when the ladder reaches `RenderScreensaver` — see
+    /// the doc on `build_render_sinks`), which is exactly why shift is
+    /// threaded as a separate parameter/command instead of a field on
+    /// `ScreensaverSettings`.
+    #[tokio::test]
+    #[cfg(feature = "render")]
+    async fn build_render_sinks_passes_shift_settings_through_even_without_screensaver_stage() {
+        use dormant_core::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
+        use dormant_core::fakes::RecordingRenderSink;
+        use dormant_core::types::{LadderStage, StageKind};
+        use std::sync::Mutex;
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::from([(
+                "mon".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into()],
+                    // Black-only ladder — NO RenderScreensaver stage.
+                    ladder: vec![
+                        LadderStage {
+                            kind: StageKind::Controller(dormant_core::types::BlankMode::PowerOff),
+                            dwell: Some(Duration::from_secs(30)),
+                        },
+                        LadderStage {
+                            kind: StageKind::RenderBlack,
+                            dwell: None,
+                        },
+                    ],
+                    // The screensaver table IS present (with shift
+                    // configured) even though the ladder never reaches
+                    // RenderScreensaver — this is the realistic shape
+                    // an operator would write to get shift on a
+                    // black-only display.
+                    screensaver: Some(ScreensaverConfig {
+                        trigger: "vacancy".into(),
+                        audio: false,
+                        source: vec![ScreensaverSource {
+                            path: Some("/tmp/img.png".into()),
+                            urls: Vec::new(),
+                            recurse: false,
+                            shuffle: false,
+                            order: None,
+                            image_duration: None,
+                        }],
+                        scale_mode: None,
+                        transition: None,
+                        transition_duration: None,
+                        shift_px: 3,
+                        shift_interval: Duration::from_secs(45),
+                    }),
+                    output: Some("DP-1".into()),
+                    ..base_display_cfg_for_test()
+                },
+            )]),
+            rules: indexmap::IndexMap::new(),
+        };
+
+        let captured_ss: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_shift: Arc<Mutex<Option<dormant_render::ShiftSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_ss_for_factory = captured_ss.clone();
+        let captured_shift_for_factory = captured_shift.clone();
+        let recording = RecordingRenderSink::new();
+        let recorded = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, shift| {
+            *captured_ss_for_factory.lock().expect("capture") = ss.cloned();
+            *captured_shift_for_factory.lock().expect("capture") = shift.copied();
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
+
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        assert!(
+            !sinks.is_empty(),
+            "black-only ladder must still produce a sink"
+        );
+
+        assert!(
+            captured_ss.lock().expect("capture").take().is_none(),
+            "ScreensaverSettings must stay None — the ladder never reaches RenderScreensaver"
+        );
+        let shift = captured_shift
+            .lock()
+            .expect("capture")
+            .take()
+            .expect("shift settings must reach the sink even on a black-only ladder");
+        assert_eq!(shift.shift_px, 3);
+        assert_eq!(shift.shift_interval, Duration::from_secs(45));
+    }
+
+    /// The dual of the above: a display with NO `[displays.<id>.
+    /// screensaver]` table at all must get a `None` shift — the
+    /// adjudicated rule is "keys only exist within that table", so
+    /// there is no config-schema default to fall back to when the
+    /// table itself is absent.
+    #[tokio::test]
+    #[cfg(feature = "render")]
+    async fn build_render_sinks_shift_is_none_when_no_screensaver_table() {
+        use dormant_core::config::schema::DisplayConfig;
+        use dormant_core::fakes::RecordingRenderSink;
+        use dormant_core::types::{LadderStage, StageKind};
+        use std::sync::Mutex;
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::from([(
+                "mon".into(),
+                DisplayConfig {
+                    controllers: vec!["kwin-dpms".into()],
+                    ladder: vec![LadderStage {
+                        kind: StageKind::RenderBlack,
+                        dwell: None,
+                    }],
+                    screensaver: None,
+                    output: Some("DP-1".into()),
+                    ..base_display_cfg_for_test()
+                },
+            )]),
+            rules: indexmap::IndexMap::new(),
+        };
+
+        let captured_shift: Arc<Mutex<Option<dormant_render::ShiftSettings>>> =
+            Arc::new(Mutex::new(None));
+        let captured_shift_for_factory = captured_shift.clone();
+        let recording = RecordingRenderSink::new();
+        let recorded = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, _ss, shift| {
+            *captured_shift_for_factory.lock().expect("capture") = shift.copied();
+            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+        });
+
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        assert!(!sinks.is_empty());
+        assert!(
+            captured_shift.lock().expect("capture").take().is_none(),
+            "no [displays.<id>.screensaver] table => shift must be None (fully disabled)"
+        );
     }
 
     /// Full-hop plumbing test: a TOML-parsed config with
@@ -2328,7 +2519,7 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
             if let Some(s) = ss {
                 *captured_for_factory.lock().expect("capture") = Some(s.clone());
             }
@@ -2425,7 +2616,7 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
             if let Some(s) = ss {
                 *captured_for_factory.lock().expect("capture") = Some(s.clone());
             }
@@ -2509,7 +2700,7 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
             if let Some(s) = ss {
                 *captured_for_factory.lock().expect("capture") = Some(s.clone());
             }
@@ -2607,7 +2798,7 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss| {
+        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
             if let Some(s) = ss {
                 *captured_for_factory.lock().expect("capture") = Some(s.clone());
             }

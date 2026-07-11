@@ -50,7 +50,8 @@ use super::blend::{self, T_MAX};
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
 use crate::screensaver::{MpvItemEvent, MpvPlayer};
-use crate::settings::{ScreensaverSettings, TransitionMode};
+use crate::settings::{ScreensaverSettings, ShiftSettings, TransitionMode};
+use crate::shift::ShiftState;
 
 /// Re-export of the long `WpSinglePixelBufferManagerV1` type so callers
 /// in [`crate::linux::surface`] can name it without a full
@@ -666,6 +667,30 @@ pub(super) struct WaylandState {
     /// `insert_source` for the mpv wakeup pipe.
     #[allow(dead_code)] // installed + consumed inside complete_screensaver_show
     pub(super) loop_handle: Option<calloop::LoopHandle<'static, WaylandState>>,
+
+    // ── Micro pixel-shift (OLED-health T10) ────────────────────────────
+    /// Per-display shift config, set once via
+    /// [`RenderCommand::SetShift`] (fire-and-forget, sent by
+    /// [`super::LayerShellRenderSink::set_shift`]).  Defaults to fully
+    /// disabled (`shift_px: 0`) — a display whose sink never receives
+    /// a `SetShift` command (no `[displays.<id>.screensaver]` table)
+    /// renders byte-identically to the pre-T10 code path.
+    pub(super) shift_settings: ShiftSettings,
+    /// Raster-walk cursor for the CURRENTLY LIVE surface.  `Some` from
+    /// the moment the first content (black or screensaver) is
+    /// installed on a fresh surface through to that surface's full
+    /// teardown — a content-swap on the SAME surface (e.g. screensaver
+    /// → black) reuses the walk already in progress rather than
+    /// resetting it; only [`Self::destroy_surface`] resets it (per the
+    /// probe: shift state does not persist across teardown/re-show,
+    /// but nothing says it must reset on a same-surface content swap).
+    /// `None` when shift is disabled OR no surface is currently up.
+    pub(super) shift_state: Option<ShiftState>,
+    /// calloop `RegistrationToken` for the shift timer.  Armed exactly
+    /// once per surface lifetime (the moment `shift_state` transitions
+    /// `None` → `Some`) via [`Self::maybe_arm_shift_timer`]; removed by
+    /// [`Self::disarm_shift_timer`] on full surface teardown.
+    pub(super) shift_timer_token: Option<calloop::RegistrationToken>,
 }
 
 impl WaylandState {
@@ -714,6 +739,9 @@ impl WaylandState {
             screensaver_session: None,
             screensaver_wakeup_token: None,
             loop_handle: None,
+            shift_settings: ShiftSettings::default(),
+            shift_state: None,
+            shift_timer_token: None,
         }
     }
 
@@ -725,6 +753,208 @@ impl WaylandState {
         handle: calloop::LoopHandle<'static, WaylandState>,
     ) {
         self.loop_handle = Some(handle);
+    }
+
+    // ── Micro pixel-shift (OLED-health T10) ─────────────────────────
+
+    /// Single source of truth for shift geometry: `(render_w,
+    /// render_h, margin)` when pixel-shift is active for this
+    /// display, or `None` when disabled (`shift_px == 0`), the
+    /// compositor has no `wp_viewporter`, or the margin arithmetic
+    /// overflows (defensive — unreachable at real display resolutions
+    /// given the validator's `shift_px <= 8` ceiling).  `render_w` /
+    /// `render_h` are `dest` oversized by `2 * margin` on each axis —
+    /// the dims every oversized shm buffer (black or screensaver) must
+    /// be allocated at.
+    fn shift_geometry(&self, dest: (u32, u32)) -> Option<(u32, u32, u32)> {
+        if self.shift_settings.shift_px == 0 || self.viewporter.is_none() {
+            return None;
+        }
+        let margin = crate::shift::margin(self.shift_settings.shift_px);
+        let total = margin.checked_mul(2)?;
+        let w = dest.0.checked_add(total)?;
+        let h = dest.1.checked_add(total)?;
+        Some((w, h, margin))
+    }
+
+    /// Buffer dims to allocate for `dest` — oversized when shift is
+    /// active, `dest` unchanged otherwise.  See [`Self::shift_geometry`].
+    pub(super) fn render_dims(&self, dest: (u32, u32)) -> (u32, u32) {
+        self.shift_geometry(dest).map_or(dest, |(w, h, _)| (w, h))
+    }
+
+    /// Ensure a `WpViewport` is bound to `wl_surface`, creating one on
+    /// first use and reusing it thereafter (a `wl_surface` may only
+    /// ever have ONE viewport for its lifetime — calling
+    /// `wp_viewporter::get_viewport` twice on the same surface is a
+    /// protocol error, so every caller MUST go through this method
+    /// rather than calling `get_viewport` directly).
+    fn ensure_viewport(&mut self, wl_surface: &WlSurface) -> Option<WpViewport> {
+        if let Some(vp) = &self.viewport {
+            return Some(vp.clone());
+        }
+        let vp = self
+            .viewporter
+            .as_ref()?
+            .get_viewport(wl_surface, &self.queue_handle, ());
+        self.viewport = Some(vp.clone());
+        Some(vp)
+    }
+
+    /// When pixel-shift is enabled: ensure a `WpViewport` is bound to
+    /// `wl_surface`, set its destination to `dest`, and — if this is
+    /// the FIRST content ever installed on this surface's current
+    /// lifetime (`self.shift_state` is still `None`) — initialise the
+    /// raster-walk state and set the initial (centred) source rect.
+    /// A later content-swap on the SAME surface (screensaver ↔ black)
+    /// reuses the walk already in progress: `self.shift_state` stays
+    /// `Some`, so this becomes a cheap idempotent re-assert of the
+    /// destination only.
+    ///
+    /// Returns `None` (no-op, no side effects) when shift is disabled
+    /// or the compositor has no `wp_viewporter` — the caller falls
+    /// back to the pre-T10 path.
+    fn ensure_shift_viewport(
+        &mut self,
+        wl_surface: &WlSurface,
+        dest: (u32, u32),
+    ) -> Option<WpViewport> {
+        self.shift_geometry(dest)?;
+        let viewport = self.ensure_viewport(wl_surface)?;
+        viewport.set_destination(dest.0.cast_signed(), dest.1.cast_signed());
+        if self.shift_state.is_none() {
+            let state = ShiftState::new(self.shift_settings.shift_px);
+            let (ox, oy) = state.source_origin();
+            viewport.set_source(
+                f64::from(ox),
+                f64::from(oy),
+                f64::from(dest.0),
+                f64::from(dest.1),
+            );
+            self.shift_state = Some(state);
+        }
+        Some(viewport)
+    }
+
+    /// Arm the shift timer exactly once per surface lifetime — the
+    /// moment `shift_state` transitions `None` → `Some` (idempotent:
+    /// a no-op if a timer is already armed or shift is inactive).
+    /// Called after every buffer-install path (black or screensaver,
+    /// fresh or content-swap) so the timer is live as soon as ANY
+    /// shifted content is showing, per the adjudicated rule ("armed
+    /// only when `shift_px` > 0 AND a surface is showing").
+    fn maybe_arm_shift_timer(&mut self) {
+        let walk_in_progress = self.shift_state.as_ref().is_some_and(ShiftState::enabled);
+        if self.shift_timer_token.is_none() && walk_in_progress {
+            self.arm_shift_timer();
+        }
+    }
+
+    /// Install the self-re-arming shift timer (`TimeoutAction::ToInstant`
+    /// pattern, same discipline as `arm_or_rearm_transition_timer`).
+    /// Each tick calls [`Self::on_shift_tick`] then re-arms for another
+    /// `shift_interval` as long as the surface is still up and a walk
+    /// is still in progress; otherwise it drops itself.  This is the
+    /// timer's OWN liveness guard — deliberately not gen-guarded like
+    /// the configure-timeout / first-frame-deadline timers, because
+    /// shift is a per-SURFACE-lifetime property (spanning multiple
+    /// `r#gen`s across content-swaps), not a per-show one.
+    fn arm_shift_timer(&mut self) {
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        let interval = self.shift_settings.shift_interval;
+        let shift_px = self.shift_settings.shift_px;
+        let timer = Timer::from_duration(interval);
+        let inserted =
+            handle.insert_source(timer, move |_deadline, _meta, state: &mut WaylandState| {
+                state.on_shift_tick();
+                if state.surface_up && state.shift_state.is_some() {
+                    TimeoutAction::ToInstant(std::time::Instant::now() + interval)
+                } else {
+                    TimeoutAction::Drop
+                }
+            });
+        match inserted {
+            Ok(token) => {
+                self.shift_timer_token = Some(token);
+                tracing::debug!(
+                    event = "render_shift_timer_armed",
+                    display_id = %self.display_id,
+                    shift_px,
+                    interval_ms = interval.as_millis(),
+                );
+            }
+            Err(e) => tracing::error!(
+                event = "render_shift_timer_insert_failed",
+                display_id = %self.display_id,
+                error = %e,
+            ),
+        }
+    }
+
+    /// Remove the shift timer's calloop registration if one is armed.
+    /// Idempotent.  Does NOT touch `shift_state` — [`Self::reset_shift`]
+    /// (full surface teardown) clears that separately.
+    fn disarm_shift_timer(&mut self) {
+        if let (Some(token), Some(handle)) =
+            (self.shift_timer_token.take(), self.loop_handle.as_ref())
+        {
+            handle.remove(token);
+        }
+    }
+
+    /// Full shift reset: disarm the timer AND drop the walk state.
+    /// Called from [`Self::destroy_surface`] — per the probe, shift
+    /// state does not persist across a full teardown/re-show; the
+    /// next Show on a fresh surface always starts centred.
+    pub(super) fn reset_shift(&mut self) {
+        self.disarm_shift_timer();
+        self.shift_state = None;
+    }
+
+    /// Shift timer tick: advance the walk one step, re-aim the live
+    /// viewport's source rect, damage the full (oversized) buffer, and
+    /// commit.  No re-render, no new attach — exactly the probe's
+    /// "cost per shift is effectively zero (compositor-side crop
+    /// move)" mechanism.  A no-op if the surface has gone down or no
+    /// walk is in progress (the timer's own re-arm guard normally
+    /// prevents this from firing at all in that case; this is
+    /// belt-and-suspenders against a tick landing in the same loop
+    /// iteration as a teardown).
+    fn on_shift_tick(&mut self) {
+        if !self.surface_up {
+            return;
+        }
+        let Some(shift_state) = self.shift_state.as_mut() else {
+            return;
+        };
+        let (ox, oy) = shift_state.advance();
+        let margin_px = shift_state.margin_px();
+        let dest = self.configured_size;
+        let Some(viewport) = self.viewport.as_ref() else {
+            return;
+        };
+        viewport.set_source(
+            f64::from(ox),
+            f64::from(oy),
+            f64::from(dest.0),
+            f64::from(dest.1),
+        );
+        let Some(surface) = self.layer_surface.as_ref() else {
+            return;
+        };
+        let wl_surface = surface.wl_surface();
+        let ow = dest.0.saturating_add(2 * margin_px);
+        let oh = dest.1.saturating_add(2 * margin_px);
+        wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
+        wl_surface.commit();
+        tracing::trace!(
+            event = "render_shift_step",
+            display_id = %self.display_id,
+            offset_x = ox,
+            offset_y = oy,
+        );
     }
 
     /// Resolve any in-flight pending show with `Err`.  Used by teardown,
@@ -795,6 +1025,7 @@ impl WaylandState {
     /// Resolve the in-flight pending show with `Ok`.  Marks the surface
     /// as live, attaches the opaque-black buffer, and consumes the
     /// pending entry.
+    #[allow(clippy::too_many_lines)] // black-buffer attach fans out into shift-enabled / single-pixel / shm-fallback branches, documented inline
     pub(super) fn complete_pending_show(&mut self, configured_size: (u32, u32)) {
         let Some(pending) = self.pending_show.take() else {
             // configure for a non-pending surface — the compositor may
@@ -848,38 +1079,65 @@ impl WaylandState {
         }
 
         // Attach the buffer now that we know the configured size.
+        //
+        // Pixel-shift (T10): when enabled, the black overlay ALWAYS
+        // uses the oversized-shm-buffer + wp_viewport path — a 1×1
+        // single-pixel buffer has no room for a raster walk (its
+        // source rect can only ever be `(0,0,1,1)`).  This preempts
+        // the single-pixel-manager preference below; when shift is
+        // disabled `ensure_shift_viewport` is a no-op and behaviour is
+        // byte-identical to the pre-T10 code (the safety invariant).
+        let wl_surface = pending.layer_surface.wl_surface().clone();
         let (buffer, viewport): (WlBuffer, Option<WpViewport>) =
-            match (&self.single_pixel_manager, &self.viewporter) {
-                (Some(spm), Some(vp)) => {
-                    let wl_surface = pending.layer_surface.wl_surface();
-                    let (b, v) = crate::linux::surface::attach_single_pixel_black(
-                        spm,
-                        vp,
-                        wl_surface,
-                        configured_size.0,
-                        configured_size.1,
-                        self,
-                    );
-                    (b, Some(v))
+            if let Some(vp) = self.ensure_shift_viewport(&wl_surface, configured_size) {
+                let (ow, oh) = self.render_dims(configured_size);
+                match crate::linux::surface::create_shm_black_buffer(ow, oh, self) {
+                    Ok(b) => {
+                        wl_surface.attach(Some(&b), 0, 0);
+                        wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
+                        wl_surface.commit();
+                        (b, Some(vp))
+                    }
+                    Err(e) => {
+                        let _ = pending.reply.send(Err(CmdFailure {
+                            controller: "render-black".into(),
+                            error: format!("{E_RENDER_UNAVAILABLE}: shift shm buffer: {e}"),
+                        }));
+                        return;
+                    }
                 }
-                _ => {
-                    // shm fallback.
-                    match crate::linux::surface::create_shm_black_buffer(
-                        configured_size.0,
-                        configured_size.1,
-                        self,
-                    ) {
-                        Ok(b) => {
-                            pending.layer_surface.wl_surface().attach(Some(&b), 0, 0);
-                            pending.layer_surface.wl_surface().commit();
-                            (b, None)
-                        }
-                        Err(e) => {
-                            let _ = pending.reply.send(Err(CmdFailure {
-                                controller: "render-black".into(),
-                                error: format!("{E_RENDER_UNAVAILABLE}: shm buffer: {e}"),
-                            }));
-                            return;
+            } else {
+                match (&self.single_pixel_manager, &self.viewporter) {
+                    (Some(spm), Some(vp)) => {
+                        let (b, v) = crate::linux::surface::attach_single_pixel_black(
+                            spm,
+                            vp,
+                            &wl_surface,
+                            configured_size.0,
+                            configured_size.1,
+                            self,
+                        );
+                        (b, Some(v))
+                    }
+                    _ => {
+                        // shm fallback.
+                        match crate::linux::surface::create_shm_black_buffer(
+                            configured_size.0,
+                            configured_size.1,
+                            self,
+                        ) {
+                            Ok(b) => {
+                                wl_surface.attach(Some(&b), 0, 0);
+                                wl_surface.commit();
+                                (b, None)
+                            }
+                            Err(e) => {
+                                let _ = pending.reply.send(Err(CmdFailure {
+                                    controller: "render-black".into(),
+                                    error: format!("{E_RENDER_UNAVAILABLE}: shm buffer: {e}"),
+                                }));
+                                return;
+                            }
                         }
                     }
                 }
@@ -890,6 +1148,7 @@ impl WaylandState {
         self.black_buffer = Some(buffer);
         self.configured_size = configured_size;
         self.surface_up = true;
+        self.maybe_arm_shift_timer();
 
         tracing::info!(
             event = "render_black_up",
@@ -926,8 +1185,25 @@ impl WaylandState {
         // player from a prior show that wasn't fully cleaned up).
         self.destroy_screensaver_session();
 
-        let width = configured_size.0;
-        let height = configured_size.1;
+        // Pixel-shift (T10): when enabled, render mpv into an
+        // OVERSIZED canvas (`render_dims`) and crop it back down to
+        // `configured_size` via a `wp_viewport` source rect walked by
+        // the shift timer.  mpv's scale_mode (fill/fit/stretch/center)
+        // simply operates against the slightly larger canvas — the
+        // few extra margin pixels of overscan around every edge are
+        // the intended mechanism (no change to the mpv pipeline
+        // itself).  `width`/`height` below flow into the mpv render
+        // context, the shm pool, BOTH double-buffers, and the
+        // session's own `width`/`height`/`stride` fields — every
+        // downstream consumer (damage rects, the blend buffer-length
+        // math, the transition capture buffer) then naturally operates
+        // on the oversized canvas with no separate "shifted" special
+        // case.  When shift is disabled `ensure_shift_viewport` /
+        // `render_dims` are no-ops and `width`/`height` equal
+        // `configured_size` exactly — byte-identical to pre-T10.
+        let wl_surface_for_shift = layer_surface.wl_surface().clone();
+        let shift_viewport = self.ensure_shift_viewport(&wl_surface_for_shift, configured_size);
+        let (width, height) = self.render_dims(configured_size);
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| cmd_failure("screensaver", "stride overflow"))?;
@@ -1065,8 +1341,19 @@ impl WaylandState {
         // `destroy_screensaver_session`.
         self.screensaver_wakeup_token = Some(wakeup_token);
         self.layer_surface = Some(layer_surface);
+        // NOTE: only overwrite `self.viewport` when shift actually
+        // built one — `complete_screensaver_show` historically never
+        // touches this field when shift is disabled (a screensaver
+        // shown with no prior black stage has no viewport at all;
+        // mpv renders directly at `configured_size`, no scaling
+        // needed).  Overwriting with `None` here would destroy a
+        // viewport a PRIOR black stage may have created.
+        if let Some(vp) = shift_viewport {
+            self.viewport = Some(vp);
+        }
         self.configured_size = configured_size;
         self.surface_up = true;
+        self.maybe_arm_shift_timer();
 
         tracing::info!(
             event = "render_screensaver_up",
@@ -1519,21 +1806,44 @@ impl WaylandState {
         // Build a black buffer NOW if the screensaver was the first
         // stage (no prior `RenderBlack` show to create one).  Use the
         // single-pixel + viewporter path when available, otherwise the
-        // shm fallback — matches the black path's own choices.
+        // shm fallback — matches the black path's own choices.  When
+        // shift is active, `self.shift_state` is already `Some` (set
+        // by the screensaver's own `complete_screensaver_show` install)
+        // so `ensure_shift_viewport` here is just an idempotent
+        // destination re-assert; the oversized black buffer keeps the
+        // walk in progress valid regardless of which content is
+        // attached.
+        let dest = self.configured_size;
+        let mut shift_active = false;
         if self.black_buffer.is_none()
             && let Some(surface) = self.layer_surface.as_ref()
         {
-            let wl_surface = surface.wl_surface();
-            let w = self.configured_size.0;
-            let h = self.configured_size.1;
-            if let (Some(spm), Some(vp)) = (&self.single_pixel_manager, &self.viewporter) {
-                let buffer = spm.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &self.queue_handle, ());
-                let viewport = vp.get_viewport(wl_surface, &self.queue_handle, ());
-                viewport.set_destination(w.cast_signed(), h.cast_signed());
-                self.viewport = Some(viewport);
+            let wl_surface = surface.wl_surface().clone();
+            let shift_viewport = self.ensure_shift_viewport(&wl_surface, dest);
+            shift_active = shift_viewport.is_some();
+            if shift_active {
+                let (ow, oh) = self.render_dims(dest);
+                match crate::linux::surface::create_shm_black_buffer(ow, oh, self) {
+                    Ok(buffer) => self.black_buffer = Some(buffer),
+                    Err(e) => tracing::error!(
+                        event = "screensaver_black_fallback_failed",
+                        display_id = %self.display_id,
+                        error = %e,
+                    ),
+                }
+            } else if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
+                let buffer = self
+                    .single_pixel_manager
+                    .as_ref()
+                    .expect("checked Some above")
+                    .create_u32_rgba_buffer(0, 0, 0, u32::MAX, &self.queue_handle, ());
+                if let Some(viewport) = self.ensure_viewport(&wl_surface) {
+                    viewport.set_destination(dest.0.cast_signed(), dest.1.cast_signed());
+                    self.viewport = Some(viewport);
+                }
                 self.black_buffer = Some(buffer);
             } else {
-                match crate::linux::surface::create_shm_black_buffer(w, h, self) {
+                match crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self) {
                     Ok(buffer) => self.black_buffer = Some(buffer),
                     Err(e) => tracing::error!(
                         event = "screensaver_black_fallback_failed",
@@ -1543,6 +1853,10 @@ impl WaylandState {
                 }
             }
         }
+        // A pre-existing (cached) black_buffer means shift's already-
+        // armed walk (if any) is still what's driving the live
+        // viewport — reflect that in the damage-rect choice below.
+        shift_active |= self.shift_state.is_some();
 
         // Destroy the session — frees the mpv player + shm pool, removes
         // the calloop wakeup source, removes the deadline timer.
@@ -1552,6 +1866,10 @@ impl WaylandState {
         if let (Some(surface), Some(black)) = (&self.layer_surface, &self.black_buffer) {
             let wl_surface = surface.wl_surface();
             wl_surface.attach(Some(black), 0, 0);
+            if shift_active {
+                let (ow, oh) = self.render_dims(dest);
+                wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
+            }
             wl_surface.commit();
         }
     }
@@ -1684,6 +2002,10 @@ impl WaylandState {
         self.surface_up = false;
         self.configured_size = (0, 0);
         self.input_latch.reset();
+        // Shift state does not persist across a full teardown/re-show
+        // (probe finding — no persistence).  A fresh Show on a NEW
+        // surface always starts its walk centred.
+        self.reset_shift();
     }
 
     /// Teardown: synchronous — destroy any live surface, fail any
@@ -1716,7 +2038,24 @@ impl WaylandState {
                 settings,
                 reply,
             } => self.handle_show_screensaver(r#gen, idx, settings, reply),
+            #[cfg(target_os = "linux")]
+            RenderCommand::SetShift { shift } => self.handle_set_shift(shift),
         }
+    }
+
+    /// `SetShift`: register the per-display pixel-shift config.  Just
+    /// a field write — the black/screensaver install paths read
+    /// `self.shift_settings` when they next build a buffer.  See
+    /// [`RenderCommand::SetShift`] for why this isn't threaded through
+    /// the `Show`/`ShowScreensaver` payloads instead.
+    fn handle_set_shift(&mut self, shift: ShiftSettings) {
+        tracing::debug!(
+            event = "render_shift_settings_registered",
+            display_id = %self.display_id,
+            shift_px = shift.shift_px,
+            interval_ms = shift.shift_interval.as_millis(),
+        );
+        self.shift_settings = shift;
     }
 
     /// Show: create the layer surface, send the initial commit, store a
@@ -1759,27 +2098,37 @@ impl WaylandState {
                     // Ensure a black buffer exists (may not, if the
                     // screensaver was the first stage).  Use the same
                     // single-pixel + viewporter / shm path the black
-                    // show uses.
+                    // show uses — or, when pixel-shift is active, the
+                    // same oversized-shm + wp_viewport path
+                    // `complete_pending_show` uses (a cached
+                    // `black_buffer` from an earlier swap in THIS
+                    // surface's lifetime is already correctly sized,
+                    // since `shift_settings` never changes mid-thread-
+                    // lifetime — see `ShiftSettings` doc).
+                    let dest = self.configured_size;
+                    let shift_viewport = self.ensure_shift_viewport(&wl_surface, dest);
                     if self.black_buffer.is_none() {
-                        let w = self.configured_size.0;
-                        let h = self.configured_size.1;
-                        if let (Some(spm), Some(vp)) =
-                            (&self.single_pixel_manager, &self.viewporter)
-                        {
-                            let buffer = spm.create_u32_rgba_buffer(
-                                0,
-                                0,
-                                0,
-                                u32::MAX,
-                                &self.queue_handle,
-                                (),
-                            );
-                            let viewport = vp.get_viewport(&wl_surface, &self.queue_handle, ());
-                            viewport.set_destination(w.cast_signed(), h.cast_signed());
-                            self.viewport = Some(viewport);
+                        if shift_viewport.is_some() {
+                            let (ow, oh) = self.render_dims(dest);
+                            if let Ok(buffer) =
+                                crate::linux::surface::create_shm_black_buffer(ow, oh, self)
+                            {
+                                self.black_buffer = Some(buffer);
+                            }
+                        } else if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
+                            let buffer = self
+                                .single_pixel_manager
+                                .as_ref()
+                                .expect("checked Some above")
+                                .create_u32_rgba_buffer(0, 0, 0, u32::MAX, &self.queue_handle, ());
+                            if let Some(viewport) = self.ensure_viewport(&wl_surface) {
+                                viewport
+                                    .set_destination(dest.0.cast_signed(), dest.1.cast_signed());
+                                self.viewport = Some(viewport);
+                            }
                             self.black_buffer = Some(buffer);
                         } else if let Ok(buffer) =
-                            crate::linux::surface::create_shm_black_buffer(w, h, self)
+                            crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self)
                         {
                             self.black_buffer = Some(buffer);
                         }
@@ -1787,7 +2136,12 @@ impl WaylandState {
 
                     if let Some(black) = self.black_buffer.as_ref() {
                         wl_surface.attach(Some(black), 0, 0);
+                        if shift_viewport.is_some() {
+                            let (ow, oh) = self.render_dims(dest);
+                            wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
+                        }
                         wl_surface.commit();
+                        self.maybe_arm_shift_timer();
                         tracing::info!(
                             event = "render_black_swap",
                             display_id = %self.display_id,

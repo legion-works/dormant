@@ -314,6 +314,18 @@ mod tests {
         }
         assert_eq!(watchdog_interval_from_env(), None);
 
+        // Negative and u64-overflow values must fall through the same
+        // parse-failure path as garbage (reviewer edge pins).
+        unsafe {
+            std::env::set_var("WATCHDOG_USEC", "-5");
+        }
+        assert_eq!(watchdog_interval_from_env(), None);
+
+        unsafe {
+            std::env::set_var("WATCHDOG_USEC", "99999999999999999999999999");
+        }
+        assert_eq!(watchdog_interval_from_env(), None);
+
         unsafe {
             std::env::remove_var("WATCHDOG_USEC");
         }

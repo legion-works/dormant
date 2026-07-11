@@ -4192,17 +4192,14 @@ kind = "power_off"
     fn watchdog_defaults_when_section_absent() {
         let (cfg, warnings) = load_str("config_version = 1\n").unwrap();
         assert!(warnings.is_empty());
-        assert_eq!(
-            cfg.watchdog.lkg_enabled,
-            crate::config::defaults::LKG_ENABLED
-        );
-        assert_eq!(
-            cfg.watchdog.lkg_rollback_enabled,
-            crate::config::defaults::LKG_ROLLBACK_ENABLED
-        );
+        // Literal values, NOT the defaults:: consts — comparing against the
+        // same symbol that produced the value would be tautological and
+        // couldn't catch a drifted const (spec §7 pins true / true / 5m).
+        assert!(cfg.watchdog.lkg_enabled);
+        assert!(cfg.watchdog.lkg_rollback_enabled);
         assert_eq!(
             cfg.watchdog.stability_window,
-            crate::config::defaults::LKG_STABILITY_WINDOW
+            std::time::Duration::from_secs(5 * 60)
         );
     }
 
@@ -4210,17 +4207,12 @@ kind = "power_off"
     fn watchdog_defaults_when_section_empty() {
         let (cfg, warnings) = load_str("config_version = 1\n[watchdog]\n").unwrap();
         assert!(warnings.is_empty());
-        assert_eq!(
-            cfg.watchdog.lkg_enabled,
-            crate::config::defaults::LKG_ENABLED
-        );
-        assert_eq!(
-            cfg.watchdog.lkg_rollback_enabled,
-            crate::config::defaults::LKG_ROLLBACK_ENABLED
-        );
+        // Literal values — see watchdog_defaults_when_section_absent.
+        assert!(cfg.watchdog.lkg_enabled);
+        assert!(cfg.watchdog.lkg_rollback_enabled);
         assert_eq!(
             cfg.watchdog.stability_window,
-            crate::config::defaults::LKG_STABILITY_WINDOW
+            std::time::Duration::from_secs(5 * 60)
         );
     }
 

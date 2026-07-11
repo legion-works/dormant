@@ -13,5 +13,6 @@ pub mod ipc;
 pub mod logging;
 pub mod notifier;
 pub mod reload;
+pub mod sd_notify;
 pub mod single_instance;
 pub mod wear_tracker;

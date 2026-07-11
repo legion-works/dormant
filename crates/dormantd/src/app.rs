@@ -73,6 +73,7 @@ use dormant_render::LayerShellRenderSink;
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
+use crate::sd_notify::SdNotify;
 
 /// Builds the daemon-lifetime notification sink. Production defaults to
 /// [`notifier::ZbusSink`]; tests inject a factory returning a shared
@@ -197,6 +198,7 @@ pub struct App {
     render_sink_builder: Option<RenderSinkBuilder>,
     notify_sink_builder: NotifySinkBuilder,
     disable_ipc: bool,
+    sd_notify: SdNotify,
 }
 
 /// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
@@ -232,6 +234,7 @@ impl App {
             render_sink_builder: None,
             notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
+            sd_notify: SdNotify::from_env(),
         })
     }
 
@@ -260,6 +263,7 @@ impl App {
             render_sink_builder: None,
             notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
+            sd_notify: SdNotify::from_env(),
         })
     }
 
@@ -293,6 +297,16 @@ impl App {
     #[must_use]
     pub fn disable_ipc(mut self) -> Self {
         self.disable_ipc = true;
+        self
+    }
+
+    /// Inject an [`SdNotify`] (test seam / explicit override — spec §6.2,
+    /// §10 R2-M8). When not called, `App::build`/`build_with_sources`
+    /// already default to `SdNotify::from_env()`, so production callers
+    /// never need this.
+    #[must_use]
+    pub fn with_sd_notify(mut self, sd: SdNotify) -> Self {
+        self.sd_notify = sd;
         self
     }
 
@@ -475,6 +489,16 @@ impl App {
 
         let watcher =
             reload::config_watcher(&self.config_path).context("install config file watcher")?;
+
+        // T4 threads `self.sd_notify` into `Runner` as a `sd: SdNotify`
+        // field (spec §6.3 probe arm + in-reload pings). T2 only lands the
+        // injectable seam (`with_sd_notify` above) — an unused `Runner`
+        // field would trip `-D warnings` dead-code (this crate has no
+        // `#[allow(dead_code)]` precedent to reach for instead), so it is
+        // intentionally dropped here rather than staged unused; T4's diff
+        // adds one `Runner` field + moves this line into the struct
+        // literal.
+        drop(self.sd_notify);
 
         let runner = Runner {
             config_path: self.config_path.clone(),

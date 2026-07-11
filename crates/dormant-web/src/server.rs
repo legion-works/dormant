@@ -5,6 +5,7 @@
 //! shutdown wired to the [`CancellationToken`] in the state.
 
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::Json;
@@ -26,6 +27,71 @@ use crate::security::security_guard;
 /// returning 504.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Full `/api`-prefixed `POST` routes registered via [`route_post!`],
+/// derived from actual router construction rather than hand-maintained —
+/// see the inverted meta-test in the `tests` module below, which asserts
+/// every entry here is classified in `security::STRICT_ORIGIN_PATHS` or
+/// `security::ACKNOWLEDGED_WEAK_ROUTES`.
+///
+/// `OnceLock<Mutex<Vec<_>>>` rather than a bare `OnceLock<Vec<_>>`: the
+/// latter is write-once and cannot accumulate more than the first
+/// registration. The `Mutex` gives interior mutability so each
+/// `route_post!` invocation can push onto the same list.
+static REGISTERED_POST_ROUTES: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
+
+/// Record `path` (already `/api`-prefixed) in [`REGISTERED_POST_ROUTES`]
+/// if it isn't already present.
+///
+/// `build_router` runs more than once in this crate (each test that
+/// builds a router calls it again), so this must be idempotent —
+/// push-if-absent rather than assume single registration — or repeated
+/// test runs would silently accumulate duplicates.
+fn register_post_route(path: &'static str) {
+    let routes = REGISTERED_POST_ROUTES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = routes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard.contains(&path) {
+        guard.push(path);
+    }
+}
+
+/// Snapshot of every full `/api`-prefixed `POST` route registered via
+/// [`route_post!`] so far, across every `build_router` call made in this
+/// process.
+///
+/// Test-only introspection: it exists to let the inverted route
+/// meta-test (below) read back what `route_post!` derived from actual
+/// registration, rather than a hand-maintained list.
+#[cfg(test)]
+fn registered_post_routes() -> Vec<&'static str> {
+    let routes = REGISTERED_POST_ROUTES.get_or_init(|| Mutex::new(Vec::new()));
+    routes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Mounts a `POST` route on `$router` at `$path` (relative to the `/api`
+/// nest prefix used by `build_router`) and records the FULL
+/// `/api`-prefixed path in [`REGISTERED_POST_ROUTES`], so the inverted
+/// route meta-test can derive the live write-route set from actual
+/// registration instead of a hand-maintained list.
+///
+/// `$path` must be a string literal: `concat!` needs it at compile time
+/// to build the `&'static str` pushed into the registry with no
+/// allocation. `$method_router` is passed through untouched, so a caller
+/// can still layer route-specific middleware (e.g.
+/// `post(handler).layer(DefaultBodyLimit::max(..))`) before handing it
+/// to this macro — the macro only wraps `.route()`, it never wraps the
+/// method router itself, so that composition keeps working unchanged.
+macro_rules! route_post {
+    ($router:expr, $path:literal, $method_router:expr) => {{
+        register_post_route(concat!("/api", $path));
+        $router.route($path, $method_router)
+    }};
+}
+
 /// Build the axum [`Router`] on the given state, mounting all HTTP routes
 /// behind the Host/Origin security guard.  API routes are nested under
 /// `/api`; all other paths are served by the SPA fallback (embedded
@@ -33,17 +99,19 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) fn build_router(state: WebState) -> Router {
     let api = Router::new()
         .route("/state", get(get_state))
-        .route("/config", get(config::get_config))
-        .route(
-            "/config/apply",
-            post(config_apply::post_apply).layer(DefaultBodyLimit::max(64 * 1024)),
-        )
-        .route("/blank", post(command::post_blank))
-        .route("/wake", post(command::post_wake))
-        .route("/pause", post(command::post_pause))
-        .route("/resume", post(command::post_resume))
-        .route("/reload", post(command::post_reload))
-        .route("/doctor", post(doctor::post_doctor))
+        .route("/config", get(config::get_config));
+    let api = route_post!(
+        api,
+        "/config/apply",
+        post(config_apply::post_apply).layer(DefaultBodyLimit::max(64 * 1024))
+    );
+    let api = route_post!(api, "/blank", post(command::post_blank));
+    let api = route_post!(api, "/wake", post(command::post_wake));
+    let api = route_post!(api, "/pause", post(command::post_pause));
+    let api = route_post!(api, "/resume", post(command::post_resume));
+    let api = route_post!(api, "/reload", post(command::post_reload));
+    let api = route_post!(api, "/doctor", post(doctor::post_doctor));
+    let api = api
         .route("/events", get(events::ws_events))
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
@@ -253,5 +321,70 @@ mod tests {
             Some("text/html"),
             "root with legit Host should serve text/html"
         );
+    }
+
+    // ── Inverted route meta-test (Task 3, P2) ──────────────────────────────
+
+    /// The derived write-route list must be non-empty and must contain
+    /// every known `POST` route mounted by `build_router` — otherwise an
+    /// empty (or partial) derivation would make the `⊆ STRICT ∪ WEAK`
+    /// check below vacuously true instead of actually exercising anything.
+    #[tokio::test]
+    async fn derived_post_routes_cover_all_known_post_mounts() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        // Building the router runs every route_post! call site, populating
+        // the derived registry.
+        let _router = build_router(state);
+
+        let derived = registered_post_routes();
+        assert!(
+            !derived.is_empty(),
+            "no POST routes were registered via route_post! — the meta-test \
+             below would vacuously pass with nothing to check"
+        );
+
+        let known_post_routes = [
+            "/api/config/apply",
+            "/api/blank",
+            "/api/wake",
+            "/api/pause",
+            "/api/resume",
+            "/api/reload",
+            "/api/doctor",
+        ];
+        for known in known_post_routes {
+            assert!(
+                derived.contains(&known),
+                "{known} is mounted with .route() but missing from the \
+                 route_post! derivation — a forgotten route_post! conversion"
+            );
+        }
+    }
+
+    /// The INVERTED meta-test: every derived `POST` route must be
+    /// classified in `STRICT_ORIGIN_PATHS` or `ACKNOWLEDGED_WEAK_ROUTES`.
+    /// A route registered via `route_post!` but classified in neither is
+    /// RED — a forgotten origin-strictness decision can no longer stay
+    /// green just because nobody remembered to hand-copy it into a list.
+    #[tokio::test]
+    async fn derived_post_routes_are_classified_strict_or_weak() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel) = test_web_state_with_bind(bind);
+        let _router = build_router(state);
+
+        let derived = registered_post_routes();
+        assert!(!derived.is_empty(), "derivation must not be empty");
+
+        for path in &derived {
+            assert!(
+                crate::security::STRICT_ORIGIN_PATHS.contains(path)
+                    || crate::security::ACKNOWLEDGED_WEAK_ROUTES.contains(path),
+                "{path} is a registered POST route but is classified in \
+                 neither STRICT_ORIGIN_PATHS nor ACKNOWLEDGED_WEAK_ROUTES — \
+                 every write route must make an explicit origin-strictness \
+                 decision"
+            );
+        }
     }
 }

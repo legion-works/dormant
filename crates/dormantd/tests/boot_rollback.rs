@@ -315,6 +315,8 @@ async fn bad_config_with_lkg_immediate_rollback() {
     drain_capture();
     let h = Harness::new();
     let bad = h.write_bad();
+    let bad_bytes = std::fs::read(&bad).unwrap();
+    let bad_fp = fingerprint_bytes(&bad_bytes);
     let lkg_path = h.write_lkg(&good_config(&h.socket_path()));
 
     let plan = boot_guard::prepare(&bad, &h.creds_path, &h.state_dir, Strictness::Strict, true);
@@ -353,6 +355,11 @@ async fn bad_config_with_lkg_immediate_rollback() {
     )
     .unwrap();
     assert!(state.rollback_active, "boot()'s own write must set this");
+    assert_eq!(
+        state.rolled_back_from,
+        Some(bad_fp),
+        "boot()'s own immediate-rollback write must pin the failed (bad) config's fingerprint"
+    );
 }
 
 /// Bad chosen config, no LKG at all → `BuildFailed` (regression pin: today's
@@ -700,4 +707,69 @@ async fn lock_failure_discounts_the_losers_nonce() {
     );
 
     shutdown(handle1, join1).await;
+}
+
+/// A `Started` boot must send `READY=1` — and exactly one, and before any
+/// `WATCHDOG=1` — by the time `boot()` returns (spec §6.2). Uses the
+/// `SdNotify::from_socket_for_test` seam bound to a per-test tempdir
+/// datagram socket (`daemon_smoke.rs`'s `fake_systemd_socket` pattern),
+/// read back here with a short bounded recv.
+///
+/// Note this deliberately does NOT assert that no `WATCHDOG=1` ever
+/// follows: `tokio::time::interval`'s first tick fires immediately (not
+/// after a full period), so `run_loop`'s watchdog probe-arm can legitimately
+/// send its own first `WATCHDOG=1` right behind `READY=1` once the engine
+/// answers a healthy probe — `BootInputs` has no watchdog-interval override
+/// seam (unlike `App::with_watchdog_interval`) to suppress that. What's
+/// pinned is ORDER and COUNT: the very first datagram must be `READY=1`,
+/// and a second datagram (if any lands in the short follow-up window) must
+/// never be a second `READY=1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_sends_ready_before_any_watchdog_ping() {
+    let h = Harness::new();
+    let good = h.write_good();
+
+    // Short name, mirroring `Harness::socket_path`'s own "never the default
+    // path, keep it short" note (abstract/unix socket path length limits).
+    let notify_path = h.dir.path().join("n.sock");
+    let listener = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let addr = std::os::unix::net::SocketAddr::from_pathname(&notify_path).unwrap();
+
+    let mut inputs = h.inputs();
+    inputs.sd_notify = SdNotify::from_socket_for_test(&addr);
+
+    let plan = boot_guard::prepare(&good, &h.creds_path, &h.state_dir, Strictness::Strict, true);
+    let outcome = boot::boot(plan, inputs).await.expect("boot");
+    let BootOutcome::Started { handle, join, .. } = outcome else {
+        panic!("expected Started");
+    };
+
+    let mut buf = [0u8; 64];
+    let (n, _) = listener
+        .recv_from(&mut buf)
+        .expect("expected a datagram by the time boot() returns");
+    assert_eq!(
+        &buf[..n],
+        b"READY=1",
+        "the first datagram boot() emits must be READY=1"
+    );
+
+    // Bounded follow-up: whatever (if anything) lands next must not be a
+    // second READY=1. A timeout here (no second datagram at all) is also a
+    // pass — the watchdog tick racing in is a possibility, not a guarantee.
+    listener
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    if let Ok((n2, _)) = listener.recv_from(&mut buf) {
+        assert_ne!(
+            &buf[..n2],
+            b"READY=1",
+            "READY=1 must be sent exactly once per boot()"
+        );
+    }
+
+    shutdown(handle, join).await;
 }

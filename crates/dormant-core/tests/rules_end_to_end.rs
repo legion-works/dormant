@@ -1608,9 +1608,10 @@ async fn retained_vacant_worst_case_timeline() {
         .expect("sensor 'desk' in snapshot");
     assert!(
         sensor_snap.reported,
-        "sensor must show reported == true throughout — it HAS delivered \
-         an event (the worst-case Absent), even though that event looks \
-         like a vacancy"
+        "sensor must show reported == true after grace expiry — it HAS \
+         delivered an event (the worst-case Absent), even though that \
+         event looks like a vacancy (persistence across state flips is \
+         covered separately by `reported_false_until_first_event_then_true`)"
     );
 
     harness.cancel.cancel();

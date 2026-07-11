@@ -935,6 +935,19 @@ impl RulesEngine {
     /// Run a presence event through the hold-filter → zone engine → display
     /// pipeline.
     fn handle_presence_event(&mut self, ev: PresenceEvent) {
+        // Diagnostic-only: record that this sensor has reported at least
+        // once since daemon start — ANY state (Present/Absent/Unavailable)
+        // counts as "has reported".  Deliberately recorded from the RAW
+        // event, BEFORE the hold filter runs, so "has reported since
+        // start" is unconditional on every `PresenceEvent` received by
+        // construction, not merely as an implicit consequence of
+        // `HoldState` always starting disarmed (T3 review S1 — a future
+        // change to `apply_hold_filter`, e.g. a hold that could start
+        // pre-armed, must not be able to silently break this).
+        // Deliberately separate from `sensor_last_seen_virtual` below (see
+        // the field doc on `RulesEngine::reported`).
+        self.reported.insert(ev.sensor_id.clone());
+
         // Hold-filter: swallow / arm / pass through based on the sensor's
         // kind and hold_time.
         let effective = self.apply_hold_filter(ev);
@@ -948,13 +961,6 @@ impl RulesEngine {
         // tests can drive minutes in milliseconds).
         self.sensor_last_seen_virtual
             .insert(effective.sensor_id.clone(), tokio::time::Instant::now());
-
-        // Diagnostic-only: record that this sensor has reported at least
-        // once since daemon start — ANY state (Present/Absent/Unavailable)
-        // counts as "has reported".  Deliberately separate from
-        // `sensor_last_seen_virtual` above (see the field doc on
-        // `RulesEngine::reported`).
-        self.reported.insert(effective.sensor_id.clone());
 
         // SensorChanged broadcast — only if the state actually changed from
         // what the zone engine has recorded.
@@ -2752,6 +2758,108 @@ mod tests {
         assert!(
             sensor.reported,
             "reported must stay true across subsequent state flips"
+        );
+    }
+
+    /// A minimal engine with exactly ONE `Motion` sensor configured with a
+    /// hold time — for the hold-configured-sensor `reported` test below.
+    fn engine_with_hold_sensor(id: &str, hold: Duration) -> RulesEngine {
+        let sid = SensorId(id.into());
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![],
+                sensors: vec![SensorRuntimeCfg {
+                    sensor: sid.clone(),
+                    kind: SensorKind::Motion,
+                    hold_time: Some(hold),
+                    stale_timeout: Duration::from_secs(3600),
+                }],
+            },
+            ZoneEngine::new(vec![], &[sid]).expect("single-sensor empty-zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("single hold-sensor engine config is valid")
+    }
+
+    /// T3 review S1: no test in the original diff configured a `hold_time`
+    /// sensor and drove `reported` through it — the "has reported since
+    /// start" guarantee for hold-configured sensors was true only because
+    /// `HoldState` always starts disarmed (`armed_until: None`), so a
+    /// sensor's very first-ever event can never be swallowed (arming only
+    /// happens on a `Present` event that has already passed the filter).
+    ///
+    /// RED-first note: the review traced this exhaustively and concluded
+    /// there is NO reachable shape where a hold-configured sensor's first
+    /// event is swallowed — so this test cannot be written to fail under
+    /// the old post-filter insert placement (a genuine RED-first case
+    /// doesn't exist here). Per the review's own fallback, this test pins
+    /// the invariant directly instead: a hold-configured sensor's first
+    /// event — even `Absent`, the state the filter CAN swallow once armed
+    /// — must flip `reported` true, and a later event that IS actually
+    /// swallowed (once the hold is armed) must not un-set it.
+    #[test]
+    fn reported_flips_true_for_hold_configured_sensor() {
+        let mut engine = engine_with_hold_sensor("motion1", Duration::from_secs(30));
+
+        let before = snapshot_of(&mut engine);
+        let sensor = before
+            .sensors
+            .iter()
+            .find(|s| s.id == "motion1")
+            .expect("sensor 'motion1' in snapshot");
+        assert!(
+            !sensor.reported,
+            "hold-configured sensor must show reported == false before any event"
+        );
+
+        // First-ever event, Absent — the state `apply_hold_filter` swallows
+        // once a hold is armed. `HoldState` starts disarmed, so today this
+        // still passes through, but `reported` must be set from the raw
+        // event regardless of the filter's verdict.
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("motion1".into()),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+
+        let after = snapshot_of(&mut engine);
+        let sensor = after
+            .sensors
+            .iter()
+            .find(|s| s.id == "motion1")
+            .expect("sensor 'motion1' in snapshot");
+        assert!(
+            sensor.reported,
+            "a hold-configured sensor's first-ever event must flip reported == true"
+        );
+
+        // Arm the hold with a Present event, then drive an Absent while
+        // armed — this one IS swallowed by the filter (stashed as
+        // `pending_absent`, replayed at hold expiry). `reported` must stay
+        // true; it must not depend on this swallowed event reaching the
+        // insert.
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("motion1".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("motion1".into()),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        let still_after = snapshot_of(&mut engine);
+        let sensor = still_after
+            .sensors
+            .iter()
+            .find(|s| s.id == "motion1")
+            .expect("sensor 'motion1' in snapshot");
+        assert!(
+            sensor.reported,
+            "reported must remain true even while a later event is swallowed by an armed hold"
         );
     }
 

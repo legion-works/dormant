@@ -69,6 +69,16 @@ type = "mqtt"
 broker_url = "tcp://localhost:1883"
 topic = "dormant/desk/occupancy"
 field = "/occupancy"
+# Availability (LWT) — optional. Defaults assume the Zigbee2MQTT convention:
+# topic "<topic>/availability" with payloads "online"/"offline". Override for
+# other conventions, e.g. Tasmota's LWT topic with literal Online/Offline:
+# availability_topic = "tele/desk/LWT"
+# availability_payload_online = "Online"
+# availability_payload_offline = "Offline"
+# See docs/src/sensors.md#retained-values-and-availability for the retained-
+# message semantics, the Zigbee2MQTT per-device "retain" setting operators
+# need to enable, and why `unavailable_policy = "absent"` is unsafe with MQTT
+# until you've verified your bridge republishes state on availability recovery.
 
 # Couch presence via Home Assistant (requires ha_token in credentials.toml).
 [sensors.couch]

@@ -32,6 +32,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - **Upgrade note:** the new per-sensor availability validation (`validate_sensors`) can reject a config that previously loaded. Two new cross-sensor rules fire as `E_CONFIG_INVALID`: sensors on the same broker must not resolve an availability topic that collides with any sensor's state topic, and sensors sharing a resolved availability topic must declare identical `availability_payload_online`/`availability_payload_offline` literals. If a reload or restart after upgrading suddenly reports `E_CONFIG_INVALID` for a config that ran fine before, check for exactly these two collisions among your MQTT sensors.
 
+### Fixed
+
+- Wake-path brightness-zero restart poison: a daemon restart while the panel is dimmed could save the blank-residue reading (0) as the operator-chosen brightness level, causing every subsequent wake to "restore" 0 (permanently dim). Controllers now refuse to save a zero pre-blank reading, and config validation rejects `samsung_restore_backlight = 0` and `restore_brightness = 0` — the fail-toward-visible fallback is always at least 1.
+
 ## [0.1.0] - 2026-07-09
 
 ### Added

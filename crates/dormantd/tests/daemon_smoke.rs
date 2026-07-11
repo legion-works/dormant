@@ -2726,6 +2726,11 @@ async fn ipc_event_stream_surfaces_blank_failure_then_recovery() {
 // Same `command` display shape as test 17 (blank succeeds iff a flag file
 // exists), but the flag is NEVER created here — the point is carry-over /
 // voiding of `last_blank_failed`, not an actual recovery.
+//
+// Reload #2's dispatch-relevant edit swaps `blank_command` for a DIFFERENT
+// command that still always fails (not a command that starts succeeding) —
+// see the comment on reload #2 below for why that de-confounds the "flag
+// cleared" assertion from a coincidental real recovery (T3-review Must-1).
 
 /// One ruled `command` display; `log_level` and `blank_command` are the two
 /// knobs this test flips independently (unrelated daemon-level edit vs. a
@@ -2827,10 +2832,28 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
         "unrelated config edit must carry last_blank_failed=true forward"
     );
 
-    // ── Reload #2: dispatch-relevant edit — blank_command itself changes ──
+    // ── Reload #2: dispatch-relevant edit that STAYS FAILING ───────────────
+    //
+    // `blank_command` changes to a DIFFERENT command ("false" instead of
+    // `test -e '<flag>'`) — dispatch-relevant per `dispatch_relevant_eq`
+    // (the literal string differs), but the new command never succeeds
+    // either. If `last_blank_failed` reads `false` after this reload it can
+    // ONLY be explained by the voiding gate proactively zeroing the carried
+    // evidence at seed time — a coincidental real recovery is impossible
+    // here (unlike a `/bin/true` swap, which would confound the assertion:
+    // see T3-review Must-1).
+    //
+    // `grace_period` is also bumped to a long value for this reload only.
+    // The rebuilt (re-converged) state machine restarts `Active`, and with
+    // the zone still absent it would otherwise re-attempt a blank after the
+    // grace elapses — which would fail again and flip the flag back to
+    // `true` for a reason that has nothing to do with the voiding gate.
+    // `grace_period` lives on the RULE, not `DisplayConfig`, so it plays no
+    // part in `dispatch_relevant_eq`'s classification; it exists purely to
+    // pin the assertion window before any new dispatch can occur.
     fs::write(
         &cfg_path,
-        reload_carry_config(&marker, "/bin/true", "debug", "50ms"),
+        reload_carry_config(&marker, "false", "debug", "10s"),
     )
     .unwrap();
     assert!(handle.trigger_reload().await);
@@ -2844,9 +2867,11 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
         "reload #2 must be accepted"
     );
 
+    // Well inside the 10s grace window — no new blank dispatch can have run
+    // yet, so this can only be the seed-time voiding gate at work.
     assert!(
-        wait_for_last_blank_failed(&ctl, "mon", false, Duration::from_secs(3)).await,
-        "blank_command edit must void (zero) the carried failure evidence"
+        wait_for_last_blank_failed(&ctl, "mon", false, Duration::from_secs(2)).await,
+        "dispatch-relevant blank_command edit must void (zero) the carried failure evidence"
     );
     let snap = snapshot_with_retry(&ctl).await;
     let d = snap
@@ -2857,6 +2882,11 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
     assert_eq!(
         d.1.wake_attempts, 0,
         "wake_attempts must also be zeroed by the voiding gate"
+    );
+    assert!(
+        !d.1.last_blank_failed,
+        "last_blank_failed must still read false within the grace window \
+         (ruling out a coincidental re-failure re-setting it)"
     );
 
     shutdown(handle, join).await;

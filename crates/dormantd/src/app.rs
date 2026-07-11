@@ -2962,10 +2962,15 @@ mod restore_tests {
 
     /// A display present in the restored snapshot but absent from the new
     /// engine config (dropped by the reload's config edit) must be skipped
-    /// silently by `apply_restore` — no seed call, no panic — while the
-    /// still-present display is seeded normally.
+    /// silently by `apply_restore` — no seed call, no panic.
+    ///
+    /// This invariant predates T3: the `dcfg`-lookup `else { continue }`
+    /// guard was already there before the failure-state seeding was added.
+    /// Split out from `restore_seeds_retained_display_alongside_removed`
+    /// (T3-review Should-1) so this test's own RED-ness isn't conflated
+    /// with the actually-new seeding behavior below.
     #[tokio::test]
-    async fn restore_drops_state_for_removed_display() {
+    async fn restore_skips_removed_display_silently() {
         let engine_cfg = manual_engine_cfg("mon");
         let mut engine = build_engine(&engine_cfg);
 
@@ -2983,6 +2988,31 @@ mod restore_tests {
             snap.displays.iter().all(|(id, _)| id != "gone"),
             "removed display must not surface in the new engine's snapshot"
         );
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    /// A display retained across reload must still have its failure state
+    /// seeded (T3's actually-new behavior, see
+    /// `restore_seeds_failure_state_independent_of_phase`) even when the
+    /// same snapshot ALSO carries a display dropped by the reload's config
+    /// edit — the removed display's `continue` must not short-circuit
+    /// seeding for entries that follow it in iteration order.
+    #[tokio::test]
+    async fn restore_seeds_retained_display_alongside_removed() {
+        let engine_cfg = manual_engine_cfg("mon");
+        let mut engine = build_engine(&engine_cfg);
+
+        let mut snap = snapshot_with("mon", "active", 5, true);
+        snap.displays
+            .push(("gone".to_string(), display_snapshot("blanked", 9, true)));
+
+        apply_restore(&mut engine, &snap, &engine_cfg);
+
+        let cancel = CancellationToken::new();
+        let (handle, snap) = spawn_and_snapshot(engine, cancel.clone()).await;
+
         let d = snap
             .displays
             .iter()

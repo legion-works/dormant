@@ -393,6 +393,40 @@ fn member_effective_bool(
     }
 }
 
+/// Sensors that participate, as a direct member, in a zone whose
+/// `unavailable_policy` is [`UnavailablePolicy::Absent`] and that use the
+/// `mqtt` sensor type — the aggressive-blanking hazard case where a broker
+/// hiccup or LWT flap (which only ever produces [`SensorState::Unavailable`],
+/// never a real absence) would blank the display instead of being treated
+/// fail-safe.
+///
+/// Returns one `(zone, sensor)` pair per matching direct zone membership; a
+/// sensor referenced by several absent-policy zones appears once per zone.
+/// Only direct `ZoneMember::Sensor` members are considered — nested zones are
+/// not recursively expanded, since a zone's own `unavailable_policy` governs
+/// its own direct sensor members, and a nested zone's members are covered by
+/// that nested zone's own entry in `cfg.zones`.
+#[must_use]
+pub fn absent_mqtt_hazards(cfg: &crate::config::Config) -> Vec<(ZoneId, SensorId)> {
+    let mut hazards = Vec::new();
+
+    for (zone_id, zc) in &cfg.zones {
+        if zc.unavailable_policy != UnavailablePolicy::Absent {
+            continue;
+        }
+        for raw in &zc.members {
+            if raw.starts_with("zone:") {
+                continue;
+            }
+            if let Some(crate::config::SensorConfig::Mqtt(_)) = cfg.sensors.get(raw) {
+                hazards.push((ZoneId(zone_id.clone()), SensorId(raw.clone())));
+            }
+        }
+    }
+
+    hazards
+}
+
 /// Get the weight for a zone member (defaults to 1.0).
 fn member_weight(member: &ZoneMember, spec: &ZoneSpec) -> f32 {
     let key = match member {
@@ -1192,5 +1226,89 @@ mod tests {
             &inventory,
         );
         assert!(engine.is_ok());
+    }
+
+    // ── absent_mqtt_hazards ─────────────────────────────────────────────────
+
+    #[test]
+    fn absent_mqtt_hazards_matrix() {
+        use crate::config::Config;
+        use crate::config::schema::{HaSensorCfg, MqttSensorCfg, SensorConfig, SensorKind};
+        use indexmap::IndexMap;
+
+        fn mqtt_cfg(topic: &str) -> MqttSensorCfg {
+            MqttSensorCfg {
+                broker_url: "tcp://localhost:1883".into(),
+                topic: topic.into(),
+                field: "/occupancy".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
+            }
+        }
+
+        fn zone_cfg(
+            members: Vec<&str>,
+            policy: UnavailablePolicy,
+        ) -> crate::config::schema::ZoneConfig {
+            crate::config::schema::ZoneConfig {
+                mode: "any".into(),
+                members: members.into_iter().map(String::from).collect(),
+                quorum: None,
+                threshold: None,
+                weights: IndexMap::new(),
+                unavailable_policy: policy,
+            }
+        }
+
+        let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
+        sensors.insert("mq1".into(), SensorConfig::Mqtt(mqtt_cfg("t1")));
+        sensors.insert(
+            "ha1".into(),
+            SensorConfig::Ha(HaSensorCfg {
+                url: "ws://ha.local:8123/api/websocket".into(),
+                entity: "binary_sensor.x".into(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+
+        let mut zones = IndexMap::new();
+        zones.insert(
+            "absent_mqtt".to_string(),
+            zone_cfg(vec!["mq1"], UnavailablePolicy::Absent),
+        );
+        zones.insert(
+            "default_mqtt".to_string(),
+            zone_cfg(vec!["mq1"], UnavailablePolicy::Present),
+        );
+        zones.insert(
+            "absent_ha_only".to_string(),
+            zone_cfg(vec!["ha1"], UnavailablePolicy::Absent),
+        );
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: crate::config::DaemonConfig::default(),
+            sensors,
+            zones,
+            displays: IndexMap::new(),
+            rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
+        };
+
+        let hazards = absent_mqtt_hazards(&cfg);
+        assert_eq!(
+            hazards,
+            vec![(ZoneId("absent_mqtt".into()), SensorId("mq1".into()))],
+            "expected exactly one hazard pair (absent-policy zone + mqtt sensor), got {hazards:?}"
+        );
     }
 }

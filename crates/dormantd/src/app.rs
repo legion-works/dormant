@@ -58,7 +58,7 @@ use dormant_core::rules::{
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
 use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
-use dormant_core::zone::{ZoneEngine, ZoneSpec};
+use dormant_core::zone::{ZoneEngine, ZoneSpec, absent_mqtt_hazards};
 use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry::{build_controllers, capabilities};
@@ -455,6 +455,21 @@ impl App {
                 event = "web_nonloopback_enabled",
                 bind = %cfg_clone.daemon.web_bind,
                 "web UI bound off-loopback + UNAUTHENTICATED — doctor/reload/command endpoints are LAN-reachable"
+            );
+        }
+
+        // Absent-policy + mqtt hazard warns (spec R3-H): a broker hiccup or
+        // LWT flap only ever produces `SensorState::Unavailable`, never a
+        // real absence, but an `unavailable_policy = "absent"` zone treats
+        // Unavailable as Absent — surface every such pairing at startup so
+        // an operator can catch the aggressive-blanking foot-gun before it
+        // fires.
+        for (zone, sensor) in absent_mqtt_hazards(&cfg_clone) {
+            tracing::warn!(
+                event = "unavailable_absent_mqtt",
+                zone = %zone,
+                sensor = %sensor,
+                "mqtt sensor in an absent-policy zone — a broker/LWT hiccup will be treated as absence"
             );
         }
 
@@ -870,9 +885,17 @@ impl Runner {
         // them into the new generation. Only the ACCEPTED-spawn path below
         // applies the gate; `rebuild_old`'s rollback callers restart the SAME
         // (old) config, so their snapshot needs no filtering.
-        let restore_snapshot = snapshot
-            .as_ref()
-            .map(|snap| reload::zero_changed_displays(snap, &self.generation.cfg, &new_cfg));
+        //
+        // The sensor `reported` voiding gate (spec R3-S) is a sibling filter
+        // applied on top: it zeroes a sensor's carried "has reported" bit
+        // when the sensor's own config changed between the same two configs.
+        // Both filters run only over the accepted-spawn snapshot; `rebuild_old`
+        // sites below keep the ORIGINAL unfiltered `snapshot`.
+        let restore_snapshot = snapshot.as_ref().map(|snap| {
+            let displays_filtered =
+                reload::zero_changed_displays(snap, &self.generation.cfg, &new_cfg);
+            reload::zero_changed_sensor_reported(&displays_filtered, &self.generation.cfg, &new_cfg)
+        });
 
         match spawn_generation(
             &self.root,
@@ -884,6 +907,19 @@ impl Runner {
         ) {
             Ok(spawn) => {
                 self.install_generation(spawn);
+                // Re-check the hazard pairing against the NEW config on every
+                // accepted reload (mirrors the startup check in
+                // `App::start`) — an edit can introduce (or remove) an
+                // absent-policy + mqtt pairing just as easily as a fresh
+                // boot can.
+                for (zone, sensor) in absent_mqtt_hazards(&new_cfg) {
+                    tracing::warn!(
+                        event = "unavailable_absent_mqtt",
+                        zone = %zone,
+                        sensor = %sensor,
+                        "mqtt sensor in an absent-policy zone — a broker/LWT hiccup will be treated as absence"
+                    );
+                }
                 // Combine retained rule-driven dark displays with stuck rule-less
                 // blanking displays — both need a physical wake because the new
                 // machines start Active.
@@ -1728,6 +1764,26 @@ fn apply_restore(
         } else {
             engine.install_restored_machine(&did, sm, effects, now);
         }
+    }
+
+    // Seed the sensor `reported` diagnostic forward (sibling seam to the
+    // display wake-failure seeding above). Only sensors still present in the
+    // NEW engine config are seeded — a sensor dropped from `[sensors]` by
+    // the edit that triggered this reload has no runtime slot in the new
+    // engine to seed into. Any dispatch-relevant voiding for a RETAINED
+    // sensor has already happened upstream (see
+    // `reload::zero_changed_sensor_reported`, applied by `Runner::reload`
+    // before this snapshot reaches `apply_restore`), so a `true` here is
+    // always meaningful for the new sensor identity.
+    for ssnap in &snapshot.sensors {
+        let sid = SensorId(ssnap.id.clone());
+        if !ssnap.reported {
+            continue;
+        }
+        if !engine_cfg.sensors.iter().any(|s| s.sensor == sid) {
+            continue;
+        }
+        engine.seed_sensor_reported(&sid);
     }
 }
 

@@ -202,6 +202,13 @@
   color: var(--text-faint);
 }
 
+.sensor-row__no-data-hint {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--warning);
+  margin-top: 2px;
+}
+
 
 .dash-zone-row {
   padding: 13px 15px;

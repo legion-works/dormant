@@ -194,6 +194,9 @@ mod tests {
             kind: dormant_core::config::schema::SensorKind::Presence,
             hold_time: None,
             stale_timeout: None,
+            availability_topic: None,
+            availability_payload_online: "online".into(),
+            availability_payload_offline: "offline".into(),
         }
     }
 

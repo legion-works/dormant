@@ -345,6 +345,9 @@ mod tests {
                 kind: SensorKind::default(),
                 hold_time: None,
                 stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
             }),
         );
         Arc::new(Config {
@@ -401,6 +404,7 @@ mod tests {
                 id: "front_desk".into(),
                 state: SensorState::Present,
                 last_seen_secs_ago: 3,
+                reported: true,
             }],
             zones: vec![],
             displays: vec![(

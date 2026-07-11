@@ -219,14 +219,59 @@ pub fn zero_changed_displays(
     out
 }
 
+// ── Reload carry-over: sensor `reported` voiding gate ───────────────────────────
+//
+// `reported` (see `SensorSnapshot::reported` / `RulesEngine::seed_sensor_reported`)
+// is a diagnostic bit meaning "this sensor has delivered at least one real
+// event since daemon start". A reload seeds it forward from the pre-reload
+// snapshot (see `app::apply_restore`) so the diagnostic survives a hot-reload
+// instead of silently resetting to the fail-safe `false`. But if the edit
+// that triggered the reload changed the sensor's OWN configuration (topic,
+// kind, hold time, stale timeout, …) the carried-forward `true` no longer
+// describes anything meaningful about the new sensor identity, and must be
+// voided.
+//
+// Unlike `dispatch_relevant_eq` (per-field classification for
+// `DisplayConfig`), this gate is deliberately coarse: it compares the WHOLE
+// `SensorConfig` and zeroes `reported` on ANY difference — there is no field
+// on a sensor exempted as "cosmetic". This intentionally also zeroes on a
+// `stale_timeout`-only tweak (spec F11: accepted false-void, pinned by
+// `stale_timeout_only_tweak_zeroes_reported` below) rather than trying to
+// draw a dispatch-relevance line for sensors.
+
+/// Clone of `snapshot` with `reported` zeroed for every sensor whose whole
+/// [`dormant_core::config::schema::SensorConfig`] differs between `old` and
+/// `new`.
+///
+/// A sensor present in only one of `old`/`new` (added or removed by the edit
+/// that triggered this reload) is treated as CHANGED — there is no baseline
+/// to compare against, so the conservative choice is to zero rather than
+/// carry a stale "has reported" bit forward under a new (or now-absent)
+/// configuration (spec R3-S).
+#[must_use]
+pub fn zero_changed_sensor_reported(
+    snapshot: &StateSnapshot,
+    old: &Config,
+    new: &Config,
+) -> StateSnapshot {
+    let mut out = snapshot.clone();
+    for ssnap in &mut out.sensors {
+        if old.sensors.get(ssnap.id.as_str()) != new.sensors.get(ssnap.id.as_str()) {
+            ssnap.reported = false;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod dispatch_gate_tests {
     use std::time::Duration;
 
     use dormant_core::config::schema::{
-        DaemonConfig, NotificationsConfig, ScreensaverConfig, WearConfig,
+        DaemonConfig, NotificationsConfig, ScreensaverConfig, SensorConfig, WearConfig,
     };
-    use dormant_core::rules::DisplaySnapshot;
+    use dormant_core::rules::{DisplaySnapshot, SensorSnapshot};
+    use dormant_core::types::SensorState;
     use dormant_core::wear::PanelType;
     use indexmap::IndexMap;
 
@@ -394,5 +439,122 @@ mod dispatch_gate_tests {
                 "{id} must be zeroed (no baseline)"
             );
         }
+    }
+
+    // ── Sensor `reported` voiding gate (P4 sensor-side test helpers) ────────
+
+    /// A minimal one-sensor [`StateSnapshot`] with `reported` set as
+    /// requested.
+    fn snap_with_reported(id: &str, reported: bool) -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![SensorSnapshot {
+                id: id.to_string(),
+                state: SensorState::Present,
+                last_seen_secs_ago: 0,
+                reported,
+            }],
+            zones: Vec::new(),
+            displays: Vec::new(),
+            pending_reload: None,
+        }
+    }
+
+    /// Look up a sensor by id in a snapshot (test helper).
+    fn sensor<'a>(snap: &'a StateSnapshot, id: &str) -> &'a SensorSnapshot {
+        snap.sensors
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("sensor '{id}' not present in snapshot"))
+    }
+
+    /// A minimal one-mqtt-sensor `Config`, built via TOML text run through
+    /// [`dormant_core::config::load_config`] (rather than hand-constructed)
+    /// so the sensor-side tests exercise the same parse path production
+    /// config goes through.
+    fn cfg_from_toml(toml_str: &str) -> Config {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml_str).expect("write test config");
+        let (cfg, _warnings) =
+            dormant_core::config::load_config(&path, dormant_core::config::Strictness::Warn)
+                .expect("load test config");
+        cfg
+    }
+
+    /// One `mqtt` sensor named "desk".
+    fn cfg_a() -> Config {
+        cfg_from_toml(
+            r#"config_version = 1
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "zigbee2mqtt/desk"
+"#,
+        )
+    }
+
+    /// Rewrite sensor `id`'s mqtt `topic` in place (test mutator).
+    fn set_mqtt_topic(cfg: &mut Config, id: &str, topic: &str) {
+        if let Some(SensorConfig::Mqtt(m)) = cfg.sensors.get_mut(id) {
+            m.topic = topic.to_string();
+        }
+    }
+
+    /// Rewrite sensor `id`'s mqtt `stale_timeout` in place (test mutator).
+    fn set_mqtt_stale_timeout(cfg: &mut Config, id: &str, timeout: Duration) {
+        if let Some(SensorConfig::Mqtt(m)) = cfg.sensors.get_mut(id) {
+            m.stale_timeout = Some(timeout);
+        }
+    }
+
+    /// `cfg_a()` with sensor `id` removed entirely (spec R3-S: added/removed
+    /// sensors have no baseline and must be treated as changed).
+    fn cfg_without(id: &str) -> Config {
+        let mut cfg = cfg_a();
+        cfg.sensors.shift_remove(id);
+        cfg
+    }
+
+    #[test]
+    fn unchanged_sensor_carries_reported() {
+        let out =
+            zero_changed_sensor_reported(&snap_with_reported("desk", true), &cfg_a(), &cfg_a());
+        assert!(sensor(&out, "desk").reported);
+    }
+
+    #[test]
+    fn changed_sensor_config_zeroes_reported() {
+        let mut new = cfg_a();
+        set_mqtt_topic(&mut new, "desk", "zigbee2mqtt/desk-NEW");
+        assert!(
+            !sensor(
+                &zero_changed_sensor_reported(&snap_with_reported("desk", true), &cfg_a(), &new),
+                "desk"
+            )
+            .reported
+        );
+    }
+
+    #[test]
+    fn sensor_absent_from_new_zeroed_by_generic_path_never_seeded() {
+        // spec R3-S
+        let new = cfg_without("desk");
+        let out = zero_changed_sensor_reported(&snap_with_reported("desk", true), &cfg_a(), &new);
+        assert!(!sensor(&out, "desk").reported); // Some != None -> zeroed
+    }
+
+    #[test]
+    fn stale_timeout_only_tweak_zeroes_reported() {
+        // spec F11 accepted false-void, pinned
+        let mut new = cfg_a();
+        set_mqtt_stale_timeout(&mut new, "desk", Duration::from_secs(999));
+        assert!(
+            !sensor(
+                &zero_changed_sensor_reported(&snap_with_reported("desk", true), &cfg_a(), &new),
+                "desk"
+            )
+            .reported
+        );
     }
 }

@@ -405,6 +405,21 @@ pub struct MqttSensorCfg {
     /// Payload that indicates absence (optional — defaults to JSON `false`).
     pub payload_off: Option<String>,
 
+    /// Optional override for the retained MQTT availability (LWT) topic.
+    /// When absent, the effective availability topic is derived as
+    /// `<topic>/availability` (the `Zigbee2MQTT` convention — see
+    /// `dormant_sensors::mqtt::availability_topic`).
+    #[serde(default)]
+    pub availability_topic: Option<String>,
+
+    /// Payload literal that marks the availability topic "online".
+    #[serde(default = "default_availability_online")]
+    pub availability_payload_online: String,
+
+    /// Payload literal that marks the availability topic "offline".
+    #[serde(default = "default_availability_offline")]
+    pub availability_payload_offline: String,
+
     // ── Inlined common fields ────────────────────────────────────────────────
     /// Sensor kind.
     #[serde(default)]
@@ -951,6 +966,12 @@ fn default_log_level() -> String {
 }
 fn default_mqtt_field() -> String {
     defaults::MQTT_FIELD.into()
+}
+fn default_availability_online() -> String {
+    defaults::AVAILABILITY_PAYLOAD_ONLINE.into()
+}
+fn default_availability_offline() -> String {
+    defaults::AVAILABILITY_PAYLOAD_OFFLINE.into()
 }
 fn default_ld2410_baud() -> u32 {
     defaults::LD2410_BAUD
@@ -1567,5 +1588,49 @@ notify_recovery = false
         assert_eq!(cfg.notifications.wake_attempt_threshold, 5);
         assert_eq!(cfg.notifications.cooldown, Duration::from_secs(30 * 60));
         assert!(!cfg.notifications.notify_recovery);
+    }
+
+    // ── MqttSensorCfg availability keys ─────────────────────────────────────
+
+    #[test]
+    fn availability_keys_default_and_load() {
+        let toml_str = r#"
+config_version = 1
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "zigbee2mqtt/desk"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let SensorConfig::Mqtt(m) = &cfg.sensors["desk"] else {
+            panic!("expected Mqtt sensor")
+        };
+        assert_eq!(m.availability_topic, None);
+        assert_eq!(m.availability_payload_online, "online");
+        assert_eq!(m.availability_payload_offline, "offline");
+    }
+
+    #[test]
+    fn availability_keys_explicit_values_parse() {
+        let toml_str = r#"
+config_version = 1
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "zigbee2mqtt/desk"
+availability_topic = "zigbee2mqtt/desk/avail"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let SensorConfig::Mqtt(m) = &cfg.sensors["desk"] else {
+            panic!("expected Mqtt sensor")
+        };
+        assert_eq!(
+            m.availability_topic.as_deref(),
+            Some("zigbee2mqtt/desk/avail")
+        );
+        assert_eq!(m.availability_payload_online, "up");
+        assert_eq!(m.availability_payload_offline, "down");
     }
 }

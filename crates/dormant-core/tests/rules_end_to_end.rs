@@ -1510,6 +1510,115 @@ async fn set_pending_reload_surfaces_in_snapshot() {
     let _ = harness.source_handle.await;
 }
 
+// ── F12: retained-vacant worst-case timeline pin (spec §7#2, §8) ──────────────
+
+/// PIN test, not RED-first in the usual sense (P1 pinned exception): this
+/// test pins PRE-EXISTING engine behavior — the blank-at-grace-expiry
+/// timeline for a single-sensor zone whose FIRST-EVER event is `Absent` at
+/// t≈0 (the shape of a broker-retained "vacant" MQTT message delivered on
+/// subscribe, which bypasses `unavailable_policy` entirely and is
+/// indistinguishable to the engine from a live Absent edge). That timeline
+/// was already GREEN before Task 3 — every assertion here except the LAST
+/// one is a pin, not new coverage. Only the trailing `reported` assertion
+/// is genuinely new: it was RED until the `RulesEngine.reported` field and
+/// its `handle_presence_event`/`send_snapshot` wiring landed in this task.
+/// A future reviewer must not misfile the whole test as a TDD violation —
+/// the timeline is a documented, ACCEPTED residual risk (§7#2), not a bug
+/// this test is meant to catch; it exists so the exposure is executable
+/// truth, per the F12 finding.
+#[tokio::test(start_paused = true)]
+async fn retained_vacant_worst_case_timeline() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    // Default timings per §7#2: grace_period = 60s, startup_holdoff = 30s.
+    // holdoff gates the FIRST blank only (state_machine.rs) and is already
+    // elapsed (30s < 60s) by the time grace expires — it does not add any
+    // extra delay here, which is the crux of the accepted exposure.
+    let timings = SmTimings {
+        grace_period: Duration::from_secs(60),
+        min_blank_time: Duration::from_secs(0),
+        min_wake_time: Duration::from_secs(0),
+        startup_holdoff: Duration::from_secs(30),
+        wake_retry_interval: Duration::from_secs(60),
+    };
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            timings,
+        }],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // The retained-vacant shape: Absent is the VERY FIRST event this sensor
+    // ever delivers, at t≈0 — no prior Present was ever observed (a
+    // motionless occupant + a stale retained "vacant" publish).
+    let script = vec![(
+        Duration::from_secs(0),
+        PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+    )];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    // Advance to grace expiry (~60s virtual) plus a beat for dispatch to
+    // land.
+    tokio::time::sleep(Duration::from_secs(65)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = sink.log();
+    let blank_at = log
+        .iter()
+        .find_map(|(t, c)| matches!(c, SinkCmd::Blank(_)).then_some(*t));
+    let blank_at = blank_at.expect(
+        "retained-vacant worst case: blank must fire at grace expiry \
+         (§7#2 accepted exposure) — PIN, not new behavior",
+    );
+    assert!(
+        blank_at.abs_diff(Duration::from_secs(60)) <= Duration::from_secs(2),
+        "blank at {blank_at:?}, expected ~60s (grace expiry; the 30s \
+         startup_holdoff was already elapsed and added no extra delay)"
+    );
+
+    // NEW assertion (RED pre-T3): the snapshot must show the sensor as
+    // `reported == true` — the worst-case Absent IS a real report from the
+    // device (as distinct from a sensor that has never reported at all).
+    // `reported` is what lets an operator tell "never heard from" apart
+    // from "went away" on a cold-start snapshot.
+    let snap = request_snapshot(&harness.ctl_tx).await;
+    let sensor_snap = snap
+        .sensors
+        .iter()
+        .find(|s| s.id == "desk")
+        .expect("sensor 'desk' in snapshot");
+    assert!(
+        sensor_snap.reported,
+        "sensor must show reported == true after grace expiry — it HAS \
+         delivered an event (the worst-case Absent), even though that \
+         event looks like a vacancy (persistence across state flips is \
+         covered separately by `reported_false_until_first_event_then_true`)"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
 // ── Helper: spawn engine with a custom OwnershipGate ───────────────────────────
 
 fn spawn_engine_with_gate(

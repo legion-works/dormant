@@ -409,6 +409,9 @@ mod tests {
                 kind: dormant_core::config::schema::SensorKind::default(),
                 hold_time: None,
                 stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
             }),
         );
         Config {
@@ -564,6 +567,9 @@ mod tests {
                 kind: dormant_core::config::schema::SensorKind::default(),
                 hold_time: None,
                 stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
             }),
         );
 
@@ -656,6 +662,9 @@ mod tests {
                 kind: dormant_core::config::schema::SensorKind::default(),
                 hold_time: None,
                 stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
             }),
         );
         let mut cfg = Config {

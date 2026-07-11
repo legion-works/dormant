@@ -110,6 +110,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "field",
             "payload_on",
             "payload_off",
+            "availability_topic",
+            "availability_payload_online",
+            "availability_payload_offline",
             // ha
             "url",
             "entity",
@@ -428,7 +431,133 @@ pub fn validate(
     // ── [notifications] validation ────────────────────────────────────────
     validate_notifications(cfg, &mut errors);
 
+    // ── [sensors.<id>] mqtt availability validation ─────────────────────
+    validate_sensors(cfg, &mut errors);
+
     errors
+}
+
+/// `Zigbee2MQTT` convention: `<topic>/availability`.
+///
+/// This is a local reimplementation of
+/// `dormant_sensors::mqtt::availability_topic` — the `dormant-sensors` crate
+/// depends on `dormant-core`, not the other way around, so the derivation
+/// string form is duplicated here for validation purposes. Keep in sync with
+/// the original in `crates/dormant-sensors/src/mqtt.rs`.
+fn derive_availability_topic(topic: &str) -> String {
+    format!("{topic}/availability")
+}
+
+/// Validate the `mqtt`-variant entries of `[sensors.<id>]`: per-sensor
+/// literal/topic sanity, and per-broker cross-sensor coherence (an
+/// availability topic must not collide with a state topic on the same
+/// broker, and sensors sharing one availability topic on the same broker
+/// must agree on the online/offline literal pair).
+///
+/// Broker grouping is reimplemented locally (over `SensorConfig::Mqtt`
+/// variants) rather than reusing the `dormant-sensors` registry grouping,
+/// for the same crate-layering reason as [`derive_availability_topic`].
+fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    use super::schema::MqttSensorCfg;
+
+    let mut by_broker: HashMap<&str, Vec<(&str, &MqttSensorCfg)>> = HashMap::new();
+
+    for (sensor_id, sc) in &cfg.sensors {
+        let super::schema::SensorConfig::Mqtt(m) = sc else {
+            continue;
+        };
+
+        // ── Per-sensor checks ────────────────────────────────────────────
+        if let Some(topic) = &m.availability_topic
+            && topic.is_empty()
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!("sensor '{sensor_id}' availability_topic is set but empty"),
+            });
+        }
+        if m.availability_payload_online.is_empty() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "sensor '{sensor_id}' availability_payload_online must be non-empty"
+                ),
+            });
+        }
+        if m.availability_payload_offline.is_empty() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "sensor '{sensor_id}' availability_payload_offline must be non-empty"
+                ),
+            });
+        }
+        if m.availability_payload_online == m.availability_payload_offline {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "sensor '{sensor_id}' availability_payload_online and \
+                     availability_payload_offline must differ (both are '{}')",
+                    m.availability_payload_online
+                ),
+            });
+        }
+
+        by_broker
+            .entry(m.broker_url.as_str())
+            .or_default()
+            .push((sensor_id.as_str(), m));
+    }
+
+    // ── Per-broker cross-sensor checks ──────────────────────────────────
+    for (broker, sensors) in &by_broker {
+        let state_topics: HashSet<&str> = sensors.iter().map(|(_, m)| m.topic.as_str()).collect();
+
+        // Resolved availability topic -> [(sensor_id, online, offline)].
+        let mut avail_map: HashMap<String, Vec<(&str, &str, &str)>> = HashMap::new();
+
+        for (sensor_id, m) in sensors {
+            let resolved = m
+                .availability_topic
+                .clone()
+                .unwrap_or_else(|| derive_availability_topic(&m.topic));
+
+            if state_topics.contains(resolved.as_str()) {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "sensor '{sensor_id}' availability_topic '{resolved}' collides with \
+                         a state topic on broker '{broker}'"
+                    ),
+                });
+            }
+
+            avail_map.entry(resolved).or_default().push((
+                sensor_id,
+                m.availability_payload_online.as_str(),
+                m.availability_payload_offline.as_str(),
+            ));
+        }
+
+        for (topic, entries) in &avail_map {
+            if entries.len() < 2 {
+                continue;
+            }
+            let (first_online, first_offline) = (entries[0].1, entries[0].2);
+            for (sensor_id, online, offline) in &entries[1..] {
+                if *online != first_online || *offline != first_offline {
+                    errors.push(ValidationError {
+                        what: crate::error::E_CONFIG_INVALID.into(),
+                        detail: format!(
+                            "sensor '{sensor_id}' shares availability_topic '{topic}' on broker \
+                             '{broker}' with divergent literals (expected online='{first_online}' \
+                             offline='{first_offline}')"
+                        ),
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Validate the `[notifications]` section: threshold floor and cooldown floor.
@@ -3846,5 +3975,276 @@ kind = "power_off"
             "cooldown = 1m (the floor) must be accepted, got: {:?}",
             errors
         );
+    }
+
+    // ── [sensors.<id>] availability_* validation ────────────────────────────
+
+    fn availability_config(toml_str: &str) -> Config {
+        toml::from_str(toml_str).unwrap()
+    }
+
+    fn availability_validation_errors(toml_str: &str) -> Vec<ValidationError> {
+        let cfg = availability_config(toml_str);
+        validate(&cfg, &HashMap::new(), &Credentials::default())
+    }
+
+    #[test]
+    fn availability_literals_must_differ() {
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "zigbee2mqtt/desk"
+availability_payload_online = "x"
+availability_payload_offline = "x"
+"#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("availability_payload")),
+            "expected an availability_payload error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn availability_topic_colliding_with_state_topic_rejected() {
+        // F10 — sensor a's state topic ("t1") is the same string as sensor b's
+        // (explicit) availability topic, on the same broker.
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t1"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t2"
+availability_topic = "t1"
+"#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("availability_topic")),
+            "expected an availability_topic collision error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn shared_availability_topic_divergent_literals_rejected_identical_accepted() {
+        // F9 — two sensors on the same broker sharing one availability_topic.
+        // Divergent literal pairs are rejected...
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/a"
+availability_topic = "shared/avail"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/b"
+availability_topic = "shared/avail"
+availability_payload_online = "online"
+availability_payload_offline = "offline"
+"#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("shared/avail")),
+            "expected a divergent-literals error for the shared availability topic, got: {:?}",
+            errs
+        );
+
+        // ...identical literal pairs are accepted.
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/a"
+availability_topic = "shared/avail"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/b"
+availability_topic = "shared/avail"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+"#,
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.detail.contains("shared/avail") && e.detail.contains("divergent")),
+            "identical literal pairs on a shared availability_topic must not error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn availability_topic_empty_string_rejected() {
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "zigbee2mqtt/desk"
+availability_topic = ""
+"#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("availability_topic")),
+            "empty availability_topic must be rejected, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn availability_topic_collision_via_default_derivation_rejected() {
+        // F10 via the DEFAULT-DERIVED path — neither sensor sets an explicit
+        // `availability_topic`. Sensor a's state topic is literally the
+        // string sensor b's availability topic derives to
+        // (`derive_availability_topic("t1") == "t1/availability"`), so the
+        // collision must be detected purely through derivation, not through
+        // an explicit override. This is the case the reviewer's mutation
+        // (breaking `derive_availability_topic`'s string form) must kill.
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t1/availability"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t1"
+"#,
+        );
+        assert!(
+            errs.iter().any(|e| e.what == "E_CONFIG_INVALID"
+                && e.detail.contains("'b'")
+                && e.detail.contains("t1/availability")
+                && e.detail.contains("collides with a state topic")),
+            "sensor b's DEFAULT-derived availability topic ('t1/availability') colliding with \
+             sensor a's literal state topic must be rejected, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn shared_derived_availability_topic_divergent_literals_rejected() {
+        // F9 via the DEFAULT-DERIVED path — neither sensor sets an explicit
+        // `availability_topic`; both share the same state topic
+        // ("sensors/shared"), so both derive to the same availability topic
+        // ("sensors/shared/availability"). A shared state topic on one
+        // broker is not itself rejected by validate_sensors, so this
+        // isolates the F9 divergent-literals check to the derived path.
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/shared"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/shared"
+availability_payload_online = "online"
+availability_payload_offline = "offline"
+"#,
+        );
+        assert!(
+            errs.iter().any(|e| e.what == "E_CONFIG_INVALID"
+                && e.detail.contains("sensors/shared/availability")),
+            "two sensors sharing a purely DEFAULT-derived availability topic with divergent \
+             literals must be rejected, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn availability_topic_same_string_different_brokers_not_collided() {
+        // F10 cross-broker independence — the same topic string used as
+        // sensor a's state topic on broker-x and sensor b's explicit
+        // availability_topic on broker-y must NOT collide: broker grouping
+        // (`by_broker`) structurally isolates them. Mirrors the reviewer's
+        // ad hoc probe (T1-review.md, finding S2).
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://broker-x:1883"
+topic = "t1"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://broker-y:1883"
+topic = "t2"
+availability_topic = "t1"
+"#,
+        );
+        assert!(
+            errs.is_empty(),
+            "same topic string on two different brokers must not collide, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn keys_on_ha_sensor_load_and_are_ignored() {
+        // F7 — the availability_* keys live in the shared `sensors.` known-key
+        // bucket (not per-variant), so setting them on an `ha` sensor loads
+        // without a strict-mode unknown-key rejection. HaSensorCfg has no such
+        // fields, so serde simply drops them on deserialization — no
+        // availability behavior applies to `ha` sensors. Pinning that HONEST
+        // behavior here (not pretending the config layer rejects it).
+        let toml_str = r#"
+config_version = 1
+[sensors.h]
+type = "ha"
+url = "ws://ha.local:8123/api/websocket"
+entity = "binary_sensor.x"
+availability_topic = "whatever"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert!(
+            unknown.is_empty(),
+            "availability_* keys must be structurally known under sensors., got {:?}",
+            unknown
+        );
+
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        match &cfg.sensors["h"] {
+            crate::config::schema::SensorConfig::Ha(_) => {} // field dropped, as expected
+            other => panic!("expected Ha sensor, got {other:?}"),
+        }
     }
 }

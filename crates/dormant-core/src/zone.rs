@@ -1302,6 +1302,7 @@ mod tests {
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
 
         let hazards = absent_mqtt_hazards(&cfg);

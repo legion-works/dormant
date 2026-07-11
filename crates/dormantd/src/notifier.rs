@@ -711,25 +711,48 @@ impl ZbusSink {
 
     /// Return the cached connection, (re)connecting if needed and not
     /// currently backing off.
+    ///
+    /// The connect itself (`zbus::Connection::session()`) is bounded by the
+    /// same [`DBUS_CALL_TIMEOUT`] as the `call_method` sites, and is awaited
+    /// with the `conn` mutex UNLOCKED — the guard is dropped before the
+    /// connect starts and re-acquired only to record the outcome. This is
+    /// deliberate: `ZbusSink` is one `Arc` shared, unchanged, across every
+    /// reload generation for the daemon's whole lifetime, so holding the
+    /// lock across an untimeouted (or even timed-out-but-still-awaited)
+    /// connect would let a single hung session-bus negotiation wedge every
+    /// future `notify()`/`close()` call from every subsequent generation
+    /// forever. No lock may ever be held across an unbounded (or
+    /// lock-spanning) await here.
     async fn connection(&self) -> Result<zbus::Connection, String> {
-        let mut guard = self.conn.lock().await;
-        if let Some(c) = guard.conn.clone() {
-            return Ok(c);
-        }
-        if let Some(last) = guard.last_attempt
-            && last.elapsed() < DBUS_RECONNECT_INTERVAL
         {
-            return Err("session bus unreachable (backing off)".to_string());
-        }
-        guard.last_attempt = Some(Instant::now());
-        match zbus::Connection::session().await {
-            Ok(c) => {
+            let mut guard = self.conn.lock().await;
+            if let Some(c) = guard.conn.clone() {
+                return Ok(c);
+            }
+            if let Some(last) = guard.last_attempt
+                && last.elapsed() < DBUS_RECONNECT_INTERVAL
+            {
+                return Err("session bus unreachable (backing off)".to_string());
+            }
+            guard.last_attempt = Some(Instant::now());
+        } // guard dropped — the connect below runs with no lock held.
+
+        match tokio::time::timeout(DBUS_CALL_TIMEOUT, zbus::Connection::session()).await {
+            Ok(Ok(c)) => {
+                let mut guard = self.conn.lock().await;
                 guard.conn = Some(c.clone());
                 guard.warned_offline = false;
                 Ok(c)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let detail = e.to_string();
+                let mut guard = self.conn.lock().await;
+                warn_unreachable_once(&mut guard, &detail);
+                Err(detail)
+            }
+            Err(_) => {
+                let detail = "connect: dbus call timed out".to_string();
+                let mut guard = self.conn.lock().await;
                 warn_unreachable_once(&mut guard, &detail);
                 Err(detail)
             }
@@ -777,7 +800,7 @@ impl NotifySink for ZbusSink {
         hints.insert("urgency", zbus::zvariant::Value::U8(urgency));
         let actions: Vec<&str> = Vec::new();
         let notify_body = (
-            "dormantd", replaces, "", summary, body, &actions, &hints, -1_i32,
+            "dormant", replaces, "dormant", summary, body, &actions, &hints, -1_i32,
         );
         let call = conn.call_method(
             Some("org.freedesktop.Notifications"),
@@ -1002,6 +1025,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_with_notify_recovery_disabled_closes_only_no_send() {
+        let mut cfg = cfg();
+        cfg.notify_recovery = false;
+        let mut st = NotifyState::default();
+        let _ = decide(&mut st, &wake_retry(3), &cfg, t0());
+        st.record_dbus_id(&key_wake("m"), 42);
+        let rec = DaemonEvent::WakeRecovered {
+            display: DisplayId("m".into()),
+            attempts: 5,
+        };
+        let acts = decide(&mut st, &rec, &cfg, t0());
+        assert!(
+            matches!(acts[..], [NotifyAction::Close { dbus_id: 42, .. }]),
+            "notify_recovery=false must yield Close only, no recovery Send"
+        );
+    }
+
+    #[test]
     fn blank_failure_notifies_with_detail_and_recovers() {
         let mut st = NotifyState::default();
         let fail = DaemonEvent::BlankFailure {
@@ -1081,6 +1122,29 @@ mod tests {
         assert!(
             !acts.iter().any(|a| matches!(a, NotifyAction::Send { .. })),
             "no recovery notice for a display that no longer exists"
+        );
+    }
+
+    // ── spawn ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn spawn_returns_none_when_notifications_disabled() {
+        // Pure (no tokio runtime needed): `spawn` must return `None` before
+        // ever calling `tokio::spawn`, so a plain `mpsc::channel` (channel
+        // creation itself needs no runtime) is enough for `NotifierDeps`.
+        let (ctl_tx, _ctl_rx) = mpsc::channel(1);
+        let mut disabled_cfg = cfg();
+        disabled_cfg.enabled = false;
+        let deps = NotifierDeps {
+            ctl: ctl_tx,
+            cfg: disabled_cfg,
+            state: Arc::new(std::sync::Mutex::new(NotifyState::default())),
+            sink: Arc::new(RecordingSink::default()),
+            cancel: CancellationToken::new(),
+        };
+        assert!(
+            spawn(deps).is_none(),
+            "enabled=false must not spawn a notifier task"
         );
     }
 

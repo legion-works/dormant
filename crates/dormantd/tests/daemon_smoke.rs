@@ -3070,3 +3070,104 @@ async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
 
     shutdown(handle, join).await;
 }
+
+// ── 20: `[notifications].enabled = false` → zero sink calls (T4 Must #3) ───
+//
+// `notifier::spawn` returns `None` when `cfg.enabled` is `false` (unit-level
+// coverage lives in `notifier::tests::spawn_returns_none_when_notifications_disabled`).
+// This is the daemon-level companion: with the notifier disabled, a wake
+// failure burst well past the (disabled) threshold must never reach the
+// injected `RecordingSink` at all — because no notifier task exists to call
+// it, not merely because policy suppressed the send.
+
+fn notifier_disabled_config(marker: &Path, wake_cmd: &str, grace: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[notifications]
+enabled = false
+wake_attempt_threshold = 2
+cooldown = "1m"
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m}'"
+wake_command = "{wake_cmd}"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        m = marker.display(),
+        wake_cmd = wake_cmd,
+        g = grace,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notifier_disabled_records_zero_sink_calls_after_failure_burst() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &notifier_disabled_config(&marker, "false", "20ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    // Same absent→present script as test 19, driving several `wake_command
+    // = "false"` failures well past `wake_attempt_threshold = 2` — the only
+    // difference is `[notifications].enabled = false`.
+    let script = vec![
+        (Duration::from_millis(0), ev("desk", SensorState::Absent)),
+        (Duration::from_millis(150), ev("desk", SensorState::Present)),
+    ];
+
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    let sink_for_builder = sink.clone();
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc()
+    .with_notify_sink_builder(move || sink_for_builder.clone() as std::sync::Arc<dyn NotifySink>);
+    let (handle, join) = app.start().await.expect("start app");
+
+    // Let several wake-retry cycles elapse — plenty of time for a failure
+    // burst that would, if the notifier were enabled, easily cross the
+    // threshold and produce at least one `Send`.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        sink.notifies.lock().unwrap().is_empty(),
+        "enabled=false: NotifySink::notify must never be called"
+    );
+    assert!(
+        sink.closes.lock().unwrap().is_empty(),
+        "enabled=false: NotifySink::close must never be called"
+    );
+
+    shutdown(handle, join).await;
+}

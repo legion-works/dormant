@@ -1,0 +1,1237 @@
+//! Boot-time crash-loop verdict + atomic state files (spec §3, §5.2).
+//!
+//! Two layers, deliberately split (spec §5.1):
+//!
+//! - [`decide`] — GENUINELY PURE. Given a parsed [`CrashLoopState`], the live
+//!   discount-nonce set, precomputed [`LkgInfo`], the current config's
+//!   [`Fingerprint`], wall-clock time, and the `watchdog.lkg_rollback_enabled`
+//!   gate, returns a [`Verdict`]. Zero I/O, zero tokio — the entire §5.2
+//!   evaluation-order matrix lives here and is unit-tested directly.
+//! - [`prepare`] — the sync I/O shell: records this boot's start entry,
+//!   builds [`LkgInfo`] (file existence + `load_config` validation + a
+//!   direct byte comparison against the current config — spec §3/§5.2 F7,
+//!   never a fingerprint-equality shortcut), calls `decide`, performs every
+//!   verdict-driven `crash-loop.json` write itself (P12 — `prepare` owns all
+//!   verdict state writes; only the *immediate* build-failure rollback,
+//!   which `decide` cannot predict, is written by `boot()` in a later task),
+//!   and returns a [`BootPlan`] with deferred log events for the caller to
+//!   emit once logging is initialised.
+//!
+//! State files live at `state_dir()` root (spec §3): `crash-loop.json`,
+//! `discount-<nonce>`. `last-known-good.toml` is read here (never written —
+//! promotion is a later task) at `state_dir().join("last-known-good.toml")`.
+//!
+//! All state-file writes are atomic (temp file + rename, same pattern as
+//! `dormant_displays::samsung_ip::write_token_state`), directory `0o700`,
+//! file `0o600`. A corrupt/torn/absent `crash-loop.json` is treated as
+//! [`CrashLoopState::default`] — crash-loop bookkeeping must never block
+//! boot (spec invariant #5).
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use dormant_core::config::{Strictness, load_config};
+use serde::{Deserialize, Serialize};
+
+/// Non-discounted starts, within [`CRASH_LOOP_WINDOW`], sharing the current
+/// config's fingerprint, required before a counted rollback fires (spec
+/// §5.2 condition a). Documented `pub const`, deliberately NOT config — this
+/// machinery must work precisely when the config is unloadable.
+pub const CRASH_LOOP_THRESHOLD: u32 = 3;
+
+/// Sliding window a crash-loop is measured over (spec §5.2, cross-family
+/// cold-gate: raised from 90s to 6m so the third restart of a
+/// `WatchdogSec=150` wedge-detect cycle still lands inside the window).
+pub const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(6 * 60);
+
+/// Consecutive display-health-deferred LKG promotion candidates before
+/// promotion proceeds anyway (spec §4 point 1). Defined here (not T4's
+/// `should_promote`) because it is a documented const alongside the other
+/// two, not because `boot_guard` uses it directly.
+pub const LKG_HEALTH_DEFER_CAP: u32 = 3;
+
+const CRASH_LOOP_FILE: &str = "crash-loop.json";
+const LKG_FILE: &str = "last-known-good.toml";
+const DISCOUNT_PREFIX: &str = "discount-";
+
+// ── Fingerprint ──────────────────────────────────────────────────────────
+
+/// Identity of a config file's bytes: `(len, hash64)` on success, or the
+/// `Unreadable` sentinel when the file could not be read at all.
+///
+/// `hash64` is a std `DefaultHasher` value — stable within one binary, NOT
+/// stable across Rust releases (spec §3 F7: no sha2 in the daemon core,
+/// following the OLED-health precedent). A binary upgrade forgetting old
+/// loop history is an accepted, documented fail-open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fingerprint {
+    Bytes { len: u64, hash64: u64 },
+    Unreadable,
+}
+
+// Custom serde (P4): the bare derive would emit `{"Bytes":{...}}` /
+// `"Unreadable"`, contradicting the spec's committed `{ len, hash64 } |
+// "unreadable"` shape. Pinned by `fingerprint_json_shape_pinned` below.
+impl Serialize for Fingerprint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            Fingerprint::Bytes { len, hash64 } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("len", len)?;
+                map.serialize_entry("hash64", hash64)?;
+                map.end()
+            }
+            Fingerprint::Unreadable => serializer.serialize_str("unreadable"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Fingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FingerprintVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FingerprintVisitor {
+            type Value = Fingerprint;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a fingerprint object `{len, hash64}` or the bare string \"unreadable\"",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Fingerprint, E>
+            where
+                E: serde::de::Error,
+            {
+                if v == "unreadable" {
+                    Ok(Fingerprint::Unreadable)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Fingerprint, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut len: Option<u64> = None;
+                let mut hash64: Option<u64> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "len" => len = Some(map.next_value()?),
+                        "hash64" => hash64 = Some(map.next_value()?),
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                let len = len.ok_or_else(|| serde::de::Error::missing_field("len"))?;
+                let hash64 = hash64.ok_or_else(|| serde::de::Error::missing_field("hash64"))?;
+                Ok(Fingerprint::Bytes { len, hash64 })
+            }
+        }
+
+        deserializer.deserialize_any(FingerprintVisitor)
+    }
+}
+
+/// Fingerprint a byte slice: `(len, hash64)` via std `DefaultHasher`.
+/// Cross-release instability is documented on [`Fingerprint`] itself.
+#[must_use]
+pub fn fingerprint_bytes(bytes: &[u8]) -> Fingerprint {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Fingerprint::Bytes {
+        len,
+        hash64: hasher.finish(),
+    }
+}
+
+/// Fingerprint a file on disk; an unreadable file (missing, permissions,
+/// I/O error) maps to the `Unreadable` sentinel (spec §5.1 point 1).
+fn fingerprint_file(path: &Path) -> Fingerprint {
+    std::fs::read(path).map_or(Fingerprint::Unreadable, |bytes| fingerprint_bytes(&bytes))
+}
+
+// ── Persisted state ──────────────────────────────────────────────────────
+
+/// One recorded daemon start (spec §3 `crash-loop.json.starts[]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct StartEntry {
+    pub epoch_s: u64,
+    pub fingerprint: Fingerprint,
+    /// Join key to `discount-<nonce>` files (spec §3 F6) — there is no
+    /// per-entry `discounted` field; a stray duplicate-instance boot is
+    /// disowned by an out-of-band file, never a rewrite of this entry.
+    pub nonce: u64,
+}
+
+/// `crash-loop.json` — spec §3. Capped at 10 most recent entries.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct CrashLoopState {
+    pub schema_version: u32,
+    pub starts: Vec<StartEntry>,
+    pub rollback_active: bool,
+    pub rolled_back_from: Option<Fingerprint>,
+}
+
+impl Default for CrashLoopState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            starts: Vec::new(),
+            rollback_active: false,
+            rolled_back_from: None,
+        }
+    }
+}
+
+/// Cap on the number of most-recent start entries kept in `crash-loop.json`.
+const MAX_STARTS: usize = 10;
+
+// ── Verdict ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    Proceed,
+    RollBack,
+    ContinueRollback,
+}
+
+/// The pure result of one [`decide`] call (spec §5.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Verdict {
+    pub action: Action,
+    pub clear_rollback_active: bool,
+    pub retry_after_quiet: bool,
+    /// Drives `config_rollback_retry` / `lkg_missing_rollback_disarmed` +
+    /// the re-parked pending message.
+    pub lkg_missing_disarmed: bool,
+}
+
+/// Facts about `last-known-good.toml` that `decide` needs, precomputed by
+/// `prepare` (I/O) so `decide` itself stays pure (spec §3/§5.2 P7/P14). The
+/// byte-compare fact is the ONLY channel through which `decide` learns
+/// whether the current config matches the LKG — never a fingerprint
+/// equality shortcut.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LkgInfo {
+    pub exists: bool,
+    pub validates: bool,
+    pub bytes_equal_current: bool,
+}
+
+/// A log event `prepare` wants the caller to emit once logging is
+/// initialised (spec §5.1 — recording happens exactly once inside
+/// `prepare`, before logging exists; the events themselves are deferred).
+#[derive(Clone, PartialEq, Debug)]
+pub enum DeferredEvent {
+    CrashLoopDetected {
+        count: u32,
+    },
+    RollbackBoot {
+        failed_fp: Fingerprint,
+        lkg_fp: Fingerprint,
+        detail: String,
+    },
+    RollbackContinued,
+    RollbackRetry {
+        message: String,
+    },
+    LkgMissingRollbackDisarmed,
+}
+
+/// The outcome of `prepare`: which config to attempt building, the nonce
+/// this boot recorded itself under (the exact join key `record_discount`
+/// must reuse on lock failure — P2), any events to log once logging exists,
+/// and a pending-reload banner message for rollback/retry paths.
+///
+/// Deliberately carries NO write-back intent fields (P12 reversal) —
+/// `prepare` performs every verdict-driven `crash-loop.json` write itself,
+/// in the same atomic rewrite as the start-entry record.
+#[derive(Clone, PartialEq, Debug)]
+pub struct BootPlan {
+    pub chosen_config: PathBuf,
+    pub nonce: u64,
+    pub deferred_events: Vec<DeferredEvent>,
+    pub pending_message: Option<String>,
+}
+
+/// Runtime-only bundle a later task's `boot()` needs (spec §5.1).
+///
+/// T1 note: `sd_notify` is deliberately NOT a field yet — `SdNotify`
+/// (`dormantd/src/sd_notify.rs`) does not exist until Task 2. The
+/// orchestrator's decision for this task is to land `BootInputs` here with
+/// this doc placeholder and no `sd_notify` field; Task 2/5 add it
+/// (`with_sd_notify` seam, spec §6.2) once the type exists. See
+/// `boot_inputs_field_list_is_minimal` below, which pins the CURRENT
+/// (pre-T5) field list — that test must be extended, not silently
+/// invalidated, when `sd_notify` lands.
+///
+/// TODO(T5): add `pub sd_notify: SdNotify` once `dormantd::sd_notify`
+/// lands (spec §5.1/§6.2 — the injected readiness/watchdog seam).
+pub struct BootInputs {
+    pub creds_path: PathBuf,
+    pub strictness: Strictness,
+    pub state_dir: PathBuf,
+    pub lock_path: PathBuf,
+}
+
+// ── decide: pure verdict ────────────────────────────────────────────────
+
+/// Pure crash-loop verdict — spec §5.2's evaluation order EXACTLY:
+///
+/// 1. Compute `clear_rollback_active` = (F2) `current != rolled_back_from`
+///    OR (R2-M4) the previous non-discounted start entry is older than
+///    [`CRASH_LOOP_WINDOW`].
+/// 2. If cleared via the AGE leg with bytes UNCHANGED (fp does NOT differ):
+///    `Proceed`, `retry_after_quiet = true` — evaluated BEFORE step 4, so
+///    quiet-retry takes precedence over sticky `ContinueRollback`.
+/// 3. Else if `rollback_active` and the LKG is missing/invalid: `Proceed`,
+///    `clear_rollback_active = true`, `lkg_missing_disarmed = true`.
+/// 4. Else if `rollback_active`, fp unchanged, and the LKG exists+validates:
+///    `ContinueRollback` (sticky substitution, no new counting).
+/// 5. Else `RollBack` iff ALL of: (a) ≥ [`CRASH_LOOP_THRESHOLD`]
+///    non-discounted starts within [`CRASH_LOOP_WINDOW`] including this
+///    one; (b) all of those share `current`'s fingerprint; (c) the current
+///    config's bytes differ from the LKG's (`!lkg.bytes_equal_current`);
+///    (d) an LKG exists; (e) `rollback_active` is not already true; (f)
+///    `lkg_rollback_enabled`. `RollBack` always forces
+///    `clear_rollback_active = false`. Else `Proceed` (with step 1's
+///    `clear_rollback_active`, unmodified).
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "the plan T1 interface pins `&HashSet<u64>` literally; a generic BuildHasher \
+              parameter would be a signature deviation, not a real hasher-generality need"
+)]
+pub fn decide(
+    state: &CrashLoopState,
+    discount_nonces: &HashSet<u64>,
+    lkg: &LkgInfo,
+    current: Fingerprint,
+    now_epoch_s: u64,
+    lkg_rollback_enabled: bool,
+) -> Verdict {
+    let window_s = CRASH_LOOP_WINDOW.as_secs();
+
+    let live: Vec<&StartEntry> = state
+        .starts
+        .iter()
+        .filter(|e| !discount_nonces.contains(&e.nonce))
+        .collect();
+    // The just-recorded current start is assumed to be the last (newest)
+    // live entry (`prepare` appends in chronological order) — "previous"
+    // is the live entry immediately before it.
+    let previous = live.iter().rev().nth(1).copied();
+
+    let fp_differs = Some(current) != state.rolled_back_from;
+    let age_leg = previous.is_some_and(|e| now_epoch_s.saturating_sub(e.epoch_s) > window_s);
+    let clear_rollback_active = fp_differs || age_leg;
+
+    // Step 2 — quiet-period retry: cleared via the AGE leg only, bytes
+    // unchanged. Checked BEFORE step 4 (sticky) — precedence is pinned by
+    // `quiet_period_clears_and_retries_loudly`.
+    if age_leg && !fp_differs {
+        return Verdict {
+            action: Action::Proceed,
+            clear_rollback_active: true,
+            retry_after_quiet: true,
+            lkg_missing_disarmed: false,
+        };
+    }
+
+    // Step 3 — LKG missing/invalid mid-storm: disarm loudly.
+    if state.rollback_active && (!lkg.exists || !lkg.validates) {
+        return Verdict {
+            action: Action::Proceed,
+            clear_rollback_active: true,
+            retry_after_quiet: false,
+            lkg_missing_disarmed: true,
+        };
+    }
+
+    // Step 4 — sticky ContinueRollback.
+    if state.rollback_active && !fp_differs && lkg.exists && lkg.validates {
+        return Verdict {
+            action: Action::ContinueRollback,
+            clear_rollback_active: false,
+            retry_after_quiet: false,
+            lkg_missing_disarmed: false,
+        };
+    }
+
+    // Step 5 — counted crash-loop RollBack.
+    let (total_in_window, matching) =
+        same_fingerprint_window_stats(state, discount_nonces, current, now_epoch_s);
+    let threshold_met = total_in_window >= CRASH_LOOP_THRESHOLD;
+    let all_same_fingerprint = total_in_window > 0 && matching == total_in_window;
+    let bytes_differ_from_lkg = !lkg.bytes_equal_current;
+    let lkg_exists = lkg.exists;
+    let not_already_rolled_back = !state.rollback_active;
+    let gate_enabled = lkg_rollback_enabled;
+
+    if threshold_met
+        && all_same_fingerprint
+        && bytes_differ_from_lkg
+        && lkg_exists
+        && not_already_rolled_back
+        && gate_enabled
+    {
+        return Verdict {
+            action: Action::RollBack,
+            clear_rollback_active: false,
+            retry_after_quiet: false,
+            lkg_missing_disarmed: false,
+        };
+    }
+
+    Verdict {
+        action: Action::Proceed,
+        clear_rollback_active,
+        retry_after_quiet: false,
+        lkg_missing_disarmed: false,
+    }
+}
+
+/// Count of non-discounted starts within [`CRASH_LOOP_WINDOW`] (`total`,
+/// spec §5.2 condition a's population) and, among those, how many share
+/// `current`'s fingerprint (`matching`, condition b's numerator). Also used
+/// by `prepare` to decide whether a plain step-5 `Proceed` still deserves a
+/// loud `crash_loop_detected` warning (spec §5.2's closing paragraph: a
+/// real same-config crash loop that didn't roll back for some other reason
+/// — no LKG, bytes already match, already rolled back, or the gate is off
+/// — is still worth surfacing).
+fn same_fingerprint_window_stats(
+    state: &CrashLoopState,
+    discount_nonces: &HashSet<u64>,
+    current: Fingerprint,
+    now_epoch_s: u64,
+) -> (u32, u32) {
+    let window_s = CRASH_LOOP_WINDOW.as_secs();
+    let mut total = 0u32;
+    let mut matching = 0u32;
+    for e in &state.starts {
+        if discount_nonces.contains(&e.nonce) {
+            continue;
+        }
+        if now_epoch_s.saturating_sub(e.epoch_s) > window_s {
+            continue;
+        }
+        total += 1;
+        if e.fingerprint == current {
+            matching += 1;
+        }
+    }
+    (total, matching)
+}
+
+// ── prepare: sync I/O shell ──────────────────────────────────────────────
+
+/// Record this boot's start, decide, and perform every verdict-driven
+/// `crash-loop.json` write — sync, no logging (spec §5.1: called before
+/// logging is initialised; events are deferred into the returned
+/// [`BootPlan`]).
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single sync shell that must record + decide + write in one atomic pass \
+              (spec §5.1); splitting it would scatter the verdict-driven write ownership \
+              this function exists to hold in one place (P12)"
+)]
+pub fn prepare(
+    config_path: &Path,
+    creds_path: &Path,
+    state_dir: &Path,
+    strictness: Strictness,
+    lkg_rollback_enabled: bool,
+) -> BootPlan {
+    // Not read in this task: `App::build` (a later task) is the sole
+    // consumer of `creds_path`; `prepare` only fingerprints/loads-for-
+    // validation, neither of which touches credentials.
+    let _ = creds_path;
+
+    let now = now_epoch_s();
+    let nonce: u64 = rand::random();
+
+    let discount_nonces = collect_and_sweep_discounts(state_dir, now);
+    let mut state = load_crash_loop_state(state_dir);
+
+    let current_fp = fingerprint_file(config_path);
+    state.starts.push(StartEntry {
+        epoch_s: now,
+        fingerprint: current_fp,
+        nonce,
+    });
+    if state.starts.len() > MAX_STARTS {
+        let excess = state.starts.len() - MAX_STARTS;
+        state.starts.drain(0..excess);
+    }
+
+    let lkg_path = state_dir.join(LKG_FILE);
+    let lkg_info = build_lkg_info(&lkg_path, config_path, strictness);
+
+    let verdict = decide(
+        &state,
+        &discount_nonces,
+        &lkg_info,
+        current_fp,
+        now,
+        lkg_rollback_enabled,
+    );
+
+    match verdict.action {
+        Action::RollBack => {
+            state.rollback_active = true;
+            state.rolled_back_from = Some(current_fp);
+        }
+        Action::ContinueRollback => {
+            // Stays active; `rolled_back_from` is already correct.
+        }
+        Action::Proceed => {
+            if verdict.clear_rollback_active {
+                state.rollback_active = false;
+                state.rolled_back_from = None;
+            }
+        }
+    }
+
+    // Unconditional write, BEFORE any build attempt (spec §3): a corrupt
+    // write attempt must never block boot, so failures are swallowed here
+    // exactly like the samsung_ip token-state precedent.
+    let _ = write_atomic_json(state_dir, CRASH_LOOP_FILE, &state);
+
+    let (chosen_config, pending_message, deferred_events) = match verdict.action {
+        Action::RollBack => {
+            let lkg_fp = fingerprint_file(&lkg_path);
+            let detail = format!(
+                "crash-loop threshold reached for '{}'; rolling back to last-known-good",
+                config_path.display()
+            );
+            let message = format!(
+                "your latest config failed and was rolled back to last-known-good — \
+                 fix it and reload: {detail}"
+            );
+            (
+                lkg_path.clone(),
+                Some(message),
+                vec![DeferredEvent::RollbackBoot {
+                    failed_fp: current_fp,
+                    lkg_fp,
+                    detail,
+                }],
+            )
+        }
+        Action::ContinueRollback => (
+            lkg_path.clone(),
+            Some(
+                "sticky rollback active; latest config is still being held back — edit it, \
+                 wait past CRASH_LOOP_WINDOW for a loud retry, or set \
+                 watchdog.lkg_rollback_enabled = false while debugging"
+                    .to_string(),
+            ),
+            vec![DeferredEvent::RollbackContinued],
+        ),
+        Action::Proceed if verdict.retry_after_quiet => {
+            let message = "retrying latest config after a quiet period; to stop this cycle, \
+                            edit the config, wait past CRASH_LOOP_WINDOW between restarts, or \
+                            set watchdog.lkg_rollback_enabled = false while debugging"
+                .to_string();
+            (
+                config_path.to_path_buf(),
+                Some(message.clone()),
+                vec![DeferredEvent::RollbackRetry { message }],
+            )
+        }
+        Action::Proceed if verdict.lkg_missing_disarmed => (
+            config_path.to_path_buf(),
+            None,
+            vec![DeferredEvent::LkgMissingRollbackDisarmed],
+        ),
+        Action::Proceed => {
+            let (total, matching) =
+                same_fingerprint_window_stats(&state, &discount_nonces, current_fp, now);
+            let events = if total >= CRASH_LOOP_THRESHOLD && total == matching {
+                vec![DeferredEvent::CrashLoopDetected { count: total }]
+            } else {
+                Vec::new()
+            };
+            (config_path.to_path_buf(), None, events)
+        }
+    };
+
+    BootPlan {
+        chosen_config,
+        nonce,
+        deferred_events,
+        pending_message,
+    }
+}
+
+/// Build [`LkgInfo`] for `lkg_path`: existence, `load_config`
+/// validation (spec §3 F16 — same trust class as any config file), and a
+/// direct byte comparison against `config_path`'s current bytes (spec §3/
+/// §5.2 F7 — never a fingerprint-equality shortcut; F14: an unreadable
+/// current file is treated as differing).
+fn build_lkg_info(lkg_path: &Path, config_path: &Path, strictness: Strictness) -> LkgInfo {
+    if !lkg_path.exists() {
+        return LkgInfo {
+            exists: false,
+            validates: false,
+            bytes_equal_current: false,
+        };
+    }
+    let validates = load_config(lkg_path, strictness).is_ok();
+    let bytes_equal_current = files_bytes_equal(lkg_path, config_path);
+    LkgInfo {
+        exists: true,
+        validates,
+        bytes_equal_current,
+    }
+}
+
+fn files_bytes_equal(a: &Path, b: &Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+// ── crash-loop.json load ────────────────────────────────────────────────
+
+fn load_crash_loop_state(state_dir: &Path) -> CrashLoopState {
+    let path = state_dir.join(CRASH_LOOP_FILE);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return CrashLoopState::default();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+// ── discount files ───────────────────────────────────────────────────────
+
+/// Create `state_dir()/discount-<nonce>` — an atomic, uniquely-named create
+/// (`O_EXCL`), never a read-modify-write of the shared `crash-loop.json`
+/// (spec §3 F6). Idempotent: a duplicate call for the same nonce is
+/// harmless.
+pub fn record_discount(state_dir: &Path, nonce: u64) {
+    if std::fs::create_dir_all(state_dir).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = state_dir.join(format!("{DISCOUNT_PREFIX}{nonce}"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(_) | Err(_) => {
+            // Ok: created. AlreadyExists: idempotent, another boot (or a
+            // previous call) already discounted this nonce. Any other
+            // error: best-effort, never blocks — discount is a courtesy,
+            // not a safety boundary.
+        }
+    }
+}
+
+/// Collect the live discount-nonce set, sweeping (deleting) any
+/// `discount-<nonce>` file older than [`CRASH_LOOP_WINDOW`] first (spec §3:
+/// "The next boot's writer sweeps discount files older than
+/// `CRASH_LOOP_WINDOW`" — deepseek nit: dedup falls out naturally from
+/// collecting into a `HashSet`).
+fn collect_and_sweep_discounts(state_dir: &Path, now_epoch_s: u64) -> HashSet<u64> {
+    let mut set = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return set;
+    };
+    let window_s = CRASH_LOOP_WINDOW.as_secs();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(nonce_str) = name_str.strip_prefix(DISCOUNT_PREFIX) else {
+            continue;
+        };
+        let Ok(nonce) = nonce_str.parse::<u64>() else {
+            continue;
+        };
+        let mtime_epoch_s = entry.metadata().ok().and_then(|m| epoch_s_of(&m));
+        let stale = mtime_epoch_s.is_some_and(|mtime| now_epoch_s.saturating_sub(mtime) > window_s);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+        set.insert(nonce);
+    }
+    set
+}
+
+fn epoch_s_of(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+// ── atomic write (samsung_ip.rs:497-548 pattern) ────────────────────────
+
+/// Atomically write `value` as JSON to `<dir>/<filename>` (temp file, same
+/// dir, then rename). Directory `0o700`, file `0o600` on Unix.
+fn write_atomic_json<T: Serialize>(dir: &Path, filename: &str, value: &T) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let raw = serde_json::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let final_path = dir.join(filename);
+    let tmp_path = dir.join(format!("{filename}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        }
+        f.write_all(raw.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(epoch_s: u64, fp: Fingerprint, nonce: u64) -> StartEntry {
+        StartEntry {
+            epoch_s,
+            fingerprint: fp,
+            nonce,
+        }
+    }
+
+    fn state_with(starts: Vec<StartEntry>) -> CrashLoopState {
+        CrashLoopState {
+            schema_version: 1,
+            starts,
+            rollback_active: false,
+            rolled_back_from: None,
+        }
+    }
+
+    fn lkg(exists: bool, validates: bool, bytes_equal_current: bool) -> LkgInfo {
+        LkgInfo {
+            exists,
+            validates,
+            bytes_equal_current,
+        }
+    }
+
+    // ── §5.2 verdict matrix ──────────────────────────────────────────────
+
+    #[test]
+    fn two_starts_proceed_three_rolls_back() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        // Two starts within the window: threshold not met.
+        let two = state_with(vec![entry(now - 120, fp_a, 1), entry(now, fp_a, 2)]);
+        let v = decide(&two, &empty, &lkg(true, true, false), fp_a, now, true);
+        assert_eq!(v.action, Action::Proceed, "2 starts must not roll back");
+
+        // Three starts, all within the window: rolls back.
+        let three = state_with(vec![
+            entry(now - 240, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        let v = decide(&three, &empty, &lkg(true, true, false), fp_a, now, true);
+        assert_eq!(
+            v.action,
+            Action::RollBack,
+            "3 starts in-window must roll back"
+        );
+        assert!(!v.clear_rollback_active, "RollBack forces clear=false");
+
+        // Window edge: the oldest start is 6m+1s old -> excluded, only 2
+        // remain in-window -> Proceed.
+        let edge = state_with(vec![
+            entry(now - 361, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        let v = decide(&edge, &empty, &lkg(true, true, false), fp_a, now, true);
+        assert_eq!(
+            v.action,
+            Action::Proceed,
+            "the 6m+1s-old start must fall outside the window"
+        );
+    }
+
+    #[test]
+    fn mixed_fingerprints_proceed() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let fp_b = fingerprint_bytes(b"config-b");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        let mixed = state_with(vec![
+            entry(now - 240, fp_a, 1),
+            entry(now - 120, fp_b, 2),
+            entry(now, fp_a, 3),
+        ]);
+        let v = decide(&mixed, &empty, &lkg(true, true, false), fp_a, now, true);
+        assert_eq!(
+            v.action,
+            Action::Proceed,
+            "condition (b) fails: not all same fp"
+        );
+    }
+
+    #[test]
+    fn bytes_equal_lkg_proceeds_with_crash_loop_detected() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        let three = state_with(vec![
+            entry(now - 240, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        // bytes_equal_current = true: condition (c) fails, exercising
+        // lkg.bytes_equal_current, NOT fingerprint hash equality (P13).
+        let v = decide(&three, &empty, &lkg(true, true, true), fp_a, now, true);
+        assert_eq!(v.action, Action::Proceed);
+
+        // The underlying pattern-detection data IS available to `prepare`
+        // (this is the data `DeferredEvent::CrashLoopDetected` is built
+        // from) — conditions (a) and (b) both hold even though the overall
+        // verdict is Proceed.
+        let (total, matching) = same_fingerprint_window_stats(&three, &empty, fp_a, now);
+        assert_eq!(total, 3);
+        assert_eq!(matching, 3);
+        assert!(total >= CRASH_LOOP_THRESHOLD && total == matching);
+    }
+
+    #[test]
+    fn fingerprint_json_shape_pinned() {
+        let fp = Fingerprint::Bytes {
+            len: 12,
+            hash64: 0xdead_beef,
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        assert!(json.contains("\"len\":12"), "got {json}");
+        assert!(json.contains("\"hash64\":"), "got {json}");
+        assert!(!json.contains("\"Bytes\""), "got {json}");
+
+        let unreadable_json = serde_json::to_string(&Fingerprint::Unreadable).unwrap();
+        assert_eq!(unreadable_json, "\"unreadable\"");
+        assert!(!unreadable_json.contains("Unreadable"));
+
+        let back: Fingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fp);
+        let back2: Fingerprint = serde_json::from_str(&unreadable_json).unwrap();
+        assert_eq!(back2, Fingerprint::Unreadable);
+    }
+
+    #[test]
+    fn record_discount_atomic_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        record_discount(dir.path(), 42);
+        assert!(dir.path().join("discount-42").exists());
+        // Second call: idempotent, no panic, file still present.
+        record_discount(dir.path(), 42);
+        assert!(dir.path().join("discount-42").exists());
+    }
+
+    #[test]
+    fn boot_inputs_field_list_is_minimal() {
+        // Pins the CURRENT (pre-T5) field list: creds_path, strictness,
+        // state_dir, lock_path — no socket override, no sd_notify yet
+        // (see the TODO(T5) doc comment on `BootInputs`). If this struct
+        // literal fails to compile, the field list has drifted from this
+        // pin and the test must be amended alongside the code change.
+        let _inputs = BootInputs {
+            creds_path: PathBuf::from("credentials.toml"),
+            strictness: Strictness::Strict,
+            state_dir: PathBuf::from("/tmp/state"),
+            lock_path: PathBuf::from("/tmp/dormant.lock"),
+        };
+    }
+
+    #[test]
+    fn no_lkg_proceeds() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        // Even with a genuine 3-start same-fingerprint pattern, condition
+        // (d) (an LKG must exist) blocks RollBack.
+        let three = state_with(vec![
+            entry(now - 240, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        let v = decide(&three, &empty, &lkg(false, false, false), fp_a, now, true);
+        assert_eq!(v.action, Action::Proceed, "no LKG must never roll back");
+    }
+
+    #[test]
+    fn discounted_starts_ignored() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let mut discounts = HashSet::new();
+        discounts.insert(1u64);
+        discounts.insert(2u64);
+
+        // 3 raw entries, but 2 are discounted -> only 1 live -> below
+        // threshold -> Proceed.
+        let three = state_with(vec![
+            entry(now - 240, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        let v = decide(&three, &discounts, &lkg(true, true, false), fp_a, now, true);
+        assert_eq!(
+            v.action,
+            Action::Proceed,
+            "discounted starts must not count"
+        );
+    }
+
+    #[test]
+    fn sticky_continue_rollback() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        let mut state = state_with(vec![entry(now - 30, fp_a, 1), entry(now, fp_a, 2)]);
+        state.rollback_active = true;
+        state.rolled_back_from = Some(fp_a);
+
+        let v = decide(&state, &empty, &lkg(true, true, true), fp_a, now, true);
+        assert_eq!(v.action, Action::ContinueRollback);
+        assert!(!v.clear_rollback_active);
+        assert!(!v.retry_after_quiet);
+        assert!(!v.lkg_missing_disarmed);
+    }
+
+    #[test]
+    fn bytes_changed_clears_and_proceeds() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let fp_b = fingerprint_bytes(b"config-b");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        let mut state = state_with(vec![entry(now - 30, fp_a, 1), entry(now, fp_b, 2)]);
+        state.rollback_active = true;
+        state.rolled_back_from = Some(fp_a);
+
+        // current is fp_b: the operator edited the config -> F2 clear leg.
+        let v = decide(&state, &empty, &lkg(true, true, false), fp_b, now, true);
+        assert_eq!(v.action, Action::Proceed);
+        assert!(
+            v.clear_rollback_active,
+            "bytes-changed must clear rollback_active"
+        );
+        assert!(!v.retry_after_quiet);
+    }
+
+    #[test]
+    fn quiet_period_clears_and_retries_loudly() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        // previous start is > CRASH_LOOP_WINDOW old, bytes UNCHANGED, and
+        // sticky conditions (rollback_active + fp unchanged + LKG good)
+        // ALSO hold -> quiet-retry must win (spec §5.2 step 2 before 4).
+        let mut state = state_with(vec![entry(now - 400, fp_a, 1), entry(now, fp_a, 2)]);
+        state.rollback_active = true;
+        state.rolled_back_from = Some(fp_a);
+
+        let v = decide(&state, &empty, &lkg(true, true, true), fp_a, now, true);
+        assert_eq!(
+            v.action,
+            Action::Proceed,
+            "quiet-retry must win over sticky ContinueRollback"
+        );
+        assert!(v.clear_rollback_active);
+        assert!(v.retry_after_quiet);
+        assert!(!v.lkg_missing_disarmed);
+    }
+
+    #[test]
+    fn lkg_missing_mid_storm_disarms_loudly() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        let mut state = state_with(vec![entry(now - 30, fp_a, 1), entry(now, fp_a, 2)]);
+        state.rollback_active = true;
+        state.rolled_back_from = Some(fp_a);
+
+        let v = decide(&state, &empty, &lkg(false, false, false), fp_a, now, true);
+        assert_eq!(v.action, Action::Proceed);
+        assert!(v.clear_rollback_active);
+        assert!(v.lkg_missing_disarmed);
+        assert!(!v.retry_after_quiet);
+    }
+
+    #[test]
+    fn counted_rollback_gate_false_proceeds() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        let three = state_with(vec![
+            entry(now - 240, fp_a, 1),
+            entry(now - 120, fp_a, 2),
+            entry(now, fp_a, 3),
+        ]);
+        // lkg_rollback_enabled = false disables ONLY counted rollback.
+        let v = decide(&three, &empty, &lkg(true, true, false), fp_a, now, false);
+        assert_eq!(
+            v.action,
+            Action::Proceed,
+            "gate=false must suppress counted RollBack"
+        );
+    }
+
+    #[test]
+    fn unreadable_sentinel_matrix() {
+        let now = 1_000_000u64;
+        let empty = HashSet::new();
+
+        // (b): unreadable == unreadable across starts -> counts as "same
+        // fingerprint" -> a persistently unreadable config IS a loop.
+        let three = state_with(vec![
+            entry(now - 240, Fingerprint::Unreadable, 1),
+            entry(now - 120, Fingerprint::Unreadable, 2),
+            entry(now, Fingerprint::Unreadable, 3),
+        ]);
+        // An unreadable current file can never byte-equal a readable LKG,
+        // so bytes_equal_current is false (condition c holds).
+        let v = decide(
+            &three,
+            &empty,
+            &lkg(true, true, false),
+            Fingerprint::Unreadable,
+            now,
+            true,
+        );
+        assert_eq!(v.action, Action::RollBack);
+
+        // (c)/immediate: Unreadable never equals a real Bytes fingerprint.
+        let real = fingerprint_bytes(b"anything");
+        assert_ne!(Fingerprint::Unreadable, real);
+    }
+
+    #[test]
+    fn corrupt_state_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(CRASH_LOOP_FILE), b"{ not json").unwrap();
+
+        let state = load_crash_loop_state(dir.path());
+        assert_eq!(state, CrashLoopState::default());
+
+        // Absent file: also Default.
+        let dir2 = tempfile::tempdir().unwrap();
+        let state2 = load_crash_loop_state(dir2.path());
+        assert_eq!(state2, CrashLoopState::default());
+    }
+
+    #[test]
+    fn cap_truncates_to_ten() {
+        let fp_a = fingerprint_bytes(b"config-a");
+        let starts: Vec<StartEntry> = (0..15u64).map(|i| entry(i, fp_a, i)).collect();
+        let mut state = state_with(starts);
+        if state.starts.len() > MAX_STARTS {
+            let excess = state.starts.len() - MAX_STARTS;
+            state.starts.drain(0..excess);
+        }
+        assert_eq!(state.starts.len(), MAX_STARTS);
+        // Most-recent-kept: the last entry (nonce 14) must survive.
+        assert_eq!(state.starts.last().unwrap().nonce, 14);
+    }
+
+    // ── prepare-level tests: state writes are observable on disk ────────
+
+    fn write_config(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn prepare_records_start_and_writes_crash_loop_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(dir.path(), b"config_version = 1\n");
+        let creds = dir.path().join("credentials.toml");
+        let state_dir = dir.path().join("state");
+
+        let plan = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
+        assert_eq!(plan.chosen_config, config);
+        assert!(plan.deferred_events.is_empty());
+        assert!(plan.pending_message.is_none());
+
+        let raw = std::fs::read_to_string(state_dir.join(CRASH_LOOP_FILE)).unwrap();
+        let state: CrashLoopState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(state.starts.len(), 1);
+        assert_eq!(state.starts[0].nonce, plan.nonce);
+        assert!(!state.rollback_active);
+
+        // Directory / file permissions (samsung_ip pattern).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            let file_mode = std::fs::metadata(state_dir.join(CRASH_LOOP_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn prepare_counted_rollback_writes_state_and_chooses_lkg() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_bytes = b"config_version = 1\nbroken = true\n";
+        let config = write_config(dir.path(), config_bytes);
+        let creds = dir.path().join("credentials.toml");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // Seed two prior same-fingerprint starts within the window.
+        let fp = fingerprint_bytes(config_bytes);
+        let now = now_epoch_s();
+        let seeded = CrashLoopState {
+            schema_version: 1,
+            starts: vec![entry(now - 60, fp, 101), entry(now - 30, fp, 102)],
+            rollback_active: false,
+            rolled_back_from: None,
+        };
+        write_atomic_json(&state_dir, CRASH_LOOP_FILE, &seeded).unwrap();
+
+        // A different, valid LKG file.
+        let lkg_bytes = b"config_version = 1\n";
+        std::fs::write(state_dir.join(LKG_FILE), lkg_bytes).unwrap();
+
+        let plan = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
+
+        assert_eq!(plan.chosen_config, state_dir.join(LKG_FILE));
+        assert!(
+            matches!(
+                plan.deferred_events.as_slice(),
+                [DeferredEvent::RollbackBoot { .. }]
+            ),
+            "got {:?}",
+            plan.deferred_events
+        );
+        assert!(plan.pending_message.is_some());
+
+        let raw = std::fs::read_to_string(state_dir.join(CRASH_LOOP_FILE)).unwrap();
+        let state: CrashLoopState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            state.starts.len(),
+            3,
+            "this boot's start must also be recorded"
+        );
+        assert!(state.rollback_active);
+        assert_eq!(state.rolled_back_from, Some(fp));
+    }
+
+    #[test]
+    fn prepare_sweeps_stale_discount_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(dir.path(), b"config_version = 1\n");
+        let creds = dir.path().join("credentials.toml");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // A discount file whose mtime we push far into the past (older
+        // than CRASH_LOOP_WINDOW) must be swept by the next `prepare`.
+        let stale_path = state_dir.join("discount-999");
+        let f = std::fs::File::create(&stale_path).unwrap();
+        let far_past = std::time::SystemTime::now() - CRASH_LOOP_WINDOW - Duration::from_secs(3600);
+        f.set_modified(far_past).unwrap();
+        drop(f);
+
+        let _ = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
+        assert!(!stale_path.exists(), "stale discount file must be swept");
+    }
+
+    #[test]
+    fn record_discount_then_prepare_ignores_that_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_bytes = b"config_version = 1\nx = 1\n";
+        let config = write_config(dir.path(), config_bytes);
+        let creds = dir.path().join("credentials.toml");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let fp = fingerprint_bytes(config_bytes);
+        let now = now_epoch_s();
+        let seeded = CrashLoopState {
+            schema_version: 1,
+            starts: vec![entry(now - 60, fp, 201), entry(now - 30, fp, 202)],
+            rollback_active: false,
+            rolled_back_from: None,
+        };
+        write_atomic_json(&state_dir, CRASH_LOOP_FILE, &seeded).unwrap();
+        // Discount one of the two seeded starts.
+        record_discount(&state_dir, 201);
+
+        // LKG differs, so if all 3 (this boot's + the 2 seeded) counted,
+        // it would roll back; with one discounted only 2 live entries
+        // remain -> below threshold -> Proceed.
+        std::fs::write(
+            state_dir.join(LKG_FILE),
+            b"config_version = 1\ndiffers = true\n",
+        )
+        .unwrap();
+
+        let plan = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
+        assert_eq!(
+            plan.chosen_config, config,
+            "discounted start must not trigger rollback"
+        );
+    }
+}

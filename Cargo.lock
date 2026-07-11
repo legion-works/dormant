@@ -1053,6 +1053,7 @@ dependencies = [
  "indexmap",
  "libc",
  "notify",
+ "rand 0.8.6",
  "reqwest",
  "rustix 1.1.4",
  "serde",

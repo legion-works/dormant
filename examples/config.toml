@@ -55,6 +55,19 @@ config_version = 1
 # cooldown = "15m"                 # minimum time between repeat notices per display (>= 1m)
 # notify_recovery = true           # send a Normal-urgency notice when a failing display recovers
 
+# ── Watchdog and rollback ────────────────────────────────────────────────────
+#
+# Optional: last-known-good (LKG) config snapshotting, boot-time rollback on
+# a bad config or a crash/wedge loop, and systemd watchdog pings (Type=notify
+# unit only — see crates/dormantd/systemd/dormant.service). See
+# docs/src/watchdog-rollback.md. Enabled by default; every key below shows
+# its default, so this section can be omitted entirely. WatchdogSec and ping
+# cadence are NOT config here — they come from systemd's own environment.
+# [watchdog]
+# lkg_enabled = true           # last-known-good snapshotting + boot rollback
+# lkg_rollback_enabled = true  # counted crash-loop rollback; disable during rapid restart debugging
+# stability_window = "5m"      # healthy runtime before a config is promoted to LKG (>= 30s)
+
 [daemon]
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"

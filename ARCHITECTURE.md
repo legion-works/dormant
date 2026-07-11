@@ -12,7 +12,7 @@ Crate map, data flow, and where-to-find-it guide for the dormant codebase.
 | `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI, Samsung Tizen (reachability + power state + token presence); live coalesced `DoctorService` for the daemon + web UI; control-path verification — `dormantctl doctor --exercise <display>` routes an `Exercise` IPC request through the daemon, which pauses the target's rules and steps blank→read→wake→read on the live controller chain to confirm each command actually moved the panel. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
 | `dormant-web` | Loopback-only web dashboard: axum HTTP/WS bridge that reads live engine state and serves a SPA (`crates/dormant-web/webui/`). Optional dependency of `dormantd`, gated behind the `web-ui` Cargo feature — when off, zero web code is compiled | No |
 | `dormant-render` | Local Wayland layer-shell `RenderSink`: software-blank black overlay (final ladder fallback when every display controller failed) and libmpv-driven screensaver overlay (last-resort idle surface). Wayland I/O is `target_os = "linux"`-gated; non-Linux builds expose a no-op stub with the same `LayerShellRenderSink` surface so callers compile unconditionally | No |
-| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, single-instance flock, reload handling, panel-wear tracker (`wear_tracker.rs` — periodic panel-state sampling through `CommandSink::read_state_sampled`, ledger persistence to `wear_state_dir()`, advisory event emission), desktop failure notifier (`notifier.rs` — pure `decide`/`reconcile` policy over a daemon-lifetime `NotifyState`, `ZbusSink` session-bus I/O boundary), dispatch-relevant reload voiding (`reload.rs::zero_changed_displays`/`dispatch_relevant_eq`), optional web UI spawn, logging | **Yes** — `dormantd` |
+| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, single-instance flock, reload handling, panel-wear tracker (`wear_tracker.rs` — periodic panel-state sampling through `CommandSink::read_state_sampled`, ledger persistence to `wear_state_dir()`, advisory event emission), desktop failure notifier (`notifier.rs` — pure `decide`/`reconcile` policy over a daemon-lifetime `NotifyState`, `ZbusSink` session-bus I/O boundary), dispatch-relevant reload voiding (`reload.rs::zero_changed_displays`/`dispatch_relevant_eq`), boot-time crash-loop verdict + LKG state I/O (`boot_guard.rs` — pure `decide`/`should_promote` + sync `prepare` shell), the split boot sequence (`boot.rs::boot`), best-effort `sd_notify` (`sd_notify.rs`), optional web UI spawn, logging | **Yes** — `dormantd` |
 | `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `emergency-wake` (IPC fast path with a direct-hardware fallback when the daemon is unresponsive), `doctor` (per-target subcommands including `samsung`, plus `--exercise <display>` for control-path verification), `pair samsung <host>` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
 | `dormant-tray` | KDE `StatusNotifierItem` tray applet (`ksni`): live icon (Normal / Attention / Paused / Unreachable), pause/resume/blank/wake menu items, tooltip, reconnecting IPC event-stream reader. Linux-only — non-Linux bin prints a notice and exits 1 so cross-platform `cargo check` stays green | **Yes** — `dormant-tray` |
 
@@ -68,17 +68,18 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 | Adjust panel-wear tracking behavior | `dormant-core/src/wear.rs` (pure model — `WearLedger`/`PanelType`/`sanitize_identity_key`/`brightness_norm`) + `dormant-core/src/config/schema.rs` (the `[wear]` and `[displays.<id>].panel_type` TOML keys) + `dormantd/src/wear_tracker.rs` (pure `tick` + async shell — sampling cadence, ledger I/O, advisory latch) + `dormant-web/src/routes/wear.rs` (HTTP exposure — `GET /api/wear`, `GET /api/wear/<display>`) |
 | Add a panel-bus readback / usage-hours seed | Add the per-controller contract to `dormant-core/src/traits.rs` (`DisplayController::read_state`/`read_state_sampled`/`read_usage_hours`/`panel_identity`), implement on the controller in `dormant-displays/src/<name>.rs`, surface the chain-walk on `dormant-displays/src/executor.rs`; serialized per-panel through `dormant-displays/src/vcp_ops.rs` + `dormant-displays/src/ddc_lock.rs` (command-priority discipline) |
 | Adjust failure-notification behavior | `dormantd/src/notifier.rs` (pure `decide`/`reconcile` policy + `NotifyState`/`ZbusSink`) + `dormant-core/src/config/schema.rs` (the `[notifications]` section) + `dormantd/src/reload.rs` (`zero_changed_displays`/`dispatch_relevant_eq` — the reload-voiding gate) + `dormant-tray/src/state.rs` (Failure icon predicate) + `dormant-web/webui/src/app/components/FailureBanner.tsx` (dashboard banner) |
+| Adjust watchdog / boot-rollback behavior | `dormantd/src/boot_guard.rs` (pure `decide` crash-loop verdict + `should_promote` LKG-promotion gate + the sync `prepare` I/O shell) + `dormantd/src/boot.rs` (`boot()` — build/substitute/lock/start, the one boot()-owned immediate-rollback write) + `dormantd/src/sd_notify.rs` (`SdNotify`, `watchdog_interval_from_env`) + `dormantd/src/app.rs` (`watchdog_tick`/`lkg_tick` — the probe arm, LKG candidate bookkeeping, reload step-boundary pings) + `dormant-core/src/config/schema.rs` (`WatchdogConfig`, the `[watchdog]` section) + `crates/dormantd/systemd/dormant.service` (`Type=notify`, `WatchdogSec`) + `dormant-web/webui/src/app/config/WatchdogSection.tsx` (web UI section) |
 
 ## Event and error-code grep anchors
 
 Every log event name and error code is a literal string at the definition site — never `format!`-constructed, never macro-generated. This makes them reliably greppable:
 
 - **Error codes:** `E_CONFIG_INVALID`, `E_CONFIG_UNKNOWN_KEY`, `E_ZONE_CYCLE`, `E_ZONE_UNKNOWN_MEMBER`, `E_CREDS_PERMS`, `E_CREDS_MISSING`, `E_MODE_UNSUPPORTED`, `E_BLANK_FAILED`, `E_WAKE_FAILED`, `E_RELOAD_WAKE_FAILED`, `E_HA_AUTH`, `E_SENSOR_IO`, `E_DISPLAY_IO`, `E_RENDER_UNAVAILABLE`, `E_SCREENSAVER_SOURCE`, `E_IPC` — all defined in `dormant-core/src/error.rs`.
-- **Log events:** grep for `event = "..."` in the source. Key events include `sensor_event`, `zone_transition`, `rule_blank`, `rule_wake`, `wake_failed`, `reload_complete`, `reload_defensive_wake`, `wear_tracker_started`/`_resumed`/`_parked`, `wear_advisory`, `wear_ledger_corrupt`, `wear_ledger_future_version`, `wear_ledger_seeded`, `wear_persist_failed`, `wear_sample_fallback`, `notifier_started`, `notify_sent`, `notify_failed`, `notify_unreachable`, `notify_suppressed`, `notify_events_lagged`, `notify_close_failed` (all defined in `dormantd/src/notifier.rs`).
+- **Log events:** grep for `event = "..."` in the source. Key events include `sensor_event`, `zone_transition`, `rule_blank`, `rule_wake`, `wake_failed`, `reload_complete`, `reload_defensive_wake`, `wear_tracker_started`/`_resumed`/`_parked`, `wear_advisory`, `wear_ledger_corrupt`, `wear_ledger_future_version`, `wear_ledger_seeded`, `wear_persist_failed`, `wear_sample_fallback`, `notifier_started`, `notify_sent`, `notify_failed`, `notify_unreachable`, `notify_suppressed`, `notify_events_lagged`, `notify_close_failed` (all defined in `dormantd/src/notifier.rs`). Watchdog/rollback events: `crash_loop_detected`, `config_rollback_boot`, `config_rollback_continued`, `config_rollback_retry`, `lkg_missing_rollback_disarmed` (`dormantd/src/main.rs` + `boot.rs`), `lkg_saved`, `lkg_save_failed`, `lkg_skipped_dirty`, `lkg_deferred_display_health`, `lkg_promoted_with_unhealthy_display`, `watchdog_probe_failed` (`dormantd/src/app.rs`), `sd_notify_unavailable` (`dormantd/src/sd_notify.rs`).
 - **Wire events** (`DaemonEvent` in `dormant-core/src/rules.rs`): tag is `event` — `sensor_changed`, `zone_changed`, `display_phase`, `config_reloaded`, `wake_retry`, `wake_recovered`, `blank_failure`, `blank_recovered`, `wear_snapshot`, `compensation_advisory`. A `#[serde(other)]` `Unknown` variant keeps older CLIs/WebUI builds streaming past foreign tags rather than failing the iterator (`crates/dormantctl/src/client.rs::EventStream` round-trips them through `DaemonEvent::Unknown`).
 - **Snapshot keys** (`DisplaySnapshot` in `dormant-core/src/rules.rs`): `wake_attempts` (consecutive failed wake attempts, `0` when healthy) and `last_blank_failed` (whether the most recent blank command exhausted its controller chain) — read by the notifier's `reconcile`, the tray's `Failure` icon predicate (`dormant-tray/src/state.rs`), and the web dashboard's failure banner (`dormant-web/webui/src/app/components/FailureBanner.tsx`), independently of each other.
 
-Config keys follow the TOML path: `daemon.log_level`, `sensors.<id>.type`, `zones.<id>.mode`, `displays.<id>.controllers`, `displays.<id>.panel_type`, `rules.<id>.zone`, `wear.<key>`, `notifications.<key>` (`enabled`, `wake_attempt_threshold`, `cooldown`, `notify_recovery`), etc. — all resolved in `dormant-core/src/config/mod.rs`.
+Config keys follow the TOML path: `daemon.log_level`, `sensors.<id>.type`, `zones.<id>.mode`, `displays.<id>.controllers`, `displays.<id>.panel_type`, `rules.<id>.zone`, `wear.<key>`, `notifications.<key>` (`enabled`, `wake_attempt_threshold`, `cooldown`, `notify_recovery`), `watchdog.<key>` (`lkg_enabled`, `lkg_rollback_enabled`, `stability_window`), etc. — all resolved in `dormant-core/src/config/mod.rs`.
 
 ## Panel-wear tracking
 
@@ -181,6 +182,51 @@ ledger above) — a full daemon restart, as opposed to a config reload,
 loses all open episodes and failure counters. See
 [`docs/src/failure-notifications.md`](docs/src/failure-notifications.md)
 for the full trigger/threshold/cooldown semantics and the config keys.
+
+## Watchdog and rollback
+
+Three composed mechanisms, kept separate the same way wear-tracking and
+failure-notifications are — pure decision logic with no I/O, driven by a
+thin async/sync shell:
+
+- **Pure verdict logic** — `crates/dormantd/src/boot_guard.rs`:
+  [`decide`] (the §5.2 crash-loop verdict matrix: `Proceed` /
+  `RollBack` / `ContinueRollback`, zero I/O) and [`should_promote`] (the
+  §4 LKG-promotion gate: `Wait` / `Promote` / `SkipDirty` / `DeferHealth` /
+  `PromoteDespiteHealth`). The documented consts `CRASH_LOOP_THRESHOLD`
+  (3), `CRASH_LOOP_WINDOW` (6m), and `LKG_HEALTH_DEFER_CAP` (3) live here.
+- **Sync I/O shell** — `boot_guard::prepare` records this boot's start
+  entry, builds `LkgInfo`, calls `decide`, and performs every
+  verdict-driven `crash-loop.json` write itself, all before logging is
+  initialised (events are deferred into the returned `BootPlan` and
+  emitted by `dormantd/src/main.rs::emit_deferred_events` once it is).
+- **The boot sequence** — `crates/dormantd/src/boot.rs::boot(plan, inputs)`
+  owns the single flock acquire, the one `App::build`/`App::start` call
+  site, the one boot()-owned crash-loop write (the immediate-rollback
+  path, which `decide` can't predict since it never validates the chosen
+  config), and parking the pending-reload banner through
+  `AppHandle::control_sender()`.
+- **The watchdog probe arm** — `crates/dormantd/src/app.rs`'s
+  `Runner::watchdog_tick`/`lkg_tick`: a periodic `run_loop` arm that pings
+  `WATCHDOG=1` (via `sd_notify.rs`'s `SdNotify`) only after the engine
+  answers a snapshot round-trip on the same control channel `reload()`
+  uses, and runs the LKG-promotion check on every healthy tick. `reload()`
+  itself pings at internal step boundaries (post-validate, post-quiesce,
+  post-teardown, per removed-display wake, pre-`rebuild_old`) so a slow
+  but healthy reload is never mistaken for a wedge.
+
+State files live at `paths::state_dir()` root (sibling of, not nested
+inside, `wear_state_dir()`): `last-known-good.toml`,
+`last-known-good.meta.json`, `crash-loop.json`, `discount-<nonce>`.
+`[watchdog]` config (`WatchdogConfig` in `dormant-core/src/config/schema.rs`,
+defaults in `defaults.rs::LKG_*`, the `stability_window >= 30s` floor in
+`validate.rs::validate_watchdog`) covers `lkg_enabled`,
+`lkg_rollback_enabled`, `stability_window` — `WatchdogSec` and ping cadence
+are deliberately not config; they come from systemd's own
+`NOTIFY_SOCKET`/`WATCHDOG_USEC` environment. See
+[`docs/src/watchdog-rollback.md`](docs/src/watchdog-rollback.md) for the
+full mechanism writeup, the `WatchdogSec=150` derivation, and the
+binary-before-unit upgrade order warning.
 
 ## Audio-safe blanking
 

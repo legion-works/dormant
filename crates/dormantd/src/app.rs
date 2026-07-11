@@ -807,7 +807,19 @@ impl Runner {
             }
         }
 
-        match spawn_generation(&self.root, new_assembly, snapshot.as_ref(), None) {
+        // Dispatch-relevant voiding gate (spec R3-M6): a display whose
+        // blank/wake command construction changed between `self.generation.cfg`
+        // (old, still live here — `install_generation` hasn't run yet) and
+        // `new_cfg` carries no meaningful failure evidence forward, so zero
+        // its `wake_attempts`/`last_blank_failed` before `apply_restore` seeds
+        // them into the new generation. Only the ACCEPTED-spawn path below
+        // applies the gate; `rebuild_old`'s rollback callers restart the SAME
+        // (old) config, so their snapshot needs no filtering.
+        let restore_snapshot = snapshot
+            .as_ref()
+            .map(|snap| reload::zero_changed_displays(snap, &self.generation.cfg, &new_cfg));
+
+        match spawn_generation(&self.root, new_assembly, restore_snapshot.as_ref(), None) {
             Ok(spawn) => {
                 self.install_generation(spawn);
                 // Combine retained rule-driven dark displays with stuck rule-less
@@ -1601,6 +1613,14 @@ fn apply_restore(
         let Some(dcfg) = engine_cfg.displays.iter().find(|d| d.display == did) else {
             continue;
         };
+        // Seed wake-failure bookkeeping BEFORE the phase match below —
+        // failure evidence (wake_attempts / last_blank_failed) must carry
+        // forward for a display regardless of its restored phase (in
+        // particular "active", which the match below `continue`s on).
+        // Any dispatch-relevant voiding has already happened upstream (see
+        // `reload::zero_changed_displays`, applied by `Runner::reload`
+        // before this snapshot reaches `apply_restore`).
+        engine.seed_failure_state(&did, dsnap.wake_attempts, dsnap.last_blank_failed);
         #[allow(clippy::match_same_arms)]
         let phase = match dsnap.phase.as_str() {
             "waking" => Phase::Waking,
@@ -2800,5 +2820,184 @@ mod forward_events_tests {
             .await
             .expect("forward_events did not exit within 1s after cancel");
         assert!(join.is_ok(), "forward_events task panicked on cancel");
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use dormant_core::fakes::RecordingSink;
+    use dormant_core::rules::DisplaySnapshot;
+    use dormant_core::types::BlankMode;
+
+    use super::*;
+
+    /// A single-display, rule-less (manual-only) engine config — mirrors
+    /// `manual_cfg` in `dormant-core`'s `rules_end_to_end.rs`, but built here
+    /// since `apply_restore` is private to this module.
+    fn manual_engine_cfg(display: &str) -> RulesEngineConfig {
+        RulesEngineConfig {
+            rules: vec![],
+            displays: vec![DisplayRuntimeCfg {
+                display: DisplayId(display.into()),
+                blank_mode: BlankMode::PowerOff,
+                ladder: vec![],
+                timings: DisplayRuntimeCfg::manual_defaults(Duration::from_secs(0)),
+            }],
+            sensors: vec![],
+        }
+    }
+
+    fn display_snapshot(
+        phase: &str,
+        wake_attempts: u64,
+        last_blank_failed: bool,
+    ) -> DisplaySnapshot {
+        DisplaySnapshot {
+            phase: phase.into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            controllers: Vec::new(),
+            wake_attempts,
+            last_blank_failed,
+            stage: None,
+        }
+    }
+
+    fn snapshot_with(
+        display: &str,
+        phase: &str,
+        wake_attempts: u64,
+        last_blank_failed: bool,
+    ) -> StateSnapshot {
+        StateSnapshot {
+            sensors: Vec::new(),
+            zones: Vec::new(),
+            displays: vec![(
+                display.to_string(),
+                display_snapshot(phase, wake_attempts, last_blank_failed),
+            )],
+            pending_reload: None,
+        }
+    }
+
+    /// Build a fresh engine over `engine_cfg` with a `RecordingSink` for
+    /// every configured display.
+    fn build_engine(engine_cfg: &RulesEngineConfig) -> RulesEngine {
+        let zone = ZoneEngine::new(Vec::new(), &[]).expect("empty zone engine is valid");
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        for dcfg in &engine_cfg.displays {
+            execs.insert(dcfg.display.clone(), Arc::new(RecordingSink::new()));
+        }
+        RulesEngine::new(
+            engine_cfg.clone(),
+            zone,
+            execs,
+            HashMap::new(),
+            Arc::new(AlwaysOwned),
+        )
+        .expect("valid engine config")
+    }
+
+    /// Spawn `engine.run()` and request one `StateSnapshot` over `ctl_tx`.
+    /// Returns the join handle (caller cancels + awaits) and the snapshot.
+    async fn spawn_and_snapshot(
+        engine: RulesEngine,
+        cancel: CancellationToken,
+    ) -> (tokio::task::JoinHandle<()>, StateSnapshot) {
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (ctl_tx, ctl_rx) = mpsc::channel(8);
+        let engine_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            engine.run(events_rx, ctl_rx, engine_cancel).await;
+        });
+        // Held so the engine's run loop (which exits when its events
+        // channel closes) stays alive for the snapshot round-trip.
+        let _events_tx = events_tx;
+
+        let (tx, rx) = oneshot::channel();
+        ctl_tx
+            .send(ControlMsg::Snapshot(tx))
+            .await
+            .expect("ctl open");
+        let snapshot = rx.await.expect("snapshot reply");
+        (handle, snapshot)
+    }
+
+    /// `apply_restore`'s failure-state seeding (the pinned insertion point:
+    /// immediately after the `dcfg` lookup, before the phase `match`) must
+    /// run for EVERY display present in both the snapshot and the new
+    /// engine config — independent of phase. In particular, phase "active"
+    /// falls into the phase match's `_ => continue` arm; a seed call placed
+    /// after that match would never run for an active display. This test is
+    /// RED against that ordering mistake.
+    #[tokio::test]
+    async fn restore_seeds_failure_state_independent_of_phase() {
+        let engine_cfg = manual_engine_cfg("mon");
+        let mut engine = build_engine(&engine_cfg);
+
+        let snap = snapshot_with("mon", "active", 5, true);
+        apply_restore(&mut engine, &snap, &engine_cfg);
+
+        let cancel = CancellationToken::new();
+        let (handle, snap) = spawn_and_snapshot(engine, cancel.clone()).await;
+
+        let d = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon present in snapshot");
+        assert_eq!(
+            d.1.wake_attempts, 5,
+            "seeded wake_attempts must survive phase='active'"
+        );
+        assert!(
+            d.1.last_blank_failed,
+            "seeded last_blank_failed must survive phase='active'"
+        );
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    /// A display present in the restored snapshot but absent from the new
+    /// engine config (dropped by the reload's config edit) must be skipped
+    /// silently by `apply_restore` — no seed call, no panic — while the
+    /// still-present display is seeded normally.
+    #[tokio::test]
+    async fn restore_drops_state_for_removed_display() {
+        let engine_cfg = manual_engine_cfg("mon");
+        let mut engine = build_engine(&engine_cfg);
+
+        let mut snap = snapshot_with("mon", "active", 5, true);
+        snap.displays
+            .push(("gone".to_string(), display_snapshot("blanked", 9, true)));
+
+        // Must not panic.
+        apply_restore(&mut engine, &snap, &engine_cfg);
+
+        let cancel = CancellationToken::new();
+        let (handle, snap) = spawn_and_snapshot(engine, cancel.clone()).await;
+
+        assert!(
+            snap.displays.iter().all(|(id, _)| id != "gone"),
+            "removed display must not surface in the new engine's snapshot"
+        );
+        let d = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon present in snapshot");
+        assert_eq!(
+            d.1.wake_attempts, 5,
+            "retained display must still be seeded"
+        );
+        assert!(
+            d.1.last_blank_failed,
+            "retained display must still be seeded"
+        );
+
+        cancel.cancel();
+        let _ = handle.await;
     }
 }

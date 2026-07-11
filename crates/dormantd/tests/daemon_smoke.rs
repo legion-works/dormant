@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
-use dormant_core::rules::{ControlMsg, StateSnapshot};
+use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{App, ReloadOutcome, validate_only};
@@ -54,6 +55,30 @@ async fn snapshot_with_retry(ctl: &mpsc::Sender<ControlMsg>) -> StateSnapshot {
         }
     }
     panic!("snapshot_with_retry: all {ATTEMPTS} attempts exhausted");
+}
+
+/// Poll `Status` snapshots (via [`snapshot_with_retry`], so it tolerates the
+/// reload generation-swap window) until `display`'s `last_blank_failed`
+/// equals `want` or `timeout` elapses.
+async fn wait_for_last_blank_failed(
+    ctl: &mpsc::Sender<ControlMsg>,
+    display: &str,
+    want: bool,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let snap = snapshot_with_retry(ctl).await;
+        if let Some((_, d)) = snap.displays.iter().find(|(id, _)| id == display)
+            && d.last_blank_failed == want
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
@@ -2508,4 +2533,331 @@ async fn wear_park_persists_final_ledger() {
          (at first persist={sample_count_at_first_persist}, after park={})",
         ledger.sample_count
     );
+}
+
+// ── 17: wake-failure-surfacing over real IPC (T3/P8, un-reloaded path) ─────────
+//
+// Exercises `blank_failure` / `blank_recovered` event delivery and the
+// `last_blank_failed` snapshot flag over the ACTUAL Unix socket via
+// `dormantctl::client` (never `.disable_ipc()`). The `command` controller's
+// outcome is flipped by creating a flag file that its shell command tests
+// for — the config's `blank_command` STRING itself never changes and no
+// reload happens here, so this test is orthogonal to the dispatch-relevant
+// voiding gate exercised by test 18 below.
+
+/// One ruled `command` display whose blank succeeds iff `flag` exists
+/// (`test -e`), real IPC via `socket_path`.
+fn ipc_failure_config(socket_path: &Path, flag: &Path, grace: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+socket_path = "{sock}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "test -e '{flag}'"
+wake_command = "/bin/true"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        sock = socket_path.display(),
+        flag = flag.display(),
+        g = grace,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn ipc_event_stream_surfaces_blank_failure_then_recovery() {
+    let dir = TempDir::new().unwrap();
+    // A separate tempdir for the socket — never the daemon's default path.
+    let sock_dir = TempDir::new().unwrap();
+    let socket_path = sock_dir.path().join("dormant.sock");
+    let flag = dir.path().join("blank_ok_flag");
+
+    let cfg = ipc_failure_config(&socket_path, &flag, "50ms");
+    let cfg_path = write_file(dir.path(), "config.toml", &cfg);
+    let creds_path = dir.path().join("credentials.toml");
+
+    // A single vacancy edge is enough: a failed blank re-enters Grace
+    // directly (state_machine.rs "blank_failed_regrace") and keeps retrying
+    // on its own every `grace_period` while the zone stays absent — no
+    // further scripted edges are needed to drive the recovery retry either.
+    let script = vec![
+        (Duration::from_millis(0), ev("desk", SensorState::Present)),
+        (Duration::from_millis(100), ev("desk", SensorState::Absent)),
+    ];
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app");
+    // Real IPC — this test needs the actual socket for event subscription.
+    let (handle, join) = app.start().await.expect("start app");
+
+    assert!(
+        wait_for(|| socket_path.exists(), Duration::from_secs(3)).await,
+        "IPC socket must be bound"
+    );
+
+    let connect_path = socket_path.clone();
+    let (event_stream, event_shutdown) =
+        tokio::task::spawn_blocking(move || dormantctl::client::connect_events(&connect_path))
+            .await
+            .expect("connect_events join")
+            .expect("connect to daemon event stream");
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<DaemonEvent>();
+    let pump = tokio::task::spawn_blocking(move || {
+        for item in event_stream {
+            let Ok(ev) = item else { break };
+            if event_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+
+    // ── Phase 1: blank fails (flag absent) ──────────────────────────────
+    let saw_failure = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match event_rx.recv().await {
+                Some(DaemonEvent::BlankFailure { display, .. }) => {
+                    assert_eq!(display.0, "mon");
+                    return;
+                }
+                Some(_) => {}
+                None => panic!("event stream closed before BlankFailure"),
+            }
+        }
+    })
+    .await;
+    assert!(saw_failure.is_ok(), "expected a BlankFailure event in time");
+
+    let status_path = socket_path.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        dormantctl::client::send_request(&status_path, &IpcRequest::Status)
+    })
+    .await
+    .expect("status join")
+    .expect("status request");
+    let snap = resp.snapshot.expect("Status response carries a snapshot");
+    let d = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("mon in snapshot");
+    assert!(
+        d.1.last_blank_failed,
+        "snapshot must show last_blank_failed=true after the failed blank"
+    );
+
+    // ── Phase 2: flip the underlying command's outcome (no reload) ─────
+    fs::write(&flag, "").expect("create flag file");
+
+    let saw_recovery = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match event_rx.recv().await {
+                Some(DaemonEvent::BlankRecovered { display }) => {
+                    assert_eq!(display.0, "mon");
+                    return;
+                }
+                Some(_) => {}
+                None => panic!("event stream closed before BlankRecovered"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        saw_recovery.is_ok(),
+        "expected a BlankRecovered event in time"
+    );
+
+    let status_path = socket_path.clone();
+    let resp = tokio::task::spawn_blocking(move || {
+        dormantctl::client::send_request(&status_path, &IpcRequest::Status)
+    })
+    .await
+    .expect("status join")
+    .expect("status request");
+    let snap = resp.snapshot.expect("Status response carries a snapshot");
+    let d = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("mon in snapshot");
+    assert!(
+        !d.1.last_blank_failed,
+        "snapshot flag must clear after recovery"
+    );
+
+    // Unblock the blocking event-pump thread before shutdown tears the
+    // socket down from the server side anyway.
+    let _ = event_shutdown.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(2), pump).await;
+
+    shutdown(handle, join).await;
+}
+
+// ── 18: reload carry-over + dispatch-relevant voiding gate (T3) ────────────────
+//
+// `.disable_ipc()` — driven entirely via `handle.control_sender()` +
+// `handle.trigger_reload()`, mirroring the file's existing reload tests.
+// Same `command` display shape as test 17 (blank succeeds iff a flag file
+// exists), but the flag is NEVER created here — the point is carry-over /
+// voiding of `last_blank_failed`, not an actual recovery.
+
+/// One ruled `command` display; `log_level` and `blank_command` are the two
+/// knobs this test flips independently (unrelated daemon-level edit vs. a
+/// dispatch-relevant per-display edit).
+fn reload_carry_config(marker: &Path, blank_cmd: &str, log_level: &str, grace: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+log_level = "{log_level}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "{blank_cmd}"
+wake_command = "printf W >> '{m}'"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        log_level = log_level,
+        blank_cmd = blank_cmd,
+        m = marker.display(),
+        g = grace,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let flag = dir.path().join("blank_ok_flag"); // never created in this test
+    let blank_cmd = format!("test -e '{}'", flag.display());
+
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &reload_carry_config(&marker, &blank_cmd, "info", "50ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    let script = vec![
+        (Duration::from_millis(0), ev("desk", SensorState::Present)),
+        (Duration::from_millis(50), ev("desk", SensorState::Absent)),
+    ];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+    let ctl = handle.control_sender();
+
+    // ── Drive a blank failure ───────────────────────────────────────────
+    assert!(
+        wait_for_last_blank_failed(&ctl, "mon", true, Duration::from_secs(3)).await,
+        "expected last_blank_failed=true after the scripted vacancy edge"
+    );
+
+    // ── Reload #1: unrelated daemon-level edit — same display block ────
+    fs::write(
+        &cfg_path,
+        reload_carry_config(&marker, &blank_cmd, "debug", "50ms"),
+    )
+    .unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload #1 outcome in time")
+        .expect("reload bus open");
+    assert_eq!(
+        outcome,
+        ReloadOutcome::Reloaded,
+        "reload #1 must be accepted"
+    );
+
+    assert!(
+        wait_for_last_blank_failed(&ctl, "mon", true, Duration::from_secs(3)).await,
+        "unrelated config edit must carry last_blank_failed=true forward"
+    );
+
+    // ── Reload #2: dispatch-relevant edit — blank_command itself changes ──
+    fs::write(
+        &cfg_path,
+        reload_carry_config(&marker, "/bin/true", "debug", "50ms"),
+    )
+    .unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload #2 outcome in time")
+        .expect("reload bus open");
+    assert_eq!(
+        outcome,
+        ReloadOutcome::Reloaded,
+        "reload #2 must be accepted"
+    );
+
+    assert!(
+        wait_for_last_blank_failed(&ctl, "mon", false, Duration::from_secs(3)).await,
+        "blank_command edit must void (zero) the carried failure evidence"
+    );
+    let snap = snapshot_with_retry(&ctl).await;
+    let d = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("mon in snapshot");
+    assert_eq!(
+        d.1.wake_attempts, 0,
+        "wake_attempts must also be zeroed by the voiding gate"
+    );
+
+    shutdown(handle, join).await;
 }

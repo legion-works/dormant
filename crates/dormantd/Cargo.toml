@@ -49,6 +49,7 @@ render = ["dep:dormant-render", "dormant-core/render"]
 [dev-dependencies]
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }
 dormant-doctor = { path = "../dormant-doctor" }
+dormantctl = { path = "../dormantctl" }
 indexmap = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

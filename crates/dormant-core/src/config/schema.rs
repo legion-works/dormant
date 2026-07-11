@@ -92,6 +92,10 @@ pub struct Config {
     /// Wake-failure notification configuration.
     #[serde(default)]
     pub notifications: NotificationsConfig,
+
+    /// Crash-loop watchdog / last-known-good rollback configuration.
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
 }
 
 // ── DaemonConfig ────────────────────────────────────────────────────────────────
@@ -308,6 +312,42 @@ impl Default for NotificationsConfig {
             wake_attempt_threshold: defaults::NOTIFY_WAKE_ATTEMPT_THRESHOLD,
             cooldown: defaults::NOTIFY_COOLDOWN,
             notify_recovery: defaults::NOTIFY_RECOVERY,
+        }
+    }
+}
+
+// ── WatchdogConfig ──────────────────────────────────────────────────────────────
+
+/// Crash-loop watchdog / last-known-good rollback configuration (the
+/// `[watchdog]` TOML section).
+///
+/// Governs whether the boot guard tracks a last-known-good (LKG) config
+/// generation, whether a detected crash loop is allowed to trigger an
+/// automatic rollback to that generation, and how long a boot must stay up
+/// before it counts as "stable" for LKG purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WatchdogConfig {
+    /// Track a last-known-good config generation. Enabled by default.
+    #[serde(default = "default_lkg_enabled")]
+    pub lkg_enabled: bool,
+
+    /// Allow a detected crash loop to trigger an automatic rollback to the
+    /// last-known-good generation. Enabled by default.
+    #[serde(default = "default_lkg_rollback_enabled")]
+    pub lkg_rollback_enabled: bool,
+
+    /// How long a boot must stay up before it counts as stable for LKG
+    /// purposes.
+    #[serde(default = "default_lkg_stability_window", with = "humantime_serde")]
+    pub stability_window: Duration,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            lkg_enabled: defaults::LKG_ENABLED,
+            lkg_rollback_enabled: defaults::LKG_ROLLBACK_ENABLED,
+            stability_window: defaults::LKG_STABILITY_WINDOW,
         }
     }
 }
@@ -1070,6 +1110,15 @@ fn default_notify_cooldown() -> Duration {
 }
 fn default_notify_recovery() -> bool {
     defaults::NOTIFY_RECOVERY
+}
+fn default_lkg_enabled() -> bool {
+    defaults::LKG_ENABLED
+}
+fn default_lkg_rollback_enabled() -> bool {
+    defaults::LKG_ROLLBACK_ENABLED
+}
+fn default_lkg_stability_window() -> Duration {
+    defaults::LKG_STABILITY_WINDOW
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

@@ -281,6 +281,7 @@ mod tests {
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),

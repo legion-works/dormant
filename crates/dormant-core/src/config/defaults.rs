@@ -165,6 +165,19 @@ pub const NOTIFY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// wakes successfully again.
 pub const NOTIFY_RECOVERY: bool = true;
 
+// ── [watchdog] section defaults ─────────────────────────────────────────────
+
+/// Whether last-known-good (LKG) config-generation tracking is enabled by
+/// default.
+pub const LKG_ENABLED: bool = true;
+
+/// Whether a detected crash loop is allowed to trigger an automatic rollback
+/// to the last-known-good generation by default.
+pub const LKG_ROLLBACK_ENABLED: bool = true;
+
+/// Default minimum uptime before a boot counts as stable for LKG purposes.
+pub const LKG_STABILITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+
 // ── Screensaver pixel-shift defaults ────────────────────────────────────────
 
 /// Default pixel-shift distance, in pixels, applied periodically while the

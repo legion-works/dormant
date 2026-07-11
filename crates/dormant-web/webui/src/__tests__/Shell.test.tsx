@@ -131,4 +131,15 @@ describe("Shell", () => {
       expect(badge?.textContent).toBe("0");
     });
   });
+
+  it("renders the GitHub repository link in the sidebar footer", () => {
+    render(<Shell />);
+
+    const link = document.querySelector(".sidebar-footer .footer-github");
+    expect(link).toBeInTheDocument();
+    expect(link?.getAttribute("href")).toBe("https://github.com/legion-works/dormant");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    expect(link?.getAttribute("rel")).toContain("noopener");
+    expect(link?.getAttribute("aria-label")).toBe("GitHub repository");
+  });
 });

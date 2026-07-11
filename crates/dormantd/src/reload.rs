@@ -24,6 +24,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use dormant_core::config::schema::{Config, DisplayConfig};
+use dormant_core::rules::StateSnapshot;
 use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
@@ -81,4 +83,316 @@ pub fn config_watcher(config_path: &Path) -> Result<ConfigWatcher> {
         _watcher: watcher,
         rx,
     })
+}
+
+// ── Reload carry-over: dispatch-relevant voiding gate ──────────────────────────
+//
+// A reload seeds `wake_attempts`/`last_blank_failed` forward from the
+// pre-reload snapshot (see `app::apply_restore`) so recorded wake-failure
+// evidence survives a config hot-reload instead of silently resetting.  But
+// that evidence describes the outcome of a specific blank/wake COMMAND; if
+// the edit that triggered the reload changed what command gets sent for a
+// display (a new `wake_command`, a different controller chain, …) the old
+// evidence no longer describes anything real and must be voided rather than
+// carried forward under a misleading "still failing" (or "recovered") label.
+//
+// `dispatch_relevant_eq` draws that line field-by-field; `zero_changed_displays`
+// applies it across a whole snapshot at reload time.
+
+/// True when the fields that determine blank/wake DISPATCH OUTCOME are equal
+/// between two [`DisplayConfig`]s.
+///
+/// This is an EXHAUSTIVE destructure (spec R3-M6 drift guard): adding a new
+/// `DisplayConfig` field is a compile error here until it is explicitly
+/// classified as dispatch-relevant (bound and compared below) or cosmetic
+/// (bound to `_`, with a comment explaining why it cannot change blank/wake
+/// command construction or controller-chain membership).
+///
+/// Ignored (cosmetic) fields and why:
+/// - `screensaver`: feeds the render overlay only, never the blank/wake
+///   command or controller chain.
+/// - `restore_brightness`, `samsung_restore_backlight`: post-wake cosmetic
+///   restoration values, consumed after dispatch succeeds — never part of
+///   command construction.
+/// - `panel_type`: wear-heuristic classification (oled-health feature); did
+///   not exist when this plan was written, and is cosmetic for dispatch —
+///   it only steers wear tracking, never blank/wake command construction.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn dispatch_relevant_eq(a: &DisplayConfig, b: &DisplayConfig) -> bool {
+    let DisplayConfig {
+        controllers: a_controllers,
+        blank_mode: a_blank_mode,
+        degraded_mode: a_degraded_mode,
+        ladder: a_ladder,
+        screensaver: _a_screensaver,
+        output: a_output,
+        ddc_display: a_ddc_display,
+        host: a_host,
+        wol_mac: a_wol_mac,
+        blank_command: a_blank_command,
+        wake_command: a_wake_command,
+        modes: a_modes,
+        ha_url: a_ha_url,
+        blank_service: a_blank_service,
+        blank_data: a_blank_data,
+        wake_service: a_wake_service,
+        wake_data: a_wake_data,
+        command_timeout: a_command_timeout,
+        restore_brightness: _a_restore_brightness,
+        samsung_restore_backlight: _a_samsung_restore_backlight,
+        treat_unreachable_as_blanked: a_treat_unreachable_as_blanked,
+        panel_type: _a_panel_type,
+    } = a;
+    let DisplayConfig {
+        controllers: b_controllers,
+        blank_mode: b_blank_mode,
+        degraded_mode: b_degraded_mode,
+        ladder: b_ladder,
+        screensaver: _b_screensaver,
+        output: b_output,
+        ddc_display: b_ddc_display,
+        host: b_host,
+        wol_mac: b_wol_mac,
+        blank_command: b_blank_command,
+        wake_command: b_wake_command,
+        modes: b_modes,
+        ha_url: b_ha_url,
+        blank_service: b_blank_service,
+        blank_data: b_blank_data,
+        wake_service: b_wake_service,
+        wake_data: b_wake_data,
+        command_timeout: b_command_timeout,
+        restore_brightness: _b_restore_brightness,
+        samsung_restore_backlight: _b_samsung_restore_backlight,
+        treat_unreachable_as_blanked: b_treat_unreachable_as_blanked,
+        panel_type: _b_panel_type,
+    } = b;
+
+    a_controllers == b_controllers
+        && a_blank_mode == b_blank_mode
+        && a_degraded_mode == b_degraded_mode
+        && a_ladder == b_ladder
+        && a_output == b_output
+        && a_ddc_display == b_ddc_display
+        && a_host == b_host
+        && a_wol_mac == b_wol_mac
+        && a_blank_command == b_blank_command
+        && a_wake_command == b_wake_command
+        && a_modes == b_modes
+        && a_ha_url == b_ha_url
+        && a_blank_service == b_blank_service
+        && a_blank_data == b_blank_data
+        && a_wake_service == b_wake_service
+        && a_wake_data == b_wake_data
+        && a_command_timeout == b_command_timeout
+        && a_treat_unreachable_as_blanked == b_treat_unreachable_as_blanked
+}
+
+/// Clone of `snapshot` with `wake_attempts`/`last_blank_failed` zeroed for
+/// every display whose dispatch-relevant config differs between `old` and
+/// `new` (see [`dispatch_relevant_eq`]).
+///
+/// A display present in only one of `old`/`new` (added or removed by the
+/// edit that triggered this reload) is treated as CHANGED — there is no
+/// meaningful "same dispatch" baseline to compare against, so the
+/// conservative choice is to zero rather than risk carrying stale evidence
+/// forward under a new (or now-absent) configuration.
+#[must_use]
+pub fn zero_changed_displays(
+    snapshot: &StateSnapshot,
+    old: &Config,
+    new: &Config,
+) -> StateSnapshot {
+    let mut out = snapshot.clone();
+    for (id, dsnap) in &mut out.displays {
+        let changed = match (old.displays.get(id), new.displays.get(id)) {
+            (Some(o), Some(n)) => !dispatch_relevant_eq(o, n),
+            // Added/removed — no baseline to compare against; treat as changed.
+            _ => true,
+        };
+        if changed {
+            dsnap.wake_attempts = 0;
+            dsnap.last_blank_failed = false;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod dispatch_gate_tests {
+    use std::time::Duration;
+
+    use dormant_core::config::schema::{
+        DaemonConfig, NotificationsConfig, ScreensaverConfig, WearConfig,
+    };
+    use dormant_core::rules::DisplaySnapshot;
+    use dormant_core::wear::PanelType;
+    use indexmap::IndexMap;
+
+    use super::*;
+
+    /// A minimal `DisplayConfig` test builder (P11) — every field set to a
+    /// concrete, non-default-looking value where practical so mutation tests
+    /// have something to actually change.
+    fn base_display_cfg() -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["ddcci".into()],
+            blank_mode: Some(dormant_core::types::BlankMode::PowerOff),
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: Some("DP-1".into()),
+            ddc_display: Some("1-1".into()),
+            host: None,
+            wol_mac: None,
+            blank_command: Some("printf B".into()),
+            wake_command: Some("printf W".into()),
+            modes: Some(vec![dormant_core::types::BlankMode::PowerOff]),
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 100,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: PanelType::default(),
+        }
+    }
+
+    /// A minimal `ScreensaverConfig` for exercising the cosmetic `screensaver`
+    /// field.
+    fn test_screensaver() -> ScreensaverConfig {
+        ScreensaverConfig {
+            trigger: "vacancy".into(),
+            audio: false,
+            source: Vec::new(),
+            scale_mode: None,
+            transition: None,
+            transition_duration: None,
+            shift_px: 4,
+            shift_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn config_with_displays(displays: Vec<(&str, DisplayConfig)>) -> Config {
+        let mut map = IndexMap::new();
+        for (id, dc) in displays {
+            map.insert(id.to_string(), dc);
+        }
+        Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: map,
+            rules: IndexMap::new(),
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+        }
+    }
+
+    fn display_snapshot(wake_attempts: u64, last_blank_failed: bool) -> DisplaySnapshot {
+        DisplaySnapshot {
+            phase: "active".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            controllers: Vec::new(),
+            wake_attempts,
+            last_blank_failed,
+            stage: None,
+        }
+    }
+
+    fn snapshot_with_displays(displays: Vec<(&str, u64, bool)>) -> StateSnapshot {
+        StateSnapshot {
+            sensors: Vec::new(),
+            zones: Vec::new(),
+            displays: displays
+                .into_iter()
+                .map(|(id, attempts, failed)| (id.to_string(), display_snapshot(attempts, failed)))
+                .collect(),
+            pending_reload: None,
+        }
+    }
+
+    #[test]
+    fn cosmetic_edit_is_dispatch_equal() {
+        let a = base_display_cfg();
+        let mut b = a.clone();
+        b.restore_brightness = 55; // cosmetic
+        b.screensaver = Some(test_screensaver()); // cosmetic
+        assert!(
+            dispatch_relevant_eq(&a, &b),
+            "cosmetic edits must NOT void failure evidence"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn dispatch_edit_is_not_equal() {
+        let a = base_display_cfg();
+        let mutations: Vec<Box<dyn Fn(&mut DisplayConfig)>> = vec![
+            Box::new(|c: &mut DisplayConfig| c.wake_command = Some("newcmd".into())),
+            Box::new(|c: &mut DisplayConfig| c.controllers = vec!["kwin-dpms".into()]),
+            Box::new(|c: &mut DisplayConfig| c.host = Some("192.0.2.9".into())),
+        ];
+        for mutate in &mutations {
+            let mut b = a.clone();
+            mutate(&mut b);
+            assert!(!dispatch_relevant_eq(&a, &b));
+        }
+    }
+
+    #[test]
+    fn zero_changed_displays_zeroes_only_changed() {
+        let old_cfg =
+            config_with_displays(vec![("m", base_display_cfg()), ("tv", base_display_cfg())]);
+        let mut new_cfg = old_cfg.clone();
+        new_cfg.displays.get_mut("tv").unwrap().wake_command = Some("newcmd".into());
+
+        let snap = snapshot_with_displays(vec![("m", 5, true), ("tv", 4, true)]);
+
+        let out = zero_changed_displays(&snap, &old_cfg, &new_cfg);
+
+        let m = out
+            .displays
+            .iter()
+            .find(|(id, _)| id == "m")
+            .expect("m present");
+        assert_eq!(m.1.wake_attempts, 5, "unchanged display must carry over");
+        assert!(m.1.last_blank_failed, "unchanged display must carry over");
+
+        let tv = out
+            .displays
+            .iter()
+            .find(|(id, _)| id == "tv")
+            .expect("tv present");
+        assert_eq!(tv.1.wake_attempts, 0, "changed display must be zeroed");
+        assert!(!tv.1.last_blank_failed, "changed display must be zeroed");
+    }
+
+    #[test]
+    fn zero_changed_displays_zeroes_added_and_removed() {
+        let old_cfg = config_with_displays(vec![("m", base_display_cfg())]);
+        // "new" removes "m" is not directly observable from a snapshot that
+        // already only contains "m"/"gone", but we exercise both directions:
+        // "gone" is absent from `new` (removed) and "added" is absent from
+        // `old` (added) — both have no baseline and must zero.
+        let new_cfg = config_with_displays(vec![("added", base_display_cfg())]);
+
+        let snap = snapshot_with_displays(vec![("m", 3, true), ("added", 2, true)]);
+        let out = zero_changed_displays(&snap, &old_cfg, &new_cfg);
+
+        for (id, dsnap) in &out.displays {
+            assert_eq!(dsnap.wake_attempts, 0, "{id} must be zeroed (no baseline)");
+            assert!(
+                !dsnap.last_blank_failed,
+                "{id} must be zeroed (no baseline)"
+            );
+        }
+    }
 }

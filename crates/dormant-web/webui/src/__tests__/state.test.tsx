@@ -512,3 +512,142 @@ describe("LiveStateProvider wear events", () => {
     expect(screen.getByTestId("wear-adv-d1")).toHaveTextContent("none");
   });
 });
+
+describe("LiveStateProvider wake/blank failure events", () => {
+  function FailureConsumer() {
+    const { snapshot } = useLiveState();
+    if (!snapshot) return <span>loading</span>;
+    return (
+      <div>
+        {snapshot.displays.map(([id, d]) => (
+          <span key={id} data-testid={`failure-${id}`}>
+            {String(d.wake_attempts ?? "undef")}:{String(d.last_blank_failed ?? "undef")}
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  it("wake_retry patches wake_attempts to the event's attempt count", async () => {
+    render(
+      <LiveStateProvider>
+        <FailureConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
+    });
+
+    act(() => {
+      mocks.onMessage?.({ event: "wake_retry", display: "d1", attempt: 2 });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("2:undef");
+    });
+  });
+
+  it("wake_recovered resets wake_attempts to 0", async () => {
+    render(
+      <LiveStateProvider>
+        <FailureConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
+    });
+
+    act(() => {
+      mocks.onMessage?.({ event: "wake_retry", display: "d1", attempt: 3 });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("3:undef");
+    });
+
+    act(() => {
+      mocks.onMessage?.({ event: "wake_recovered", display: "d1", attempts: 3 });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("0:undef");
+    });
+  });
+
+  it("blank_failure sets last_blank_failed to true", async () => {
+    render(
+      <LiveStateProvider>
+        <FailureConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
+    });
+
+    act(() => {
+      mocks.onMessage?.({
+        event: "blank_failure",
+        display: "d1",
+        controller: "ddcci",
+        detail: "E_TIMEOUT: no ack",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:true");
+    });
+  });
+
+  it("blank_recovered sets last_blank_failed to false", async () => {
+    render(
+      <LiveStateProvider>
+        <FailureConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
+    });
+
+    act(() => {
+      mocks.onMessage?.({
+        event: "blank_failure",
+        display: "d1",
+        controller: "ddcci",
+        detail: "E_TIMEOUT: no ack",
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:true");
+    });
+
+    act(() => {
+      mocks.onMessage?.({ event: "blank_recovered", display: "d1" });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:false");
+    });
+  });
+
+  it("an unknown WS event tag is a no-op — displays unchanged", async () => {
+    render(
+      <LiveStateProvider>
+        <FailureConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
+    });
+
+    act(() => {
+      mocks.onMessage?.({ event: "some_future_tag", display: "d1", whatever: 1 });
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
+  });
+});

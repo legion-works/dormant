@@ -331,6 +331,8 @@ mod tests {
                 paused,
                 cmd_gen: 0,
                 controllers: vec![],
+                wake_attempts: 0,
+                last_blank_failed: false,
                 stage,
             },
         )

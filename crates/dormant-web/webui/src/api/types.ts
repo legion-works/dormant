@@ -54,6 +54,9 @@ export const DAEMON_EVENT_TAGS = [
   "config_reload_rejected",
   "wear_snapshot",
   "compensation_advisory",
+  "blank_failure",
+  "blank_recovered",
+  "wake_recovered",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -96,6 +99,9 @@ export interface ControllerHealth {
  * serde: `controllers` is `#[serde(default)]` (absent for legacy snapshots).
  * `stage` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
  * (absent from legacy wire and omitted when None — back-compat).
+ * `wake_attempts` / `last_blank_failed` are `#[serde(default)]` — mirrors
+ * the `stage?:` back-compat precedent: legacy wire that omits these keys
+ * deserializes as `undefined` here, not a hard failure.
  */
 export interface DisplaySnapshot {
   phase: string; // grep-stable literal: "active" | "grace" | "blanking" | "blanked" | "waking" | "render_pending" | "staged"
@@ -103,6 +109,12 @@ export interface DisplaySnapshot {
   paused: boolean;
   cmd_gen: number;
   controllers: ControllerHealth[];
+  /** Current wake-retry attempt counter for this display (0 once healthy
+   * or before the first attempt). Absent on legacy wire. */
+  wake_attempts?: number;
+  /** Whether the last blank attempt for this display exhausted its
+   * controller chain and has not yet recovered. Absent on legacy wire. */
+  last_blank_failed?: boolean;
   /** Present only when the display is in the `staged` phase. */
   stage?: { idx: number; kind: StageKind } | null;
 }
@@ -133,7 +145,10 @@ export type DaemonEvent =
   | ConfigReloadRejectedEvent
   | WakeRetryEvent
   | WearSnapshotEvent
-  | CompensationAdvisoryEvent;
+  | CompensationAdvisoryEvent
+  | BlankFailureEvent
+  | BlankRecoveredEvent
+  | WakeRecoveredEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -201,6 +216,38 @@ export interface CompensationAdvisoryEvent {
 }
 
 /**
+ * rust: rules.rs DaemonEvent::BlankFailure
+ * serde: `controller` / `detail` are `#[serde(default)]`. NOTE: the
+ * `blank_failure` wire tag is unrelated to `DisplayPhase.phase` string
+ * literals — don't conflate the two when grepping.
+ */
+export interface BlankFailureEvent {
+  event: "blank_failure";
+  display: string;
+  controller: string;
+  detail: string;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::BlankRecovered
+ * serde: field names match exactly (no rename).
+ */
+export interface BlankRecoveredEvent {
+  event: "blank_recovered";
+  display: string;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::WakeRecovered
+ * serde: `attempts` is `#[serde(default)]`.
+ */
+export interface WakeRecoveredEvent {
+  event: "wake_recovered";
+  display: string;
+  attempts: number;
+}
+
+/**
  * rust: doctor.rs Check
  * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
  */
@@ -244,6 +291,10 @@ export interface ConfigInventory {
   /** rust: config/schema.rs WearConfig — the `[wear]` TOML section. Optional
    * in fixtures/older payloads; the WearSection form treats absence as `{}`. */
   wear?: Record<string, unknown>;
+  /** rust: config/schema.rs NotificationsConfig — the `[notifications]`
+   * TOML section. Optional in fixtures/older payloads, mirroring `wear`;
+   * the NotificationsSection form treats absence as `{}`. */
+  notifications?: Record<string, unknown>;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;

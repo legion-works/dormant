@@ -29,6 +29,12 @@ export function badgeForEvent(ev: DaemonEvent): EventBadge {
       return { color: "var(--text-muted)", bg: "color-mix(in oklab, var(--text-muted) 14%, transparent)", label: "wear" };
     case "compensation_advisory":
       return { color: "var(--warning)", bg: "color-mix(in oklab, var(--warning) 14%, transparent)", label: "advisory" };
+    case "blank_failure":
+      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "blank fail" };
+    case "blank_recovered":
+      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "recovered" };
+    case "wake_recovered":
+      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "recovered" };
     default:
       return { color: "var(--text-muted)", bg: "var(--bg-sunken)", label: (ev as { event: string }).event };
   }
@@ -54,6 +60,12 @@ export function messageForEvent(ev: DaemonEvent): string {
       const days = Math.floor(ev.hours_since_long_dwell / 24);
       return `${ev.display}: no long standby window in ${days} days`;
     }
+    case "blank_failure":
+      return `${ev.display}: blank failed on ${ev.controller} (${ev.detail})`;
+    case "blank_recovered":
+      return `${ev.display}: blank recovered`;
+    case "wake_recovered":
+      return `${ev.display}: wake recovered after ${ev.attempts} attempt${ev.attempts === 1 ? "" : "s"}`;
     default:
       return JSON.stringify(ev);
   }

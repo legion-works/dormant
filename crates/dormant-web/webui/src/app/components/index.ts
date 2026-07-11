@@ -8,3 +8,4 @@ export { statusLabel, stageKindLabel, phaseChipLabel } from "./status";
 export { default as Card } from "./Card";
 export { default as HealthChip } from "./HealthChip";
 export { default as WearCard } from "./WearCard";
+export { default as FailureBanner } from "./FailureBanner";

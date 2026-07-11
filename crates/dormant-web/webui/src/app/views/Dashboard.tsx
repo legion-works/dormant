@@ -9,7 +9,7 @@
  */
 import { useNavigate } from "../nav";
 import { useLiveState, useEventLog } from "../hooks/useLiveState";
-import { Card, StatusChip, WearCard, statusLabel, phaseChipLabel } from "../components";
+import { Card, StatusChip, WearCard, FailureBanner, statusLabel, phaseChipLabel } from "../components";
 import { badgeForEvent, messageForEvent } from "./eventFormat";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";
@@ -212,6 +212,9 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard">
+      {/* Failure banner — surfaces displays failing to wake or blank. */}
+      <FailureBanner />
+
       {/* Stat row */}
       <div className="stat-row">
         {stats.map((s) => (

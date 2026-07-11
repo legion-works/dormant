@@ -83,6 +83,32 @@ function patchDisplayPhase(
   return { ...snapshot, displays };
 }
 
+/** Patch a display's `wake_attempts` counter (from `wake_retry`/`wake_recovered`). */
+function patchWakeAttempts(
+  snapshot: StateSnapshot,
+  display: string,
+  attempts: number,
+): StateSnapshot {
+  const displays = snapshot.displays.map(
+    ([id, d]): [string, DisplaySnapshot] =>
+      id === display ? [id, { ...d, wake_attempts: attempts }] : [id, d],
+  );
+  return { ...snapshot, displays };
+}
+
+/** Patch a display's `last_blank_failed` flag (from `blank_failure`/`blank_recovered`). */
+function patchBlankFailed(
+  snapshot: StateSnapshot,
+  display: string,
+  failed: boolean,
+): StateSnapshot {
+  const displays = snapshot.displays.map(
+    ([id, d]): [string, DisplaySnapshot] =>
+      id === display ? [id, { ...d, last_blank_failed: failed }] : [id, d],
+  );
+  return { ...snapshot, displays };
+}
+
 export function LiveStateProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -165,6 +191,22 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
           case "display_phase": {
             const de = ev as { display: string; phase: string };
             return patchDisplayPhase(prev, de.display, de.phase);
+          }
+          case "wake_retry": {
+            const we = ev as { display: string; attempt: number };
+            return patchWakeAttempts(prev, we.display, we.attempt);
+          }
+          case "wake_recovered": {
+            const re = ev as { display: string; attempts: number };
+            return patchWakeAttempts(prev, re.display, 0);
+          }
+          case "blank_failure": {
+            const be = ev as { display: string };
+            return patchBlankFailed(prev, be.display, true);
+          }
+          case "blank_recovered": {
+            const be = ev as { display: string };
+            return patchBlankFailed(prev, be.display, false);
           }
           case "wear_snapshot": {
             // Not part of StateSnapshot — patches the separate

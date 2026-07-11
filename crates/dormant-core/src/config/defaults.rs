@@ -140,6 +140,22 @@ pub const WEAR_SHORT_CYCLE_DWELL: Duration = Duration::from_secs(10 * 60);
 /// surfacing to the operator.
 pub const WEAR_ADVISORY_AFTER: Duration = Duration::from_secs(96 * 60 * 60);
 
+// ── [notifications] section defaults ────────────────────────────────────────
+
+/// Whether wake-failure notifications are enabled by default.
+pub const NOTIFY_ENABLED: bool = true;
+
+/// Number of consecutive wake-command failures before a notification fires.
+pub const NOTIFY_WAKE_ATTEMPT_THRESHOLD: u64 = 3;
+
+/// Minimum time between successive wake-failure notifications for the same
+/// display.
+pub const NOTIFY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// Whether a recovery notification fires when a previously-failing display
+/// wakes successfully again.
+pub const NOTIFY_RECOVERY: bool = true;
+
 // ── Screensaver pixel-shift defaults ────────────────────────────────────────
 
 /// Default pixel-shift distance, in pixels, applied periodically while the

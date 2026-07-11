@@ -42,7 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -71,7 +71,13 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::inhibit_activity::{self, ActivityRule};
+use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
+
+/// Builds the daemon-lifetime notification sink. Production defaults to
+/// [`notifier::ZbusSink`]; tests inject a factory returning a shared
+/// recording fake (`with_notify_sink_builder` — `source_builder` precedent).
+type NotifySinkBuilder = Arc<dyn Fn() -> Arc<dyn NotifySink> + Send + Sync>;
 
 /// Builds the sensor sources for a config. Production uses the sensor
 /// registry; tests inject a factory that returns scripted fakes.
@@ -189,7 +195,14 @@ pub struct App {
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
     render_sink_builder: Option<RenderSinkBuilder>,
+    notify_sink_builder: NotifySinkBuilder,
     disable_ipc: bool,
+}
+
+/// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
+/// per call (constructed exactly once, in `App::start`).
+fn default_notify_sink_builder() -> NotifySinkBuilder {
+    Arc::new(|| Arc::new(notifier::ZbusSink::new()) as Arc<dyn NotifySink>)
 }
 
 impl App {
@@ -217,6 +230,7 @@ impl App {
             source_builder,
             #[cfg(feature = "render")]
             render_sink_builder: None,
+            notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
         })
     }
@@ -244,6 +258,7 @@ impl App {
             source_builder: Arc::new(factory),
             #[cfg(feature = "render")]
             render_sink_builder: None,
+            notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
         })
     }
@@ -278,6 +293,21 @@ impl App {
     #[must_use]
     pub fn disable_ipc(mut self) -> Self {
         self.disable_ipc = true;
+        self
+    }
+
+    /// Set an injected notification-sink factory (test seam — the
+    /// `source_builder` precedent). Production defaults to
+    /// [`notifier::ZbusSink`]; tests typically capture a shared `Arc` and
+    /// have the factory clone it, so the SAME recording fake instance is
+    /// used across every reload generation (mirrors how [`NotifyState`] is
+    /// daemon-lifetime, not per-generation).
+    #[must_use]
+    pub fn with_notify_sink_builder<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Arc<dyn NotifySink> + Send + Sync + 'static,
+    {
+        self.notify_sink_builder = Arc::new(factory);
         self
     }
 
@@ -331,6 +361,15 @@ impl App {
         // lock is the same `Arc<PanelLock>` across every generation swap.
         let panel_locks = PanelLocks::new();
 
+        // Daemon-lifetime notifier state + sink (spec §4.4): constructed
+        // once here and threaded into every `spawn_generation` call (this
+        // one and every subsequent reload/rollback via `Runner`), so the
+        // notifier's open episodes — and the underlying `ZbusSink`'s cached
+        // DBus connection — survive a config reload, exactly like
+        // `panel_locks` above.
+        let notify_state: Arc<Mutex<NotifyState>> = Arc::new(Mutex::new(NotifyState::default()));
+        let notify_sink: Arc<dyn NotifySink> = (self.notify_sink_builder)();
+
         // Clone before cfg/creds are moved into assemble_static.
         let cfg_clone = cfg.clone();
         let creds_clone = creds.clone();
@@ -352,7 +391,14 @@ impl App {
             .await
             .context("assemble initial runtime")?;
 
-        let spawn = spawn_generation(&root, assembly, None, None)?;
+        let spawn = spawn_generation(
+            &root,
+            assembly,
+            None,
+            None,
+            notify_state.clone(),
+            notify_sink.clone(),
+        )?;
 
         // Executor-map watch channel for the wear tracker (spec §4.3):
         // seeded here from the first generation, republished by
@@ -433,6 +479,8 @@ impl App {
             started_web_port,
             started_web_bind,
             panel_locks,
+            notify_state,
+            notify_sink,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -645,6 +693,13 @@ struct Runner {
     /// the same `Arc<PanelLock>` whether it came from the old generation's
     /// controller or the new one's.
     panel_locks: Arc<PanelLocks>,
+    /// Daemon-lifetime notifier episode state (spec §4.4), constructed once
+    /// in [`App::start`] and threaded unchanged into every generation's
+    /// [`spawn_generation`] call — episodes survive a config reload.
+    notify_state: Arc<Mutex<NotifyState>>,
+    /// Daemon-lifetime notification sink, constructed once in
+    /// [`App::start`] and threaded unchanged into every generation.
+    notify_sink: Arc<dyn NotifySink>,
 }
 
 impl Runner {
@@ -807,7 +862,26 @@ impl Runner {
             }
         }
 
-        match spawn_generation(&self.root, new_assembly, snapshot.as_ref(), None) {
+        // Dispatch-relevant voiding gate (spec R3-M6): a display whose
+        // blank/wake command construction changed between `self.generation.cfg`
+        // (old, still live here — `install_generation` hasn't run yet) and
+        // `new_cfg` carries no meaningful failure evidence forward, so zero
+        // its `wake_attempts`/`last_blank_failed` before `apply_restore` seeds
+        // them into the new generation. Only the ACCEPTED-spawn path below
+        // applies the gate; `rebuild_old`'s rollback callers restart the SAME
+        // (old) config, so their snapshot needs no filtering.
+        let restore_snapshot = snapshot
+            .as_ref()
+            .map(|snap| reload::zero_changed_displays(snap, &self.generation.cfg, &new_cfg));
+
+        match spawn_generation(
+            &self.root,
+            new_assembly,
+            restore_snapshot.as_ref(),
+            None,
+            self.notify_state.clone(),
+            self.notify_sink.clone(),
+        ) {
             Ok(spawn) => {
                 self.install_generation(spawn);
                 // Combine retained rule-driven dark displays with stuck rule-less
@@ -931,7 +1005,14 @@ impl Runner {
             #[cfg(feature = "render")]
             input_wake_rx: Some(input_wake_rx),
         };
-        match spawn_generation(&self.root, assembly, snapshot, pending) {
+        match spawn_generation(
+            &self.root,
+            assembly,
+            snapshot,
+            pending,
+            self.notify_state.clone(),
+            self.notify_sink.clone(),
+        ) {
             Ok(spawn) => self.install_generation(spawn),
             Err(e) => tracing::error!(event = "reload_rebuild_old_failed", error = %e),
         }
@@ -1481,12 +1562,19 @@ fn build_render_sinks(
     (sinks, input_wake_rx)
 }
 
-/// Spawn the engine, sources, and inhibitor for one generation.
+/// Spawn the engine, sources, inhibitor, and notifier for one generation.
+///
+/// `notify_state` / `notify_sink` are daemon-lifetime (constructed once in
+/// [`App::start`]) — every call site threads the SAME `Arc`s through so the
+/// notifier's open episodes (and the sink's cached connection) survive a
+/// config reload.
 fn spawn_generation(
     root: &CancellationToken,
     assembly: StaticAssembly,
     restore: Option<&StateSnapshot>,
     pending: Option<String>,
+    notify_state: Arc<Mutex<NotifyState>>,
+    notify_sink: Arc<dyn NotifySink>,
 ) -> Result<GenSpawn> {
     let token = root.child_token();
     let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(64);
@@ -1557,6 +1645,17 @@ fn spawn_generation(
         token.clone(),
     );
 
+    // Desktop wake/blank-failure notifier (spec §4.4) — `notifier::spawn`
+    // returns `None` (no-op) when `[notifications] enabled = false`,
+    // mirroring `inhibit_activity::spawn`'s own None-returning precedent.
+    let _notifier = notifier::spawn(NotifierDeps {
+        ctl: ctl_tx.clone(),
+        cfg: assembly.cfg.notifications,
+        state: notify_state,
+        sink: notify_sink,
+        cancel: token.clone(),
+    });
+
     let generation = Generation {
         token,
         engine_handle: Some(engine_handle),
@@ -1601,6 +1700,14 @@ fn apply_restore(
         let Some(dcfg) = engine_cfg.displays.iter().find(|d| d.display == did) else {
             continue;
         };
+        // Seed wake-failure bookkeeping BEFORE the phase match below —
+        // failure evidence (wake_attempts / last_blank_failed) must carry
+        // forward for a display regardless of its restored phase (in
+        // particular "active", which the match below `continue`s on).
+        // Any dispatch-relevant voiding has already happened upstream (see
+        // `reload::zero_changed_displays`, applied by `Runner::reload`
+        // before this snapshot reaches `apply_restore`).
+        engine.seed_failure_state(&did, dsnap.wake_attempts, dsnap.last_blank_failed);
         #[allow(clippy::match_same_arms)]
         let phase = match dsnap.phase.as_str() {
             "waking" => Phase::Waking,
@@ -2010,6 +2117,7 @@ mod render_tests {
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: IndexMap::new(),
             zones: IndexMap::new(),
             displays: {
@@ -2116,6 +2224,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2203,6 +2312,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2297,6 +2407,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2382,6 +2493,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2795,5 +2907,214 @@ mod forward_events_tests {
             .await
             .expect("forward_events did not exit within 1s after cancel");
         assert!(join.is_ok(), "forward_events task panicked on cancel");
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use dormant_core::fakes::RecordingSink;
+    use dormant_core::rules::DisplaySnapshot;
+    use dormant_core::types::BlankMode;
+
+    use super::*;
+
+    /// A single-display, rule-less (manual-only) engine config — mirrors
+    /// `manual_cfg` in `dormant-core`'s `rules_end_to_end.rs`, but built here
+    /// since `apply_restore` is private to this module.
+    fn manual_engine_cfg(display: &str) -> RulesEngineConfig {
+        RulesEngineConfig {
+            rules: vec![],
+            displays: vec![DisplayRuntimeCfg {
+                display: DisplayId(display.into()),
+                blank_mode: BlankMode::PowerOff,
+                ladder: vec![],
+                timings: DisplayRuntimeCfg::manual_defaults(Duration::from_secs(0)),
+            }],
+            sensors: vec![],
+        }
+    }
+
+    fn display_snapshot(
+        phase: &str,
+        wake_attempts: u64,
+        last_blank_failed: bool,
+    ) -> DisplaySnapshot {
+        DisplaySnapshot {
+            phase: phase.into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            controllers: Vec::new(),
+            wake_attempts,
+            last_blank_failed,
+            stage: None,
+        }
+    }
+
+    fn snapshot_with(
+        display: &str,
+        phase: &str,
+        wake_attempts: u64,
+        last_blank_failed: bool,
+    ) -> StateSnapshot {
+        StateSnapshot {
+            sensors: Vec::new(),
+            zones: Vec::new(),
+            displays: vec![(
+                display.to_string(),
+                display_snapshot(phase, wake_attempts, last_blank_failed),
+            )],
+            pending_reload: None,
+        }
+    }
+
+    /// Build a fresh engine over `engine_cfg` with a `RecordingSink` for
+    /// every configured display.
+    fn build_engine(engine_cfg: &RulesEngineConfig) -> RulesEngine {
+        let zone = ZoneEngine::new(Vec::new(), &[]).expect("empty zone engine is valid");
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        for dcfg in &engine_cfg.displays {
+            execs.insert(dcfg.display.clone(), Arc::new(RecordingSink::new()));
+        }
+        RulesEngine::new(
+            engine_cfg.clone(),
+            zone,
+            execs,
+            HashMap::new(),
+            Arc::new(AlwaysOwned),
+        )
+        .expect("valid engine config")
+    }
+
+    /// Spawn `engine.run()` and request one `StateSnapshot` over `ctl_tx`.
+    /// Returns the join handle (caller cancels + awaits) and the snapshot.
+    async fn spawn_and_snapshot(
+        engine: RulesEngine,
+        cancel: CancellationToken,
+    ) -> (tokio::task::JoinHandle<()>, StateSnapshot) {
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (ctl_tx, ctl_rx) = mpsc::channel(8);
+        let engine_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            engine.run(events_rx, ctl_rx, engine_cancel).await;
+        });
+        // Held so the engine's run loop (which exits when its events
+        // channel closes) stays alive for the snapshot round-trip.
+        let _events_tx = events_tx;
+
+        let (tx, rx) = oneshot::channel();
+        ctl_tx
+            .send(ControlMsg::Snapshot(tx))
+            .await
+            .expect("ctl open");
+        let snapshot = rx.await.expect("snapshot reply");
+        (handle, snapshot)
+    }
+
+    /// `apply_restore`'s failure-state seeding (the pinned insertion point:
+    /// immediately after the `dcfg` lookup, before the phase `match`) must
+    /// run for EVERY display present in both the snapshot and the new
+    /// engine config — independent of phase. In particular, phase "active"
+    /// falls into the phase match's `_ => continue` arm; a seed call placed
+    /// after that match would never run for an active display. This test is
+    /// RED against that ordering mistake.
+    #[tokio::test]
+    async fn restore_seeds_failure_state_independent_of_phase() {
+        let engine_cfg = manual_engine_cfg("mon");
+        let mut engine = build_engine(&engine_cfg);
+
+        let snap = snapshot_with("mon", "active", 5, true);
+        apply_restore(&mut engine, &snap, &engine_cfg);
+
+        let cancel = CancellationToken::new();
+        let (handle, snap) = spawn_and_snapshot(engine, cancel.clone()).await;
+
+        let d = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon present in snapshot");
+        assert_eq!(
+            d.1.wake_attempts, 5,
+            "seeded wake_attempts must survive phase='active'"
+        );
+        assert!(
+            d.1.last_blank_failed,
+            "seeded last_blank_failed must survive phase='active'"
+        );
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    /// A display present in the restored snapshot but absent from the new
+    /// engine config (dropped by the reload's config edit) must be skipped
+    /// silently by `apply_restore` — no seed call, no panic.
+    ///
+    /// This invariant predates T3: the `dcfg`-lookup `else { continue }`
+    /// guard was already there before the failure-state seeding was added.
+    /// Split out from `restore_seeds_retained_display_alongside_removed`
+    /// (T3-review Should-1) so this test's own RED-ness isn't conflated
+    /// with the actually-new seeding behavior below.
+    #[tokio::test]
+    async fn restore_skips_removed_display_silently() {
+        let engine_cfg = manual_engine_cfg("mon");
+        let mut engine = build_engine(&engine_cfg);
+
+        let mut snap = snapshot_with("mon", "active", 5, true);
+        snap.displays
+            .push(("gone".to_string(), display_snapshot("blanked", 9, true)));
+
+        // Must not panic.
+        apply_restore(&mut engine, &snap, &engine_cfg);
+
+        let cancel = CancellationToken::new();
+        let (handle, snap) = spawn_and_snapshot(engine, cancel.clone()).await;
+
+        assert!(
+            snap.displays.iter().all(|(id, _)| id != "gone"),
+            "removed display must not surface in the new engine's snapshot"
+        );
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    /// A display retained across reload must still have its failure state
+    /// seeded (T3's actually-new behavior, see
+    /// `restore_seeds_failure_state_independent_of_phase`) even when the
+    /// same snapshot ALSO carries a display dropped by the reload's config
+    /// edit — the removed display's `continue` must not short-circuit
+    /// seeding for entries that follow it in iteration order.
+    #[tokio::test]
+    async fn restore_seeds_retained_display_alongside_removed() {
+        let engine_cfg = manual_engine_cfg("mon");
+        let mut engine = build_engine(&engine_cfg);
+
+        let mut snap = snapshot_with("mon", "active", 5, true);
+        snap.displays
+            .push(("gone".to_string(), display_snapshot("blanked", 9, true)));
+
+        apply_restore(&mut engine, &snap, &engine_cfg);
+
+        let cancel = CancellationToken::new();
+        let (handle, snap) = spawn_and_snapshot(engine, cancel.clone()).await;
+
+        let d = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon present in snapshot");
+        assert_eq!(
+            d.1.wake_attempts, 5,
+            "retained display must still be seeded"
+        );
+        assert!(
+            d.1.last_blank_failed,
+            "retained display must still be seeded"
+        );
+
+        cancel.cancel();
+        let _ = handle.await;
     }
 }

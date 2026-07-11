@@ -2746,3 +2746,382 @@ async fn exercise_handler_runs_for_manual_only_display_with_empty_paused_rules()
     let _ = harness.engine_handle.await;
     let _ = harness.source_handle.await;
 }
+
+// ── wake-failure-surfacing: BlankFailure / BlankRecovered / WakeRecovered ──────
+//
+// These tests drive the display directly via `ForceBlank` / `ForceWake` (no
+// zone/sensor wiring needed) so the scripted `CmdFailure`s land deterministically
+// on the exact command we're scripting, mirroring `wake_failure_retries_until_success`'s
+// use of `RecordingSink::push_{blank,wake}_result` but without the grace-timing
+// dependency that test needs for its own (unrelated) assertions.
+
+/// A manual-only (rule-less) config for a single display — `ForceBlank` /
+/// `ForceWake` bypass grace/zone gating entirely, so no rule or sensor
+/// wiring is needed to drive the blank/wake command paths directly.
+fn manual_cfg(display_id: &str) -> (RulesEngineConfig, ZoneEngine) {
+    let cfg = RulesEngineConfig {
+        rules: vec![],
+        displays: vec![display_cfg(display_id)],
+        sensors: vec![],
+    };
+    let zones = ZoneEngine::new(Vec::new(), &[]).expect("empty zone engine is valid");
+    (cfg, zones)
+}
+
+#[tokio::test(start_paused = true)]
+async fn chain_exhausted_blank_emits_blank_failure_and_sets_snapshot_flag() {
+    let display = DisplayId("mon".into());
+
+    let (cfg, zones) = manual_cfg("mon");
+    let sink = Arc::new(RecordingSink::new());
+    sink.push_blank_result(Err(CmdFailure {
+        controller: "cmd".into(),
+        error: "E_BLANK_FAILED: boom".into(),
+    }));
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx = sub_rx.await.expect("subscribe reply");
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceBlank(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut saw_blank_failure = None;
+    while let Ok(ev) = events_rx.try_recv() {
+        if let DaemonEvent::BlankFailure {
+            display: d,
+            controller,
+            detail,
+        } = ev
+        {
+            saw_blank_failure = Some((d, controller, detail));
+        }
+    }
+    let (d, controller, detail) =
+        saw_blank_failure.expect("expected a BlankFailure event on the stream");
+    assert_eq!(d, display);
+    assert_eq!(controller, "cmd");
+    assert_eq!(detail, "E_BLANK_FAILED: boom");
+
+    let snap = request_snapshot(&harness.ctl_tx).await;
+    let d_snap = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("display in snapshot");
+    assert!(
+        d_snap.1.last_blank_failed,
+        "snapshot must show last_blank_failed=true after chain-exhausted blank"
+    );
+    assert_eq!(d_snap.1.wake_attempts, 0);
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn blank_recovery_emits_once_and_clears_flag() {
+    let display = DisplayId("mon".into());
+
+    let (cfg, zones) = manual_cfg("mon");
+    let sink = Arc::new(RecordingSink::new());
+    sink.push_blank_result(Err(CmdFailure {
+        controller: "cmd".into(),
+        error: "E_BLANK_FAILED: boom".into(),
+    }));
+    sink.push_blank_result(Ok(()));
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx = sub_rx.await.expect("subscribe reply");
+
+    // First ForceBlank: scripted failure — enters BlankFailure state, and
+    // (per the blank-failure state-machine path with no zone bound) the
+    // display returns to Active, so a second ForceBlank can drive the next
+    // (successful) blank attempt.
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceBlank(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceBlank(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut blank_recovered_count = 0;
+    while let Ok(ev) = events_rx.try_recv() {
+        if matches!(ev, DaemonEvent::BlankRecovered { .. }) {
+            blank_recovered_count += 1;
+        }
+    }
+    assert_eq!(
+        blank_recovered_count, 1,
+        "expected exactly one BlankRecovered event"
+    );
+
+    let snap = request_snapshot(&harness.ctl_tx).await;
+    let d_snap = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("display in snapshot");
+    assert!(
+        !d_snap.1.last_blank_failed,
+        "snapshot flag must clear after recovery"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// Anti-tautology pin (spec §9): a display's very first ever blank/wake
+/// attempt succeeding must NOT be reported as a "recovery" — recovery only
+/// makes sense relative to a prior recorded failure.
+#[tokio::test(start_paused = true)]
+async fn first_ever_success_emits_no_recovery() {
+    let display = DisplayId("mon".into());
+
+    let (cfg, zones) = manual_cfg("mon");
+    let sink = Arc::new(RecordingSink::new());
+    // No scripted results — every call defaults to Ok.
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx = sub_rx.await.expect("subscribe reply");
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceBlank(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceWake(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    while let Ok(ev) = events_rx.try_recv() {
+        assert!(
+            !matches!(
+                ev,
+                DaemonEvent::BlankRecovered { .. } | DaemonEvent::WakeRecovered { .. }
+            ),
+            "first-ever success must not be reported as a recovery, got {ev:?}"
+        );
+    }
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn wake_recovery_carries_attempt_count() {
+    let display = DisplayId("mon".into());
+
+    let (cfg, zones) = manual_cfg("mon");
+    let sink = Arc::new(RecordingSink::new());
+    for _ in 0..3 {
+        sink.push_wake_result(Err(CmdFailure {
+            controller: "mon".into(),
+            error: "E_DISPLAY_IO: timeout".into(),
+        }));
+    }
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    harness
+        .ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx = sub_rx.await.expect("subscribe reply");
+
+    // Blank first (default Ok) so the display is Blanked, then ForceWake —
+    // Waking's WakeResult(Err) handler immediately re-issues wake with a
+    // fresh generation (state_machine.rs: "the executor's own burst already
+    // backed off"), so all 3 scripted failures plus the final success drain
+    // within a handful of executor task turns — no virtual-clock advance
+    // needed.
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceBlank(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::ForceWake(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut retry_count = 0;
+    let mut wake_recovered_attempts = None;
+    while let Ok(ev) = events_rx.try_recv() {
+        match ev {
+            DaemonEvent::WakeRetry { .. } => retry_count += 1,
+            DaemonEvent::WakeRecovered { attempts, .. } => wake_recovered_attempts = Some(attempts),
+            _ => {}
+        }
+    }
+    assert_eq!(retry_count, 3, "expected 3 WakeRetry broadcasts");
+    assert_eq!(
+        wake_recovered_attempts,
+        Some(3),
+        "expected WakeRecovered{{ attempts: 3 }}"
+    );
+
+    let snap = request_snapshot(&harness.ctl_tx).await;
+    let d_snap = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("display in snapshot");
+    assert_eq!(
+        d_snap.1.wake_attempts, 0,
+        "wake_attempts must reset to 0 after recovery"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// `RulesEngine::seed_failure_state` is the seam a future reload/restore
+/// path (T3) uses to carry failure bookkeeping across an engine rebuild.
+/// Since `spawn_engine` constructs the `RulesEngine` internally, this test
+/// builds the engine + task inline (mirroring `spawn_engine`'s body) so it
+/// can seed pre-run, exactly as a real caller must (there is no post-spawn
+/// seeding control message — seeding is a pre-run-only mutator, like
+/// `apply_restore_effects`).
+#[tokio::test(start_paused = true)]
+async fn seeded_failure_state_surfaces_in_next_snapshot() {
+    let display = DisplayId("mon".into());
+
+    let (cfg, zones) = manual_cfg("mon");
+    let sink = Arc::new(RecordingSink::new());
+    sink.push_wake_result(Ok(()));
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let (events_tx, events_rx) = mpsc::channel(64);
+    let (ctl_tx, ctl_rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+
+    let mut engine = RulesEngine::new(
+        cfg,
+        zones,
+        execs,
+        HashMap::new(),
+        Arc::new(dormant_core::ownership::AlwaysOwned),
+    )
+    .expect("valid engine config");
+
+    // Seed pre-run: as if a prior engine generation recorded 5 wake
+    // attempts and a still-open blank failure for this display.
+    engine.seed_failure_state(&display, 5, true);
+
+    // Kept alive for the whole test (like `Harness::events_tx`) — the
+    // engine's `run()` loop breaks its main select on `events.recv() ==
+    // None`, so dropping this early would end the run before our ctl
+    // messages are processed.  This test drives everything via `ctl_tx` /
+    // `ForceBlank` / `ForceWake`; no sensor script is needed.
+    let _events_tx = events_tx;
+
+    let engine_cancel = cancel.clone();
+    let engine_handle = tokio::spawn(async move {
+        engine.run(events_rx, ctl_rx, engine_cancel).await;
+    });
+
+    let (sub_tx, sub_rx) = oneshot::channel();
+    ctl_tx
+        .send(ControlMsg::SubscribeEvents(sub_tx))
+        .await
+        .expect("ctl open");
+    let mut events_rx_sub = sub_rx.await.expect("subscribe reply");
+
+    let snap = request_snapshot(&ctl_tx).await;
+    let d_snap = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("display in snapshot");
+    assert_eq!(
+        d_snap.1.wake_attempts, 5,
+        "seeded wake_attempts must surface"
+    );
+    assert!(
+        d_snap.1.last_blank_failed,
+        "seeded last_blank_failed must surface"
+    );
+
+    // A subsequent successful wake must report the seeded attempt count.
+    ctl_tx
+        .send(ControlMsg::ForceBlank(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ctl_tx
+        .send(ControlMsg::ForceWake(display.clone()))
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut wake_recovered_attempts = None;
+    while let Ok(ev) = events_rx_sub.try_recv() {
+        if let DaemonEvent::WakeRecovered { attempts, .. } = ev {
+            wake_recovered_attempts = Some(attempts);
+        }
+    }
+    assert_eq!(
+        wake_recovered_attempts,
+        Some(5),
+        "WakeRecovered must carry the seeded attempt count"
+    );
+
+    cancel.cancel();
+    let _ = engine_handle.await;
+}

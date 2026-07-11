@@ -7,6 +7,9 @@
 //!
 //! - **paused** — base + a small yellow `||` badge in the bottom-right
 //!   corner (notification-dot idiom).
+//! - **failure** — base + a small red `!` badge in the same bottom-right
+//!   corner geometry as the pause badge (distinct colour + glyph so the
+//!   two overlay states are never confused at a glance).
 //! - **unreachable** — base desaturated (each RGB mixed 50% toward mid
 //!   grey).
 //!
@@ -112,6 +115,8 @@ pub struct IconSet {
     pub base: Vec<(u32, Vec<u8>)>,
     /// Size → ARGB32 BE bytes (base + pause-badge overlay).
     pub paused: Vec<(u32, Vec<u8>)>,
+    /// Size → ARGB32 BE bytes (base + failure-badge overlay).
+    pub failure: Vec<(u32, Vec<u8>)>,
     /// Size → ARGB32 BE bytes (base desaturated toward grey).
     pub unreachable: Vec<(u32, Vec<u8>)>,
 }
@@ -131,22 +136,27 @@ impl IconSet {
 
         let mut base = Vec::with_capacity(SIZES.len());
         let mut paused = Vec::with_capacity(SIZES.len());
+        let mut failure = Vec::with_capacity(SIZES.len());
         let mut unreachable = Vec::with_capacity(SIZES.len());
 
         for (size, bytes) in raw {
             let mut p = bytes.to_vec();
             draw_pause_badge(&mut p, size);
+            let mut f = bytes.to_vec();
+            draw_failure_badge(&mut f, size);
             let mut u = bytes.to_vec();
             desaturate(&mut u);
 
             base.push((size, bytes.to_vec()));
             paused.push((size, p));
+            failure.push((size, f));
             unreachable.push((size, u));
         }
 
         Self {
             base,
             paused,
+            failure,
             unreachable,
         }
     }
@@ -217,6 +227,82 @@ pub fn draw_pause_badge(pixels: &mut [u8], size: u32) {
         }
         for x in bar_x2..bar_x3 {
             blend_pixel(pixels, size, x, y, bar);
+        }
+    }
+}
+
+/// Draw a red `!` badge in the bottom-right corner of an ARGB32 BE
+/// pixmap.
+///
+/// Reuses [`draw_pause_badge`]'s badge geometry (same anchor, same size)
+/// so the paused and failure overlays never fight for screen space; only
+/// the fill colour (red instead of yellow) and the glyph (an
+/// exclamation mark — a stem bar plus a dot — instead of two bars)
+/// differ, so the two states stay visually distinct at tray resolution.
+///
+/// Public for unit testing.
+#[allow(clippy::similar_names)]
+pub fn draw_failure_badge(pixels: &mut [u8], size: u32) {
+    let s = size.cast_signed();
+    // Same badge anchor/size as `draw_pause_badge` — bottom-right corner,
+    // 40% of side length.
+    let badge_w = (s * 2) / 5;
+    let badge_h = (s * 2) / 5;
+    let badge_x0 = s - badge_w - (s / 12).max(1);
+    let badge_y0 = s - badge_h - (s / 12).max(1);
+    let badge_x1 = badge_x0 + badge_w;
+    let badge_y1 = badge_y0 + badge_h;
+
+    // Red opaque fill #E53935 (RGB), straight alpha 255.
+    // ARGB BE bytes: [A=255, R=229, G=57, B=53].
+    let fill: [u8; 4] = [0xFF, 0xE5, 0x39, 0x35];
+
+    // Exclamation glyph — white on red.
+    // ARGB BE bytes: [A=255, R=255, G=255, B=255].
+    let glyph: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
+
+    // `badge_w` is small (≤ 19 for our largest size 48), so the i32
+    // intermediate from f32 is in-range and the truncation is exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let stroke_px = (f64::from(badge_w) * 0.12).ceil().max(1.0) as i32;
+
+    // Fill the badge background (excluding a 1-px transparent inset so
+    // the badge reads as a distinct shape against the green mark).
+    for y in badge_y0..badge_y1 {
+        for x in badge_x0..badge_x1 {
+            if x == badge_x0 || y == badge_y0 || x == badge_x1 - 1 || y == badge_y1 - 1 {
+                continue;
+            }
+            blend_pixel(pixels, size, x, y, fill);
+        }
+    }
+
+    // Exclamation mark: a vertical stem occupying the top ~55% of the
+    // badge's inner height, centered horizontally, followed by a small
+    // square dot at the bottom — the same vertical extent the pause
+    // badge's bars use.
+    let inner_w = badge_x1 - badge_x0 - 2;
+    let stem_w = (inner_w / 4).max(1);
+    let stem_x0 = badge_x0 + 1 + (inner_w - stem_w) / 2;
+    let stem_x1 = stem_x0 + stem_w;
+
+    let bar_y0 = badge_y0 + stroke_px.max(2);
+    let bar_y1 = badge_y1 - stroke_px.max(2) - 1;
+    let dot_h = stem_w.max(1);
+    // Leave a 1-px gap between the stem's bottom and the dot's top so the
+    // two glyph pieces read as separate shapes.
+    let stem_y1 = (bar_y1 - dot_h - 1).max(bar_y0 + 1);
+
+    for y in bar_y0..stem_y1 {
+        for x in stem_x0..stem_x1 {
+            blend_pixel(pixels, size, x, y, glyph);
+        }
+    }
+
+    let dot_y0 = bar_y1 - dot_h;
+    for y in dot_y0..bar_y1 {
+        for x in stem_x0..stem_x1 {
+            blend_pixel(pixels, size, x, y, glyph);
         }
     }
 }
@@ -364,10 +450,48 @@ mod tests {
         let set = IconSet::load();
         assert_eq!(set.base.len(), SIZES.len());
         assert_eq!(set.paused.len(), SIZES.len());
+        assert_eq!(set.failure.len(), SIZES.len());
         assert_eq!(set.unreachable.len(), SIZES.len());
         for (size, bytes) in &set.base {
             assert_eq!(bytes.len(), (*size as usize) * (*size as usize) * 4);
         }
+    }
+
+    #[test]
+    fn failure_badge_writes_red_in_bottom_right_quadrant() {
+        // 24×24 fixture with one fully-opaque white pixel per location.
+        let size = 24u32;
+        let mut pix = vec![0u8; (size * size * 4) as usize];
+        for px in pix.chunks_exact_mut(4) {
+            px.copy_from_slice(&[255, 255, 255, 255]);
+        }
+        draw_failure_badge(&mut pix, size);
+        // Same probe point used by the pause-badge test — inside the
+        // badge fill, above the glyph.
+        let px_x = 14u32;
+        let px_y = 14u32;
+        let idx = ((px_y * size + px_x) * 4) as usize;
+        // Red fill is [A=255, R=229, G=57, B=53].  Expect a strong red
+        // channel and much weaker green/blue.
+        assert!(
+            pix[idx + 1] > 180,
+            "R: expected red tint, got {}",
+            pix[idx + 1]
+        );
+        assert!(pix[idx + 2] < 100, "G: got {}", pix[idx + 2]);
+        assert!(pix[idx + 3] < 100, "B: got {}", pix[idx + 3]);
+    }
+
+    #[test]
+    fn failure_badge_leaves_top_left_alone() {
+        let size = 24u32;
+        let mut pix = vec![0u8; (size * size * 4) as usize];
+        for px in pix.chunks_exact_mut(4) {
+            px.copy_from_slice(&[255, 200, 100, 50]); // opaque orange
+        }
+        draw_failure_badge(&mut pix, size);
+        // Pixel (0, 0) — top-left — must be untouched.
+        assert_eq!(pix[0..4], [255, 200, 100, 50]);
     }
 
     /// Icon blobs must be baked into the binary at compile time, not read
@@ -410,7 +534,7 @@ mod tests {
         });
 
         // Every (state, size) slot must be present and the right size.
-        for variant in [&set.base, &set.paused, &set.unreachable] {
+        for variant in [&set.base, &set.paused, &set.failure, &set.unreachable] {
             assert_eq!(variant.len(), SIZES.len(), "wrong variant entry count");
             for (size, bytes) in variant {
                 assert_eq!(

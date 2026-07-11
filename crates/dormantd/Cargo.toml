@@ -47,8 +47,10 @@ web-ui = ["dep:dormant-web"]
 render = ["dep:dormant-render", "dormant-core/render"]
 
 [dev-dependencies]
+async-trait = { workspace = true }
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }
 dormant-doctor = { path = "../dormant-doctor" }
+dormantctl = { path = "../dormantctl" }
 indexmap = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

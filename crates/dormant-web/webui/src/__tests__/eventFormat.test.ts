@@ -49,6 +49,62 @@ describe("eventFormat — compensation_advisory", () => {
   });
 });
 
+describe("eventFormat — blank_failure", () => {
+  it("badgeForEvent labels it with a danger badge", () => {
+    const ev: DaemonEvent = {
+      event: "blank_failure",
+      display: "d1",
+      controller: "ddcci",
+      detail: "E_TIMEOUT: no ack",
+    };
+    const badge = badgeForEvent(ev);
+    expect(badge.label).toBe("blank fail");
+    expect(badge.color).toBe("var(--danger)");
+  });
+
+  it("messageForEvent reports the display, controller, and detail", () => {
+    const ev: DaemonEvent = {
+      event: "blank_failure",
+      display: "d1",
+      controller: "ddcci",
+      detail: "E_TIMEOUT: no ack",
+    };
+    const msg = messageForEvent(ev);
+    expect(msg).toContain("d1");
+    expect(msg).toContain("ddcci");
+    expect(msg).toContain("E_TIMEOUT: no ack");
+  });
+});
+
+describe("eventFormat — blank_recovered", () => {
+  it("badgeForEvent labels it 'recovered'", () => {
+    const ev: DaemonEvent = { event: "blank_recovered", display: "d1" };
+    expect(badgeForEvent(ev).label).toBe("recovered");
+  });
+
+  it("messageForEvent reports the display recovered", () => {
+    const ev: DaemonEvent = { event: "blank_recovered", display: "d1" };
+    expect(messageForEvent(ev)).toBe("d1: blank recovered");
+  });
+});
+
+describe("eventFormat — wake_recovered", () => {
+  it("badgeForEvent labels it 'recovered'", () => {
+    const ev: DaemonEvent = { event: "wake_recovered", display: "d1", attempts: 3 };
+    expect(badgeForEvent(ev).label).toBe("recovered");
+  });
+
+  it("messageForEvent reports the display and attempt count", () => {
+    const ev: DaemonEvent = { event: "wake_recovered", display: "d1", attempts: 3 };
+    expect(messageForEvent(ev)).toBe("d1: wake recovered after 3 attempts");
+  });
+
+  it("messageForEvent singularizes a single attempt", () => {
+    const ev: DaemonEvent = { event: "wake_recovered", display: "d1", attempts: 1 };
+    expect(messageForEvent(ev)).toBe("d1: wake recovered after 1 attempt");
+  });
+});
+
 describe("eventFormat — unknown tag fallthrough (both formatters)", () => {
   it("badgeForEvent falls through to the default arm using the raw tag as the label", () => {
     const ev = { event: "some_future_tag" } as unknown as DaemonEvent;

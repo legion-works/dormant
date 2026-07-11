@@ -6,5 +6,6 @@
 - [Sensors](./sensors.md)
 - [Displays](./displays.md)
 - [OLED health](./oled-health.md)
+- [Failure notifications](./failure-notifications.md)
 - [Web UI](./web-ui.md)
 - [Troubleshooting](./troubleshooting.md)

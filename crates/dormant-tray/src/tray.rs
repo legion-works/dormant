@@ -120,6 +120,7 @@ impl Tray for DormantTray {
     fn icon_pixmap(&self) -> Vec<Icon> {
         let view = self.view();
         let blobs: &[(u32, Vec<u8>)] = match view.icon_state {
+            IconState::Failure => &self.icons.failure,
             IconState::Paused => &self.icons.paused,
             IconState::Unreachable => &self.icons.unreachable,
             // Normal and Attention share the base blob (the mark IS the
@@ -146,6 +147,7 @@ impl Tray for DormantTray {
         match view.icon_state {
             IconState::Normal | IconState::Attention => "dormant".into(),
             IconState::Paused => "dormant-paused".into(),
+            IconState::Failure => "dormant-failure".into(),
             IconState::Unreachable => "dormant-unreachable".into(),
         }
     }
@@ -159,6 +161,7 @@ impl Tray for DormantTray {
         let icon = match view.icon_state {
             IconState::Normal | IconState::Attention => "dormant",
             IconState::Paused => "dormant-paused",
+            IconState::Failure => "dormant-failure",
             IconState::Unreachable => "dormant-unreachable",
         };
         ksni::ToolTip {

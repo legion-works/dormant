@@ -1,6 +1,6 @@
 //! Pure-logic icon-state derivation from a [`StateSnapshot`].
 //!
-//! The tray's icon carries four semantic states:
+//! The tray's icon carries five semantic states:
 //!
 //! - [`IconState::Normal`] — every display in the engine is `active` and
 //!   no display is paused.
@@ -13,6 +13,10 @@
 //!   operator pause is in effect).  Paused overrides Attention because a
 //!   human deliberately disabled blanking; the overlay badge communicates
 //!   that intent.
+//! - [`IconState::Failure`] — any display has accumulated wake attempts
+//!   (`wake_attempts > 0`) or failed its last blank (`last_blank_failed`).
+//!   Failure outranks Paused: a failing display needs the operator's
+//!   attention even if the display happens to also be paused.
 //! - [`IconState::Unreachable`] — the IPC socket could not be reached
 //!   when the snapshot was taken.  This is set by the caller (the IPC
 //!   loop); once set it sticks until a fresh snapshot arrives, even if a
@@ -20,7 +24,7 @@
 
 use dormant_core::rules::StateSnapshot;
 
-/// The four tray icon states.  Cheap `Copy` — the enum has no payload.
+/// The five tray icon states.  Cheap `Copy` — the enum has no payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconState {
     /// All displays active, no pauses, daemon reachable.
@@ -29,6 +33,9 @@ pub enum IconState {
     Attention,
     /// At least one display paused (operator override).
     Paused,
+    /// At least one display is failing to wake or failed its last blank
+    /// attempt (`wake_attempts > 0 || last_blank_failed`).
+    Failure,
     /// Daemon unreachable (IPC socket down).
     Unreachable,
 }
@@ -39,7 +46,9 @@ pub enum IconState {
 /// connectivity.  The IPC loop layers `Unreachable` on top of this
 /// result when its reconnect timer is armed.
 ///
-/// Precedence (highest first): **Paused** > **Attention** > **Normal**.
+/// Precedence (highest first): **Failure** > **Paused** > **Attention** >
+/// **Normal**.  (`Unreachable` is layered on top by the caller — the IPC
+/// loop — and is not derived here.)
 ///
 /// # Examples
 ///
@@ -76,6 +85,14 @@ pub fn derive_icon_state(snap: &StateSnapshot) -> IconState {
         return IconState::Normal;
     }
 
+    let any_failing = snap
+        .displays
+        .iter()
+        .any(|(_id, d)| d.wake_attempts > 0 || d.last_blank_failed);
+    if any_failing {
+        return IconState::Failure;
+    }
+
     let any_paused = snap.displays.iter().any(|(_id, d)| d.paused);
     if any_paused {
         return IconState::Paused;
@@ -108,6 +125,53 @@ mod tests {
                     controllers: vec![],
                     wake_attempts: 0,
                     last_blank_failed: false,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+        }
+    }
+
+    fn snap_failing(phase: &str, wake_attempts: u64, last_blank_failed: bool) -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: phase.into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    controllers: vec![],
+                    wake_attempts,
+                    last_blank_failed,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+        }
+    }
+
+    fn snap_failing_paused(
+        phase: &str,
+        wake_attempts: u64,
+        last_blank_failed: bool,
+        paused: bool,
+    ) -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: phase.into(),
+                    inhibited: false,
+                    paused,
+                    cmd_gen: 0,
+                    controllers: vec![],
+                    wake_attempts,
+                    last_blank_failed,
                     stage: None,
                 },
             )],
@@ -232,6 +296,39 @@ mod tests {
         assert_eq!(
             derive_icon_state(&snap_with_two(("active", false), ("active", false))),
             IconState::Normal
+        );
+    }
+
+    #[test]
+    fn wake_failing_display_is_failure() {
+        assert_eq!(
+            derive_icon_state(&snap_failing("blanked", 3, false)),
+            IconState::Failure
+        );
+    }
+
+    #[test]
+    fn blank_failed_active_display_is_failure() {
+        assert_eq!(
+            derive_icon_state(&snap_failing("active", 0, true)),
+            IconState::Failure
+        );
+    }
+
+    #[test]
+    fn failure_outranks_paused() {
+        assert_eq!(
+            derive_icon_state(&snap_failing_paused("active", 3, false, true)),
+            IconState::Failure
+        );
+    }
+
+    #[test]
+    fn healthy_displays_unchanged() {
+        // regression
+        assert_eq!(
+            derive_icon_state(&snap_with("blanked", false)),
+            IconState::Attention
         );
     }
 }

@@ -17,6 +17,8 @@
 //! [`TooltipInputs::unreachable`] and the function emits a single
 //! "dormant: daemon unreachable" line.
 
+use std::fmt::Write as _;
+
 use dormant_core::rules::StateSnapshot;
 
 /// The legend block the tooltip carries below the header.  Kept
@@ -89,11 +91,20 @@ pub fn build_tooltip(inputs: &TooltipInputs<'_>) -> Tooltip {
     let mut parts: Vec<String> = Vec::with_capacity(snap.displays.len());
     for (id, d) in &snap.displays {
         // Phase + paused flag, e.g. `tv: blanked (paused)`.
-        let phase = if d.paused {
+        let mut phase = if d.paused {
             format!("{} (paused)", d.phase)
         } else {
             d.phase.clone()
         };
+        // Failure detail — wake attempts outrank a stale blank failure
+        // (a display that's currently retrying wake is the more urgent
+        // signal); each is mutually exclusive with the other in the
+        // suffix so the tooltip line stays short.
+        if d.wake_attempts > 0 {
+            let _ = write!(phase, " (wake failing ×{})", d.wake_attempts);
+        } else if d.last_blank_failed {
+            phase.push_str(" (last blank failed)");
+        }
         parts.push(format!("{id}: {phase}"));
     }
     let detail = parts.join(" · ");
@@ -241,6 +252,96 @@ mod tests {
         assert_eq!(
             t.body,
             "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: active"
+        );
+    }
+
+    #[test]
+    fn wake_failing_display_gets_attempt_count_suffix() {
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "blanked".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    controllers: vec![],
+                    wake_attempts: 3,
+                    last_blank_failed: false,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+        };
+        let t = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert_eq!(
+            t.body,
+            "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: blanked (wake failing ×3)"
+        );
+    }
+
+    #[test]
+    fn blank_failed_display_gets_last_blank_failed_suffix() {
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "active".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    controllers: vec![],
+                    wake_attempts: 0,
+                    last_blank_failed: true,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+        };
+        let t = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert_eq!(
+            t.body,
+            "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: active (last blank failed)"
+        );
+    }
+
+    #[test]
+    fn paused_and_wake_failing_combines_both_suffixes() {
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "blanked".into(),
+                    inhibited: false,
+                    paused: true,
+                    cmd_gen: 0,
+                    controllers: vec![],
+                    wake_attempts: 2,
+                    last_blank_failed: false,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+        };
+        let t = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert_eq!(
+            t.body,
+            "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: blanked (paused) (wake failing ×2)"
         );
     }
 }

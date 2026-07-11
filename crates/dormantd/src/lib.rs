@@ -10,6 +10,7 @@ pub mod inhibit_activity;
 #[cfg(unix)]
 pub mod ipc;
 pub mod logging;
+pub mod notifier;
 pub mod reload;
 pub mod single_instance;
 pub mod wear_tracker;

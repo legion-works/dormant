@@ -42,7 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -71,7 +71,13 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::inhibit_activity::{self, ActivityRule};
+use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
+
+/// Builds the daemon-lifetime notification sink. Production defaults to
+/// [`notifier::ZbusSink`]; tests inject a factory returning a shared
+/// recording fake (`with_notify_sink_builder` — `source_builder` precedent).
+type NotifySinkBuilder = Arc<dyn Fn() -> Arc<dyn NotifySink> + Send + Sync>;
 
 /// Builds the sensor sources for a config. Production uses the sensor
 /// registry; tests inject a factory that returns scripted fakes.
@@ -189,7 +195,14 @@ pub struct App {
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
     render_sink_builder: Option<RenderSinkBuilder>,
+    notify_sink_builder: NotifySinkBuilder,
     disable_ipc: bool,
+}
+
+/// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
+/// per call (constructed exactly once, in `App::start`).
+fn default_notify_sink_builder() -> NotifySinkBuilder {
+    Arc::new(|| Arc::new(notifier::ZbusSink::new()) as Arc<dyn NotifySink>)
 }
 
 impl App {
@@ -217,6 +230,7 @@ impl App {
             source_builder,
             #[cfg(feature = "render")]
             render_sink_builder: None,
+            notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
         })
     }
@@ -244,6 +258,7 @@ impl App {
             source_builder: Arc::new(factory),
             #[cfg(feature = "render")]
             render_sink_builder: None,
+            notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
         })
     }
@@ -278,6 +293,21 @@ impl App {
     #[must_use]
     pub fn disable_ipc(mut self) -> Self {
         self.disable_ipc = true;
+        self
+    }
+
+    /// Set an injected notification-sink factory (test seam — the
+    /// `source_builder` precedent). Production defaults to
+    /// [`notifier::ZbusSink`]; tests typically capture a shared `Arc` and
+    /// have the factory clone it, so the SAME recording fake instance is
+    /// used across every reload generation (mirrors how [`NotifyState`] is
+    /// daemon-lifetime, not per-generation).
+    #[must_use]
+    pub fn with_notify_sink_builder<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Arc<dyn NotifySink> + Send + Sync + 'static,
+    {
+        self.notify_sink_builder = Arc::new(factory);
         self
     }
 
@@ -331,6 +361,15 @@ impl App {
         // lock is the same `Arc<PanelLock>` across every generation swap.
         let panel_locks = PanelLocks::new();
 
+        // Daemon-lifetime notifier state + sink (spec §4.4): constructed
+        // once here and threaded into every `spawn_generation` call (this
+        // one and every subsequent reload/rollback via `Runner`), so the
+        // notifier's open episodes — and the underlying `ZbusSink`'s cached
+        // DBus connection — survive a config reload, exactly like
+        // `panel_locks` above.
+        let notify_state: Arc<Mutex<NotifyState>> = Arc::new(Mutex::new(NotifyState::default()));
+        let notify_sink: Arc<dyn NotifySink> = (self.notify_sink_builder)();
+
         // Clone before cfg/creds are moved into assemble_static.
         let cfg_clone = cfg.clone();
         let creds_clone = creds.clone();
@@ -352,7 +391,14 @@ impl App {
             .await
             .context("assemble initial runtime")?;
 
-        let spawn = spawn_generation(&root, assembly, None, None)?;
+        let spawn = spawn_generation(
+            &root,
+            assembly,
+            None,
+            None,
+            notify_state.clone(),
+            notify_sink.clone(),
+        )?;
 
         // Executor-map watch channel for the wear tracker (spec §4.3):
         // seeded here from the first generation, republished by
@@ -433,6 +479,8 @@ impl App {
             started_web_port,
             started_web_bind,
             panel_locks,
+            notify_state,
+            notify_sink,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -645,6 +693,13 @@ struct Runner {
     /// the same `Arc<PanelLock>` whether it came from the old generation's
     /// controller or the new one's.
     panel_locks: Arc<PanelLocks>,
+    /// Daemon-lifetime notifier episode state (spec §4.4), constructed once
+    /// in [`App::start`] and threaded unchanged into every generation's
+    /// [`spawn_generation`] call — episodes survive a config reload.
+    notify_state: Arc<Mutex<NotifyState>>,
+    /// Daemon-lifetime notification sink, constructed once in
+    /// [`App::start`] and threaded unchanged into every generation.
+    notify_sink: Arc<dyn NotifySink>,
 }
 
 impl Runner {
@@ -819,7 +874,14 @@ impl Runner {
             .as_ref()
             .map(|snap| reload::zero_changed_displays(snap, &self.generation.cfg, &new_cfg));
 
-        match spawn_generation(&self.root, new_assembly, restore_snapshot.as_ref(), None) {
+        match spawn_generation(
+            &self.root,
+            new_assembly,
+            restore_snapshot.as_ref(),
+            None,
+            self.notify_state.clone(),
+            self.notify_sink.clone(),
+        ) {
             Ok(spawn) => {
                 self.install_generation(spawn);
                 // Combine retained rule-driven dark displays with stuck rule-less
@@ -943,7 +1005,14 @@ impl Runner {
             #[cfg(feature = "render")]
             input_wake_rx: Some(input_wake_rx),
         };
-        match spawn_generation(&self.root, assembly, snapshot, pending) {
+        match spawn_generation(
+            &self.root,
+            assembly,
+            snapshot,
+            pending,
+            self.notify_state.clone(),
+            self.notify_sink.clone(),
+        ) {
             Ok(spawn) => self.install_generation(spawn),
             Err(e) => tracing::error!(event = "reload_rebuild_old_failed", error = %e),
         }
@@ -1493,12 +1562,19 @@ fn build_render_sinks(
     (sinks, input_wake_rx)
 }
 
-/// Spawn the engine, sources, and inhibitor for one generation.
+/// Spawn the engine, sources, inhibitor, and notifier for one generation.
+///
+/// `notify_state` / `notify_sink` are daemon-lifetime (constructed once in
+/// [`App::start`]) — every call site threads the SAME `Arc`s through so the
+/// notifier's open episodes (and the sink's cached connection) survive a
+/// config reload.
 fn spawn_generation(
     root: &CancellationToken,
     assembly: StaticAssembly,
     restore: Option<&StateSnapshot>,
     pending: Option<String>,
+    notify_state: Arc<Mutex<NotifyState>>,
+    notify_sink: Arc<dyn NotifySink>,
 ) -> Result<GenSpawn> {
     let token = root.child_token();
     let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(64);
@@ -1568,6 +1644,17 @@ fn spawn_generation(
         ctl_tx.clone(),
         token.clone(),
     );
+
+    // Desktop wake/blank-failure notifier (spec §4.4) — `notifier::spawn`
+    // returns `None` (no-op) when `[notifications] enabled = false`,
+    // mirroring `inhibit_activity::spawn`'s own None-returning precedent.
+    let _notifier = notifier::spawn(NotifierDeps {
+        ctl: ctl_tx.clone(),
+        cfg: assembly.cfg.notifications,
+        state: notify_state,
+        sink: notify_sink,
+        cancel: token.clone(),
+    });
 
     let generation = Generation {
         token,

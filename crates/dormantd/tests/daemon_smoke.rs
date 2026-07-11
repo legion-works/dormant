@@ -2891,3 +2891,182 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
 
     shutdown(handle, join).await;
 }
+
+// ── 19: notifier cross-generation close via startup reconcile (T4, R3-S/C) ────
+//
+// A wake failure past `[notifications].wake_attempt_threshold` must produce
+// a `Send` on the injected `RecordingSink`. A subsequent reload with a
+// dispatch-relevant `wake_command` edit (still always-failing — never
+// `/bin/true`, so a coincidental REAL recovery cannot explain the result,
+// mirroring test 18's de-confounding rationale) voids the carried
+// `wake_attempts` evidence. The notifier's `NotifyState` is daemon-lifetime
+// (shared across generations via `App::start`), so the NEW generation's
+// startup `reconcile` sees the (now healthy) snapshot with the OLD open
+// episode still recorded and must `Close` it — with no recovery `Send`,
+// since this is voided evidence, not a real recovery.
+
+use dormantd::notifier::NotifySink;
+
+/// A `NotifySink` fake that records every `notify`/`close` call. Shared via
+/// `Arc` between the test and the `App`'s injected builder so the SAME
+/// instance observes both generations.
+#[derive(Default)]
+struct RecordingSink {
+    notifies: Mutex<Vec<(String, String, u8, u32)>>,
+    closes: Mutex<Vec<u32>>,
+    next_id: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl NotifySink for RecordingSink {
+    async fn notify(
+        &self,
+        summary: &str,
+        body: &str,
+        urgency: u8,
+        replaces: u32,
+    ) -> Result<u32, String> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.notifies.lock().unwrap().push((
+            summary.to_string(),
+            body.to_string(),
+            urgency,
+            replaces,
+        ));
+        Ok(id)
+    }
+
+    async fn close(&self, id: u32) -> Result<(), String> {
+        self.closes.lock().unwrap().push(id);
+        Ok(())
+    }
+}
+
+/// One ruled `command` display whose wake command is the tunable `wake_cmd`
+/// (always a failing shell command in this test — only the literal string
+/// changes between generations). Fast grace/wake-retry so the threshold is
+/// crossed quickly.
+fn notifier_reload_config(marker: &Path, wake_cmd: &str, grace: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[notifications]
+wake_attempt_threshold = 2
+cooldown = "1m"
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m}'"
+wake_command = "{wake_cmd}"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        m = marker.display(),
+        wake_cmd = wake_cmd,
+        g = grace,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &notifier_reload_config(&marker, "false", "20ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    // Absent long enough for the grace period to elapse (blank succeeds via
+    // the marker-writing command), then present again to trigger a wake —
+    // `wake_command = "false"` always fails, so the state machine retries on
+    // `wake_retry_interval` (20ms) indefinitely (the wake-wedge invariant),
+    // giving the notifier several `WakeRetry` events past the threshold.
+    let script = vec![
+        (Duration::from_millis(0), ev("desk", SensorState::Absent)),
+        (Duration::from_millis(150), ev("desk", SensorState::Present)),
+    ];
+
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    let sink_for_builder = sink.clone();
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .disable_ipc()
+    .with_notify_sink_builder(move || sink_for_builder.clone() as std::sync::Arc<dyn NotifySink>);
+    let (handle, join) = app.start().await.expect("start app");
+
+    // ── Generation 1: drive a wake failure past the threshold ──────────────
+    assert!(
+        wait_for(
+            || !sink.notifies.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        )
+        .await,
+        "expected the notifier to Send once wake_attempts crossed the threshold"
+    );
+    let sent_count = sink.notifies.lock().unwrap().len();
+    assert_eq!(sent_count, 1, "expected exactly one Send before the reload");
+    assert!(
+        sink.closes.lock().unwrap().is_empty(),
+        "no Close expected yet"
+    );
+
+    // ── Reload: dispatch-relevant wake_command edit, STILL always-failing ──
+    // (never `/bin/true` — see test 18's comment on why that would confound
+    // the assertion with a coincidental real recovery).
+    let mut reloads = handle.subscribe_reload();
+    fs::write(&cfg_path, notifier_reload_config(&marker, "exit 1", "20ms")).unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded, "reload must be accepted");
+
+    // ── Generation 2's startup reconcile must Close the stale episode ──────
+    assert!(
+        wait_for(
+            || !sink.closes.lock().unwrap().is_empty(),
+            Duration::from_secs(5),
+        )
+        .await,
+        "expected the new generation's startup reconcile to Close the voided episode"
+    );
+    assert_eq!(
+        sink.notifies.lock().unwrap().len(),
+        1,
+        "no recovery notice must be emitted for voided (not real) evidence"
+    );
+
+    shutdown(handle, join).await;
+}

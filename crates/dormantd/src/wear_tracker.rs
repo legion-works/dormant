@@ -262,6 +262,36 @@ fn ensure_ledgers_loaded(
             state.persist_readonly.insert(display_id.clone());
         }
     }
+
+    // Refresh panel_type from config for already-resolved displays (reload /
+    // mid-run config-edit path). panel_type is config-declared, never
+    // auto-detected — a persisted ledger created before the operator set the
+    // field must adopt the config's current value, and a reload that swaps in
+    // a new generation with a different panel_type must propagate to the
+    // in-memory ledger immediately.
+    {
+        let resolved: Vec<DisplayId> = state.resolved.iter().cloned().collect();
+        for display_id in &resolved {
+            let display_cfg = cfg.displays.get(&display_id.0);
+            let cfg_panel_type = display_cfg.map(|d| d.panel_type).unwrap_or_default();
+            if let Some(ledger) = state.ledgers.get_mut(display_id)
+                && ledger.panel_type != cfg_panel_type
+            {
+                tracing::debug!(
+                    event = "wear_panel_type_updated",
+                    display = %display_id,
+                    from = ?ledger.panel_type,
+                    to = ?cfg_panel_type,
+                );
+                ledger.panel_type = cfg_panel_type;
+                // Reset the persist clock so the persist-interval check
+                // emits a Persist action on this same loop iteration
+                // (ensure_ledgers_loaded runs before tick()) and writes the
+                // updated panel_type to disk before the next restart.
+                state.last_persist_epoch_s.insert(display_id.clone(), 0);
+            }
+        }
+    }
 }
 
 /// Persist every currently-loaded, non-readonly ledger — the "final
@@ -730,11 +760,25 @@ fn load_or_create_ledger(
                 persist_readonly: true,
             }
         }
-        Ok(ledger) => LoadResult {
-            ledger,
-            needs_seed: false,
-            persist_readonly: false,
-        },
+        Ok(mut ledger) => {
+            // panel_type is config-declared (spec: never auto-detected) —
+            // a ledger persisted before the operator set the field carries
+            // Unknown forever unless we adopt the config value here.
+            if ledger.panel_type != panel_type {
+                tracing::debug!(
+                    event = "wear_panel_type_updated",
+                    display = %display_key,
+                    from = ?ledger.panel_type,
+                    to = ?panel_type,
+                );
+                ledger.panel_type = panel_type;
+            }
+            LoadResult {
+                ledger,
+                needs_seed: false,
+                persist_readonly: false,
+            }
+        }
         Err(_) => {
             let corrupt_path = dir.join(format!("wear-{key}.json.corrupt.{now_epoch_s}"));
             match std::fs::rename(&path, &corrupt_path) {
@@ -1692,6 +1736,87 @@ mod tests {
         assert_eq!(
             after, original,
             "apply_actions must never overwrite a future-version (persist_readonly) ledger"
+        );
+    }
+
+    // ── panel_type sync: config-declared, never auto-detected ───────────
+
+    /// Load path: a ledger persisted with `panel_type = Unknown` must adopt
+    /// the config's current `panel_type` on load — config is the declared
+    /// source of truth, spec: config-declared, never auto-detected.
+    #[test]
+    fn load_or_create_ledger_adopts_config_panel_type_over_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = WearIdentity {
+            key: "mon".into(),
+            display_name: "mon".into(),
+        };
+        // Persist a ledger with Unknown — simulating a pre-config-declaration
+        // ledger created before the operator set panel_type.
+        let mut disk_ledger = WearLedger::new(identity.clone(), PanelType::Unknown, 9, 16, 0);
+        disk_ledger.attribute_uniform(Duration::from_secs(3600), 1.0);
+        persist_ledger(dir.path(), "mon", &disk_ledger).unwrap();
+
+        // Config now declares QdOled — load must adopt it.
+        let result =
+            load_or_create_ledger(dir.path(), "mon", identity, PanelType::QdOled, 9, 16, 500);
+        assert!(!result.needs_seed, "existing ledger must not re-seed");
+        assert!(!result.persist_readonly);
+        assert_eq!(
+            result.ledger.panel_type,
+            PanelType::QdOled,
+            "config panel_type must win over the on-disk value"
+        );
+        // Wear data is preserved: only panel_type should change.
+        assert!(
+            (result.ledger.total_on_hours - disk_ledger.total_on_hours).abs() < 1e-9,
+            "wear data must be preserved when only panel_type changes"
+        );
+    }
+
+    /// Reload path: a display already in `state.resolved` must pick up a
+    /// mid-run config change to `panel_type` and mark itself dirty so the
+    /// new value survives a daemon restart.
+    #[test]
+    fn ensure_ledgers_loaded_refreshes_panel_type_for_resolved_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+
+        // First load: panel_type = Unknown (the default).
+        let mut cfg = minimal_config();
+        cfg.displays.insert(
+            "mon".to_string(),
+            display_config_with_controllers(&["command"]),
+        );
+
+        let mut state = TrackerState::default();
+        let executors = fake_executors(&[(&display, None)]);
+        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+
+        assert_eq!(
+            state.ledgers.get(&display).unwrap().panel_type,
+            PanelType::Unknown
+        );
+        assert!(state.resolved.contains(&display));
+
+        // Operator edits config: panel_type changes to QdOled.
+        cfg.displays.get_mut("mon").unwrap().panel_type = PanelType::QdOled;
+
+        // A subsequent tick (or reload) calls ensure_ledgers_loaded again —
+        // the resolved display must pick up the new panel_type.
+        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+
+        assert_eq!(
+            state.ledgers.get(&display).unwrap().panel_type,
+            PanelType::QdOled,
+            "panel_type must adopt config's current value for already-resolved displays"
+        );
+        // Dirty marker: last_persist_epoch_s reset to 0 so the next tick's
+        // persist-interval check emits a Persist action.
+        assert_eq!(
+            state.last_persist_epoch_s.get(&display).copied(),
+            Some(0),
+            "dirty marker must force a persist so the change survives restart"
         );
     }
 

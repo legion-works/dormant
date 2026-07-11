@@ -257,6 +257,38 @@ fn drain_capture() -> String {
     })
 }
 
+// ── Notify-sink isolation ───────────────────────────────────────────────────
+
+use dormantd::notifier::{NotifySink, zbus_sink_was_constructed};
+
+struct NoopNotifySink;
+
+#[async_trait::async_trait]
+impl NotifySink for NoopNotifySink {
+    async fn notify(
+        &self,
+        _summary: &str,
+        _body: &str,
+        _urgency: u8,
+        _replaces: u32,
+    ) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    async fn close(&self, _id: u32) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Every smoke-test App construction site must route through this factory
+/// unless the test explicitly opts into notification tracking with a
+/// `RecordingSink`.  The factory is called once per `App::start` (a fresh
+/// `Arc` each generation — the sink is stateless, so sharing would be safe
+/// but adds no value).
+fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
+    std::sync::Arc::new(NoopNotifySink)
+}
+
 // ── 1: blank then wake ─────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -282,6 +314,7 @@ async fn smoke_blank_and_wake() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -302,6 +335,11 @@ async fn smoke_blank_and_wake() {
     assert!(
         b.is_some() && w.is_some() && b < w,
         "expected B before W, got {content:?}"
+    );
+    assert!(
+        !zbus_sink_was_constructed(),
+        "ZbusSink must never be constructed by any smoke test — \
+         every App construction site must inject a no-op notify sink"
     );
 }
 
@@ -351,6 +389,7 @@ async fn reload_swap() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -404,6 +443,7 @@ async fn reload_rejected_keeps_old() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -542,6 +582,7 @@ async fn removed_display_verified_wake() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -599,7 +640,8 @@ async fn removed_display_wake_failure_aborts() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory);
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 
@@ -668,6 +710,7 @@ async fn reload_defensive_wake_retained() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -722,6 +765,7 @@ async fn ruleless_display_preserves_phase_on_reload() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -805,6 +849,7 @@ async fn config_watch_updates_on_successful_reload_only() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -890,6 +935,7 @@ async fn creds_watch_updates_on_successful_reload_only() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -972,6 +1018,7 @@ async fn web_nonloopback_warning_fires_at_startup() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -1006,6 +1053,7 @@ async fn web_bind_change_ignored_on_reload() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -1167,6 +1215,7 @@ wake_retry_interval = "1s"
             fake_factory("desk", script),
         )
         .expect("build app")
+        .with_notify_sink_builder(noop_factory)
         .with_render_sink_builder(builder)
         .disable_ipc();
 
@@ -1249,6 +1298,7 @@ wake_retry_interval = "1s"
             fake_factory("desk", script),
         )
         .expect("build app")
+        .with_notify_sink_builder(noop_factory)
         .with_render_sink_builder(builder)
         .disable_ipc();
 
@@ -1443,6 +1493,7 @@ wake_retry_interval = "1s"
             fake_factory("desk", script),
         )
         .expect("build app")
+        .with_notify_sink_builder(noop_factory)
         .with_render_sink_builder(builder)
         .disable_ipc();
 
@@ -1668,6 +1719,7 @@ async fn manual_only_display_present_in_snapshot() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -1770,6 +1822,7 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -1887,6 +1940,7 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -1950,6 +2004,7 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         fake_factory("desk", vec![]),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -2159,6 +2214,7 @@ async fn wear_ledger_file_appears_and_seeds() {
         fake_factory("desk", Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2222,6 +2278,7 @@ async fn wear_disabled_creates_nothing() {
         fake_factory("desk", Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2277,6 +2334,7 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
         fake_factory("desk", Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2407,6 +2465,7 @@ async fn wear_shutdown_persists_final_ledger() {
         fake_factory("desk", Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2500,6 +2559,7 @@ async fn wear_park_persists_final_ledger() {
         fake_factory("desk", Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2635,7 +2695,8 @@ async fn ipc_event_stream_surfaces_blank_failure_then_recovery() {
         Strictness::Strict,
         fake_factory("desk", script),
     )
-    .expect("build app");
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory);
     // Real IPC — this test needs the actual socket for event subscription.
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2822,6 +2883,7 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -2927,8 +2989,6 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
 // startup `reconcile` sees the (now healthy) snapshot with the OLD open
 // episode still recorded and must `Close` it — with no recovery `Send`,
 // since this is voided evidence, not a real recovery.
-
-use dormantd::notifier::NotifySink;
 
 /// A `NotifySink` fake that records every `notify`/`close` call. Shared via
 /// `Arc` between the test and the `App`'s injected builder so the SAME
@@ -3263,6 +3323,7 @@ async fn reload_carries_sensor_reported_until_own_config_edit() {
         fake_factory("desk", Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -3405,6 +3466,7 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
         fake_factory(SENSOR, Vec::new()),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 

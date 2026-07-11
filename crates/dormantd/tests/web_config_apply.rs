@@ -121,6 +121,33 @@ fn origin(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+// ── Notify-sink isolation ───────────────────────────────────────────────────
+
+use dormantd::notifier::{NotifySink, zbus_sink_was_constructed};
+
+struct NoopNotifySink;
+
+#[async_trait::async_trait]
+impl NotifySink for NoopNotifySink {
+    async fn notify(
+        &self,
+        _summary: &str,
+        _body: &str,
+        _urgency: u8,
+        _replaces: u32,
+    ) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    async fn close(&self, _id: u32) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
+    std::sync::Arc::new(NoopNotifySink)
+}
+
 // ── Test 1: full-loop happy path + backup-write-no-reload pin ─────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -147,6 +174,7 @@ async fn config_apply_full_loop() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -257,6 +285,11 @@ async fn config_apply_full_loop() {
     );
 
     shutdown(handle, join).await;
+
+    assert!(
+        !zbus_sink_was_constructed(),
+        "ZbusSink must never be constructed — every App construction site must inject a no-op notify sink"
+    );
 }
 
 // ── Test 2: wake_command change → reloaded, not rejected ──────────────────────
@@ -311,6 +344,7 @@ async fn config_apply_wake_command_change_reloads() {
         fake_factory("desk", script),
     )
     .expect("build app")
+    .with_notify_sink_builder(noop_factory)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 

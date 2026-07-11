@@ -968,6 +968,7 @@ name = "dormant-tray"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dormant-core",
  "dormantctl",
  "dormantd",

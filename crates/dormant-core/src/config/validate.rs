@@ -4118,6 +4118,104 @@ availability_topic = ""
     }
 
     #[test]
+    fn availability_topic_collision_via_default_derivation_rejected() {
+        // F10 via the DEFAULT-DERIVED path — neither sensor sets an explicit
+        // `availability_topic`. Sensor a's state topic is literally the
+        // string sensor b's availability topic derives to
+        // (`derive_availability_topic("t1") == "t1/availability"`), so the
+        // collision must be detected purely through derivation, not through
+        // an explicit override. This is the case the reviewer's mutation
+        // (breaking `derive_availability_topic`'s string form) must kill.
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t1/availability"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t1"
+"#,
+        );
+        assert!(
+            errs.iter().any(|e| e.what == "E_CONFIG_INVALID"
+                && e.detail.contains("'b'")
+                && e.detail.contains("t1/availability")
+                && e.detail.contains("collides with a state topic")),
+            "sensor b's DEFAULT-derived availability topic ('t1/availability') colliding with \
+             sensor a's literal state topic must be rejected, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn shared_derived_availability_topic_divergent_literals_rejected() {
+        // F9 via the DEFAULT-DERIVED path — neither sensor sets an explicit
+        // `availability_topic`; both share the same state topic
+        // ("sensors/shared"), so both derive to the same availability topic
+        // ("sensors/shared/availability"). A shared state topic on one
+        // broker is not itself rejected by validate_sensors, so this
+        // isolates the F9 divergent-literals check to the derived path.
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/shared"
+availability_payload_online = "up"
+availability_payload_offline = "down"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "sensors/shared"
+availability_payload_online = "online"
+availability_payload_offline = "offline"
+"#,
+        );
+        assert!(
+            errs.iter().any(|e| e.what == "E_CONFIG_INVALID"
+                && e.detail.contains("sensors/shared/availability")),
+            "two sensors sharing a purely DEFAULT-derived availability topic with divergent \
+             literals must be rejected, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn availability_topic_same_string_different_brokers_not_collided() {
+        // F10 cross-broker independence — the same topic string used as
+        // sensor a's state topic on broker-x and sensor b's explicit
+        // availability_topic on broker-y must NOT collide: broker grouping
+        // (`by_broker`) structurally isolates them. Mirrors the reviewer's
+        // ad hoc probe (T1-review.md, finding S2).
+        let errs = availability_validation_errors(
+            r#"
+config_version = 1
+[sensors.a]
+type = "mqtt"
+broker_url = "tcp://broker-x:1883"
+topic = "t1"
+
+[sensors.b]
+type = "mqtt"
+broker_url = "tcp://broker-y:1883"
+topic = "t2"
+availability_topic = "t1"
+"#,
+        );
+        assert!(
+            errs.is_empty(),
+            "same topic string on two different brokers must not collide, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
     fn keys_on_ha_sensor_load_and_are_ignored() {
         // F7 — the availability_* keys live in the shared `sensors.` known-key
         // bucket (not per-variant), so setting them on an `ha` sensor loads

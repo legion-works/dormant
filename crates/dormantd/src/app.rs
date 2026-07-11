@@ -415,7 +415,7 @@ impl App {
     /// post-probe validation, zone/engine construction) or the watcher cannot
     /// be installed.
     #[allow(clippy::too_many_lines)]
-    pub async fn start(self) -> Result<(AppHandle, JoinHandle<()>)> {
+    pub async fn start(mut self) -> Result<(AppHandle, JoinHandle<()>)> {
         let root = CancellationToken::new();
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
@@ -544,52 +544,6 @@ impl App {
         let watcher =
             reload::config_watcher(&self.config_path).context("install config file watcher")?;
 
-        // The watchdog probe-arm's tick period (spec §6.3): captured ONCE
-        // here so a mid-run env change never re-times the interval arm.
-        // Production reads `WATCHDOG_USEC` (halved by `sd_notify`) or falls
-        // back to 30s; `with_watchdog_interval` overrides for tests.
-        let watchdog_interval = self.watchdog_interval.unwrap_or_else(|| {
-            sd_notify::watchdog_interval_from_env().unwrap_or(Duration::from_secs(30))
-        });
-
-        // The first LKG candidate tracks this boot's generation (spec §4
-        // Mechanism: "set at startup completion"). `None` when
-        // `watchdog.lkg_enabled` is false — no candidate tracking, no
-        // files written, ever, until the config re-enables it on a reload.
-        let lkg_candidate =
-            new_lkg_candidate(&self.config_path, cfg_clone.watchdog.lkg_enabled, "boot");
-
-        let runner = Runner {
-            config_path: self.config_path.clone(),
-            creds_path: self.creds_path.clone(),
-            strictness: self.strictness,
-            source_builder: self.source_builder,
-            #[cfg(feature = "render")]
-            render_sink_builder: self.render_sink_builder,
-            root: root.clone(),
-            engine_ctl: engine_ctl_tx,
-            engine_events: engine_events_tx,
-            executors_tx,
-            reload_tx: reload_tx.clone(),
-            config_tx,
-            creds_tx,
-            generation: spawn.generation,
-            started_web_port,
-            started_web_bind,
-            panel_locks,
-            notify_state,
-            notify_sink,
-            sd: self.sd_notify,
-            watchdog_interval,
-            lkg_candidate,
-            lkg_defer_count: 0,
-            probe_failed_warned: false,
-            #[cfg(any(test, feature = "test-util"))]
-            force_reload_spawn_failure: self.force_reload_spawn_failure,
-        };
-
-        let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
-
         // The doctor service is shared by the IPC server (for
         // `IpcRequest::Doctor`) and the web server (for the
         // `POST /api/doctor` route).  Construct it once here from
@@ -660,6 +614,67 @@ impl App {
         #[cfg(not(feature = "web-ui"))]
         let web_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // The watchdog probe-arm's tick period (spec §6.3): captured ONCE
+        // here so a mid-run env change never re-times the interval arm.
+        // Production reads `WATCHDOG_USEC` (halved by `sd_notify`) or falls
+        // back to 30s; `with_watchdog_interval` overrides for tests.
+        let watchdog_interval = self.watchdog_interval.unwrap_or_else(|| {
+            sd_notify::watchdog_interval_from_env().unwrap_or(Duration::from_secs(30))
+        });
+
+        // The first LKG candidate tracks this boot's generation (spec §4
+        // Mechanism: "set at startup completion"). `None` when
+        // `watchdog.lkg_enabled` is false — no candidate tracking, no
+        // files written, ever, until the config re-enables it on a reload.
+        let lkg_candidate =
+            new_lkg_candidate(&self.config_path, cfg_clone.watchdog.lkg_enabled, "boot");
+
+        // READY=1 (spec §6.2 F1): the TRUE end of `App::start` — after the
+        // IPC listener spawn AND the web spawn above, immediately before
+        // this function's `Ok` return. `SdNotify` is deliberately not
+        // `Clone` (its own module doc: exactly one owner at a time along
+        // the boot chain, `BootInputs::sd_notify` → `App::with_sd_notify` →
+        // `Runner`) and `Runner` below takes ownership of it for the
+        // lifetime of the run loop — so this is the LAST point at which
+        // `self` (not yet moved into `Runner`) still holds it. Sending here,
+        // then moving it into the `Runner` literal two lines down, is the
+        // ownership-preserving way to hit the spec's placement without
+        // giving `SdNotify` a second owner or an `Arc` it doesn't need
+        // (T5 boot-integration design note — see also `boot.rs`'s module
+        // docs, which reference this comment).
+        self.sd_notify.ready();
+
+        let runner = Runner {
+            config_path: self.config_path.clone(),
+            creds_path: self.creds_path.clone(),
+            strictness: self.strictness,
+            source_builder: self.source_builder,
+            #[cfg(feature = "render")]
+            render_sink_builder: self.render_sink_builder,
+            root: root.clone(),
+            engine_ctl: engine_ctl_tx,
+            engine_events: engine_events_tx,
+            executors_tx,
+            reload_tx: reload_tx.clone(),
+            config_tx,
+            creds_tx,
+            generation: spawn.generation,
+            started_web_port,
+            started_web_bind,
+            panel_locks,
+            notify_state,
+            notify_sink,
+            sd: self.sd_notify,
+            watchdog_interval,
+            lkg_candidate,
+            lkg_defer_count: 0,
+            probe_failed_warned: false,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_spawn_failure: self.force_reload_spawn_failure,
+        };
+
+        let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
+
         let handle = AppHandle {
             ctl_tx: front_ctl_tx,
             events_tx: front_events_tx,
@@ -677,8 +692,18 @@ impl App {
         Ok((handle, join))
     }
 
-    /// Run the daemon to completion (production entry point): starts and then
-    /// awaits the run loop until a shutdown signal fires.
+    /// Run the daemon to completion: starts and then awaits the run loop
+    /// until a shutdown signal fires.
+    ///
+    /// **Not the production entry point (spec §5.1, T5):** `dormantd`'s
+    /// `main.rs` calls [`crate::boot::boot`] instead, which owns the
+    /// single-instance flock (P1/P15 — acquired immediately before its own
+    /// `App::start()` call, the ONLY one on a production boot path) and the
+    /// bad-config/crash-loop rollback machinery this method knows nothing
+    /// about. Kept as a convenience for callers (tests, other binaries)
+    /// that want the plain "just start and run" shape with no rollback
+    /// semantics and no lock — such a caller MUST NOT be a second
+    /// concurrent daemon process against the same displays/state.
     ///
     /// # Errors
     ///

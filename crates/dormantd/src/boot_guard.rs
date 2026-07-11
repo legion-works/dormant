@@ -36,6 +36,8 @@ use dormant_core::config::{Strictness, load_config};
 use dormant_core::rules::StateSnapshot;
 use serde::{Deserialize, Serialize};
 
+use crate::sd_notify::SdNotify;
+
 /// Non-discounted starts, within [`CRASH_LOOP_WINDOW`], sharing the current
 /// config's fingerprint, required before a counted rollback fires (spec
 /// §5.2 condition a). Documented `pub const`, deliberately NOT config — this
@@ -53,9 +55,23 @@ pub const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(6 * 60);
 /// two, not because `boot_guard` uses it directly.
 pub const LKG_HEALTH_DEFER_CAP: u32 = 3;
 
-const CRASH_LOOP_FILE: &str = "crash-loop.json";
+// `pub(crate)`: `boot()` (T5, `dormantd/src/boot.rs`) is the ONLY other
+// consumer — the single boot()-owned crash-loop write (spec §5.1 point 3,
+// immediate rollback) reads-modifies-writes this exact file via
+// `load_crash_loop_state`/`write_atomic_json` directly, since `decide()`
+// cannot predict a build-time-only failure.
+pub(crate) const CRASH_LOOP_FILE: &str = "crash-loop.json";
 const LKG_FILE: &str = "last-known-good.toml";
 const DISCOUNT_PREFIX: &str = "discount-";
+
+/// `state_dir().join("last-known-good.toml")` — the single canonical join
+/// point `boot()` uses both to detect whether `prepare` already chose the
+/// LKG (`plan.chosen_config == lkg_path(..)`) and to run its own immediate-
+/// rollback eligibility check (spec §5.1 point 3).
+#[must_use]
+pub(crate) fn lkg_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LKG_FILE)
+}
 
 // ── Fingerprint ──────────────────────────────────────────────────────────
 
@@ -161,7 +177,11 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> Fingerprint {
 
 /// Fingerprint a file on disk; an unreadable file (missing, permissions,
 /// I/O error) maps to the `Unreadable` sentinel (spec §5.1 point 1).
-fn fingerprint_file(path: &Path) -> Fingerprint {
+///
+/// `pub(crate)`: `boot()` (T5) reuses this for its own immediate-rollback
+/// eligibility check and `config_rollback_boot` log fields — the exact same
+/// unreadable-sentinel semantics `prepare` uses, never a second definition.
+pub(crate) fn fingerprint_file(path: &Path) -> Fingerprint {
     std::fs::read(path).map_or(Fingerprint::Unreadable, |bytes| fingerprint_bytes(&bytes))
 }
 
@@ -269,24 +289,21 @@ pub struct BootPlan {
     pub pending_message: Option<String>,
 }
 
-/// Runtime-only bundle a later task's `boot()` needs (spec §5.1).
-///
-/// T1 note: `sd_notify` is deliberately NOT a field yet — `SdNotify`
-/// (`dormantd/src/sd_notify.rs`) does not exist until Task 2. The
-/// orchestrator's decision for this task is to land `BootInputs` here with
-/// this doc placeholder and no `sd_notify` field; Task 2/5 add it
-/// (`with_sd_notify` seam, spec §6.2) once the type exists. See
-/// `boot_inputs_field_list_is_minimal` below, which pins the CURRENT
-/// (pre-T5) field list — that test must be extended, not silently
-/// invalidated, when `sd_notify` lands.
-///
-/// TODO(T5): add `pub sd_notify: SdNotify` once `dormantd::sd_notify`
-/// lands (spec §5.1/§6.2 — the injected readiness/watchdog seam).
+/// Runtime-only bundle `boot()` (T5, `dormantd/src/boot.rs`) needs (spec
+/// §5.1). Five fields, pinned by `boot_inputs_field_list_is_minimal` below —
+/// no socket override field, because T5's tests set `daemon.socket_path`
+/// directly in the seeded config instead (`App::start` binds real IPC; the
+/// tempdir-socket pattern, `ipc_roundtrip.rs:34-50` precedent).
 pub struct BootInputs {
     pub creds_path: PathBuf,
     pub strictness: Strictness,
     pub state_dir: PathBuf,
     pub lock_path: PathBuf,
+    /// Injected readiness/watchdog seam (spec §6.2). `boot()` threads this
+    /// straight into `App::with_sd_notify` on whichever `App` it ends up
+    /// starting — production callers build it via `SdNotify::from_env()`;
+    /// tests inject `SdNotify::from_socket_for_test`/a disabled instance.
+    pub sd_notify: SdNotify,
 }
 
 // ── decide: pure verdict ────────────────────────────────────────────────
@@ -520,10 +537,7 @@ pub fn prepare(
                 "crash-loop threshold reached for '{}'; rolling back to last-known-good",
                 config_path.display()
             );
-            let message = format!(
-                "your latest config failed and was rolled back to last-known-good — \
-                 fix it and reload: {detail}"
-            );
+            let message = pending_message_for_rollback(&detail);
             (
                 lkg_path.clone(),
                 Some(message),
@@ -580,6 +594,19 @@ pub fn prepare(
     }
 }
 
+/// The spec §5.1 point 6 (F11) pending-reload banner text for a rollback
+/// boot, parameterised on `detail`. Shared by `prepare`'s counted `RollBack`
+/// arm and `boot()`'s (T5) immediate-rollback arm — the SAME wording either
+/// way, since from the operator's point of view both are "your latest
+/// config failed and was rolled back to last-known-good".
+#[must_use]
+pub(crate) fn pending_message_for_rollback(detail: &str) -> String {
+    format!(
+        "your latest config failed and was rolled back to last-known-good — \
+         fix it and reload: {detail}"
+    )
+}
+
 /// Build [`LkgInfo`] for `lkg_path`: existence, `load_config`
 /// validation (spec §3 F16 — same trust class as any config file), and a
 /// direct byte comparison against `config_path`'s current bytes (spec §3/
@@ -602,7 +629,10 @@ fn build_lkg_info(lkg_path: &Path, config_path: &Path, strictness: Strictness) -
     }
 }
 
-fn files_bytes_equal(a: &Path, b: &Path) -> bool {
+/// `pub(crate)`: `boot()` (T5) reuses this exact direct byte-comparison
+/// (spec §3/§5.2 F7) for its own immediate-rollback eligibility check —
+/// never a fingerprint-equality shortcut, matching `prepare`'s use.
+pub(crate) fn files_bytes_equal(a: &Path, b: &Path) -> bool {
     match (std::fs::read(a), std::fs::read(b)) {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
@@ -730,7 +760,10 @@ fn generate_nonce() -> u64 {
 
 // ── crash-loop.json load ────────────────────────────────────────────────
 
-fn load_crash_loop_state(state_dir: &Path) -> CrashLoopState {
+/// `pub(crate)`: `boot()` (T5) reads-modifies-writes this exact state via
+/// this loader for its own immediate-rollback write (spec §5.1 point 3 —
+/// the ONLY boot()-owned crash-loop write; `prepare` owns every other one).
+pub(crate) fn load_crash_loop_state(state_dir: &Path) -> CrashLoopState {
     let path = state_dir.join(CRASH_LOOP_FILE);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return CrashLoopState::default();
@@ -1086,16 +1119,17 @@ mod tests {
 
     #[test]
     fn boot_inputs_field_list_is_minimal() {
-        // Pins the CURRENT (pre-T5) field list: creds_path, strictness,
-        // state_dir, lock_path — no socket override, no sd_notify yet
-        // (see the TODO(T5) doc comment on `BootInputs`). If this struct
-        // literal fails to compile, the field list has drifted from this
-        // pin and the test must be amended alongside the code change.
+        // Pins the T5 field list: creds_path, strictness, state_dir,
+        // lock_path, sd_notify — no socket override (T5 tests set
+        // `daemon.socket_path` in the seeded config instead). If this
+        // struct literal fails to compile, the field list has drifted from
+        // this pin and the test must be amended alongside the code change.
         let _inputs = BootInputs {
             creds_path: PathBuf::from("credentials.toml"),
             strictness: Strictness::Strict,
             state_dir: PathBuf::from("/tmp/state"),
             lock_path: PathBuf::from("/tmp/dormant.lock"),
+            sd_notify: SdNotify::from_env(),
         };
     }
 

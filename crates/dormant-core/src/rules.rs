@@ -370,6 +370,14 @@ pub struct SensorSnapshot {
     pub state: SensorState,
     /// Seconds since the last event arrived from this sensor.
     pub last_seen_secs_ago: u64,
+    /// Whether this sensor has delivered at least one event since daemon
+    /// start (carried across config reloads). `false` = the state shown is
+    /// the fail-safe seed, not information from the device.
+    /// `#[serde(default)]` for legacy wire back-compat (older snapshots
+    /// have no `reported` key; the honest default is `false` — unknown
+    /// provenance).
+    #[serde(default)]
+    pub reported: bool,
 }
 
 /// A zone as seen by a [`StateSnapshot`].
@@ -642,6 +650,12 @@ pub struct RulesEngine {
     /// Per-display wake-retry counter (increments on each failure, resets on
     /// success).
     wake_attempts: HashMap<DisplayId, u64>,
+    /// Sensors that have delivered at least one [`PresenceEvent`] since
+    /// daemon start (any state — this records "has reported", not "is
+    /// present").  Diagnostic-only: deliberately SEPARATE from
+    /// `sensor_last_seen_virtual` (seeding that map would perturb
+    /// stale-sweep semantics).  Surfaced via [`SensorSnapshot::reported`].
+    reported: HashSet<SensorId>,
     /// Displays whose last blank attempt exhausted its controller chain and
     /// has not yet recovered.  Sibling of `wake_attempts` — same
     /// insert-on-failure / remove-on-success bookkeeping, but as a set since
@@ -757,6 +771,7 @@ impl RulesEngine {
             paused_rules: HashSet::new(),
             holds,
             wake_attempts: HashMap::new(),
+            reported: HashSet::new(),
             last_blank_failed: HashSet::new(),
             sensor_last_seen_virtual: HashMap::new(),
             timers: BinaryHeap::new(),
@@ -833,6 +848,17 @@ impl RulesEngine {
         if last_blank_failed {
             self.last_blank_failed.insert(display.clone());
         }
+    }
+
+    /// Seed the diagnostic "has reported since daemon start" bit for a
+    /// sensor — used by the daemon's reload/restore path to carry the
+    /// `reported` flag across a reload (sibling seam to
+    /// [`RulesEngine::seed_failure_state`]).  The caller is responsible for
+    /// only seeding sensors whose binding is unchanged across the reload
+    /// (provenance discipline lives in the daemon's reload helper, not
+    /// here); this method just records the bit.
+    pub fn seed_sensor_reported(&mut self, sensor: &SensorId) {
+        self.reported.insert(sensor.clone());
     }
 
     /// Drive the engine until `cancel` is triggered or both inbound channels
@@ -922,6 +948,13 @@ impl RulesEngine {
         // tests can drive minutes in milliseconds).
         self.sensor_last_seen_virtual
             .insert(effective.sensor_id.clone(), tokio::time::Instant::now());
+
+        // Diagnostic-only: record that this sensor has reported at least
+        // once since daemon start — ANY state (Present/Absent/Unavailable)
+        // counts as "has reported".  Deliberately separate from
+        // `sensor_last_seen_virtual` above (see the field doc on
+        // `RulesEngine::reported`).
+        self.reported.insert(effective.sensor_id.clone());
 
         // SensorChanged broadcast — only if the state actually changed from
         // what the zone engine has recorded.
@@ -1425,6 +1458,7 @@ impl RulesEngine {
                     id: scfg.sensor.0.clone(),
                     state,
                     last_seen_secs_ago: secs_ago,
+                    reported: self.reported.contains(&scfg.sensor),
                 }
             })
             .collect();
@@ -2635,6 +2669,121 @@ mod tests {
         assert!(!d.last_blank_failed);
     }
 
+    // ── `reported` cold-start diagnostic (spec §5) ──────────────────────────
+
+    /// A minimal engine with exactly ONE sensor and no rules/displays — for
+    /// the `reported` tests below, which drive `handle_presence_event` and
+    /// `handle_control(Snapshot)` directly (private-access, co-located).
+    fn engine_with_sensor(id: &str) -> RulesEngine {
+        let sid = SensorId(id.into());
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![],
+                sensors: vec![SensorRuntimeCfg {
+                    sensor: sid.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: Duration::from_secs(3600),
+                }],
+            },
+            ZoneEngine::new(vec![], &[sid]).expect("single-sensor empty-zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("single-sensor engine config is valid")
+    }
+
+    /// Take a synchronous snapshot from an engine via `handle_control` —
+    /// `send_snapshot` replies inline (no `run()` loop needed).
+    fn snapshot_of(engine: &mut RulesEngine) -> StateSnapshot {
+        let (tx, mut rx) = oneshot::channel();
+        engine.handle_control(ControlMsg::Snapshot(tx));
+        rx.try_recv().expect("snapshot reply sent inline")
+    }
+
+    #[test]
+    fn reported_false_until_first_event_then_true() {
+        let mut engine = engine_with_sensor("desk");
+
+        let before = snapshot_of(&mut engine);
+        let sensor = before
+            .sensors
+            .iter()
+            .find(|s| s.id == "desk")
+            .expect("sensor 'desk' in snapshot");
+        assert!(
+            !sensor.reported,
+            "a sensor that has never delivered an event must show reported == false"
+        );
+
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("desk".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+
+        let after = snapshot_of(&mut engine);
+        let sensor = after
+            .sensors
+            .iter()
+            .find(|s| s.id == "desk")
+            .expect("sensor 'desk' in snapshot");
+        assert!(
+            sensor.reported,
+            "reported must flip to true after the first PresenceEvent"
+        );
+
+        // A further state flip (Present → Absent) must not clear it — the
+        // set records "has reported since start", not "is currently
+        // present".
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("desk".into()),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        let still_after = snapshot_of(&mut engine);
+        let sensor = still_after
+            .sensors
+            .iter()
+            .find(|s| s.id == "desk")
+            .expect("sensor 'desk' in snapshot");
+        assert!(
+            sensor.reported,
+            "reported must stay true across subsequent state flips"
+        );
+    }
+
+    #[test]
+    fn legacy_sensor_snapshot_parses_without_reported() {
+        // Old daemon JSON has no "reported" key; new binary must default
+        // it to false (serde back-compat — honest: unknown provenance).
+        let json = r#"{"id":"desk","state":"present","last_seen_secs_ago":2}"#;
+        let s: SensorSnapshot = serde_json::from_str(json).unwrap();
+        assert!(!s.reported);
+    }
+
+    #[test]
+    fn seed_sensor_reported_surfaces_in_snapshot() {
+        // Fresh engine, zero events processed — seed_sensor_reported is the
+        // reload/restore carry-over seam; it must surface in the snapshot
+        // without any PresenceEvent ever having been processed.
+        let mut engine = engine_with_sensor("desk");
+        engine.seed_sensor_reported(&SensorId("desk".into()));
+
+        let snap = snapshot_of(&mut engine);
+        let sensor = snap
+            .sensors
+            .iter()
+            .find(|s| s.id == "desk")
+            .expect("sensor 'desk' in snapshot");
+        assert!(
+            sensor.reported,
+            "seed_sensor_reported must surface as reported == true with zero events processed"
+        );
+    }
+
     /// Minimal engine used by the `PublishDaemonEvent` tests below — no
     /// rules/displays/sensors, `AlwaysOwned` gate.  `handle_control` is
     /// synchronous and self-contained (no `run()` loop needed), so these
@@ -2749,6 +2898,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         paused_rules: HashSet::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
+        reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
         timers: BinaryHeap::new(),
@@ -2845,6 +2995,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         paused_rules: HashSet::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
+        reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
         timers: BinaryHeap::new(),

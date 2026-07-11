@@ -404,6 +404,7 @@ mod tests {
                 id: "front_desk".into(),
                 state: SensorState::Present,
                 last_seen_secs_ago: 3,
+                reported: true,
             }],
             zones: vec![],
             displays: vec![(

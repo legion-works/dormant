@@ -140,11 +140,13 @@ mod tests {
                     id: "desk".into(),
                     state: dormant_core::types::SensorState::Present,
                     last_seen_secs_ago: 2,
+                    reported: true,
                 },
                 SensorSnapshot {
                     id: "hallway".into(),
                     state: dormant_core::types::SensorState::Absent,
                     last_seen_secs_ago: 120,
+                    reported: true,
                 },
             ],
             zones: vec![ZoneSnapshot {

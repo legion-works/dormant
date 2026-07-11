@@ -36,6 +36,7 @@ fn spawn_fake_engine() -> (
             id: "desk".into(),
             state: SensorState::Present,
             last_seen_secs_ago: 2,
+            reported: true,
         }],
         zones: vec![ZoneSnapshot {
             id: "office".into(),

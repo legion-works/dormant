@@ -819,6 +819,8 @@ mod tests {
                     paused: false,
                     cmd_gen: 0,
                     controllers: Vec::new(),
+                    wake_attempts: 0,
+                    last_blank_failed: false,
                     stage,
                 },
             )],

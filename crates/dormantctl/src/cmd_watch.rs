@@ -82,6 +82,19 @@ fn fmt_event(event: &DaemonEvent) -> String {
                 "display {display}: compensation advisory ({hours_since_long_dwell}h since long dwell)"
             )
         }
+        DaemonEvent::BlankFailure {
+            display,
+            controller,
+            detail,
+        } => {
+            format!("display {display}: blank failed via {controller}: {detail}")
+        }
+        DaemonEvent::BlankRecovered { display } => {
+            format!("display {display}: blank recovered")
+        }
+        DaemonEvent::WakeRecovered { display, attempts } => {
+            format!("display {display}: wake recovered after {attempts} attempts")
+        }
         DaemonEvent::Unknown => "unknown daemon event".to_string(),
     }
 }
@@ -124,6 +137,39 @@ mod tests {
         assert_eq!(
             fmt_event(&event),
             "display desk: compensation advisory (48h since long dwell)"
+        );
+    }
+
+    #[test]
+    fn fmt_event_blank_failure_formats_controller_and_detail() {
+        let event = DaemonEvent::BlankFailure {
+            display: DisplayId("desk".to_string()),
+            controller: "ddcci".to_string(),
+            detail: "E_DISPLAY_IO: bus gone".to_string(),
+        };
+        assert_eq!(
+            fmt_event(&event),
+            "display desk: blank failed via ddcci: E_DISPLAY_IO: bus gone"
+        );
+    }
+
+    #[test]
+    fn fmt_event_blank_recovered_formats() {
+        let event = DaemonEvent::BlankRecovered {
+            display: DisplayId("desk".to_string()),
+        };
+        assert_eq!(fmt_event(&event), "display desk: blank recovered");
+    }
+
+    #[test]
+    fn fmt_event_wake_recovered_formats_attempts() {
+        let event = DaemonEvent::WakeRecovered {
+            display: DisplayId("desk".to_string()),
+            attempts: 3,
+        };
+        assert_eq!(
+            fmt_event(&event),
+            "display desk: wake recovered after 3 attempts"
         );
     }
 }

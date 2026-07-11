@@ -313,6 +313,43 @@ pub enum DaemonEvent {
         #[serde(default)]
         hours_since_long_dwell: u64,
     },
+    /// A blank command exhausted its controller chain (every controller in
+    /// the ladder failed).  `display` is required; `controller` /
+    /// `detail` are `#[serde(default)]` so a future producer can omit them
+    /// without breaking older consumers.  NOTE: `blank_failure` is the wire
+    /// tag (via `rename_all = "snake_case"` on the variant name
+    /// `BlankFailure`); it is unrelated to the `phase` log literals emitted
+    /// by [`DaemonEvent::DisplayPhase`] — don't conflate the two when
+    /// grepping.
+    BlankFailure {
+        /// The display whose blank command failed.
+        display: DisplayId,
+        /// Name of the controller that failed (from the folded
+        /// [`crate::types::CmdFailure`]).
+        #[serde(default)]
+        controller: String,
+        /// Error detail, starting with an `E_*` code (from the folded
+        /// [`crate::types::CmdFailure`]).
+        #[serde(default)]
+        detail: String,
+    },
+    /// A display's blank command succeeded after a prior [`Self::BlankFailure`]
+    /// — the failed-blank condition has cleared.  Emitted at most once per
+    /// failure (no repeat spam while healthy).
+    BlankRecovered {
+        /// The display whose blank command recovered.
+        display: DisplayId,
+    },
+    /// A display's wake command succeeded after one or more prior
+    /// [`DaemonEvent::WakeRetry`] broadcasts.  `display` is required;
+    /// `attempts` is `#[serde(default)]` for forward compat.
+    WakeRecovered {
+        /// The display whose wake command recovered.
+        display: DisplayId,
+        /// How many retry attempts preceded the success.
+        #[serde(default)]
+        attempts: u64,
+    },
     /// Wire-tolerance catch-all: any event tag this build does not
     /// recognize deserializes to this variant instead of failing the whole
     /// stream.  The daemon never constructs this — see
@@ -397,6 +434,16 @@ pub struct DisplaySnapshot {
     /// field (serde back-compat).
     #[serde(default)]
     pub controllers: Vec<ControllerHealth>,
+    /// Current wake-retry attempt counter for this display (0 once healthy
+    /// or before the first attempt).  `#[serde(default)]` for legacy wire
+    /// back-compat.
+    #[serde(default)]
+    pub wake_attempts: u64,
+    /// Whether the last blank attempt for this display exhausted its
+    /// controller chain and has not yet recovered.  `#[serde(default)]` for
+    /// legacy wire back-compat.
+    #[serde(default)]
+    pub last_blank_failed: bool,
     /// The active ladder stage when the display is in the `staged` phase.
     /// `None` for every other phase (and for legacy wire — the key is
     /// omitted when `None`, byte-identical to a pre-stage snapshot).
@@ -595,6 +642,11 @@ pub struct RulesEngine {
     /// Per-display wake-retry counter (increments on each failure, resets on
     /// success).
     wake_attempts: HashMap<DisplayId, u64>,
+    /// Displays whose last blank attempt exhausted its controller chain and
+    /// has not yet recovered.  Sibling of `wake_attempts` — same
+    /// insert-on-failure / remove-on-success bookkeeping, but as a set since
+    /// blank failure has no attempt counter (spec §3.1).
+    last_blank_failed: HashSet<DisplayId>,
     /// Virtual last-seen per sensor — drives the stale-sensor sweep using
     /// the tokio clock so paused tests can advance minutes in milliseconds.
     sensor_last_seen_virtual: HashMap<SensorId, tokio::time::Instant>,
@@ -705,6 +757,7 @@ impl RulesEngine {
             paused_rules: HashSet::new(),
             holds,
             wake_attempts: HashMap::new(),
+            last_blank_failed: HashSet::new(),
             sensor_last_seen_virtual: HashMap::new(),
             timers: BinaryHeap::new(),
             results_rx,
@@ -757,6 +810,28 @@ impl RulesEngine {
             let mut queued = effects;
             queued.extend(refeed);
             self.pending_restore.push((display.clone(), queued));
+        }
+    }
+
+    /// Seed pre-run wake/blank failure bookkeeping for a display — used by
+    /// the daemon's reload/restore path (T3) to carry a display's failure
+    /// state across a reload alongside [`RulesEngine::install_restored_machine`],
+    /// so an operator watching `dormantctl watch`/the snapshot doesn't see a
+    /// spurious "recovered" event (or lose an in-flight failure indicator)
+    /// purely because the engine was rebuilt.  A no-op for a fresh
+    /// (never-failed) display: `wake_attempts == 0` and
+    /// `last_blank_failed == false` insert nothing.
+    pub fn seed_failure_state(
+        &mut self,
+        display: &DisplayId,
+        wake_attempts: u64,
+        last_blank_failed: bool,
+    ) {
+        if wake_attempts > 0 {
+            self.wake_attempts.insert(display.clone(), wake_attempts);
+        }
+        if last_blank_failed {
+            self.last_blank_failed.insert(display.clone());
         }
     }
 
@@ -1377,6 +1452,8 @@ impl RulesEngine {
                         paused: m.overlays().paused.is_some(),
                         cmd_gen: m.cmd_gen(),
                         controllers,
+                        wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
+                        last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
                         stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
                     },
                 ));
@@ -1399,10 +1476,29 @@ impl RulesEngine {
                 r#gen,
                 result,
             } => {
+                // Move-order pin (spec F4): capture the folded failure
+                // BEFORE `result` is moved into `machine.step` below —
+                // precedent: `let ok = result.is_ok();` in the Wake arm.
+                let failure: Option<CmdFailure> = result.as_ref().err().cloned();
                 if let Some(machine) = self.machines.get_mut(&display) {
                     let effects = machine.step(Input::BlankResult { r#gen, result }, now);
                     for effect in effects {
                         self.process_effect(&display, effect);
+                    }
+                }
+                match failure {
+                    Some(f) => {
+                        self.last_blank_failed.insert(display.clone());
+                        let _ = self.event_tx.send(DaemonEvent::BlankFailure {
+                            display,
+                            controller: f.controller,
+                            detail: f.error,
+                        });
+                    }
+                    None => {
+                        if self.last_blank_failed.remove(&display) {
+                            let _ = self.event_tx.send(DaemonEvent::BlankRecovered { display });
+                        }
                     }
                 }
             }
@@ -1419,7 +1515,14 @@ impl RulesEngine {
                     }
                 }
                 if ok {
-                    self.wake_attempts.remove(&display);
+                    if let Some(n) = self.wake_attempts.remove(&display)
+                        && n > 0
+                    {
+                        let _ = self.event_tx.send(DaemonEvent::WakeRecovered {
+                            display,
+                            attempts: n,
+                        });
+                    }
                 } else {
                     let attempt = self.wake_attempts.entry(display.clone()).or_insert(0);
                     *attempt = attempt.saturating_add(1);
@@ -2366,6 +2469,8 @@ mod tests {
             paused: false,
             cmd_gen: 0,
             controllers: vec![],
+            wake_attempts: 0,
+            last_blank_failed: false,
             stage: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -2381,6 +2486,8 @@ mod tests {
             paused: false,
             cmd_gen: 1,
             controllers: vec![],
+            wake_attempts: 0,
+            last_blank_failed: false,
             stage: Some(StageInfo {
                 idx: 1,
                 kind: StageKind::RenderBlack,
@@ -2476,6 +2583,56 @@ mod tests {
             serde_json::from_str(&s).unwrap(),
             DaemonEvent::CompensationAdvisory { .. }
         ));
+    }
+
+    /// `BlankFailure` round-trips through the wire with the expected tag.
+    #[test]
+    fn blank_failure_round_trips_with_tag() {
+        let e = DaemonEvent::BlankFailure {
+            display: DisplayId("m".into()),
+            controller: "ddcci".into(),
+            detail: "E_DISPLAY_IO: bus gone".into(),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"event\":\"blank_failure\""));
+        assert!(matches!(
+            serde_json::from_str(&s).unwrap(),
+            DaemonEvent::BlankFailure { .. }
+        ));
+    }
+
+    /// First in-repo exercise of `#[serde(default)]` on fields of an
+    /// internally tagged variant (spec F18) — `display` is REQUIRED, the
+    /// rest default.
+    #[test]
+    fn new_variants_deserialize_with_missing_defaulted_fields() {
+        let e: DaemonEvent =
+            serde_json::from_str(r#"{"event":"blank_failure","display":"m"}"#).unwrap();
+        match e {
+            DaemonEvent::BlankFailure {
+                controller, detail, ..
+            } => {
+                assert_eq!(controller, "");
+                assert_eq!(detail, "");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let e: DaemonEvent =
+            serde_json::from_str(r#"{"event":"wake_recovered","display":"m"}"#).unwrap();
+        assert!(matches!(e, DaemonEvent::WakeRecovered { attempts: 0, .. }));
+        // display truly required:
+        assert!(serde_json::from_str::<DaemonEvent>(r#"{"event":"blank_recovered"}"#).is_err());
+    }
+
+    /// Old `DisplaySnapshot` JSON without the two new failure-tracking keys
+    /// must still parse, defaulting them to the "healthy" values.
+    #[test]
+    fn legacy_display_snapshot_parses_without_new_keys() {
+        let json =
+            r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":3,"controllers":[]}"#;
+        let d: DisplaySnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(d.wake_attempts, 0);
+        assert!(!d.last_blank_failed);
     }
 
     /// Minimal engine used by the `PublishDaemonEvent` tests below — no
@@ -2592,6 +2749,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         paused_rules: HashSet::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
+        last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
         timers: BinaryHeap::new(),
         results_rx,
@@ -2687,6 +2845,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         paused_rules: HashSet::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
+        last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
         timers: BinaryHeap::new(),
         results_rx,

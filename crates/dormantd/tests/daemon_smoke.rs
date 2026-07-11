@@ -81,6 +81,29 @@ async fn wait_for_last_blank_failed(
     }
 }
 
+/// Poll `Status` snapshots (via [`snapshot_with_retry`]) until `sensor`'s
+/// `reported` bit equals `want` or `timeout` elapses.
+async fn wait_for_sensor_reported(
+    ctl: &mpsc::Sender<ControlMsg>,
+    sensor: &str,
+    want: bool,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let snap = snapshot_with_retry(ctl).await;
+        if let Some(s) = snap.sensors.iter().find(|s| s.id == sensor)
+            && s.reported == want
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, contents).expect("write file");
@@ -3167,6 +3190,253 @@ async fn notifier_disabled_records_zero_sink_calls_after_failure_burst() {
     assert!(
         sink.closes.lock().unwrap().is_empty(),
         "enabled=false: NotifySink::close must never be called"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── 21: reload carries sensor `reported` until the sensor's own config edit (T4) ──
+//
+// `.disable_ipc()`. Mirrors test 18's shape (carry-over across an unrelated
+// edit, then voiding on a dispatch-relevant edit) but for the sensor-side
+// `reported` diagnostic bit instead of display `last_blank_failed`. The
+// sensor's own `topic` changing is the dispatch-relevant edit here — any
+// whole-`SensorConfig` difference zeroes `reported` (spec R3-S), unlike the
+// per-field display gate.
+
+/// One `mqtt` sensor ("desk") feeding an `any` zone that drives a quiet
+/// rule-driven display; `log_level` and `topic` are the two knobs this test
+/// flips independently (unrelated daemon-level edit vs. a sensor-own-config
+/// edit). `grace_period` is long so no dispatch confounds the `reported`
+/// assertions within the test window.
+fn reported_carry_config(topic: &str, log_level: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+log_level = "{log_level}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "{topic}"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "true"
+wake_command = "true"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "10s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_carries_sensor_reported_until_own_config_edit() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &reported_carry_config("zigbee2mqtt/desk", "info"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    // No scripted events — the sensor is driven live via `events_sender()`
+    // so the test controls exactly when the first event lands.
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+    let ctl = handle.control_sender();
+
+    // Before any event, `reported` must read false (fail-safe seed).
+    let snap0 = snapshot_with_retry(&ctl).await;
+    let desk0 = snap0
+        .sensors
+        .iter()
+        .find(|s| s.id == "desk")
+        .expect("desk sensor in snapshot");
+    assert!(!desk0.reported, "reported must be false before any event");
+
+    // Deliver one live event — `reported` must flip true.
+    handle
+        .events_sender()
+        .send(ev("desk", SensorState::Present))
+        .await
+        .unwrap();
+    assert!(
+        wait_for_sensor_reported(&ctl, "desk", true, Duration::from_secs(3)).await,
+        "reported must flip true after the first event"
+    );
+
+    // ── Reload #1: unrelated daemon-level edit — same sensor block ─────
+    fs::write(
+        &cfg_path,
+        reported_carry_config("zigbee2mqtt/desk", "debug"),
+    )
+    .unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload #1 outcome in time")
+        .expect("reload bus open");
+    assert_eq!(
+        outcome,
+        ReloadOutcome::Reloaded,
+        "reload #1 must be accepted"
+    );
+
+    assert!(
+        wait_for_sensor_reported(&ctl, "desk", true, Duration::from_secs(3)).await,
+        "unrelated config edit must carry reported=true forward"
+    );
+
+    // ── Reload #2: sensor's own config edit (topic change) ─────────────
+    fs::write(
+        &cfg_path,
+        reported_carry_config("zigbee2mqtt/desk-NEW", "debug"),
+    )
+    .unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload #2 outcome in time")
+        .expect("reload bus open");
+    assert_eq!(
+        outcome,
+        ReloadOutcome::Reloaded,
+        "reload #2 must be accepted"
+    );
+
+    assert!(
+        wait_for_sensor_reported(&ctl, "desk", false, Duration::from_secs(2)).await,
+        "sensor's own config edit must void (zero) the carried reported bit"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── 22: absent-policy + mqtt hazard warns at startup, silent on rejection (T4) ──
+//
+// `.disable_ipc()`. Uses the file's tracing-capture precedent
+// (`install_capture_subscriber`/`drain_capture`, tests 10/11). Per the P5
+// race caveat: the capture buffer is process-global, so (a) the absence
+// window is bounded by draining immediately before the rejected reload and
+// reading immediately after, and (b) the zone/sensor names are unique to
+// this test so sibling tests running concurrently in the same process
+// cannot pollute the evidence either direction.
+
+/// One `mqtt` sensor as a direct member of an `unavailable_policy = "absent"`
+/// zone — the exact hazard shape `absent_mqtt_hazards` matches on. No
+/// displays/rules are needed for the hazard warn itself, but a quiet
+/// rule-driven display is included anyway to keep the config shape close to
+/// the file's other fixtures.
+fn hazard_config(zone: &str, sensor: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.{sensor}]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "t"
+
+[zones.{zone}]
+mode = "any"
+members = ["{sensor}"]
+unavailable_policy = "absent"
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "true"
+wake_command = "true"
+modes = ["power_off"]
+
+[rules.r]
+zone = "{zone}"
+displays = ["mon"]
+grace_period = "10s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
+    const ZONE: &str = "hazmat-zone-t4";
+    const SENSOR: &str = "hazmat-sensor-t4";
+
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let cfg_path = write_file(dir.path(), "config.toml", &hazard_config(ZONE, SENSOR));
+    let creds_path = dir.path().join("credentials.toml");
+
+    drain_capture(); // discard any startup noise from prior tests
+
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory(SENSOR, Vec::new()),
+    )
+    .expect("build app")
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    let startup_output = drain_capture();
+    assert!(
+        startup_output.contains("unavailable_absent_mqtt")
+            && startup_output.contains(ZONE)
+            && startup_output.contains(SENSOR),
+        "expected unavailable_absent_mqtt hazard warn at startup mentioning zone/sensor: \
+         {startup_output}"
+    );
+
+    let mut reloads = handle.subscribe_reload();
+
+    // Bound the absence window: drain immediately before the rejected
+    // reload, read immediately after (P5 race caveat).
+    drain_capture();
+    fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
+    }
+    let rejected_output = drain_capture();
+    assert!(
+        !rejected_output.contains("unavailable_absent_mqtt"),
+        "a REJECTED reload must not log a new unavailable_absent_mqtt hazard warn: \
+         {rejected_output}"
     );
 
     shutdown(handle, join).await;

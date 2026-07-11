@@ -74,6 +74,8 @@ pub(crate) enum WebError {
     PatchValueRejected(String),
     /// The request exceeds the maximum allowed patch count (256).
     PatchCapExceeded(u32),
+    /// `CreateEntity` targeted an id that already exists in the collection.
+    EntityExists(String),
 }
 
 impl IntoResponse for WebError {
@@ -148,6 +150,13 @@ impl IntoResponse for WebError {
                 let body = serde_json::json!({ "errors": [{
                     "what": "patch_cap_exceeded",
                     "detail": format!("max 256 patches; received {count}")
+                }] });
+                return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
+            }
+            WebError::EntityExists(detail) => {
+                let body = serde_json::json!({ "errors": [{
+                    "what": "entity_exists",
+                    "detail": detail
                 }] });
                 return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
             }

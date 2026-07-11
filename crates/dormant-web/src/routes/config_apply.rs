@@ -233,6 +233,7 @@ fn patch_error_to_web(e: PatchError) -> WebError {
         PatchError::RedactedPath(msg) => WebError::RedactedPathTargeted(msg),
         PatchError::EntityUnknown(msg) => WebError::EntityUnknown(msg),
         PatchError::ValueRejected(msg) => WebError::PatchValueRejected(msg),
+        PatchError::EntityExists(msg) => WebError::EntityExists(msg),
     }
 }
 
@@ -364,6 +365,7 @@ mod tests {
     };
     use dormant_core::reload::ReloadOutcome;
     use indexmap::IndexMap;
+    use serde_json::json;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1379,5 +1381,214 @@ field = "/val"
         let result = handle.await.unwrap().unwrap();
         assert!(result.applied);
         assert_eq!(result.reload, "pending");
+    }
+
+    // ── Task 2 Step 5: CreateEntity/DeleteEntity apply integration ──────────
+    // (the daemon-identical-validate net — config_apply.rs is the ONLY place
+    // that runs the real dormant_core::config::validate() on a patched doc)
+
+    #[tokio::test]
+    async fn create_display_unknown_controllers_422_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n[daemon]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "displays".into(),
+                id: "tv".into(),
+                value: json!({
+                    "controllers": ["nonexistent-controller"],
+                    "blank_mode": "power_off",
+                }),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown controller must fail the daemon-identical validate"
+        );
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when validate rejects the create"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_zone_referenced_by_rule_422_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"
+config_version = 1
+
+[zones.myzone]
+mode = "any"
+members = []
+
+[rules.myrule]
+zone = "myzone"
+displays = []
+"#;
+        write_config(dir.path(), content);
+
+        let (cfg, _rule_id) = config_with_rule();
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::DeleteEntity {
+                collection: "zones".into(),
+                id: "myzone".into(),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "deleting a zone still referenced by a rule must fail the reference-integrity net"
+        );
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when the delete orphans a reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_then_delete_entity_round_trip_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "# top comment\nconfig_version = 1\n\n# sensors section\n[sensors]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+
+        // ── Step 1: create a sensor ─────────────────────────────────────
+        let fingerprint = get_fingerprint(&state);
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "newsensor".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/new",
+                }),
+            }],
+        };
+        let result = post_apply(State(state.clone()), axum::Json(req)).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+
+        let after_create = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            after_create.contains("# top comment"),
+            "comment preserved after create"
+        );
+        assert!(
+            after_create.contains("# sensors section"),
+            "comment preserved after create"
+        );
+        assert!(
+            after_create.contains("[sensors.newsensor]"),
+            "created entity present:\n{after_create}"
+        );
+
+        let backups_dir = dir.path().join("backups");
+        let backup_count_after_create = std::fs::read_dir(&backups_dir).unwrap().count();
+        assert_eq!(
+            backup_count_after_create, 1,
+            "create backed up the pre-create file"
+        );
+
+        // ── Step 2: delete the same sensor ──────────────────────────────
+        let fingerprint2 = get_fingerprint(&state);
+        let req2 = ApplyRequest {
+            fingerprint: fingerprint2,
+            patches: vec![Patch::DeleteEntity {
+                collection: "sensors".into(),
+                id: "newsensor".into(),
+            }],
+        };
+        let result2 = post_apply(State(state), axum::Json(req2)).await;
+        assert!(
+            result2.is_ok(),
+            "delete should succeed: {:?}",
+            result2.err()
+        );
+
+        let after_delete = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            after_delete.contains("# top comment"),
+            "comment preserved after delete"
+        );
+        assert!(
+            after_delete.contains("# sensors section"),
+            "comment preserved after delete"
+        );
+        assert!(
+            !after_delete.contains("newsensor"),
+            "deleted entity gone:\n{after_delete}"
+        );
+
+        let backup_count_after_delete = std::fs::read_dir(&backups_dir).unwrap().count();
+        assert_eq!(
+            backup_count_after_delete, 2,
+            "delete backed up the post-create file (atomic rename on both legs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_sensor_renders_as_explicit_table_not_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "golden".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/golden",
+                }),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+
+        let after = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        // Golden assertion: an explicit `[sensors.golden]` section, never a
+        // one-line inline table (`golden = { ... }`).
+        assert!(
+            after.contains("[sensors.golden]"),
+            "expected explicit [sensors.golden] section, got:\n{after}"
+        );
+        assert!(
+            !after.contains("golden = {"),
+            "must not render as an inline table, got:\n{after}"
+        );
+        assert!(after.contains(r#"type = "mqtt""#));
+        assert!(after.contains(r#"broker_url = "mqtt://localhost""#));
     }
 }

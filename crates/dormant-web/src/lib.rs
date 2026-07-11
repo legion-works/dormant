@@ -149,6 +149,7 @@ mod tests {
         let config = Arc::new(Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -177,6 +178,7 @@ mod tests {
             creds_path: PathBuf::from("/dev/null"),
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 8080,

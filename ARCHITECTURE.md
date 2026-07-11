@@ -6,14 +6,14 @@ Crate map, data flow, and where-to-find-it guide for the dormant codebase.
 
 | Crate | Purpose | Has binaries? |
 |---|---|---|
-| `dormant-core` | Domain types, traits, config schema/validation, zone fusion engine, rules engine, state machine, IPC protocol, reload types, doctor wire types (`DoctorReport`/`Check`/`CheckStatus`) — pure logic, no I/O | No |
+| `dormant-core` | Domain types, traits, config schema/validation, zone fusion engine, rules engine, state machine, IPC protocol, reload types, doctor wire types (`DoctorReport`/`Check`/`CheckStatus`), panel-wear ledger model (`wear.rs` — `WearLedger`/`WearIdentity`/`PanelType`/`WearHandle`/identity normalization; `DaemonEvent::WearSnapshot` + `CompensationAdvisory`) — pure logic, no I/O | No |
 | `dormant-sensors` | Sensor sources: MQTT (`mqtt.rs`), Home Assistant WebSocket (`ha_ws.rs`), USB-serial LD2410 radar (`usb_ld2410.rs`), plus a shared backoff helper and a static registry | No |
-| `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), VCP operations (`vcp_ops.rs`), Home Assistant passthrough (`ha_passthrough.rs`), Samsung Tizen (`samsung_tizen.rs` — port 8002 WebSocket + Wake-on-LAN + pairing) plus its audio-safe IP Control G2 JSON-RPC transport (`samsung_ip.rs` — port 1516 `backlightControl` for `brightness_zero`), execution engine with fallback/retry (`executor.rs`), static registry | No |
-| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI, Samsung Tizen (reachability + power state + token presence); live coalesced `DoctorService` for the daemon + web UI. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
+| `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), abstract VCP operations (`vcp_ops.rs` — ddc-hi real backend + scripted fake, panic-recovery via `catch_unwind`), per-panel DDC/CI bus lock (`ddc_lock.rs` — `PanelLocks` registry, `VcpPriority::Command` vs `Sampler`, poison recovery), Home Assistant passthrough (`ha_passthrough.rs`), Samsung Tizen (`samsung_tizen.rs` — port 8002 WebSocket + Wake-on-LAN + pairing) plus its audio-safe IP Control G2 JSON-RPC transport (`samsung_ip.rs` — port 1516 `backlightControl` for `brightness_zero`), execution engine with fallback/retry (`executor.rs`), static registry | No |
+| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI, Samsung Tizen (reachability + power state + token presence); live coalesced `DoctorService` for the daemon + web UI; control-path verification — `dormantctl doctor --exercise <display>` routes an `Exercise` IPC request through the daemon, which pauses the target's rules and steps blank→read→wake→read on the live controller chain to confirm each command actually moved the panel. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
 | `dormant-web` | Loopback-only web dashboard: axum HTTP/WS bridge that reads live engine state and serves a SPA (`crates/dormant-web/webui/`). Optional dependency of `dormantd`, gated behind the `web-ui` Cargo feature — when off, zero web code is compiled | No |
 | `dormant-render` | Local Wayland layer-shell `RenderSink`: software-blank black overlay (final ladder fallback when every display controller failed) and libmpv-driven screensaver overlay (last-resort idle surface). Wayland I/O is `target_os = "linux"`-gated; non-Linux builds expose a no-op stub with the same `LayerShellRenderSink` surface so callers compile unconditionally | No |
-| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, single-instance flock, reload handling, optional web UI spawn, logging | **Yes** — `dormantd` |
-| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `doctor` (per-target subcommands including `samsung`), `pair samsung <host>` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
+| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher, single-instance flock, reload handling, panel-wear tracker (`wear_tracker.rs` — periodic panel-state sampling through `CommandSink::read_state_sampled`, ledger persistence to `wear_state_dir()`, advisory event emission), optional web UI spawn, logging | **Yes** — `dormantd` |
+| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `emergency-wake` (IPC fast path with a direct-hardware fallback when the daemon is unresponsive), `doctor` (per-target subcommands including `samsung`, plus `--exercise <display>` for control-path verification), `pair samsung <host>` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
 | `dormant-tray` | KDE `StatusNotifierItem` tray applet (`ksni`): live icon (Normal / Attention / Paused / Unreachable), pause/resume/blank/wake menu items, tooltip, reconnecting IPC event-stream reader. Linux-only — non-Linux bin prints a notice and exits 1 so cross-platform `cargo check` stays green | **Yes** — `dormant-tray` |
 
 Each crate follows the convention: one module per concept, one file per sensor/controller, explicit static registry with no proc-macro magic.
@@ -55,7 +55,7 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 |---|---|
 | Add a sensor | `dormant-sensors/src/<name>.rs` (new module) + `dormant-sensors/src/registry.rs` (register it) + `dormant-core/src/config/schema.rs` (config variant) |
 | Add a display controller | `dormant-displays/src/<name>.rs` (new module) + `dormant-displays/src/registry.rs` (register it) + `dormant-core/src/config/schema.rs` (config fields if needed) |
-| Add a config key | `dormant-core/src/config/schema.rs` (struct field + serde) + `dormant-core/src/config/defaults.rs` (default value) + `dormant-core/src/config/validate.rs` (validation rule) + `dormant-core/src/config/mod.rs` (known-key tree for unknown-key detection) |
+| Add a config key | `dormant-core/src/config/schema.rs` (struct field + serde) + `dormant-core/src/config/defaults.rs` (default value) + `dormant-core/src/config/validate.rs` (validation rule AND the `KNOWN_KEYS` known-key-tree entry for unknown-key detection — `mod.rs` only calls `validate::collect_unknown_keys`, it does not hold the tree) |
 | Add an error code | `dormant-core/src/error.rs` (`pub const E_*` + variant in `DormantError`) |
 | Change timing defaults | `dormant-core/src/config/defaults.rs` (single source of truth) |
 | Add a doctor probe | `dormant-doctor/src/probes/<name>.rs` (new probe) + `dormant-doctor/src/probes/mod.rs` + `dormant-doctor/src/lib.rs` (re-export) + `dormantctl/src/cmd_doctor.rs` (CLI dispatch + subcommand) |
@@ -65,15 +65,88 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 | Add a render ladder stage | `dormant-render/src/<module>.rs` (shared pure logic — `command`, `latch`, `settings`, `playlist`) + `dormant-render/src/linux/<impl>.rs` for the Wayland implementation (Linux-only). The cross-platform `LayerShellRenderSink` re-export is in `dormant-render/src/lib.rs` |
 | Add a tray menu/state piece | `dormant-tray/src/<module>.rs` (pure logic — `state`, `tooltip`, `menu`, `icon`; unit-tested without D-Bus); Linux-only glue lives in `dormant-tray/src/tray.rs` and `dormant-tray/src/ipc_loop.rs` |
 | Drive the daemon from another binary | Reuse `dormantctl::client` (re-exported via `crates/dormantctl/src/lib.rs`) — `dormant-tray` is the canonical example |
+| Adjust panel-wear tracking behavior | `dormant-core/src/wear.rs` (pure model — `WearLedger`/`PanelType`/`sanitize_identity_key`/`brightness_norm`) + `dormant-core/src/config/schema.rs` (the `[wear]` and `[displays.<id>].panel_type` TOML keys) + `dormantd/src/wear_tracker.rs` (pure `tick` + async shell — sampling cadence, ledger I/O, advisory latch) + `dormant-web/src/routes/wear.rs` (HTTP exposure — `GET /api/wear`, `GET /api/wear/<display>`) |
+| Add a panel-bus readback / usage-hours seed | Add the per-controller contract to `dormant-core/src/traits.rs` (`DisplayController::read_state`/`read_state_sampled`/`read_usage_hours`/`panel_identity`), implement on the controller in `dormant-displays/src/<name>.rs`, surface the chain-walk on `dormant-displays/src/executor.rs`; serialized per-panel through `dormant-displays/src/vcp_ops.rs` + `dormant-displays/src/ddc_lock.rs` (command-priority discipline) |
 
 ## Event and error-code grep anchors
 
 Every log event name and error code is a literal string at the definition site — never `format!`-constructed, never macro-generated. This makes them reliably greppable:
 
-- **Error codes:** `E_CONFIG_INVALID`, `E_CONFIG_UNKNOWN_KEY`, `E_ZONE_CYCLE`, `E_ZONE_UNKNOWN_MEMBER`, `E_CREDS_PERMS`, `E_CREDS_MISSING`, `E_MODE_UNSUPPORTED`, `E_BLANK_FAILED`, `E_WAKE_FAILED`, `E_RELOAD_WAKE_FAILED`, `E_HA_AUTH`, `E_SENSOR_IO`, `E_DISPLAY_IO`, `E_IPC` — all defined in `dormant-core/src/error.rs`.
-- **Log events:** grep for `event = "..."` in the source. Key events include `sensor_event`, `zone_transition`, `rule_blank`, `rule_wake`, `wake_failed`, `reload_complete`, `reload_defensive_wake`.
+- **Error codes:** `E_CONFIG_INVALID`, `E_CONFIG_UNKNOWN_KEY`, `E_ZONE_CYCLE`, `E_ZONE_UNKNOWN_MEMBER`, `E_CREDS_PERMS`, `E_CREDS_MISSING`, `E_MODE_UNSUPPORTED`, `E_BLANK_FAILED`, `E_WAKE_FAILED`, `E_RELOAD_WAKE_FAILED`, `E_HA_AUTH`, `E_SENSOR_IO`, `E_DISPLAY_IO`, `E_RENDER_UNAVAILABLE`, `E_SCREENSAVER_SOURCE`, `E_IPC` — all defined in `dormant-core/src/error.rs`.
+- **Log events:** grep for `event = "..."` in the source. Key events include `sensor_event`, `zone_transition`, `rule_blank`, `rule_wake`, `wake_failed`, `reload_complete`, `reload_defensive_wake`, `wear_tracker_started`/`_resumed`/`_parked`, `wear_advisory`, `wear_ledger_corrupt`, `wear_ledger_future_version`, `wear_ledger_seeded`, `wear_persist_failed`, `wear_sample_fallback`.
+- **Wire events** (`DaemonEvent` in `dormant-core/src/rules.rs`): tag is `event` — `sensor_changed`, `zone_changed`, `display_phase`, `config_reloaded`, `wake_retry`, `wear_snapshot`, `compensation_advisory`. A `#[serde(other)]` `Unknown` variant keeps older CLIs/WebUI builds streaming past foreign tags rather than failing the iterator (`crates/dormantctl/src/client.rs::EventStream` round-trips them through `DaemonEvent::Unknown`).
 
-Config keys follow the TOML path: `daemon.log_level`, `sensors.<id>.type`, `zones.<id>.mode`, `displays.<id>.controllers`, `rules.<id>.zone`, etc. — all resolved in `dormant-core/src/config/mod.rs`.
+Config keys follow the TOML path: `daemon.log_level`, `sensors.<id>.type`, `zones.<id>.mode`, `displays.<id>.controllers`, `displays.<id>.panel_type`, `rules.<id>.zone`, `wear.<key>`, etc. — all resolved in `dormant-core/src/config/mod.rs`.
+
+## Panel-wear tracking
+
+`dormant` attributes per-display brightness-weighted on-time to a coarse
+grid overlaid on each panel — the operator sees a heat map (and a
+"compensation advisory" nudge) and can reason about uneven burn-in risk.
+Three concerns, kept cleanly separated:
+
+- **Pure model** — `crates/dormant-core/src/wear.rs` (`WearLedger`,
+  `WearIdentity`, `PanelType`, `sanitize_identity_key`, `brightness_norm`,
+  `WearHandle = Arc<RwLock<HashMap<String, WearLedger>>>`). No I/O; the
+  tracker in `dormantd` owns reading/writing/scheduling. `brightness_norm`
+  scales per-controller readbacks to `0.0..=1.0` using the controller's
+  `native_max` (DDC/CI `100`, Samsung port-1516 `50`).
+- **Sample + persist loop** — `crates/dormantd/src/wear_tracker.rs`. A
+  pure `tick(snapshot, samples, config, now)` advances the in-memory
+  ledgers (attribution, dwell tracking, advisory latch, persist-due
+  bookkeeping) and returns `TrackerAction`s; the async shell owns file
+  I/O, event publication, and per-display ledger creation
+  (`load_or_create_ledger` — corrupt-file recovery, future-schema
+  read-only mode). The shell samples displays in the `active` OR `grace`
+  phase (spec §4.2 pins both to the same attribution row — a display in
+  its grace period still gets a real brightness read, not the fallback)
+  through `CommandSink::read_state_sampled` (the sampler-priority
+  variant of `read_state`); every other phase attributes a fixed factor
+  and needs no hardware read. Controllers with a single physical bus
+  (DDC/CI) implement the variant under the
+  `crates/dormant-displays/src/vcp_ops.rs` + `crates/dormant-displays/src/ddc_lock.rs`
+  panel-lock discipline — `VcpPriority::Command` blocks until the panel
+  is free; `VcpPriority::Sampler` does a double-checked `try_lock` and
+  yields instantly to any command-path caller that announced itself.
+- **Wire events** — `DaemonEvent::WearSnapshot` and
+  `DaemonEvent::CompensationAdvisory` (additive variants in
+  `crates/dormant-core/src/rules.rs`; the `#[serde(other)] Unknown`
+  catch-all keeps older CLIs/WebUI builds streaming past foreign tags).
+
+Identity uses the panel-derived key from
+`DisplayController::panel_identity()` when one is exposed (DDC/CI's
+canonical panel-lock key, Samsung's `"samsung:<host>"`) so a
+`[displays.*]` config rename doesn't orphan or collide with an existing
+ledger; controllers with no panel-derived identity (`command`,
+`kwin-dpms`, `ha-passthrough`) fall back to the sanitized config
+display key. `seeded_usage_hours` (from `read_usage_hours`, DDC/CI VCP
+`0xC0`) seeds the ledger's prior-on-hours if the panel was not new
+when tracking started.
+
+Persistence path: `dormant_core::paths::wear_state_dir()` returns
+`$XDG_STATE_HOME/dormant/wear` (or `$HOME/.local/state/dormant/wear` as
+fallback) — one ledger file per tracked display, baselined at
+`advisory_baseline_epoch_s` (the "assume-healthy" anchor for the
+advisory formula).
+
+Configuration: the top-level `[wear]` section (`WearConfig` in
+`crates/dormant-core/src/config/schema.rs`, defaults in
+`crates/dormant-core/src/config/defaults.rs::WEAR_*`) — `enabled`,
+`sample_interval`, `persist_interval`, `read_timeout`, `grid_rows`,
+`grid_cols`, `fallback_brightness`, `screensaver_factor`,
+`short_cycle_dwell`, `advisory_after`. Panel technology
+(`[displays.<id>].panel_type`, `woled`/`qd-oled`/`unknown`) is
+config-declared (never auto-detected — see the doctor/wear spec) and
+recorded on the ledger, but v1's attribution math does not yet branch on
+it — it is stored now as the bridge for a later per-channel weighting
+without a schema break, not a live heuristic today.
+
+Exposure: `GET /api/wear` (per-display summary; `advisory` is
+server-derived from `wear.advisory_after` and
+`max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)`, independent
+of any WS nudge the client may have missed) and
+`GET /api/wear/<display>` (summary + per-cell `cells` + min-max
+normalized `heat`) at `crates/dormant-web/src/routes/wear.rs`.
 
 ## Audio-safe blanking
 

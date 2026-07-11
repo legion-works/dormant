@@ -199,6 +199,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     let config = Arc::new(Config {
         config_version: 1,
         daemon: DaemonConfig::default(),
+        wear: dormant_core::config::schema::WearConfig::default(),
         sensors: IndexMap::default(),
         zones: IndexMap::default(),
         displays: IndexMap::default(),
@@ -225,6 +226,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
         creds_path: std::path::PathBuf::from("/dev/null"),
         apply_lock: tokio::sync::Mutex::new(()),
         doctor,
+        wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         cancel,
         reload_timeout: Duration::from_secs(10),
@@ -293,6 +295,7 @@ mod tests {
         let config = Arc::new(Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -319,6 +322,7 @@ mod tests {
             creds_path: std::path::PathBuf::from("/dev/null"),
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
             reload_timeout: Duration::from_secs(10),
@@ -568,6 +572,7 @@ mod tests {
         let config = Arc::new(Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -594,6 +599,7 @@ mod tests {
             creds_path: std::path::PathBuf::from("/dev/null"),
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             cancel,
             reload_timeout: Duration::from_secs(10),

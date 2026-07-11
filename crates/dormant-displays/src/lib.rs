@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod command;
+pub mod ddc_lock;
 pub mod ddcci;
 pub mod executor;
 pub mod ha_passthrough;

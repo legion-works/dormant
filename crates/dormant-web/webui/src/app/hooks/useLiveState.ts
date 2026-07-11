@@ -18,6 +18,15 @@ import type {
   DisplayRuleInfo,
 } from "../../api/types";
 
+/** Live-nudged numbers from `wear_snapshot` WS events, keyed by the wear
+ * tracker's storage key (not necessarily the config display id). These
+ * patch the numbers a fetched `WearSummary` displays; the fetch itself
+ * (`GET /api/wear`) remains the source of truth on mount/refresh. */
+export interface WearSnapshotPatch {
+  total_on_hours: number;
+  sample_count: number;
+}
+
 export interface StampedEvent {
   /** ISO time string captured at arrival. */
   time: string;
@@ -34,6 +43,12 @@ export interface LiveState {
   zoneConfigs: Record<string, ZoneConfig>;
   displayConfigs: Record<string, DisplayConfig>;
   displayRules: Record<string, DisplayRuleInfo>;
+  /** `wear_snapshot` WS nudges, keyed by wear-tracker storage key. */
+  wearSnapshots: Record<string, WearSnapshotPatch>;
+  /** `compensation_advisory` WS nudges: hours since last long-dwell,
+   * keyed by wear-tracker storage key. A fresh `GET /api/wear` fetch
+   * remains authoritative — this is a best-effort UI nudge only. */
+  wearAdvisories: Record<string, number>;
   refresh: () => void;
 }
 

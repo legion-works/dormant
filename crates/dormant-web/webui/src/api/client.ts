@@ -20,6 +20,8 @@ import type {
   DoctorReport,
   ApplyRequest,
   ApplyResponse,
+  WearListResponse,
+  WearDetail,
 } from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -57,6 +59,16 @@ export function getState(): Promise<StateSnapshot> {
 
 export function getConfig(): Promise<ConfigResponse> {
   return request<ConfigResponse>("/config");
+}
+
+/** GET /api/wear — every tracked display's panel-exposure summary. */
+export function getWear(): Promise<WearListResponse> {
+  return request<WearListResponse>("/wear");
+}
+
+/** GET /api/wear/:display — one display's summary plus its wear grid. */
+export function getWearDetail(display: string): Promise<WearDetail> {
+  return request<WearDetail>(`/wear/${encodeURIComponent(display)}`);
 }
 
 /** POST /api/blank — force-blank a display by id. */

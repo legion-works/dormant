@@ -457,6 +457,57 @@ impl CommandSink for DisplayExecutor {
         }
         None
     }
+
+    /// Walk the configured chain and return the first non-`None` panel
+    /// state reported by a controller's
+    /// [`DisplayController::read_state_sampled`] — the sampler-priority
+    /// twin of [`Self::read_state`], used by the periodic wear-tracking
+    /// poll (spec §4.3).
+    ///
+    /// This override is **mandatory**, not cosmetic (P1): the
+    /// [`CommandSink::read_state_sampled`] trait default merely delegates
+    /// to `read_state()` (command priority), which would silently drop
+    /// sampler priority at exactly this boundary — the one place the
+    /// engine ever talks to a display is through this trait object, not
+    /// through the concrete controller chain.
+    async fn read_state_sampled(&self) -> Option<PanelState> {
+        for controller in &self.chain {
+            if let Some(state) = controller.read_state_sampled().await {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    /// Walk the configured chain and return the first non-`None`
+    /// usage-hours reading — mirrors [`Self::read_state`]'s chain-walk
+    /// shape exactly. Used once, at wear-ledger seeding time (task T7),
+    /// so a chain with a primary controller that has no usage-hours
+    /// readback (e.g. `command`, `kwin-dpms`) falls through to a `ddcci`
+    /// fallback that does.
+    async fn read_usage_hours(&self) -> Option<u32> {
+        for controller in &self.chain {
+            if let Some(hours) = controller.read_usage_hours().await {
+                return Some(hours);
+            }
+        }
+        None
+    }
+
+    /// Walk the configured chain and return the first non-`None`
+    /// panel-derived identity — mirrors [`Self::read_usage_hours`]'s
+    /// chain-walk shape exactly (T7 review M1). Used once, at wear-ledger
+    /// creation time, so a chain with a primary controller that has no
+    /// panel identity (e.g. `command`, `kwin-dpms`) falls through to a
+    /// `ddcci`/`samsung-tizen` fallback that does.
+    fn panel_identity(&self) -> Option<String> {
+        for controller in &self.chain {
+            if let Some(id) = controller.panel_identity() {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -492,6 +543,12 @@ mod tests {
         blank_delay: Duration,
         /// Same as `blank_delay` but for `wake()`.
         wake_delay: Duration,
+        /// Scripted [`DisplayController::read_usage_hours`] response — used
+        /// by the T5 chain-walk test (test 2).
+        usage_hours: Option<u32>,
+        /// Scripted [`DisplayController::panel_identity`] response — used
+        /// by the T7 chain-walk test.
+        panel_identity: Option<String>,
     }
 
     impl FakeController {
@@ -525,6 +582,14 @@ mod tests {
 
         fn set_wake_delay(&self, d: Duration) {
             self.inner.lock().unwrap().wake_delay = d;
+        }
+
+        fn set_usage_hours(&self, hours: Option<u32>) {
+            self.inner.lock().unwrap().usage_hours = hours;
+        }
+
+        fn set_panel_identity(&self, id: Option<String>) {
+            self.inner.lock().unwrap().panel_identity = id;
         }
 
         fn count_op(&self, op: &'static str) -> usize {
@@ -580,6 +645,14 @@ mod tests {
             }
             let mut g = self.inner.lock().unwrap();
             g.wake_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        async fn read_usage_hours(&self) -> Option<u32> {
+            self.inner.lock().unwrap().usage_hours
+        }
+
+        fn panel_identity(&self) -> Option<String> {
+            self.inner.lock().unwrap().panel_identity.clone()
         }
     }
 
@@ -1080,5 +1153,164 @@ mod tests {
         assert_eq!(health.len(), 1);
         assert!(health[0].healthy, "blank succeeded on A");
         assert_eq!(health[0].detail, None);
+    }
+
+    // ── T5: read_usage_hours chain-walk (test 2) ─────────────────────────────
+
+    #[tokio::test]
+    async fn read_usage_hours_chain_walk_primary_none_fallback_some() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // A has no usage-hours readback (default None, mirroring a
+        // `kwin-dpms`/`command` primary); B does (mirroring a `ddcci`
+        // fallback).
+        b.set_usage_hours(Some(966));
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+
+        assert_eq!(
+            exec.read_usage_hours().await,
+            Some(966),
+            "chain-walk must fall through A's None to B's Some(966)"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_usage_hours_none_when_no_controller_reports_it() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a], default_retry());
+        assert_eq!(exec.read_usage_hours().await, None);
+    }
+
+    // ── T7 fix M1: panel_identity chain-walk ─────────────────────────────────
+
+    #[tokio::test]
+    async fn panel_identity_chain_walk_primary_none_fallback_some() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // A has no panel identity (default None, mirroring a
+        // `kwin-dpms`/`command` primary); B does (mirroring a `ddcci`
+        // fallback that resolved its canonical key during probe).
+        b.set_panel_identity(Some("i2c-dev:56 DEL DELL U2723QE".into()));
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+
+        assert_eq!(
+            exec.panel_identity().as_deref(),
+            Some("i2c-dev:56 DEL DELL U2723QE"),
+            "chain-walk must fall through A's None to B's Some(..)"
+        );
+    }
+
+    #[tokio::test]
+    async fn panel_identity_none_when_no_controller_reports_it() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a], default_retry());
+        assert_eq!(exec.panel_identity(), None);
+    }
+
+    // ── T5 Step 7 (P1, MANDATORY): trait-boundary priority proof ────────────
+
+    /// Proves sampler priority is honored through the `CommandSink` trait
+    /// boundary — the ONE place the rules engine / wear-tracking sampler
+    /// ever talks to a display — using a real `DdcciController` + `FakeVcp`
+    /// + real `PanelLock`, not a hand-rolled fake that could accidentally
+    /// bypass the real acquisition logic.
+    ///
+    /// RED-first: this test is exactly what would fail if
+    /// `DisplayExecutor::read_state_sampled` were deleted and the
+    /// `CommandSink` trait default (delegate to `read_state`, command
+    /// priority) took over instead — the sampled call would then block
+    /// and succeed just like `read_state()`, and the `assert_eq!(..,
+    /// None)` below would fail. Verified by temporarily deleting the
+    /// override during development (see T5.md for the pasted failure).
+    #[tokio::test]
+    async fn read_state_sampled_priority_observable_at_command_sink_trait_boundary() {
+        use std::time::Instant;
+
+        let ident = "i2c-dev:99 TST TEST";
+        let fake = Arc::new({
+            let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
+                ident_string: ident.into(),
+            }]);
+            f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
+            f
+        });
+        let locks = crate::ddc_lock::PanelLocks::new();
+        let mut ddc = crate::ddcci::DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn crate::vcp_ops::VcpOps>,
+            &locks,
+        );
+        ddc.probe().await.unwrap();
+        let lock = ddc
+            .panel_lock_for_test()
+            .expect("a probed DdcciController has resolved a panel lock");
+
+        // Wrap the real controller in the production CommandSink — the
+        // executor — and erase it to `Arc<dyn CommandSink>`, exactly the
+        // boundary the rules engine and the wear-tracking sampler see.
+        let sink: Arc<dyn CommandSink> = Arc::new(DisplayExecutor::new(
+            DisplayId("t5-panel".into()),
+            vec![Box::new(ddc) as Box<dyn DisplayController>],
+            BlankMode::BrightnessZero,
+            default_retry(),
+        ));
+
+        // Two rounds of scripted responses. `FakeVcp::get_vcp` pops its
+        // script entry before checking whether the priority gate lets the
+        // transaction proceed (mirroring `RealVcp`, which can't know a
+        // scripted value in advance either) — so the sampled attempt below
+        // consumes one throwaway entry per code regardless of outcome; the
+        // second, definitely-successful command-priority read consumes the
+        // real entries.
+        fake.expect_get(ident, 0x10, Ok(77)); // consumed by the sampled attempt
+        fake.expect_get(ident, 0xD6, Err("no".into()));
+        fake.expect_get(ident, 0x10, Ok(50)); // consumed by the command-priority read
+        fake.expect_get(ident, 0xD6, Err("no".into()));
+
+        // A "fake command" holds the panel lock on a REAL OS thread for
+        // 60ms — standing in for an in-flight blank/wake elsewhere in the
+        // daemon, exercising the real `PanelLock` mutex contention (not a
+        // simulated announcement).
+        let held_lock = Arc::clone(&lock);
+        let holder = std::thread::spawn(move || {
+            let _g = held_lock.command_guard();
+            std::thread::sleep(Duration::from_millis(60));
+        });
+        // Let the holder thread actually acquire the mutex first.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let sampled_start = Instant::now();
+        let sampled = sink.read_state_sampled().await;
+        let sampled_elapsed = sampled_start.elapsed();
+        assert_eq!(
+            sampled, None,
+            "sampler must skip through the CommandSink trait boundary while \
+             a command-path caller holds the panel lock"
+        );
+        assert!(
+            sampled_elapsed < Duration::from_millis(30),
+            "a skipped sampler read must return immediately, not block on \
+             the held lock: {sampled_elapsed:?}"
+        );
+
+        // Command priority blocks until the holder releases, then
+        // succeeds — the SAME scenario, proving both halves of the
+        // priority contract at the same trait boundary.
+        let start = Instant::now();
+        let state = sink.read_state().await;
+        let elapsed = start.elapsed();
+        holder.join().unwrap();
+
+        assert!(
+            state.is_some(),
+            "command-priority read_state must block then succeed: {state:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "read_state must have actually waited for the held lock, not \
+             raced past it: {elapsed:?}"
+        );
     }
 }

@@ -415,6 +415,7 @@ mod tests {
             creds_path,
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
             cancel,
             reload_timeout: Duration::from_secs(10),
@@ -457,6 +458,7 @@ mod tests {
             creds_path,
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
             cancel,
             reload_timeout,
@@ -470,6 +472,7 @@ mod tests {
         Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -511,6 +514,7 @@ mod tests {
         let cfg = Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones,
             displays: IndexMap::default(),
@@ -744,6 +748,7 @@ field = "/val"
         let cfg = Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors,
             zones: IndexMap::default(),
             displays: IndexMap::default(),

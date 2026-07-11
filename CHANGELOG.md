@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Panel-wear tracking: a daemon-lifetime tracker samples brightness-weighted on-time for displays that expose a real readback (`ddcci`, `samsung-tizen`), persists a per-display JSON ledger under `$XDG_STATE_HOME/dormant/wear` (fallback `~/.local/state/dormant/wear`), and seeds prior usage from a DDC/CI panel's own VCP `0xC0` counter where available. Config-only gate (`[wear] enabled`, default `true`); zero new Cargo features.
+- Compensation advisory: a "no long standby window in N days" nudge in the web UI when a display has gone longer than `wear.advisory_after` (default 96h) without a qualifying blanked dwell. Strictly advisory — v1 makes no dwell-enforcement changes to the state machine.
+- Web UI: a per-display "Panel exposure" card (`GET /api/wear`, `GET /api/wear/<display>`) honestly labeled as a v1 uniform-exposure ledger — no spatial/heat-map attribution yet. `WearSummary` now also carries `hours_since_long_dwell`, so the advisory line always shows a real day count, even for a display that has never had an observed long dwell yet (the common first-load case), instead of falling back to "?".
+- Config: new `[wear]` section (`enabled`, `sample_interval`, `persist_interval`, `read_timeout`, `grid_rows`, `grid_cols`, `fallback_brightness`, `screensaver_factor`, `short_cycle_dwell`, `advisory_after`) and a per-display `panel_type` key (`woled` / `qd-oled` / `unknown`, config-declared only — never auto-detected). `panel_type` is recorded on the ledger as a v2 bridge; v1 attribution does not yet branch on it.
+- `DaemonEvent` gains additive `WearSnapshot` and `CompensationAdvisory` variants, plus a `#[serde(other)] Unknown` catch-all so older `dormantctl`/tray/WebUI builds keep streaming past event tags they don't recognize instead of erroring.
+- Docs: new "OLED health" mdBook chapter covering what wear tracking does and does not track, the ledger file location, the advisory's meaning, and its all-local/no-telemetry privacy story.
+
 ## [0.1.0] - 2026-07-09
 
 ### Added

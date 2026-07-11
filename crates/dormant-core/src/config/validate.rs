@@ -50,6 +50,23 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "zones",
             "displays",
             "rules",
+            "wear",
+        ],
+    ),
+    // ── wear ────────────────────────────────────────────────────────────────
+    (
+        "wear",
+        &[
+            "enabled",
+            "sample_interval",
+            "persist_interval",
+            "read_timeout",
+            "grid_rows",
+            "grid_cols",
+            "fallback_brightness",
+            "screensaver_factor",
+            "short_cycle_dwell",
+            "advisory_after",
         ],
     ),
     // ── daemon ──────────────────────────────────────────────────────────────
@@ -128,6 +145,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "restore_brightness",
             "samsung_restore_backlight",
             "treat_unreachable_as_blanked",
+            "panel_type",
         ],
     ),
     // ── rules.<id> ─────────────────────────────────────────────────────────
@@ -159,6 +177,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "scale_mode",
             "transition",
             "transition_duration",
+            "shift_px",
+            "shift_interval",
         ],
     ),
     // ── displays.<id>.screensaver.source (array-of-tables entries) ────────
@@ -391,7 +411,135 @@ pub fn validate(
         });
     }
 
+    // ── [wear] validation ────────────────────────────────────────────────
+    validate_wear(cfg, &mut errors);
+
     errors
+}
+
+/// Validate the `[wear]` section: duration floors, cross-field ordering
+/// (`persist_interval` vs `sample_interval`), grid dimension range, and
+/// fraction bounds.
+#[allow(clippy::too_many_lines)] // one flat list of independent range checks; extracting helpers would scatter the logic
+fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let wear = &cfg.wear;
+
+    if wear.sample_interval < Duration::from_secs(5) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.sample_interval {:?} is below the 5s floor",
+                wear.sample_interval
+            ),
+        });
+    }
+
+    if wear.persist_interval < wear.sample_interval {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.persist_interval {:?} must be >= wear.sample_interval {:?}",
+                wear.persist_interval, wear.sample_interval
+            ),
+        });
+    }
+
+    if wear.read_timeout < Duration::from_millis(500) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.read_timeout {:?} is below the 500ms floor",
+                wear.read_timeout
+            ),
+        });
+    }
+
+    if !(4..=64).contains(&wear.grid_rows) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.grid_rows {} is out of range — allowed: 4..=64",
+                wear.grid_rows
+            ),
+        });
+    }
+
+    if !(4..=64).contains(&wear.grid_cols) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.grid_cols {} is out of range — allowed: 4..=64",
+                wear.grid_cols
+            ),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&wear.fallback_brightness) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.fallback_brightness {} is out of range — allowed: 0.0..=1.0",
+                wear.fallback_brightness
+            ),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&wear.screensaver_factor) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.screensaver_factor {} is out of range — allowed: 0.0..=1.0",
+                wear.screensaver_factor
+            ),
+        });
+    }
+
+    if wear.short_cycle_dwell < Duration::from_secs(60) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.short_cycle_dwell {:?} is below the 1m floor",
+                wear.short_cycle_dwell
+            ),
+        });
+    }
+
+    if wear.advisory_after < Duration::from_secs(3600) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "wear.advisory_after {:?} is below the 1h floor",
+                wear.advisory_after
+            ),
+        });
+    }
+
+    // ── Per-display screensaver shift-key range checks ──────────────────
+    for (display_id, dc) in &cfg.displays {
+        let Some(ss) = &dc.screensaver else {
+            continue;
+        };
+        if ss.shift_px > 8 {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: format!(
+                    "display '{display_id}' screensaver shift_px {} is out of range — \
+                     allowed: 0..=8",
+                    ss.shift_px
+                ),
+            });
+        }
+        if ss.shift_interval < Duration::from_secs(10) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: format!(
+                    "display '{display_id}' screensaver shift_interval {:?} is below \
+                     the 10s floor",
+                    ss.shift_interval
+                ),
+            });
+        }
+    }
 }
 
 /// Validate all zones: member resolution, mode coherence, cycles, empty members.
@@ -1575,6 +1723,8 @@ gracee_period = "60s"
                 scale_mode: scale_mode.map(str::to_string),
                 transition: None,
                 transition_duration: None,
+                shift_px: crate::config::defaults::SHIFT_PX,
+                shift_interval: crate::config::defaults::SHIFT_INTERVAL,
             }),
             output: Some("DP-1".into()),
             ..base_display_cfg()
@@ -1608,6 +1758,7 @@ gracee_period = "60s"
             restore_brightness: defaults::RESTORE_BRIGHTNESS,
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
+            panel_type: crate::wear::PanelType::default(),
         }
     }
 
@@ -1619,6 +1770,7 @@ gracee_period = "60s"
             zones: IndexMap::new(),
             displays: IndexMap::from([("d1".into(), display_with_scale_mode(scale_mode))]),
             rules: IndexMap::new(),
+            wear: super::super::schema::WearConfig::default(),
         }
     }
 
@@ -1717,6 +1869,8 @@ gracee_period = "60s"
                 scale_mode: None,
                 transition: transition.map(str::to_string),
                 transition_duration,
+                shift_px: crate::config::defaults::SHIFT_PX,
+                shift_interval: crate::config::defaults::SHIFT_INTERVAL,
             }),
             output: Some("DP-1".into()),
             ..base_display_cfg()
@@ -1737,6 +1891,7 @@ gracee_period = "60s"
                 display_with_transition(transition, transition_duration),
             )]),
             rules: IndexMap::new(),
+            wear: super::super::schema::WearConfig::default(),
         }
     }
 
@@ -2126,9 +2281,11 @@ password = "test-pass"
                     restore_brightness: 80,
                     samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                     treat_unreachable_as_blanked: true,
+                    panel_type: crate::wear::PanelType::default(),
                 },
             )]),
             rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -2178,9 +2335,11 @@ password = "test-pass"
                     restore_brightness: 80,
                     samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                     treat_unreachable_as_blanked: true,
+                    panel_type: crate::wear::PanelType::default(),
                 },
             )]),
             rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -2307,6 +2466,7 @@ password = "test-pass"
             restore_brightness: 80,
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
+            panel_type: crate::wear::PanelType::default(),
         };
         let ladder = dc.normalized_ladder();
         assert_eq!(ladder.len(), 1);
@@ -2353,6 +2513,7 @@ password = "test-pass"
             zones: IndexMap::new(),
             displays: IndexMap::from([("d".into(), dc)]),
             rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2374,6 +2535,7 @@ password = "test-pass"
             zones: IndexMap::new(),
             displays: IndexMap::from([("d".into(), dc)]),
             rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3068,6 +3230,7 @@ kind = "power_off"
             restore_brightness: 80,
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
+            panel_type: crate::wear::PanelType::default(),
         }
     }
 
@@ -3161,5 +3324,377 @@ kind = "power_off"
     #[test]
     fn is_known_path_rejects_bare_ladder_index() {
         assert!(!is_known_config_path(&["displays", "x", "ladder", "0"]));
+    }
+
+    // ── [wear] validation ────────────────────────────────────────────────
+
+    fn wear_config(body: &str) -> Config {
+        let toml_str = format!("config_version = 1\n[wear]\n{body}");
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    fn wear_validation_errors(body: &str) -> Vec<ValidationError> {
+        let cfg = wear_config(body);
+        validate(&cfg, &HashMap::new(), &Credentials::default())
+    }
+
+    #[test]
+    fn wear_unknown_key_rejected_strict() {
+        let dir = std::env::temp_dir().join("dormant-test-wear-unknown-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wear_unknown.toml");
+        std::fs::write(&path, "config_version = 1\n[wear]\nbogus = 1\n").unwrap();
+
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("wear.bogus"),
+            "expected error mentioning wear.bogus, got: {err}"
+        );
+    }
+
+    #[test]
+    fn wear_all_keys_known_in_strict_mode() {
+        let dir = std::env::temp_dir().join("dormant-test-wear-known-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wear_known.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n\
+             [wear]\n\
+             enabled = true\n\
+             sample_interval = \"60s\"\n\
+             persist_interval = \"5m\"\n\
+             read_timeout = \"2s\"\n\
+             grid_rows = 9\n\
+             grid_cols = 16\n\
+             fallback_brightness = 0.5\n\
+             screensaver_factor = 0.35\n\
+             short_cycle_dwell = \"10m\"\n\
+             advisory_after = \"96h\"\n",
+        )
+        .unwrap();
+        assert!(
+            crate::config::load_config(&path, Strictness::Strict).is_ok(),
+            "all [wear] keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn wear_defaults_accepted_with_no_errors() {
+        let errors = wear_validation_errors("");
+        assert!(
+            errors.is_empty(),
+            "default [wear] section must validate cleanly, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wear_sample_interval_floor_accepts_5s() {
+        let errors = wear_validation_errors("sample_interval = \"5s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("sample_interval")),
+            "5s sample_interval (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_sample_interval_below_floor_rejected() {
+        let errors = wear_validation_errors("sample_interval = \"4s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("sample_interval")),
+            "sample_interval below 5s floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_persist_shorter_than_sample_rejected() {
+        let errors =
+            wear_validation_errors("sample_interval = \"5m\"\npersist_interval = \"1m\"\n");
+        assert!(
+            errors.iter().any(|e| e.detail.contains("persist_interval")),
+            "persist_interval < sample_interval must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_persist_equal_to_sample_accepted() {
+        let errors =
+            wear_validation_errors("sample_interval = \"5m\"\npersist_interval = \"5m\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("persist_interval")),
+            "persist_interval == sample_interval must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_read_timeout_floor_accepts_500ms() {
+        let errors = wear_validation_errors("read_timeout = \"500ms\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("read_timeout")),
+            "500ms read_timeout (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_read_timeout_below_floor_rejected() {
+        let errors = wear_validation_errors("read_timeout = \"100ms\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("read_timeout")),
+            "read_timeout below 500ms floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_grid_rows_in_range_accepted() {
+        for rows in [4, 64] {
+            let errors = wear_validation_errors(&format!("grid_rows = {rows}\n"));
+            assert!(
+                !errors.iter().any(|e| e.detail.contains("grid_rows")),
+                "grid_rows = {rows} (edge of 4..=64) must be accepted, got: {:?}",
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn wear_grid_rows_out_of_range_rejected() {
+        for rows in [3, 65] {
+            let errors = wear_validation_errors(&format!("grid_rows = {rows}\n"));
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("grid_rows")),
+                "grid_rows = {rows} (outside 4..=64) must be rejected, got: {:?}",
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn wear_grid_cols_in_range_accepted() {
+        for cols in [4, 64] {
+            let errors = wear_validation_errors(&format!("grid_cols = {cols}\n"));
+            assert!(
+                !errors.iter().any(|e| e.detail.contains("grid_cols")),
+                "grid_cols = {cols} (edge of 4..=64) must be accepted, got: {:?}",
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn wear_grid_cols_out_of_range_rejected() {
+        for cols in [3, 65] {
+            let errors = wear_validation_errors(&format!("grid_cols = {cols}\n"));
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("grid_cols")),
+                "grid_cols = {cols} (outside 4..=64) must be rejected, got: {:?}",
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn wear_fallback_brightness_in_range_accepted() {
+        for b in ["0.0", "1.0"] {
+            let errors = wear_validation_errors(&format!("fallback_brightness = {b}\n"));
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.detail.contains("fallback_brightness")),
+                "fallback_brightness = {b} (edge of 0.0..=1.0) must be accepted, got: {:?}",
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn wear_fallback_brightness_out_of_range_rejected() {
+        let errors = wear_validation_errors("fallback_brightness = 1.5\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("fallback_brightness")),
+            "fallback_brightness outside 0.0..=1.0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_screensaver_factor_in_range_accepted() {
+        for f in ["0.0", "1.0"] {
+            let errors = wear_validation_errors(&format!("screensaver_factor = {f}\n"));
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.detail.contains("screensaver_factor")),
+                "screensaver_factor = {f} (edge of 0.0..=1.0) must be accepted, got: {:?}",
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn wear_screensaver_factor_out_of_range_rejected() {
+        let errors = wear_validation_errors("screensaver_factor = -0.1\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("screensaver_factor")),
+            "screensaver_factor outside 0.0..=1.0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_short_cycle_dwell_floor_accepts_1m() {
+        let errors = wear_validation_errors("short_cycle_dwell = \"1m\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("short_cycle_dwell")),
+            "1m short_cycle_dwell (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_short_cycle_dwell_below_floor_rejected() {
+        let errors = wear_validation_errors("short_cycle_dwell = \"30s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("short_cycle_dwell")),
+            "short_cycle_dwell below 1m floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_advisory_after_floor_accepts_1h() {
+        let errors = wear_validation_errors("advisory_after = \"1h\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("advisory_after")),
+            "1h advisory_after (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn wear_advisory_after_below_floor_rejected() {
+        let errors = wear_validation_errors("advisory_after = \"30m\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("advisory_after")),
+            "advisory_after below 1h floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    // ── displays.<id>.screensaver.shift_px / shift_interval ────────────────
+
+    fn config_with_shift(shift_px: u8, shift_interval: &str) -> Config {
+        let toml_str = format!(
+            "config_version = 1\n\
+             [displays.d1]\n\
+             controllers = [\"kwin-dpms\"]\n\
+             blank_mode = \"power_off\"\n\
+             [displays.d1.screensaver]\n\
+             trigger = \"vacancy\"\n\
+             shift_px = {shift_px}\n\
+             shift_interval = \"{shift_interval}\"\n\
+             [[displays.d1.screensaver.source]]\n\
+             path = \"/tmp/img.png\"\n"
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    #[test]
+    fn shift_keys_known_in_strict_mode() {
+        let dir = std::env::temp_dir().join("dormant-test-shift-keys-known");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shift_keys.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n\
+             [displays.d1]\n\
+             controllers = [\"kwin-dpms\"]\n\
+             blank_mode = \"power_off\"\n\
+             [displays.d1.screensaver]\n\
+             trigger = \"vacancy\"\n\
+             shift_px = 2\n\
+             shift_interval = \"120s\"\n\
+             [[displays.d1.screensaver.source]]\n\
+             path = \"/tmp/img.png\"\n",
+        )
+        .unwrap();
+        assert!(
+            crate::config::load_config(&path, Strictness::Strict).is_ok(),
+            "shift_px and shift_interval must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn shift_px_in_range_accepted() {
+        let cfg = config_with_shift(8, "120s");
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("shift_px")),
+            "shift_px = 8 (the ceiling) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn shift_px_out_of_range_rejected() {
+        let cfg = config_with_shift(20, "120s");
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("shift_px")),
+            "shift_px above 8 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn shift_interval_floor_accepts_10s() {
+        let cfg = config_with_shift(2, "10s");
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("shift_interval")),
+            "shift_interval = 10s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn shift_interval_below_floor_rejected() {
+        let cfg = config_with_shift(2, "5s");
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("shift_interval")),
+            "shift_interval below 10s floor must be rejected, got: {:?}",
+            errors
+        );
     }
 }

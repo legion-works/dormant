@@ -8,3 +8,4 @@ pub(crate) mod config;
 pub(crate) mod config_apply;
 pub(crate) mod doctor;
 pub(crate) mod events;
+pub(crate) mod wear;

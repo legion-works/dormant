@@ -1,0 +1,84 @@
+/* WearCard — Dashboard panel-exposure summary. */
+
+.wear-card__header {
+  padding: 12px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 10%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+.wear-card__caption {
+  padding: 8px 15px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.wear-card__loading,
+.wear-card__empty {
+  padding: 14px 15px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.wear-card__error {
+  padding: 14px 15px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.wear-row {
+  padding: 12px 15px;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+}
+.wear-row:last-child {
+  border-bottom: none;
+}
+
+.wear-row__top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.wear-row__name {
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.wear-row__panel {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.wear-row__stats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.wear-row__advisory {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--warning);
+}

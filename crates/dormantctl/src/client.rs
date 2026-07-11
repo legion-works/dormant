@@ -166,15 +166,23 @@ impl EventShutdown {
 }
 
 /// An iterator over [`DaemonEvent`] JSON lines from the event stream.
+///
+/// Generic over the reader so tests can drive the parsing/line-length logic
+/// against an in-memory buffer instead of a real `UnixStream`; production
+/// code always uses the default `R = UnixStream` (via [`EventStream::from_reader`]
+/// / [`connect_events`]).
+#[cfg(unix)]
+pub struct EventStream<R = UnixStream> {
+    reader: BufReader<R>,
+}
+
+#[cfg(not(unix))]
 pub struct EventStream {
-    #[cfg(unix)]
-    reader: BufReader<UnixStream>,
-    #[cfg(not(unix))]
     _marker: std::marker::PhantomData<()>,
 }
 
 #[cfg(unix)]
-impl EventStream {
+impl EventStream<UnixStream> {
     /// Build an `EventStream` from a pre-connected `BufReader<UnixStream>`.
     ///
     /// The caller is responsible for writing the `Events` request line
@@ -187,52 +195,79 @@ impl EventStream {
     }
 }
 
+#[cfg(all(unix, test))]
+impl<R: std::io::Read> EventStream<R> {
+    /// Build an `EventStream` over any [`std::io::Read`] source — test infra
+    /// only. Production callers always go through [`EventStream::from_reader`]
+    /// / [`connect_events`], both pinned to `UnixStream`.
+    pub(crate) fn from_reader_for_test(reader: BufReader<R>) -> Self {
+        Self { reader }
+    }
+}
+
+#[cfg(unix)]
+impl<R: std::io::Read> Iterator for EventStream<R> {
+    type Item = Result<DaemonEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::io::{BufRead, Read};
+
+        loop {
+            let mut line = String::new();
+            // Cap the line buffer so a malicious or broken server cannot
+            // cause unbounded memory growth.
+            let mut reader = self
+                .reader
+                .by_ref()
+                .take(u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX) + 1);
+            match reader.read_line(&mut line) {
+                Ok(0) => return None, // EOF
+                Ok(n) => {
+                    if n > MAX_LINE_BYTES {
+                        // Drain the rest of the oversized line.
+                        let _ = std::io::copy(
+                            &mut self.reader.by_ref().take(u64::MAX),
+                            &mut std::io::sink(),
+                        );
+                        return Some(Err(anyhow::anyhow!(
+                            "event line exceeds maximum length of {MAX_LINE_BYTES} bytes"
+                        )));
+                    }
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        return Some(serde_json::from_str(trimmed).context("parse daemon event"));
+                    }
+                    // Empty line — continue reading.
+                }
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
 impl Iterator for EventStream {
     type Item = Result<DaemonEvent>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        #[cfg(unix)]
-        {
-            use std::io::{BufRead, Read};
+        let _ = self;
+        None
+    }
+}
 
-            loop {
-                let mut line = String::new();
-                // Cap the line buffer so a malicious or broken server cannot
-                // cause unbounded memory growth.
-                let mut reader = self
-                    .reader
-                    .by_ref()
-                    .take(u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX) + 1);
-                match reader.read_line(&mut line) {
-                    Ok(0) => return None, // EOF
-                    Ok(n) => {
-                        if n > MAX_LINE_BYTES {
-                            // Drain the rest of the oversized line.
-                            let _ = std::io::copy(
-                                &mut self.reader.by_ref().take(u64::MAX),
-                                &mut std::io::sink(),
-                            );
-                            return Some(Err(anyhow::anyhow!(
-                                "event line exceeds maximum length of {MAX_LINE_BYTES} bytes"
-                            )));
-                        }
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            return Some(
-                                serde_json::from_str(trimmed).context("parse daemon event"),
-                            );
-                        }
-                        // Empty line — continue reading.
-                    }
-                    Err(e) => return Some(Err(e.into())),
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self;
-            None
-        }
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+
+    /// A foreign/unrecognized `"event"` tag must deserialize to
+    /// `DaemonEvent::Unknown` instead of erroring the iterator — an older
+    /// `dormantctl` talking to a newer daemon must keep streaming past
+    /// event kinds it doesn't understand yet.
+    #[test]
+    fn event_stream_yields_ok_unknown_for_foreign_tag() {
+        let lines = b"{\"event\":\"from_the_future\",\"x\":1}\n" as &[u8];
+        let mut s = EventStream::from_reader_for_test(BufReader::new(lines));
+        assert!(matches!(s.next(), Some(Ok(DaemonEvent::Unknown))));
     }
 }
 

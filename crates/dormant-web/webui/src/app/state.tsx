@@ -24,7 +24,12 @@ import {
   LiveStateContext,
   EventLogContext,
 } from "./hooks/useLiveState";
-import type { StampedEvent, LiveState, EventLogState } from "./hooks/useLiveState";
+import type {
+  StampedEvent,
+  LiveState,
+  EventLogState,
+  WearSnapshotPatch,
+} from "./hooks/useLiveState";
 
 const MAX_EVENTS = 100;
 
@@ -85,6 +90,8 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [events, setEvents] = useState<StampedEvent[]>([]);
   const [lagged, setLagged] = useState(false);
+  const [wearSnapshots, setWearSnapshots] = useState<Record<string, WearSnapshotPatch>>({});
+  const [wearAdvisories, setWearAdvisories] = useState<Record<string, number>>({});
   const lagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
 
@@ -159,6 +166,33 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
             const de = ev as { display: string; phase: string };
             return patchDisplayPhase(prev, de.display, de.phase);
           }
+          case "wear_snapshot": {
+            // Not part of StateSnapshot — patches the separate
+            // wearSnapshots map as a side effect; the snapshot itself
+            // is unchanged.
+            const we = ev as {
+              display: string;
+              total_on_hours: number;
+              sample_count: number;
+            };
+            setWearSnapshots((prevWear) => ({
+              ...prevWear,
+              [we.display]: {
+                total_on_hours: we.total_on_hours,
+                sample_count: we.sample_count,
+              },
+            }));
+            return prev;
+          }
+          case "compensation_advisory": {
+            // Best-effort nudge only — GET /api/wear remains the truth.
+            const ce = ev as { display: string; hours_since_long_dwell: number };
+            setWearAdvisories((prevAdv) => ({
+              ...prevAdv,
+              [ce.display]: ce.hours_since_long_dwell,
+            }));
+            return prev;
+          }
           default:
             return prev;
         }
@@ -199,6 +233,8 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     zoneConfigs,
     displayConfigs,
     displayRules,
+    wearSnapshots,
+    wearAdvisories,
     refresh,
   };
 

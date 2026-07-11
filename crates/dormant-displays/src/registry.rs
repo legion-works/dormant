@@ -15,6 +15,7 @@
 //! - the per-display chain assembly (via [`build_controllers`]).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use dormant_core::config::schema::{Credentials, DisplayConfig};
 use dormant_core::error::DormantError;
@@ -22,6 +23,7 @@ use dormant_core::traits::DisplayController;
 use dormant_core::types::BlankMode;
 
 use crate::command::CommandController;
+use crate::ddc_lock::PanelLocks;
 #[cfg(target_os = "linux")]
 use crate::ddcci::DdcciController;
 use crate::ha_passthrough::HaPassthroughController;
@@ -95,11 +97,22 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
 ///   display so the operator can locate it in their TOML). An *empty*
 ///   `modes = []` is treated the same as a missing `modes` — an empty
 ///   capability set can never blank any mode.
+///
+/// `locks` is the shared per-panel DDC/CI lock registry (spec §4.3) — the
+/// caller constructs exactly ONE `Arc<PanelLocks>` for its whole lifetime
+/// (the daemon in `App::start`; each direct-hardware CLI invocation gets
+/// its own fresh one, being a separate process) and passes it to every
+/// `build_controllers` call, so that a panel's lock resolves to the same
+/// `Arc<PanelLock>` no matter which config-reload generation or call site
+/// derived its controller. Only the `ddcci` arm consumes it; every other
+/// controller type ignores the parameter (no shared physical bus to
+/// serialize).
 #[allow(clippy::too_many_lines)]
 pub fn build_controllers(
     display_name: &str,
     cfg: &DisplayConfig,
     creds: &Credentials,
+    locks: &Arc<PanelLocks>,
 ) -> Result<Vec<Box<dyn DisplayController>>, DormantError> {
     let mut chain: Vec<Box<dyn DisplayController>> = Vec::with_capacity(cfg.controllers.len());
 
@@ -114,6 +127,7 @@ pub fn build_controllers(
                     matcher,
                     cfg.restore_brightness,
                     cfg.primary_blank_mode(),
+                    locks,
                 )));
             }
             #[cfg(target_os = "linux")]
@@ -268,6 +282,7 @@ mod tests {
             restore_brightness: 80,
             samsung_restore_backlight: SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
         }
     }
 
@@ -311,7 +326,7 @@ mod tests {
     fn build_command_happy() {
         let cfg = command_cfg();
         let creds = Credentials::default();
-        let chain = build_controllers("main", &cfg, &creds).unwrap();
+        let chain = build_controllers("main", &cfg, &creds, &PanelLocks::new()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "command");
         assert_eq!(chain[0].supported_modes(), vec![BlankMode::PowerOff]);
@@ -357,13 +372,14 @@ mod tests {
             restore_brightness: 80,
             samsung_restore_backlight: 42, // operator-tuned override
             treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
         };
         let mut creds = Credentials::default();
         creds
             .samsung
             .insert("192.0.2.7".into(), "test-token".into());
 
-        let chain = build_controllers("tv", &cfg, &creds).unwrap();
+        let chain = build_controllers("tv", &cfg, &creds, &PanelLocks::new()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "samsung-tizen");
 
@@ -416,7 +432,7 @@ mod tests {
         cfg.ddc_display = Some("DELL".into());
 
         let creds = Credentials::default();
-        let chain = build_controllers("main", &cfg, &creds).unwrap();
+        let chain = build_controllers("main", &cfg, &creds, &PanelLocks::new()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "ddcci");
 
@@ -438,7 +454,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.controllers = vec!["lg-webos".into()]; // not yet registered (M3)
         let creds = Credentials::default();
-        let res = build_controllers("main", &cfg, &creds);
+        let res = build_controllers("main", &cfg, &creds, &PanelLocks::new());
         match res {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("unknown controller 'lg-webos'"));
@@ -454,7 +470,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.blank_command = None;
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds) {
+        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(
                     detail.contains("display 'tv-corner'"),
@@ -472,7 +488,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.wake_command = None;
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds) {
+        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("missing 'wake_command'"));
                 assert!(detail.contains("display 'tv-corner'"));
@@ -487,7 +503,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.modes = None;
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds) {
+        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("missing or empty 'modes'"));
                 assert!(detail.contains("display 'tv-corner'"));
@@ -504,7 +520,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.modes = Some(vec![]);
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds) {
+        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(
                     detail.contains("missing or empty 'modes'"),
@@ -522,7 +538,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.controllers = vec![];
         let creds = Credentials::default();
-        let chain = build_controllers("no-display", &cfg, &creds).unwrap();
+        let chain = build_controllers("no-display", &cfg, &creds, &PanelLocks::new()).unwrap();
         assert!(chain.is_empty());
     }
 
@@ -534,7 +550,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.controllers = vec!["command".into(), "command".into()];
         let creds = Credentials::default();
-        let chain = build_controllers("multi", &cfg, &creds).unwrap();
+        let chain = build_controllers("multi", &cfg, &creds, &PanelLocks::new()).unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].name(), "command");
         assert_eq!(chain[1].name(), "command");
@@ -545,7 +561,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.command_timeout = Duration::from_secs(42);
         let creds = Credentials::default();
-        let chain = build_controllers("with-timeout", &cfg, &creds).unwrap();
+        let chain = build_controllers("with-timeout", &cfg, &creds, &PanelLocks::new()).unwrap();
         // We can't observe the timeout directly through the trait, but the
         // controller built with a non-default timeout must at least not panic
         // and expose the configured mode set.

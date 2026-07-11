@@ -111,6 +111,53 @@ pub fn resolve_socket_path(config_socket: Option<&std::path::Path>) -> PathBuf {
     config_socket.map_or_else(default_socket_path, std::path::Path::to_path_buf)
 }
 
+/// Return the daemon-owned state directory.
+///
+/// 1. `$XDG_STATE_HOME/dormant` (if `XDG_STATE_HOME` is set)
+/// 2. `$HOME/.local/state/dormant` (fallback)
+///
+/// This is the single implementation of the XDG-state precedence used by
+/// any component that persists daemon-owned state (as opposed to
+/// `credentials.toml`, which the user owns and edits directly).
+#[must_use]
+pub fn state_dir() -> PathBuf {
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// Internal: build the state directory from explicit env values (test seam).
+#[must_use]
+fn state_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(xdg) = xdg {
+        return PathBuf::from(xdg).join("dormant");
+    }
+    let home = home.unwrap_or_default();
+    PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("dormant")
+}
+
+/// Public seam onto `state_dir_from` for downstream crates that need to
+/// derive the state directory from explicit (test-injected) env values
+/// rather than reading the process environment directly.
+///
+/// `state_dir_from` itself stays private — this is a thin, additive
+/// pass-through so callers like `dormant-displays` can build a pure
+/// "is persistence possible at all" test seam (both env vars absent) on
+/// top of a *single* source of XDG-state-vs-`HOME` precedence truth,
+/// without duplicating that precedence logic at the call site.
+#[must_use]
+pub fn state_dir_from_env(xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    state_dir_from(xdg, home)
+}
+
+/// Return the `wear` subdirectory of the daemon-owned state directory,
+/// where panel-wear tracking data is persisted.
+#[must_use]
+pub fn wear_state_dir() -> PathBuf {
+    state_dir().join("wear")
+}
+
 /// `credentials.toml` in the same directory as the config file.
 #[must_use]
 pub fn sibling_credentials(config_path: &std::path::Path) -> PathBuf {
@@ -189,5 +236,26 @@ mod tests {
     fn lock_path_from_fallback() {
         let p = lock_path_from(None);
         assert_eq!(p, PathBuf::from("/run/dormant/dormant.lock"));
+    }
+
+    #[test]
+    fn state_dir_prefers_xdg_state_home() {
+        assert_eq!(
+            state_dir_from(Some("/xdg-state".into()), Some("/home/u".into())),
+            PathBuf::from("/xdg-state/dormant")
+        );
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_home_local_state() {
+        assert_eq!(
+            state_dir_from(None, Some("/home/u".into())),
+            PathBuf::from("/home/u/.local/state/dormant")
+        );
+    }
+
+    #[test]
+    fn wear_state_dir_is_wear_subdir() {
+        assert!(wear_state_dir().ends_with("dormant/wear"));
     }
 }

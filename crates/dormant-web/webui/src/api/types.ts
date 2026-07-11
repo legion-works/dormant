@@ -52,8 +52,14 @@ export const DAEMON_EVENT_TAGS = [
   "config_reloaded",
   "wake_retry",
   "config_reload_rejected",
+  "wear_snapshot",
+  "compensation_advisory",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
+
+/** rust: wear.rs PanelType, serde(rename_all = "kebab-case") */
+export const PANEL_TYPES = ["woled", "qd-oled", "unknown"] as const;
+export type PanelType = (typeof PANEL_TYPES)[number];
 
 /**
  * rust: rules.rs SensorSnapshot
@@ -125,7 +131,9 @@ export type DaemonEvent =
   | DisplayPhaseEvent
   | ConfigReloadedEvent
   | ConfigReloadRejectedEvent
-  | WakeRetryEvent;
+  | WakeRetryEvent
+  | WearSnapshotEvent
+  | CompensationAdvisoryEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -172,6 +180,27 @@ export interface WakeRetryEvent {
 }
 
 /**
+ * rust: rules.rs DaemonEvent::WearSnapshot
+ * serde: `total_on_hours` / `sample_count` are `#[serde(default)]`.
+ */
+export interface WearSnapshotEvent {
+  event: "wear_snapshot";
+  display: string;
+  total_on_hours: number;
+  sample_count: number;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::CompensationAdvisory
+ * serde: `hours_since_long_dwell` is `#[serde(default)]`.
+ */
+export interface CompensationAdvisoryEvent {
+  event: "compensation_advisory";
+  display: string;
+  hours_since_long_dwell: number;
+}
+
+/**
  * rust: doctor.rs Check
  * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
  */
@@ -212,6 +241,9 @@ export interface DisplayRuleInfo {
 export interface ConfigInventory {
   config_version: number;
   daemon: Record<string, unknown>;
+  /** rust: config/schema.rs WearConfig — the `[wear]` TOML section. Optional
+   * in fixtures/older payloads; the WearSection form treats absence as `{}`. */
+  wear?: Record<string, unknown>;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
@@ -301,6 +333,10 @@ export interface ScreensaverConfig {
   /** Length of the Crossfade blend. `null`/undefined → 1 second. */
   transition_duration?: string | null;
   source: ScreensaverSource[];
+  /** Pixel-shift distance (px) applied periodically to reduce burn-in. Default 2. */
+  shift_px?: number;
+  /** Interval between successive pixel shifts. Default "120s". */
+  shift_interval?: string;
 }
 
 /** rust: config/schema.rs DisplayConfig */
@@ -325,6 +361,8 @@ export interface DisplayConfig {
   command_timeout?: unknown;
   restore_brightness?: number;
   treat_unreachable_as_blanked?: boolean;
+  /** Panel technology classification. Default "unknown". */
+  panel_type?: PanelType;
 }
 
 // ─── Config-apply wire types ──────────────────────────────────────────────
@@ -410,4 +448,49 @@ export interface ConfigResponse {
   fingerprint: string;
   /** TOML-key paths of every value that was redacted, in discovery order. */
   redacted_paths: string[][];
+}
+
+// ─── Wear (panel-exposure) wire types ─────────────────────────────────────
+// rust: dormant-web/src/routes/wear.rs
+
+/**
+ * rust: routes/wear.rs WearSummary
+ *
+ * `display` is the wear tracker's resolved storage key (panel identity when
+ * available, else the sanitized config display key) — NOT necessarily the
+ * `[displays.*]` config id.  `advisory` is server-derived (recomputed on
+ * every fetch), so this is always the truth even if a WS nudge was missed.
+ */
+export interface WearSummary {
+  display: string;
+  display_name: string;
+  panel_type: PanelType;
+  total_on_hours: number;
+  seeded_usage_hours?: number | null;
+  sample_count: number;
+  last_sample_at_epoch_s?: number | null;
+  last_long_dwell_epoch_s?: number | null;
+  advisory: boolean;
+  /**
+   * Hours since `max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)` —
+   * the same derivation the tracker uses for
+   * `CompensationAdvisoryEvent.hours_since_long_dwell`. Always a real
+   * number, even when `last_long_dwell_epoch_s` is null (no long dwell
+   * observed yet — the common first-load case), so the client never has
+   * to render a "?" day count.
+   */
+  hours_since_long_dwell: number;
+}
+
+/** rust: routes/wear.rs — `GET /api/wear` response envelope. */
+export interface WearListResponse {
+  displays: WearSummary[];
+}
+
+/** rust: routes/wear.rs WearDetail — `GET /api/wear/:display` response. */
+export interface WearDetail extends WearSummary {
+  grid_rows: number;
+  grid_cols: number;
+  cells: number[];
+  heat: number[];
 }

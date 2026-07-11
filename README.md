@@ -66,6 +66,10 @@ Each display gets an ordered controller chain with automatic fallback and bounde
 
 A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. This is the way a TV joins dormant without a keep-awake dummy zone.
 
+### OLED health
+
+dormant tracks brightness-weighted on-hours per display and surfaces them as a "panel exposure" card in the web dashboard, with an advisory nudge when a display has gone a long stretch without a rest window. It measures and reports only — nothing here changes blank/wake timing. Tracking is local: ledger files live under the daemon's own state directory, the only exposure is the existing loopback-only web UI, and there is no telemetry of any kind. See [docs/src/oled-health.md](./docs/src/oled-health.md) for what's tracked, what isn't, and the `[wear]` config keys.
+
 ### Web dashboard and tray
 
 Build with `--features web-ui` for a loopback web dashboard: a live view of the sensor → zone → rule → display pipeline, force blank/wake, pause/resume, and a full config editor that writes your `config.toml` in place — comments preserved, secrets locked, every change validated exactly as the daemon would before it touches disk.

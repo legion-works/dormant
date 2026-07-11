@@ -147,6 +147,7 @@ pub async fn run(
 }
 
 /// The result of one connection attempt.
+#[derive(Debug)]
 enum TickOutcome {
     /// The cancel token fired.
     Cancelled,
@@ -328,5 +329,81 @@ mod tests {
             Duration::from_secs(8),
             "cold-connect failure escalates 4s → 8s"
         );
+    }
+
+    // --- Wire-tolerance: an unrecognized DaemonEvent tag must not error tick() ---
+
+    /// `tick()`'s event loop never inspects the `DaemonEvent` payload — any
+    /// `Ok(_)` off the pump channel (recognized variant or the wire-tolerance
+    /// `Unknown` catch-all alike) just triggers a snapshot refetch. This
+    /// pins that behavior for the new `Unknown` variant: a fake daemon sends
+    /// one foreign-tagged event, and `tick()` must NOT surface it as
+    /// `TickOutcome::Errored` — it should refetch cleanly and only end (via
+    /// `TickOutcome::Closed`) once the daemon closes the connection, mirroring
+    /// a normal recognized-event tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tick_ignores_unknown_event_without_reconnect() {
+        use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("dormant.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Fake daemon: services the initial Status, then the Events
+        // subscribe (writes one foreign-tagged event line and closes so the
+        // pump sees EOF), then the post-event Status refetch. Three
+        // sequential connections, exactly what `tick()`'s happy path drives.
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = TokioBufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: IpcRequest = serde_json::from_str(line.trim()).unwrap();
+                match req {
+                    IpcRequest::Status => {
+                        let snap = StateSnapshot {
+                            sensors: vec![],
+                            zones: vec![],
+                            displays: vec![],
+                            pending_reload: None,
+                        };
+                        let json = serde_json::to_string(&IpcResponse::ok(Some(snap))).unwrap();
+                        writer.write_all(json.as_bytes()).await.unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    IpcRequest::Events => {
+                        writer
+                            .write_all(b"{\"event\":\"from_the_future\",\"x\":1}\n")
+                            .await
+                            .unwrap();
+                        writer.flush().await.unwrap();
+                        // Connection drops at end of loop iteration — the
+                        // client sees EOF right after this one event.
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        });
+
+        let state = Arc::new(Mutex::new(TrayState::new(sock.clone())));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let outcome = tick(&sock, &state, &cancel).await;
+
+        assert!(
+            !matches!(outcome, TickOutcome::Errored { .. }),
+            "an unrecognized event tag must not error the tick, got {outcome:?}"
+        );
+        assert!(
+            !state.lock().await.unreachable,
+            "state must still read as reachable after tolerating the unknown event"
+        );
+
+        server.await.unwrap();
     }
 }

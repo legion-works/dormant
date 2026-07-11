@@ -12,6 +12,7 @@ pub mod rules;
 pub mod state_machine;
 pub mod traits;
 pub mod types;
+pub mod wear;
 pub mod zone;
 
 #[cfg(feature = "test-fakes")]

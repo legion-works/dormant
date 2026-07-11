@@ -26,8 +26,8 @@ oled-proximity/
 
 **`crates/dormant-core/`**
 - Purpose: Pure-logic domain — no I/O. Every other crate depends on this.
-- Contains: `types`, `traits`, `error`, `ipc_proto`, `paths`, `reload`, `rules`, `state_machine`, `zone`, `config` (`schema`/`defaults`/`validate`/`mod`), `doctor` (wire types only), `fakes` (gated by `test-fakes` feature).
-- Key files: `crates/dormant-core/src/lib.rs`, `crates/dormant-core/src/config/schema.rs`, `crates/dormant-core/src/rules.rs`, `crates/dormant-core/src/zone.rs`, `crates/dormant-core/src/error.rs`.
+- Contains: `types`, `traits`, `error`, `ipc_proto`, `paths` (XDG helpers + `state_dir`/`wear_state_dir` test seams), `reload`, `rules`, `state_machine`, `zone`, `config` (`schema`/`defaults`/`validate`/`mod`), `doctor` (wire types only), `wear` (per-panel ledger model — `WearLedger`/`WearIdentity`/`PanelType`/`sanitize_identity_key`/`brightness_norm`/`WearHandle`), `fakes` (gated by `test-fakes` feature).
+- Key files: `crates/dormant-core/src/lib.rs`, `crates/dormant-core/src/config/schema.rs`, `crates/dormant-core/src/config/defaults.rs` (single source of truth for every timing knob, including the `WEAR_*` constants), `crates/dormant-core/src/wear.rs`, `crates/dormant-core/src/rules.rs`, `crates/dormant-core/src/zone.rs`, `crates/dormant-core/src/error.rs`.
 
 **`crates/dormant-sensors/`**
 - Purpose: Sensor sources that emit `PresenceEvent`s. One module per sensor.
@@ -35,9 +35,9 @@ oled-proximity/
 - Key files: `crates/dormant-sensors/src/registry.rs` (explicit static registry — add new sources here).
 
 **`crates/dormant-displays/`**
-- Purpose: Display controllers that turn rules-engine `CommandSink` calls into real blank/wake operations.
-- Contains: `command.rs`, `ddcci.rs` (Linux-only), `kwin_dpms.rs` (Linux-only), `samsung_tizen.rs` (port 8002 WebSocket remote control + Wake-on-LAN + network pairing), `samsung_ip.rs` (port 1516 IP Control G2 JSON-RPC — `backlightControl` for the audio-safe `brightness_zero` blank path), `ha_passthrough.rs`, `vcp_ops.rs`, `executor.rs` (per-display fallback chain + retry), `registry.rs`.
-- Key files: `crates/dormant-displays/src/registry.rs` (`CONTROLLER_TYPES`, `capabilities()`, `build_controllers()`).
+- Purpose: Display controllers that turn rules-engine `CommandSink` calls into real blank/wake operations, plus the per-panel DDC/CI bus lock that serializes command-vs-sampler transactions on a single I²C bus.
+- Contains: `command.rs`, `ddcci.rs` (Linux-only), `kwin_dpms.rs` (Linux-only), `samsung_tizen.rs` (port 8002 WebSocket remote control + Wake-on-LAN + network pairing), `samsung_ip.rs` (port 1516 IP Control G2 JSON-RPC — `backlightControl` for the audio-safe `brightness_zero` blank path; uses `dormant_core::paths::state_dir_from_env` for token-store path derivation), `ha_passthrough.rs`, `vcp_ops.rs` (abstract `VcpOps` trait + ddc-hi real backend + scripted fake; every physical transaction runs under `spawn_blocking` with `catch_unwind` for panic recovery), `ddc_lock.rs` (`PanelLocks` registry, `PanelLock` with command-priority + poison recovery), `executor.rs` (per-display fallback chain + retry; chain-walks `read_state`/`read_state_sampled`/`read_usage_hours`/`panel_identity`), `registry.rs`.
+- Key files: `crates/dormant-displays/src/registry.rs` (`CONTROLLER_TYPES`, `capabilities()`, `build_controllers()` — the new controllers accept an `Arc<PanelLocks>` argument for the same bus lock to be shared across an `App` generation).
 
 **`crates/dormant-doctor/`**
 - Purpose: Probe logic + live coalesced `DoctorService`. Re-exports the wire types from `dormant_core::doctor`.
@@ -46,18 +46,18 @@ oled-proximity/
 
 **`crates/dormant-web/`**
 - Purpose: Optional loopback-only web dashboard. Gated behind the `web-ui` Cargo feature of `dormantd`; when off, zero web code compiles.
-- Contains: `server.rs` (axum router), `routes/` (command, config, doctor, events), `state.rs` (`WebState`/`WebStateInner`), `assets.rs` (embedded SPA), `error.rs`, `security.rs`.
+- Contains: `server.rs` (axum router), `routes/` (command, config, `config_apply`, doctor, events, **wear** — `GET /api/wear` + `GET /api/wear/<display>` reads the shared `WearHandle` directly so a fresh GET is always the truth even if the browser missed a WS nudge), `state.rs` (`WebState`/`WebStateInner`; carries the per-generation `WearHandle` from `dormantd`), `config_patch.rs` (pure patch hygiene + `toml_edit` application — only `config_apply.rs` consumes it), `assets.rs` (embedded SPA), `error.rs`, `security.rs`.
 - Key files: `crates/dormant-web/src/lib.rs` (`spawn` is the entry point), `crates/dormant-web/src/routes/mod.rs` (mount the routes).
-- Web UI assets: `crates/dormant-web/webui/src/` (SPA — React/Vite — `App.tsx`, `main.tsx`, `app/views/*`, `app/components/*`, `app/hooks/*`, `__tests__/`).
+- Web UI assets: `crates/dormant-web/webui/src/` (SPA — React/Vite — `App.tsx`, `main.tsx`, `app/views/*` (`Dashboard`, `Displays`, `Doctor`, `Config`, `Events`), `app/components/*` (`WearCard` for the panel-exposure summary + advisory banner, `HealthChip`, `StatusChip`, `Card`, …), `app/config/*` (`WearSection` — the `[wear]` TOML editor with the ten known keys, `ScreensaverEditor` now includes `shift_px` + `shift_interval` for static-image burn-in mitigation, `DisplaysSection` adds the `panel_type` select), `app/hooks/*`, `__tests__/`.
 
 **`crates/dormantd/`**
-- Purpose: The daemon binary — wires config → sensors → zones → rules → displays, with hot reload, inhibit-activity, IPC, optional web UI.
-- Contains: `app.rs` (`App`, `AppHandle`, generation assembly + reload + teardown), `inhibit_activity.rs`, `idle_source.rs`, `ipc.rs`, `single_instance.rs` (per-user-session `flock` guard — non-config-overridable), `reload.rs`, `logging.rs`, `lib.rs`, `main.rs`. Also: `systemd/dormant.service` (unit file), `tests/` (`daemon_smoke.rs`, `ipc_roundtrip.rs`, `web_config_apply.rs`).
-- Key files: `crates/dormantd/src/main.rs` (binary entry), `crates/dormantd/src/app.rs` (runtime assembly).
+- Purpose: The daemon binary — wires config → sensors → zones → rules → displays, with hot reload, inhibit-activity, the panel-wear tracker, IPC, optional web UI.
+- Contains: `app.rs` (`App`, `AppHandle`, generation assembly + reload + teardown — also constructs one `Arc<PanelLocks>` above generation swaps and threads it into controllers, plus the per-generation `WearHandle` shared with the web UI), `inhibit_activity.rs`, `idle_source.rs`, `ipc.rs`, `single_instance.rs` (per-user-session `flock` guard — non-config-overridable), `reload.rs`, `wear_tracker.rs` (daemon-lifetime task — pure `tick(snapshot, samples, config, now)` plus async shell; samples displays in the `active` OR `grace` phase — both attribute a real brightness read per spec §4.2 — through `CommandSink::read_state_sampled`, persists ledgers to `wear_state_dir()`, publishes `DaemonEvent::WearSnapshot` + `CompensationAdvisory`), `logging.rs`, `lib.rs`, `main.rs`. Also: `systemd/dormant.service` (unit file), `tests/` (`daemon_smoke.rs`, `ipc_roundtrip.rs`, `web_config_apply.rs`).
+- Key files: `crates/dormantd/src/main.rs` (binary entry), `crates/dormantd/src/app.rs` (runtime assembly), `crates/dormantd/src/wear_tracker.rs` (panel-wear tracker — pure tick + async shell split).
 
 **`crates/dormantctl/`**
-- Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor). Also exposes an IPC `client` library entry for out-of-binary consumers (e.g. `dormant-tray`).
-- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs`, `cmd_doctor.rs`, `cmd_pair.rs` (`dormantctl pair samsung <host>` — connects to the TV, prompts the on-screen allow, and stores the returned token via `dormant_core::config::upsert_samsung_token`), `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
+- Purpose: CLI companion. Talks to a running daemon over the Unix socket; some subcommands are offline (validate, doctor). Also exposes an IPC `client` library entry for out-of-binary consumers (e.g. `dormant-tray`). Emergency-wake falls back to direct-hardware probing + waking through the registry when the daemon is wedged or unreachable.
+- Contains: `main.rs` (clap dispatch), `lib.rs` (`pub mod client` re-export for library users), `client.rs` (IPC client), `cmd_blank.rs` (blank + wake), `cmd_doctor.rs` (per-target subcommands + `exercise` for control-path verification), `cmd_emergency_wake.rs` (`dormantctl emergency-wake` — IPC fast path with a direct-hardware fallback when the daemon is unresponsive; probes each freshly-built executor before waking), `cmd_pair.rs` (`dormantctl pair samsung <host>` — connects to the TV, prompts the on-screen allow, and stores the returned token via `dormant_core::config::upsert_samsung_token`), `cmd_pause.rs` (pause + resume), `cmd_status.rs`, `cmd_validate.rs`, `cmd_watch.rs`.
 - Key files: `crates/dormantctl/src/main.rs` (register new subcommands here).
 
 **`crates/dormant-render/`**
@@ -83,24 +83,27 @@ oled-proximity/
 **Configuration:**
 - `crates/dormant-core/src/config/schema.rs` — TOML-mirroring structs (`Config`, `DaemonConfig`, `SensorConfig`, `DisplayConfig`, `RuleConfig`, `Credentials`, …).
 - `crates/dormant-core/src/config/defaults.rs` — single source of truth for every timing knob.
-- `crates/dormant-core/src/config/validate.rs` — cross-reference validation rules.
-- `crates/dormant-core/src/config/mod.rs` — loader + known-key tree for unknown-key detection.
-- `crates/dormant-core/src/paths.rs` — XDG path resolution (`config_path`, `socket_path`, `sibling_credentials`).
+- `crates/dormant-core/src/config/validate.rs` — cross-reference validation rules AND the known-key tree for unknown-key detection (`KNOWN_KEYS`, `validate.rs:42`) — **not** `config/mod.rs` (F5 correction: an earlier revision of this file misattributed the tree to `mod.rs`).
+- `crates/dormant-core/src/config/mod.rs` — loader; calls `validate::collect_unknown_keys` but does not itself hold the known-key tree.
+- `crates/dormant-core/src/paths.rs` — XDG path resolution (`config_path`, `socket_path`, `sibling_credentials`, plus the daemon-owned `state_dir()` / `wear_state_dir()` and the `state_dir_from_env` test seam).
 - `examples/config.toml`, `examples/credentials.toml` — working reference configs.
 
-**Domain logic:** `crates/dormant-core/src/{types,traits,rules,state_machine,zone,reload,ipc_proto,error,doctor}.rs`.
-**Display executor (fallback + retry):** `crates/dormant-displays/src/executor.rs`.
+**Domain logic:** `crates/dormant-core/src/{types,traits,rules,state_machine,zone,reload,ipc_proto,error,doctor,wear}.rs`. `wear.rs` owns the per-panel `WearLedger` model (no I/O) — the tracker in `dormantd` owns sampling/persistence.
+**Display executor (fallback + retry):** `crates/dormant-displays/src/executor.rs` (chain-walks `read_state`/`read_state_sampled`/`read_usage_hours`/`panel_identity`).
+**DDC/CI VCP operations:** `crates/dormant-displays/src/vcp_ops.rs` (abstract `VcpOps` trait + ddc-hi real backend + scripted fake; every transaction runs inside `spawn_blocking` with `catch_unwind` for panic recovery).
+**Per-panel DDC/CI bus lock:** `crates/dormant-displays/src/ddc_lock.rs` (`PanelLocks` registry + `PanelLock` with `VcpPriority::Command` vs `Sampler` discipline + poison recovery).
 **Sensor source registry:** `crates/dormant-sensors/src/registry.rs`.
 **Display controller registry:** `crates/dormant-displays/src/registry.rs`.
 **Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,samsung,usb}.rs`.
-**Web routes:** `crates/dormant-web/src/routes/{command,config,config_apply,doctor,events}.rs`.
+**Web routes:** `crates/dormant-web/src/routes/{command,config,config_apply,doctor,events,wear}.rs`. `wear.rs` reads the shared `WearHandle` directly (no engine round-trip; mirrors the `doctor` route's read-only-diagnostics ethos).
 **Web config-patch module:** `crates/dormant-web/src/config_patch.rs` — pure patch hygiene / allowlist / `toml_edit` application; the `config_apply.rs` route is the only consumer.
+**Wear tracker:** `crates/dormantd/src/wear_tracker.rs` — pure `tick(snapshot, samples, config, now)` advances ledgers; async shell owns file I/O, `load_or_create_ledger`, and `DaemonEvent::WearSnapshot`/`CompensationAdvisory` publication.
 **Render entry:** `crates/dormant-render/src/lib.rs` (re-exports `LayerShellRenderSink` + `ScreensaverSettings`).
 **Tray entry:** `crates/dormant-tray/src/main.rs` (binary) and `crates/dormant-tray/src/lib.rs` (library surface).
 **Tests:**
 - Co-located `#[cfg(test)] mod tests` in every source file.
 - Integration tests: `crates/dormant-core/tests/`, `crates/dormant-sensors/tests/`, `crates/dormantd/tests/`, `crates/dormant-web/webui/src/__tests__/`.
-- Property regressions: `crates/dormant-core/proptest-regressions/`.
+- Property regressions: `crates/dormant-core/proptest-regressions/` (currently only `state_machine.txt` — no failure has shrunk a regression seed for `wear::resize_grid` yet; its total-conservation invariant is checked by a live `proptest!` block co-located in `wear.rs`, not (yet) by a pinned regression file here).
 - HTTP/SPA fixtures: `crates/dormant-sensors/fixtures/`, `crates/dormant-web/webui/src/__tests__/fixtures/`, `crates/dormant-core/tests/fixtures/config/`.
 
 ## Naming Conventions
@@ -124,7 +127,7 @@ oled-proximity/
 
 **New display controller:** Create `crates/dormant-displays/src/<name>.rs` implementing `dormant_core::traits::DisplayController`, then add to `crates/dormant-displays/src/lib.rs` and register in `crates/dormant-displays/src/registry.rs` (`CONTROLLER_TYPES` + `capabilities()` + `build_controllers` match arm). Gate with `#[cfg(target_os = "linux")]` if it needs platform I/O.
 
-**New config key:** `crates/dormant-core/src/config/schema.rs` (struct field + serde rename) + `crates/dormant-core/src/config/defaults.rs` (default shim) + `crates/dormant-core/src/config/validate.rs` (cross-reference rule) + `crates/dormant-core/src/config/mod.rs` (known-key tree). Constants go in `crates/dormant-core/src/error.rs` (`pub const E_*`).
+**New config key:** `crates/dormant-core/src/config/schema.rs` (struct field + serde rename) + `crates/dormant-core/src/config/defaults.rs` (default shim) + `crates/dormant-core/src/config/validate.rs` (cross-reference rule AND the `KNOWN_KEYS` known-key-tree entry — both live in this file, not `config/mod.rs`). Constants go in `crates/dormant-core/src/error.rs` (`pub const E_*`).
 
 **New doctor probe:** Create `crates/dormant-doctor/src/probes/<target>.rs`, register in `crates/dormant-doctor/src/probes/mod.rs`, re-export in `crates/dormant-doctor/src/lib.rs`, add a CLI subcommand in `crates/dormantctl/src/cmd_doctor.rs` (`DoctorSubcommand` + dispatch).
 
@@ -140,4 +143,8 @@ oled-proximity/
 
 **New error code:** `crates/dormant-core/src/error.rs` — add `pub const E_<NAME>: &str`, add a variant to `DormantError` with `#[error("E_<NAME>: ...")]`, and map it in `DormantError::code()`.
 
-**Shared utilities:** A new pure-logic helper belongs in `crates/dormant-core/` under a topical module. I/O helpers go in the relevant crate (`dormant-sensors`, `dormant-displays`, `dormant-doctor`, `dormant-web`).
+**New wear sub-feature:** Pure model goes in `crates/dormant-core/src/wear.rs` (extend `WearLedger`/`PanelType`/identity helpers; bumping `WEAR_SCHEMA_VERSION` requires a migration branch in `load_or_create_ledger`). Sampling/persistence/advisory emission lives in `crates/dormantd/src/wear_tracker.rs` (the pure `tick` first, then a `TrackerAction` for the shell to execute). Wire events are additive `DaemonEvent` variants in `crates/dormant-core/src/rules.rs` — keep the `#[serde(other)] Unknown` catch-all so older consumers keep streaming. HTTP exposure goes in `crates/dormant-web/src/routes/wear.rs`, mounted in `routes/mod.rs` and the router at `crates/dormant-web/src/server.rs`; the SPA widget is `crates/dormant-web/webui/src/app/components/WearCard.tsx` (used by `app/views/Dashboard.tsx`) and the config editor is `crates/dormant-web/webui/src/app/config/WearSection.tsx`.
+
+**New controller with a DDC/CI-shaped readback:** Implement the per-controller contracts in `crates/dormant-core/src/traits.rs` (`DisplayController::read_state`/`read_state_sampled`/`read_usage_hours`/`panel_identity`); serialize physical transactions through the `PanelLock` (`crates/dormant-displays/src/ddc_lock.rs`) using `VcpPriority` (`crates/dormant-displays/src/vcp_ops.rs`). The chain-walk overrides on `dormant-displays/src/executor.rs` ensure the sampler priority is preserved across the `CommandSink` boundary.
+
+**Shared utilities:** A new pure-logic helper belongs in `crates/dormant-core/` under a topical module. I/O helpers go in the relevant crate (`dormant-sensors`, `dormant-displays`, `dormant-doctor`, `dormant-web`). For daemon-owned persisted state (e.g. wear ledgers) reach for `crates/dormant-core/src/paths.rs::state_dir()` / `state_dir_from_env` rather than re-deriving the XDG-state-vs-`HOME` precedence at the call site.

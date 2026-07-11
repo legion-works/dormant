@@ -66,6 +66,11 @@ pub struct WebStateInner {
     /// uses.
     pub doctor: DoctorService,
 
+    /// Shared panel-wear ledger map — same [`dormant_core::wear::WearHandle`]
+    /// instance the wear tracker writes to (spec §5).  `/api/wear` reads it
+    /// directly; no dormantd-local type, so no dependency cycle.
+    pub wear: dormant_core::wear::WearHandle,
+
     /// The socket address the web server is bound to.  Used by the
     /// security middleware to validate the Host header against the
     /// configured bind address.

@@ -59,6 +59,7 @@ use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
 use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
 use dormant_core::zone::{ZoneEngine, ZoneSpec};
+use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry::{build_controllers, capabilities};
 use dormant_doctor::DoctorService;
@@ -323,6 +324,13 @@ impl App {
         let socket_path =
             dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
 
+        // The daemon's ONE process-wide panel-lock registry (spec §4.3):
+        // constructed here, threaded into every `assemble_static` call
+        // (this one and every subsequent reload via `Runner`), and never
+        // reconstructed for the life of the process — a physical panel's
+        // lock is the same `Arc<PanelLock>` across every generation swap.
+        let panel_locks = PanelLocks::new();
+
         // Clone before cfg/creds are moved into assemble_static.
         let cfg_clone = cfg.clone();
         let creds_clone = creds.clone();
@@ -335,15 +343,35 @@ impl App {
             creds,
             &self.source_builder,
             self.render_sink_builder.as_ref(),
+            &panel_locks,
         )
         .await
         .context("assemble initial runtime")?;
         #[cfg(not(feature = "render"))]
-        let assembly = assemble_static(cfg, creds, &self.source_builder)
+        let assembly = assemble_static(cfg, creds, &self.source_builder, &panel_locks)
             .await
             .context("assemble initial runtime")?;
 
         let spawn = spawn_generation(&root, assembly, None, None)?;
+
+        // Executor-map watch channel for the wear tracker (spec §4.3):
+        // seeded here from the first generation, republished by
+        // `Runner::install_generation` on every subsequent install/rollback,
+        // and emptied (`send_replace(Arc::new(HashMap::new()))`) immediately
+        // before teardown in `Runner::reload` so the tracker never calls
+        // into a dead executor mid-swap.
+        let executors0: HashMap<DisplayId, Arc<dyn CommandSink>> = spawn
+            .generation
+            .display_executors
+            .iter()
+            .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+            .collect();
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors0));
+
+        // The daemon's single wear-ledger map (spec §5) — shared with the
+        // tracker and, in future, IPC/WebUI readers.
+        let wear_handle: dormant_core::wear::WearHandle =
+            Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         // Stable front channels forwarded to the *current* generation.
         let (engine_ctl_tx, engine_ctl_rx) = watch::channel(spawn.ctl_tx.clone());
@@ -363,6 +391,18 @@ impl App {
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
+
+        // Wear tracker: daemon-lifetime, reads config via watch, publishes
+        // over the front ctl channel (rides `forward_ctl`'s
+        // `deliver_or_drop` across generation swaps), sees the current
+        // generation's executors via the watch seeded above.
+        let _wear_tracker = crate::wear_tracker::spawn(crate::wear_tracker::WearTrackerDeps {
+            config_rx: config_rx.clone(),
+            ctl_tx: front_ctl_tx.clone(),
+            executors_rx: executors_rx.clone(),
+            handle: wear_handle.clone(),
+            cancel: root.clone(),
+        });
 
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
@@ -385,12 +425,14 @@ impl App {
             root: root.clone(),
             engine_ctl: engine_ctl_tx,
             engine_events: engine_events_tx,
+            executors_tx,
             reload_tx: reload_tx.clone(),
             config_tx,
             creds_tx,
             generation: spawn.generation,
             started_web_port,
             started_web_bind,
+            panel_locks,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -441,6 +483,7 @@ impl App {
                     creds_path: self.creds_path.clone(),
                     apply_lock: tokio::sync::Mutex::new(()),
                     doctor: doctor_service.clone(),
+                    wear: wear_handle.clone(),
                     web_bind: addr,
                     cancel: root.clone(),
                     reload_timeout: std::time::Duration::from_secs(10),
@@ -583,6 +626,10 @@ struct Runner {
     root: CancellationToken,
     engine_ctl: watch::Sender<mpsc::Sender<ControlMsg>>,
     engine_events: watch::Sender<mpsc::Sender<PresenceEvent>>,
+    /// Current generation's executor map for the wear tracker (spec §4.3).
+    /// Republished on every install/rollback via [`Runner::install_generation`];
+    /// emptied immediately before teardown in [`Runner::reload`].
+    executors_tx: watch::Sender<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     reload_tx: broadcast::Sender<ReloadOutcome>,
     config_tx: watch::Sender<Arc<Config>>,
     creds_tx: watch::Sender<Arc<Credentials>>,
@@ -591,12 +638,26 @@ struct Runner {
     started_web_port: Option<u16>,
     /// Bind address the web UI was started with (for reload change-detection).
     started_web_bind: std::net::IpAddr,
+    /// The daemon's single process-wide panel-lock registry (spec §4.3),
+    /// constructed once in [`App::start`] and carried by `Runner` across
+    /// every reload so `load_and_assemble`'s `assemble_static` call always
+    /// reuses the SAME registry — a physical panel's lock must resolve to
+    /// the same `Arc<PanelLock>` whether it came from the old generation's
+    /// controller or the new one's.
+    panel_locks: Arc<PanelLocks>,
 }
 
 impl Runner {
     fn install_generation(&mut self, spawn: GenSpawn) {
         let _ = self.engine_ctl.send(spawn.ctl_tx);
         let _ = self.engine_events.send(spawn.events_tx);
+        let executors: HashMap<DisplayId, Arc<dyn CommandSink>> = spawn
+            .generation
+            .display_executors
+            .iter()
+            .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+            .collect();
+        self.executors_tx.send_replace(Arc::new(executors));
         self.generation = spawn.generation;
     }
 
@@ -720,6 +781,12 @@ impl Runner {
             );
         }
 
+        // Fail-closed during the swap: the wear tracker must never call into
+        // an executor that is about to be torn down (spec §4.3). Empty the
+        // watch BEFORE teardown so a tracker tick racing this window sees no
+        // executors (skips its round) rather than a stale/dying one.
+        self.executors_tx.send_replace(Arc::new(HashMap::new()));
+
         teardown(&mut self.generation).await;
 
         // Verified physical wake of REMOVED displays (no executor in the new
@@ -822,13 +889,14 @@ impl Runner {
                 creds,
                 &self.source_builder,
                 self.render_sink_builder.as_ref(),
+                &self.panel_locks,
             )
             .await
             .map_err(|e| e.to_string())
         }
         #[cfg(not(feature = "render"))]
         {
-            assemble_static(cfg, creds, &self.source_builder)
+            assemble_static(cfg, creds, &self.source_builder, &self.panel_locks)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1067,12 +1135,19 @@ fn load_cfg_creds(
 }
 
 /// Build controllers + executors (probing each) and derive the engine config.
+///
+/// `locks` is the daemon's single process-wide [`PanelLocks`] registry
+/// (spec §4.3) — constructed once in [`App::start`] and reused, unchanged,
+/// across every reload generation (see [`Runner::panel_locks`]), so a
+/// physical panel's lock is the same `Arc<PanelLock>` before and after a
+/// config reload.
 #[allow(clippy::too_many_lines)]
 async fn assemble_static(
     cfg: Config,
     creds: Credentials,
     source_builder: &SourceBuilder,
     #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
+    locks: &Arc<PanelLocks>,
 ) -> Result<StaticAssembly> {
     // First rule referencing each display drives its retry + timings.
     let display_rule = index_display_rules(&cfg);
@@ -1112,7 +1187,7 @@ async fn assemble_static(
             ),
         };
 
-        let controllers = build_controllers(name, dc, &creds)
+        let controllers = build_controllers(name, dc, &creds, locks)
             .with_context(|| format!("build controllers for display '{name}'"))?;
         let mut executor =
             DisplayExecutor::new(did.clone(), controllers, dc.primary_blank_mode(), retry);
@@ -1877,6 +1952,7 @@ mod render_tests {
             restore_brightness: 100,
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
         }
     }
 
@@ -1933,6 +2009,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::new(),
             zones: IndexMap::new(),
             displays: {
@@ -1965,6 +2042,7 @@ mod render_tests {
                         samsung_restore_backlight:
                             dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
                         treat_unreachable_as_blanked: true,
+                        panel_type: dormant_core::wear::PanelType::default(),
                     },
                 );
                 m
@@ -2037,6 +2115,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2067,6 +2146,8 @@ mod render_tests {
                         scale_mode: Some("stretch".into()),
                         transition: None,
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -2121,6 +2202,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2153,6 +2235,8 @@ mod render_tests {
                         scale_mode: None,
                         transition: None,
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -2212,6 +2296,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2242,6 +2327,8 @@ mod render_tests {
                         scale_mode: None,
                         transition: Some("none".into()),
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -2294,6 +2381,7 @@ mod render_tests {
         let cfg = Config {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2327,6 +2415,8 @@ mod render_tests {
                         // Crossfade (the user asked for transitions).
                         transition: None,
                         transition_duration: None,
+                        shift_px: 2,
+                        shift_interval: Duration::from_secs(120),
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()

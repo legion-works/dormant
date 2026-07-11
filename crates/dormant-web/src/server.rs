@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
-use crate::routes::{command, config, config_apply, doctor, events};
+use crate::routes::{command, config, config_apply, doctor, events, wear};
 use crate::security::security_guard;
 
 /// Duration the `/api/state` handler waits for a snapshot reply before
@@ -45,6 +45,8 @@ pub(crate) fn build_router(state: WebState) -> Router {
         .route("/reload", post(command::post_reload))
         .route("/doctor", post(doctor::post_doctor))
         .route("/events", get(events::ws_events))
+        .route("/wear", get(wear::get_wear))
+        .route("/wear/:display", get(wear::get_wear_detail))
         // API miss → 404, never the SPA fallback.
         .fallback(api_not_found)
         .with_state(state.clone());
@@ -140,6 +142,7 @@ mod tests {
         let config = Arc::new(Config {
             config_version: 1,
             daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -166,6 +169,7 @@ mod tests {
             creds_path: std::path::PathBuf::from("/dev/null"),
             apply_lock: tokio::sync::Mutex::new(()),
             doctor,
+            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: bind,
             cancel: cancel.clone(),
             reload_timeout: Duration::from_secs(10),

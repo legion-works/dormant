@@ -1,0 +1,28 @@
+/* FailureBanner — Dashboard wake/blank failure surfacing. */
+
+.failure-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  background: color-mix(in oklab, var(--danger) 10%, transparent);
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+
+.failure-banner__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.failure-banner__id {
+  color: var(--text-body);
+  font-weight: 600;
+}
+
+.failure-banner__detail {
+  color: var(--danger);
+}

@@ -12,6 +12,7 @@ import { createPatchStore } from "./patch";
 import type { PatchStore } from "./patch";
 import DaemonSection from "./DaemonSection";
 import WearSection from "./WearSection";
+import NotificationsSection from "./NotificationsSection";
 import SensorsSection from "./SensorsSection";
 import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
@@ -213,6 +214,14 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
 
       <WearSection
         wear={inv.wear}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
+
+      <NotificationsSection
+        notifications={inv.notifications}
         store={store}
         redactedPaths={config.redacted_paths}
         onDirty={onDirty}

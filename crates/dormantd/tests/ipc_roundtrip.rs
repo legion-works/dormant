@@ -116,6 +116,7 @@ fn fake_doctor(ctl_tx: mpsc::Sender<ControlMsg>) -> DoctorService {
         config_version: 1,
         daemon: DaemonConfig::default(),
         wear: dormant_core::config::schema::WearConfig::default(),
+        notifications: dormant_core::config::schema::NotificationsConfig::default(),
         sensors: IndexMap::default(),
         zones: IndexMap::default(),
         displays: IndexMap::default(),

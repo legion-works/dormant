@@ -2010,6 +2010,7 @@ mod render_tests {
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: IndexMap::new(),
             zones: IndexMap::new(),
             displays: {
@@ -2116,6 +2117,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2203,6 +2205,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2297,6 +2300,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -2382,6 +2386,7 @@ mod render_tests {
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(

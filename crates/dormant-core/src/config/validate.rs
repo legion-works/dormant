@@ -51,6 +51,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "displays",
             "rules",
             "wear",
+            "notifications",
         ],
     ),
     // ── wear ────────────────────────────────────────────────────────────────
@@ -67,6 +68,16 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "screensaver_factor",
             "short_cycle_dwell",
             "advisory_after",
+        ],
+    ),
+    // ── notifications ──────────────────────────────────────────────────────
+    (
+        "notifications",
+        &[
+            "enabled",
+            "wake_attempt_threshold",
+            "cooldown",
+            "notify_recovery",
         ],
     ),
     // ── daemon ──────────────────────────────────────────────────────────────
@@ -414,7 +425,35 @@ pub fn validate(
     // ── [wear] validation ────────────────────────────────────────────────
     validate_wear(cfg, &mut errors);
 
+    // ── [notifications] validation ────────────────────────────────────────
+    validate_notifications(cfg, &mut errors);
+
     errors
+}
+
+/// Validate the `[notifications]` section: threshold floor and cooldown floor.
+fn validate_notifications(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let notifications = &cfg.notifications;
+
+    if notifications.wake_attempt_threshold == 0 {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "notifications.wake_attempt_threshold {} is below the minimum of 1",
+                notifications.wake_attempt_threshold
+            ),
+        });
+    }
+
+    if notifications.cooldown < Duration::from_secs(60) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "notifications.cooldown {:?} is below the 1m floor",
+                notifications.cooldown
+            ),
+        });
+    }
 }
 
 /// Validate the `[wear]` section: duration floors, cross-field ordering
@@ -1771,6 +1810,7 @@ gracee_period = "60s"
             displays: IndexMap::from([("d1".into(), display_with_scale_mode(scale_mode))]),
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
+            notifications: super::super::schema::NotificationsConfig::default(),
         }
     }
 
@@ -1892,6 +1932,7 @@ gracee_period = "60s"
             )]),
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
+            notifications: super::super::schema::NotificationsConfig::default(),
         }
     }
 
@@ -2286,6 +2327,7 @@ password = "test-pass"
             )]),
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -2340,6 +2382,7 @@ password = "test-pass"
             )]),
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -2514,6 +2557,7 @@ password = "test-pass"
             displays: IndexMap::from([("d".into(), dc)]),
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2536,6 +2580,7 @@ password = "test-pass"
             displays: IndexMap::from([("d".into(), dc)]),
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3694,6 +3739,111 @@ kind = "power_off"
                 .iter()
                 .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("shift_interval")),
             "shift_interval below 10s floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    // ── [notifications] validation ──────────────────────────────────────
+
+    fn notifications_config(body: &str) -> Config {
+        let toml_str = format!("config_version = 1\n[notifications]\n{body}");
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    fn notifications_validation_errors(body: &str) -> Vec<ValidationError> {
+        let cfg = notifications_config(body);
+        validate(&cfg, &HashMap::new(), &Credentials::default())
+    }
+
+    #[test]
+    fn notifications_all_keys_known_in_strict_mode() {
+        let dir = std::env::temp_dir().join("dormant-test-notifications-keys-known");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notifications_full.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n\
+             [notifications]\n\
+             enabled = true\n\
+             wake_attempt_threshold = 3\n\
+             cooldown = \"15m\"\n\
+             notify_recovery = true\n",
+        )
+        .unwrap();
+        assert!(
+            crate::config::load_config(&path, Strictness::Strict).is_ok(),
+            "all [notifications] keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn notifications_unknown_key_rejected_strict() {
+        let dir = std::env::temp_dir().join("dormant-test-notifications-unknown-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notifications_unknown.toml");
+        std::fs::write(&path, "config_version = 1\n[notifications]\nbogus = 1\n").unwrap();
+
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("notifications.bogus"),
+            "expected error mentioning notifications.bogus, got: {err}"
+        );
+    }
+
+    #[test]
+    fn notifications_defaults_accepted_with_no_errors() {
+        let errors = notifications_validation_errors("");
+        assert!(
+            errors.is_empty(),
+            "default [notifications] section must validate cleanly, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn notifications_threshold_zero_rejected() {
+        let errors = notifications_validation_errors("wake_attempt_threshold = 0\n");
+        assert!(
+            errors.iter().any(
+                |e| e.what == "E_CONFIG_INVALID" && e.detail.contains("wake_attempt_threshold")
+            ),
+            "wake_attempt_threshold = 0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn notifications_threshold_one_accepted() {
+        let errors = notifications_validation_errors("wake_attempt_threshold = 1\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("wake_attempt_threshold")),
+            "wake_attempt_threshold = 1 (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn notifications_cooldown_floor() {
+        let errors = notifications_validation_errors("cooldown = \"10s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("cooldown")),
+            "cooldown = 10s (below the 1m floor) must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn notifications_cooldown_at_floor_accepted() {
+        let errors = notifications_validation_errors("cooldown = \"1m\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("cooldown")),
+            "cooldown = 1m (the floor) must be accepted, got: {:?}",
             errors
         );
     }

@@ -852,6 +852,7 @@ mod tests {
             displays: indexmap::IndexMap::new(),
             rules: indexmap::IndexMap::new(),
             wear: WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
         }
     }
 

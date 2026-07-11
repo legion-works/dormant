@@ -88,6 +88,10 @@ pub struct Config {
     /// Panel-wear tracking configuration.
     #[serde(default)]
     pub wear: WearConfig,
+
+    /// Wake-failure notification configuration.
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 // ── DaemonConfig ────────────────────────────────────────────────────────────────
@@ -264,6 +268,46 @@ impl Default for WearConfig {
             screensaver_factor: defaults::WEAR_SCREENSAVER_FACTOR,
             short_cycle_dwell: defaults::WEAR_SHORT_CYCLE_DWELL,
             advisory_after: defaults::WEAR_ADVISORY_AFTER,
+        }
+    }
+}
+
+// ── NotificationsConfig ─────────────────────────────────────────────────────────
+
+/// Wake-failure notification configuration (the `[notifications]` TOML section).
+///
+/// Governs when the daemon surfaces a desktop notification after repeated
+/// wake-command failures for a display, the cooldown between successive
+/// notifications, and whether a recovery notification fires once the display
+/// wakes successfully again.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// Enable wake-failure notifications. Enabled by default.
+    #[serde(default = "default_notify_enabled")]
+    pub enabled: bool,
+
+    /// Number of consecutive wake-command failures before a notification fires.
+    #[serde(default = "default_notify_wake_attempt_threshold")]
+    pub wake_attempt_threshold: u64,
+
+    /// Minimum time between successive wake-failure notifications for the
+    /// same display.
+    #[serde(default = "default_notify_cooldown", with = "humantime_serde")]
+    pub cooldown: Duration,
+
+    /// Emit a recovery notification when a previously-failing display wakes
+    /// successfully again.
+    #[serde(default = "default_notify_recovery")]
+    pub notify_recovery: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::NOTIFY_ENABLED,
+            wake_attempt_threshold: defaults::NOTIFY_WAKE_ATTEMPT_THRESHOLD,
+            cooldown: defaults::NOTIFY_COOLDOWN,
+            notify_recovery: defaults::NOTIFY_RECOVERY,
         }
     }
 }
@@ -992,6 +1036,18 @@ fn default_wear_short_cycle_dwell() -> Duration {
 fn default_wear_advisory_after() -> Duration {
     defaults::WEAR_ADVISORY_AFTER
 }
+fn default_notify_enabled() -> bool {
+    defaults::NOTIFY_ENABLED
+}
+fn default_notify_wake_attempt_threshold() -> u64 {
+    defaults::NOTIFY_WAKE_ATTEMPT_THRESHOLD
+}
+fn default_notify_cooldown() -> Duration {
+    defaults::NOTIFY_COOLDOWN
+}
+fn default_notify_recovery() -> bool {
+    defaults::NOTIFY_RECOVERY
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -1476,5 +1532,40 @@ path = "/tmp/img.png"
         let ss = cfg.displays["d1"].screensaver.as_ref().unwrap();
         assert_eq!(ss.shift_px, 2);
         assert_eq!(ss.shift_interval, Duration::from_secs(120));
+    }
+
+    // ── [notifications] section ─────────────────────────────────────────
+
+    #[test]
+    fn notifications_defaults_load_from_empty_and_absent_section() {
+        let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
+        assert!(cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.wake_attempt_threshold, 3);
+        assert_eq!(cfg.notifications.cooldown, Duration::from_secs(15 * 60));
+        assert!(cfg.notifications.notify_recovery);
+
+        let cfg: Config = toml::from_str("config_version = 1\n[notifications]\n").unwrap();
+        assert!(cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.wake_attempt_threshold, 3);
+        assert_eq!(cfg.notifications.cooldown, Duration::from_secs(15 * 60));
+        assert!(cfg.notifications.notify_recovery);
+    }
+
+    #[test]
+    fn notifications_explicit_values_parse() {
+        let toml_str = r#"
+config_version = 1
+
+[notifications]
+enabled = false
+wake_attempt_threshold = 5
+cooldown = "30m"
+notify_recovery = false
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.wake_attempt_threshold, 5);
+        assert_eq!(cfg.notifications.cooldown, Duration::from_secs(30 * 60));
+        assert!(!cfg.notifications.notify_recovery);
     }
 }

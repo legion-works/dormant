@@ -3517,8 +3517,44 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
 // Timing (reported in the T4 write-up): `stability_window = "30s"` is the
 // validated floor (`validate.rs`); `watchdog_healthy_run_writes_lkg_and_sidecar`
 // and `watchdog_reload_mid_window_resets_candidate` each wait close to that
-// floor and are run with their OWN `timeout 42` invocation, never inside the
-// full-suite `--test-threads=4` run, to stay inside the 42s harness budget.
+// floor and are run with their OWN `timeout 42` invocation, never inside
+// either of the two bulk runs below, to stay inside the 42s harness budget.
+//
+// F5 (T4 review): once this file grew enough `watchdog_*` step-boundary
+// tests, running "every test except the two long ones" as a single
+// `--test-threads=4` invocation risked busting the 42s cap the moment any
+// more watchdog coverage landed. The fix is a STABLE two-half split by
+// name, not a shrinking act — CI, reviewers, and operators re-running this
+// file locally all use the exact same two commands:
+//
+//   1) watchdog smoke half (all `watchdog_*` tests EXCEPT the two long
+//      ones above, which keep their own individual `timeout 42` runs):
+//        timeout 42 cargo test -p dormantd --test daemon_smoke \
+//          --all-features -- --test-threads=4 watchdog_ \
+//          --skip watchdog_healthy_run_writes_lkg_and_sidecar \
+//          --skip watchdog_reload_mid_window_resets_candidate
+//      Measured on the sandbox's 2-core box: ~2.7s.
+//
+//   2) everything else (every non-`watchdog_*` test in this file —
+//      `--skip watchdog_` substring-matches and excludes ALL of them,
+//      including the two long ones, so this half never touches them):
+//        timeout 42 cargo test -p dormantd --test daemon_smoke \
+//          --all-features -- --test-threads=4 --skip watchdog_
+//      Measured on the sandbox's 2-core box: ~40-41s across repeated runs
+//      — inside the 42s cap but with LESS headroom than half (1). This is
+//      a PRE-EXISTING characteristic of the legacy (pre-T4) test bucket,
+//      not a regression from this fix: none of the tests added by this
+//      commit land in half (2), and its runtime is unchanged from before
+//      this branch. A real-time-heavy handful (e.g.
+//      `wear_park_persists_final_ledger`'s fixed 7s settle sleep) account
+//      for most of the margin loss; rebalancing that legacy weight is
+//      out of scope here — flagged as a follow-up, not fixed in this
+//      watchdog-focused change.
+//
+// A new smoke test belongs in half (1) if its name starts with
+// `watchdog_`, half (2) otherwise — no other bookkeeping needed as the
+// suite keeps growing. A new HEAVY (multi-second real sleep) test in half
+// (2) should be weighed against that shrinking margin before it lands.
 
 use dormantd::sd_notify::SdNotify;
 
@@ -3891,6 +3927,11 @@ wake_retry_interval = "1s"
     reason = "capture_count_lock() is test-local (only these 2 tests touch it) and always \
               released promptly at test end — see the lock's doc comment"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "F2: exact-count + strict-ordering assertions across seven step-boundary markers \
+              read better linearly than split across helper fns for a single-purpose test"
+)]
 async fn watchdog_in_reload_pings_healthy_boundaries() {
     let _guard = capture_count_lock()
         .lock()
@@ -3969,6 +4010,16 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
     // captured bytes even though it renders contiguously — match on the
     // (sufficiently distinctive) bare step-name token instead.
     assert_eq!(
+        output.matches("after_assemble").count(),
+        1,
+        "after_assemble must fire exactly once (spec §6.3: distinct from after_quiesce): {output}"
+    );
+    assert_eq!(
+        output.matches("after_quiesce").count(),
+        1,
+        "after_quiesce must fire exactly once (spec §6.3: distinct from after_assemble): {output}"
+    );
+    assert_eq!(
         output.matches("before_teardown").count(),
         1,
         "before_teardown must fire exactly once: {output}"
@@ -3983,6 +4034,36 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
         output.matches("reload_end").count(),
         1,
         "reload_end must fire exactly once on a successful reload: {output}"
+    );
+
+    // Order matters as much as presence (spec §6.3 names these as an
+    // ordered sequence of boundaries): after_assemble -> after_quiesce ->
+    // before_teardown -> removed_display_wake (xN) -> reload_end.
+    let pos = |needle: &str| {
+        output
+            .find(needle)
+            .unwrap_or_else(|| panic!("marker {needle} missing from captured output: {output}"))
+    };
+    let p_assemble = pos("after_assemble");
+    let p_quiesce = pos("after_quiesce");
+    let p_teardown = pos("before_teardown");
+    let p_wake_first = pos("removed_display_wake");
+    let p_reload_end = pos("reload_end");
+    assert!(
+        p_assemble < p_quiesce,
+        "after_assemble must fire before after_quiesce: {output}"
+    );
+    assert!(
+        p_quiesce < p_teardown,
+        "after_quiesce must fire before before_teardown: {output}"
+    );
+    assert!(
+        p_teardown < p_wake_first,
+        "before_teardown must fire before removed_display_wake: {output}"
+    );
+    assert!(
+        p_wake_first < p_reload_end,
+        "removed_display_wake must fire before reload_end: {output}"
     );
 }
 
@@ -4069,6 +4150,90 @@ async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
     assert!(
         output.contains("before_rebuild_old_wake_failure"),
         "the rebuild_old(wake-failure) call site must be pinged first: {output}"
+    );
+    assert!(
+        !output.contains("reload_end"),
+        "an aborted reload must never reach the reload_end boundary: {output}"
+    );
+}
+
+/// F1 (T4 review): the `before_rebuild_old_spawn_failure` boundary (the
+/// ACCEPTED-config `spawn_generation` call failing, distinct from the
+/// verified-wake failure covered by the sibling test above) had NO
+/// coverage. No config-only edit can drive a REAL `spawn_generation`
+/// failure past `validate()` here — `ZoneEngine::new` runs the identical
+/// deterministic construction `validate()` already ran on the same `cfg`,
+/// and `RulesEngine::new`'s only fallible check can't fire because
+/// `assemble_static` is fail-fast (an incomplete executor/machine map never
+/// reaches `spawn_generation`). This test uses the `App::
+/// with_test_force_reload_spawn_failure` seam (test-util feature, same
+/// pattern as `SdNotify::from_socket_for_test`) to force the REAL `Err(e)`
+/// arm in `Runner::reload` to run, with a synthetic cause — everything
+/// downstream of that point (the ping, `rebuild_old`, the `Rejected`
+/// outcome) is production code, unmodified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() is test-local and always released promptly at test end \
+              — see the lock's doc comment"
+)]
+async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_secs(120))
+    .with_test_force_reload_spawn_failure();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "display should blank before reload"
+    );
+
+    drain_capture(); // discard startup noise
+
+    // Any accepted-shape edit triggers a reload attempt; the seam forces
+    // spawn_generation to fail regardless of content.
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected (forced spawn_generation failure)"),
+    }
+
+    let output = drain_capture();
+    shutdown(handle, join).await;
+
+    assert!(
+        output.contains("before_rebuild_old_spawn_failure"),
+        "the accepted-spawn failure boundary must fire: {output}"
     );
     assert!(
         !output.contains("reload_end"),

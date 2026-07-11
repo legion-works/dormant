@@ -209,6 +209,21 @@ pub struct App {
     /// shrink the tick period without touching env — mirrors
     /// `with_sd_notify`'s injection shape.
     watchdog_interval: Option<Duration>,
+    /// Test seam (F1, T4 reviewer finding): forces the ACCEPTED-config
+    /// `spawn_generation` call in `Runner::reload` (the one after
+    /// `load_and_assemble`/`validate` already passed) to fail, so a test
+    /// can drive the `before_rebuild_old_spawn_failure` boundary + the
+    /// `rebuild_old` recovery path. No config-only seam reaches this call
+    /// site: `ZoneEngine::new` runs the SAME deterministic construction
+    /// `validate()` already ran on the identical `cfg`, and
+    /// `RulesEngine::new`'s only fallible check (a rule's display missing
+    /// from the built executor/machine maps) can't fire because
+    /// `assemble_static` is fail-fast — an incomplete map never reaches
+    /// here. This mirrors the `SdNotify::from_socket_for_test` precedent
+    /// (R2-M8): an internal seam, gated the same way, for a real path a
+    /// black-box config edit provably cannot reach.
+    #[cfg(any(test, feature = "test-util"))]
+    force_reload_spawn_failure: bool,
 }
 
 /// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
@@ -246,6 +261,8 @@ impl App {
             disable_ipc: false,
             sd_notify: SdNotify::from_env(),
             watchdog_interval: None,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_spawn_failure: false,
         })
     }
 
@@ -276,6 +293,8 @@ impl App {
             disable_ipc: false,
             sd_notify: SdNotify::from_env(),
             watchdog_interval: None,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_spawn_failure: false,
         })
     }
 
@@ -331,6 +350,17 @@ impl App {
     #[must_use]
     pub fn with_watchdog_interval(mut self, interval: Duration) -> Self {
         self.watchdog_interval = Some(interval);
+        self
+    }
+
+    /// Force the accepted-config `spawn_generation` call inside
+    /// `Runner::reload` to fail on every subsequent reload (test seam, F1 —
+    /// see the field doc on `App::force_reload_spawn_failure` for why no
+    /// config-only seam reaches this call site).
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_force_reload_spawn_failure(mut self) -> Self {
+        self.force_reload_spawn_failure = true;
         self
     }
 
@@ -554,6 +584,8 @@ impl App {
             lkg_candidate,
             lkg_defer_count: 0,
             probe_failed_warned: false,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_spawn_failure: self.force_reload_spawn_failure,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -793,6 +825,9 @@ struct Runner {
     /// CURRENT run of consecutive probe failures (spec §6.3: warn once per
     /// failure streak, not once per failed tick).
     probe_failed_warned: bool,
+    /// Test seam (F1) — see `App::force_reload_spawn_failure`.
+    #[cfg(any(test, feature = "test-util"))]
+    force_reload_spawn_failure: bool,
 }
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
@@ -887,6 +922,14 @@ impl Runner {
             }
         };
 
+        // Step-boundary ping 1/7 (spec §6.3): after `load_and_assemble`
+        // returns (probes done). The spec names this as a boundary DISTINCT
+        // from "after the quiesce loop" below — the serial controller
+        // probes inside `load_and_assemble` and the quiesce loop that
+        // follows are two independently-unbounded stretches of work, so
+        // each needs its own ping to keep either gap alone bounded.
+        self.ping("after_assemble");
+
         // Build the set of rule-driven displays from the NEW config.
         // Rule-less (manual-only) displays are those in [displays] but NOT
         // referenced by any rule.
@@ -965,6 +1008,13 @@ impl Runner {
             }
         }
 
+        // Step-boundary ping 2/7 (spec §6.3): after the quiesce loop above
+        // (whether or not any rule-less display actually needed quiescing)
+        // — the second of the two DISTINCT probes-done / quiesce-done
+        // boundaries the spec names; fired unconditionally so the boundary
+        // exists even on a reload with nothing to quiesce.
+        self.ping("after_quiesce");
+
         let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
         let retained_dark =
             retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors, &ruled);
@@ -990,10 +1040,10 @@ impl Runner {
         // executors (skips its round) rather than a stale/dying one.
         self.executors_tx.send_replace(Arc::new(HashMap::new()));
 
-        // Step-boundary ping 1/5 (spec §6.3 F5): the serial controller
-        // probes inside `load_and_assemble` and the quiesce loop above can
-        // legitimately run long; ping once more right before the teardown +
-        // verified-wake work below so that gap alone is bounded.
+        // Step-boundary ping 3/7 (spec §6.3 F5): right before the teardown +
+        // verified-wake work below, so that gap too is independently
+        // bounded (on top of the after_assemble/after_quiesce boundaries
+        // above covering the two stretches that precede this point).
         self.ping("before_teardown");
 
         teardown(&mut self.generation).await;
@@ -1008,7 +1058,7 @@ impl Runner {
                     let detail =
                         format!("removed display '{display_id}' failed verified wake: {e}");
                     tracing::error!(event = "config_reload_rejected", detail = %detail);
-                    // Step-boundary ping 3/5 (spec §6.3/P10): before the
+                    // Step-boundary ping 5/7 (spec §6.3/P10): before the
                     // `rebuild_old` recovery rebuild (`spawn_generation` +
                     // engine construction, controllers reused — not a
                     // controller reprobe, but still non-trivial work).
@@ -1018,7 +1068,7 @@ impl Runner {
                     return;
                 }
                 tracing::info!(event = "reload_removed_display_woken", display = %display_id);
-                // Step-boundary ping 2/5 (spec §6.3 F5/R2-M5): one ping PER
+                // Step-boundary ping 4/7 (spec §6.3 F5/R2-M5): one ping PER
                 // removed display inside this loop — the serial verified-wake
                 // burst is unbounded in display count, so bounding every gap
                 // at one display's worst-case burst requires a ping here,
@@ -1047,14 +1097,30 @@ impl Runner {
             reload::zero_changed_sensor_reported(&displays_filtered, &self.generation.cfg, &new_cfg)
         });
 
-        match spawn_generation(
+        let spawn_result = spawn_generation(
             &self.root,
             new_assembly,
             restore_snapshot.as_ref(),
             None,
             self.notify_state.clone(),
             self.notify_sink.clone(),
-        ) {
+        );
+        // Test seam (F1): see `App::force_reload_spawn_failure` doc — no
+        // config-only path reaches an `Err` here, so a test that needs to
+        // pin `before_rebuild_old_spawn_failure` + the `rebuild_old`
+        // recovery flips this flag and gets the REAL `Err(e)` arm below,
+        // just with a synthetic cause.
+        #[cfg(any(test, feature = "test-util"))]
+        let spawn_result = if self.force_reload_spawn_failure {
+            spawn_result.and_then(|_| {
+                Err(anyhow::anyhow!(
+                    "test-injected spawn_generation failure (F1 test-util seam)"
+                ))
+            })
+        } else {
+            spawn_result
+        };
+        match spawn_result {
             Ok(spawn) => {
                 self.install_generation(spawn);
                 // Re-check the hazard pairing against the NEW config on every
@@ -1106,7 +1172,7 @@ impl Runner {
                     self.generation.cfg.watchdog.lkg_enabled,
                     "reload",
                 );
-                // Step-boundary ping 5/5 (spec §6.3): reload end. Fires
+                // Step-boundary ping 7/7 (spec §6.3): reload end. Fires
                 // BEFORE the reload-outcome broadcast (not after): on the
                 // real multi-threaded runtime a receiver parked on
                 // `subscribe_reload()` can wake and run in TRUE PARALLEL
@@ -1120,7 +1186,7 @@ impl Runner {
             Err(e) => {
                 let detail = format!("rebuild from new config failed: {e}");
                 tracing::error!(event = "config_reload_rejected", detail = %detail);
-                // Step-boundary ping 4/5 (spec §6.3/P10): before the second
+                // Step-boundary ping 6/7 (spec §6.3/P10): before the second
                 // `rebuild_old` call site (the accepted-config
                 // `spawn_generation` failure path).
                 self.ping("before_rebuild_old_spawn_failure");
@@ -1231,7 +1297,7 @@ impl Runner {
     /// Send `WATCHDOG=1` and log a `step`-tagged marker (test/ops
     /// observability — `sd_notify::watchdog`'s wire payload is always the
     /// literal `WATCHDOG=1`; the `step` field is how tests and journal
-    /// readers tell the five in-reload boundaries apart, spec §6.3/P9).
+    /// readers tell the seven in-reload boundaries apart, spec §6.3/P9).
     /// Info level (not debug): `reload()` boundaries fire at most a handful
     /// of times per reload, not per periodic tick, so the volume is the
     /// same order as the `reload_*` events already logged at info here.
@@ -1245,10 +1311,16 @@ impl Runner {
     /// and run the §4 LKG-promotion check on every healthy tick.
     async fn watchdog_tick(&mut self) {
         let ctl = self.engine_ctl.borrow().clone();
-        if let Some(snapshot) = watchdog_probe(&ctl).await {
+        let probe_result = watchdog_probe(&ctl).await;
+        if ping_if_healthy(&mut self.sd, probe_result.as_ref()) {
             self.probe_failed_warned = false;
-            self.sd.watchdog();
-            self.lkg_tick(&snapshot);
+            // `ping_if_healthy` returning `true` only on `Some` is the
+            // whole point of the extraction below — safe to unwrap.
+            self.lkg_tick(
+                probe_result
+                    .as_ref()
+                    .expect("ping_if_healthy true implies Some"),
+            );
         } else {
             // A wedged engine starves the watchdog by design (spec
             // invariant #3) — NO ping — and any in-flight LKG candidate
@@ -1324,7 +1396,22 @@ impl Runner {
                     );
                 }
                 let source = self.lkg_candidate.as_ref().map_or("boot", |c| c.source);
-                match self.write_lkg(source) {
+                // F4 (TOCTOU re-read fix): `on_disk_matches` being true is
+                // the ONLY way to reach this arm (`should_promote`'s dirty
+                // check gates it — see the doc above), which guarantees
+                // `fresh_bytes` is `Some`. Reuse those already-read bytes
+                // instead of re-reading `config_path` a second time: a
+                // second read would race a concurrent edit landing in the
+                // gap between the dirty check above and the write below,
+                // silently promoting bytes that were never validated
+                // against the candidate at all. One read per tick, period.
+                let Some(bytes) = fresh_bytes.as_ref() else {
+                    // Unreachable given should_promote's contract (dirty
+                    // check requires Some on both sides), but fail closed
+                    // (retry next tick) rather than panic if it ever isn't.
+                    return;
+                };
+                match write_lkg(source, bytes) {
                     Ok(()) => {
                         tracing::info!(event = "lkg_saved");
                         self.lkg_defer_count = 0;
@@ -1344,26 +1431,26 @@ impl Runner {
             }
         }
     }
+}
 
-    /// Atomically copy the current config bytes to
-    /// `state_dir()/last-known-good.toml` + the `.meta.json` sidecar (spec
-    /// §3). Re-reads `self.config_path` fresh rather than reusing the
-    /// candidate's captured bytes — the dirty check above already proved
-    /// they match at this tick.
-    fn write_lkg(&self, source: &'static str) -> std::io::Result<()> {
-        let bytes = std::fs::read(&self.config_path)?;
-        let dir = dormant_core::paths::state_dir();
-        boot_guard::write_atomic_bytes(&dir, "last-known-good.toml", &bytes)?;
-        let meta = LkgMeta {
-            schema_version: 1,
-            fingerprint: boot_guard::fingerprint_bytes(&bytes),
-            saved_at_epoch_s: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-            source,
-        };
-        boot_guard::write_atomic_json(&dir, "last-known-good.meta.json", &meta)
-    }
+/// Atomically copy `bytes` (the config bytes the caller already read fresh
+/// for this tick's dirty check — F4: no second read here, closing the
+/// TOCTOU window a re-read would otherwise open) to
+/// `state_dir()/last-known-good.toml` + the `.meta.json` sidecar (spec §3).
+/// A free function, not a `Runner` method (`clippy::unused_self`): it needs
+/// nothing from `Runner` beyond the two arguments the caller already has.
+fn write_lkg(source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = dormant_core::paths::state_dir();
+    boot_guard::write_atomic_bytes(&dir, "last-known-good.toml", bytes)?;
+    let meta = LkgMeta {
+        schema_version: 1,
+        fingerprint: boot_guard::fingerprint_bytes(bytes),
+        saved_at_epoch_s: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        source,
+    };
+    boot_guard::write_atomic_json(&dir, "last-known-good.meta.json", &meta)
 }
 
 /// The watchdog probe (spec §6.3 F8): proves the engine drains its ctl
@@ -1373,6 +1460,29 @@ impl Runner {
 /// needing to wedge a real running engine.
 async fn watchdog_probe(ctl: &mpsc::Sender<ControlMsg>) -> Option<StateSnapshot> {
     request_snapshot(ctl).await
+}
+
+/// The probe→ping decision (spec §6.3 invariant #3, F3 reviewer finding
+/// m6: "ping even when the probe fails" must be impossible). Extracted as a
+/// free fn over a plain `&mut SdNotify` — not a `Runner` method — so a unit
+/// test can pin BOTH halves ("healthy probe → a `WATCHDOG=1` datagram is
+/// sent" AND "failed probe → no datagram, ever") against a real
+/// `UnixDatagram` receiver via [`SdNotify::from_socket_for_test`], without
+/// constructing a full `Runner` (which `watchdog_tick`'s cadence-stop
+/// behavior otherwise has no honest seam to reach from outside — closing
+/// the T4 review's m6 survivor).
+///
+/// Returns whether a ping was sent, so the caller (`watchdog_tick`) can
+/// gate its own healthy-path bookkeeping (clearing `probe_failed_warned`,
+/// running the LKG tick) on the SAME decision this function made, instead
+/// of re-deriving it from `probe_result` a second time.
+fn ping_if_healthy(sd: &mut SdNotify, probe_result: Option<&StateSnapshot>) -> bool {
+    if probe_result.is_some() {
+        sd.watchdog();
+        true
+    } else {
+        false
+    }
 }
 
 /// Reset an LKG candidate's window start on a failed engine probe (spec §4
@@ -2385,6 +2495,69 @@ mod watchdog_tests {
             }
         });
         assert!(watchdog_probe(&tx).await.is_some());
+    }
+
+    /// F3 (T4 review): pins the cadence-stop half of the probe→ping
+    /// decision that had no test — a closed ctl channel (probe fails) must
+    /// produce NO datagram on the wire, not just a `None` return value.
+    /// Uses the SAME `from_socket_for_test`/`UnixDatagram` seam the
+    /// `daemon_smoke` cadence test uses, at the unit level, so this doesn't
+    /// need a full `Runner`/`App`. This is also the re-kill test for
+    /// reviewer mutation m6 ("ping unconditionally, ignoring the probe
+    /// result") — see the report for the mutation re-application evidence.
+    #[test]
+    fn ping_if_healthy_sends_nothing_on_failed_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let addr = std::os::unix::net::SocketAddr::from_pathname(&path).unwrap();
+        let mut sd = SdNotify::from_socket_for_test(&addr);
+
+        let sent = ping_if_healthy(&mut sd, None);
+
+        assert!(
+            !sent,
+            "ping_if_healthy must report no ping on a failed probe"
+        );
+        let mut buf = [0u8; 64];
+        assert!(
+            listener.recv_from(&mut buf).is_err(),
+            "a failed probe must never put a WATCHDOG=1 datagram on the wire"
+        );
+    }
+
+    /// Companion to the failure-side pin above: a healthy probe result MUST
+    /// still ping (guards against an overcorrection that silences the
+    /// healthy path too).
+    #[test]
+    fn ping_if_healthy_sends_watchdog_on_healthy_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = std::os::unix::net::SocketAddr::from_pathname(&path).unwrap();
+        let mut sd = SdNotify::from_socket_for_test(&addr);
+
+        let snapshot = StateSnapshot {
+            sensors: Vec::new(),
+            zones: Vec::new(),
+            displays: Vec::new(),
+            pending_reload: None,
+        };
+        let sent = ping_if_healthy(&mut sd, Some(&snapshot));
+
+        assert!(
+            sent,
+            "ping_if_healthy must report a ping on a healthy probe"
+        );
+        let mut buf = [0u8; 64];
+        let (n, _) = listener.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"WATCHDOG=1");
     }
 
     /// Spec §4 F3: "any failed probe RESETS the candidate window" — the

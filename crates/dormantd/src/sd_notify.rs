@@ -64,7 +64,17 @@ mod linux_impl {
         /// Test seam (R2-M8): `NOTIFY_SOCKET` is process-global and races
         /// under concurrent test execution, so tests inject a target
         /// address directly instead of setting the env var.
-        #[cfg(test)]
+        ///
+        /// Gated on `any(test, feature = "test-util")` rather than bare
+        /// `cfg(test)` (T4 fix): an external integration test binary
+        /// (`tests/daemon_smoke.rs`) links the library WITHOUT `--cfg
+        /// test` — only the crate's OWN `cargo test` lib-unittest build
+        /// gets that cfg — so `cfg(test)` alone left this seam invisible
+        /// to `daemon_smoke`'s watchdog-ping-cadence tests. The `test-util`
+        /// feature is enabled only via `dormantd`'s own
+        /// `[dev-dependencies]` self-reference (Cargo.toml), never by a
+        /// production build.
+        #[cfg(any(test, feature = "test-util"))]
         #[must_use]
         pub fn from_socket_for_test(addr: &SocketAddr) -> Self {
             let Ok(sock) = UnixDatagram::unbound() else {

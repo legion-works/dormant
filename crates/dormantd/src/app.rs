@@ -43,9 +43,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
+
 use dormant_core::config::schema::{Config, Credentials, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_credentials, validate,
@@ -70,10 +72,11 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "render")]
 use dormant_render::LayerShellRenderSink;
 
+use crate::boot_guard::{self, PromoteVerdict};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
-use crate::sd_notify::SdNotify;
+use crate::sd_notify::{self, SdNotify};
 
 /// Builds the daemon-lifetime notification sink. Production defaults to
 /// [`notifier::ZbusSink`]; tests inject a factory returning a shared
@@ -199,6 +202,13 @@ pub struct App {
     notify_sink_builder: NotifySinkBuilder,
     disable_ipc: bool,
     sd_notify: SdNotify,
+    /// Test seam (T4): overrides the watchdog probe-arm's tick period,
+    /// otherwise `sd_notify::watchdog_interval_from_env().unwrap_or(30s)`
+    /// (spec §6.3). `WATCHDOG_USEC` is process-global and forbidden in
+    /// tests (Global Constraints), so a real cadence test needs a way to
+    /// shrink the tick period without touching env — mirrors
+    /// `with_sd_notify`'s injection shape.
+    watchdog_interval: Option<Duration>,
 }
 
 /// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
@@ -235,6 +245,7 @@ impl App {
             notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
             sd_notify: SdNotify::from_env(),
+            watchdog_interval: None,
         })
     }
 
@@ -264,6 +275,7 @@ impl App {
             notify_sink_builder: default_notify_sink_builder(),
             disable_ipc: false,
             sd_notify: SdNotify::from_env(),
+            watchdog_interval: None,
         })
     }
 
@@ -307,6 +319,18 @@ impl App {
     #[must_use]
     pub fn with_sd_notify(mut self, sd: SdNotify) -> Self {
         self.sd_notify = sd;
+        self
+    }
+
+    /// Override the watchdog probe-arm's tick period (test seam — spec
+    /// §6.3). Production leaves this unset and `Runner` falls back to
+    /// `sd_notify::watchdog_interval_from_env().unwrap_or(30s)`; a cadence
+    /// test that needs a short LKG `stability_window` to elapse inside the
+    /// gate's real-time budget calls this instead of touching the
+    /// process-global `WATCHDOG_USEC` (forbidden in tests).
+    #[must_use]
+    pub fn with_watchdog_interval(mut self, interval: Duration) -> Self {
+        self.watchdog_interval = Some(interval);
         self
     }
 
@@ -490,15 +514,20 @@ impl App {
         let watcher =
             reload::config_watcher(&self.config_path).context("install config file watcher")?;
 
-        // T4 threads `self.sd_notify` into `Runner` as a `sd: SdNotify`
-        // field (spec §6.3 probe arm + in-reload pings). T2 only lands the
-        // injectable seam (`with_sd_notify` above) — an unused `Runner`
-        // field would trip `-D warnings` dead-code (this crate has no
-        // `#[allow(dead_code)]` precedent to reach for instead), so it is
-        // intentionally dropped here rather than staged unused; T4's diff
-        // adds one `Runner` field + moves this line into the struct
-        // literal.
-        drop(self.sd_notify);
+        // The watchdog probe-arm's tick period (spec §6.3): captured ONCE
+        // here so a mid-run env change never re-times the interval arm.
+        // Production reads `WATCHDOG_USEC` (halved by `sd_notify`) or falls
+        // back to 30s; `with_watchdog_interval` overrides for tests.
+        let watchdog_interval = self.watchdog_interval.unwrap_or_else(|| {
+            sd_notify::watchdog_interval_from_env().unwrap_or(Duration::from_secs(30))
+        });
+
+        // The first LKG candidate tracks this boot's generation (spec §4
+        // Mechanism: "set at startup completion"). `None` when
+        // `watchdog.lkg_enabled` is false — no candidate tracking, no
+        // files written, ever, until the config re-enables it on a reload.
+        let lkg_candidate =
+            new_lkg_candidate(&self.config_path, cfg_clone.watchdog.lkg_enabled, "boot");
 
         let runner = Runner {
             config_path: self.config_path.clone(),
@@ -520,6 +549,11 @@ impl App {
             panel_locks,
             notify_state,
             notify_sink,
+            sd: self.sd_notify,
+            watchdog_interval,
+            lkg_candidate,
+            lkg_defer_count: 0,
+            probe_failed_warned: false,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -739,6 +773,81 @@ struct Runner {
     /// Daemon-lifetime notification sink, constructed once in
     /// [`App::start`] and threaded unchanged into every generation.
     notify_sink: Arc<dyn NotifySink>,
+    /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
+    /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
+    sd: SdNotify,
+    /// The probe arm's tick period (spec §6.3), captured once at
+    /// construction — see [`App::with_watchdog_interval`].
+    watchdog_interval: Duration,
+    /// The in-flight LKG promotion candidate (spec §4), or `None` when
+    /// `watchdog.lkg_enabled` is false (no candidate tracking at all) or no
+    /// candidate has been armed yet. Set at startup and at every successful
+    /// reload; cleared on a successful promotion write.
+    lkg_candidate: Option<LkgCandidate>,
+    /// Consecutive display-health-deferred promotion ticks (spec §4 R2-M3
+    /// starvation cap; R3-M2: counts ANY unhealthy set, not just a fixed
+    /// one — see [`boot_guard::should_promote`]). Reset on a successful
+    /// promotion or a fully-healthy candidate tick.
+    lkg_defer_count: u32,
+    /// Whether `watchdog_probe_failed` has already been logged for the
+    /// CURRENT run of consecutive probe failures (spec §6.3: warn once per
+    /// failure streak, not once per failed tick).
+    probe_failed_warned: bool,
+}
+
+/// One LKG promotion candidate (spec §4 Mechanism): the config bytes
+/// captured when the generation this candidate tracks became live, and the
+/// wall-clock instant it started running. `bytes` is the "candidate copy"
+/// spec §4 point 2 compares fresh reads of the live config path against, to
+/// detect an un-applied direct edit sitting on disk (`lkg_skipped_dirty`).
+struct LkgCandidate {
+    bytes: Vec<u8>,
+    since: Instant,
+    /// Where this candidate's generation came from — carried into the
+    /// `.meta.json` sidecar's `source` field on promotion (spec §3:
+    /// `"boot"|"reload"`).
+    source: &'static str,
+    /// One-shot log latches (spec §4: several promotion-gate events are
+    /// "warn once per candidate", not once per tick).
+    dirty_logged: bool,
+    health_deferred_logged: bool,
+    save_failed_logged: bool,
+}
+
+/// Build the initial (or post-reload) LKG candidate for `config_path`, or
+/// `None` when `lkg_enabled` is false (spec §4 failure semantics: "no
+/// candidate tracking, no files written" — the gate is checked ONCE here,
+/// not re-checked every tick, so a mid-run config edit that disables
+/// tracking only takes effect at the next reload, matching how every other
+/// `Runner` field derived from `self.generation.cfg` behaves).
+fn new_lkg_candidate(
+    config_path: &std::path::Path,
+    lkg_enabled: bool,
+    source: &'static str,
+) -> Option<LkgCandidate> {
+    if !lkg_enabled {
+        return None;
+    }
+    let bytes = std::fs::read(config_path).ok()?;
+    Some(LkgCandidate {
+        bytes,
+        since: Instant::now(),
+        source,
+        dirty_logged: false,
+        health_deferred_logged: false,
+        save_failed_logged: false,
+    })
+}
+
+/// `last-known-good.meta.json` sidecar shape (spec §3 — advisory only; the
+/// LKG file itself is the source of truth, loaded directly via
+/// `load_config`).
+#[derive(Serialize)]
+struct LkgMeta {
+    schema_version: u32,
+    fingerprint: boot_guard::Fingerprint,
+    saved_at_epoch_s: u64,
+    source: &'static str,
 }
 
 impl Runner {
@@ -881,6 +990,12 @@ impl Runner {
         // executors (skips its round) rather than a stale/dying one.
         self.executors_tx.send_replace(Arc::new(HashMap::new()));
 
+        // Step-boundary ping 1/5 (spec §6.3 F5): the serial controller
+        // probes inside `load_and_assemble` and the quiesce loop above can
+        // legitimately run long; ping once more right before the teardown +
+        // verified-wake work below so that gap alone is bounded.
+        self.ping("before_teardown");
+
         teardown(&mut self.generation).await;
 
         // Verified physical wake of REMOVED displays (no executor in the new
@@ -893,11 +1008,22 @@ impl Runner {
                     let detail =
                         format!("removed display '{display_id}' failed verified wake: {e}");
                     tracing::error!(event = "config_reload_rejected", detail = %detail);
+                    // Step-boundary ping 3/5 (spec §6.3/P10): before the
+                    // `rebuild_old` recovery rebuild (`spawn_generation` +
+                    // engine construction, controllers reused — not a
+                    // controller reprobe, but still non-trivial work).
+                    self.ping("before_rebuild_old_wake_failure");
                     self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
                     let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
                     return;
                 }
                 tracing::info!(event = "reload_removed_display_woken", display = %display_id);
+                // Step-boundary ping 2/5 (spec §6.3 F5/R2-M5): one ping PER
+                // removed display inside this loop — the serial verified-wake
+                // burst is unbounded in display count, so bounding every gap
+                // at one display's worst-case burst requires a ping here,
+                // not just before/after the whole loop.
+                self.ping("removed_display_wake");
             }
         }
 
@@ -969,11 +1095,35 @@ impl Runner {
                 self.config_tx.send_replace(Arc::new(new_cfg));
                 self.creds_tx.send_replace(Arc::new(new_creds));
                 tracing::info!(event = "config_reloaded");
+                // New generation, new LKG candidate (spec §4: "cleared/reset
+                // by any reload" — a reload restarts the stability window
+                // for the NEW config). `watchdog.lkg_enabled` is read from
+                // the just-installed config, so a reload can also arm
+                // tracking that was off before.
+                self.lkg_defer_count = 0;
+                self.lkg_candidate = new_lkg_candidate(
+                    &self.config_path,
+                    self.generation.cfg.watchdog.lkg_enabled,
+                    "reload",
+                );
+                // Step-boundary ping 5/5 (spec §6.3): reload end. Fires
+                // BEFORE the reload-outcome broadcast (not after): on the
+                // real multi-threaded runtime a receiver parked on
+                // `subscribe_reload()` can wake and run in TRUE PARALLEL
+                // with the rest of this function the instant `send` is
+                // called, so anything after `send` races an observer that
+                // reacts to the outcome — the ping must be fully visible
+                // BEFORE the outcome is, not after.
+                self.ping("reload_end");
                 let _ = self.reload_tx.send(ReloadOutcome::Reloaded);
             }
             Err(e) => {
                 let detail = format!("rebuild from new config failed: {e}");
                 tracing::error!(event = "config_reload_rejected", detail = %detail);
+                // Step-boundary ping 4/5 (spec §6.3/P10): before the second
+                // `rebuild_old` call site (the accepted-config
+                // `spawn_generation` failure path).
+                self.ping("before_rebuild_old_spawn_failure");
                 self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
                 let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
             }
@@ -1077,6 +1227,163 @@ impl Runner {
             Err(e) => tracing::error!(event = "reload_rebuild_old_failed", error = %e),
         }
     }
+
+    /// Send `WATCHDOG=1` and log a `step`-tagged marker (test/ops
+    /// observability — `sd_notify::watchdog`'s wire payload is always the
+    /// literal `WATCHDOG=1`; the `step` field is how tests and journal
+    /// readers tell the five in-reload boundaries apart, spec §6.3/P9).
+    /// Info level (not debug): `reload()` boundaries fire at most a handful
+    /// of times per reload, not per periodic tick, so the volume is the
+    /// same order as the `reload_*` events already logged at info here.
+    fn ping(&mut self, step: &'static str) {
+        self.sd.watchdog();
+        tracing::info!(event = "watchdog_ping", step = %step);
+    }
+
+    /// The watchdog probe-arm tick (spec §6.3): probe the engine via the
+    /// SAME `request_snapshot` idiom `reload()` uses, ping only on success,
+    /// and run the §4 LKG-promotion check on every healthy tick.
+    async fn watchdog_tick(&mut self) {
+        let ctl = self.engine_ctl.borrow().clone();
+        if let Some(snapshot) = watchdog_probe(&ctl).await {
+            self.probe_failed_warned = false;
+            self.sd.watchdog();
+            self.lkg_tick(&snapshot);
+        } else {
+            // A wedged engine starves the watchdog by design (spec
+            // invariant #3) — NO ping — and any in-flight LKG candidate
+            // loses its unbroken-healthy-window claim (spec F3).
+            reset_candidate_on_probe_failure(&mut self.lkg_candidate, Instant::now());
+            if !self.probe_failed_warned {
+                tracing::warn!(
+                    event = "watchdog_probe_failed",
+                    "engine did not answer a snapshot round-trip; watchdog ping withheld"
+                );
+                self.probe_failed_warned = true;
+            }
+        }
+    }
+
+    /// The §4 LKG-promotion check, run on every healthy probe tick. A
+    /// `None` candidate (disabled, or none armed yet) is a no-op — spec
+    /// §4 failure semantics: `lkg_enabled = false` means no candidate
+    /// tracking, no files, ever.
+    fn lkg_tick(&mut self, snapshot: &StateSnapshot) {
+        let Some(since) = self.lkg_candidate.as_ref().map(|c| c.since) else {
+            return;
+        };
+        let window = self.generation.cfg.watchdog.stability_window;
+        // Read fresh, THEN compare — kept as two owned values (not a
+        // borrow held across the match below) so the verdict handlers are
+        // free to take `&mut self.lkg_candidate`/`&self` without conflict.
+        let fresh_bytes = std::fs::read(&self.config_path).ok();
+        let on_disk_matches = matches!(
+            (&fresh_bytes, self.lkg_candidate.as_ref()),
+            (Some(b), Some(c)) if *b == c.bytes
+        );
+
+        let verdict = boot_guard::should_promote(
+            since,
+            Instant::now(),
+            window,
+            snapshot,
+            self.lkg_defer_count,
+            on_disk_matches,
+        );
+
+        match verdict {
+            PromoteVerdict::Wait => {}
+            PromoteVerdict::DeferHealth => {
+                self.lkg_defer_count += 1;
+                if let Some(candidate) = self.lkg_candidate.as_mut()
+                    && !candidate.health_deferred_logged
+                {
+                    tracing::warn!(
+                        event = "lkg_deferred_display_health",
+                        "LKG promotion deferred: at least one display's controllers are all unhealthy"
+                    );
+                    candidate.health_deferred_logged = true;
+                }
+            }
+            PromoteVerdict::SkipDirty => {
+                if let Some(candidate) = self.lkg_candidate.as_mut()
+                    && !candidate.dirty_logged
+                {
+                    tracing::warn!(
+                        event = "lkg_skipped_dirty",
+                        "LKG promotion skipped: on-disk config no longer matches the running candidate"
+                    );
+                    candidate.dirty_logged = true;
+                }
+            }
+            PromoteVerdict::Promote | PromoteVerdict::PromoteDespiteHealth => {
+                if verdict == PromoteVerdict::PromoteDespiteHealth {
+                    tracing::warn!(
+                        event = "lkg_promoted_with_unhealthy_display",
+                        "LKG promoted despite an unhealthy display: deferral cap reached"
+                    );
+                }
+                let source = self.lkg_candidate.as_ref().map_or("boot", |c| c.source);
+                match self.write_lkg(source) {
+                    Ok(()) => {
+                        tracing::info!(event = "lkg_saved");
+                        self.lkg_defer_count = 0;
+                        self.lkg_candidate = None;
+                    }
+                    Err(e) => {
+                        if let Some(candidate) = self.lkg_candidate.as_mut()
+                            && !candidate.save_failed_logged
+                        {
+                            tracing::warn!(event = "lkg_save_failed", error = %e);
+                            candidate.save_failed_logged = true;
+                        }
+                        // Retry next tick (spec §4 failure semantics) —
+                        // candidate stays armed, `since` untouched.
+                    }
+                }
+            }
+        }
+    }
+
+    /// Atomically copy the current config bytes to
+    /// `state_dir()/last-known-good.toml` + the `.meta.json` sidecar (spec
+    /// §3). Re-reads `self.config_path` fresh rather than reusing the
+    /// candidate's captured bytes — the dirty check above already proved
+    /// they match at this tick.
+    fn write_lkg(&self, source: &'static str) -> std::io::Result<()> {
+        let bytes = std::fs::read(&self.config_path)?;
+        let dir = dormant_core::paths::state_dir();
+        boot_guard::write_atomic_bytes(&dir, "last-known-good.toml", &bytes)?;
+        let meta = LkgMeta {
+            schema_version: 1,
+            fingerprint: boot_guard::fingerprint_bytes(&bytes),
+            saved_at_epoch_s: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            source,
+        };
+        boot_guard::write_atomic_json(&dir, "last-known-good.meta.json", &meta)
+    }
+}
+
+/// The watchdog probe (spec §6.3 F8): proves the engine drains its ctl
+/// mailbox via the SAME `request_snapshot` idiom `reload()` uses. Extracted
+/// as a plain function taking the ctl sender — not a `Runner` method — so a
+/// test can hand it a manufactured closed channel directly (P11) without
+/// needing to wedge a real running engine.
+async fn watchdog_probe(ctl: &mpsc::Sender<ControlMsg>) -> Option<StateSnapshot> {
+    request_snapshot(ctl).await
+}
+
+/// Reset an LKG candidate's window start on a failed engine probe (spec §4
+/// F3: "any failed probe RESETS the candidate window"). Factored out of
+/// [`Runner::watchdog_tick`] so the reset rule is unit-testable without a
+/// full `Runner`/`App` — the reset is explicitly the CALLER's job, not
+/// `should_promote`'s (spec's pure gate only ever sees an unbroken window).
+fn reset_candidate_on_probe_failure(candidate: &mut Option<LkgCandidate>, now: Instant) {
+    if let Some(c) = candidate.as_mut() {
+        c.since = now;
+    }
 }
 
 /// The run loop: reload triggers (watcher / SIGHUP / IPC) and shutdown
@@ -1090,6 +1397,14 @@ async fn run_loop(
     mut watcher: reload::ConfigWatcher,
     mut reload_trigger: mpsc::Receiver<()>,
 ) {
+    // The watchdog probe arm (spec §6.3): a plain interval, period captured
+    // once at `Runner` construction (`App::start`/`with_watchdog_interval`).
+    // Runs on BOTH platform branches below — on non-Unix the tick still
+    // drives §4 LKG promotion even though `sd.watchdog()` itself is a
+    // permanent no-op there (no `NOTIFY_SOCKET` concept off Linux).
+    let mut watchdog_ticker = tokio::time::interval(runner.watchdog_interval);
+    watchdog_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1129,6 +1444,9 @@ async fn run_loop(
                     debounce(&mut watcher, window).await;
                     runner.reload().await;
                 }
+                _ = watchdog_ticker.tick() => {
+                    runner.watchdog_tick().await;
+                }
             }
         }
     }
@@ -1156,6 +1474,9 @@ async fn run_loop(
                     let window = runner.generation.cfg.daemon.reload_debounce;
                     debounce(&mut watcher, window).await;
                     runner.reload().await;
+                }
+                _ = watchdog_ticker.tick() => {
+                    runner.watchdog_tick().await;
                 }
             }
         }
@@ -2032,6 +2353,92 @@ fn classify_transient(phase: &str, ruleless: bool) -> TransientClass {
         ("blanking", true) => TransientClass::Quiesce,
         ("blanked" | "waking", true) => TransientClass::RestoreDirect,
         _ => TransientClass::Ignore,
+    }
+}
+
+// ── Watchdog probe arm + LKG candidate reset (T4) ───────────────────────────
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    /// P11: the probe fn takes the ctl sender directly, so a test can hand
+    /// it a manufactured closed channel without wedging a real engine.
+    #[tokio::test]
+    async fn probe_returns_none_on_closed_ctl_channel() {
+        let (tx, rx) = mpsc::channel::<ControlMsg>(1);
+        drop(rx);
+        assert!(watchdog_probe(&tx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_returns_snapshot_on_live_channel() {
+        let (tx, mut rx) = mpsc::channel::<ControlMsg>(1);
+        tokio::spawn(async move {
+            if let Some(ControlMsg::Snapshot(reply)) = rx.recv().await {
+                let _ = reply.send(StateSnapshot {
+                    sensors: Vec::new(),
+                    zones: Vec::new(),
+                    displays: Vec::new(),
+                    pending_reload: None,
+                });
+            }
+        });
+        assert!(watchdog_probe(&tx).await.is_some());
+    }
+
+    /// Spec §4 F3: "any failed probe RESETS the candidate window" — the
+    /// reset is the CALLER's job (`watchdog_tick`), not `should_promote`'s;
+    /// this pins that the extracted reset helper actually advances `since`.
+    #[test]
+    fn failed_probe_resets_candidate_since() {
+        let far_past = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
+        let mut candidate = Some(LkgCandidate {
+            bytes: vec![1, 2, 3],
+            since: far_past,
+            source: "boot",
+            dirty_logged: false,
+            health_deferred_logged: false,
+            save_failed_logged: false,
+        });
+
+        let now = Instant::now();
+        reset_candidate_on_probe_failure(&mut candidate, now);
+
+        assert_eq!(
+            candidate.unwrap().since,
+            now,
+            "since must be reset to `now`"
+        );
+    }
+
+    #[test]
+    fn failed_probe_reset_is_noop_on_no_candidate() {
+        let mut candidate: Option<LkgCandidate> = None;
+        // Must not panic when no candidate is armed (lkg_enabled = false,
+        // or none set yet).
+        reset_candidate_on_probe_failure(&mut candidate, Instant::now());
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn new_lkg_candidate_disabled_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"config_version = 1\n").unwrap();
+        assert!(new_lkg_candidate(&path, false, "boot").is_none());
+    }
+
+    #[test]
+    fn new_lkg_candidate_enabled_captures_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"config_version = 1\nx = 1\n").unwrap();
+        let candidate = new_lkg_candidate(&path, true, "reload").expect("candidate armed");
+        assert_eq!(candidate.bytes, b"config_version = 1\nx = 1\n");
+        assert_eq!(candidate.source, "reload");
     }
 }
 

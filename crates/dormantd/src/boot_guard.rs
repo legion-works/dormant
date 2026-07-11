@@ -30,9 +30,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dormant_core::config::{Strictness, load_config};
+use dormant_core::rules::StateSnapshot;
 use serde::{Deserialize, Serialize};
 
 /// Non-discounted starts, within [`CRASH_LOOP_WINDOW`], sharing the current
@@ -608,6 +609,90 @@ fn files_bytes_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+// ── LKG promotion gate (T4, spec §4) ────────────────────────────────────
+
+/// The pure result of one [`should_promote`] call (spec §4 Mechanism).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PromoteVerdict {
+    /// The stability window has not elapsed since the candidate started.
+    Wait,
+    /// Window elapsed, display health proven (or unproven-but-not-failing),
+    /// on-disk bytes match the candidate — write the LKG.
+    Promote,
+    /// Window elapsed and healthy, but the on-disk config no longer matches
+    /// the candidate (an un-applied direct edit is sitting there) — skip
+    /// this tick, never promote unproven bytes (spec invariant #6).
+    SkipDirty,
+    /// Window elapsed, but at least one display has a non-empty
+    /// [`dormant_core::rules::ControllerHealth`] set with every row
+    /// unhealthy, and the consecutive-defer count is still below
+    /// [`LKG_HEALTH_DEFER_CAP`] — hold off, re-check next tick.
+    DeferHealth,
+    /// Same all-unhealthy-display condition as `DeferHealth`, but the defer
+    /// cap has been reached — promote anyway (an imperfect LKG beats none,
+    /// spec R2-M3) unless the dirty check overrides it (`SkipDirty` still
+    /// wins — invariant #6 outranks the starvation cap).
+    PromoteDespiteHealth,
+}
+
+/// Pure LKG promotion gate (spec §4 Mechanism, points 1-2; R2-M3's
+/// starvation cap; R3-M2's any-set accumulation).
+///
+/// Evaluation order:
+/// 1. `now - since < window` → [`PromoteVerdict::Wait`] (no health/dirty
+///    checks yet — an unbroken healthy window is a wall-clock precondition,
+///    not something the display-health gate can shortcut).
+/// 2. Display-health gate (spec F4): a display counts as "all-unhealthy"
+///    only when its `controllers` vector is NON-EMPTY and every row is
+///    unhealthy — a display never commanded during the window (empty
+///    health) is unproven, not failing, and NEVER defers (spec's honest
+///    limit, documented, not a bug). If any display is all-unhealthy:
+///    - `defer_count < LKG_HEALTH_DEFER_CAP` → [`PromoteVerdict::DeferHealth`]
+///      (the caller increments its counter; R3-M2: this function takes only
+///      a bare count, never a per-set counter, so DIFFERENT unhealthy sets
+///      across ticks accumulate identically to the same set repeating — the
+///      starvation cap cannot be reset by a fluctuating set by construction).
+///    - `defer_count >= LKG_HEALTH_DEFER_CAP` → proceeds to the dirty check
+///      below instead of deferring again (an imperfect LKG beats none).
+/// 3. Dirty check (spec invariant #6, outranks the health cap): on-disk
+///    bytes no longer equal to the candidate's captured bytes →
+///    [`PromoteVerdict::SkipDirty`].
+/// 4. Otherwise: [`PromoteVerdict::Promote`], or
+///    [`PromoteVerdict::PromoteDespiteHealth`] if the health gate was
+///    overridden by the cap in step 2.
+#[must_use]
+pub fn should_promote(
+    since: Instant,
+    now: Instant,
+    window: Duration,
+    snapshot: &StateSnapshot,
+    defer_count: u32,
+    on_disk_matches: bool,
+) -> PromoteVerdict {
+    if now.saturating_duration_since(since) < window {
+        return PromoteVerdict::Wait;
+    }
+
+    let any_all_unhealthy = snapshot
+        .displays
+        .iter()
+        .any(|(_, d)| !d.controllers.is_empty() && d.controllers.iter().all(|c| !c.healthy));
+
+    if any_all_unhealthy && defer_count < LKG_HEALTH_DEFER_CAP {
+        return PromoteVerdict::DeferHealth;
+    }
+
+    if !on_disk_matches {
+        return PromoteVerdict::SkipDirty;
+    }
+
+    if any_all_unhealthy {
+        PromoteVerdict::PromoteDespiteHealth
+    } else {
+        PromoteVerdict::Promote
+    }
+}
+
 fn now_epoch_s() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -735,7 +820,23 @@ fn epoch_s_of(meta: &std::fs::Metadata) -> Option<u64> {
 
 /// Atomically write `value` as JSON to `<dir>/<filename>` (temp file, same
 /// dir, then rename). Directory `0o700`, file `0o600` on Unix.
-fn write_atomic_json<T: Serialize>(dir: &Path, filename: &str, value: &T) -> std::io::Result<()> {
+pub(crate) fn write_atomic_json<T: Serialize>(
+    dir: &Path,
+    filename: &str,
+    value: &T,
+) -> std::io::Result<()> {
+    let raw = serde_json::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_atomic_bytes(dir, filename, raw.as_bytes())
+}
+
+/// Atomically write raw `bytes` to `<dir>/<filename>` (temp file, same dir,
+/// then rename). Directory `0o700`, file `0o600` on Unix. `pub(crate)` so
+/// T4's LKG-promotion writer (`app.rs`) can reuse the same atomic-write
+/// primitive for `last-known-good.toml` (a verbatim config-byte copy, not
+/// JSON) that `write_atomic_json` already uses for `crash-loop.json` and
+/// the `.meta.json` sidecar.
+pub(crate) fn write_atomic_bytes(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     std::fs::create_dir_all(dir)?;
@@ -744,9 +845,6 @@ fn write_atomic_json<T: Serialize>(dir: &Path, filename: &str, value: &T) -> std
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
-
-    let raw = serde_json::to_string_pretty(value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let final_path = dir.join(filename);
     let tmp_path = dir.join(format!("{filename}.tmp"));
@@ -757,7 +855,7 @@ fn write_atomic_json<T: Serialize>(dir: &Path, filename: &str, value: &T) -> std
             use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
         }
-        f.write_all(raw.as_bytes())?;
+        f.write_all(bytes)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp_path, &final_path)?;
@@ -1391,5 +1489,207 @@ mod tests {
             plan.chosen_config, config,
             "discounted start must not trigger rollback"
         );
+    }
+}
+
+// ── should_promote matrix (T4, spec §4) ─────────────────────────────────
+
+#[cfg(test)]
+mod promote_tests {
+    use super::*;
+    use dormant_core::rules::{ControllerHealth, ControllerRole, DisplaySnapshot};
+
+    fn healthy_ctl(name: &str) -> ControllerHealth {
+        ControllerHealth {
+            name: name.to_string(),
+            role: ControllerRole::Primary,
+            healthy: true,
+            detail: None,
+        }
+    }
+
+    fn unhealthy_ctl(name: &str) -> ControllerHealth {
+        ControllerHealth {
+            name: name.to_string(),
+            role: ControllerRole::Primary,
+            healthy: false,
+            detail: Some("wedged".to_string()),
+        }
+    }
+
+    fn display(phase: &str, controllers: Vec<ControllerHealth>) -> DisplaySnapshot {
+        DisplaySnapshot {
+            phase: phase.to_string(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            controllers,
+            wake_attempts: 0,
+            last_blank_failed: false,
+            stage: None,
+        }
+    }
+
+    fn snap(displays: Vec<(&str, DisplaySnapshot)>) -> StateSnapshot {
+        StateSnapshot {
+            sensors: Vec::new(),
+            zones: Vec::new(),
+            displays: displays
+                .into_iter()
+                .map(|(id, d)| (id.to_string(), d))
+                .collect(),
+            pending_reload: None,
+        }
+    }
+
+    fn all_healthy_snap() -> StateSnapshot {
+        snap(vec![(
+            "mon",
+            display("active", vec![healthy_ctl("command")]),
+        )])
+    }
+
+    const WINDOW: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn window_not_elapsed_waits() {
+        let since = Instant::now();
+        let now = since + Duration::from_secs(10);
+        let v = should_promote(since, now, WINDOW, &all_healthy_snap(), 0, true);
+        assert_eq!(v, PromoteVerdict::Wait);
+    }
+
+    #[test]
+    fn elapsed_healthy_clean_promotes() {
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let v = should_promote(since, now, WINDOW, &all_healthy_snap(), 0, true);
+        assert_eq!(v, PromoteVerdict::Promote);
+    }
+
+    #[test]
+    fn elapsed_healthy_dirty_skips() {
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let v = should_promote(since, now, WINDOW, &all_healthy_snap(), 0, false);
+        assert_eq!(v, PromoteVerdict::SkipDirty);
+    }
+
+    #[test]
+    fn all_unhealthy_display_defers_below_cap() {
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let unhealthy = snap(vec![(
+            "mon",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+        for defer_count in 0..LKG_HEALTH_DEFER_CAP {
+            let v = should_promote(since, now, WINDOW, &unhealthy, defer_count, true);
+            assert_eq!(
+                v,
+                PromoteVerdict::DeferHealth,
+                "defer_count={defer_count} must still defer"
+            );
+        }
+    }
+
+    #[test]
+    fn all_unhealthy_display_promotes_despite_health_at_cap() {
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let unhealthy = snap(vec![(
+            "mon",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+        let v = should_promote(since, now, WINDOW, &unhealthy, LKG_HEALTH_DEFER_CAP, true);
+        assert_eq!(v, PromoteVerdict::PromoteDespiteHealth);
+    }
+
+    #[test]
+    fn dirty_check_still_wins_at_cap() {
+        // Invariant #6 (never promote unproven bytes) outranks the
+        // starvation cap — a dirty on-disk edit still skips even once the
+        // defer cap has been reached.
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let unhealthy = snap(vec![(
+            "mon",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+        let v = should_promote(since, now, WINDOW, &unhealthy, LKG_HEALTH_DEFER_CAP, false);
+        assert_eq!(v, PromoteVerdict::SkipDirty);
+    }
+
+    #[test]
+    fn different_unhealthy_sets_accumulate_identically_r3_m2() {
+        // R3-M2: the deferral cap counts ANY consecutive deferred
+        // candidates regardless of WHICH display(s) are unhealthy each
+        // time. `should_promote` takes only a bare `defer_count` — never a
+        // per-set counter — so calling it with a DIFFERENT unhealthy
+        // display each time must still defer/promote on the exact same
+        // schedule as a fixed set would (a same-set-only counter would be
+        // the RED trap this pins against).
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let set_a = snap(vec![(
+            "a",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+        let set_b = snap(vec![(
+            "b",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+        let set_c = snap(vec![(
+            "c",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+
+        assert_eq!(
+            should_promote(since, now, WINDOW, &set_a, 0, true),
+            PromoteVerdict::DeferHealth
+        );
+        assert_eq!(
+            should_promote(since, now, WINDOW, &set_b, 1, true),
+            PromoteVerdict::DeferHealth
+        );
+        assert_eq!(
+            should_promote(since, now, WINDOW, &set_c, 2, true),
+            PromoteVerdict::DeferHealth
+        );
+        // 4th distinct set, defer_count now at the cap -> promotes anyway.
+        let set_d = snap(vec![(
+            "d",
+            display("active", vec![unhealthy_ctl("command")]),
+        )]);
+        assert_eq!(
+            should_promote(since, now, WINDOW, &set_d, LKG_HEALTH_DEFER_CAP, true),
+            PromoteVerdict::PromoteDespiteHealth
+        );
+    }
+
+    #[test]
+    fn empty_health_display_never_defers() {
+        // A display never commanded during the window has an empty
+        // `controllers` vec — unproven, not failing; must never defer.
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let unproven = snap(vec![("mon", display("active", Vec::new()))]);
+        let v = should_promote(since, now, WINDOW, &unproven, 0, true);
+        assert_eq!(v, PromoteVerdict::Promote);
+    }
+
+    #[test]
+    fn mixed_proven_and_unproven_only_proven_can_defer() {
+        // One display fully healthy, one empty (unproven), one all-
+        // unhealthy: the all-unhealthy one alone must still defer.
+        let since = Instant::now();
+        let now = since + WINDOW + Duration::from_secs(1);
+        let mixed = snap(vec![
+            ("ok", display("active", vec![healthy_ctl("command")])),
+            ("unproven", display("active", Vec::new())),
+            ("bad", display("active", vec![unhealthy_ctl("command")])),
+        ]);
+        let v = should_promote(since, now, WINDOW, &mixed, 0, true);
+        assert_eq!(v, PromoteVerdict::DeferHealth);
     }
 }

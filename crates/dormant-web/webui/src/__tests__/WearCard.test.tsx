@@ -89,6 +89,7 @@ function sample(overrides: Partial<WearListResponse["displays"][number]> = {}): 
         last_sample_at_epoch_s: NOW,
         last_long_dwell_epoch_s: NOW - 600, // 10 minutes ago
         advisory: false,
+        hours_since_long_dwell: 0,
         ...overrides,
       },
     ],
@@ -133,7 +134,11 @@ describe("WearCard", () => {
 
   it("shows the advisory line worded exactly 'no long standby window in N days' when the fetch reports advisory=true", async () => {
     mocks.getWear.mockResolvedValue(
-      sample({ advisory: true, last_long_dwell_epoch_s: NOW - 4 * 86400 }),
+      sample({
+        advisory: true,
+        last_long_dwell_epoch_s: NOW - 4 * 86400,
+        hours_since_long_dwell: 4 * 24,
+      }),
     );
 
     render(
@@ -145,6 +150,32 @@ describe("WearCard", () => {
     await waitFor(() => {
       expect(screen.getByText(/no long standby window in 4 days/)).toBeInTheDocument();
     });
+  });
+
+  it("shows a real day count (not '?') when advisory=true but no long dwell has ever been observed (baseline-only)", async () => {
+    // T8 review Should-fix: the baseline-only case (a display that has
+    // never had an observed long dwell — the common first-load case)
+    // must still render a real day count derived from
+    // `hours_since_long_dwell` (server-computed from
+    // `advisory_baseline_epoch_s`), not fall back to "?".
+    mocks.getWear.mockResolvedValue(
+      sample({
+        advisory: true,
+        last_long_dwell_epoch_s: null,
+        hours_since_long_dwell: 5 * 24,
+      }),
+    );
+
+    render(
+      <LiveStateProvider>
+        <WearCard />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/no long standby window in 5 days/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/no long standby window in \? days/)).toBeNull();
   });
 
   it("compensation_advisory WS event nudges the advisory banner into view", async () => {

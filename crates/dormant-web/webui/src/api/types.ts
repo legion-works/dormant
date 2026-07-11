@@ -471,6 +471,15 @@ export interface WearSummary {
   last_sample_at_epoch_s?: number | null;
   last_long_dwell_epoch_s?: number | null;
   advisory: boolean;
+  /**
+   * Hours since `max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)` —
+   * the same derivation the tracker uses for
+   * `CompensationAdvisoryEvent.hours_since_long_dwell`. Always a real
+   * number, even when `last_long_dwell_epoch_s` is null (no long dwell
+   * observed yet — the common first-load case), so the client never has
+   * to render a "?" day count.
+   */
+  hours_since_long_dwell: number;
 }
 
 /** rust: routes/wear.rs — `GET /api/wear` response envelope. */

@@ -26,12 +26,6 @@ function minutesAgoLabel(epochS: number | null | undefined): string {
   return `${mins} min ago`;
 }
 
-/** Whole days elapsed since an epoch-seconds timestamp, or null if unknown. */
-function daysSince(epochS: number | null | undefined): number | null {
-  if (epochS == null) return null;
-  return Math.max(0, Math.floor((Date.now() / 1000 - epochS) / 86400));
-}
-
 interface WearRowProps {
   summary: WearSummary;
   /** `compensation_advisory` WS nudge: hours since long-dwell, if any arrived. */
@@ -40,10 +34,12 @@ interface WearRowProps {
 
 function WearRow({ summary, advisoryHoursNudge }: WearRowProps) {
   const advisory = summary.advisory || advisoryHoursNudge !== undefined;
-  const days =
-    advisoryHoursNudge !== undefined
-      ? Math.floor(advisoryHoursNudge / 24)
-      : daysSince(summary.last_long_dwell_epoch_s);
+  // `hours_since_long_dwell` is server-derived from
+  // `max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)` (T8 review
+  // Should-fix) — always a real number, even for a display that has never
+  // had an observed long dwell yet (baseline-only, the common first-load
+  // case), so this never falls back to a "?" day count.
+  const days = Math.floor((advisoryHoursNudge ?? summary.hours_since_long_dwell) / 24);
 
   return (
     <div className="wear-row" data-testid={`wear-row-${summary.display}`}>
@@ -59,9 +55,7 @@ function WearRow({ summary, advisoryHoursNudge }: WearRowProps) {
         <span>last long-dwell {minutesAgoLabel(summary.last_long_dwell_epoch_s)}</span>
       </div>
       {advisory && (
-        <div className="wear-row__advisory">
-          no long standby window in {days ?? "?"} days
-        </div>
+        <div className="wear-row__advisory">no long standby window in {days} days</div>
       )}
     </div>
   );

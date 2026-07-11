@@ -48,6 +48,14 @@ pub(crate) struct WearSummary {
     /// creation baseline) — server-derived truth, independent of any WS
     /// nudge the client may have missed.
     pub(crate) advisory: bool,
+    /// Hours since `max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)`
+    /// — the SAME derivation `dormantd::wear_tracker::tick` uses for
+    /// `DaemonEvent::CompensationAdvisory::hours_since_long_dwell`. Exposed
+    /// unconditionally (not just when `advisory` is true) so the client has
+    /// a real day count even for a display that has never had an observed
+    /// long dwell yet (baseline-only — the common first-load case), instead
+    /// of rendering "no long standby window in ? days".
+    pub(crate) hours_since_long_dwell: u64,
 }
 
 /// `GET /api/wear` response envelope.
@@ -81,14 +89,21 @@ fn now_epoch_s() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Same advisory formula as `dormantd::wear_tracker::tick`'s latch check,
-/// recomputed statelessly: `now - max(observed, baseline) > advisory_after`.
-fn is_advisory(ledger: &WearLedger, advisory_after_s: u64, now_epoch_s: u64) -> bool {
+/// `now - max(last_long_dwell_epoch_s, advisory_baseline_epoch_s)`, in
+/// whole seconds — the single shared reference point for both the
+/// `advisory` bool and the `hours_since_long_dwell` count, mirroring
+/// `dormantd::wear_tracker::tick`'s advisory-latch derivation exactly.
+fn since_reference_s(ledger: &WearLedger, now_epoch_s: u64) -> u64 {
     let baseline = ledger.advisory_baseline_epoch_s;
     let observed = ledger.last_long_dwell_epoch_s.unwrap_or(0);
     let reference = observed.max(baseline);
-    let since_s = now_epoch_s.saturating_sub(reference);
-    since_s > advisory_after_s
+    now_epoch_s.saturating_sub(reference)
+}
+
+/// Same advisory formula as `dormantd::wear_tracker::tick`'s latch check,
+/// recomputed statelessly: `now - max(observed, baseline) > advisory_after`.
+fn is_advisory(ledger: &WearLedger, advisory_after_s: u64, now_epoch_s: u64) -> bool {
+    since_reference_s(ledger, now_epoch_s) > advisory_after_s
 }
 
 fn summarize(
@@ -107,6 +122,7 @@ fn summarize(
         last_sample_at_epoch_s: ledger.last_sample_at_epoch_s,
         last_long_dwell_epoch_s: ledger.last_long_dwell_epoch_s,
         advisory: is_advisory(ledger, advisory_after_s, now_epoch_s),
+        hours_since_long_dwell: since_reference_s(ledger, now_epoch_s) / 3600,
     }
 }
 
@@ -292,6 +308,65 @@ mod tests {
         assert!(
             !s.advisory,
             "freshly-baselined ledger must not be advisory yet"
+        );
+        assert_eq!(
+            s.hours_since_long_dwell, 0,
+            "a ledger baselined at `now` must report ~0 hours since reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_wear_hours_since_long_dwell_uses_baseline_when_no_dwell_observed_yet() {
+        // T8 review Should-fix: a display that has NEVER had an observed
+        // long dwell (baseline-only — the common first-load case) must
+        // still report a real `hours_since_long_dwell` count derived from
+        // `advisory_baseline_epoch_s`, not merely omit/null the field.
+        let now = now_epoch_s();
+        let old_baseline = now.saturating_sub(3 * 3600); // 3h ago, no dwell ever observed
+        let mut wear = HashMap::new();
+        wear.insert(
+            "baseline-only".to_string(),
+            ledger_with(
+                "baseline-only",
+                "Baseline Only Panel",
+                PanelType::Unknown,
+                old_baseline,
+                None,
+            ),
+        );
+        let state = test_state_with(wear, WearConfig::default(), BIND);
+
+        let Json(resp) = get_wear(State(state)).await;
+        assert_eq!(resp.displays.len(), 1);
+        assert_eq!(
+            resp.displays[0].hours_since_long_dwell, 3,
+            "baseline-only ledger must derive hours_since_long_dwell from advisory_baseline_epoch_s"
+        );
+        assert_eq!(resp.displays[0].last_long_dwell_epoch_s, None);
+    }
+
+    #[tokio::test]
+    async fn get_wear_hours_since_long_dwell_uses_observed_dwell_when_more_recent_than_baseline() {
+        let now = now_epoch_s();
+        let old_baseline = now.saturating_sub(10 * 3600);
+        let recent_dwell = now.saturating_sub(2 * 3600);
+        let mut wear = HashMap::new();
+        wear.insert(
+            "observed".to_string(),
+            ledger_with(
+                "observed",
+                "Observed Panel",
+                PanelType::Woled,
+                old_baseline,
+                Some(recent_dwell),
+            ),
+        );
+        let state = test_state_with(wear, WearConfig::default(), BIND);
+
+        let Json(resp) = get_wear(State(state)).await;
+        assert_eq!(
+            resp.displays[0].hours_since_long_dwell, 2,
+            "a more-recent observed dwell must win over the older baseline"
         );
     }
 

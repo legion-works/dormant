@@ -4516,6 +4516,10 @@ availability_payload_offline = "down"
     #[test]
     fn is_passthrough_data_key_rejects_near_miss_suffix() {
         assert!(!is_passthrough_data_key("blank_data_extra"));
+        // Both broadening directions (reviewer pin): a prefix-style broadening
+        // is caught above; an ends_with-style broadening is caught here.
+        assert!(!is_passthrough_data_key("evil_blank_data"));
+        assert!(!is_passthrough_data_key("x.wake_data"));
     }
 
     // Each predicate's accepted names ⊆ STRUCTURAL_RESERVED_NAMES, ENUMERATED

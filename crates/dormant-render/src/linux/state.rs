@@ -2479,6 +2479,16 @@ impl LayerShellHandler for WaylandState {
                 self.black_buffer = None;
                 self.configured_size = (0, 0);
                 self.input_latch.reset();
+                // NOTE: mirrors destroy_surface()'s tail (see above) —
+                // any teardown path that drops the live surface must
+                // also reset shift state, or a stale shift_state
+                // survives to corrupt the NEXT Show/ShowScreensaver on
+                // this display (ensure_shift_viewport sees a stale
+                // Some() and skips set_source on the fresh WpViewport;
+                // maybe_arm_shift_timer never re-arms with a stale
+                // token). Keep this call whenever a new teardown path
+                // is added.
+                self.reset_shift();
                 tracing::info!(
                     event = "layer_surface_closed_by_compositor",
                     display_id = %self.display_id,

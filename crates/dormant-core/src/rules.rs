@@ -646,6 +646,24 @@ enum InternalResult {
     },
 }
 
+/// One rule's per-kind inhibitor bookkeeping.
+///
+/// `kinds` records the last-known engaged/released bool per
+/// [`InhibitorKind`] this rule has ever seen (kinds never reported for this
+/// rule are simply absent — treated as not-engaged by the OR-derivation).
+/// `effective` is the OR of every value in `kinds`, cached so
+/// [`RulesEngine::apply_inhibitor`] can detect a no-op update (a kind flip
+/// that doesn't change the OR result) without recomputing against the
+/// previous state machine input.
+#[derive(Debug, Default, Clone)]
+struct InhibitorSet {
+    /// Last-known engaged/released bool per inhibitor kind.
+    kinds: HashMap<InhibitorKind, bool>,
+    /// OR of every value in `kinds` — the bit actually fed to
+    /// [`Input::InhibitorChanged`].
+    effective: bool,
+}
+
 /// Motion-sensor hold state — one entry per sensor with `kind == Motion` and
 /// `hold_time = Some(_)`.
 #[derive(Debug, Default, Clone)]
@@ -690,6 +708,11 @@ pub struct RulesEngine {
     zone_rules: HashMap<ZoneId, Vec<RuleId>>,
     /// Sensors that are currently paused at the rule level (skip blanking).
     paused_rules: HashSet<RuleId>,
+    /// Per-rule inhibitor bookkeeping (kind → engaged, plus the OR-derived
+    /// effective bit). A rule absent from this map has never received a
+    /// [`ControlMsg::SetInhibited`] — equivalent to an all-`false`
+    /// [`InhibitorSet`].
+    inhibitor_state: HashMap<RuleId, InhibitorSet>,
     /// Per-sensor hold state (only populated for `Motion + Some(hold_time)`).
     holds: HashMap<SensorId, HoldState>,
     /// Per-display wake-retry counter (increments on each failure, resets on
@@ -814,6 +837,7 @@ impl RulesEngine {
             rule_displays,
             zone_rules,
             paused_rules: HashSet::new(),
+            inhibitor_state: HashMap::new(),
             holds,
             wake_attempts: HashMap::new(),
             reported: HashSet::new(),
@@ -1147,29 +1171,47 @@ impl RulesEngine {
         }
     }
 
-    /// Route an inhibitor state change to a rule's displays (or every display
-    /// when `rule` is `None`), mirroring [`Self::handle_pause`]'s fan-out.
-    ///
-    /// `_kind` is accepted but not yet consulted — per-kind bookkeeping
-    /// lands in a follow-up commit; this overwrite-fan-out behavior is
-    /// unchanged from before `kind` existed on [`ControlMsg::SetInhibited`].
+    /// Route an inhibitor state change to a rule (or every rule when `rule`
+    /// is `None`), mirroring [`Self::handle_pause`]'s per-RULE bookkeeping
+    /// idiom for the `None` case (NOT the bare `cfg.displays` fan-out —
+    /// each rule's inhibitor state is tracked, and fanned out to displays,
+    /// independently).
     fn handle_set_inhibited(
         &mut self,
         rule: Option<&RuleId>,
-        _kind: InhibitorKind,
+        kind: InhibitorKind,
         inhibited: bool,
     ) {
-        let targets: Vec<DisplayId> = match rule {
-            Some(r) => self.rule_displays.get(r).cloned().unwrap_or_default(),
-            None => self
-                .cfg
-                .displays
-                .iter()
-                .map(|d| d.display.clone())
-                .collect(),
-        };
+        if let Some(r) = rule {
+            self.apply_inhibitor(r, kind, inhibited);
+        } else {
+            let rule_ids: Vec<RuleId> = self.rule_displays.keys().cloned().collect();
+            for r in rule_ids {
+                self.apply_inhibitor(&r, kind, inhibited);
+            }
+        }
+    }
+
+    /// Update one rule's per-kind inhibitor bookkeeping and, ONLY when the
+    /// OR-derived effective bit actually changes, fan out
+    /// [`Input::InhibitorChanged`] to that rule's displays.
+    ///
+    /// This is the change-dedup mechanism: a repeated `SetInhibited` for a
+    /// kind that doesn't flip the effective bit is a pure no-op past the
+    /// bookkeeping update — no display step, no [`Effect`], no `SinkCmd`.
+    fn apply_inhibitor(&mut self, rule: &RuleId, kind: InhibitorKind, inhibited: bool) {
+        let set = self.inhibitor_state.entry(rule.clone()).or_default();
+        set.kinds.insert(kind, inhibited);
+        let new_effective = set.kinds.values().any(|&engaged| engaged);
+        let changed = new_effective != set.effective;
+        if !changed {
+            return;
+        }
+        set.effective = new_effective;
+
+        let targets = self.rule_displays.get(rule).cloned().unwrap_or_default();
         for d in targets {
-            self.step_one(&d, Input::InhibitorChanged(inhibited));
+            self.step_one(&d, Input::InhibitorChanged(new_effective));
         }
     }
 
@@ -3087,6 +3129,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
         paused_rules: HashSet::new(),
+        inhibitor_state: HashMap::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
         reported: HashSet::new(),
@@ -3184,6 +3227,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
         paused_rules: HashSet::new(),
+        inhibitor_state: HashMap::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
         reported: HashSet::new(),

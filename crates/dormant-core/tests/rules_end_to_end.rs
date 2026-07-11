@@ -1457,6 +1457,319 @@ async fn set_inhibited_freezes_grace_until_released() {
     let _ = harness.source_handle.await;
 }
 
+// ── SetInhibited: per-kind bookkeeping (F6 staging — RED at commit 1) ──────────
+
+/// A second inhibitor kind releasing must NOT clobber a first kind that is
+/// still engaged. One rule, one display: engage `UserActivity` (freezes
+/// grace), then release an unrelated `AudioPlayback` kind that was never
+/// engaged. The grace must stay frozen — `UserActivity` is still on.
+///
+/// RED at commit 1: `handle_set_inhibited` ignores `kind` and just overwrites
+/// the state machine's single `inhibited` bool, so the `AudioPlayback`
+/// release also clears the `UserActivity` engagement and the grace resumes
+/// (and eventually blanks).
+#[tokio::test(start_paused = true)]
+async fn second_inhibitor_kind_does_not_clobber_first() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+    let rule = RuleId("r1".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let sink = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![display_cfg("mon")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Present@0, Absent@10s → grace runs until ~70s.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    // Let grace start, then engage UserActivity before it would expire.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: Some(rule.clone()),
+            kind: InhibitorKind::UserActivity,
+            inhibited: true,
+        })
+        .await
+        .expect("ctl open");
+
+    // Release a DIFFERENT kind that was never engaged. Must be a no-op for
+    // the effective inhibition — UserActivity is still on.
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: Some(rule.clone()),
+            kind: InhibitorKind::AudioPlayback,
+            inhibited: false,
+        })
+        .await
+        .expect("ctl open");
+
+    // Well past the original grace deadline — must still be frozen.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    assert!(
+        !sink
+            .log()
+            .iter()
+            .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+        "releasing an unrelated inhibitor kind must not clobber the still-engaged \
+         UserActivity kind: no blank expected, got {:?}",
+        sink.log()
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// `rule: None` must update EACH rule's own effective inhibition
+/// independently — not fan the same bool out to every display regardless of
+/// which rule owns it.
+///
+/// Setup: `r1` already has `UserActivity` engaged (frozen); `r2` has nothing
+/// engaged yet. A broadcast `AudioPlayback` engage-then-release (both
+/// `rule: None`) must: leave `r1` frozen (its `UserActivity` engagement is
+/// untouched) while correctly freezing-then-unfreezing `r2` (whose only
+/// engaged kind IS `AudioPlayback`).
+///
+/// RED at commit 1: the `None` arm enumerates `cfg.displays` and feeds every
+/// display the SAME bare bool, with no per-rule memory — so the
+/// `AudioPlayback` release also clobbers `r1`'s `UserActivity` engagement and
+/// `r1` incorrectly unfreezes too.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::too_many_lines)]
+async fn none_rule_updates_each_rules_own_effective() {
+    let sensor1 = SensorId("desk1".into());
+    let sensor2 = SensorId("desk2".into());
+    let display1 = DisplayId("mon1".into());
+    let display2 = DisplayId("mon2".into());
+    let rule1 = RuleId("r1".into());
+
+    let zones = ZoneEngine::new(
+        vec![
+            ZoneSpec {
+                id: ZoneId("office1".into()),
+                mode: FusionMode::Any,
+                members: vec![ZoneMember::Sensor(sensor1.clone())],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            },
+            ZoneSpec {
+                id: ZoneId("office2".into()),
+                mode: FusionMode::Any,
+                members: vec![ZoneMember::Sensor(sensor2.clone())],
+                weights: HashMap::new(),
+                unavailable_policy: UnavailablePolicy::Present,
+            },
+        ],
+        &[sensor1.clone(), sensor2.clone()],
+    )
+    .expect("zone specs are well-formed");
+
+    let sink1 = Arc::new(RecordingSink::new());
+    let sink2 = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display1.clone(), sink1.clone());
+    execs.insert(display2.clone(), sink2.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![
+            rule_cfg("r1", "office1", &["mon1"]),
+            rule_cfg("r2", "office2", &["mon2"]),
+        ],
+        displays: vec![display_cfg("mon1"), display_cfg("mon2")],
+        sensors: vec![
+            sensor_cfg(
+                "desk1",
+                SensorKind::Presence,
+                None,
+                Duration::from_secs(3600),
+            ),
+            sensor_cfg(
+                "desk2",
+                SensorKind::Presence,
+                None,
+                Duration::from_secs(3600),
+            ),
+        ],
+    };
+
+    // Both zones: Present@0, Absent@10s → both graces run until ~70s.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor1.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor2.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor1.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor2.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine(cfg, zones, execs, script);
+
+    // Engage r1's UserActivity directly — r1 is now frozen; r2 untouched.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: Some(rule1.clone()),
+            kind: InhibitorKind::UserActivity,
+            inhibited: true,
+        })
+        .await
+        .expect("ctl open");
+
+    // Broadcast AudioPlayback engage — freezes r2 (its first engaged kind);
+    // r1 stays frozen (already true, no effective change).
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: None,
+            kind: InhibitorKind::AudioPlayback,
+            inhibited: true,
+        })
+        .await
+        .expect("ctl open");
+
+    // Broadcast AudioPlayback release — must unfreeze r2 (its only engaged
+    // kind) while leaving r1 frozen (UserActivity is still on).
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: None,
+            kind: InhibitorKind::AudioPlayback,
+            inhibited: false,
+        })
+        .await
+        .expect("ctl open");
+
+    // Well past both original grace deadlines.
+    tokio::time::sleep(Duration::from_secs(90)).await;
+
+    assert!(
+        !sink1
+            .log()
+            .iter()
+            .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+        "r1 must stay frozen: its own UserActivity engagement must not be \
+         clobbered by an unrelated broadcast release, got {:?}",
+        sink1.log()
+    );
+    assert!(
+        sink2
+            .log()
+            .iter()
+            .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+        "r2 must unfreeze and blank once its only engaged kind releases, got {:?}",
+        sink2.log()
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+/// A manual-only display (no rule references it) must receive NO inhibitor
+/// input from a `rule: None` broadcast. Only displays reachable through a
+/// rule are inhibitor targets.
+///
+/// RED at commit 1: the `None` arm enumerates `cfg.displays` (every declared
+/// display, ruled or not) rather than iterating rules' own display sets, so
+/// the manual-only display incorrectly picks up `inhibited: true`.
+#[tokio::test(start_paused = true)]
+async fn manual_only_display_gets_no_inhibitor_input_on_none() {
+    let sink_ruled = Arc::new(RecordingSink::new());
+    let sink_manual = Arc::new(RecordingSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(DisplayId("ruled".into()), sink_ruled.clone());
+    execs.insert(DisplayId("manual".into()), sink_manual.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["ruled"])],
+        displays: vec![display_cfg("ruled"), display_cfg("manual")],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+    let zones = zone_with_sensor("desk", "office");
+
+    let harness = spawn_engine(cfg, zones, execs, vec![]);
+
+    harness
+        .ctl_tx
+        .send(ControlMsg::SetInhibited {
+            rule: None,
+            kind: InhibitorKind::UserActivity,
+            inhibited: true,
+        })
+        .await
+        .expect("ctl open");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let snap = request_snapshot(&harness.ctl_tx).await;
+    let ruled_snap = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "ruled")
+        .map(|(_, d)| d)
+        .expect("ruled display in snapshot");
+    let manual_snap = snap
+        .displays
+        .iter()
+        .find(|(id, _)| id == "manual")
+        .map(|(_, d)| d)
+        .expect("manual display in snapshot");
+
+    assert!(
+        ruled_snap.inhibited,
+        "sanity: the None broadcast must still reach rule-bound displays"
+    );
+    assert!(
+        !manual_snap.inhibited,
+        "a rule-less (manual-only) display must never receive inhibitor input \
+         from a None broadcast"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
 // ── SetPendingReload: runtime pending-reload flag ──────────────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -2268,6 +2581,148 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
     assert!(
         teardown_after_dwell >= 1,
         "dwell escalation into the controller stage must tear down the render surface — got {render_log_after:?}"
+    );
+
+    harness.cancel.cancel();
+    let _ = harness.engine_handle.await;
+    let _ = harness.source_handle.await;
+}
+
+// ── SetInhibited: change-dedup pin (commit 2) ───────────────────────────────────
+
+/// A repeated `SetInhibited` that doesn't flip the rule's OR-derived
+/// effective bit must produce NO additional display step at all — not even
+/// a no-op [`Input::InhibitorChanged`] delivery.
+///
+/// This matters concretely in the `Staged` phase: the state machine's
+/// `InhibitorChanged(false)` handler unconditionally re-arms the stage-tick
+/// with whatever (possibly zero) remaining dwell it has on hand — it has no
+/// way to tell "this is a genuine release" from "this is a redundant
+/// re-send" (`state_machine.rs` is wake-path-sanctified and out of scope for
+/// this feature). So a naive engine-side handler that fans out on EVERY
+/// `SetInhibited` — not just on an effective-bit change — would fast-forward
+/// a display straight through its render dwell and into an early controller
+/// blank purely from redundant polling noise. `apply_inhibitor`'s
+/// change-detection is what prevents that.
+///
+/// Asserted indirectly via [`StateSnapshot`]'s `cmd_gen` (`SinkCmd` only has
+/// `Blank`/`Wake` — there's no direct way to observe an `InhibitorChanged`
+/// delivery from the test side): `cmd_gen` only bumps when the display
+/// machine actually issues a blank/wake command, so if two redundant
+/// `SetInhibited(false)` sends (with the kind never previously engaged —
+/// effective stays `false` throughout) left `cmd_gen` unchanged shortly
+/// after, neither send touched the display machine.
+#[tokio::test(start_paused = true)]
+async fn repeated_identical_set_inhibited_causes_no_extra_display_step() {
+    let sensor = SensorId("desk".into());
+    let display = DisplayId("mon".into());
+    let rule = RuleId("r1".into());
+
+    let zones = zone_with_sensor("desk", "office");
+    let cmd_sink = Arc::new(RecordingSink::new());
+    let render_sink = Arc::new(RecordingRenderSink::new());
+    let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+    execs.insert(display.clone(), cmd_sink.clone());
+    let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    renders.insert(display.clone(), render_sink.clone());
+
+    let cfg = RulesEngineConfig {
+        rules: vec![rule_cfg("r1", "office", &["mon"])],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![
+                LadderStage {
+                    kind: StageKind::RenderBlack,
+                    dwell: Some(Duration::from_secs(30)),
+                },
+                LadderStage {
+                    kind: StageKind::Controller(BlankMode::PowerOff),
+                    dwell: None,
+                },
+            ],
+            timings: timings_grace_60s(),
+        }],
+        sensors: vec![sensor_cfg(
+            "desk",
+            SensorKind::Presence,
+            None,
+            Duration::from_secs(3600),
+        )],
+    };
+
+    // Absent@10s → grace 60s → ladder (Staged, RenderBlack, dwell 30s) entry
+    // at ~70s → controller blank would fire at ~100s if left untouched.
+    let script = vec![
+        (
+            Duration::from_secs(0),
+            PresenceEvent::new(sensor.clone(), SensorState::Present, Timestamp::now()),
+        ),
+        (
+            Duration::from_secs(10),
+            PresenceEvent::new(sensor.clone(), SensorState::Absent, Timestamp::now()),
+        ),
+    ];
+
+    let harness = spawn_engine_with_render(cfg, zones, execs, renders, script);
+
+    // Land safely inside the dwell window (entry ~70s, dwell ends ~100s).
+    tokio::time::sleep(Duration::from_secs(72)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let before = request_snapshot(&harness.ctl_tx).await;
+    let cmd_gen_before = before
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .map(|(_, d)| d.cmd_gen)
+        .expect("mon display in snapshot");
+    assert_eq!(
+        cmd_gen_before, 0,
+        "sanity: no blank/wake issued yet at ~72s (still mid-dwell)"
+    );
+
+    // `AudioPlayback` was never engaged for this rule — effective is
+    // already `false`. Two identical `inhibited: false` sends must be a
+    // pure no-op: no InhibitorChanged delivery, no stage re-arm.
+    for _ in 0..2 {
+        harness
+            .ctl_tx
+            .send(ControlMsg::SetInhibited {
+                rule: Some(rule.clone()),
+                kind: InhibitorKind::AudioPlayback,
+                inhibited: false,
+            })
+            .await
+            .expect("ctl open");
+    }
+
+    // Short wait — long enough for a spurious immediate re-arm to have
+    // fired and issued a blank, far short of the real ~100s dwell deadline.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let after = request_snapshot(&harness.ctl_tx).await;
+    let cmd_gen_after = after
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .map(|(_, d)| d.cmd_gen)
+        .expect("mon display in snapshot");
+
+    assert_eq!(
+        cmd_gen_after,
+        cmd_gen_before,
+        "a repeated SetInhibited that doesn't change the effective bit must not \
+         touch the display machine at all (cmd_gen must be stable); log={:?}",
+        cmd_sink.log()
+    );
+    assert!(
+        !cmd_sink
+            .log()
+            .iter()
+            .any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+        "no blank must fire this early from redundant no-op SetInhibited sends: {:?}",
+        cmd_sink.log()
     );
 
     harness.cancel.cancel();

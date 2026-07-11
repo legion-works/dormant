@@ -74,6 +74,14 @@ pub const LD2410_BAUD: u32 = 256_000;
 /// Default JSON-pointer field read from MQTT payloads.
 pub const MQTT_FIELD: &str = "/occupancy";
 
+/// Default payload literal that marks an MQTT availability (LWT) topic
+/// "online" — the `Zigbee2MQTT`/Home-Assistant-MQTT convention.
+pub const AVAILABILITY_PAYLOAD_ONLINE: &str = "online";
+
+/// Default payload literal that marks an MQTT availability (LWT) topic
+/// "offline" — the `Zigbee2MQTT`/Home-Assistant-MQTT convention.
+pub const AVAILABILITY_PAYLOAD_OFFLINE: &str = "offline";
+
 /// Default web-UI bind address — loopback only (operator tool).
 pub const WEB_BIND_DEFAULT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 

@@ -745,6 +745,9 @@ field = "/val"
                 kind: dormant_core::config::schema::SensorKind::default(),
                 hold_time: None,
                 stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
             }),
         );
         let cfg = Config {

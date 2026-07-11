@@ -40,6 +40,9 @@ async fn mqtt_round_trip_publishes_presence_event() {
         kind: SensorKind::Presence,
         hold_time: None,
         stale_timeout: None,
+        availability_topic: None,
+        availability_payload_online: "online".into(),
+        availability_payload_offline: "offline".into(),
     };
 
     let source = dormant_sensors::mqtt::MqttSource::new(

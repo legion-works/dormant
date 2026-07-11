@@ -507,6 +507,9 @@ mod tests {
             kind: SensorKind::Presence,
             hold_time: None,
             stale_timeout: None,
+            availability_topic: None,
+            availability_payload_online: "online".into(),
+            availability_payload_offline: "offline".into(),
         }
     }
 
@@ -520,6 +523,9 @@ mod tests {
             kind: SensorKind::Presence,
             hold_time: None,
             stale_timeout: None,
+            availability_topic: None,
+            availability_payload_online: "online".into(),
+            availability_payload_offline: "offline".into(),
         }
     }
 
@@ -597,6 +603,9 @@ mod tests {
             kind: SensorKind::Presence,
             hold_time: None,
             stale_timeout: None,
+            availability_topic: None,
+            availability_payload_online: "online".into(),
+            availability_payload_offline: "offline".into(),
         };
         let payload = br#"{"presence":true,"temperature":22.5}"#;
         assert_eq!(parse_payload(&cfg, payload), Some(SensorState::Present));
@@ -662,6 +671,9 @@ mod tests {
                         kind: SensorKind::Presence,
                         hold_time: None,
                         stale_timeout: None,
+                        availability_topic: None,
+                        availability_payload_online: "online".into(),
+                        availability_payload_offline: "offline".into(),
                     },
                 ),
                 (
@@ -675,6 +687,9 @@ mod tests {
                         kind: SensorKind::Presence,
                         hold_time: None,
                         stale_timeout: None,
+                        availability_topic: None,
+                        availability_payload_online: "online".into(),
+                        availability_payload_offline: "offline".into(),
                     },
                 ),
             ],
@@ -711,6 +726,9 @@ mod tests {
                         kind: SensorKind::Presence,
                         hold_time: None,
                         stale_timeout: None,
+                        availability_topic: None,
+                        availability_payload_online: "online".into(),
+                        availability_payload_offline: "offline".into(),
                     },
                 ),
                 (
@@ -724,6 +742,9 @@ mod tests {
                         kind: SensorKind::Presence,
                         hold_time: None,
                         stale_timeout: None,
+                        availability_topic: None,
+                        availability_payload_online: "online".into(),
+                        availability_payload_offline: "offline".into(),
                     },
                 ),
             ],
@@ -793,6 +814,9 @@ mod tests {
                     kind: SensorKind::Presence,
                     hold_time: None,
                     stale_timeout: None,
+                    availability_topic: None,
+                    availability_payload_online: "online".into(),
+                    availability_payload_offline: "offline".into(),
                 },
             )],
             None,

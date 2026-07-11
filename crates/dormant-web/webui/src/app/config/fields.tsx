@@ -5,6 +5,7 @@
  * optional `lockedReason` (shown in a tooltip on the lock icon) and
  * `error` (inline 422 validation detail rendered below the input).
  */
+import { useState, useEffect } from "react";
 
 export { LOG_LEVELS, FUSION_MODES, UNAVAILABLE_POLICIES, IDLE_TIME_UNITS, IDLE_SOURCES, PANEL_TYPES } from "./constants";
 
@@ -174,6 +175,120 @@ export function TextField({ path, label, value, locked, lockedReason, onEdit, er
         />
         {locked && <LockIcon reason={lockedReason} />}
       </div>
+      {help && <span className="cf-field__hint">{help}</span>}
+      {error && <span className="cf-field__error">{error}</span>}
+    </div>
+  );
+}
+
+/**
+ * String-list field — add/remove/edit a `Vec<String>`-shaped value
+ * (e.g. `audio.call_roles`, and the inner list of an optional
+ * string-list field like `audio.playback_roles`).
+ *
+ * Owns its working array as internal state, seeded from `value` and
+ * re-synced only when the `value` *reference* itself changes (a fresh
+ * fetch/discard/reload passes a new array). This means repeated
+ * add/remove/edit interactions accumulate correctly against the same
+ * mount even when the host re-renders with the same (stale) `value`
+ * prop between keystrokes — the existing scalar fields in this file
+ * rely on the host re-supplying `value` from pending store state,
+ * which doesn't hold for a widget that must support several
+ * micro-edits (add, then edit, then remove) before Apply.
+ */
+export function StringListField({ path, label, value, locked, lockedReason, onEdit, error, help, placeholder }: FieldProps) {
+  const [items, setItems] = useState<string[]>(() => (Array.isArray(value) ? [...(value as string[])] : []));
+  const [draft, setDraft] = useState("");
+
+  // Re-sync when the host hands us a genuinely new array (fresh fetch/
+  // discard/reload) — not on every render, since `value` is typically
+  // the same reference across re-renders triggered by our own edits.
+  useEffect(() => {
+    setItems(Array.isArray(value) ? [...(value as string[])] : []);
+  }, [value]);
+
+  function commit(next: string[]) {
+    setItems(next);
+    onEdit(path, next);
+  }
+
+  function addEntry() {
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    commit([...items, trimmed]);
+    setDraft("");
+  }
+
+  function removeAt(idx: number) {
+    commit(items.filter((_, i) => i !== idx));
+  }
+
+  function editAt(idx: number, next: string) {
+    const copy = [...items];
+    copy[idx] = next;
+    commit(copy);
+  }
+
+  const addInputId = `${path.join(".")}-add`;
+
+  return (
+    <div className={fieldClassName(locked, !!error)}>
+      <label className="cf-field__label" htmlFor={addInputId}>{label}</label>
+      <div className="cf-field__value-list">
+        {items.map((item, idx) =>
+          locked ? (
+            <span key={idx} className="cf-field__value-chip">{item}</span>
+          ) : (
+            <span key={idx} className="cf-field__value-chip" style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+              <input
+                type="text"
+                className="cf-field__input"
+                style={{ width: "auto", maxWidth: "160px", padding: "3px 6px" }}
+                value={item}
+                aria-label={`${label} item ${idx + 1}`}
+                onChange={(e) => editAt(idx, e.target.value)}
+              />
+              <button
+                type="button"
+                className="cf-apply__btn cf-apply__btn--discard"
+                style={{ padding: "2px 6px", fontSize: "10px" }}
+                onClick={() => removeAt(idx)}
+                aria-label={`Remove ${label} item ${idx + 1}`}
+                title={`Remove ${label} item ${idx + 1}`}
+              >
+                {"✕"}
+              </button>
+            </span>
+          ),
+        )}
+        {locked && <LockIcon reason={lockedReason} />}
+      </div>
+      {!locked && (
+        <div className="cf-field__input-row">
+          <input
+            id={addInputId}
+            type="text"
+            className="cf-field__input"
+            value={draft}
+            placeholder={placeholder}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addEntry();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="cf-apply__btn"
+            onClick={addEntry}
+            aria-label={`Add ${label}`}
+          >
+            {"+ Add"}
+          </button>
+        </div>
+      )}
       {help && <span className="cf-field__hint">{help}</span>}
       {error && <span className="cf-field__error">{error}</span>}
     </div>

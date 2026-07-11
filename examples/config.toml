@@ -40,6 +40,21 @@ config_version = 1
 # short_cycle_dwell = "10m"      # blanked dwell long enough to count as a "rest" window (>= 1m)
 # advisory_after = "96h"         # advise when no qualifying rest window for this long (>= 1h)
 
+# ── Failure notifications ───────────────────────────────────────────────────
+#
+# Optional: desktop notifications (freedesktop D-Bus, session bus only) when
+# a wake command fails repeatedly or a blank command exhausts its controller
+# chain, plus a recovery notice when it clears. The tray icon's Failure
+# state and the web dashboard's failure banner are unaffected by this
+# section — they always reflect the live failure state. See
+# docs/src/failure-notifications.md. Enabled by default; every key below
+# shows its default, so this section can be omitted entirely.
+# [notifications]
+# enabled = true                  # kill-switch; false = no notifier task, no D-Bus I/O
+# wake_attempt_threshold = 3       # consecutive wake failures before notifying (>= 1)
+# cooldown = "15m"                 # minimum time between repeat notices per display (>= 1m)
+# notify_recovery = true           # send a Normal-urgency notice when a failing display recovers
+
 [daemon]
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"

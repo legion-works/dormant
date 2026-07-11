@@ -50,15 +50,16 @@ pub const WAKE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// failed and moves to the next retry or escalation step.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Brightness to restore when waking a display (0–100).
+/// Brightness to restore when waking a display (1–100; 0 is rejected by
+/// config validation to guarantee a lit panel on wake).
 /// 80 is a sane daytime default that doesn't require per-display tuning.
 pub const RESTORE_BRIGHTNESS: u8 = 80;
 
 /// Backlight to restore on wake for Samsung IP Control G2 (`backlightControl`)
 /// when the saved value is missing (daemon restart, reload, or first wake).
-/// Scale 0–50 (the TV's panel-backlight range). 50 is the max — the
-/// fail-safe-toward-screens-on doctrine accepts a too-bright panel; a
-/// stuck-dim one is not acceptable.
+/// Scale 1–50 (the TV's panel-backlight range; 0 is rejected by config
+/// validation). 50 is the max — the fail-safe-toward-screens-on doctrine
+/// accepts a too-bright panel; a stuck-dim one is not acceptable.
 pub const SAMSUNG_RESTORE_BACKLIGHT: u8 = 50;
 
 /// Which idle source to use for the activity inhibitor (`"auto"` | `"wayland"` |

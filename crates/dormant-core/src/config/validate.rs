@@ -1226,18 +1226,35 @@ fn validate_display(
         }
     }
 
-    // ── Samsung backlight restore range ─────────────────────────────────
-    // The TV's IP-Control panel-backlight range is 0–50; values outside it
-    // would be silently clipped by the TV or rejected as an invalid
-    // JSON-RPC param. Reject at config-validate so the operator finds out
-    // at startup, not at the first wake after a restart.
-    if dc.samsung_restore_backlight > 50 {
+    // ── Restore-level guards ────────────────────────────────────────────
+    // A zero restore level would wake to a dark panel (fail-toward-visible
+    // requires at least 1). Reject here so the operator finds out at
+    // config-validate time, not at the first wake after a restart.
+    if dc.samsung_restore_backlight == 0 {
+        errors.push(ValidationError {
+            what: "invalid samsung_restore_backlight".into(),
+            detail: format!(
+                "display '{display_id}' samsung_restore_backlight is 0 — \
+                 a zero restore level would wake to a dark panel; minimum is 1"
+            ),
+        });
+    } else if dc.samsung_restore_backlight > 50 {
         errors.push(ValidationError {
             what: "invalid samsung_restore_backlight".into(),
             detail: format!(
                 "display '{display_id}' samsung_restore_backlight {} is out of \
-                 range — allowed: 0..=50 (Samsung IP-Control backlight scale)",
+                 range — allowed: 1..=50 (Samsung IP-Control backlight scale)",
                 dc.samsung_restore_backlight
+            ),
+        });
+    }
+
+    if dc.restore_brightness == 0 {
+        errors.push(ValidationError {
+            what: "invalid restore_brightness".into(),
+            detail: format!(
+                "display '{display_id}' restore_brightness is 0 — \
+                 a zero restore level would wake to a dark panel; minimum is 1"
             ),
         });
     }
@@ -2724,8 +2741,135 @@ password = "test-pass"
             .map(|e| e.detail.clone())
             .unwrap_or_default();
         assert!(
-            detail.contains("0..=50"),
-            "error detail should describe the 0..=50 scale: {detail}"
+            detail.contains("1..=50"),
+            "error detail should describe the 1..=50 scale: {detail}"
+        );
+    }
+
+    #[test]
+    fn samsung_restore_backlight_zero_rejected() {
+        let mut dc = blank_display_config();
+        dc.samsung_restore_backlight = 0;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let samsung_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.what == "invalid samsung_restore_backlight")
+            .collect();
+        assert_eq!(
+            samsung_errors.len(),
+            1,
+            "exactly one error for samsung_restore_backlight=0, got: {errors:?}"
+        );
+        assert!(
+            samsung_errors[0].detail.contains("dark panel"),
+            "error must state the reason: {}",
+            samsung_errors[0].detail
+        );
+    }
+
+    #[test]
+    fn samsung_restore_backlight_one_accepted() {
+        let mut dc = blank_display_config();
+        dc.samsung_restore_backlight = 1;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.what != "invalid samsung_restore_backlight"),
+            "in-range samsung_restore_backlight=1 should not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn restore_brightness_zero_rejected() {
+        let mut dc = blank_display_config();
+        dc.restore_brightness = 0;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        let restore_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.what == "invalid restore_brightness")
+            .collect();
+        assert_eq!(
+            restore_errors.len(),
+            1,
+            "exactly one error for restore_brightness=0, got: {errors:?}"
+        );
+        assert!(restore_errors[0].detail.contains("dark panel"));
+    }
+
+    #[test]
+    fn restore_brightness_one_accepted() {
+        let mut dc = blank_display_config();
+        dc.restore_brightness = 1;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.what != "invalid restore_brightness"),
+            "in-range restore_brightness=1 should not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn restore_brightness_100_accepted() {
+        let mut dc = blank_display_config();
+        dc.restore_brightness = 100;
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("d".into(), dc)]),
+            rules: IndexMap::new(),
+            wear: crate::config::schema::WearConfig::default(),
+            notifications: crate::config::schema::NotificationsConfig::default(),
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.what != "invalid restore_brightness"),
+            "in-range restore_brightness=100 should not error: {errors:?}"
         );
     }
 

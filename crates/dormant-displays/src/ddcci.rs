@@ -351,10 +351,22 @@ impl DisplayController for DdcciController {
 
                 // Only save on the FIRST blank — a second blank while already
                 // blanked reads current=0 and would clobber the real saved
-                // value, causing wake to restore 0 (stuck dark).
+                // value, causing wake to restore 0 (stuck dark). A zero read
+                // on the very first blank is also refused: a genuine zero
+                // operator preference cannot be distinguished from blank
+                // residue, and failing-toward-visible means the fallback
+                // (config `restore_brightness`, validated ≥ 1) is always safe.
                 let mut state = self.state.lock().unwrap();
                 if state.saved_brightness.is_none() {
-                    state.saved_brightness = Some(current);
+                    if current > 0 {
+                        state.saved_brightness = Some(current);
+                    } else {
+                        tracing::debug!(
+                            event = "brightness_zero_not_saved",
+                            display = %ident,
+                            "pre-blank brightness is 0 — not saving as operator level (fail-toward-visible)",
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1430,6 +1442,102 @@ mod tests {
         assert!(
             wake_elapsed < read_timeout,
             "wake_elapsed {wake_elapsed:?} must stay well under the command timeout"
+        );
+    }
+
+    /// Daemon restart while the panel is dimmed (brightness physically at 0)
+    /// — the first blank reads current=0. A zero reading can be either
+    /// blank residue or a genuine operator preference; to fail-toward-visible
+    /// the controller refuses to save it, leaving `saved_brightness == None`
+    /// so wake falls through to `restore_brightness` (77 here,
+    /// operator-configured) — never 0. Config validation rejects a zero
+    /// restore default so the fallback is always at least 1.
+    #[tokio::test]
+    async fn brightness_zero_not_saved_wake_restores_config_default() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            77, // operator-configured restore (non-default to prove config path)
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // Blank reads 0 → saves nothing, sets to 0.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+
+        // Wake — restores config default 77, not 0.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 77, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        // Decisive: wake wrote 77 (config default), not a poisoned restore of 0.
+        assert!(
+            log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("77")),
+            "wake must restore config default 77, not 0: {log:?}"
+        );
+        let wake_sets: Vec<&String> = log
+            .iter()
+            .filter(|l| l.contains("set_vcp") && l.contains("0x10"))
+            .collect();
+        assert_eq!(
+            wake_sets.len(),
+            2,
+            "one blank set (→0) + one wake set (→77)"
+        );
+        assert!(wake_sets[1].contains("77"), "second VCP set must be 77");
+        // Corroborating: the zero reading was not saved as an operator level.
+        assert!(
+            ctrl.state.lock().unwrap().saved_brightness.is_none(),
+            "pre-blank brightness 0 must not be saved as operator level"
+        );
+    }
+
+    /// Healthy path: nonzero pre-blank reading IS the operator-chosen level —
+    /// saved on first blank and restored on wake.
+    #[tokio::test]
+    async fn nonzero_brightness_saved_and_restored_on_wake() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            77, // config default — irrelevant; saved value wins
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // Blank reads 55 → saves 55, sets to 0.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(55));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            Some(55),
+            "nonzero pre-blank brightness must be saved"
+        );
+
+        // Wake restores saved 55.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 55, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("55")),
+            "wake must restore saved brightness 55: {log:?}"
         );
     }
 }

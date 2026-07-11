@@ -779,13 +779,15 @@ pub struct DisplayConfig {
     #[serde(default = "default_command_timeout", with = "humantime_serde")]
     pub command_timeout: Duration,
 
-    /// Brightness level to restore on wake (0–100).
+    /// Brightness level to restore on wake (1–100; 0 is rejected by config
+    /// validation).
     #[serde(default = "default_restore_brightness")]
     pub restore_brightness: u8,
 
     /// Backlight to restore on wake for Samsung IP Control G2 (`backlightControl`)
     /// when the saved value is missing (daemon restart, reload, or first
-    /// wake). Scale 0–50 (the TV's panel-backlight range); defaults to
+    /// wake). Scale 1–50 (the TV's panel-backlight range; 0 is rejected by
+    /// config validation); defaults to
     /// [`defaults::SAMSUNG_RESTORE_BACKLIGHT`] (50 — the max on that scale).
     /// Only consumed by the `samsung-tizen` controller; other controllers
     /// ignore it.

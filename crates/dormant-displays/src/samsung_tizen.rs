@@ -729,7 +729,7 @@ pub struct SamsungTizenController {
     configured_primary_mode: BlankMode,
     /// Per-display override for the backlight value restored on wake when
     /// no saved value is available. Operator-tuned via the
-    /// `samsung_restore_backlight` config key (validated 0–50 by
+    /// `samsung_restore_backlight` config key (validated 1–50 by
     /// `dormant_core::config::validate`).
     restore_backlight: u8,
     /// The actual blank mode of the LAST successful blank — recorded by
@@ -778,7 +778,7 @@ impl SamsungTizenController {
     /// `last_blank_mode` is `None`.
     /// `restore_backlight` is the per-display backlight restore value
     /// (operator-tuned via the `samsung_restore_backlight` config key,
-    /// validated 0–50).
+    /// validated 1–50; zero is rejected — it would wake to a dark panel).
     #[must_use]
     pub fn new(
         host: String,
@@ -922,7 +922,11 @@ impl SamsungTizenController {
     ///
     /// On subsequent blanks (already at 0): read returns 0, but the saved
     /// value is NOT overwritten — first-blank-wins prevents the wake from
-    /// restoring 0 (stuck-dark).
+    /// restoring 0 (stuck-dark). A zero read on the very first blank (panel
+    /// was dimmed when the daemon started, e.g. after a deploy) is also
+    /// refused — a genuine zero operator preference cannot be distinguished
+    /// from blank residue, and failing-toward-visible means the fallback
+    /// (config `restore_backlight`, validated ≥ 1) is always safe.
     async fn blank_backlight(&self) -> Result<(), CmdFailure> {
         let token = self
             .backlight
@@ -947,7 +951,15 @@ impl SamsungTizenController {
             .lock()
             .expect("saved_backlight poisoned");
         if saved.is_none() {
-            *saved = Some(current);
+            if current > 0 {
+                *saved = Some(current);
+            } else {
+                tracing::debug!(
+                    event = "backlight_zero_not_saved",
+                    host = %self.host,
+                    "pre-blank backlight is 0 — not saving as operator level (fail-toward-visible)",
+                );
+            }
         }
         Ok(())
     }
@@ -956,7 +968,7 @@ impl SamsungTizenController {
     ///
     /// Uses the saved value if present, otherwise falls back to the
     /// per-display `restore_backlight` override (operator-tuned via the
-    /// `samsung_restore_backlight` config key, validated 0–50). The
+    /// `samsung_restore_backlight` config key, validated 1–50). The
     /// default is the same value — per the fail-safe-toward-screens-on
     /// doctrine a too-bright panel is acceptable; a stuck-dim one is not.
     ///
@@ -3087,5 +3099,117 @@ mod tests {
         );
         // Three set calls (blank to 0, wake to 40, wake retry to 40).
         assert_eq!(bl_fake.set_calls.lock().unwrap().len(), 3);
+    }
+
+    /// Daemon restart while the panel is dimmed (backlight physically at 0)
+    /// — the first blank reads current=0. A zero reading can be either
+    /// blank residue or a genuine operator preference; to fail-toward-visible
+    /// the controller refuses to save it, leaving `saved_backlight == None`
+    /// so wake falls through to `restore_backlight` (37 here,
+    /// operator-configured) — never 0. Config validation rejects a zero
+    /// restore default so the fallback is always at least 1.
+    #[tokio::test]
+    async fn restart_while_dimmed_wake_restores_config_default_not_zero() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // Blank: acquire → get 0 → set to 0 → confirm 0.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Wake: acquire → set 37 (config default) → confirm 37.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(37));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            37, // operator-configured restore, distinct from DEFAULT_RESTORE_BACKLIGHT
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        ctrl.wake().await.unwrap();
+
+        // Decisive: wake wrote config default 37, NOT 0.
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("192.0.2.7".to_string(), 0), ("192.0.2.7".to_string(), 37)]
+        );
+        assert!(
+            tv_fake.take_sent_keys().is_empty(),
+            "wake must not fall through to KEY_RETURN"
+        );
+        // Corroborating: the zero reading was not saved as an operator level.
+        assert!(
+            ctrl.saved_backlight.lock().unwrap().is_none(),
+            "pre-blank backlight 0 must not be saved as operator level"
+        );
+    }
+
+    /// Healthy path: nonzero pre-blank reading IS the operator-chosen level —
+    /// save it on first blank and restore it on wake.
+    #[tokio::test]
+    async fn nonzero_backlight_saved_and_restored_on_wake() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // Blank: acquire → get 42 → set to 0 → confirm 0.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(42));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        // Wake: acquire → set 42 → confirm 42.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(42));
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            37, // distinct config default — saved value 42 wins
+        );
+
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(
+            *ctrl.saved_backlight.lock().unwrap(),
+            Some(42),
+            "nonzero pre-blank reading must be saved"
+        );
+
+        ctrl.wake().await.unwrap();
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap(),
+            vec![("192.0.2.7".to_string(), 0), ("192.0.2.7".to_string(), 42)]
+        );
+        assert!(
+            tv_fake.take_sent_keys().is_empty(),
+            "wake must not fall through to KEY_RETURN"
+        );
     }
 }

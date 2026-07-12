@@ -3619,8 +3619,8 @@ fn drain_datagrams(listener: &std::os::unix::net::UnixDatagram) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
-              body (app lifetime included) — test-local, always released promptly at test end"
+    reason = "wear_env_lock + capture_count_lock serialize test-local state and are \
+              always released promptly at test end"
 )]
 async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     let _guard = wear_env_lock()
@@ -3742,7 +3742,15 @@ async fn watchdog_lkg_disabled_writes_nothing() {
               body (app lifetime included) — test-local, always released promptly at test end"
 )]
 async fn watchdog_reload_mid_window_resets_candidate() {
-    let _guard = wear_env_lock()
+    let _wear_guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Serialize against the count-sensitive watchdog tests: this test does
+    // a reload which emits the same step-boundary markers
+    // (after_assemble/after_quiesce/before_teardown/reload_end) that
+    // watchdog_in_reload_pings_healthy_boundaries counts — without this
+    // lock, a parallel reload from this test contaminates that count.
+    let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state_home = TempDir::new().unwrap();

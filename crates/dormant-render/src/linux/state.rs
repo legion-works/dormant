@@ -2481,7 +2481,7 @@ mod tests {
         assert_eq!(surface_match(pending, live, &event), SurfaceMatch::Stale);
     }
 
-    // ── viewport source unset (must-fix) ────────────────────────────
+    // ── viewport source unset ────────────────────────────────────────
     //
     // The wp_viewport protocol unset is `set_source(-1, -1, -1, -1)`.
     // reset_shift() calls this when a viewport exists to prevent

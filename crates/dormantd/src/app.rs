@@ -2299,7 +2299,7 @@ mod render_tests {
         drop(input_wake_rx);
     }
 
-    /// OLED-health T10, U5 + reviewer should-fix: pixel-shift settings
+    /// U5: pixel-shift settings
     /// must NOT reach the sink when the display's ladder is black-only
     /// (no `RenderScreensaver` stage) — the black overlay never shifts,
     /// so shift settings are useless without a screensaver stage.
@@ -2389,7 +2389,7 @@ mod render_tests {
             captured_ss.lock().expect("capture").take().is_none(),
             "ScreensaverSettings must stay None — the ladder never reaches RenderScreensaver"
         );
-        // U5 + reviewer should-fix: shift settings must NOT reach a
+        // U5: shift settings must NOT reach a
         // sink whose ladder never reaches RenderScreensaver — the
         // black overlay never shifts regardless of config.
         assert!(

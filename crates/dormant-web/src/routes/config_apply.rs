@@ -407,21 +407,22 @@ mod tests {
         let config_path = config_dir.join("config.toml");
         let creds_path = config_dir.join("config.creds.toml");
 
-        WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path,
-            creds_path,
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        })
+        WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path,
+                creds_path,
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ))
     }
 
     /// Like [`test_state`] but returns the [`broadcast::Sender`]`<`[`ReloadOutcome`]`>`
@@ -450,21 +451,22 @@ mod tests {
         let config_path = config_dir.join("config.toml");
         let creds_path = config_dir.join("config.creds.toml");
 
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path,
-            creds_path,
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
-            cancel,
-            reload_timeout,
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path,
+                creds_path,
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
+                cancel,
+                reload_timeout,
+            },
+        ));
 
         (state, reload_tx)
     }

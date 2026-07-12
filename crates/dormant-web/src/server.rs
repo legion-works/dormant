@@ -194,7 +194,7 @@ mod tests {
     use dormant_doctor::DoctorService;
 
     use crate::WebState;
-    use crate::state::WebStateInner;
+    use crate::state::{WebStateInner, WebStateInnerParams};
 
     /// Build a minimal [`WebState`] suitable for testing `build_router`.
     /// The API routes will fail if called (no real engine behind the
@@ -228,7 +228,7 @@ mod tests {
 
         let doctor = DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        let state = WebState::new(WebStateInner {
+        let state = WebState::new(WebStateInner::new_for_test(WebStateInnerParams {
             ctl_tx: ctl_tx.clone(),
             reload_trigger: reload_trigger_tx,
             reload_rx,
@@ -236,13 +236,12 @@ mod tests {
             creds_rx,
             config_path: std::path::PathBuf::from("/dev/null"),
             creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: bind,
             cancel: cancel.clone(),
             reload_timeout: Duration::from_secs(10),
-        });
+        }));
 
         (state, cancel)
     }

@@ -302,21 +302,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let event_tx_for_engine = event_tx.clone();
         tokio::spawn(async move {
@@ -441,21 +442,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let event_tx_for_engine = event_tx.clone();
         tokio::spawn(async move {
@@ -552,21 +554,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let event_tx_for_engine = event_tx.clone();
         tokio::spawn(async move {
@@ -660,21 +663,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let gen1_clone = gen1_tx.clone();
         let gen2_clone = gen2_tx.clone();
@@ -819,21 +823,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let gen1_clone = gen1_tx.clone();
         let gen2_clone = gen2_tx.clone();
@@ -981,21 +986,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let first_subscribe = StdArc::new(AtomicBool::new(true));
         let first_subscribe_clone = first_subscribe.clone();
@@ -1137,21 +1143,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let gen1_clone = gen1_tx.clone();
         let gen2_clone = gen2_tx.clone();
@@ -1360,21 +1367,22 @@ mod tests {
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let gen1_clone = gen1_tx.clone();
         let gen2_clone = gen2_tx.clone();

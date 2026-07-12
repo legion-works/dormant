@@ -30,6 +30,7 @@ rand = { workspace = true }
 humantime = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 indexmap = { workspace = true }
 reqwest = { workspace = true }
 tempfile = "3"

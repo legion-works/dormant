@@ -252,21 +252,22 @@ mod tests {
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: Arc::new(RwLock::new(wear)),
-            web_bind: bind,
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        })
+        WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: Arc::new(RwLock::new(wear)),
+                web_bind: bind,
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ))
     }
 
     const BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);

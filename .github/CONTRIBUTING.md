@@ -36,15 +36,14 @@ Install once after cloning:
 lefthook install
 ```
 
-- **pre-commit** — `cargo fmt`, `typos`, `taplo fmt --check`, `gitleaks` (staged-only secret scan).
+- **pre-commit** — `cargo fmt`, `typos`, `taplo fmt --check`, and a staged-only `gitleaks` scan.
 - **pre-push** — `cargo clippy -- -D warnings -W clippy::pedantic`, `cargo doc` (the two gates that most often fail CI).
 
-Skip in an emergency with `git commit --no-verify` or `LEFTHOOK=0 git push`.
 CI remains the authoritative gate — these are local mirrors, not replacements.
 
 ## Gate commands
 
-Run these before committing. All must pass. They mirror the CI workflow exactly — what runs locally is what runs on the PR.
+Run the core workspace gates before committing:
 
 ```bash
 cargo fmt --all -- --check
@@ -52,10 +51,28 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
-mdbook build docs     # if mdbook installed
+mdbook build docs
+taplo fmt --check
+typos
 ```
 
-CI also enforces `taplo fmt --check`, `typos`, and `cargo audit`, plus the webui gate (`npm ci && npm run lint && npm run build && npx vitest run`), the portability gate (`cargo check --workspace` on Windows + macOS), the MSRV gate (`cargo check --workspace` on Rust 1.88), and the render-feature gate (Linux-only build of `dormant-render` and `dormantd --features render`). Run `cargo deny check` locally; the rest run automatically on PRs.
+The CI jobs in `.github/workflows/ci.yml` are:
+
+- `fmt` — `cargo fmt --all -- --check`
+- `webui` — `npm ci`, `npm run lint`, `npm run build`, `npx vitest run`
+- `clippy` — workspace/all-targets/all-features with warnings and Clippy pedantic denied
+- `test` — `cargo test --workspace --all-features`
+- `render` — render-feature builds and tests for `dormant-core`, `dormantd`, and `dormant-render`
+- `portability` — `cargo check --workspace` on Windows and macOS
+- `deny` and `audit` — dependency policy and RustSec advisories
+- `msrv` — `cargo check --workspace` on Rust 1.88
+- `mqtt-integration` — live Mosquitto tests, including retained state and availability
+- `docs` and `mdbook` — rustdoc with warnings denied, then `mdbook build docs`
+- `taplo`, `gitleaks`, and `typos`
+- `pr-title` — conventional-commit title validation on pull requests
+
+Run the platform-specific and integration jobs when your change touches those
+paths. CI remains the final matrix.
 
 ## TDD expectation
 
@@ -67,7 +84,7 @@ Conventional commits only: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `tes
 
 ## Adding a sensor
 
-Use `dormant-sensors/src/mqtt.rs` as the reference implementation. Steps:
+Use `crates/dormant-sensors/src/mqtt.rs` as the reference implementation. Steps:
 
 1. **Config variant** — add a new variant to `SensorConfig` in `dormant-core/src/config/schema.rs` with the `type` tag string (e.g., `#[serde(rename = "my-sensor")]`). Inline the common fields (`kind`, `hold_time`, `stale_timeout`).
 2. **Module** — create `dormant-sensors/src/my_sensor.rs`. Implement the `SensorSource` trait from `dormant-core/src/traits.rs`.
@@ -78,13 +95,13 @@ Use `dormant-sensors/src/mqtt.rs` as the reference implementation. Steps:
 
 ## Adding a display controller
 
-Use `dormant-displays/src/command.rs` as the reference implementation. Steps:
+Use `crates/dormant-displays/src/command.rs` as the reference implementation. Steps:
 
 1. **Module** — create `dormant-displays/src/my_controller.rs`. Implement the `DisplayController` trait (`name()`, `supported_modes()`, `probe()`, `is_available()`, `blank()`, `wake()`).
 2. **Registry entry** — add a match arm to `build_controllers` in `dormant-displays/src/registry.rs`.
 3. **Config fields** — add any new fields needed in `DisplayConfig` (schema.rs), with serde defaults.
 4. **Rules for `supported_modes()`** — return only modes you have verified work. Do not claim support for a mode that you have not tested on real hardware. A controller that falsely claims `power_off` support can leave a screen on — the worst failure mode.
-5. **Fail-safe wake contract** — `wake()` must be idempotent (safe to call on an already-awake display). Wakes must retry internally or escalate to the executor's chain. Never silently give up — a screen that won't wake is a hard failure.
+5. **Fail-safe wake contract** — `wake()` must be idempotent (safe to call on an already-awake display). Wakes retry internally or escalate through the executor's chain; exhausted retries must surface through the existing failure state.
 6. **Tests** — mock the controller's I/O surface (process spawn, network, DBus) and test blank/wake round-trips, mode-support filtering, and reachability timeouts.
 
 ## PR checklist

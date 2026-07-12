@@ -37,13 +37,13 @@ Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a co
 | `E_DISPLAY_IO` | Display controller I/O error | Network controller: host reachable? DDC/CI: I2C bus accessible? Command: binary exists? |
 | `E_IPC` | Inter-process communication error | Check that `dormantd` is running. Verify the socket path matches between daemon and CLI. |
 
-## Fail-safe: why my display won't blank
-
-This is by design. The most common "my display won't blank" scenarios and why they happen:
+## Display will not blank
 
 ### Sensor is stale
 
-If a sensor stops reporting data (MQTT broker down, USB cable unplugged, HA WebSocket disconnect), the zone treats it as **present** — not absent. This prevents dormant from blanking a room it cannot see.
+**Symptom:** the rule stays active after the room empties.
+
+**Cause:** a sensor stopped reporting. The zone treats `unavailable` as present by default, so dormant will not blank a room it cannot see.
 
 Check with:
 
@@ -51,11 +51,13 @@ Check with:
 dormantctl status
 ```
 
-Look for `unavailable` sensor states. Fix the sensor, and blanking will resume.
+Look for `unavailable` sensor states, then repair the broker, connection, or device.
 
 ### Grace period has not elapsed
 
-The rule's `grace_period` prevents rapid toggling. If you just left the room, it may still be counting down. The default is 60 seconds. Reduce it if your room layout allows faster detection:
+**Symptom:** the zone is vacant, but blanking is delayed.
+
+**Cause:** `rules.<id>.grace_period` is still counting down. The default is 60 seconds.
 
 ```toml
 [rules.office_blank]
@@ -64,17 +66,32 @@ grace_period = "30s"
 
 ### Inhibitor is active
 
-If you set `inhibitors = ["user-activity"]`, dormant will not blank displays while it detects keyboard/mouse activity. This prevents blanking while you are at the desk but still (e.g., reading).
+**Symptom:** the sensor and zone are vacant, but the rule remains inhibited.
+
+**Cause:** `"user-activity"` is active, or the rule was paused manually.
 
 ```bash
-dormantctl pause
+dormantctl status
 ```
 
-Shows active inhibitors. Use `dormantctl pause off` to force-resume blanking.
+Resume manual pauses with:
+
+```bash
+dormantctl resume
+```
+
+`"audio-playback"` and `"call"` may appear in config, but audio detection is
+not shipped and cannot currently inhibit a rule.
 
 ### Min-wake-time floor
 
-After a wake, the display cannot be blanked again for `min_wake_time` (default 10 s). This prevents rapid blank/wake thrashing if someone briefly leaves and returns.
+**Symptom:** a just-woken display stays on despite vacancy.
+
+**Cause:** `rules.<id>.min_wake_time` has not elapsed. The default is 10 seconds.
+
+```bash
+dormantctl status
+```
 
 ## Emergency wake
 
@@ -94,12 +111,12 @@ For a one-keystroke recovery, bind the command to a global shortcut:
 
 First-class daemon-registered shortcuts (no compositor setup) are a separate roadmap item.
 
-## Control-path verification — `dormantctl doctor --exercise <display>`
+## Control-path verification — `dormantctl doctor exercise <display>`
 
 Confirms that a blank/wake **actually moved the panel** — the systemic guard against the failure mode where a controller logs `blank_succeeded` while the panel never changed (the samsung stale-socket + port-1516 400s both did exactly this).
 
 ```bash
-dormantctl doctor --exercise mon
+dormantctl doctor exercise mon
 ```
 
 The command routes through the daemon over IPC: the daemon pauses the target's rule(s) for the exercise window, runs `blank → read → wake → read → restore` on its live controllers, and replies with a per-step report. Exit code is non-zero only when at least one step verdict is `Failed` — a confirmable panel that did not move despite the controller returning `Ok`. The wake path is sacred: the restore step guarantees a final wake regardless of any earlier failure, so an exercise can never leave a display dark.
@@ -123,6 +140,42 @@ The command routes through the daemon over IPC: the daemon pauses the target's r
 - The exercise causes a brief blank → wake blink on a display currently in use (the wake step + the defensive restore wake).
 - The command is per-display only (`--exercise <name>`); there is no `--all` or default target.
 - `command` / `kwin-dpms` / `ha-passthrough` controllers report `Unconfirmable` for every step because they cannot observe the panel — exit 0, but no verification was possible.
+
+## Failure notification does not appear
+
+**Symptom:** the tray or web dashboard marks a display failed, but no desktop
+notification appears.
+
+**Cause:** wake failures notify only after
+`notifications.wake_attempt_threshold` consecutive attempts; repeats are
+limited by `notifications.cooldown`. Desktop notices may also be disabled.
+
+```bash
+journalctl --user -u dormant -f
+```
+
+Check `notifications.enabled`, the session D-Bus, and `notify_suppressed` /
+`notify_unreachable` events. Blank failures notify on the first exhausted
+controller chain. See [Failure notifications](./failure-notifications.md).
+
+## Daemon booted from last-known-good config
+
+**Symptom:** `dormantctl status` or the web UI says the current config was
+rolled back, and edits to the original config do not take effect after reload.
+
+**Cause:** the daemon booted from `last-known-good.toml`. Due to
+[issue #53](https://github.com/legion-works/dormant/issues/53), the running
+file watcher still follows the LKG path for that process.
+
+Fix the intended config, then restart the service:
+
+```bash
+dormantctl validate
+systemctl --user restart dormant
+```
+
+Do not rely on `dormantctl reload` for recovery from a rollback boot until
+issue #53 is fixed. See [Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
 ## Logging
 

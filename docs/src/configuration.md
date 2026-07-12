@@ -19,7 +19,14 @@ Required. Must be `1`. This gates backward compatibility — bump when making br
 | `log_level` | string | `"info"` | Tracing log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `socket_path` | path | auto | Unix-domain socket for `dormantctl` IPC (defaults to XDG_RUNTIME_DIR) |
 | `idle_time_unit` | string | `"auto"` | How to interpret screensaver idle values: `"auto"`, `"ms"`, `"s"`. KDE returns ms despite the spec saying seconds — auto detects the unit at runtime |
+| `idle_source` | string | `"auto"` | User-activity source: `"auto"`, `"wayland"`, or `"dbus"` |
 | `reload_debounce` | duration | `"500ms"` | Coalesces rapid config-file changes into a single reload |
+| `web_port` | integer | unset | Web UI port; unset disables the server even in a `web-ui` build |
+| `web_bind` | IP address | `"127.0.0.1"` | Web UI bind address |
+| `web_allow_nonloopback` | boolean | `false` | Required before `web_bind` may use a non-loopback address |
+| `entity_crud_enabled` | boolean | `true` | Allow web creation/deletion of sensors, zones, displays, and rules |
+| `pairing_enabled` | boolean | `true` | Allow the web Samsung pairing wizard |
+| `pair_timeout` | duration | `"120s"` | Pairing timeout; valid range `30s`–`300s` |
 
 ## `[sensors.<id>]` — sensor definitions
 
@@ -44,6 +51,9 @@ Connects to an MQTT broker and subscribes to a topic.
 | `field` | string | `"/occupancy"` | JSON pointer into the payload (RFC 6901) |
 | `payload_on` | string | none | Override for the "on" payload value (default: JSON `true`) |
 | `payload_off` | string | none | Override for the "off" payload value (default: JSON `false`) |
+| `availability_topic` | string | `<topic>/availability` | Override the derived availability/LWT topic |
+| `availability_payload_online` | string | `"online"` | Payload meaning the device is reachable |
+| `availability_payload_offline` | string | `"offline"` | Payload meaning the device is unreachable |
 
 If your broker requires authentication, add a `[mqtt]` section to your credentials file:
 
@@ -54,7 +64,12 @@ username = "your-username"
 password = "your-password"
 ```
 
-The key MUST match the sensor's `broker_url` **exactly** — a `mqtt://` vs `tcp://` mismatch or trailing difference causes a silent miss (anonymous connect → auth failure).
+The credentials key must match the sensor's `broker_url` exactly. A `mqtt://` / `tcp://` mismatch or a trailing difference causes an anonymous connection attempt, which an authenticated broker rejects.
+
+Retained state values are accepted on initial subscribe and reconnect. See
+[Retained values and availability](./sensors.md#retained-values-and-availability)
+before setting `zones.<id>.unavailable_policy = "absent"` on an MQTT-backed
+zone.
 
 Example:
 
@@ -147,8 +162,10 @@ Each display has a user-chosen `id`. The `controllers` list is an ordered fallba
 | `wake_service` | string | conditional | HA service to call for waking |
 | `wake_data` | any | conditional | HA service data for waking (TOML value) |
 | `command_timeout` | duration | `"10s"` | Timeout for a single blank/wake command |
-| `restore_brightness` | integer | `80` | Brightness level to restore on wake (0–100) |
+| `restore_brightness` | integer | `80` | DDC/CI brightness restored on wake (1–100) |
+| `samsung_restore_backlight` | integer | `50` | Samsung IP Control G2 backlight restored when no saved value exists (1–50) |
 | `treat_unreachable_as_blanked` | boolean | `true` | If controller is unreachable, assume display is blanked (fail-safe) |
+| `panel_type` | string | `"unknown"` | Panel classification recorded by panel-wear tracking: `"woled"`, `"qd-oled"`, or `"unknown"` |
 
 ### Manual-only displays
 
@@ -261,6 +278,8 @@ order = "sequential"    # only value accepted; mutually exclusive with `shuffle`
 | `scale_mode` | string | no | `"fill"` | How source frames are scaled onto the output rectangle. One of `"fill"`, `"fit"`, `"stretch"`, `"center"`. See [Scale mode](#scale-mode) below. |
 | `transition` | string | no | `"crossfade"` | How consecutive playlist items transition. `"crossfade"` blends successive frames with a per-pixel u8 lerp; `"none"` cuts immediately (the pre-feature behaviour). |
 | `transition_duration` | duration | no | `"1s"` | Length of the crossfade blend (ignored when `transition = "none"`). Bounded to `100ms..=10s`. |
+| `shift_px` | integer | no | `2` | Pixel-shift distance on the screensaver surface. `0` disables pixel shift. |
+| `shift_interval` | duration | no | `"120s"` | Time between screensaver shifts; minimum `10s`. |
 | `[[…source]]` | array | yes | — | Ordered list of media sources for the playlist. |
 
 Each source supports:
@@ -272,7 +291,11 @@ Each source supports:
 | `recurse` | boolean | no | `false` | Scan `path` recursively for media files. |
 | `shuffle` | boolean | no | `false` | Shuffle items from this source (Fisher-Yates, seeded per restart). Mutually exclusive with `order`. |
 | `order` | string | no | — | Ordering strategy. Only `"sequential"` is accepted. Mutually exclusive with `shuffle`. |
-| `image_duration` | duration | no | 10 s | Per-image display duration override (must be > 0). |
+| `image_duration` | duration | no | `"8s"` | Per-image display duration override (must be > 0). |
+
+Pixel shift applies only to `render_screensaver`. The `render_black` surface
+is a uniform black field and never shifts. Defaults are 2 px every 2 minutes;
+set `displays.<id>.screensaver.shift_px = 0` to disable it.
 
 ###### Transitions
 
@@ -359,12 +382,75 @@ A rule links a zone to one or more displays with timing parameters.
 | `grace_period` | duration | `"60s"` | Zone must be stable for this long before acting |
 | `min_blank_time` | duration | `"10s"` | Minimum time a display stays blanked before waking |
 | `min_wake_time` | duration | `"10s"` | Minimum time a display stays awake before blanking |
-| `inhibitors` | []string | `[]` | Named inhibitors that suppress this rule: `"user-activity"`, `"manual-pause"` |
+| `inhibitors` | []string | `[]` | Named inhibitors: `"user-activity"`, `"manual-pause"`, `"audio-playback"`, `"call"` |
 | `activity_idle_threshold` | duration | `"2m"` | How long without input before user-activity inhibitor considers user idle |
 | `activity_poll_interval` | duration | `"5s"` | How often to poll activity state |
 | `wake_retries` | integer | `3` | Number of wake retries before escalating |
 | `wake_retry_backoff` | duration | `"2s"` | Backoff before the first wake retry |
 | `wake_retry_interval` | duration | `"60s"` | Interval between successive wake retries |
+
+`"audio-playback"` and `"call"` are accepted for forward-compatible config,
+but the PipeWire poller is not shipped. They do not currently inhibit a rule.
+See the `[audio]` section below.
+
+## `[wear]` — panel-wear tracking
+
+Panel-wear tracking is enabled by default. It records brightness-weighted
+on-hours and exposes them through the web UI; it does not change blank/wake
+timing.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Enable the tracker and ledger I/O |
+| `sample_interval` | duration | `"60s"` | Panel-state sampling interval |
+| `persist_interval` | duration | `"5m"` | Ledger write interval |
+| `read_timeout` | duration | `"2s"` | Budget for one panel read |
+| `grid_rows` | integer | `9` | Logical ledger rows; v1 attribution is uniform |
+| `grid_cols` | integer | `16` | Logical ledger columns; v1 attribution is uniform |
+| `fallback_brightness` | float | `0.5` | Brightness fraction used when readback fails |
+| `screensaver_factor` | float | `0.35` | Fixed attribution factor during `render_screensaver` |
+| `short_cycle_dwell` | duration | `"10m"` | Blanked dwell that counts as a long rest window |
+| `advisory_after` | duration | `"96h"` | Time without a long rest window before the advisory appears |
+
+See [Panel-wear tracking](./oled-health.md) for ledger location and limits.
+
+## `[notifications]` — failure notifications
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Enable desktop notifications over the session D-Bus |
+| `wake_attempt_threshold` | integer | `3` | Consecutive wake failures before notification; minimum `1` |
+| `cooldown` | duration | `"15m"` | Minimum interval between repeat notices per display; minimum `1m` |
+| `notify_recovery` | boolean | `true` | Notify when a previously failing display succeeds |
+
+This section gates desktop notifications only. The tray failure state and web
+failure banner remain active. See [Failure notifications](./failure-notifications.md).
+
+## `[watchdog]` — watchdog + last-known-good rollback
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `lkg_enabled` | boolean | `true` | Save a last-known-good config after a healthy stability window |
+| `lkg_rollback_enabled` | boolean | `true` | Allow counted crash-loop rollback |
+| `stability_window` | duration | `"5m"` | Healthy runtime before LKG promotion; minimum `30s` |
+
+The systemd watchdog interval comes from the unit, not this table. See
+[Watchdog + last-known-good rollback](./watchdog-rollback.md).
+
+## `[audio]` — reserved audio-aware blanking settings
+
+The schema, validation, and web settings are shipped, but audio detection is
+not. No PipeWire poller runs in this release, so these settings and the
+`"audio-playback"` / `"call"` inhibitors have no runtime effect yet.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `poll_interval` | duration | `"5s"` | Reserved PipeWire graph polling interval |
+| `min_active` | duration | `"3s"` | Reserved stream-activity debounce |
+| `call_roles` | []string | `["Communication"]` | Reserved `media.role` values classified as calls |
+| `playback_roles` | []string | unset | Optional reserved playback-role filter; an empty list is invalid |
+| `capture_is_call` | boolean | `false` | Reserved microphone-as-call classification |
+| `pw_dump_command` | string | `"pw-dump"` | Reserved poller command |
 
 ## `[credentials]` — credentials file
 
@@ -388,7 +474,12 @@ ha_token = "eyJ..."
 
 When the web UI is enabled (see [Web UI](web-ui.md)), the **Settings** tab on the Config page provides a form-based editor for live config changes without editing the TOML file directly.
 
-**Editable fields (v1):** leaf values (strings, numbers, durations), whole arrays (ladders, rule display lists, screensaver source lists), and a limited set of optional keys can be removed. **Not editable:** `type`, `blank_data`, `wake_data` (hard-locked), any entity table add/remove (file-only), and any field whose value carries redacted credentials. Display command strings, controller lists, and mode lists are file-only in v1 (the Settings form does not render controls for them).
+**Editable fields:** leaf values, whole arrays, and a limited set of optional
+keys. The form can create and delete sensors, zones, displays, and rules when
+`daemon.entity_crud_enabled = true` (the default). Existing entity `type`
+values, `blank_data`, and `wake_data` are locked. Display command strings stay
+file-only; the browser creation path never accepts daemon-executed shell
+commands.
 
 **Backups:** every apply creates a timestamped backup of the previous config in `<config-dir>/backups/config.toml.<rfc3339>.<rand>`, keeping at most 5 newest copies. The directory is created with mode `0o700`.
 
@@ -447,17 +538,10 @@ controllers = ["ddcci"]
 blank_mode = "power_off"
 
 [displays.living_tv]
-controllers = ["ha-passthrough"]
+controllers = ["samsung-tizen"]
 blank_mode = "screen_off_audio_on"
-ha_url = "http://ha.local:8123"
-blank_service = "media_player.turn_off"
-blank_data = { entity_id = "media_player.living_tv" }
-wake_service = "media_player.turn_on"
-wake_data = { entity_id = "media_player.living_tv" }
-modes = ["screen_off_audio_on"]
-# Note: samsung-tizen (native WebSocket KEY_PICTURE_OFF) will replace this
-# once hardware verification completes — ha-passthrough via the HA Samsung
-# integration is the recommended path today.
+host = "192.168.1.50"
+wol_mac = "00:11:22:33:44:55"
 
 [displays.kitchen_display]
 controllers = ["command"]

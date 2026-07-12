@@ -1,6 +1,6 @@
 # Displays
 
-dormant controls displays through an ordered controller chain. The first controller in the chain is tried first; if it fails, the next one is tried. Wake commands retry with exponential backoff before escalating to the next controller.
+dormant controls displays through an ordered controller chain. If one controller fails, the next is tried. Wake commands follow the rule's configured retry schedule before escalating.
 
 ## Controllers
 
@@ -30,7 +30,7 @@ blank_mode = "power_off"
 restore_brightness = 80
 ```
 
-`restore_brightness` sets the brightness level to restore on wake (0–100, default 80).
+`displays.<id>.restore_brightness` sets the brightness restored on wake (1–100, default 80). Zero is rejected so a wake cannot restore a black panel.
 
 #### I2C permissions
 
@@ -112,7 +112,7 @@ wake matrix.
 
 Two blank modes are audio-safe:
 
-- `screen_off_audio_on` (default): `KEY_PICTURE_OFF` — true picture-off.
+- `screen_off_audio_on`: `KEY_PICTURE_OFF` — true picture-off.
   Audio continues on the TV speakers but the HDMI source is paused and the
   panel is dark. Verified end-to-end on S90D.
 - `brightness_zero`: Samsung IP Control G2 `backlightControl` → 0.
@@ -123,7 +123,7 @@ Two blank modes are audio-safe:
   it on wake (first-blank-wins: a re-blank while already dimmed does not
   clobber the saved value).
 
-The optional `samsung_restore_backlight` per-display config key (0–50,
+The optional `displays.<id>.samsung_restore_backlight` key (1–50,
 defaults to 50) sets the backlight value restored on wake when no saved
 value is available — daemon restart, reload, or first wake. The default
 50 (the max on the 0–50 scale) is the fail-safe-toward-screens-on
@@ -136,10 +136,18 @@ cycling), but it does not produce a true pixel-off — it only dims.
 The token goes in the credentials file:
 
 ```toml
-[credentials]
 [samsung]
 "192.0.2.7" = "eyJ..."
 ```
+
+Pair from the CLI, then accept the prompt on the TV:
+
+```bash
+dormantctl pair samsung 192.0.2.7
+```
+
+The web config editor offers the same handshake through its Samsung pairing
+wizard.
 
 See `docs/research/2026-07-05-s90d-verification.md` for the full spike data
 including wake matrix, latency measurements, and socket survival findings.
@@ -152,13 +160,23 @@ Every controller must satisfy three invariants for `wake()`:
 2. **Retries or escalates** — must not silently give up. Internally retry, or let the executor's chain handle it.
 3. **No permanent failure state** — a screen that won't wake is the worst outcome. Controllers must report failures clearly so the user can intervene.
 
-## Doctor check
+## Doctor checks
 
 ```bash
 dormantctl doctor ddcci
 ```
 
 Verifies: controller reachability, supported modes vs configured mode, last known state, and performs a dry-run capability probe (does not blank the display).
+
+To verify the full control path against one configured display:
+
+```bash
+dormantctl doctor exercise main
+```
+
+This runs `blank → read → wake → read → restore` through the daemon's live
+controller chain. It briefly blanks the panel. See
+[Control-path verification](./troubleshooting.md).
 
 ## Audio-safe blanking
 
@@ -238,7 +256,14 @@ cargo build --release --features render
 
 Without the `render` feature, configs containing a render stage are rejected
 at startup with error `E_RENDER_UNAVAILABLE`. On Linux, the render backend
-also requires `libwayland-dev` at build time.
+also requires `libwayland-dev` and `libmpv-dev` at build time.
+
+### Pixel shift
+
+The `render_screensaver` surface shifts by 2 px every 2 minutes by default.
+Set `displays.<id>.screensaver.shift_px = 0` to disable it, or tune
+`displays.<id>.screensaver.shift_interval` (minimum `10s`). Pixel shift never
+applies to `render_black`: a uniform black field has no static content to move.
 
 ## Manual-only displays
 
@@ -263,11 +288,6 @@ Manual-only phase is preserved across config reloads (SIGHUP /
 `dormantctl reload`).  A display you blanked stays blanked.  However, a full
 daemon **restart** loses state — the display starts `active` (phase
 persistence to disk is not implemented in v1).
-
-**Known limitation:** a manual blank or wake command issued in the brief
-window while a config reload is in progress may be lost (the new generation
-restores the pre-command state).  Re-issue the command after the reload
-settles.  Tracked in [issue #9](https://github.com/legion-works/dormant/issues/9).
 
 ```toml
 # A Samsung Tizen TV controlled entirely by hand.

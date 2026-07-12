@@ -552,7 +552,6 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, watch};
     use tokio_util::sync::CancellationToken;
     use tower::util::ServiceExt;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     use dormant_core::config::schema::{
         Config, Credentials, DaemonConfig, NotificationsConfig, WearConfig,
@@ -825,62 +824,16 @@ mod tests {
     // recording" (the common case for every other test in this file) and
     // `Some(vec)` means "this test is recording", with no cross-test
     // interference.
+    //
+    // The install-once global subscriber + thread-local buffer live in
+    // `crate::test_support` (shared with `routes::config_apply`'s tests,
+    // which need the same capture pattern) rather than being duplicated
+    // here — `tracing::subscriber::set_global_default` only succeeds once
+    // per process, and this crate's route tests all share one test binary,
+    // so two independent `Once`-gated installs would race for the single
+    // global slot and silently blind whichever module lost.
 
-    thread_local! {
-        static CAPTURE_BUF: std::cell::RefCell<Option<Vec<String>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    struct FieldDumpVisitor(String);
-
-    impl tracing::field::Visit for FieldDumpVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write as _;
-            let _ = write!(self.0, " {}={value:?}", field.name());
-        }
-    }
-
-    struct ThreadLocalCaptureLayer;
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadLocalCaptureLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            CAPTURE_BUF.with(|buf| {
-                if let Some(events) = buf.borrow_mut().as_mut() {
-                    let mut visitor = FieldDumpVisitor(String::new());
-                    event.record(&mut visitor);
-                    events.push(visitor.0);
-                }
-            });
-        }
-    }
-
-    /// Install [`ThreadLocalCaptureLayer`] as the process-wide global
-    /// default subscriber, exactly once. Safe to call from every test that
-    /// wants to capture — only the first caller's `Once::call_once` body
-    /// actually runs.
-    fn ensure_capture_subscriber_installed() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let subscriber = tracing_subscriber::registry().with(ThreadLocalCaptureLayer);
-            let _ = tracing::subscriber::set_global_default(subscriber);
-        });
-    }
-
-    /// Start recording tracing events on the CURRENT thread.
-    fn start_capturing() {
-        ensure_capture_subscriber_installed();
-        CAPTURE_BUF.with(|buf| *buf.borrow_mut() = Some(Vec::new()));
-    }
-
-    /// Stop recording and return everything captured on the CURRENT thread
-    /// since the matching [`start_capturing`] call.
-    fn take_captured() -> Vec<String> {
-        CAPTURE_BUF.with(|buf| buf.borrow_mut().take().unwrap_or_default())
-    }
+    use crate::test_support::{start_capturing, take_captured};
 
     #[tokio::test]
     async fn token_never_appears_in_tracing_events_success_and_timeout() {

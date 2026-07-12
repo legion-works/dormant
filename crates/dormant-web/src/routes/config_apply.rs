@@ -87,6 +87,13 @@ fn rand4() -> String {
 
 // ── Handler ────────────────────────────────────────────────────────────────
 
+// This handler is a single linear, explicitly step-numbered pipeline (see
+// the step comments below and the module doc comment) — splitting it up
+// would scatter one atomic operation across several functions for no
+// readability gain. It sat right at clippy's 100-line pedantic threshold
+// before this change; the `entity_created`/`entity_deleted` audit-log call
+// (spec §11 invariant 8, §14) tips it to 101.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn post_apply(
     State(state): State<WebState>,
     Json(body): Json<ApplyRequest>,
@@ -199,6 +206,9 @@ pub(crate) async fn post_apply(
         WebError::ConfigReadError(format!("rename failed: {e}"))
     })?;
     sync_dir(config_dir)?;
+    // Step 8b: audit-log, now that steps 4-8 have ALL succeeded (spec §11
+    // invariant 8, §14; see `log_entity_audit_events`'s doc comment).
+    log_entity_audit_events(&body.patches);
 
     // ── Step 9: subscribe to reload outcome, wait for it ─────────────────
     // Subscribe AFTER the rename but INSIDE the apply_lock so concurrent
@@ -251,6 +261,29 @@ fn patch_error_to_web(e: PatchError) -> WebError {
         PatchError::EntityUnknown(msg) => WebError::EntityUnknown(msg),
         PatchError::ValueRejected(msg) => WebError::PatchValueRejected(msg),
         PatchError::EntityExists(msg) => WebError::EntityExists(msg),
+    }
+}
+
+/// Emit `entity_created`/`entity_deleted` audit events for every
+/// [`Patch::CreateEntity`]/[`Patch::DeleteEntity`] in `patches` (spec §11
+/// invariant 8, §14 — grep-stable literal event names).
+///
+/// Callers MUST only invoke this once the patch set has been fully applied
+/// AND durably written to disk — never on a rejected patch. Deliberately
+/// logs `collection`+`id` ONLY: an entity's `value` can carry secrets
+/// (broker URLs, hostnames, tokens) and must never reach a log line (same
+/// concern [`redact_config_secrets`] handles for reads).
+fn log_entity_audit_events(patches: &[Patch]) {
+    for patch in patches {
+        match patch {
+            Patch::CreateEntity { collection, id, .. } => {
+                tracing::info!(event = "entity_created", collection = %collection, id = %id);
+            }
+            Patch::DeleteEntity { collection, id } => {
+                tracing::info!(event = "entity_deleted", collection = %collection, id = %id);
+            }
+            Patch::Set { .. } | Patch::Remove { .. } => {}
+        }
     }
 }
 
@@ -387,6 +420,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::broadcast;
+
+    use crate::test_support::{start_capturing, take_captured};
 
     // ── Test helpers ────────────────────────────────────────────────────────
 
@@ -1766,6 +1801,156 @@ members = []
             "an ordinary Set patch must still succeed when entity_crud_enabled is false \
              (the flag gates create_entity/delete_entity only, not Set/Remove): {:?}",
             result.err()
+        );
+    }
+
+    // ── entity_created / entity_deleted audit events (spec §11 invariant 8,
+    // §14) ────────────────────────────────────────────────────────────────
+    // These literal `event = "entity_created"` / `event = "entity_deleted"`
+    // tracing events are grep-stable per spec but, prior to this fix, were
+    // never emitted anywhere. The capture layer is shared with
+    // `routes::pair`'s tests via `crate::test_support` — see that module's
+    // comment for why a per-module `Once`-gated global subscriber would
+    // race and silently blind whichever module lost.
+
+    #[tokio::test]
+    async fn successful_create_emits_entity_created_not_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n[sensors]\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        start_capturing();
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "golden".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://s3cret-host-must-not-leak",
+                    "topic": "presence/golden",
+                }),
+            }],
+        };
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let events = take_captured();
+
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+        let joined = events.join("\n");
+        assert!(
+            joined.contains("entity_created"),
+            "missing entity_created in: {joined}"
+        );
+        assert!(
+            joined.contains("collection=sensors"),
+            "missing collection field in: {joined}"
+        );
+        assert!(
+            joined.contains("id=golden"),
+            "missing id field in: {joined}"
+        );
+        assert!(
+            !joined.contains("s3cret-host-must-not-leak"),
+            "entity value payload must never be logged: {joined}"
+        );
+        assert!(
+            !joined.contains("broker_url"),
+            "entity value payload must never be logged: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_delete_emits_entity_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n[sensors]\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+
+        // Create first (uncaptured) so there's something to delete.
+        let fingerprint = get_fingerprint(&state);
+        let create_req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "todelete".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/todelete",
+                }),
+            }],
+        };
+        let result = post_apply(State(state.clone()), axum::Json(create_req)).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+
+        start_capturing();
+        let fingerprint2 = get_fingerprint(&state);
+        let delete_req = ApplyRequest {
+            fingerprint: fingerprint2,
+            patches: vec![Patch::DeleteEntity {
+                collection: "sensors".into(),
+                id: "todelete".into(),
+            }],
+        };
+        let result2 = post_apply(State(state), axum::Json(delete_req)).await;
+        let events = take_captured();
+
+        assert!(
+            result2.is_ok(),
+            "delete should succeed: {:?}",
+            result2.err()
+        );
+        let joined = events.join("\n");
+        assert!(
+            joined.contains("entity_deleted"),
+            "missing entity_deleted in: {joined}"
+        );
+        assert!(
+            joined.contains("collection=sensors"),
+            "missing collection field in: {joined}"
+        );
+        assert!(
+            joined.contains("id=todelete"),
+            "missing id field in: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_create_reserved_id_emits_no_entity_created() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n[sensors]\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        start_capturing();
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                // "type" is in RESERVED_ENTITY_IDS — rejected by
+                // check_patches, BEFORE apply_patches ever runs.
+                collection: "sensors".into(),
+                id: "type".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/x",
+                }),
+            }],
+        };
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let events = take_captured();
+
+        assert!(
+            result.is_err(),
+            "create with a reserved id must be rejected"
+        );
+        let joined = events.join("\n");
+        assert!(
+            !joined.contains("entity_created"),
+            "a rejected create must never emit entity_created: {joined}"
         );
     }
 }

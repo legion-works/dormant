@@ -21,6 +21,8 @@ mod routes;
 mod security;
 mod server;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::net::SocketAddr;
 

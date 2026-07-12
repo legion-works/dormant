@@ -249,12 +249,12 @@ impl Default for ScreensaverSettings {
 
 /// Per-display micro pixel-shift configuration (OLED-health T10) —
 /// threaded to the render sink INDEPENDENTLY of [`ScreensaverSettings`]
-/// because BOTH the black overlay and the screensaver surface shift
-/// (see `docs/research/2026-07-11-pixel-shift-probe.md`), whereas
-/// `ScreensaverSettings` only ever reaches the sink when the display's
-/// ladder contains a `RenderScreensaver` stage.  Mirrors
-/// `dormant_core::config::schema::ScreensaverConfig::shift_px` /
-/// `.shift_interval` — the daemon assembles this from
+/// because only the screensaver surface shifts — the black overlay never
+/// shifts (U5: a uniform RGB(0,0,0) field is translation-invariant on
+/// OLED, subpixels off), whereas `ScreensaverSettings` only ever reaches
+/// the sink when the display's ladder contains a `RenderScreensaver`
+/// stage.  Mirrors `dormant_core::config::schema::ScreensaverConfig::shift_px`
+/// / `.shift_interval` — the daemon assembles this from
 /// `displays.<id>.screensaver.shift_px` / `.shift_interval` in
 /// [`crate::linux::LayerShellRenderSink::set_shift`]'s caller
 /// (`dormantd::app::build_render_sinks`), regardless of whether that

@@ -105,11 +105,11 @@ impl LayerShellRenderSink {
     /// (OLED-health T10).  Unlike [`Self::set_screensaver`] this does
     /// NOT cache the value on the handle — it's a fire-and-forget
     /// `RenderCommand::SetShift` send straight to the Wayland
-    /// thread, which stores it directly on `WaylandState` and reads
-    /// it whenever it builds a black or screensaver buffer.  Both
-    /// surfaces consult the SAME per-display value; see
-    /// [`crate::settings::ShiftSettings`] for why this is a dedicated
-    /// seam rather than a field on `ScreensaverSettings`.
+    /// thread, which stores it directly on `WaylandState`; the
+    /// screensaver install path reads it at attach time.  U5: the
+    /// black overlay never shifts — this setting does not affect it.
+    /// See [`crate::settings::ShiftSettings`] for why this is a
+    /// dedicated seam rather than a field on `ScreensaverSettings`.
     ///
     /// Safe to call before the daemon issues any `show()` — the
     /// channel is FIFO, so a call at sink-build time (the daemon's

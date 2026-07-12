@@ -82,13 +82,13 @@ pub(crate) enum RenderCommand {
     ///
     /// Unlike `ShowScreensaver`'s `settings` payload (per-show,
     /// consumed once), shift settings are NOT per-show: they're a
-    /// static per-display property that both the black overlay and
-    /// the screensaver surface consult.  Rather than thread a shift
-    /// field through every `Show`/`ShowScreensaver` variant (a much
-    /// larger ripple across every call site, for a value that never
-    /// varies show-to-show), this is a dedicated command that sets
-    /// `WaylandState::shift_settings` directly; the black and
-    /// screensaver install paths both read that field at attach time.
+    /// static per-display property that the screensaver surface
+    /// consults.  Rather than thread a shift field through every
+    /// `Show`/`ShowScreensaver` variant (a much larger ripple across
+    /// every call site, for a value that never varies show-to-show),
+    /// this is a dedicated command that sets
+    /// `WaylandState::shift_settings` directly; the screensaver
+    /// install path reads that field at attach time.
     /// The channel is FIFO, so a `set_shift` issued at sink-build time
     /// (mirroring `set_screensaver`'s call site) is guaranteed to be
     /// applied before the first `Show`/`ShowScreensaver` reaches the

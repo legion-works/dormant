@@ -676,19 +676,14 @@ pub(super) struct WaylandState {
     /// a `SetShift` command (no `[displays.<id>.screensaver]` table)
     /// renders byte-identically to the pre-T10 code path.
     pub(super) shift_settings: ShiftSettings,
-    /// Raster-walk cursor for the CURRENTLY LIVE surface.  `Some` from
-    /// the moment the first content (black or screensaver) is
-    /// installed on a fresh surface through to that surface's full
-    /// teardown — a content-swap on the SAME surface (e.g. screensaver
-    /// → black) reuses the walk already in progress rather than
-    /// resetting it; only [`Self::destroy_surface`] resets it (per the
-    /// probe: shift state does not persist across teardown/re-show,
-    /// but nothing says it must reset on a same-surface content swap).
-    /// `None` when shift is disabled OR no surface is currently up.
+    /// Raster-walk cursor for the CURRENTLY LIVE screensaver surface.
+    /// `Some` from the moment the screensaver is installed through to
+    /// its teardown.  `None` when shift is disabled, no surface is up,
+    /// or a black overlay is showing (U5: black never shifts).
     pub(super) shift_state: Option<ShiftState>,
     /// calloop `RegistrationToken` for the shift timer.  Armed exactly
-    /// once per surface lifetime (the moment `shift_state` transitions
-    /// `None` → `Some`) via [`Self::maybe_arm_shift_timer`]; removed by
+    /// once per surface lifetime when the screensaver install path
+    /// calls [`Self::maybe_arm_shift_timer`]; removed by
     /// [`Self::disarm_shift_timer`] on full surface teardown.
     pub(super) shift_timer_token: Option<calloop::RegistrationToken>,
 }
@@ -806,10 +801,8 @@ impl WaylandState {
     /// the FIRST content ever installed on this surface's current
     /// lifetime (`self.shift_state` is still `None`) — initialise the
     /// raster-walk state and set the initial (centred) source rect.
-    /// A later content-swap on the SAME surface (screensaver ↔ black)
-    /// reuses the walk already in progress: `self.shift_state` stays
-    /// `Some`, so this becomes a cheap idempotent re-assert of the
-    /// destination only.
+    /// Called only from the screensaver install path (U5: the black
+    /// overlay never shifts and never calls this method).
     ///
     /// Returns `None` (no-op, no side effects) when shift is disabled
     /// or the compositor has no `wp_viewporter` — the caller falls
@@ -839,10 +832,10 @@ impl WaylandState {
     /// Arm the shift timer exactly once per surface lifetime — the
     /// moment `shift_state` transitions `None` → `Some` (idempotent:
     /// a no-op if a timer is already armed or shift is inactive).
-    /// Called after every buffer-install path (black or screensaver,
-    /// fresh or content-swap) so the timer is live as soon as ANY
-    /// shifted content is showing, per the adjudicated rule ("armed
-    /// only when `shift_px` > 0 AND a surface is showing").
+    /// Called from the screensaver install path so the timer is live
+    /// as soon as shifted content is showing, per the adjudicated
+    /// rule ("armed only when `shift_px` > 0 AND a surface is
+    /// showing").  U5: the black overlay never arms this timer.
     fn maybe_arm_shift_timer(&mut self) {
         let walk_in_progress = self.shift_state.as_ref().is_some_and(ShiftState::enabled);
         if self.shift_timer_token.is_none() && walk_in_progress {
@@ -956,7 +949,49 @@ impl WaylandState {
             offset_y = oy,
         );
     }
+}
 
+// ── Black-overlay attach strategy (U5 invariant) ─────────────
+
+/// Buffer-attach strategy for the black overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlackAttachStrategy {
+    /// Use `wp_single_pixel_buffer` (1×1) + `wp_viewport::set_destination`
+    /// — the compositor scales the single pixel to fill the configured area.
+    SinglePixel,
+    /// Allocate an oversized SHM buffer with `wp_viewport` source-rect
+    /// shift — the pixel-shift path (pre-U5-restore, screensaver only).
+    OversizedShm,
+    /// Allocate a full SHM buffer at configured size, fill with opaque black.
+    ShmFallback,
+}
+
+/// Determine the buffer-attach strategy for a black-overlay surface.
+///
+/// **U5 invariant**: the black overlay NEVER shifts — a uniform
+/// RGB(0,0,0) field is translation-invariant on OLED (subpixels off),
+/// so shifting buys zero wear protection and costs an oversized shm
+/// buffer (~21 MB at 3072×1728) plus periodic damage/commit wakeups,
+/// replacing the near-free `wp_single_pixel_buffer` fast path.
+/// When `single_pixel_manager` + `viewporter` are available the 1×1
+/// fast path is unconditionally preferred; otherwise `shm` at
+/// configured size.  The `shift_px` parameter is deliberately ignored —
+/// the black overlay's strategy is independent of the configured
+/// pixel-shift value (which governs the screensaver surface only).
+#[must_use]
+pub(super) fn black_attach_strategy(
+    _shift_px: u8,
+    has_single_pixel: bool,
+    has_viewporter: bool,
+) -> BlackAttachStrategy {
+    if has_single_pixel && has_viewporter {
+        BlackAttachStrategy::SinglePixel
+    } else {
+        BlackAttachStrategy::ShmFallback
+    }
+}
+
+impl WaylandState {
     /// Resolve any in-flight pending show with `Err`.  Used by teardown,
     /// the configure-timeout handler, and `Event::Closed` channel closure
     /// to ensure the oneshot is never left dangling.
@@ -1078,77 +1113,78 @@ impl WaylandState {
             return;
         }
 
-        // Attach the buffer now that we know the configured size.
-        //
-        // Pixel-shift (T10): when enabled, the black overlay ALWAYS
-        // uses the oversized-shm-buffer + wp_viewport path — a 1×1
-        // single-pixel buffer has no room for a raster walk (its
-        // source rect can only ever be `(0,0,1,1)`).  This preempts
-        // the single-pixel-manager preference below; when shift is
-        // disabled `ensure_shift_viewport` is a no-op and behaviour is
-        // byte-identical to the pre-T10 code (the safety invariant).
+        // Attach the black-overlay buffer.  U5: the black overlay
+        // NEVER shifts — a uniform black field is translation-invariant
+        // on OLED (subpixels off), so shift buys zero wear protection.
+        // The 1×1 single-pixel-buffer fast path is unconditionally
+        // preferred; otherwise a plain shm buffer at configured size.
         let wl_surface = pending.layer_surface.wl_surface().clone();
-        let (buffer, viewport): (WlBuffer, Option<WpViewport>) =
-            if let Some(vp) = self.ensure_shift_viewport(&wl_surface, configured_size) {
-                let (ow, oh) = self.render_dims(configured_size);
-                match crate::linux::surface::create_shm_black_buffer(ow, oh, self) {
+        let strategy = black_attach_strategy(
+            self.shift_settings.shift_px,
+            self.single_pixel_manager.is_some(),
+            self.viewporter.is_some(),
+        );
+        debug_assert!(
+            strategy != BlackAttachStrategy::OversizedShm,
+            "U5: black overlay never shifts — OversizedShm must not be chosen"
+        );
+        let (buffer, viewport): (WlBuffer, Option<WpViewport>) = match strategy {
+            BlackAttachStrategy::SinglePixel => {
+                let spm = self
+                    .single_pixel_manager
+                    .as_ref()
+                    .expect("SinglePixel strategy requires single_pixel_manager");
+                let vp = self
+                    .viewporter
+                    .as_ref()
+                    .expect("SinglePixel strategy requires viewporter");
+                let (b, v) = crate::linux::surface::attach_single_pixel_black(
+                    spm,
+                    vp,
+                    &wl_surface,
+                    configured_size.0,
+                    configured_size.1,
+                    self,
+                );
+                (b, Some(v))
+            }
+            BlackAttachStrategy::ShmFallback => {
+                match crate::linux::surface::create_shm_black_buffer(
+                    configured_size.0,
+                    configured_size.1,
+                    self,
+                ) {
                     Ok(b) => {
                         wl_surface.attach(Some(&b), 0, 0);
-                        wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
                         wl_surface.commit();
-                        (b, Some(vp))
+                        (b, None)
                     }
                     Err(e) => {
                         let _ = pending.reply.send(Err(CmdFailure {
                             controller: "render-black".into(),
-                            error: format!("{E_RENDER_UNAVAILABLE}: shift shm buffer: {e}"),
+                            error: format!("{E_RENDER_UNAVAILABLE}: shm buffer: {e}"),
                         }));
                         return;
                     }
                 }
-            } else {
-                match (&self.single_pixel_manager, &self.viewporter) {
-                    (Some(spm), Some(vp)) => {
-                        let (b, v) = crate::linux::surface::attach_single_pixel_black(
-                            spm,
-                            vp,
-                            &wl_surface,
-                            configured_size.0,
-                            configured_size.1,
-                            self,
-                        );
-                        (b, Some(v))
-                    }
-                    _ => {
-                        // shm fallback.
-                        match crate::linux::surface::create_shm_black_buffer(
-                            configured_size.0,
-                            configured_size.1,
-                            self,
-                        ) {
-                            Ok(b) => {
-                                wl_surface.attach(Some(&b), 0, 0);
-                                wl_surface.commit();
-                                (b, None)
-                            }
-                            Err(e) => {
-                                let _ = pending.reply.send(Err(CmdFailure {
-                                    controller: "render-black".into(),
-                                    error: format!("{E_RENDER_UNAVAILABLE}: shm buffer: {e}"),
-                                }));
-                                return;
-                            }
-                        }
-                    }
-                }
-            };
+            }
+            BlackAttachStrategy::OversizedShm => {
+                // U5: unreachable — the black overlay never shifts.
+                // `black_attach_strategy` ignores `shift_px` entirely.
+                let _ = pending.reply.send(Err(CmdFailure {
+                    controller: "render-black".into(),
+                    error: format!("{E_RENDER_UNAVAILABLE}: internal error — U5 violated"),
+                }));
+                return;
+            }
+        };
 
         self.layer_surface = Some(pending.layer_surface);
         self.viewport = viewport;
         self.black_buffer = Some(buffer);
         self.configured_size = configured_size;
         self.surface_up = true;
-        self.maybe_arm_shift_timer();
+        // U5: black overlay never shifts — no shift timer to arm.
 
         tracing::info!(
             event = "render_black_up",
@@ -1796,6 +1832,11 @@ impl WaylandState {
     /// been the FIRST stage (no prior black), so the black buffer
     /// must be created on demand before the screensaver's pool goes
     /// away.
+    ///
+    /// U5: the black overlay never shifts — shift state from the
+    /// screensaver is reset before the black buffer is built.  The
+    /// black buffer uses the single-pixel fast path when available,
+    /// or a plain shm buffer at configured size.
     fn fail_screensaver_to_black(&mut self, reason: &str) {
         tracing::warn!(
             event = "screensaver_failed_to_black",
@@ -1803,35 +1844,20 @@ impl WaylandState {
             reason = reason,
         );
 
-        // Build a black buffer NOW if the screensaver was the first
-        // stage (no prior `RenderBlack` show to create one).  Use the
-        // single-pixel + viewporter path when available, otherwise the
-        // shm fallback — matches the black path's own choices.  When
-        // shift is active, `self.shift_state` is already `Some` (set
-        // by the screensaver's own `complete_screensaver_show` install)
-        // so `ensure_shift_viewport` here is just an idempotent
-        // destination re-assert; the oversized black buffer keeps the
-        // walk in progress valid regardless of which content is
-        // attached.
+        // U5: black overlay never shifts — reset any shift state the
+        // screensaver path set up before building the fallback buffer.
+        self.reset_shift();
+
+        // Build a black buffer on demand if the screensaver was the
+        // first stage (no prior `RenderBlack` show to create one).
+        // Use the single-pixel + viewporter path when available,
+        // otherwise the shm fallback.
         let dest = self.configured_size;
-        let mut shift_active = false;
         if self.black_buffer.is_none()
             && let Some(surface) = self.layer_surface.as_ref()
         {
             let wl_surface = surface.wl_surface().clone();
-            let shift_viewport = self.ensure_shift_viewport(&wl_surface, dest);
-            shift_active = shift_viewport.is_some();
-            if shift_active {
-                let (ow, oh) = self.render_dims(dest);
-                match crate::linux::surface::create_shm_black_buffer(ow, oh, self) {
-                    Ok(buffer) => self.black_buffer = Some(buffer),
-                    Err(e) => tracing::error!(
-                        event = "screensaver_black_fallback_failed",
-                        display_id = %self.display_id,
-                        error = %e,
-                    ),
-                }
-            } else if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
+            if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                 let buffer = self
                     .single_pixel_manager
                     .as_ref()
@@ -1853,10 +1879,6 @@ impl WaylandState {
                 }
             }
         }
-        // A pre-existing (cached) black_buffer means shift's already-
-        // armed walk (if any) is still what's driving the live
-        // viewport — reflect that in the damage-rect choice below.
-        shift_active |= self.shift_state.is_some();
 
         // Destroy the session — frees the mpv player + shm pool, removes
         // the calloop wakeup source, removes the deadline timer.
@@ -1866,10 +1888,6 @@ impl WaylandState {
         if let (Some(surface), Some(black)) = (&self.layer_surface, &self.black_buffer) {
             let wl_surface = surface.wl_surface();
             wl_surface.attach(Some(black), 0, 0);
-            if shift_active {
-                let (ow, oh) = self.render_dims(dest);
-                wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
-            }
             wl_surface.commit();
         }
     }
@@ -2095,27 +2113,15 @@ impl WaylandState {
                     // timer — but KEEP the layer surface alive.
                     self.destroy_screensaver_session();
 
-                    // Ensure a black buffer exists (may not, if the
-                    // screensaver was the first stage).  Use the same
-                    // single-pixel + viewporter / shm path the black
-                    // show uses — or, when pixel-shift is active, the
-                    // same oversized-shm + wp_viewport path
-                    // `complete_pending_show` uses (a cached
-                    // `black_buffer` from an earlier swap in THIS
-                    // surface's lifetime is already correctly sized,
-                    // since `shift_settings` never changes mid-thread-
-                    // lifetime — see `ShiftSettings` doc).
+                    // U5: the black overlay never shifts — build
+                    // (or reuse) a black buffer via the single-pixel
+                    // fast path when available, or shm fallback.
                     let dest = self.configured_size;
-                    let shift_viewport = self.ensure_shift_viewport(&wl_surface, dest);
+                    // Disarm and reset any shift state the screensaver
+                    // may have left active — U5: black never shifts.
+                    self.reset_shift();
                     if self.black_buffer.is_none() {
-                        if shift_viewport.is_some() {
-                            let (ow, oh) = self.render_dims(dest);
-                            if let Ok(buffer) =
-                                crate::linux::surface::create_shm_black_buffer(ow, oh, self)
-                            {
-                                self.black_buffer = Some(buffer);
-                            }
-                        } else if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
+                        if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                             let buffer = self
                                 .single_pixel_manager
                                 .as_ref()
@@ -2136,12 +2142,7 @@ impl WaylandState {
 
                     if let Some(black) = self.black_buffer.as_ref() {
                         wl_surface.attach(Some(black), 0, 0);
-                        if shift_viewport.is_some() {
-                            let (ow, oh) = self.render_dims(dest);
-                            wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
-                        }
                         wl_surface.commit();
-                        self.maybe_arm_shift_timer();
                         tracing::info!(
                             event = "render_black_swap",
                             display_id = %self.display_id,
@@ -2343,6 +2344,69 @@ mod tests {
             !stale_should_fail,
             "stale gen=1 timer must not fail gen=2's live pending show"
         );
+    }
+
+    // ── black_attach_strategy (U5: black never shifts) ────────────────
+    //
+    // These tests verify the U5 invariant: the black overlay always
+    // prefers the single-pixel fast path regardless of shift_px.
+    // Before the U5 restore, the black overlay would choose
+    // `OversizedShm` when `shift_px > 0` — these tests assert the
+    // inverse, so they must be RED against the pre-fix both-surfaces
+    // code and GREEN once the black path stops consulting shift.
+
+    #[test]
+    fn black_attach_with_shift_enabled_always_uses_single_pixel() {
+        // U5: even when shift_px > 0 AND the compositor supports
+        // single_pixel + viewporter, the black overlay uses the
+        // single-pixel fast path — never the oversized-shm shift path.
+        let strategy = super::black_attach_strategy(
+            2,    // shift_px > 0, shift IS configured
+            true, // single_pixel_manager available
+            true, // viewporter available
+        );
+        assert_eq!(
+            strategy,
+            super::BlackAttachStrategy::SinglePixel,
+            "U5: black overlay MUST use single-pixel path when available, \
+             even when shift_px > 0"
+        );
+    }
+
+    #[test]
+    fn black_attach_with_shift_enabled_falls_back_to_shm() {
+        // When single_pixel is unavailable but shift is configured,
+        // the black overlay still uses the plain SHM fallback — NOT
+        // an oversized shift buffer.
+        let strategy = super::black_attach_strategy(
+            2,     // shift_px > 0, shift IS configured
+            false, // single_pixel_manager unavailable
+            true,  // viewporter available
+        );
+        assert_eq!(
+            strategy,
+            super::BlackAttachStrategy::ShmFallback,
+            "U5: black overlay MUST use shm fallback (not oversized shift) \
+             when single_pixel is unavailable, even when shift_px > 0"
+        );
+    }
+
+    #[test]
+    fn black_attach_without_shift_uses_single_pixel() {
+        // Sanity: when shift is disabled (shift_px = 0), the black
+        // overlay uses single_pixel — this was correct before and
+        // must stay correct.
+        let strategy = super::black_attach_strategy(0, true, true);
+        assert_eq!(strategy, super::BlackAttachStrategy::SinglePixel);
+    }
+
+    #[test]
+    fn black_attach_without_viewporter_uses_shm() {
+        // When viewporter is unavailable, the black overlay falls
+        // back to SHM regardless of shift_px — this path is shared
+        // and must stay intact.
+        let strategy = super::black_attach_strategy(0, true, false);
+        assert_eq!(strategy, super::BlackAttachStrategy::ShmFallback);
     }
 
     // ── surface_match tests (round-3 — M2 stale-event guard) ───────────

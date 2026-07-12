@@ -97,11 +97,12 @@ type SourceBuilder =
 /// The 5th parameter is the OLED-health T10 pixel-shift settings —
 /// see [`dormant_render::ShiftSettings`] for why it's a SEPARATE
 /// parameter from the `ScreensaverSettings` one rather than a field on
-/// it: shift applies to BOTH the black overlay and the screensaver
-/// surface, so it's derived from `dc.screensaver` independently of
-/// whether the display's ladder ever reaches `RenderScreensaver`
-/// (see `build_render_sinks` below).  `None` means the display has no
-/// `[displays.<id>.screensaver]` table at all — shift stays disabled.
+/// it: shift applies only to the screensaver surface (U5: the black
+/// overlay never shifts), so it's derived from `dc.screensaver`
+/// independently of whether the display's ladder ever reaches
+/// `RenderScreensaver` (see `build_render_sinks` below).  `None` means
+/// the display has no `[displays.<id>.screensaver]` table at all —
+/// shift stays disabled.
 #[cfg(feature = "render")]
 type RenderSinkBuilder = Arc<
     dyn Fn(
@@ -1569,8 +1570,8 @@ fn build_render_sinks(
 
         // Shift settings (OLED-health T10): derived DIRECTLY from
         // `dc.screensaver`, independent of whether the ladder reaches
-        // `RenderScreensaver` — both the black overlay and the
-        // screensaver surface shift.  A display with no
+        // `RenderScreensaver` — only the screensaver surface shifts
+        // (U5: the black overlay never shifts).  A display with no
         // `[displays.<id>.screensaver]` table at all gets `None` here
         // (never a `set_shift` call), so the sink's shift stays fully
         // disabled (`ShiftSettings::default`).
@@ -2296,11 +2297,12 @@ mod render_tests {
 
     /// OLED-health T10, core adjudicated decision: pixel-shift settings
     /// must reach the sink even when the display's ladder is
-    /// black-only (no `RenderScreensaver` stage) — BOTH the black
-    /// overlay and the screensaver surface shift, and shift is derived
-    /// from `dc.screensaver` independently of the ladder.  This is the
-    /// scenario `ScreensaverSettings` deliberately does NOT cover (it's
-    /// only built when the ladder reaches `RenderScreensaver` — see
+    /// black-only (no `RenderScreensaver` stage) — the screensaver
+    /// surface shifts, and shift is derived from `dc.screensaver`
+    /// independently of the ladder (U5: the black overlay never
+    /// shifts).  This is the scenario `ScreensaverSettings` deliberately
+    /// does NOT cover (it's only built when the ladder reaches
+    /// `RenderScreensaver` — see
     /// the doc on `build_render_sinks`), which is exactly why shift is
     /// threaded as a separate parameter/command instead of a field on
     /// `ScreensaverSettings`.

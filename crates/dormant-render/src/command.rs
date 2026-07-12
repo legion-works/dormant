@@ -11,7 +11,7 @@
 use dormant_core::types::{CmdFailure, StageKind};
 
 #[cfg(target_os = "linux")]
-use crate::settings::ScreensaverSettings;
+use crate::settings::{ScreensaverSettings, ShiftSettings};
 
 /// A command sent from the async engine task to the dedicated Wayland
 /// thread via a [`calloop::channel`].
@@ -75,6 +75,30 @@ pub(crate) enum RenderCommand {
         /// (`Ok`) or by the first-frame deadline timer (`Err`).
         reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
     },
+
+    /// Linux-only, OLED-health T10: register (or replace) the
+    /// per-display pixel-shift settings.  Fire-and-forget — no reply,
+    /// same non-fatal-if-thread-gone shape as `Teardown`'s send.
+    ///
+    /// Unlike `ShowScreensaver`'s `settings` payload (per-show,
+    /// consumed once), shift settings are NOT per-show: they're a
+    /// static per-display property that the screensaver surface
+    /// consults.  Rather than thread a shift field through every
+    /// `Show`/`ShowScreensaver` variant (a much larger ripple across
+    /// every call site, for a value that never varies show-to-show),
+    /// this is a dedicated command that sets
+    /// `WaylandState::shift_settings` directly; the screensaver
+    /// install path reads that field at attach time.
+    /// The channel is FIFO, so a `set_shift` issued at sink-build time
+    /// (mirroring `set_screensaver`'s call site) is guaranteed to be
+    /// applied before the first `Show`/`ShowScreensaver` reaches the
+    /// thread.
+    #[cfg(target_os = "linux")]
+    SetShift {
+        /// The new shift settings to apply to this display's Wayland
+        /// thread state.
+        shift: ShiftSettings,
+    },
 }
 
 #[cfg(test)]
@@ -107,6 +131,8 @@ mod tests {
             RenderCommand::Teardown { .. } => panic!("expected Show variant"),
             #[cfg(target_os = "linux")]
             RenderCommand::ShowScreensaver { .. } => panic!("expected Show variant"),
+            #[cfg(target_os = "linux")]
+            RenderCommand::SetShift { .. } => panic!("expected Show variant"),
         }
         let r = tokio::runtime::Runtime::new()
             .unwrap()
@@ -156,11 +182,32 @@ mod tests {
             RenderCommand::Show { .. } => panic!("expected Teardown variant"),
             #[cfg(target_os = "linux")]
             RenderCommand::ShowScreensaver { .. } => panic!("expected Teardown variant"),
+            #[cfg(target_os = "linux")]
+            RenderCommand::SetShift { .. } => panic!("expected Teardown variant"),
         }
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(rx)
             .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_shift_carries_settings() {
+        let shift = ShiftSettings {
+            shift_px: 3,
+            shift_interval: std::time::Duration::from_secs(45),
+        };
+        let cmd = RenderCommand::SetShift { shift };
+        match cmd {
+            RenderCommand::SetShift { shift } => {
+                assert_eq!(shift.shift_px, 3);
+                assert_eq!(shift.shift_interval, std::time::Duration::from_secs(45));
+            }
+            RenderCommand::Show { .. }
+            | RenderCommand::Teardown { .. }
+            | RenderCommand::ShowScreensaver { .. } => panic!("expected SetShift variant"),
+        }
     }
 
     #[cfg(target_os = "linux")]

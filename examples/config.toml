@@ -190,7 +190,10 @@ modes = ["power_off"]
 # # validator.  Default: "1s".
 # transition_duration = "500ms"
 # # shift_px / shift_interval — periodic micro pixel-shift on the screensaver
-# # surface only, to even out static-image burn-in. shift_px = 0 disables.
+# # surface only, to even out static-image burn-in. The black overlay never
+# # shifts (U5): a uniform black field is translation-invariant on OLED.
+# # shift_px is in buffer pixels (a fractional output scale multiplies the
+# # physical step). shift_px = 0 disables.
 # shift_px = 2                   # pixels per shift, 0..=8 (default 2)
 # shift_interval = "120s"        # time between shifts, >= 10s (default "120s")
 # [[displays.desktop.screensaver.source]]

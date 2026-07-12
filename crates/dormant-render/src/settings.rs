@@ -247,6 +247,53 @@ impl Default for ScreensaverSettings {
     }
 }
 
+/// Per-display micro pixel-shift configuration (OLED-health T10) —
+/// threaded to the render sink INDEPENDENTLY of [`ScreensaverSettings`]
+/// because only the screensaver surface shifts — the black overlay never
+/// shifts (U5: a uniform RGB(0,0,0) field is translation-invariant on
+/// OLED, subpixels off), whereas `ScreensaverSettings` only ever reaches
+/// the sink when the display's ladder contains a `RenderScreensaver`
+/// stage.  Mirrors `dormant_core::config::schema::ScreensaverConfig::shift_px`
+/// / `.shift_interval` — the daemon assembles this from
+/// `displays.<id>.screensaver.shift_px` / `.shift_interval` in
+/// [`crate::linux::LayerShellRenderSink::set_shift`]'s caller
+/// (`dormantd::app::build_render_sinks`), regardless of whether that
+/// display's ladder ever reaches `RenderScreensaver`.
+///
+/// A display with NO `[displays.<id>.screensaver]` table never gets a
+/// `set_shift` call at all — the sink then keeps [`Self::default`]
+/// (`shift_px: 0`, fully disabled), which is byte-identical to the
+/// pre-T10 render path (no oversized buffer, no `wp_viewport::set_source`,
+/// no timer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShiftSettings {
+    /// Raster-walk step size, in **buffer pixels** — NOT compositor /
+    /// output pixels.  Probe finding 2: a fractional output scale
+    /// multiplies the on-screen physical step (e.g. a 2 buffer-px
+    /// step measured as ~2.5 physical px at output scale 1.25); the
+    /// shift magnitude is approximate by design (wear-evening, not a
+    /// precision tool).  `0` disables the shift entirely: the
+    /// Wayland glue never oversizes a buffer, never calls
+    /// `wp_viewport::set_source`, and never arms the shift timer —
+    /// rendering is byte-identical to the pre-T10 code path.
+    /// Validated upstream to `0..=8`
+    /// (`dormant_core::config::validate`).
+    pub shift_px: u8,
+    /// Interval between successive raster-walk steps.  Ignored when
+    /// `shift_px == 0`.  Validated upstream to `>= 10s`
+    /// (`dormant_core::config::validate`).
+    pub shift_interval: Duration,
+}
+
+impl Default for ShiftSettings {
+    fn default() -> Self {
+        Self {
+            shift_px: 0,
+            shift_interval: Duration::from_secs(120),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::uninlined_format_args)]
 mod tests {
@@ -303,6 +350,38 @@ mod tests {
         assert_eq!(s.scale_mode, ScaleMode::Center);
         assert_eq!(s.transition, TransitionMode::None);
         assert_eq!(s.transition_duration, Duration::from_millis(500));
+    }
+
+    // ── ShiftSettings ─────────────────────────────────────────────────
+
+    #[test]
+    fn shift_settings_default_is_fully_disabled() {
+        // shift_px = 0 is the SAFETY invariant: a sink that never
+        // receives a `set_shift` call (no `[displays.<id>.screensaver]`
+        // table) must render byte-identically to pre-T10.
+        let s = ShiftSettings::default();
+        assert_eq!(s.shift_px, 0);
+        assert_eq!(s.shift_interval, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn shift_settings_carries_configured_values() {
+        let s = ShiftSettings {
+            shift_px: 4,
+            shift_interval: Duration::from_secs(90),
+        };
+        assert_eq!(s.shift_px, 4);
+        assert_eq!(s.shift_interval, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn shift_settings_is_copy_and_eq() {
+        let a = ShiftSettings {
+            shift_px: 2,
+            shift_interval: Duration::from_secs(120),
+        };
+        let b = a; // Copy, not move — proves the derive.
+        assert_eq!(a, b);
     }
 
     // ── TransitionMode ────────────────────────────────────────────────

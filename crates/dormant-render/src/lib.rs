@@ -42,6 +42,7 @@
 
 mod command;
 mod latch;
+mod shift;
 
 pub mod playlist;
 pub mod settings;
@@ -58,7 +59,7 @@ mod stub;
 // from a `dormant_core::config::ScreensaverConfig` and pass it into
 // the sink.  Available on all platforms — the stub sink just ignores
 // the settings.
-pub use settings::{ScaleMode, ScreensaverSettings, TransitionMode};
+pub use settings::{ScaleMode, ScreensaverSettings, ShiftSettings, TransitionMode};
 
 // Linux uses the real Wayland backend; non-Linux uses the stub.  Both
 // expose a `LayerShellRenderSink` with the same surface so consumers

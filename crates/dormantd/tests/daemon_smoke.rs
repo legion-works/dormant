@@ -1253,11 +1253,12 @@ wake_retry_interval = "1s"
         String,
         Option<&tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
         Option<&dormant_render::ScreensaverSettings>,
+        Option<&dormant_render::ShiftSettings>,
     ) -> Option<Arc<dyn dormant_core::traits::RenderSink>>
     + Send
     + Sync
     + 'static {
-        move |_did, _output, _tx, _ss| Some(Arc::new(sink.clone()))
+        move |_did, _output, _tx, _ss, _shift| Some(Arc::new(sink.clone()))
     }
 
     /// Assembles a config with a render ladder and verifies the
@@ -1549,22 +1550,22 @@ wake_retry_interval = "1s"
         // selection can tell rollback sinks apart from initial ones.
         let pairs: Arc<Mutex<Vec<WakePair>>> = Arc::new(Mutex::new(Vec::new()));
         let pairs_for_factory = pairs.clone();
-        let builder =
-            move |_did: dormant_core::types::DisplayId,
-                  _output: String,
-                  tx: Option<
-                &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
-            >,
-                  _ss: Option<&dormant_render::ScreensaverSettings>| {
-                let sink = RecordingRenderSink::new();
-                if let Some(tx) = tx {
-                    pairs_for_factory
-                        .lock()
-                        .unwrap()
-                        .push((sink.clone(), tx.clone()));
-                }
-                Some(Arc::new(sink) as Arc<dyn dormant_core::traits::RenderSink>)
-            };
+        let builder = move |_did: dormant_core::types::DisplayId,
+                            _output: String,
+                            tx: Option<
+            &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+        >,
+                            _ss: Option<&dormant_render::ScreensaverSettings>,
+                            _shift: Option<&dormant_render::ShiftSettings>| {
+            let sink = RecordingRenderSink::new();
+            if let Some(tx) = tx {
+                pairs_for_factory
+                    .lock()
+                    .unwrap()
+                    .push((sink.clone(), tx.clone()));
+            }
+            Some(Arc::new(sink) as Arc<dyn dormant_core::traits::RenderSink>)
+        };
 
         let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
         let app = App::build_with_sources(

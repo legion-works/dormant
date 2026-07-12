@@ -21,7 +21,7 @@ use dormant_core::traits::RenderSink;
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 use crate::command::RenderCommand;
-use crate::settings::ScreensaverSettings;
+use crate::settings::{ScreensaverSettings, ShiftSettings};
 
 /// Per-display handle that ships [`RenderSink`] commands across the
 /// async-tokio → sync-calloop boundary to a dedicated wayland thread.
@@ -99,6 +99,25 @@ impl LayerShellRenderSink {
         if let Ok(mut guard) = self.screensaver.lock() {
             *guard = Some(settings);
         }
+    }
+
+    /// Register (or replace) the per-display pixel-shift settings
+    /// (OLED-health T10).  Unlike [`Self::set_screensaver`] this does
+    /// NOT cache the value on the handle — it's a fire-and-forget
+    /// `RenderCommand::SetShift` send straight to the Wayland
+    /// thread, which stores it directly on `WaylandState`; the
+    /// screensaver install path reads it at attach time.  U5: the
+    /// black overlay never shifts — this setting does not affect it.
+    /// See [`crate::settings::ShiftSettings`] for why this is a
+    /// dedicated seam rather than a field on `ScreensaverSettings`.
+    ///
+    /// Safe to call before the daemon issues any `show()` — the
+    /// channel is FIFO, so a call at sink-build time (the daemon's
+    /// only call site today) is guaranteed to land before the first
+    /// Show/ShowScreensaver command.  Send failures (thread already
+    /// gone) are swallowed, matching `teardown`'s non-fatal shape.
+    pub fn set_shift(&self, shift: ShiftSettings) {
+        let _ = self.cmd_tx.send(RenderCommand::SetShift { shift });
     }
 
     /// Identifier of the display this sink was built for.

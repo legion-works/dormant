@@ -20,6 +20,17 @@ export interface PatchStore {
   trackRemove(path: string[]): void;
   /** Return the pending set value for a path, or undefined if not tracked (or a remove is pending). */
   getEdit(path: string[]): unknown | undefined;
+  /**
+   * Track a pending `CreateEntity` for `id` in `collection` (spec §3/§7).
+   * A later `trackDelete` for the same `collection`/`id` replaces it
+   * (last-write-wins, mirroring the trackEdit/trackRemove pair).
+   */
+  trackCreate(collection: string, id: string, value: unknown): void;
+  /**
+   * Track a pending `DeleteEntity` for `id` in `collection`. A later
+   * `trackCreate` for the same `collection`/`id` replaces it.
+   */
+  trackDelete(collection: string, id: string): void;
   buildPatches(): ConfigPatch[];
   isLocked(path: string[], redactedPaths: string[][]): boolean;
   reset(): void;
@@ -36,6 +47,10 @@ export function createPatchStore(): PatchStore {
   const edits = new Map<string, unknown>();
   /* pending removals: key → true */
   const removals = new Set<string>();
+  /* pending creates: "collection\x1Eid" → {collection, id, value} */
+  const creates = new Map<string, { collection: string; id: string; value: unknown }>();
+  /* pending deletes: "collection\x1Eid" → {collection, id} */
+  const deletes = new Map<string, { collection: string; id: string }>();
 
   function trackEdit(path: string[], value: unknown): void {
     const key = pathKey(path);
@@ -64,6 +79,20 @@ export function createPatchStore(): PatchStore {
     return edits.get(key);
   }
 
+  function trackCreate(collection: string, id: string, value: unknown): void {
+    const key = pathKey([collection, id]);
+    creates.set(key, { collection, id, value });
+    // Last-write-wins: a create after a delete replaces the delete.
+    deletes.delete(key);
+  }
+
+  function trackDelete(collection: string, id: string): void {
+    const key = pathKey([collection, id]);
+    deletes.set(key, { collection, id });
+    // Last-write-wins: a delete after a create replaces the create.
+    creates.delete(key);
+  }
+
   function buildPatches(): ConfigPatch[] {
     const patches: ConfigPatch[] = [];
 
@@ -75,6 +104,14 @@ export function createPatchStore(): PatchStore {
     for (const key of removals) {
       const path = key.split("\x1E");
       patches.push({ op: "remove", path });
+    }
+
+    for (const { collection, id, value } of creates.values()) {
+      patches.push({ op: "create_entity", collection, id, value });
+    }
+
+    for (const { collection, id } of deletes.values()) {
+      patches.push({ op: "delete_entity", collection, id });
     }
 
     return patches;
@@ -124,7 +161,18 @@ export function createPatchStore(): PatchStore {
   function reset(): void {
     edits.clear();
     removals.clear();
+    creates.clear();
+    deletes.clear();
   }
 
-  return { trackEdit, trackRemove, getEdit, buildPatches, isLocked, reset };
+  return {
+    trackEdit,
+    trackRemove,
+    getEdit,
+    trackCreate,
+    trackDelete,
+    buildPatches,
+    isLocked,
+    reset,
+  };
 }

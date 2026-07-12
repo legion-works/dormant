@@ -17,8 +17,10 @@ import SensorsSection from "./SensorsSection";
 import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
 import DisplaysSection from "./DisplaysSection";
+import PairingWizard from "./PairingWizard";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
+import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
 
 interface SettingsFormProps {
   config: ConfigResponse;
@@ -63,6 +65,11 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
   const [conflict, setConflict] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string | undefined>>({});
   const [bannerErrors, setBannerErrors] = useState<string[]>([]);
+  // Pairing wizard "create display?" hand-off (spec §8.3) — set when the
+  // operator accepts it, consumed by DisplaysSection to auto-open its
+  // create form pre-filled, then cleared so a later manual Add doesn't
+  // reuse stale values.
+  const [pairingPrefill, setPairingPrefill] = useState<Record<string, unknown> | null>(null);
 
   // Re-sync config when the prop changes (e.g. after parent re-fetches).
   // Uses a ref to track the last-synced fingerprint rather than reading
@@ -201,6 +208,11 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
   }, [dirtyCount, onNavigationGuard, handleDiscard]);
 
   const inv = config.inventory;
+  const entityCrudEnabled = isEntityCrudEnabled(inv.daemon);
+  const pairingEnabled = isPairingEnabled(inv.daemon);
+  const sensorIds = Object.keys(inv.sensors);
+  const zoneIds = Object.keys(inv.zones);
+  const displayIds = Object.keys(inv.displays);
 
   return (
     <div className="cf-form">
@@ -234,6 +246,8 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         redactedPaths={config.redacted_paths}
         onDirty={onDirty}
         fieldErrors={fieldErrors}
+        entityCrudEnabled={entityCrudEnabled}
+        zones={inv.zones}
       />
 
       <ZonesSection
@@ -242,6 +256,9 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         redactedPaths={config.redacted_paths}
         onDirty={onDirty}
         fieldErrors={fieldErrors}
+        entityCrudEnabled={entityCrudEnabled}
+        sensorIds={sensorIds}
+        rules={inv.rules}
       />
 
       <RulesSection
@@ -250,6 +267,9 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         redactedPaths={config.redacted_paths}
         onDirty={onDirty}
         fieldErrors={fieldErrors}
+        entityCrudEnabled={entityCrudEnabled}
+        zoneIds={zoneIds}
+        displayIds={displayIds}
       />
 
       <DisplaysSection
@@ -258,6 +278,14 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         redactedPaths={config.redacted_paths}
         onDirty={onDirty}
         fieldErrors={fieldErrors}
+        entityCrudEnabled={entityCrudEnabled}
+        rules={inv.rules}
+        createPrefill={pairingPrefill}
+      />
+
+      <PairingWizard
+        pairingEnabled={pairingEnabled}
+        onDisplayCreateRequest={(prefill) => setPairingPrefill(prefill)}
       />
 
       {/* Banner-level errors not mapped to fields */}

@@ -14,9 +14,11 @@ import FormSection from "./FormSection";
 import LadderEditor from "./LadderEditor";
 import ScreensaverEditor from "./ScreensaverEditor";
 import { EnumField, PANEL_TYPES } from "./fields";
-import { useState } from "react";
-import type { DisplayConfig, LadderStage } from "../../api/types";
+import { useState, useEffect } from "react";
+import type { DisplayConfig, LadderStage, RuleConfig } from "../../api/types";
 import type { PatchStore } from "./patch";
+import CreateEntityForm from "./CreateEntityForm";
+import { referencingEntities } from "./entityCrud";
 
 const BLANK_MODE_OPTIONS = ["power_off", "screen_off_audio_on", "brightness_zero"] as const;
 
@@ -52,15 +54,50 @@ interface DisplaysSectionProps {
   redactedPaths: string[][];
   onDirty: () => void;
   fieldErrors: Record<string, string | undefined>;
+  /** Whether entity create/delete is enabled (`daemon.entity_crud_enabled`, spec §2/§10). Defaults to true for pre-feature callers. */
+  entityCrudEnabled?: boolean;
+  /** Live rules inventory — used to compute the delete-confirm references warning (spec §7). */
+  rules?: Record<string, RuleConfig>;
+  /**
+   * Pre-fill for the create form from the pairing wizard's post-pair
+   * "create display?" hand-off (spec §8.3: `{host, controllers:
+   * ["samsung-tizen"]}`). Presence auto-opens the create form.
+   */
+  createPrefill?: Record<string, unknown> | null;
 }
 
-export default function DisplaysSection({ displays, store, redactedPaths, onDirty, fieldErrors }: DisplaysSectionProps) {
+export default function DisplaysSection({
+  displays,
+  store,
+  redactedPaths,
+  onDirty,
+  fieldErrors,
+  entityCrudEnabled = true,
+  rules = {},
+  createPrefill = null,
+}: DisplaysSectionProps) {
   const ids = Object.keys(displays);
   // Re-render tick: incremented on mode switch so the pending indicator
   // and effective mode update immediately even without a parent re-render.
   const [, rerender] = useState(0);
+  const [showCreate, setShowCreate] = useState(createPrefill != null);
 
-  if (ids.length === 0) return null;
+  useEffect(() => {
+    if (createPrefill) setShowCreate(true);
+  }, [createPrefill]);
+
+  if (ids.length === 0 && !entityCrudEnabled) return null;
+
+  function handleDelete(id: string) {
+    const refs = referencingEntities("displays", id, { zones: {}, rules });
+    const msg = refs.length > 0
+      ? `Delete display "${id}"? It is referenced by ${refs.join(", ")} — deleting it may make those entities invalid.`
+      : `Delete display "${id}"?`;
+    if (window.confirm(msg)) {
+      store.trackDelete("displays", id);
+      onDirty();
+    }
+  }
 
   return (
     <FormSection title="Displays">
@@ -87,6 +124,15 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
           <div key={id} className="cf-card">
             <div className="cf-card__header">
               <span className="cf-card__name">{id}</span>
+              {entityCrudEnabled && (
+                <button
+                  type="button"
+                  className="cf-apply__btn cf-apply__btn--danger cf-card__delete"
+                  onClick={() => handleDelete(id)}
+                >
+                  Delete
+                </button>
+              )}
             </div>
 
             {/* ── No-mode warning ── */}
@@ -199,6 +245,26 @@ export default function DisplaysSection({ displays, store, redactedPaths, onDirt
           </div>
         );
       })}
+
+      {entityCrudEnabled && (
+        showCreate ? (
+          <CreateEntityForm
+            collection="displays"
+            existingIds={ids}
+            initialFields={createPrefill ?? undefined}
+            onCreate={(id, value) => {
+              store.trackCreate("displays", id, value);
+              onDirty();
+              setShowCreate(false);
+            }}
+            onCancel={() => setShowCreate(false)}
+          />
+        ) : (
+          <button type="button" className="cf-apply__btn cf-card__add" onClick={() => setShowCreate(true)}>
+            + Add display
+          </button>
+        )
+      )}
     </FormSection>
   );
 }

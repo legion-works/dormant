@@ -824,8 +824,9 @@ describe("Config tab-switch guard", () => {
     expect(patches).toHaveLength(3);
 
     // Verify the patch paths — these must be accepted by the server's
-    // is_known_config_path and editable-subset checks.
-    const paths = patches.map((p) => p.path.join("."));
+    // is_known_config_path and editable-subset checks. All three patches
+    // here come from trackEdit, so every entry has a `path`.
+    const paths = patches.map((p) => ("path" in p ? p.path.join(".") : ""));
     expect(paths).toContain("daemon.idle_time_unit");
     expect(paths).toContain("daemon.idle_source");
     expect(paths).toContain("daemon.stale_sensor_timeout");
@@ -943,7 +944,7 @@ describe("DisplaysSection — mode switch", () => {
 
     // No OTHER patches targeting this display
     const displayPatches = patches.filter(
-      (p) => p.path[0] === "displays" && p.path[1] === "lg-oled",
+      (p) => "path" in p && p.path[0] === "displays" && p.path[1] === "lg-oled",
     );
     expect(displayPatches).toHaveLength(3);
   });
@@ -987,7 +988,7 @@ describe("DisplaysSection — mode switch", () => {
 
     // No OTHER patches targeting this display
     const displayPatches = patches.filter(
-      (p) => p.path[0] === "displays" && p.path[1] === "lg-oled",
+      (p) => "path" in p && p.path[0] === "displays" && p.path[1] === "lg-oled",
     );
     expect(displayPatches).toHaveLength(2);
   });
@@ -1001,8 +1002,10 @@ describe("DisplaysSection — mode switch", () => {
       expect(screen.getByText("Displays")).toBeInTheDocument();
     });
 
-    // Should render the display name
-    expect(screen.getByText("monitor")).toBeInTheDocument();
+    // Should render the display name (also appears as a `displays`
+    // cross-ref multi-select option in RulesSection now that entity_crud_enabled
+    // defaults to true — config-crud-wizard T6 — so this may match >1 element)
+    expect(screen.getAllByText("monitor").length).toBeGreaterThanOrEqual(1);
     // Updated warning text (no stale "until this editor ships" copy)
     expect(screen.getByText(/neither blank_mode nor a ladder/)).toBeInTheDocument();
   });
@@ -1072,6 +1075,9 @@ describe("DisplaysSection — mode switch", () => {
       expect(screen.getByText("Displays")).toBeInTheDocument();
     });
 
-    expect(screen.getByText("tv")).toBeInTheDocument();
+    // "tv" also appears as a `displays` cross-ref multi-select option in
+    // RulesSection now that entity_crud_enabled defaults to true
+    // (config-crud-wizard T6), so this may match >1 element.
+    expect(screen.getAllByText("tv").length).toBeGreaterThanOrEqual(1);
   });
 });

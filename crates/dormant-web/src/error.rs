@@ -76,6 +76,11 @@ pub(crate) enum WebError {
     PatchCapExceeded(u32),
     /// `CreateEntity` targeted an id that already exists in the collection.
     EntityExists(String),
+    /// A `CreateEntity`/`DeleteEntity` patch was submitted to
+    /// `/api/config/apply` while `daemon.entity_crud_enabled = false`
+    /// (spec §2: "the UI hides the affordance but the server is the
+    /// boundary"). `Set`/`Remove` patches are unaffected.
+    EntityCrudFeatureDisabled,
     /// `POST /api/pair/samsung` was called while
     /// `daemon.pairing_enabled = false`.
     PairFeatureDisabled,
@@ -169,6 +174,9 @@ impl IntoResponse for WebError {
                     "detail": detail
                 }] });
                 return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
+            }
+            WebError::EntityCrudFeatureDisabled => {
+                (StatusCode::FORBIDDEN, "feature_disabled", None)
             }
 
             // ── Pairing-wizard variants (Task 5) ───────────────────────────────

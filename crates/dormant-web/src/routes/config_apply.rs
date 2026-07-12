@@ -120,6 +120,23 @@ pub(crate) async fn post_apply(
     let mut cfg: dormant_core::config::schema::Config = toml::from_str(&raw)
         .map_err(|e| WebError::ConfigReadError(format!("config deserialize error: {e}")))?;
 
+    // ── Step 2b: entity_crud_enabled gate (spec §2) ─────────────────────
+    // The switch gates the CRUD *verbs* (CreateEntity/DeleteEntity), not
+    // ordinary edits — Set/Remove ride the existing 5-stage pipeline
+    // unchanged (spec §11 invariant 2, §0: "the existing 5-stage
+    // pipeline, UNCHANGED"). Read from `cfg`, the SAME just-re-read,
+    // fingerprint-matched bytes `check_patches` below validates against
+    // (not the live `config_rx` watch, which could momentarily lag a
+    // concurrent on-disk edit) — this is the strictest, race-free read of
+    // "current" available in this handler.
+    let wants_entity_crud = body
+        .patches
+        .iter()
+        .any(|p| matches!(p, Patch::CreateEntity { .. } | Patch::DeleteEntity { .. }));
+    if wants_entity_crud && !cfg.daemon.entity_crud_enabled {
+        return Err(WebError::EntityCrudFeatureDisabled);
+    }
+
     // ── Step 3: redact for redacted-path checking ──────────────────────
     let redacted = redact_config_secrets(&mut cfg);
 
@@ -1592,5 +1609,163 @@ displays = []
         );
         assert!(after.contains(r#"type = "mqtt""#));
         assert!(after.contains(r#"broker_url = "mqtt://localhost""#));
+    }
+
+    // ── entity_crud_enabled server-side enforcement (cross-task Must) ───────
+    // T1 shipped `daemon.entity_crud_enabled` (default true) with zero
+    // server-side gate: `check_create_entity`/`check_delete_entity` never
+    // consulted it, so a client could POST create_entity/delete_entity with
+    // the flag off and succeed. Spec §2: "When a switch is false, the route
+    // returns 403 `feature_disabled` ... the UI hides the affordance but the
+    // server is the boundary." `Set`/`Remove` patches are NOT gated by this
+    // flag (spec §2 talks about "the route" for the CRUD verbs; §11
+    // invariant 2 confirms ordinary `Set`/`Remove` editing is unrelated,
+    // pre-existing behaviour this spec does not touch).
+
+    fn minimal_config_crud_disabled() -> Config {
+        let mut cfg = minimal_config();
+        cfg.daemon.entity_crud_enabled = false;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn create_entity_denied_when_crud_disabled_403_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // post_apply re-parses `cfg` fresh from THIS on-disk content (not
+        // from the in-memory `Config` handed to `test_state`, which only
+        // seeds `config_rx`) — the flag must live in the file.
+        let content = "config_version = 1\n[daemon]\nentity_crud_enabled = false\n[sensors]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_crud_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "newsensor".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/new",
+                }),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "create_entity must be denied 403 when daemon.entity_crud_enabled is false"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "feature_disabled");
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when entity CRUD is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_denied_when_crud_disabled_403_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // post_apply re-parses `cfg` fresh from THIS on-disk content (not
+        // from the in-memory `Config` handed to `test_state`) — the flag
+        // must live in the file.
+        let content = r#"
+config_version = 1
+
+[daemon]
+entity_crud_enabled = false
+
+[zones.myzone]
+mode = "any"
+members = []
+"#;
+        write_config(dir.path(), content);
+
+        let mut cfg = minimal_config();
+        cfg.daemon.entity_crud_enabled = false;
+        let mut zones = IndexMap::new();
+        zones.insert(
+            "myzone".into(),
+            ZoneConfig {
+                mode: "any".into(),
+                members: vec![],
+                quorum: None,
+                threshold: None,
+                weights: IndexMap::default(),
+                unavailable_policy: dormant_core::zone::UnavailablePolicy::Present,
+            },
+        );
+        cfg.zones = zones;
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::DeleteEntity {
+                collection: "zones".into(),
+                id: "myzone".into(),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "delete_entity must be denied 403 when daemon.entity_crud_enabled is false"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "feature_disabled");
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when entity CRUD is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_patch_unaffected_by_crud_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // entity_crud_enabled = false in the ACTUAL on-disk content (what
+        // post_apply re-parses `cfg` from) — a plain Set must still work.
+        let content = "config_version = 1\n[daemon]\nentity_crud_enabled = false\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_crud_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "log_level".into()],
+                value: serde_json::Value::String("debug".into()),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(
+            result.is_ok(),
+            "an ordinary Set patch must still succeed when entity_crud_enabled is false \
+             (the flag gates create_entity/delete_entity only, not Set/Remove): {:?}",
+            result.err()
+        );
     }
 }

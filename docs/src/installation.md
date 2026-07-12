@@ -4,17 +4,17 @@
 
 - Linux (x86_64 or aarch64) with a desktop environment (X11 or Wayland)
 - Rust 1.88+ (MSRV) if installing from source
-- `libudev` for USB-serial sensor support: `sudo apt install libudev-dev pkg-config`
+- Build dependencies for the full daemon: `sudo apt install libudev-dev libwayland-dev libmpv-dev pkg-config`
 - If `pkg-config` cannot find `libudev`, set `PKG_CONFIG_PATH=/usr/lib/pkgconfig`
 
-### Optional: render backend
+### Render backend
 
 The software render backend (`render_black`, `render_screensaver` ladder stages)
-is off by default. To enable it:
+is off by default. The full build below enables it. For a smaller build, omit
+`render` and its `libwayland-dev` / `libmpv-dev` dependencies.
 
 - **Build:** add `--features render` — `cargo build --release --features render`
-- **Deps (Linux):** `sudo apt install libwayland-dev` (Wayland client protocol
-  headers)
+- **Dependencies:** `libwayland-dev`, `libmpv-dev`, and `pkg-config`
 - Without the feature, configs using render stages are rejected at startup with
   `E_RENDER_UNAVAILABLE`; the daemon, CLI, and non-render sensors/displays still
   build and run normally.
@@ -24,7 +24,8 @@ is off by default. To enable it:
 ```bash
 git clone https://github.com/legion-works/dormant.git
 cd dormant
-cargo build --release
+sudo apt install libudev-dev libwayland-dev libmpv-dev pkg-config
+cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 ```
@@ -77,11 +78,16 @@ systemctl --user status dormant
 journalctl --user -u dormant -f
 ```
 
-The unit is configured to restart on failure and reload (SIGHUP) on `systemctl --user reload dormant`. To stop:
+The unit runs as `Type=notify`, restarts on failure, and uses a 150-second engine-liveness watchdog. Reload sends `SIGHUP` through `systemctl --user reload dormant`. To stop:
 
 ```bash
 systemctl --user stop dormant
 ```
+
+When upgrading from a unit that used `Type=simple`, install the new
+`dormantd` binary before copying or reloading the new unit. Then run
+`systemctl --user daemon-reload` and `systemctl --user restart dormant`.
+See [Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
 ## Configuration file location
 
@@ -91,7 +97,7 @@ dormant reads config from these paths, first match wins:
 2. `$DORMANT_CONFIG` environment variable
 3. `$XDG_CONFIG_HOME/dormant/config.toml` (usually `~/.config/dormant/config.toml`)
 
-Credentials (HA tokens, Samsung TV tokens) go in a separate file with restricted permissions:
+MQTT credentials, HA tokens, and Samsung TV tokens go in a separate file with restricted permissions:
 
 ```
 $XDG_CONFIG_HOME/dormant/credentials.toml

@@ -1,21 +1,16 @@
 # Failure notifications
 
-A silent control failure on a display you're not looking at is invisible —
-the daemon logs it and keeps retrying, but nothing tells the operator. When a
-wake command keeps failing or a blank command exhausts its whole controller
-chain, `dormant` surfaces it on three independent surfaces:
+When a wake command keeps failing or a blank command exhausts its controller
+chain, dormant surfaces the failure in three places:
 
 - a **desktop notification** over the session D-Bus (`org.freedesktop.Notifications`),
 - a **tray icon state** (`Failure`, outranking `Paused`) with a badge and
   tooltip detail, and
 - a **web-dashboard failure banner** on the Dashboard view.
 
-The tray and web-dashboard surfaces derive directly from the per-display
-snapshot (`wake_attempts > 0 || last_blank_failed`) and always reflect the
-truth regardless of the `[notifications]` config — only the desktop
-notification is gated by `[notifications] enabled`. Disabling notifications
-silences the desktop popups only; the tray icon and dashboard banner keep
-showing a failing display.
+The tray and web dashboard read per-display failure state directly. Only the
+desktop popup is gated by `notifications.enabled`; disabling it does not hide
+the tray state or dashboard banner.
 
 ## What fires and when
 
@@ -25,7 +20,7 @@ showing a failing display.
 | Blank failure | a blank command exhausts its controller chain — **one-shot, no threshold** | Critical | Yes, if `notify_recovery` |
 | Recovery (wake or blank) | the display succeeds its wake/blank command after a prior failure notice | Normal | gated by `notify_recovery` itself |
 
-Two details worth being precise about:
+Two rules matter:
 
 - **The threshold applies to wake failures only.** Each failed wake attempt
   increments a per-display counter; a notification fires only once that
@@ -68,13 +63,9 @@ notification until the user dismisses it, rather than letting it time out
 and vanish. Recovery notices use `normal` urgency, since they are
 informational rather than something the operator must act on.
 
-This asymmetry is deliberate: a display that won't wake is the worst failure
-mode a presence daemon can have — the whole point of `dormant` is that the
-screen comes back the instant you're back in the room, and a wake failure
-means it silently didn't. A notification that quietly expires while the
-operator is away from their desk defeats the point, so wake and blank
-failures are pushed as loud, sticky notices; a recovery is a "for your
-information," not an emergency.
+A display that will not wake is the worst failure mode for a presence daemon.
+Wake and blank failures therefore use loud, sticky notices; recovery is
+informational.
 
 ## Reload carry-over semantics
 

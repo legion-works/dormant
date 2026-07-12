@@ -48,7 +48,6 @@ Three binaries: **`dormantd`** (the daemon), **`dormantctl`** (the CLI), and **`
 | MQTT — Zigbee2MQTT, ESPHome, any broker (auth supported) | Ready |
 | Home Assistant WebSocket | Ready |
 | USB-serial LD2410 mmWave radar | Ready |
-| Keyboard/mouse idle (Wayland `ext_idle_notifier` + DBus fallback) | Ready |
 
 Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A sensor that goes quiet — broker down, USB unplugged, a stale reading — resolves as *present*, never absent. dormant will not blank a room it can't see.
 
@@ -62,19 +61,19 @@ Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A 
 | `ha-passthrough` — any Home Assistant service call | Ready |
 | `command` — arbitrary blank/wake shell commands | Ready |
 
-Each display gets an ordered controller chain with automatic fallback and bounded wake-retry. A wake that fails on the first controller escalates to the next; wake is unconditional and never gives up on a dark screen.
+Each display gets an ordered controller chain with automatic fallback and bounded wake retry. A wake that fails on one controller escalates to the next. Repeated failures surface through desktop notifications, the tray, and the web dashboard.
 
 A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. This is the way a TV joins dormant without a keep-awake dummy zone.
 
-### OLED health
+### Panel-wear tracking
 
-dormant tracks brightness-weighted on-hours per display and surfaces them as a "panel exposure" card in the web dashboard, with an advisory nudge when a display has gone a long stretch without a rest window. It measures and reports only — nothing here changes blank/wake timing. Tracking is local: ledger files live under the daemon's own state directory, the only exposure is the existing loopback-only web UI, and there is no telemetry of any kind. See [docs/src/oled-health.md](./docs/src/oled-health.md) for what's tracked, what isn't, and the `[wear]` config keys.
+dormant tracks brightness-weighted on-hours per display and shows them in the web dashboard as a panel-exposure card. An advisory appears after a long stretch without a rest window. Tracking does not change blank/wake timing. Ledgers stay under the daemon's local state directory; there is no telemetry. See [Panel-wear tracking](./docs/src/oled-health.md) for the limits and the `wear.*` keys.
 
 ### Web dashboard and tray
 
-Build with `--features web-ui` for a loopback web dashboard: a live view of the sensor → zone → rule → display pipeline, force blank/wake, pause/resume, and a full config editor that writes your `config.toml` in place — comments preserved, secrets locked, every change validated exactly as the daemon would before it touches disk.
+Build with `--features web-ui` for a loopback web dashboard: a live view of the sensor → zone → rule → display pipeline, force blank/wake, pause/resume, panel-wear tracking, failure state, and a config editor. The editor can create and delete sensors, zones, displays, and rules; its Samsung pairing wizard stores the granted token in `credentials.toml`. Config writes preserve comments and pass daemon-identical validation before they reach disk.
 
-Build with `--features render` for audio-safe blanking that never touches DPMS: a fullscreen black Wayland overlay, an escalation ladder (screensaver → black → power-off on your own dwell timers), and a muted streaming screensaver driven by mpv.
+Build with `--features render` for blanking that never touches DPMS: a fullscreen black Wayland overlay, an escalation ladder (screensaver → black → power-off on your own dwell timers), and a muted streaming screensaver driven by mpv. The screensaver applies a 2 px pixel shift every 2 minutes by default; the uniform black overlay never shifts.
 
 The `dormant-tray` applet puts per-display status and blank/wake/pause controls in the KDE system tray.
 
@@ -94,9 +93,11 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/re
 ```bash
 git clone https://github.com/legion-works/dormant.git
 cd dormant
+sudo apt install libudev-dev libwayland-dev libmpv-dev pkg-config
 cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd  ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
+install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 ```
 
 Write `~/.config/dormant/config.toml`:
@@ -130,6 +131,7 @@ dormantctl validate     # check the config
 dormantd                # start the daemon
 dormantctl status       # watch the pipeline
 dormantctl doctor       # diagnose sensors and displays against your hardware
+dormantctl doctor exercise monitor  # verify a real blank → wake control path
 ```
 
 Run it as a user service:
@@ -146,7 +148,7 @@ Configuration reference, sensor and controller guides, and the `doctor` command 
 
 ## Status
 
-Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows. The daemon's idle RSS is held flat by capped tokio workers (`worker_threads = 2`) and a `malloc_trim` after every screensaver teardown; the libmpv crossfade buffers do not leak across cycles.
+Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows. The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit. The shipped watchdog restarts a wedged engine; last-known-good rollback can recover a bad boot config.
 
 It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
 

@@ -1,23 +1,46 @@
-//! Value types for the Samsung pairing wizard (`POST /api/pair/samsung` and
-//! its poll endpoint, `GET /api/pair/samsung/{id}`).
+//! The Samsung pairing wizard: `POST /api/pair/samsung` starts a
+//! connect+handshake attempt against a Samsung Tizen TV in a spawned,
+//! single-flight, `pair_timeout`-bounded background task; `GET
+//! /api/pair/samsung/{id}` polls its status.
 //!
-//! This file is intentionally types-only for now (Task 4 of the
-//! config-crud-wizard plan): [`PairId`], [`PairStatus`], and [`Token`] are
-//! defined here so [`crate::state::WebStateInner`]'s pairing fields (Task
-//! 4b) can name them before the route HANDLERS land (Task 5). Until then
-//! `PairId::new`/`Token::new`/`Token::expose_secret` are only reachable
-//! from this module's own tests — expect transient `dead_code` warnings on
-//! a lib-only, non-test build; they resolve once Task 5 wires the handlers
-//! in. `dead_code` is allowed crate-locally in this module for the same
-//! reason — clippy's `-D warnings` gate would otherwise hard-fail a
-//! deliberately-not-yet-wired stub.
-#![allow(dead_code)]
+//! ## Design invariants
+//!
+//! - The TV token NEVER appears in an HTTP response body or a log line —
+//!   [`PairStatus`] has no token field by construction, and [`Token`]'s
+//!   `Debug`/`Display` redact to `"***"` (the only way to read the raw
+//!   value is [`Token::expose_secret`], a single grep-able bypass).
+//! - Single-flight: [`crate::state::WebStateInner::pair_lock`] is taken via
+//!   `try_lock_owned` (never `.await`ed) so a second concurrent attempt
+//!   gets an immediate 409, and the `OwnedMutexGuard` is moved into the
+//!   spawned task so it's held for the attempt's whole bounded duration.
+//! - Non-blocking: `POST` returns 202 immediately; the actual TV I/O runs
+//!   in the spawned task via the injectable
+//!   [`dormant_displays::samsung_tizen::PairConnect`] seam
+//!   (`state.pair_connect`), bounded by `daemon.pair_timeout` via
+//!   `tokio::time::timeout` and raced against daemon shutdown
+//!   (`state.cancel`).
+//! - Literal tracing event names `pair_started` / `pair_succeeded` /
+//!   `pair_failed` — never carry the token as a field (see the
+//!   `Token`/`PairStatus` invariant above).
 
 use std::fmt;
 use std::fmt::Write as _;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use dormant_core::error::DormantError;
+use dormant_displays::samsung_tizen::PairConnect;
+use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedMutexGuard;
+use tokio_util::sync::CancellationToken;
+
+use crate::WebState;
+use crate::error::WebError;
+use crate::state::UpsertToken;
 
 /// Opaque identifier for one in-flight (or recently finished) pairing
 /// attempt, handed back to the client in the `POST` response and used to
@@ -156,6 +179,214 @@ impl fmt::Display for Token {
     }
 }
 
+// ── Request / response types ──────────────────────────────────────────────
+
+/// Request body for `POST /api/pair/samsung`.
+#[derive(Deserialize, Debug)]
+pub(crate) struct PairRequest {
+    /// TV hostname or IP address to pair with.
+    pub(crate) host: String,
+}
+
+/// Response body for `POST /api/pair/samsung` (202 Accepted).
+#[derive(Serialize, Debug)]
+pub(crate) struct PairAccepted {
+    /// Opaque id to poll via `GET /api/pair/samsung/{id}`.
+    pub(crate) pair_id: String,
+}
+
+// ── Handlers ────────────────────────────────────────────────────────────────
+
+/// Outcome of the connect race in [`run_pairing_attempt`], kept out of
+/// [`PairStatus`] proper so the token (only reachable via
+/// `PairOutcome::Token`) can never be accidentally routed through a
+/// `Debug`/log path before [`Token::new`] wraps it.
+enum PairOutcome {
+    Token(String),
+    Timeout,
+    Error(DormantError),
+    /// Daemon is shutting down mid-attempt — abandon without touching the
+    /// map; nobody is expected to still be polling.
+    Cancelled,
+}
+
+/// Run the bounded connect+handshake for one pairing attempt and write the
+/// resulting status back into `state`'s pairing map.
+///
+/// Spawned (never awaited directly) by [`post_pair_samsung`]. Holds
+/// `_guard` — the single-flight lock — for this function's whole duration,
+/// releasing it on return via `Drop` regardless of which branch below is
+/// taken.
+#[allow(clippy::too_many_arguments)]
+async fn run_pairing_attempt(
+    state: WebState,
+    pair_id: PairId,
+    host: String,
+    pair_timeout: Duration,
+    pair_connect: Arc<dyn PairConnect>,
+    upsert_token: UpsertToken,
+    creds_path: PathBuf,
+    cancel: CancellationToken,
+    _guard: OwnedMutexGuard<()>,
+) {
+    let outcome = tokio::select! {
+        biased;
+        () = cancel.cancelled() => PairOutcome::Cancelled,
+        result = tokio::time::timeout(pair_timeout, pair_connect.connect(&host, pair_timeout)) => {
+            match result {
+                Ok(Ok(token)) => PairOutcome::Token(token),
+                Ok(Err(e)) => PairOutcome::Error(e),
+                Err(_) => PairOutcome::Timeout,
+            }
+        }
+    };
+
+    let new_status = match outcome {
+        PairOutcome::Cancelled => None,
+        PairOutcome::Token(raw) => {
+            let token = Token::new(raw);
+            match upsert_token(&creds_path, &host, token.expose_secret()) {
+                Ok(()) => {
+                    tracing::info!(event = "pair_succeeded", host = %host, pair_id = %pair_id);
+                    Some(PairStatus {
+                        state: "paired",
+                        detail: None,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "pair_failed",
+                        host = %host,
+                        pair_id = %pair_id,
+                        reason = "token_save_failed",
+                    );
+                    Some(PairStatus {
+                        state: "error",
+                        detail: Some(format!("failed to save token: {e}")),
+                    })
+                }
+            }
+        }
+        PairOutcome::Timeout => {
+            tracing::warn!(
+                event = "pair_failed",
+                host = %host,
+                pair_id = %pair_id,
+                reason = "timeout",
+            );
+            Some(PairStatus {
+                state: "timeout",
+                detail: Some(format!(
+                    "no response from TV within {pair_timeout:?} — \
+                     accept the 'Allow' prompt on the TV?"
+                )),
+            })
+        }
+        PairOutcome::Error(e) => {
+            tracing::warn!(
+                event = "pair_failed",
+                host = %host,
+                pair_id = %pair_id,
+                reason = "connect_error",
+            );
+            Some(PairStatus {
+                state: "error",
+                detail: Some(e.to_string()),
+            })
+        }
+    };
+
+    if let Some(status) = new_status {
+        let mut pairing = state.inner.pairing.lock().await;
+        if let Some(entry) = pairing.get_mut(&pair_id) {
+            entry.status = status;
+        }
+    }
+}
+
+/// `POST /api/pair/samsung` — start a Samsung Tizen pairing attempt.
+///
+/// Body: `{"host": "<tv-ip-or-hostname>"}` (4 KiB body cap enforced at the
+/// route mount in `server.rs`, not here).
+///
+/// - `daemon.pairing_enabled = false` → 403 `feature_disabled`.
+/// - A pairing attempt already in flight → 409 `pairing_in_progress`
+///   (checked via a non-blocking `try_lock_owned` — this branch returns
+///   fast, no `.await` on the lock).
+/// - Otherwise: records a fresh `"pairing"` entry, spawns
+///   [`run_pairing_attempt`], and returns 202 + `{"pair_id": "<32-hex>"}`
+///   immediately. The spawned task NEVER blocks this handler.
+pub(crate) async fn post_pair_samsung(
+    State(state): State<WebState>,
+    Json(body): Json<PairRequest>,
+) -> Result<(StatusCode, Json<PairAccepted>), WebError> {
+    let cfg = state.inner.config_rx.borrow().clone();
+    if !cfg.daemon.pairing_enabled {
+        return Err(WebError::PairFeatureDisabled);
+    }
+
+    // Single-flight: try_lock_owned never awaits, so a second concurrent
+    // POST gets an immediate 409 rather than queueing behind the first.
+    let Ok(guard) = Arc::clone(&state.inner.pair_lock).try_lock_owned() else {
+        return Err(WebError::PairInProgress);
+    };
+
+    let pair_id = PairId::new();
+    {
+        let mut pairing = state.inner.pairing.lock().await;
+        pairing.insert(
+            pair_id.clone(),
+            PairEntry {
+                status: PairStatus {
+                    state: "pairing",
+                    detail: None,
+                },
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    let host = body.host;
+    tracing::info!(event = "pair_started", host = %host, pair_id = %pair_id);
+
+    tokio::spawn(run_pairing_attempt(
+        state.clone(),
+        pair_id.clone(),
+        host,
+        cfg.daemon.pair_timeout,
+        Arc::clone(&state.inner.pair_connect),
+        Arc::clone(&state.inner.upsert_token),
+        state.inner.creds_path.clone(),
+        state.inner.cancel.clone(),
+        guard,
+    ));
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PairAccepted {
+            pair_id: pair_id.to_string(),
+        }),
+    ))
+}
+
+/// `GET /api/pair/samsung/{id}` — poll the status of a pairing attempt.
+///
+/// Lazily sweeps terminal entries older than 5 minutes (see
+/// [`sweep_expired`]) before looking up `id`; an unknown or already-swept
+/// id returns 404 `pair_not_found`. The response body is always a
+/// [`PairStatus`] — never a token field, by construction.
+pub(crate) async fn get_pair_samsung(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Json<PairStatus>, WebError> {
+    let mut pairing = state.inner.pairing.lock().await;
+    sweep_expired(&mut pairing, Instant::now(), PAIR_TERMINAL_TTL);
+    pairing
+        .get(&PairId::from_raw(id))
+        .map(|entry| Json(entry.status.clone()))
+        .ok_or(WebError::PairNotFound)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -221,5 +452,707 @@ mod tests {
                 "serialized PairStatus should contain state {state}: {json}"
             );
         }
+    }
+
+    // ── sweep_expired: pure-function unit tests ─────────────────────────────
+    //
+    // These use `created + Duration` (addition, never subtraction) to place
+    // `now` past the TTL — deterministic regardless of the test host's real
+    // uptime, unlike backdating `Instant::now()` via `checked_sub`.
+
+    #[test]
+    fn sweep_expired_evicts_aged_terminal_entries_but_keeps_pairing() {
+        let mut map = std::collections::HashMap::new();
+        let created = Instant::now();
+        map.insert(
+            PairId::from_raw("terminal-paired"),
+            PairEntry {
+                status: PairStatus {
+                    state: "paired",
+                    detail: None,
+                },
+                created_at: created,
+            },
+        );
+        map.insert(
+            PairId::from_raw("terminal-error"),
+            PairEntry {
+                status: PairStatus {
+                    state: "error",
+                    detail: None,
+                },
+                created_at: created,
+            },
+        );
+        map.insert(
+            PairId::from_raw("still-pairing"),
+            PairEntry {
+                status: PairStatus {
+                    state: "pairing",
+                    detail: None,
+                },
+                created_at: created,
+            },
+        );
+
+        let past_ttl = created + PAIR_TERMINAL_TTL + std::time::Duration::from_secs(1);
+        sweep_expired(&mut map, past_ttl, PAIR_TERMINAL_TTL);
+
+        assert!(
+            !map.contains_key(&PairId::from_raw("terminal-paired")),
+            "aged 'paired' entry should be evicted"
+        );
+        assert!(
+            !map.contains_key(&PairId::from_raw("terminal-error")),
+            "aged 'error' entry should be evicted"
+        );
+        assert!(
+            map.contains_key(&PairId::from_raw("still-pairing")),
+            "'pairing' entries must never be evicted by age"
+        );
+    }
+
+    #[test]
+    fn sweep_expired_keeps_terminal_entries_within_ttl() {
+        let mut map = std::collections::HashMap::new();
+        let created = Instant::now();
+        map.insert(
+            PairId::from_raw("recent-terminal"),
+            PairEntry {
+                status: PairStatus {
+                    state: "timeout",
+                    detail: None,
+                },
+                created_at: created,
+            },
+        );
+
+        let just_inside_ttl = (created + PAIR_TERMINAL_TTL)
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        sweep_expired(&mut map, just_inside_ttl, PAIR_TERMINAL_TTL);
+
+        assert!(
+            map.contains_key(&PairId::from_raw("recent-terminal")),
+            "a terminal entry still within the TTL must survive the sweep"
+        );
+    }
+
+    // ── Handler-level tests ──────────────────────────────────────────────────
+
+    use std::collections::HashMap as StdHashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use indexmap::IndexMap;
+    use tokio::sync::{broadcast, mpsc, watch};
+    use tokio_util::sync::CancellationToken;
+    use tower::util::ServiceExt;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use dormant_core::config::schema::{
+        Config, Credentials, DaemonConfig, NotificationsConfig, WearConfig,
+    };
+    use dormant_core::rules::ControlMsg;
+    use dormant_displays::samsung_tizen::PairConnect;
+    use dormant_displays::test_support::FakePairConnect;
+    use dormant_doctor::DoctorService;
+
+    use crate::state::{WebStateInner, WebStateInnerParams};
+
+    /// `(path, host, token)` calls recorded by the test `upsert_token` fake.
+    type UpsertLog = Arc<StdMutex<Vec<(PathBuf, String, String)>>>;
+
+    fn daemon_cfg(pairing_enabled: bool, pair_timeout: Duration) -> DaemonConfig {
+        DaemonConfig {
+            pairing_enabled,
+            pair_timeout,
+            ..Default::default()
+        }
+    }
+
+    /// Build a [`WebState`] with an injected [`PairConnect`] fake and a
+    /// recording `upsert_token` fake — never touches the filesystem or a
+    /// real TV. `web_bind` is fixed at `127.0.0.1:8080` so Origin-check
+    /// tests can assert against a known port.
+    fn test_state(
+        daemon: DaemonConfig,
+        pair_connect: Arc<dyn PairConnect>,
+    ) -> (WebState, CancellationToken, UpsertLog) {
+        let cancel = CancellationToken::new();
+        let (ctl_tx, _ctl_rx) = mpsc::channel::<ControlMsg>(8);
+        let (reload_trigger_tx, _reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_tx, reload_rx) = broadcast::channel(16);
+        let config = Arc::new(Config {
+            config_version: 1,
+            daemon,
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        });
+        let creds = Arc::new(Credentials::default());
+        let (config_tx, config_rx) = watch::channel(config);
+        let (creds_tx, creds_rx) = watch::channel(creds);
+        std::mem::forget(reload_tx);
+        std::mem::forget(config_tx);
+        std::mem::forget(creds_tx);
+
+        let doctor = DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+
+        let upsert_log: UpsertLog = Arc::new(StdMutex::new(Vec::new()));
+        let upsert_token: crate::state::UpsertToken = {
+            let log = Arc::clone(&upsert_log);
+            Arc::new(move |path: &std::path::Path, host: &str, token: &str| {
+                log.lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), host.to_string(), token.to_string()));
+                Ok(())
+            })
+        };
+
+        let state = WebState::new(WebStateInner::new_for_test_with_pairing(
+            WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: PathBuf::from("/dev/null"),
+                creds_path: PathBuf::from("/dev/null"),
+                doctor,
+                wear: Arc::new(std::sync::RwLock::new(StdHashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+            pair_connect,
+            upsert_token,
+        ));
+
+        (state, cancel, upsert_log)
+    }
+
+    async fn post_pair(router: &axum::Router, host: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({ "host": host });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/samsung")
+            .header("Host", "127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .header("Origin", "http://127.0.0.1:8080")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    async fn get_pair(router: &axum::Router, id: &str) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/pair/samsung/{id}"))
+            .header("Host", "127.0.0.1:8080")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Poll `GET /api/pair/samsung/{id}` until the state leaves `"pairing"`
+    /// (or panic after a generous bound — the fakes used in these tests
+    /// resolve near-instantly, so a stuck `"pairing"` means a real bug).
+    async fn poll_until_terminal(router: &axum::Router, id: &str) -> serde_json::Value {
+        for _ in 0..500 {
+            let (status, body) = get_pair(router, id).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "GET should find pair_id {id}: {body}"
+            );
+            if body["state"] != "pairing" {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("pairing attempt {id} never left the 'pairing' state");
+    }
+
+    // ── POST: 202 + 32-hex pair_id ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn post_pair_samsung_returns_202_with_32_hex_pair_id() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status, body) = post_pair(&router, "192.0.2.1").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let pair_id = body["pair_id"]
+            .as_str()
+            .expect("pair_id should be a string");
+        assert_eq!(
+            pair_id.len(),
+            32,
+            "pair_id should be 32 hex chars: {pair_id}"
+        );
+        assert!(
+            pair_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "pair_id should be lowercase hex: {pair_id}"
+        );
+    }
+
+    // ── Happy path: paired + upsert_token called with host + token ──────────
+
+    #[tokio::test]
+    async fn poll_reaches_paired_and_upsert_token_called_with_host_and_token() {
+        let secret = "s3cr3t-tv-token-happy-path";
+        let (state, _cancel, upsert_log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::yielding(secret)),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status, body) = post_pair(&router, "192.0.2.2").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let pair_id = body["pair_id"].as_str().unwrap().to_string();
+
+        let final_status = poll_until_terminal(&router, &pair_id).await;
+        assert_eq!(final_status["state"], "paired", "{final_status}");
+        assert!(
+            final_status.get("token").is_none(),
+            "response must never carry a token field"
+        );
+
+        let calls = upsert_log.lock().unwrap();
+        assert_eq!(calls.len(), 1, "upsert_token should be called exactly once");
+        let (path, host, token) = &calls[0];
+        assert_eq!(path, &PathBuf::from("/dev/null"));
+        assert_eq!(host, "192.0.2.2");
+        assert_eq!(token, secret);
+    }
+
+    // ── Timeout path: short pair_timeout built via struct literal, ──────────
+    // ── bypassing validate()'s 30s floor ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn timeout_status_when_connect_never_resolves_with_short_pair_timeout() {
+        let (state, _cancel, upsert_log) = test_state(
+            daemon_cfg(true, Duration::from_millis(50)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status, body) = post_pair(&router, "192.0.2.3").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let pair_id = body["pair_id"].as_str().unwrap().to_string();
+
+        let final_status = poll_until_terminal(&router, &pair_id).await;
+        assert_eq!(final_status["state"], "timeout", "{final_status}");
+        assert!(
+            upsert_log.lock().unwrap().is_empty(),
+            "upsert_token must never be called when pairing times out"
+        );
+    }
+
+    // ── Token never echoed: HTTP response bodies ─────────────────────────────
+
+    #[tokio::test]
+    async fn token_never_echoed_in_post_or_get_json_bodies() {
+        let secret = "s3cr3t-should-never-leak-into-json";
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::yielding(secret)),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status, post_body) = post_pair(&router, "192.0.2.4").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{post_body}");
+        assert!(!post_body.to_string().contains(secret));
+        let pair_id = post_body["pair_id"].as_str().unwrap().to_string();
+
+        let final_status = poll_until_terminal(&router, &pair_id).await;
+        assert_eq!(final_status["state"], "paired", "{final_status}");
+        assert!(
+            !final_status.to_string().contains(secret),
+            "GET response leaked the token: {final_status}"
+        );
+    }
+
+    // ── Token never echoed: tracing events (P11 registry capture layer) ──────
+    //
+    // tracing caches each event macro callsite's `Interest` the FIRST time
+    // it ever fires in the process, based on whichever subscriber is
+    // ambient on whatever thread got there first. With `cargo test`'s
+    // default parallel execution, a scoped `tracing::dispatcher::set_default`
+    // guard on just this test's thread is racy: some OTHER concurrently
+    // running test can reach the SAME `pair_failed` callsite first with NO
+    // subscriber active on ITS thread, permanently caching "never
+    // interested" for that callsite before this test's guard is even
+    // installed — a real failure observed while writing this test (see the
+    // task report's RED evidence).
+    //
+    // The robust fix used here: install ONE real subscriber as the
+    // process-wide GLOBAL default, exactly once (`std::sync::Once`), before
+    // any test's assertions run. Every callsite's interest then resolves
+    // against a subscriber that is always "interested" (our `Layer` doesn't
+    // override `register_callsite`, so the default trait impl returns
+    // `Interest::always()`), regardless of which thread/test hits it first.
+    // Per-test isolation of the CAPTURED events is then done with a
+    // `thread_local!` buffer keyed on `Option<Vec<String>>`: each
+    // `#[tokio::test]` runs on its own dedicated OS thread for its whole
+    // duration (current-thread flavor — the `tokio::spawn`ed pairing task
+    // stays on that same thread too), so a `None` buffer means "not
+    // recording" (the common case for every other test in this file) and
+    // `Some(vec)` means "this test is recording", with no cross-test
+    // interference.
+
+    thread_local! {
+        static CAPTURE_BUF: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    struct FieldDumpVisitor(String);
+
+    impl tracing::field::Visit for FieldDumpVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    struct ThreadLocalCaptureLayer;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadLocalCaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            CAPTURE_BUF.with(|buf| {
+                if let Some(events) = buf.borrow_mut().as_mut() {
+                    let mut visitor = FieldDumpVisitor(String::new());
+                    event.record(&mut visitor);
+                    events.push(visitor.0);
+                }
+            });
+        }
+    }
+
+    /// Install [`ThreadLocalCaptureLayer`] as the process-wide global
+    /// default subscriber, exactly once. Safe to call from every test that
+    /// wants to capture — only the first caller's `Once::call_once` body
+    /// actually runs.
+    fn ensure_capture_subscriber_installed() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(ThreadLocalCaptureLayer);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// Start recording tracing events on the CURRENT thread.
+    fn start_capturing() {
+        ensure_capture_subscriber_installed();
+        CAPTURE_BUF.with(|buf| *buf.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and return everything captured on the CURRENT thread
+    /// since the matching [`start_capturing`] call.
+    fn take_captured() -> Vec<String> {
+        CAPTURE_BUF.with(|buf| buf.borrow_mut().take().unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn token_never_appears_in_tracing_events_success_and_timeout() {
+        start_capturing();
+
+        let secret = "s3cr3t-must-never-appear-in-a-log-line";
+
+        // Success path.
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::yielding(secret)),
+        );
+        let router = crate::server::build_router(state);
+        let (status, body) = post_pair(&router, "192.0.2.5").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let pair_id = body["pair_id"].as_str().unwrap().to_string();
+        let final_status = poll_until_terminal(&router, &pair_id).await;
+        assert_eq!(final_status["state"], "paired", "{final_status}");
+
+        // Timeout path (separate state — pair_lock is per-WebState).
+        let (state2, _cancel2, _log2) = test_state(
+            daemon_cfg(true, Duration::from_millis(50)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router2 = crate::server::build_router(state2);
+        let (status2, body2) = post_pair(&router2, "192.0.2.6").await;
+        assert_eq!(status2, StatusCode::ACCEPTED, "{body2}");
+        let pair_id2 = body2["pair_id"].as_str().unwrap().to_string();
+        let final_status2 = poll_until_terminal(&router2, &pair_id2).await;
+        assert_eq!(final_status2["state"], "timeout", "{final_status2}");
+
+        let events = take_captured();
+        let joined = events.join("\n");
+        assert!(
+            !joined.contains(secret),
+            "token leaked into a tracing event: {joined}"
+        );
+        assert!(
+            joined.contains("pair_started"),
+            "missing pair_started in: {joined}"
+        );
+        assert!(
+            joined.contains("pair_succeeded"),
+            "missing pair_succeeded in: {joined}"
+        );
+        assert!(
+            joined.contains("pair_failed"),
+            "missing pair_failed in: {joined}"
+        );
+    }
+
+    // ── Single-flight: second POST while first in-flight → fast 409 ─────────
+
+    #[tokio::test]
+    async fn second_post_while_in_flight_returns_409_fast() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status1, body1) = post_pair(&router, "192.0.2.7").await;
+        assert_eq!(status1, StatusCode::ACCEPTED, "{body1}");
+
+        let start = std::time::Instant::now();
+        let (status2, body2) = post_pair(&router, "192.0.2.7").await;
+        let elapsed = start.elapsed();
+        assert_eq!(status2, StatusCode::CONFLICT, "{body2}");
+        assert_eq!(body2["error"], "pairing_in_progress");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "409 for an in-flight attempt should be near-instant, took {elapsed:?}"
+        );
+    }
+
+    // ── Feature-off: 403 feature_disabled ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn feature_disabled_returns_403() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(false, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status, body) = post_pair(&router, "192.0.2.8").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "feature_disabled");
+    }
+
+    // ── CSRF (spec §13): cross-origin / missing / exact-match Origin ────────
+
+    #[tokio::test]
+    async fn cross_origin_post_rejected_403() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let body = serde_json::json!({ "host": "192.0.2.9" });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/samsung")
+            .header("Host", "127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .header("Origin", "http://127.0.0.1:9999")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-origin (wrong port) POST must be rejected"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "web_reject_origin");
+    }
+
+    #[tokio::test]
+    async fn missing_origin_post_rejected_403() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let body = serde_json::json!({ "host": "192.0.2.11" });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/samsung")
+            .header("Host", "127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            // No Origin header — strict-origin routes must reject absent
+            // Origin too (the generic same-origin check would allow it;
+            // this route is in security::STRICT_ORIGIN_PATHS specifically
+            // to close that gap).
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "missing Origin on a strict-origin POST must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_loopback_origin_passes_guard() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        // post_pair already sends `Origin: http://127.0.0.1:8080`, matching
+        // web_bind's port exactly.
+        let (status, body) = post_pair(&router, "192.0.2.12").await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "exact-match loopback Origin should reach the handler: {body}"
+        );
+    }
+
+    // ── Body size >4KiB → 413 ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn body_over_4kib_returns_413() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let big_host = "x".repeat(5_000);
+        let body = serde_json::json!({ "host": big_host });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/samsung")
+            .header("Host", "127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .header("Origin", "http://127.0.0.1:8080")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body > 4KiB should be 413"
+        );
+    }
+
+    // ── Sweep (integration-level, through the real GET handler) ─────────────
+
+    #[tokio::test]
+    async fn get_evicts_aged_terminal_entry_but_keeps_pairing_entry() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+
+        // Best-effort backdate via checked_sub; on a test host with less
+        // than 301s of monotonic uptime this degrades to a no-op skip
+        // rather than a flaky panic — the deterministic coverage of this
+        // exact boundary lives in the `sweep_expired_*` unit tests above,
+        // which use `now + delta` and never depend on real elapsed time.
+        let Some(aged) = Instant::now().checked_sub(PAIR_TERMINAL_TTL + Duration::from_secs(1))
+        else {
+            eprintln!("skipping: test host uptime too short to backdate an Instant");
+            return;
+        };
+
+        let old_terminal_id = PairId::from_raw("aged-terminal-entry-for-sweep-test");
+        let old_pairing_id = PairId::from_raw("aged-but-still-pairing-entry-for-sweep-test");
+        {
+            let mut pairing = state.inner.pairing.lock().await;
+            pairing.insert(
+                old_terminal_id.clone(),
+                PairEntry {
+                    status: PairStatus {
+                        state: "paired",
+                        detail: None,
+                    },
+                    created_at: aged,
+                },
+            );
+            pairing.insert(
+                old_pairing_id.clone(),
+                PairEntry {
+                    status: PairStatus {
+                        state: "pairing",
+                        detail: None,
+                    },
+                    created_at: aged,
+                },
+            );
+        }
+
+        let router = crate::server::build_router(state);
+
+        let (status, body) = get_pair(&router, &old_terminal_id.to_string()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "aged terminal entry should have been swept on this poll: {body}"
+        );
+
+        let (status2, body2) = get_pair(&router, &old_pairing_id.to_string()).await;
+        assert_eq!(
+            status2,
+            StatusCode::OK,
+            "a 'pairing' entry must survive the sweep regardless of age: {body2}"
+        );
+        assert_eq!(body2["state"], "pairing");
+    }
+
+    // ── GET on an id that never existed → 404 ────────────────────────────────
+
+    #[tokio::test]
+    async fn get_unknown_pair_id_returns_404() {
+        let (state, _cancel, _log) = test_state(
+            daemon_cfg(true, Duration::from_secs(60)),
+            Arc::new(FakePairConnect::never()),
+        );
+        let router = crate::server::build_router(state);
+
+        let (status, body) = get_pair(&router, "0000000000000000000000000000000000ff").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "pair_not_found");
     }
 }

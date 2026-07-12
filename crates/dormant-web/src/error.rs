@@ -76,6 +76,16 @@ pub(crate) enum WebError {
     PatchCapExceeded(u32),
     /// `CreateEntity` targeted an id that already exists in the collection.
     EntityExists(String),
+    /// `POST /api/pair/samsung` was called while
+    /// `daemon.pairing_enabled = false`.
+    PairFeatureDisabled,
+    /// A pairing attempt is already in flight (`pair_lock` `try_lock`
+    /// failed).
+    PairInProgress,
+    /// `GET /api/pair/samsung/{id}` referenced an id with no matching
+    /// entry (never existed, or already swept as an expired terminal
+    /// entry — see `routes::pair::sweep_expired`).
+    PairNotFound,
 }
 
 impl IntoResponse for WebError {
@@ -160,6 +170,11 @@ impl IntoResponse for WebError {
                 }] });
                 return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
             }
+
+            // ── Pairing-wizard variants (Task 5) ───────────────────────────────
+            WebError::PairFeatureDisabled => (StatusCode::FORBIDDEN, "feature_disabled", None),
+            WebError::PairInProgress => (StatusCode::CONFLICT, "pairing_in_progress", None),
+            WebError::PairNotFound => (StatusCode::NOT_FOUND, "pair_not_found", None),
         };
         let mut body = serde_json::json!({ "error": event });
         if let Some(d) = detail {

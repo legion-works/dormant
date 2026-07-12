@@ -27,7 +27,8 @@ use crate::routes::pair::{PairEntry, PairId};
 /// Seam type for persisting a granted pairing token — factored into a type
 /// alias (`clippy::type_complexity`) rather than spelling the trait-object
 /// `Fn` type out at every field/parameter that needs it.
-pub(crate) type UpsertToken = Arc<dyn Fn(&Path, &str, &str) -> Result<(), DormantError> + Send + Sync>;
+pub(crate) type UpsertToken =
+    Arc<dyn Fn(&Path, &str, &str) -> Result<(), DormantError> + Send + Sync>;
 
 /// Shared state for the web server.
 ///
@@ -112,11 +113,6 @@ pub struct WebStateInner {
     /// [`crate::routes::pair::sweep_expired`]. Values are
     /// [`crate::routes::pair::PairStatus`], which is token-free by
     /// construction — a token never lives in this map.
-    ///
-    /// `#[allow(dead_code)]`: not read yet — the pairing route handlers
-    /// that read this land in the next commit (Task 5). Mirrors the same
-    /// transient allowance on `routes::pair`'s module-level doc comment.
-    #[allow(dead_code)]
     pub(crate) pairing: Mutex<HashMap<PairId, PairEntry>>,
 
     /// Single-flight guard for the pairing wizard: `POST /api/pair/samsung`
@@ -128,18 +124,12 @@ pub struct WebStateInner {
     /// `OwnedMutexGuard` that can be moved into the `tokio::spawn`ed
     /// pairing task and held for its whole (bounded-by-`pair_timeout`)
     /// duration.
-    ///
-    /// `#[allow(dead_code)]`: see `pairing` above — wired up in Task 5.
-    #[allow(dead_code)]
     pub(crate) pair_lock: Arc<Mutex<()>>,
 
     /// Injectable seam for the pairing wizard's TV-connect step —
     /// production wiring is [`RealPairConnect`]; pairing tests inject
     /// `dormant_displays::test_support::FakePairConnect` (feature
     /// `test-util`) via `WebStateInner::new_for_test_with_pairing`.
-    ///
-    /// `#[allow(dead_code)]`: see `pairing` above — wired up in Task 5.
-    #[allow(dead_code)]
     pub(crate) pair_connect: Arc<dyn PairConnect>,
 
     /// Injectable seam for persisting a granted pairing token —
@@ -147,9 +137,6 @@ pub struct WebStateInner {
     /// [`dormant_core::config::upsert_samsung_token`] unmodified; tests
     /// substitute a closure that records `(path, host, token)` calls
     /// instead of touching the filesystem.
-    ///
-    /// `#[allow(dead_code)]`: see `pairing` above — wired up in Task 5.
-    #[allow(dead_code)]
     pub(crate) upsert_token: UpsertToken,
 }
 
@@ -219,9 +206,6 @@ impl WebStateInner {
     /// seams explicitly (typically a
     /// `dormant_displays::test_support::FakePairConnect` and a closure that
     /// records `upsert_token` calls into a test-owned `Vec`/`Mutex`).
-    /// `#[allow(dead_code)]`: not called yet — the pairing-wizard tests
-    /// that use this land in the next commit (Task 5).
-    #[allow(dead_code)]
     #[cfg(test)]
     #[must_use]
     pub(crate) fn new_for_test_with_pairing(

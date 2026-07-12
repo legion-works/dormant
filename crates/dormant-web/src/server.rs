@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
-use crate::routes::{command, config, config_apply, doctor, events, wear};
+use crate::routes::{command, config, config_apply, doctor, events, pair, wear};
 use crate::security::security_guard;
 
 /// Duration the `/api/state` handler waits for a snapshot reply before
@@ -111,10 +111,16 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = route_post!(api, "/resume", post(command::post_resume));
     let api = route_post!(api, "/reload", post(command::post_reload));
     let api = route_post!(api, "/doctor", post(doctor::post_doctor));
+    let api = route_post!(
+        api,
+        "/pair/samsung",
+        post(pair::post_pair_samsung).layer(DefaultBodyLimit::max(4 * 1024))
+    );
     let api = api
         .route("/events", get(events::ws_events))
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
+        .route("/pair/samsung/:id", get(pair::get_pair_samsung))
         // API miss → 404, never the SPA fallback.
         .fallback(api_not_found)
         .with_state(state.clone());

@@ -31,11 +31,13 @@ humantime = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+dormant-displays = { path = "../dormant-displays", features = ["test-util"] }
 indexmap = { workspace = true }
 reqwest = { workspace = true }
 tempfile = "3"
 tokio-tungstenite = "0.26"
 tower = "0.5"
+tracing-subscriber = { workspace = true, features = ["registry"] }
 tokio = { workspace = true, features = [
   "test-util",
   "time",

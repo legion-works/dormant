@@ -23,4 +23,9 @@ extend-ignore-re = ["shufle"]
 [files]
 # Vendored Legion Works design-system bundle (minified third-party JS/CSS/JSON) —
 # not project-authored; exclude from spell-check (e.g. a literal "teh" in _ds_bundle.js).
-extend-exclude = ["design/web-ui/_ds/"]
+# pw_dump/ — verbatim PipeWire captures (real hardware strings like "HDA", "snd_hda_intel"),
+# not project-authored prose.
+extend-exclude = [
+  "design/web-ui/_ds/",
+  "crates/dormantd/tests/fixtures/pw_dump/",
+]

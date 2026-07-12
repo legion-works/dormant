@@ -370,7 +370,16 @@ fn validate_only_exit_codes() {
 // ── 3: reload swaps behavior ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_swap() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -562,7 +571,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn removed_display_verified_wake() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
@@ -621,7 +639,16 @@ async fn removed_display_verified_wake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn removed_display_wake_failure_aborts() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
@@ -692,7 +719,16 @@ async fn removed_display_wake_failure_aborts() {
 // ── Retained dark display gets a defensive wake on reload ──────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_defensive_wake_retained() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -745,7 +781,16 @@ async fn reload_defensive_wake_retained() {
 /// now manual-only — its phase is preserved across reload (no defensive wake).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn ruleless_display_preserves_phase_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
@@ -831,7 +876,16 @@ async fn ruleless_display_preserves_phase_on_reload() {
 // ── 8: config_watch updates on successful reload only ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn config_watch_updates_on_successful_reload_only() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -917,7 +971,16 @@ async fn config_watch_updates_on_successful_reload_only() {
 // ── 9: creds_watch updates on successful reload only ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn creds_watch_updates_on_successful_reload_only() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -1034,7 +1097,16 @@ async fn web_nonloopback_warning_fires_at_startup() {
 // ── 11: web_bind_change_ignored fires on reload without rebinding ──────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn web_bind_change_ignored_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     install_capture_subscriber();
 
     let dir = TempDir::new().unwrap();
@@ -1403,7 +1475,16 @@ wake_retry_interval = "1s"
     /// count gate.
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+                  count step-boundary tests it would otherwise contaminate — test-local, always \
+                  released promptly at test end"
+    )]
     async fn rollback_input_wake_routes_through_drain() {
+        let _capture_guard = capture_count_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap();
         let m1 = dir.path().join("mon1");
         let m2 = dir.path().join("mon2");
@@ -1803,7 +1884,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn manual_only_display_no_defensive_wake_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
@@ -1922,7 +2012,16 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
 // ── 15: rule-driven dark display defensive-woken on reload (regression) ─────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn rule_driven_dark_display_defensive_woken_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -1983,7 +2082,16 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
 /// manual command (tracked in issue #9).
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn manual_only_display_full_lifecycle_across_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
@@ -2310,6 +2418,13 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
     let _guard = wear_env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // This test drives 3 back-to-back reloads (below) — each is a real
+    // Runner::reload() call that emits the same step-boundary markers the
+    // exact-count watchdog tests count, so it also serializes on
+    // capture_count_lock (see that lock's doc comment).
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state_home = TempDir::new().unwrap();
     let _env = XdgStateHomeGuard::set(state_home.path());
 
@@ -2536,6 +2651,13 @@ async fn wear_shutdown_persists_final_ledger() {
 )]
 async fn wear_park_persists_final_ledger() {
     let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The [wear].enabled = false reload below is a real Runner::reload()
+    // call that emits the same step-boundary markers the exact-count
+    // watchdog tests count, so it also serializes on capture_count_lock
+    // (see that lock's doc comment).
+    let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state_home = TempDir::new().unwrap();
@@ -2859,7 +2981,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() calls against the exact- \
+              count step-boundary tests they would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let flag = dir.path().join("blank_ok_flag"); // never created in this test
@@ -3074,7 +3205,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
 
@@ -3305,7 +3445,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() calls against the exact- \
+              count step-boundary tests they would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_carries_sensor_reported_until_own_config_edit() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let cfg_path = write_file(
         dir.path(),
@@ -3562,13 +3711,30 @@ use dormantd::sd_notify::SdNotify;
 /// installed, becomes the default subscriber for EVERY test in this
 /// binary (not just ones that call it) — the existing hazard test (22)
 /// documents the residual race and bounds its window instead of trying to
-/// eliminate it entirely. The two EXACT-COUNT step-boundary tests below
-/// are far more sensitive to that race than a substring check (any
-/// concurrently-running reload anywhere in the suite also logs
-/// `watchdog_ping` lines), so they additionally serialize against EACH
-/// OTHER on a dedicated lock — eliminating the highest-probability source
-/// of collision (two near-identical scenarios racing) while accepting the
-/// same documented residual risk against unrelated concurrent tests.
+/// eliminate it entirely.
+///
+/// The three EXACT-COUNT / ordered step-boundary tests
+/// (`watchdog_in_reload_pings_healthy_boundaries`,
+/// `watchdog_ping_before_rebuild_old_on_verified_wake_failure`,
+/// `watchdog_ping_before_rebuild_old_on_spawn_generation_failure`) are far
+/// more sensitive to that race than a substring check: `Runner::reload()`
+/// logs the SAME `after_assemble`/`after_quiesce`/`before_teardown`/
+/// `removed_display_wake`/`reload_end` step markers (`app.rs`'s
+/// `Runner::ping`) on every single reload it runs, whether or not the
+/// caller cares about watchdog pings — so any OTHER test in this binary
+/// that drives a real `Runner::reload()` (`trigger_reload()` or a file-
+/// watcher-triggered reload) while a step-boundary test's capture window
+/// is open can inject a foreign marker into the count/order the reader is
+/// asserting on.
+///
+/// Mirrors `boot_rollback.rs`'s fix for the identical mechanism there
+/// (`config_rollback_boot`): every reload-driving test in this binary that
+/// can emit these markers takes this lock for its own reload work, not
+/// just the readers — a non-emitting test needs no lock (its own log
+/// lines never match the readers' substrings). This trades away
+/// cross-test parallelism for these particular tests in exchange for
+/// eliminating the collision outright; the binary has ample real-time
+/// headroom (see the two-half split above) to absorb it.
 static CAPTURE_COUNT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn capture_count_lock() -> &'static Mutex<()> {
@@ -3932,8 +4098,9 @@ wake_retry_interval = "1s"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "capture_count_lock() is test-local (only these 2 tests touch it) and always \
-              released promptly at test end — see the lock's doc comment"
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
 )]
 #[allow(
     clippy::too_many_lines,
@@ -4078,8 +4245,9 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "capture_count_lock() is test-local (only these 2 tests touch it) and always \
-              released promptly at test end — see the lock's doc comment"
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
 )]
 async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
     let _guard = capture_count_lock()
@@ -4182,8 +4350,9 @@ async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "capture_count_lock() is test-local and always released promptly at test end \
-              — see the lock's doc comment"
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
 )]
 async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
     let _guard = capture_count_lock()

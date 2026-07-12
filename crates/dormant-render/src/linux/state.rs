@@ -137,6 +137,26 @@ fn make_wakeup_pipe() -> Result<(OwnedFd, OwnedFd), CmdFailure> {
     Ok((read_fd, write_fd))
 }
 
+/// Pure-arithmetic core of [`create_dual_buffers`]: computes the two
+/// buffer offsets (`0` and `stride * height`) and calls `create` once
+/// per offset.  Production passes a closure that wraps
+/// `RawPool::create_buffer`; tests pass a recorder closure to verify
+/// the offset values without constructing real Wayland objects.
+///
+/// Returns `(buf0, buf1)` — the closure's return type is opaque so the
+/// caller controls what `(T, T)` represents.
+fn create_dual_buffers_core<T>(
+    stride: u32,
+    height: u32,
+    mut create: impl FnMut(i32) -> T,
+) -> (T, T) {
+    let buf0 = create(0);
+    let buf1_offset = i32::try_from(dual_buf_second_offset(stride, height))
+        .expect("second buffer offset must fit in i32");
+    let buf1 = create(buf1_offset);
+    (buf0, buf1)
+}
+
 /// Build two `WlBuffer`s from a single `RawPool` — `buf0` at offset 0,
 /// `buf1` at offset `stride * height`.  Together they cover the full
 /// pool so mpv can ping-pong writes without overwriting a buffer the
@@ -156,27 +176,11 @@ fn create_dual_buffers(
     // declares "the 4th byte is ignored"; the same byte stream is
     // correct content either way.
     let fmt = wayland_client::protocol::wl_shm::Format::Xrgb8888;
-    let buf0 = pool.create_buffer(
-        0,
-        width.cast_signed(),
-        height.cast_signed(),
-        stride_i32,
-        fmt,
-        (),
-        qh,
-    );
-    let buf1_offset = i32::try_from(dual_buf_second_offset(stride, height))
-        .expect("second buffer offset must fit in i32");
-    let buf1 = pool.create_buffer(
-        buf1_offset,
-        width.cast_signed(),
-        height.cast_signed(),
-        stride_i32,
-        fmt,
-        (),
-        qh,
-    );
-    (buf0, buf1)
+    let w = width.cast_signed();
+    let h = height.cast_signed();
+    create_dual_buffers_core(stride, height, |offset| {
+        pool.create_buffer(offset, w, h, stride_i32, fmt, (), qh)
+    })
 }
 
 /// Byte offset within the pool for the second buffer in a
@@ -2576,6 +2580,31 @@ mod tests {
         assert!(
             expected + u64::from(stride) * u64::from(buf_h) <= pool_size,
             "buf1 end must be within pool"
+        );
+    }
+
+    /// Drive [`create_dual_buffers_core`] through its closure seam with
+    /// a recorder and assert the TWO actual creation calls receive
+    /// exactly `[0, stride×height]` for the AOC geometry.  This catches
+    /// a regression where ONLY the arithmetic helper is correct but the
+    /// call-site wiring still passes the wrong offset (the U5-round
+    /// failure class — constants test passes, wiring doesn't use them).
+    #[test]
+    fn dual_buf_creation_offsets_are_zero_and_stride_times_height() {
+        let stride: u32 = 12_352;
+        let height: u32 = 1744;
+        let mut offsets = Vec::new();
+        super::create_dual_buffers_core(stride, height, |offset| {
+            offsets.push(offset);
+        });
+        let buf1_expected: i32 = 21_541_888;
+        assert_eq!(
+            offsets,
+            vec![0, buf1_expected],
+            "create_dual_buffers_core must call the closure with offsets [0, stride×height]; \
+             got {offsets:?}.  If buf1 offset is {stride} (= stride, one row) instead of \
+             {buf1_expected} (= stride×height), the fix was only applied to the helper, \
+             not the call-site wiring."
         );
     }
 }

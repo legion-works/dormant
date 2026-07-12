@@ -156,6 +156,49 @@ export function NumberField({ path, label, value, locked, lockedReason, onEdit, 
   );
 }
 
+/**
+ * Multi-select field — a checkbox per option, tracking an array of
+ * selected strings. Used for cross-reference array fields (rules'
+ * `displays`/`inhibitors`, zones' `members`, displays' `controllers`) —
+ * spec §6/§7, config-crud-wizard T6.
+ *
+ * Each checkbox's `aria-label` is `"<label>: <option>"` so tests (and
+ * screen readers) can target a specific option unambiguously.
+ */
+export function MultiSelectField({ path, label, value, locked, lockedReason, onEdit, error, help, options }: FieldProps & { options: readonly string[] }) {
+  const selected = Array.isArray(value) ? (value as string[]) : [];
+
+  function toggle(opt: string) {
+    const next = selected.includes(opt)
+      ? selected.filter((o) => o !== opt)
+      : [...selected, opt];
+    onEdit(path, next);
+  }
+
+  return (
+    <div className={fieldClassName(locked, !!error)}>
+      <label className="cf-field__label">{label}</label>
+      <div className="cf-field__multiselect">
+        {options.map((opt) => (
+          <label key={opt} className="cf-field__checkbox-option">
+            <input
+              type="checkbox"
+              aria-label={`${label}: ${opt}`}
+              checked={selected.includes(opt)}
+              disabled={locked}
+              onChange={() => toggle(opt)}
+            />
+            {opt}
+          </label>
+        ))}
+        {locked && <LockIcon reason={lockedReason} />}
+      </div>
+      {help && <span className="cf-field__hint">{help}</span>}
+      {error && <span className="cf-field__error">{error}</span>}
+    </div>
+  );
+}
+
 /** Plain text field. */
 export function TextField({ path, label, value, locked, lockedReason, onEdit, error, help, placeholder }: FieldProps) {
   const raw = typeof value === "string" ? value : String(value ?? "");

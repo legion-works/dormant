@@ -379,21 +379,22 @@ mod tests {
 
         let creds_path = config_path.with_extension("creds.toml");
 
-        WebState::new(super::super::super::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path,
-            creds_path,
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        })
+        WebState::new(super::super::super::state::WebStateInner::new_for_test(
+            super::super::super::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path,
+                creds_path,
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ))
     }
 
     fn config_with_secret() -> Config {

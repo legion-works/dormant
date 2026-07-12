@@ -113,7 +113,7 @@ describe("buildPatches", () => {
     const patches = s.buildPatches();
     expect(patches).toHaveLength(3);
 
-    const paths = patches.map((p) => p.path.join(".")).sort();
+    const paths = patches.map((p) => ("path" in p ? p.path.join(".") : "")).sort();
     expect(paths).toEqual([
       "daemon.hold_time",
       "rules.r1.grace_period",
@@ -250,6 +250,105 @@ describe("getEdit", () => {
 });
 
 /**
+ * CreateEntity / DeleteEntity store ops (spec §3/§7, config-crud-wizard T6).
+ *
+ * Wire shape MUST exactly match the Rust serde enum
+ * (config_patch.rs:37-60): `{op:"create_entity", collection, id, value}`
+ * and `{op:"delete_entity", collection, id}` — top-level fields, NOT
+ * path-based like Set/Remove.
+ */
+describe("trackCreate / trackDelete — CreateEntity/DeleteEntity verbs", () => {
+  it("trackCreate alone emits exactly one create_entity patch with the exact wire shape", () => {
+    const s = createPatchStore();
+    s.trackCreate("sensors", "new-desk", { type: "mqtt", broker_url: "tcp://mqtt:1883", topic: "t" });
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toEqual<ConfigPatch>({
+      op: "create_entity",
+      collection: "sensors",
+      id: "new-desk",
+      value: { type: "mqtt", broker_url: "tcp://mqtt:1883", topic: "t" },
+    });
+  });
+
+  it("trackDelete alone emits exactly one delete_entity patch with the exact wire shape", () => {
+    const s = createPatchStore();
+    s.trackDelete("zones", "old-zone");
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toEqual<ConfigPatch>({
+      op: "delete_entity",
+      collection: "zones",
+      id: "old-zone",
+    });
+  });
+
+  it("a later trackDelete on the same collection/id cancels a pending trackCreate (last-write-wins)", () => {
+    const s = createPatchStore();
+    s.trackCreate("displays", "tv", { controllers: ["samsung-tizen"] });
+    s.trackDelete("displays", "tv");
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toEqual<ConfigPatch>({
+      op: "delete_entity",
+      collection: "displays",
+      id: "tv",
+    });
+  });
+
+  it("a later trackCreate on the same collection/id cancels a pending trackDelete (last-write-wins)", () => {
+    const s = createPatchStore();
+    s.trackDelete("rules", "r1");
+    s.trackCreate("rules", "r1", { zone: "office", displays: [] });
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(1);
+    expect(patches[0]).toEqual<ConfigPatch>({
+      op: "create_entity",
+      collection: "rules",
+      id: "r1",
+      value: { zone: "office", displays: [] },
+    });
+  });
+
+  it("creates/deletes coexist with ordinary edits/removals in the same buildPatches() call", () => {
+    const s = createPatchStore();
+    set(s, "daemon.hold_time", "30s");
+    s.trackCreate("sensors", "new-desk", { type: "mqtt", broker_url: "x", topic: "y" });
+    del(s, "rules.r1.grace_period");
+    s.trackDelete("zones", "old-zone");
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(4);
+    const ops = patches.map((p) => p.op).sort();
+    expect(ops).toEqual(["create_entity", "delete_entity", "remove", "set"]);
+  });
+
+  it("reset() clears pending creates and deletes too", () => {
+    const s = createPatchStore();
+    s.trackCreate("sensors", "new-desk", { type: "mqtt" });
+    s.trackDelete("zones", "old-zone");
+    expect(s.buildPatches()).toHaveLength(2);
+
+    s.reset();
+    expect(s.buildPatches()).toEqual([]);
+  });
+
+  it("distinct ids in the same collection are independent", () => {
+    const s = createPatchStore();
+    s.trackCreate("sensors", "a", { type: "mqtt" });
+    s.trackCreate("sensors", "b", { type: "ha" });
+    s.trackDelete("sensors", "c");
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(3);
+  });
+});
+
+/**
  * M2 RED test — sequential array edits must NOT clobber.
  *
  * Simulates: user edits stage-0's kind, then edits stage-0's dwell.
@@ -279,9 +378,10 @@ describe("sequential array edits do not clobber (M2)", () => {
     const patches = s.buildPatches();
     expect(patches).toHaveLength(1);
     expect(patches[0].op).toBe("set");
-    expect(patches[0].path).toEqual(arrPath);
 
-    return (patches[0] as Extract<ConfigPatch, { op: "set" }>).value as unknown[];
+    const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    expect(setPatch.path).toEqual(arrPath);
+    return setPatch.value as unknown[];
   }
 
   it("carries both edits (kind + dwell) when using getEdit ?? fetched", () => {

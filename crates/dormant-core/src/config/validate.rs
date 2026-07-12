@@ -107,6 +107,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "web_port",
             "web_bind",
             "web_allow_nonloopback",
+            "entity_crud_enabled",
+            "pairing_enabled",
+            "pair_timeout",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────
@@ -341,15 +344,51 @@ fn is_collection_level(path: &str) -> bool {
     path == "sensors" || path == "zones" || path == "displays" || path == "rules"
 }
 
+// ── Structural reserved names (P1/P10 single source of truth) ──────────────
+
+/// The single source of truth for every structurally-special TOML key/id
+/// name in the schema. The three predicates below (`is_weights_level`,
+/// `is_array_of_tables_parent`, `is_passthrough_data_key`) each consume a
+/// PER-PREDICATE subset const derived from names in this list — never one
+/// shared/blanket loop (P10) — because their match semantics differ
+/// (suffix-with-dot vs. exact equality) and a uniform loop would silently
+/// broaden `is_passthrough_data_key` from exact-key equality into a suffix
+/// match, opening a config-smuggling surface.
+///
+/// Drift-proofing: `dormant_web`'s `RESERVED_ENTITY_IDS` cross-check
+/// (`config_patch.rs`, Task 2) asserts `RESERVED_ENTITY_IDS ⊇
+/// STRUCTURAL_RESERVED_NAMES` against this REAL symbol (re-exported via
+/// `config/mod.rs`). Within this crate, each predicate's own subset const is
+/// pinned ⊆ `STRUCTURAL_RESERVED_NAMES` by an enumerated-by-name test in this
+/// module's test suite (`predicate_name_subsets_are_reserved` and friends) —
+/// a genuinely NEW 7th predicate needs its own enumerated test line added at
+/// write time; this is not automatic/reflective discovery.
+pub const STRUCTURAL_RESERVED_NAMES: &[&str] =
+    &["weights", "source", "ladder", "blank_data", "wake_data"];
+
+/// Suffix-matched name subset of [`STRUCTURAL_RESERVED_NAMES`] consumed by
+/// [`is_weights_level`] — only `"weights"`.
+const WEIGHTS_LEVEL_NAMES: &[&str] = &["weights"];
+
 /// Is this path at a weights sub-table where keys are dynamic member ids?
 fn is_weights_level(path: &str) -> bool {
-    path.ends_with(".weights")
+    WEIGHTS_LEVEL_NAMES.iter().any(|name| {
+        path.strip_suffix(name)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
+
+/// Exact-equality name subset of [`STRUCTURAL_RESERVED_NAMES`] consumed by
+/// [`is_passthrough_data_key`] — only `"blank_data"`/`"wake_data"`.
+const PASSTHROUGH_DATA_KEY_NAMES: &[&str] = &["blank_data", "wake_data"];
 
 /// Is this a passthrough data key whose children are arbitrary TOML that
 /// should not be checked against the known-key set?
+///
+/// EXACT equality, not a suffix match — `"blank_data_extra"` must NOT match
+/// (P10 — a suffix loop here would widen the passthrough surface).
 fn is_passthrough_data_key(key: &str) -> bool {
-    key == "blank_data" || key == "wake_data"
+    PASSTHROUGH_DATA_KEY_NAMES.contains(&key)
 }
 
 /// Is this one level deeper than an empty allowed set? (deep nesting of unknown
@@ -448,6 +487,9 @@ pub fn validate(
             ),
         });
     }
+
+    // ── [daemon] validation ──────────────────────────────────────────────
+    validate_daemon(cfg, &mut errors);
 
     // ── [wear] validation ────────────────────────────────────────────────
     validate_wear(cfg, &mut errors);
@@ -584,6 +626,23 @@ fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 }
             }
         }
+    }
+}
+
+/// Validate the `[daemon]` section: `pair_timeout` bounds.
+fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let daemon = &cfg.daemon;
+
+    if daemon.pair_timeout < Duration::from_secs(30)
+        || daemon.pair_timeout > Duration::from_secs(300)
+    {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "daemon.pair_timeout {:?} is out of range — allowed: 30s..=300s",
+                daemon.pair_timeout
+            ),
+        });
     }
 }
 
@@ -1427,8 +1486,18 @@ pub fn is_known_config_path(path: &[&str]) -> bool {
 ///
 /// Kept next to [`KNOWN_KEYS`] so the name list is grep-stable and
 /// trivially auditable.
+///
+/// Suffix-matched name subset of [`STRUCTURAL_RESERVED_NAMES`] consumed
+/// here — only `"ladder"`/`"source"` (P10 — its own const, not shared with
+/// [`is_weights_level`] or [`is_passthrough_data_key`]).
+const ARRAY_OF_TABLES_PARENT_NAMES: &[&str] = &["ladder", "source"];
+
 fn is_array_of_tables_parent(parent: &str) -> bool {
-    parent.ends_with(".ladder") || parent.ends_with(".source")
+    ARRAY_OF_TABLES_PARENT_NAMES.iter().any(|name| {
+        parent
+            .strip_suffix(name)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 /// Recursive helper: `parent` is the dot-joined path consumed so far;
@@ -4789,5 +4858,188 @@ availability_payload_offline = "down"
             crate::config::schema::SensorConfig::Ha(_) => {} // field dropped, as expected
             other => panic!("expected Ha sensor, got {other:?}"),
         }
+    }
+
+    // ── Task 1: STRUCTURAL_RESERVED_NAMES + predicate refactor (P1/P10) ────
+
+    #[test]
+    fn structural_reserved_names_contains_all_five() {
+        for n in ["weights", "source", "ladder", "blank_data", "wake_data"] {
+            assert!(
+                STRUCTURAL_RESERVED_NAMES.contains(&n),
+                "STRUCTURAL_RESERVED_NAMES missing {n}"
+            );
+        }
+        assert_eq!(STRUCTURAL_RESERVED_NAMES.len(), 5);
+    }
+
+    // Byte-identical behavior pins for the refactored predicates (existing
+    // unknown-key-walker tests above — passthrough_data_subkeys_not_flagged
+    // et al. — already exercise these indirectly; these pin the raw fns).
+    #[test]
+    fn is_weights_level_matches_dot_weights_suffix_only() {
+        assert!(is_weights_level("zones.media.weights"));
+        assert!(!is_weights_level("zones.media.weightsx"));
+        assert!(!is_weights_level("weights")); // bare root — no leading dot, not a suffix match
+    }
+
+    #[test]
+    fn is_array_of_tables_parent_matches_ladder_and_source_suffixes() {
+        assert!(is_array_of_tables_parent("displays.tv.ladder"));
+        assert!(is_array_of_tables_parent("displays.tv.screensaver.source"));
+        assert!(!is_array_of_tables_parent("displays.tv.laddery"));
+    }
+
+    #[test]
+    fn is_passthrough_data_key_exact_equality_only() {
+        assert!(is_passthrough_data_key("blank_data"));
+        assert!(is_passthrough_data_key("wake_data"));
+        assert!(!is_passthrough_data_key("blank_data_extra"));
+        assert!(!is_passthrough_data_key("wake_data2"));
+    }
+
+    // Cross-predicate non-overlap pins (P10) — an accidental broadening (e.g.
+    // a shared blanket loop instead of per-predicate consts) fails HERE, at
+    // the unit where it would be introduced, not downstream.
+    #[test]
+    fn is_weights_level_rejects_ladder_suffix() {
+        assert!(!is_weights_level("displays.x.ladder"));
+    }
+
+    #[test]
+    fn is_array_of_tables_parent_rejects_weights_suffix() {
+        assert!(!is_array_of_tables_parent("displays.x.weights"));
+    }
+
+    #[test]
+    fn is_passthrough_data_key_rejects_near_miss_suffix() {
+        assert!(!is_passthrough_data_key("blank_data_extra"));
+        // Both broadening directions (reviewer pin): a prefix-style broadening
+        // is caught above; an ends_with-style broadening is caught here.
+        assert!(!is_passthrough_data_key("evil_blank_data"));
+        assert!(!is_passthrough_data_key("x.wake_data"));
+    }
+
+    // Each predicate's accepted names ⊆ STRUCTURAL_RESERVED_NAMES, ENUMERATED
+    // EXPLICITLY BY NAME per predicate (cold-gate Gemini Should) — a unit
+    // test cannot reflectively discover a predicate function it was never
+    // told about, so a genuinely NEW 7th predicate needs its own enumerated
+    // test line added here at write time; this is not automatic discovery.
+    #[test]
+    fn weights_level_accepted_names_are_subset_of_structural_reserved_names() {
+        // Single-name enumeration (not a loop, clippy::single_element_loop) —
+        // still an explicit, by-name pin, not a reference to the const it
+        // checks against.
+        assert!(STRUCTURAL_RESERVED_NAMES.contains(&"weights"));
+    }
+
+    #[test]
+    fn array_of_tables_parent_accepted_names_are_subset_of_structural_reserved_names() {
+        for n in ["ladder", "source"] {
+            assert!(STRUCTURAL_RESERVED_NAMES.contains(&n));
+        }
+    }
+
+    #[test]
+    fn passthrough_data_key_accepted_names_are_subset_of_structural_reserved_names() {
+        for n in ["blank_data", "wake_data"] {
+            assert!(STRUCTURAL_RESERVED_NAMES.contains(&n));
+        }
+    }
+
+    // ── Task 1: daemon.entity_crud_enabled / pairing_enabled / pair_timeout ─
+    // `load_str`/`load_str_strict`/`validate_str` live at the audio-test
+    // module above (merge-resolved — byte-identical duplicates collapsed).
+
+    #[test]
+    fn daemon_section_absent_uses_literal_defaults() {
+        // [daemon] entirely absent — Config::daemon's #[serde(default)] must
+        // produce DaemonConfig::default(). Literal pins, NOT compared against
+        // defaults::* consts — a comparison against the same const the impl
+        // reads from would be a tautology unable to catch a wrong literal in
+        // either the const or the Default impl.
+        let (cfg, _warnings) = load_str("config_version = 1\n").unwrap();
+        assert!(cfg.daemon.entity_crud_enabled);
+        assert!(cfg.daemon.pairing_enabled);
+        assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn daemon_section_present_but_empty_uses_literal_defaults() {
+        // [daemon] present with zero keys. DaemonConfig::socket_path is
+        // `Option<PathBuf>` with no `#[serde(default)]` attribute (checked
+        // against the live struct, per the plan's "test what's true"
+        // instruction) — TOML/serde treats a missing Option field as None
+        // without one (the same pattern already relied on by DisplayConfig's
+        // `output`/`host`/etc. fields), so an empty `[daemon]` table still
+        // deserializes cleanly.
+        let (cfg, _warnings) = load_str("config_version = 1\n[daemon]\n").unwrap();
+        assert!(cfg.daemon.entity_crud_enabled);
+        assert!(cfg.daemon.pairing_enabled);
+        assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn pair_timeout_floor_29s_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"29s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("pair_timeout")),
+            "pair_timeout below the 30s floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn pair_timeout_floor_30s_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"30s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("pair_timeout")),
+            "pair_timeout = 30s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn pair_timeout_ceiling_300s_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"300s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("pair_timeout")),
+            "pair_timeout = 300s (the ceiling) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn pair_timeout_ceiling_301s_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"301s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("pair_timeout")),
+            "pair_timeout above the 300s ceiling must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn daemon_new_keys_accepted_in_strict_mode() {
+        let result = load_str_strict(
+            "config_version = 1\n\
+             [daemon]\n\
+             entity_crud_enabled = false\n\
+             pairing_enabled = false\n\
+             pair_timeout = \"60s\"\n",
+        );
+        assert!(
+            result.is_ok(),
+            "the three new daemon keys must be in KNOWN_KEYS, got: {:?}",
+            result.err()
+        );
+        let (cfg, _warnings) = result.unwrap();
+        assert!(!cfg.daemon.entity_crud_enabled);
+        assert!(!cfg.daemon.pairing_enabled);
+        assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(60));
     }
 }

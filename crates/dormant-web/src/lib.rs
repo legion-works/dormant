@@ -21,12 +21,14 @@ mod routes;
 mod security;
 mod server;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::net::SocketAddr;
 
 use tokio::task::JoinHandle;
 
-pub use state::{WebState, WebStateInner};
+pub use state::{WebState, WebStateInner, WebStateInnerParams};
 
 /// Spawn the web server on `bind`, returning a [`JoinHandle`] for the
 /// server task together with the resolved [`SocketAddr`] (useful when
@@ -170,7 +172,7 @@ mod tests {
 
         let doctor = DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        let state = WebState::new(WebStateInner {
+        let state = WebState::new(WebStateInner::new_for_test(WebStateInnerParams {
             ctl_tx,
             reload_trigger: reload_trigger_tx,
             reload_rx,
@@ -178,7 +180,6 @@ mod tests {
             creds_rx,
             config_path: PathBuf::from("/dev/null"),
             creds_path: PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
             doctor,
             wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             web_bind: std::net::SocketAddr::new(
@@ -187,7 +188,7 @@ mod tests {
             ),
             cancel: cancel.clone(),
             reload_timeout: Duration::from_secs(10),
-        });
+        }));
 
         (state, cancel)
     }

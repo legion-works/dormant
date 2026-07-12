@@ -5,11 +5,14 @@
  * grace_period, wake_retry_interval (durations), wake_retries (number),
  * inhibitors (read-only in T7).
  */
+import { useState } from "react";
 import FormSection from "./FormSection";
-import { DurationField, NumberField, TextField } from "./fields";
+import { DurationField, NumberField, TextField, EnumField, MultiSelectField } from "./fields";
 import type { FieldProps } from "./fields";
 import type { PatchStore } from "./patch";
 import type { RuleConfig } from "../../api/types";
+import CreateEntityForm from "./CreateEntityForm";
+import { VALID_INHIBITORS } from "./entityCrud";
 
 /** Per-key help for rule scalar fields — accurate to the real config semantics. */
 const RULE_HELP: Record<string, string> = {
@@ -26,11 +29,38 @@ interface RulesSectionProps {
   redactedPaths: string[][];
   onDirty: () => void;
   fieldErrors: Record<string, string | undefined>;
+  /** Whether entity create/delete + cross-ref unlock is enabled (`daemon.entity_crud_enabled`, spec §2/§6/§10). Defaults to true for pre-feature callers. */
+  entityCrudEnabled?: boolean;
+  /** Live zone ids — populates the `zone` select (spec §6). */
+  zoneIds?: string[];
+  /** Live display ids — populates the `displays` multi-select (spec §6). */
+  displayIds?: string[];
 }
 
-export default function RulesSection({ rules, store, redactedPaths, onDirty, fieldErrors }: RulesSectionProps) {
+export default function RulesSection({
+  rules,
+  store,
+  redactedPaths,
+  onDirty,
+  fieldErrors,
+  entityCrudEnabled = true,
+  zoneIds = [],
+  displayIds = [],
+}: RulesSectionProps) {
   const ids = Object.keys(rules);
-  if (ids.length === 0) return null;
+  const [showCreate, setShowCreate] = useState(false);
+
+  if (ids.length === 0 && !entityCrudEnabled) return null;
+
+  function handleDelete(id: string) {
+    // Nothing in the schema references a rule (rules reference zones/
+    // displays, never the reverse) — no client-side references warning
+    // needed, unlike zones/sensors/displays.
+    if (window.confirm(`Delete rule "${id}"?`)) {
+      store.trackDelete("rules", id);
+      onDirty();
+    }
+  }
 
   return (
     <FormSection title="Rules">
@@ -56,28 +86,45 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
           <div key={id} className="cf-card">
             <div className="cf-card__header">
               <span className="cf-card__name">{id}</span>
+              {entityCrudEnabled && (
+                <button
+                  type="button"
+                  className="cf-apply__btn cf-apply__btn--danger cf-card__delete"
+                  onClick={() => handleDelete(id)}
+                >
+                  Delete
+                </button>
+              )}
             </div>
 
             <div className="cf-card__fields">
-              {/* zone — display name linking to which zone this rule governs */}
-              <div className="cf-field cf-field--locked">
-                <label className="cf-field__label">zone</label>
-                <div className="cf-field__value-row">
-                  <span className="cf-field__value-text">{cfg.zone}</span>
-                  <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+              {/* zone — unlocked to a select under entity_crud_enabled (spec §6) */}
+              {entityCrudEnabled ? (
+                <EnumField {...makeShared("zone", cfg.zone)} options={zoneIds} />
+              ) : (
+                <div className="cf-field cf-field--locked">
+                  <label className="cf-field__label">zone</label>
+                  <div className="cf-field__value-row">
+                    <span className="cf-field__value-text">{cfg.zone}</span>
+                    <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+                  </div>
                 </div>
-              </div>
+              )}
 
-              {/* displays — read-only in T7 */}
-              <div className="cf-field cf-field--locked">
-                <label className="cf-field__label">displays</label>
-                <div className="cf-field__value-list">
-                  {cfg.displays.map((d) => (
-                    <span key={d} className="cf-field__value-chip">{d}</span>
-                  ))}
-                  <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+              {/* displays — unlocked to a multi-select under entity_crud_enabled (spec §6) */}
+              {entityCrudEnabled ? (
+                <MultiSelectField {...makeShared("displays", cfg.displays)} options={displayIds} />
+              ) : (
+                <div className="cf-field cf-field--locked">
+                  <label className="cf-field__label">displays</label>
+                  <div className="cf-field__value-list">
+                    {cfg.displays.map((d) => (
+                      <span key={d} className="cf-field__value-chip">{d}</span>
+                    ))}
+                    <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+                  </div>
                 </div>
-              </div>
+              )}
 
               {/* grace_period — duration */}
               {cfg.grace_period !== undefined && (
@@ -94,17 +141,21 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
                 <NumberField {...makeShared("wake_retries", cfg.wake_retries, { help: "Number of wake retries before escalating to the next controller or failing.", placeholder: "3" })} />
               )}
 
-              {/* inhibitors — read-only in T7 */}
-              {cfg.inhibitors && cfg.inhibitors.length > 0 && (
-                <div className="cf-field cf-field--locked">
-                  <label className="cf-field__label">inhibitors</label>
-                  <div className="cf-field__value-list">
-                    {cfg.inhibitors.map((inhibitor) => (
-                      <span key={inhibitor} className="cf-field__value-chip">{inhibitor}</span>
-                    ))}
-                    <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+              {/* inhibitors — unlocked to a multi-select under entity_crud_enabled (spec §6) */}
+              {entityCrudEnabled ? (
+                <MultiSelectField {...makeShared("inhibitors", cfg.inhibitors ?? [])} options={VALID_INHIBITORS} />
+              ) : (
+                cfg.inhibitors && cfg.inhibitors.length > 0 && (
+                  <div className="cf-field cf-field--locked">
+                    <label className="cf-field__label">inhibitors</label>
+                    <div className="cf-field__value-list">
+                      {cfg.inhibitors.map((inhibitor) => (
+                        <span key={inhibitor} className="cf-field__value-chip">{inhibitor}</span>
+                      ))}
+                      <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+                    </div>
                   </div>
-                </div>
+                )
               )}
 
               {/* Render any remaining scalar keys not handled above */}
@@ -129,6 +180,27 @@ export default function RulesSection({ rules, store, redactedPaths, onDirty, fie
           </div>
         );
       })}
+
+      {entityCrudEnabled && (
+        showCreate ? (
+          <CreateEntityForm
+            collection="rules"
+            existingIds={ids}
+            zoneIds={zoneIds}
+            displayIds={displayIds}
+            onCreate={(id, value) => {
+              store.trackCreate("rules", id, value);
+              onDirty();
+              setShowCreate(false);
+            }}
+            onCancel={() => setShowCreate(false)}
+          />
+        ) : (
+          <button type="button" className="cf-apply__btn cf-card__add" onClick={() => setShowCreate(true)}>
+            + Add rule
+          </button>
+        )
+      )}
     </FormSection>
   );
 }

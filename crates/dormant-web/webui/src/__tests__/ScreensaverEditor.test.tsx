@@ -48,9 +48,9 @@ describe("ScreensaverEditor", () => {
     const patches = store.buildPatches();
     expect(patches).toHaveLength(1);
     expect(patches[0].op).toBe("set");
-    expect(patches[0].path).toEqual(["displays", "tv", "screensaver", "source"]);
 
     const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    expect(setPatch.path).toEqual(["displays", "tv", "screensaver", "source"]);
     const value = setPatch.value as ScreensaverSource[];
     expect(value).toHaveLength(2);
     expect(value[0]).toEqual(FIXTURE_SS.source[0]);
@@ -75,9 +75,9 @@ describe("ScreensaverEditor", () => {
     const patches = store.buildPatches();
     expect(patches).toHaveLength(1);
     expect(patches[0].op).toBe("set");
-    expect(patches[0].path).toEqual(["displays", "tv", "screensaver", "source"]);
 
     const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    expect(setPatch.path).toEqual(["displays", "tv", "screensaver", "source"]);
     const value = setPatch.value as ScreensaverSource[];
     expect(value).toHaveLength(1);
     expect(value[0]).toEqual({ path: "/a" });

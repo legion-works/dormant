@@ -35,6 +35,11 @@ ddc-hi = { workspace = true }
 # Enables the rcgen-based TLS handshake integration test.
 # Off by default so CI keeps the dep footprint lean.
 rcgen-test = ["dep:rcgen"]
+# Exposes `test_support` (scripted fakes, e.g. `FakePairConnect`) so other
+# workspace crates' tests (e.g. dormant-web's pairing wizard) can inject
+# them without touching real hardware or network. Off by default — prod
+# builds never compile this module.
+test-util = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "time", "macros", "rt"] }

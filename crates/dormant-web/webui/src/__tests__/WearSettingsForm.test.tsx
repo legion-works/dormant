@@ -102,7 +102,7 @@ describe("WearSection — settings form", () => {
     fireEvent.change(screen.getByLabelText("advisory_after"), { target: { value: "48h" } });
 
     const patches = store.buildPatches();
-    const paths = patches.map((p) => p.path.join("."));
+    const paths = patches.map((p) => ("path" in p ? p.path.join(".") : ""));
 
     expect(paths).toContain("wear.sample_interval");
     expect(paths).toContain("wear.persist_interval");

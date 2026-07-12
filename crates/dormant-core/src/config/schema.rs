@@ -147,6 +147,19 @@ pub struct DaemonConfig {
     /// unauthenticated surface — see spec §8).
     #[serde(default)]
     pub web_allow_nonloopback: bool,
+
+    /// Whether the web UI's entity create/delete affordances are enabled.
+    #[serde(default = "default_entity_crud_enabled")]
+    pub entity_crud_enabled: bool,
+
+    /// Whether the Samsung pairing wizard route is enabled.
+    #[serde(default = "default_pairing_enabled")]
+    pub pairing_enabled: bool,
+
+    /// Timeout for a single pairing-wizard attempt. Validated to
+    /// `30s..=300s`.
+    #[serde(default = "default_pair_timeout", with = "humantime_serde")]
+    pub pair_timeout: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -162,6 +175,9 @@ impl Default for DaemonConfig {
             web_port: None,
             web_bind: defaults::WEB_BIND_DEFAULT,
             web_allow_nonloopback: false,
+            entity_crud_enabled: defaults::ENTITY_CRUD_ENABLED,
+            pairing_enabled: defaults::PAIRING_ENABLED,
+            pair_timeout: defaults::PAIR_TIMEOUT,
         }
     }
 }
@@ -1087,6 +1103,15 @@ fn default_wake_retry_interval() -> Duration {
 }
 fn default_web_bind() -> std::net::IpAddr {
     defaults::WEB_BIND_DEFAULT
+}
+fn default_entity_crud_enabled() -> bool {
+    defaults::ENTITY_CRUD_ENABLED
+}
+fn default_pairing_enabled() -> bool {
+    defaults::PAIRING_ENABLED
+}
+fn default_pair_timeout() -> Duration {
+    defaults::PAIR_TIMEOUT
 }
 fn default_trigger() -> String {
     defaults::SCREENSAVER_TRIGGER.into()

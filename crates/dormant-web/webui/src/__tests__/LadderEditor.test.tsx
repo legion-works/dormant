@@ -46,9 +46,9 @@ describe("LadderEditor", () => {
     const patches = store.buildPatches();
     expect(patches).toHaveLength(1);
     expect(patches[0].op).toBe("set");
-    expect(patches[0].path).toEqual(["displays", "tv", "ladder"]);
 
     const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    expect(setPatch.path).toEqual(["displays", "tv", "ladder"]);
     const value = setPatch.value as LadderStage[];
     expect(value).toHaveLength(4); // 3 + 1 new
     // Original stages preserved
@@ -70,9 +70,9 @@ describe("LadderEditor", () => {
     const patches = store.buildPatches();
     expect(patches).toHaveLength(1);
     expect(patches[0].op).toBe("set");
-    expect(patches[0].path).toEqual(["displays", "tv", "ladder"]);
 
     const setPatch = patches[0] as Extract<ConfigPatch, { op: "set" }>;
+    expect(setPatch.path).toEqual(["displays", "tv", "ladder"]);
     const value = setPatch.value as LadderStage[];
     expect(value).toHaveLength(2);
     expect(value[0]).toEqual({ kind: "render_black", dwell: "30s" });

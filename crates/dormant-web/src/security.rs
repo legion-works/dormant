@@ -27,6 +27,47 @@ use crate::WebState;
 /// included because the Host header may carry either (`[::1]` or `[::1]:8080`).
 const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 
+/// Full `/api`-prefixed `POST` routes that require the *strict* Origin
+/// check (`check_apply_origin`): the Origin header MUST be present, MUST
+/// be loopback, and MUST match the bound port exactly.
+///
+/// `/api/pair/samsung` is not mounted yet (a later task adds it), but it
+/// is listed here now on purpose: the inverted route meta-test in
+/// `server.rs` derives the live set of registered `POST` routes from
+/// actual router construction and asserts every entry is classified in
+/// either this set or [`ACKNOWLEDGED_WEAK_ROUTES`].  Pre-registering the
+/// strict classification here means the moment `/api/pair/samsung` is
+/// mounted, it is already strict by construction — there is no window
+/// where a forgotten classification decision defaults to the weaker
+/// same-origin check.
+pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &["/api/config/apply", "/api/pair/samsung"];
+
+/// Full `/api`-prefixed `POST` routes that are deliberately left on the
+/// generic same-origin check (`is_same_origin`) rather than the strict
+/// exact-port check in [`STRICT_ORIGIN_PATHS`].
+///
+/// This is an *acknowledgement*, not a default: the inverted route
+/// meta-test in `server.rs` asserts every `POST` route registered via
+/// `route_post!` appears in this set or `STRICT_ORIGIN_PATHS`. Adding a
+/// new route here (instead of to `STRICT_ORIGIN_PATHS`) is a conscious,
+/// reviewable security decision that a route does not need the stricter
+/// check, not an oversight that a route was never classified at all.
+///
+/// Not read by any runtime request path (only `STRICT_ORIGIN_PATHS` is —
+/// membership here just means "not strict", the generic `is_same_origin`
+/// check still applies to every POST route). Consumed only by the
+/// inverted route meta-test in `server.rs` and this module's own tests,
+/// hence `#[allow(dead_code)]` on non-test builds.
+#[allow(dead_code)]
+pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
+    "/api/blank",
+    "/api/wake",
+    "/api/pause",
+    "/api/resume",
+    "/api/reload",
+    "/api/doctor",
+];
+
 /// Reject any request whose `Host` header is not in the allow-list.
 ///
 /// Returns 403 with literal event name `web_reject_host`.
@@ -70,11 +111,14 @@ pub(crate) async fn security_guard(
             return (StatusCode::UNSUPPORTED_MEDIA_TYPE, axum::Json(body)).into_response();
         }
 
-        // For the config-apply write endpoint, the Origin header MUST be
+        // For strict-origin write endpoints, the Origin header MUST be
         // present (the generic is_same_origin allows absent Origin, which is
         // a CSRF gap for a write endpoint) and must exact-match the loopback
-        // origin including the actual bound port.
-        if request.uri().path() == "/api/config/apply" {
+        // origin including the actual bound port.  Membership in
+        // STRICT_ORIGIN_PATHS is checked against the raw, un-normalized
+        // `uri().path()` — see the structural test at the bottom of this
+        // module for why that's safe.
+        if STRICT_ORIGIN_PATHS.contains(&request.uri().path()) {
             let origin_ok = check_apply_origin(&headers, state.inner.web_bind);
             if !origin_ok {
                 tracing::warn!(event = "web_reject_origin", reason = "apply_origin");
@@ -298,21 +342,22 @@ mod tests {
 
         let doctor = DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        let state = WebState::new(super::super::state::WebStateInner {
-            ctl_tx: ctl_tx.clone(),
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: bind,
-            cancel: cancel.clone(),
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(super::super::state::WebStateInner::new_for_test(
+            super::super::state::WebStateInnerParams {
+                ctl_tx: ctl_tx.clone(),
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: bind,
+                cancel: cancel.clone(),
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         (state, cancel)
     }
@@ -586,5 +631,54 @@ mod tests {
         let resp = router.oneshot(req).await.unwrap();
         // Should NOT be 403 from the security guard (may be 200 or 426 from handler).
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── Generalized strict-origin path set (Task 3) ────────────────────────
+
+    /// M3 Must-2: a direct membership assertion, not merely coverage by the
+    /// `⊆ STRICT ∪ WEAK` union check in `server.rs` — a mistaken WEAK-set
+    /// classification for the not-yet-mounted pairing route must be caught
+    /// HERE, at the classification site, the moment T5 mounts it.
+    #[test]
+    fn strict_origin_paths_contains_pair_samsung() {
+        assert!(
+            STRICT_ORIGIN_PATHS.contains(&"/api/pair/samsung"),
+            "/api/pair/samsung must be pre-classified strict so the route \
+             is strict-by-construction the moment it is mounted"
+        );
+    }
+
+    /// Structural comment-test (no path-normalization layer): the guard
+    /// compares `request.uri().path()` LITERALLY against
+    /// `STRICT_ORIGIN_PATHS` / `ACKNOWLEDGED_WEAK_ROUTES` — there is no
+    /// `tower_http::normalize_path` (or similar) layer mounted above
+    /// `security_guard` in `server.rs::build_router`. That raw comparison
+    /// is only safe because every entry here is already in axum's
+    /// canonical route-path form. If a normalization layer is ever added
+    /// upstream of the guard, this raw comparison would need to normalize
+    /// its input the same way, or a differently-spelled-but-equivalent
+    /// path (e.g. a trailing slash) could route to the handler while
+    /// silently missing the strict check.
+    #[test]
+    fn strict_and_weak_route_paths_are_already_normalized() {
+        for path in STRICT_ORIGIN_PATHS
+            .iter()
+            .chain(ACKNOWLEDGED_WEAK_ROUTES.iter())
+        {
+            assert!(path.starts_with("/api/"), "{path} must be a full /api path");
+            assert!(
+                !path.ends_with('/'),
+                "{path} must not have a trailing slash"
+            );
+            assert!(
+                !path.contains("//"),
+                "{path} must not contain a double slash"
+            );
+            assert_eq!(
+                *path,
+                path.to_ascii_lowercase(),
+                "{path} must already be lowercase"
+            );
+        }
     }
 }

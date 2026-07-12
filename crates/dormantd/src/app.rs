@@ -2952,6 +2952,8 @@ mod render_tests {
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -3048,6 +3050,8 @@ mod render_tests {
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(

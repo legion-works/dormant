@@ -165,8 +165,10 @@ fn create_dual_buffers(
         (),
         qh,
     );
+    let buf1_offset = i32::try_from(dual_buf_second_offset(stride, height))
+        .expect("second buffer offset must fit in i32");
     let buf1 = pool.create_buffer(
-        stride.cast_signed(),
+        buf1_offset,
         width.cast_signed(),
         height.cast_signed(),
         stride_i32,
@@ -175,6 +177,20 @@ fn create_dual_buffers(
         qh,
     );
     (buf0, buf1)
+}
+
+/// Byte offset within the pool for the second buffer in a
+/// double-buffered setup.  Must be `stride * height` so the two
+/// buffers are non-overlapping: buf0 covers `[0, stride*height)`,
+/// buf1 covers `[stride*height, 2*stride*height)`.
+///
+/// `stride` is the bytes-per-row (including any padding), `height`
+/// is the buffer height in pixels.
+#[must_use]
+pub(super) fn dual_buf_second_offset(stride: u32, height: u32) -> u64 {
+    // stride (bytes per row) × height (rows) = one full buffer in bytes.
+    // buf0 occupies [0, stride*height); buf1 starts at stride*height.
+    u64::from(stride) * u64::from(height)
 }
 
 /// Calloop dispatch callback for the screensaver wakeup pipe.
@@ -2511,6 +2527,56 @@ mod tests {
         let disabled = crate::shift::ShiftState::new(0);
         assert!(!disabled.enabled());
         // reset_shift() clears shift_state → equivalent to ShiftState::new(0).
+    }
+
+    // ── dual-buffer pool layout (regression: #56) ─────────────────
+
+    /// Regression test for issue #56: the second buffer offset in a
+    /// double-buffered shm pool must be `stride * height`, not
+    /// `stride`.  The pre-fix code used `stride` (= one row's bytes)
+    /// as buf1's offset, causing buf1 to overlap buf0 → the compositor
+    /// read stale content for every other frame.  With pixel-shift
+    /// enabled the artefact appeared as an unpainted (black) region
+    /// at the bottom-right because the overlapping tail extended
+    /// beyond the painted area of buf0 into zeroed pool memory.
+    ///
+    /// The test uses the concrete AOC dimensions from the bug report
+    /// (3072×1728 panel, `shift_px=4` → margin=8 → buffer 3088×1744,
+    /// stride=12352).  Two buffers at this size each occupy 21 541 888
+    /// bytes → buf1 must start at byte 21 541 888, i.e.
+    /// `stride * height`.
+    #[test]
+    fn dual_buf_second_offset_is_stride_times_height() {
+        // AOC panel dimensions + shift_px=4 (from the live-observed bug).
+        let panel_w: u32 = 3072;
+        let panel_h: u32 = 1728;
+        let shift_px: u8 = 4;
+        let margin = crate::shift::margin(shift_px);
+        let buf_w = panel_w + 2 * margin;
+        let buf_h = panel_h + 2 * margin;
+        let stride = buf_w * 4; // XRGB8888
+        assert_eq!(buf_w, 3088);
+        assert_eq!(buf_h, 1744);
+        assert_eq!(stride, 12_352);
+
+        // The second buffer must start one full buffer past the first.
+        let expected = u64::from(stride) * u64::from(buf_h);
+        let actual = super::dual_buf_second_offset(stride, buf_h);
+        assert_eq!(
+            actual, expected,
+            "buf1 offset must be stride×height={expected}, got {actual}; \
+             this is the root cause of #56 — pre-fix `create_dual_buffers` \
+             used offset `stride` (={stride}) which is one ROW, not one buffer, \
+             causing the second buffer to overlap buf0"
+        );
+
+        // Sanity: both buffers fit in the standard pool size (2× stride×height).
+        let pool_size = u64::from(stride) * u64::from(buf_h) * 2;
+        assert!(expected < pool_size, "buf1 start must be within pool");
+        assert!(
+            expected + u64::from(stride) * u64::from(buf_h) <= pool_size,
+            "buf1 end must be within pool"
+        );
     }
 }
 

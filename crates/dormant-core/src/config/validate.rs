@@ -52,6 +52,19 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "rules",
             "wear",
             "notifications",
+            "audio",
+        ],
+    ),
+    // ── audio ───────────────────────────────────────────────────────────────
+    (
+        "audio",
+        &[
+            "poll_interval",
+            "min_active",
+            "call_roles",
+            "playback_roles",
+            "capture_is_call",
+            "pw_dump_command",
         ],
     ),
     // ── wear ────────────────────────────────────────────────────────────────
@@ -388,8 +401,19 @@ fn is_id_level(empty_allowed: bool) -> bool {
 
 // ── Cross-reference validation ─────────────────────────────────────────────────
 
-/// Known inhibitor names for M1.
-const VALID_INHIBITORS: &[&str] = &["user-activity", "manual-pause"];
+/// Known inhibitor names.
+///
+/// Composed from the single-definition-site consts in [`crate::rules`] (F7 —
+/// avoids a third independent string copy of the audio/call literals
+/// alongside `InhibitorKind::from_config`). `"manual-pause"` stays a local
+/// literal: it is accepted-but-unwired (validated here, never mapped by
+/// [`crate::rules::InhibitorKind::from_config`]).
+pub(crate) const VALID_INHIBITORS: &[&str] = &[
+    crate::rules::INHIBITOR_USER_ACTIVITY,
+    crate::rules::INHIBITOR_AUDIO_PLAYBACK,
+    crate::rules::INHIBITOR_CALL,
+    "manual-pause",
+];
 
 /// Run all cross-reference checks on a loaded configuration.
 ///
@@ -472,6 +496,9 @@ pub fn validate(
 
     // ── [notifications] validation ────────────────────────────────────────
     validate_notifications(cfg, &mut errors);
+
+    // ── [audio] validation ──────────────────────────────────────────────
+    validate_audio(cfg, &mut errors);
 
     // ── [sensors.<id>] mqtt availability validation ─────────────────────
     validate_sensors(cfg, &mut errors);
@@ -640,6 +667,68 @@ fn validate_notifications(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 "notifications.cooldown {:?} is below the 1m floor",
                 notifications.cooldown
             ),
+        });
+    }
+}
+
+/// Validate the `[audio]` section: duration floors/ceilings, non-empty role
+/// strings, the F16 `playback_roles = []` trap, and a non-empty
+/// `pw_dump_command`.
+fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let audio = &cfg.audio;
+
+    if audio.poll_interval < Duration::from_secs(1) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "audio.poll_interval {:?} is below the 1s floor",
+                audio.poll_interval
+            ),
+        });
+    }
+
+    let ten_times_poll = audio.poll_interval.saturating_mul(10);
+    if audio.min_active > ten_times_poll {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "audio.min_active {:?} exceeds 10x audio.poll_interval {:?} ({ten_times_poll:?})",
+                audio.min_active, audio.poll_interval
+            ),
+        });
+    }
+
+    for role in &audio.call_roles {
+        if role.is_empty() {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "audio.call_roles contains an empty string".into(),
+            });
+            break;
+        }
+    }
+
+    if let Some(roles) = &audio.playback_roles {
+        if roles.is_empty() {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "audio.playback_roles is set but empty — an explicitly empty list \
+                          silently disables playback inhibition; omit the key instead to \
+                          accept every non-call running output stream"
+                    .into(),
+            });
+        } else if roles.iter().any(String::is_empty) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "audio.playback_roles contains an empty string".into(),
+            });
+        }
+    }
+
+    if audio.pw_dump_command.is_empty() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "audio.pw_dump_command must be non-empty".into(),
         });
     }
 }
@@ -1696,6 +1785,37 @@ gracee_period = "60s"
         }
     }
 
+    /// Write `toml` to a fresh tempfile and load it via [`crate::config::load_config`]
+    /// in [`Strictness::Warn`] mode. Shared helper for `[audio]` config tests
+    /// that need real unknown-key-walk behavior (not just `toml::from_str`).
+    fn load_str(
+        toml: &str,
+    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        crate::config::load_config(&path, Strictness::Warn)
+    }
+
+    /// Same as [`load_str`] but in [`Strictness::Strict`] mode — the first
+    /// unknown key becomes a hard error instead of a warning.
+    fn load_str_strict(
+        toml: &str,
+    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        crate::config::load_config(&path, Strictness::Strict)
+    }
+
+    /// Parse `toml` directly (no unknown-key walk) and run cross-reference
+    /// [`validate`] against it with the standard test capabilities/creds
+    /// fixtures. Shared helper for `[audio]` range-check tests.
+    fn validate_str(toml: &str) -> Vec<ValidationError> {
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg, &test_capabilities(), &test_creds())
+    }
+
     #[test]
     fn validate_accepts_valid_full_config() {
         let cfg = valid_full_config();
@@ -1817,6 +1937,274 @@ gracee_period = "60s"
             errors.iter().any(|e| e.what == "unknown inhibitor"),
             "expected unknown inhibitor error, got: {:?}",
             errors
+        );
+    }
+
+    // ── [audio] section ──────────────────────────────────────────────────
+
+    #[test]
+    fn audio_defaults_accepted_when_section_absent() {
+        let errors = validate_str("config_version = 1\n");
+        assert!(
+            errors.is_empty(),
+            "absent [audio] section must validate cleanly, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn audio_defaults_accepted_when_section_empty() {
+        let errors = validate_str("config_version = 1\n[audio]\n");
+        assert!(
+            errors.is_empty(),
+            "empty [audio] section must validate cleanly, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn audio_poll_interval_below_floor_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\npoll_interval = \"500ms\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("poll_interval")),
+            "poll_interval below 1s floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_poll_interval_at_floor_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\npoll_interval = \"1s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("poll_interval")),
+            "poll_interval = 1s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_min_active_above_ten_times_poll_interval_rejected() {
+        let errors = validate_str(
+            "config_version = 1\n[audio]\npoll_interval = \"1s\"\nmin_active = \"11s\"\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("min_active")),
+            "min_active > 10x poll_interval must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_min_active_at_ten_times_poll_interval_accepted() {
+        let errors = validate_str(
+            "config_version = 1\n[audio]\npoll_interval = \"1s\"\nmin_active = \"10s\"\n",
+        );
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("min_active")),
+            "min_active == 10x poll_interval (the ceiling) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_min_active_zero_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\nmin_active = \"0s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("min_active")),
+            "min_active = 0s must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_call_roles_empty_element_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\ncall_roles = [\"\"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("call_roles")),
+            "empty string in call_roles must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_pw_dump_command_empty_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\npw_dump_command = \"\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("pw_dump_command")),
+            "empty pw_dump_command must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_empty_list_rejected() {
+        // F16 — Some([]) silently disables playback inhibition; reject it.
+        let errors = validate_str("config_version = 1\n[audio]\nplayback_roles = []\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("playback_roles")),
+            "playback_roles = [] must be rejected (F16), got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_unset_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("playback_roles")),
+            "unset playback_roles must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_nonempty_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\nplayback_roles = [\"Movie\"]\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("playback_roles")),
+            "playback_roles = [\"Movie\"] must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_empty_string_element_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\nplayback_roles = [\"\"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("playback_roles")),
+            "playback_roles = [\"\"] must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_inhibitor_literal_accepted_by_rule_validation() {
+        let mut cfg = valid_full_config();
+        cfg.rules.get_mut("office_blank").unwrap().inhibitors = vec!["audio-playback".into()];
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.what == "unknown inhibitor"),
+            "\"audio-playback\" must be a recognized inhibitor literal, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn call_inhibitor_literal_accepted_by_rule_validation() {
+        let mut cfg = valid_full_config();
+        cfg.rules.get_mut("office_blank").unwrap().inhibitors = vec!["call".into()];
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.what == "unknown inhibitor"),
+            "\"call\" must be a recognized inhibitor literal, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_underscore_typo_still_rejected() {
+        let mut cfg = valid_full_config();
+        cfg.rules.get_mut("office_blank").unwrap().inhibitors = vec!["audio_playback".into()];
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|e| e.what == "unknown inhibitor"),
+            "underscore typo \"audio_playback\" must still be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_all_keys_known_in_strict_mode() {
+        let toml = "config_version = 1\n\
+             [audio]\n\
+             poll_interval = \"5s\"\n\
+             min_active = \"3s\"\n\
+             call_roles = [\"Communication\"]\n\
+             playback_roles = [\"Movie\", \"Music\"]\n\
+             capture_is_call = false\n\
+             pw_dump_command = \"pw-dump\"\n";
+        assert!(
+            load_str_strict(toml).is_ok(),
+            "all [audio] keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn audio_unknown_key_rejected_strict() {
+        let result = load_str_strict("config_version = 1\n[audio]\nbogus_key = 1\n");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("audio.bogus_key"),
+            "expected error mentioning audio.bogus_key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn audio_unknown_key_warned_in_warn_mode() {
+        let (_, warnings) = load_str("config_version = 1\n[audio]\nbogus_key = 1\n").unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.key_path.contains("audio.bogus_key")),
+            "expected a warning mentioning audio.bogus_key, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn audio_all_keys_known_in_warn_mode_no_warnings() {
+        let toml = "config_version = 1\n\
+             [audio]\n\
+             poll_interval = \"5s\"\n\
+             min_active = \"3s\"\n\
+             call_roles = [\"Communication\"]\n\
+             playback_roles = [\"Movie\", \"Music\"]\n\
+             capture_is_call = false\n\
+             pw_dump_command = \"pw-dump\"\n";
+        let (_, warnings) = load_str(toml).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "all [audio] keys must be recognized, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn valid_inhibitors_round_trips_through_inhibitor_kind_from_config() {
+        // P7/P13 — VALID_INHIBITORS must not drift from InhibitorKind::from_config:
+        // every literal that maps through from_config to Some(..) must be in
+        // VALID_INHIBITORS, and vice versa for the audio/activity literals
+        // ("manual-pause" is the one deliberate exception — accepted but unwired).
+        for literal in VALID_INHIBITORS {
+            if *literal == "manual-pause" {
+                assert_eq!(
+                    crate::rules::InhibitorKind::from_config(literal),
+                    None,
+                    "'manual-pause' is accepted-but-unwired and must NOT map to an InhibitorKind"
+                );
+                continue;
+            }
+            assert!(
+                crate::rules::InhibitorKind::from_config(literal).is_some(),
+                "VALID_INHIBITORS literal '{literal}' does not map through \
+                 InhibitorKind::from_config — the const recomposition has drifted"
+            );
+        }
+        assert_eq!(
+            crate::rules::InhibitorKind::from_config("audio_playback"),
+            None,
+            "underscore typo must not parse"
         );
     }
 
@@ -2027,6 +2415,7 @@ gracee_period = "60s"
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
             notifications: super::super::schema::NotificationsConfig::default(),
+            audio: super::super::schema::AudioConfig::default(),
         }
     }
 
@@ -2149,6 +2538,7 @@ gracee_period = "60s"
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
             notifications: super::super::schema::NotificationsConfig::default(),
+            audio: super::super::schema::AudioConfig::default(),
         }
     }
 
@@ -2544,6 +2934,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -2599,6 +2990,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -2774,6 +3166,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2797,6 +3190,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2829,6 +3223,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let samsung_errors: Vec<_> = errors
@@ -2860,6 +3255,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2883,6 +3279,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let restore_errors: Vec<_> = errors
@@ -2910,6 +3307,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2933,6 +3331,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(

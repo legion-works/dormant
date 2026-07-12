@@ -268,7 +268,7 @@ mod dispatch_gate_tests {
     use std::time::Duration;
 
     use dormant_core::config::schema::{
-        DaemonConfig, NotificationsConfig, ScreensaverConfig, SensorConfig, WearConfig,
+        AudioConfig, DaemonConfig, NotificationsConfig, ScreensaverConfig, SensorConfig, WearConfig,
     };
     use dormant_core::rules::{DisplaySnapshot, SensorSnapshot};
     use dormant_core::types::SensorState;
@@ -336,6 +336,7 @@ mod dispatch_gate_tests {
             rules: IndexMap::new(),
             wear: WearConfig::default(),
             notifications: NotificationsConfig::default(),
+            audio: AudioConfig::default(),
         }
     }
 

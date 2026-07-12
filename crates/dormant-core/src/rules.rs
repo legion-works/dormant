@@ -50,6 +50,49 @@ use crate::types::{
 };
 use crate::zone::ZoneEngine;
 
+// ── Inhibitor kinds ─────────────────────────────────────────────────────────
+
+/// The category of an inhibitor source that can suppress blanking for a rule.
+///
+/// Multiple inhibitor sources (user activity, audio playback, an active
+/// call) can be engaged concurrently for the same rule; the engine tracks
+/// each kind independently and OR-derives one effective inhibition bit from
+/// them (see [`ControlMsg::SetInhibited`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InhibitorKind {
+    /// User keyboard/mouse/idle-time activity (config literal
+    /// [`INHIBITOR_USER_ACTIVITY`]).
+    UserActivity,
+    /// Active audio playback (config literal [`INHIBITOR_AUDIO_PLAYBACK`]).
+    AudioPlayback,
+    /// An active call (config literal [`INHIBITOR_CALL`]).
+    Call,
+}
+
+/// Config-file literal for [`InhibitorKind::UserActivity`].
+pub const INHIBITOR_USER_ACTIVITY: &str = "user-activity";
+/// Config-file literal for [`InhibitorKind::AudioPlayback`].
+pub const INHIBITOR_AUDIO_PLAYBACK: &str = "audio-playback";
+/// Config-file literal for [`InhibitorKind::Call`].
+pub const INHIBITOR_CALL: &str = "call";
+
+impl InhibitorKind {
+    /// Parse a config-file inhibitor literal into its [`InhibitorKind`].
+    ///
+    /// Returns `None` for any string that isn't one of the three known
+    /// literals. Rejecting unknown inhibitor names at config-validation time
+    /// is a config-layer concern, not this parser's.
+    #[must_use]
+    pub fn from_config(s: &str) -> Option<Self> {
+        match s {
+            INHIBITOR_USER_ACTIVITY => Some(Self::UserActivity),
+            INHIBITOR_AUDIO_PLAYBACK => Some(Self::AudioPlayback),
+            INHIBITOR_CALL => Some(Self::Call),
+            _ => None,
+        }
+    }
+}
+
 // ── Public I/O surfaces ───────────────────────────────────────────────────────
 
 /// Inbound control messages to the engine.
@@ -84,6 +127,8 @@ pub enum ControlMsg {
     SetInhibited {
         /// Target rule (`None` → all rules).
         rule: Option<RuleId>,
+        /// Which inhibitor category this update is for.
+        kind: InhibitorKind,
         /// Whether the inhibitor is now engaged.
         inhibited: bool,
     },
@@ -601,6 +646,24 @@ enum InternalResult {
     },
 }
 
+/// One rule's per-kind inhibitor bookkeeping.
+///
+/// `kinds` records the last-known engaged/released bool per
+/// [`InhibitorKind`] this rule has ever seen (kinds never reported for this
+/// rule are simply absent — treated as not-engaged by the OR-derivation).
+/// `effective` is the OR of every value in `kinds`, cached so
+/// [`RulesEngine::apply_inhibitor`] can detect a no-op update (a kind flip
+/// that doesn't change the OR result) without recomputing against the
+/// previous state machine input.
+#[derive(Debug, Default, Clone)]
+struct InhibitorSet {
+    /// Last-known engaged/released bool per inhibitor kind.
+    kinds: HashMap<InhibitorKind, bool>,
+    /// OR of every value in `kinds` — the bit actually fed to
+    /// [`Input::InhibitorChanged`].
+    effective: bool,
+}
+
 /// Motion-sensor hold state — one entry per sensor with `kind == Motion` and
 /// `hold_time = Some(_)`.
 #[derive(Debug, Default, Clone)]
@@ -645,6 +708,11 @@ pub struct RulesEngine {
     zone_rules: HashMap<ZoneId, Vec<RuleId>>,
     /// Sensors that are currently paused at the rule level (skip blanking).
     paused_rules: HashSet<RuleId>,
+    /// Per-rule inhibitor bookkeeping (kind → engaged, plus the OR-derived
+    /// effective bit). A rule absent from this map has never received a
+    /// [`ControlMsg::SetInhibited`] — equivalent to an all-`false`
+    /// [`InhibitorSet`].
+    inhibitor_state: HashMap<RuleId, InhibitorSet>,
     /// Per-sensor hold state (only populated for `Motion + Some(hold_time)`).
     holds: HashMap<SensorId, HoldState>,
     /// Per-display wake-retry counter (increments on each failure, resets on
@@ -769,6 +837,7 @@ impl RulesEngine {
             rule_displays,
             zone_rules,
             paused_rules: HashSet::new(),
+            inhibitor_state: HashMap::new(),
             holds,
             wake_attempts: HashMap::new(),
             reported: HashSet::new(),
@@ -1089,8 +1158,12 @@ impl RulesEngine {
             ControlMsg::SubscribeEvents(tx) => {
                 let _ = tx.send(self.event_tx.subscribe());
             }
-            ControlMsg::SetInhibited { rule, inhibited } => {
-                self.handle_set_inhibited(rule.as_ref(), inhibited);
+            ControlMsg::SetInhibited {
+                rule,
+                kind,
+                inhibited,
+            } => {
+                self.handle_set_inhibited(rule.as_ref(), kind, inhibited);
             }
             ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
             ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
@@ -1098,20 +1171,47 @@ impl RulesEngine {
         }
     }
 
-    /// Route an inhibitor state change to a rule's displays (or every display
-    /// when `rule` is `None`), mirroring [`Self::handle_pause`]'s fan-out.
-    fn handle_set_inhibited(&mut self, rule: Option<&RuleId>, inhibited: bool) {
-        let targets: Vec<DisplayId> = match rule {
-            Some(r) => self.rule_displays.get(r).cloned().unwrap_or_default(),
-            None => self
-                .cfg
-                .displays
-                .iter()
-                .map(|d| d.display.clone())
-                .collect(),
-        };
+    /// Route an inhibitor state change to a rule (or every rule when `rule`
+    /// is `None`), mirroring [`Self::handle_pause`]'s per-RULE bookkeeping
+    /// idiom for the `None` case (NOT the bare `cfg.displays` fan-out —
+    /// each rule's inhibitor state is tracked, and fanned out to displays,
+    /// independently).
+    fn handle_set_inhibited(
+        &mut self,
+        rule: Option<&RuleId>,
+        kind: InhibitorKind,
+        inhibited: bool,
+    ) {
+        if let Some(r) = rule {
+            self.apply_inhibitor(r, kind, inhibited);
+        } else {
+            let rule_ids: Vec<RuleId> = self.rule_displays.keys().cloned().collect();
+            for r in rule_ids {
+                self.apply_inhibitor(&r, kind, inhibited);
+            }
+        }
+    }
+
+    /// Update one rule's per-kind inhibitor bookkeeping and, ONLY when the
+    /// OR-derived effective bit actually changes, fan out
+    /// [`Input::InhibitorChanged`] to that rule's displays.
+    ///
+    /// This is the change-dedup mechanism: a repeated `SetInhibited` for a
+    /// kind that doesn't flip the effective bit is a pure no-op past the
+    /// bookkeeping update — no display step, no [`Effect`], no `SinkCmd`.
+    fn apply_inhibitor(&mut self, rule: &RuleId, kind: InhibitorKind, inhibited: bool) {
+        let set = self.inhibitor_state.entry(rule.clone()).or_default();
+        set.kinds.insert(kind, inhibited);
+        let new_effective = set.kinds.values().any(|&engaged| engaged);
+        let changed = new_effective != set.effective;
+        if !changed {
+            return;
+        }
+        set.effective = new_effective;
+
+        let targets = self.rule_displays.get(rule).cloned().unwrap_or_default();
         for d in targets {
-            self.step_one(&d, Input::InhibitorChanged(inhibited));
+            self.step_one(&d, Input::InhibitorChanged(new_effective));
         }
     }
 
@@ -2071,6 +2171,31 @@ mod tests {
     use super::*;
     use crate::traits::{PanelState, PowerState};
 
+    // ── InhibitorKind::from_config literal pin ──────────────────────────────
+
+    /// Each `INHIBITOR_*` const must round-trip through `from_config` to the
+    /// matching [`InhibitorKind`] variant, and an unrecognized literal must
+    /// yield `None`. Pins the config-string ⇄ enum mapping so a typo'd
+    /// literal fails loudly here instead of silently at config-validation
+    /// time (Task 2's `VALID_INHIBITORS` is a separate, config-layer
+    /// concern — not referenced by this test).
+    #[test]
+    fn inhibitor_kind_from_config_round_trips_known_literals() {
+        assert_eq!(
+            InhibitorKind::from_config(INHIBITOR_USER_ACTIVITY),
+            Some(InhibitorKind::UserActivity)
+        );
+        assert_eq!(
+            InhibitorKind::from_config(INHIBITOR_AUDIO_PLAYBACK),
+            Some(InhibitorKind::AudioPlayback)
+        );
+        assert_eq!(
+            InhibitorKind::from_config(INHIBITOR_CALL),
+            Some(InhibitorKind::Call)
+        );
+        assert_eq!(InhibitorKind::from_config("not-a-real-inhibitor"), None);
+    }
+
     // ── Verdict logic (pure functions) ─────────────────────────────────────
 
     /// The decisive test for the blank step: a controller that returns Ok
@@ -3004,6 +3129,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
         paused_rules: HashSet::new(),
+        inhibitor_state: HashMap::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
         reported: HashSet::new(),
@@ -3101,6 +3227,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
         paused_rules: HashSet::new(),
+        inhibitor_state: HashMap::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
         reported: HashSet::new(),

@@ -92,6 +92,10 @@ pub struct Config {
     /// Wake-failure notification configuration.
     #[serde(default)]
     pub notifications: NotificationsConfig,
+
+    /// Global `PipeWire` audio-inhibitor configuration.
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 // ── DaemonConfig ────────────────────────────────────────────────────────────────
@@ -324,6 +328,73 @@ impl Default for NotificationsConfig {
             wake_attempt_threshold: defaults::NOTIFY_WAKE_ATTEMPT_THRESHOLD,
             cooldown: defaults::NOTIFY_COOLDOWN,
             notify_recovery: defaults::NOTIFY_RECOVERY,
+        }
+    }
+}
+
+// ── AudioConfig ─────────────────────────────────────────────────────────────────
+
+/// Global `PipeWire` audio-inhibitor configuration (the `[audio]` TOML
+/// section).
+///
+/// Global rather than per-rule (a deliberate divergence from the per-rule
+/// `activity_*` precedent): stream classification is a system-wide fact
+/// about ONE `PipeWire` instance — per-rule copies would be fake granularity
+/// that still collapses to one poller. Rules choose WHICH kinds inhibit them
+/// via `RuleConfig::inhibitors`; `[audio]` says what those kinds MEAN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioConfig {
+    /// How often to poll `pw_dump_command` for the current `PipeWire` graph.
+    #[serde(default = "default_audio_poll_interval", with = "humantime_serde")]
+    pub poll_interval: Duration,
+
+    /// Minimum continuous stream activity before the audio inhibitor
+    /// asserts (debounces transient blips such as a notification chime).
+    /// Deassertion is immediate — the debounce is asymmetric on purpose,
+    /// fail-toward-blanking.
+    #[serde(default = "default_audio_min_active", with = "humantime_serde")]
+    pub min_active: Duration,
+
+    /// `media.role` values that mean "this running stream is a call".
+    #[serde(default = "default_audio_call_roles")]
+    pub call_roles: Vec<String>,
+
+    /// Optional narrowing filter for the `"audio-playback"` kind: when set,
+    /// only running output streams whose `media.role` is in this list
+    /// inhibit. Unset (the default) means every non-call running output
+    /// stream inhibits — the permissive default avoids a curated role list
+    /// `PipeWire` apps notoriously fill inconsistently. An explicitly empty
+    /// list is rejected by validation (it would silently disable playback
+    /// inhibition).
+    #[serde(default)]
+    pub playback_roles: Option<Vec<String>>,
+
+    /// Whether a running INPUT stream (an open microphone) counts as a
+    /// call. Defaults to `false`: `PipeWire` input nodes commonly sit
+    /// `running` for hours under ordinary setups (idling Discord/Teams,
+    /// OBS mic sources, wake-word assistants, granted browser mic
+    /// permissions) — a `true` default would silently defeat blanking for a
+    /// wide slice of users. Opt in deliberately.
+    #[serde(default)]
+    pub capture_is_call: bool,
+
+    /// Override for the `pw-dump` invocation. Split with
+    /// `str::split_whitespace()` — no shell, no quoting support; paths
+    /// containing spaces are unsupported. This is the test/override seam
+    /// (point it at a fake script emitting fixture JSON).
+    #[serde(default = "default_audio_pw_dump_command")]
+    pub pw_dump_command: String,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: defaults::AUDIO_POLL_INTERVAL,
+            min_active: defaults::AUDIO_MIN_ACTIVE,
+            call_roles: default_audio_call_roles(),
+            playback_roles: None,
+            capture_is_call: false,
+            pw_dump_command: defaults::AUDIO_PW_DUMP_COMMAND.into(),
         }
     }
 }
@@ -1096,6 +1167,21 @@ fn default_notify_cooldown() -> Duration {
 fn default_notify_recovery() -> bool {
     defaults::NOTIFY_RECOVERY
 }
+fn default_audio_poll_interval() -> Duration {
+    defaults::AUDIO_POLL_INTERVAL
+}
+fn default_audio_min_active() -> Duration {
+    defaults::AUDIO_MIN_ACTIVE
+}
+fn default_audio_call_roles() -> Vec<String> {
+    defaults::AUDIO_CALL_ROLES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+fn default_audio_pw_dump_command() -> String {
+    defaults::AUDIO_PW_DUMP_COMMAND.into()
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -1203,6 +1289,26 @@ mod tests {
         assert_eq!(r2.zone, "media");
         assert_eq!(r2.displays, vec!["tv", "escape"]);
         assert_eq!(r2.wake_retries, 5); // explicit in TOML
+    }
+
+    // ── AudioConfig ──────────────────────────────────────────────────────
+
+    #[test]
+    fn audio_config_defaults_when_section_absent() {
+        let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
+        assert_eq!(cfg.audio, AudioConfig::default());
+        assert_eq!(cfg.audio.poll_interval, defaults::AUDIO_POLL_INTERVAL);
+        assert_eq!(cfg.audio.min_active, defaults::AUDIO_MIN_ACTIVE);
+        assert_eq!(cfg.audio.call_roles, vec!["Communication".to_string()]);
+        assert_eq!(cfg.audio.playback_roles, None);
+        assert!(!cfg.audio.capture_is_call);
+        assert_eq!(cfg.audio.pw_dump_command, "pw-dump");
+    }
+
+    #[test]
+    fn audio_config_defaults_when_section_empty() {
+        let cfg: Config = toml::from_str("config_version = 1\n[audio]\n").unwrap();
+        assert_eq!(cfg.audio, AudioConfig::default());
     }
 
     // ── ZoneConfig::to_zone_spec ──────────────────────────────────────────

@@ -160,6 +160,7 @@ const REMOVABLE_KEYS: &[&str] = &[
     "output",
     "wol_mac",
     "host",
+    "playback_roles",
 ];
 
 /// v1-locked leaves — may never be written or removed through the patch API.
@@ -1223,6 +1224,9 @@ kind = "power_off"
 zone = "office"
 displays = ["tv"]
 grace_period = "30s"
+
+[audio]
+playback_roles = ["Movie"]
 "#)
     }
 
@@ -1533,6 +1537,12 @@ grace_period = "30s"
         check_ok(&[remove(&["displays", "tv", "host"])], &cur, &[]);
     }
 
+    #[test]
+    fn remove_playback_roles_is_allowed() {
+        let cur = minimal_config();
+        check_ok(&[remove(&["audio", "playback_roles"])], &cur, &[]);
+    }
+
     // ==================================================================
     // 4. Entity-existence tests
     // ==================================================================
@@ -1838,6 +1848,31 @@ grace_period = "30s" # trailing grace_period comment
         // Full-string equality: blank_mode line removed, everything else intact.
         let expected = GOLDEN_FIXTURE.replace("blank_mode = \"picture_off\"\n", "");
         assert_eq!(after, expected, "only blank_mode line should be removed");
+    }
+
+    #[test]
+    fn remove_playback_roles_actually_unsets_key() {
+        let mut doc = doc(r#"
+config_version = 1
+
+[audio]
+poll_interval = "5s"
+playback_roles = ["Movie", "Music"]
+capture_is_call = false
+"#);
+
+        let patches = [remove(&["audio", "playback_roles"])];
+        check_ok(&patches, &doc, &[]);
+        apply_patches(&mut doc, &patches).unwrap();
+
+        let after = doc.to_string();
+        assert!(
+            !after.contains("playback_roles"),
+            "playback_roles key should be fully removed, got: {after}"
+        );
+        // Neighboring keys survive the removal untouched.
+        assert!(after.contains("poll_interval = \"5s\""));
+        assert!(after.contains("capture_is_call = false"));
     }
 
     #[test]

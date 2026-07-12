@@ -184,3 +184,22 @@ pub const SHIFT_PX: u8 = 2;
 
 /// Default interval between successive pixel shifts.
 pub const SHIFT_INTERVAL: Duration = Duration::from_secs(120);
+
+// ── [audio] section defaults ────────────────────────────────────────────────
+
+/// How often the audio inhibitor polls `pw_dump_command` for the current
+/// `PipeWire` graph state.
+pub const AUDIO_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Minimum continuous stream activity before the audio inhibitor asserts
+/// inhibition (debounces transient blips; bypassed once at poller startup
+/// for a stream already running when the daemon starts — see the audio
+/// source's `startup_grace`).
+pub const AUDIO_MIN_ACTIVE: Duration = Duration::from_secs(3);
+
+/// `media.role` values that mean "this running stream is a call".
+pub const AUDIO_CALL_ROLES: &[&str] = &["Communication"];
+
+/// Default `pw-dump` invocation (resolved via `$PATH`); override via
+/// `[audio].pw_dump_command` — the test/override seam.
+pub const AUDIO_PW_DUMP_COMMAND: &str = "pw-dump";

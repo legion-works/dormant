@@ -52,7 +52,26 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "rules",
             "wear",
             "notifications",
+            "watchdog",
+            "audio",
         ],
+    ),
+    // ── audio ───────────────────────────────────────────────────────────────
+    (
+        "audio",
+        &[
+            "poll_interval",
+            "min_active",
+            "call_roles",
+            "playback_roles",
+            "capture_is_call",
+            "pw_dump_command",
+        ],
+    ),
+    // ── watchdog ────────────────────────────────────────────────────────────
+    (
+        "watchdog",
+        &["lkg_enabled", "lkg_rollback_enabled", "stability_window"],
     ),
     // ── wear ────────────────────────────────────────────────────────────────
     (
@@ -94,6 +113,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "web_port",
             "web_bind",
             "web_allow_nonloopback",
+            "entity_crud_enabled",
+            "pairing_enabled",
+            "pair_timeout",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────
@@ -328,15 +350,51 @@ fn is_collection_level(path: &str) -> bool {
     path == "sensors" || path == "zones" || path == "displays" || path == "rules"
 }
 
+// ── Structural reserved names (P1/P10 single source of truth) ──────────────
+
+/// The single source of truth for every structurally-special TOML key/id
+/// name in the schema. The three predicates below (`is_weights_level`,
+/// `is_array_of_tables_parent`, `is_passthrough_data_key`) each consume a
+/// PER-PREDICATE subset const derived from names in this list — never one
+/// shared/blanket loop (P10) — because their match semantics differ
+/// (suffix-with-dot vs. exact equality) and a uniform loop would silently
+/// broaden `is_passthrough_data_key` from exact-key equality into a suffix
+/// match, opening a config-smuggling surface.
+///
+/// Drift-proofing: `dormant_web`'s `RESERVED_ENTITY_IDS` cross-check
+/// (`config_patch.rs`, Task 2) asserts `RESERVED_ENTITY_IDS ⊇
+/// STRUCTURAL_RESERVED_NAMES` against this REAL symbol (re-exported via
+/// `config/mod.rs`). Within this crate, each predicate's own subset const is
+/// pinned ⊆ `STRUCTURAL_RESERVED_NAMES` by an enumerated-by-name test in this
+/// module's test suite (`predicate_name_subsets_are_reserved` and friends) —
+/// a genuinely NEW 7th predicate needs its own enumerated test line added at
+/// write time; this is not automatic/reflective discovery.
+pub const STRUCTURAL_RESERVED_NAMES: &[&str] =
+    &["weights", "source", "ladder", "blank_data", "wake_data"];
+
+/// Suffix-matched name subset of [`STRUCTURAL_RESERVED_NAMES`] consumed by
+/// [`is_weights_level`] — only `"weights"`.
+const WEIGHTS_LEVEL_NAMES: &[&str] = &["weights"];
+
 /// Is this path at a weights sub-table where keys are dynamic member ids?
 fn is_weights_level(path: &str) -> bool {
-    path.ends_with(".weights")
+    WEIGHTS_LEVEL_NAMES.iter().any(|name| {
+        path.strip_suffix(name)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
+
+/// Exact-equality name subset of [`STRUCTURAL_RESERVED_NAMES`] consumed by
+/// [`is_passthrough_data_key`] — only `"blank_data"`/`"wake_data"`.
+const PASSTHROUGH_DATA_KEY_NAMES: &[&str] = &["blank_data", "wake_data"];
 
 /// Is this a passthrough data key whose children are arbitrary TOML that
 /// should not be checked against the known-key set?
+///
+/// EXACT equality, not a suffix match — `"blank_data_extra"` must NOT match
+/// (P10 — a suffix loop here would widen the passthrough surface).
 fn is_passthrough_data_key(key: &str) -> bool {
-    key == "blank_data" || key == "wake_data"
+    PASSTHROUGH_DATA_KEY_NAMES.contains(&key)
 }
 
 /// Is this one level deeper than an empty allowed set? (deep nesting of unknown
@@ -349,8 +407,19 @@ fn is_id_level(empty_allowed: bool) -> bool {
 
 // ── Cross-reference validation ─────────────────────────────────────────────────
 
-/// Known inhibitor names for M1.
-const VALID_INHIBITORS: &[&str] = &["user-activity", "manual-pause"];
+/// Known inhibitor names.
+///
+/// Composed from the single-definition-site consts in [`crate::rules`] (F7 —
+/// avoids a third independent string copy of the audio/call literals
+/// alongside `InhibitorKind::from_config`). `"manual-pause"` stays a local
+/// literal: it is accepted-but-unwired (validated here, never mapped by
+/// [`crate::rules::InhibitorKind::from_config`]).
+pub(crate) const VALID_INHIBITORS: &[&str] = &[
+    crate::rules::INHIBITOR_USER_ACTIVITY,
+    crate::rules::INHIBITOR_AUDIO_PLAYBACK,
+    crate::rules::INHIBITOR_CALL,
+    "manual-pause",
+];
 
 /// Run all cross-reference checks on a loaded configuration.
 ///
@@ -425,11 +494,19 @@ pub fn validate(
         });
     }
 
+    // ── [daemon] validation ──────────────────────────────────────────────
+    validate_daemon(cfg, &mut errors);
+
     // ── [wear] validation ────────────────────────────────────────────────
     validate_wear(cfg, &mut errors);
 
     // ── [notifications] validation ────────────────────────────────────────
     validate_notifications(cfg, &mut errors);
+
+    // ── [watchdog] validation ───────────────────────────────────────────
+    validate_watchdog(cfg, &mut errors);
+    // ── [audio] validation ──────────────────────────────────────────────
+    validate_audio(cfg, &mut errors);
 
     // ── [sensors.<id>] mqtt availability validation ─────────────────────
     validate_sensors(cfg, &mut errors);
@@ -560,6 +637,23 @@ fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
     }
 }
 
+/// Validate the `[daemon]` section: `pair_timeout` bounds.
+fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let daemon = &cfg.daemon;
+
+    if daemon.pair_timeout < Duration::from_secs(30)
+        || daemon.pair_timeout > Duration::from_secs(300)
+    {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "daemon.pair_timeout {:?} is out of range — allowed: 30s..=300s",
+                daemon.pair_timeout
+            ),
+        });
+    }
+}
+
 /// Validate the `[notifications]` section: threshold floor and cooldown floor.
 fn validate_notifications(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let notifications = &cfg.notifications;
@@ -581,6 +675,76 @@ fn validate_notifications(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 "notifications.cooldown {:?} is below the 1m floor",
                 notifications.cooldown
             ),
+        });
+    }
+}
+
+/// Validate the `[watchdog]` section: `stability_window` floor.
+fn validate_watchdog(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let watchdog = &cfg.watchdog;
+    if watchdog.stability_window < Duration::from_secs(30) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "watchdog.stability_window {:?} is below the 30s floor",
+                watchdog.stability_window
+            ),
+        });
+    }
+}
+/// Validate the `[audio]` section: duration floors/ceilings, non-empty role
+/// strings, the F16 `playback_roles = []` trap, and a non-empty
+/// `pw_dump_command`.
+fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let audio = &cfg.audio;
+    if audio.poll_interval < Duration::from_secs(1) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "audio.poll_interval {:?} is below the 1s floor",
+                audio.poll_interval
+            ),
+        });
+    }
+    let ten_times_poll = audio.poll_interval.saturating_mul(10);
+    if audio.min_active > ten_times_poll {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "audio.min_active {:?} exceeds 10x audio.poll_interval {:?} ({ten_times_poll:?})",
+                audio.min_active, audio.poll_interval
+            ),
+        });
+    }
+    for role in &audio.call_roles {
+        if role.is_empty() {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "audio.call_roles contains an empty string".into(),
+            });
+            break;
+        }
+    }
+    if let Some(roles) = &audio.playback_roles {
+        if roles.is_empty() {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "audio.playback_roles is set but empty — an explicitly empty list \
+                          silently disables playback inhibition; omit the key instead to \
+                          accept every non-call running output stream"
+                    .into(),
+            });
+        } else if roles.iter().any(String::is_empty) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "audio.playback_roles contains an empty string".into(),
+            });
+        }
+    }
+    if audio.pw_dump_command.is_empty() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "audio.pw_dump_command must be non-empty".into(),
         });
     }
 }
@@ -1338,8 +1502,18 @@ pub fn is_known_config_path(path: &[&str]) -> bool {
 ///
 /// Kept next to [`KNOWN_KEYS`] so the name list is grep-stable and
 /// trivially auditable.
+///
+/// Suffix-matched name subset of [`STRUCTURAL_RESERVED_NAMES`] consumed
+/// here — only `"ladder"`/`"source"` (P10 — its own const, not shared with
+/// [`is_weights_level`] or [`is_passthrough_data_key`]).
+const ARRAY_OF_TABLES_PARENT_NAMES: &[&str] = &["ladder", "source"];
+
 fn is_array_of_tables_parent(parent: &str) -> bool {
-    parent.ends_with(".ladder") || parent.ends_with(".source")
+    ARRAY_OF_TABLES_PARENT_NAMES.iter().any(|name| {
+        parent
+            .strip_suffix(name)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 /// Recursive helper: `parent` is the dot-joined path consumed so far;
@@ -1626,6 +1800,37 @@ gracee_period = "60s"
         }
     }
 
+    /// Write `toml` to a fresh tempfile and load it via [`crate::config::load_config`]
+    /// in [`Strictness::Warn`] mode. Shared helper for config tests
+    /// that need real unknown-key-walk behavior (not just `toml::from_str`).
+    fn load_str(
+        toml: &str,
+    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        crate::config::load_config(&path, Strictness::Warn)
+    }
+
+    /// Same as [`load_str`] but in [`Strictness::Strict`] mode — the first
+    /// unknown key becomes a hard error instead of a warning.
+    fn load_str_strict(
+        toml: &str,
+    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        crate::config::load_config(&path, Strictness::Strict)
+    }
+
+    /// Parse `toml` directly (no unknown-key walk) and run cross-reference
+    /// [`validate`] against it with the standard test capabilities/creds
+    /// fixtures.
+    fn validate_str(toml: &str) -> Vec<ValidationError> {
+        let cfg: Config = toml::from_str(toml).unwrap();
+        validate(&cfg, &test_capabilities(), &test_creds())
+    }
+
     #[test]
     fn validate_accepts_valid_full_config() {
         let cfg = valid_full_config();
@@ -1747,6 +1952,274 @@ gracee_period = "60s"
             errors.iter().any(|e| e.what == "unknown inhibitor"),
             "expected unknown inhibitor error, got: {:?}",
             errors
+        );
+    }
+
+    // ── [audio] section ──────────────────────────────────────────────────
+
+    #[test]
+    fn audio_defaults_accepted_when_section_absent() {
+        let errors = validate_str("config_version = 1\n");
+        assert!(
+            errors.is_empty(),
+            "absent [audio] section must validate cleanly, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn audio_defaults_accepted_when_section_empty() {
+        let errors = validate_str("config_version = 1\n[audio]\n");
+        assert!(
+            errors.is_empty(),
+            "empty [audio] section must validate cleanly, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn audio_poll_interval_below_floor_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\npoll_interval = \"500ms\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("poll_interval")),
+            "poll_interval below 1s floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_poll_interval_at_floor_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\npoll_interval = \"1s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("poll_interval")),
+            "poll_interval = 1s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_min_active_above_ten_times_poll_interval_rejected() {
+        let errors = validate_str(
+            "config_version = 1\n[audio]\npoll_interval = \"1s\"\nmin_active = \"11s\"\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("min_active")),
+            "min_active > 10x poll_interval must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_min_active_at_ten_times_poll_interval_accepted() {
+        let errors = validate_str(
+            "config_version = 1\n[audio]\npoll_interval = \"1s\"\nmin_active = \"10s\"\n",
+        );
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("min_active")),
+            "min_active == 10x poll_interval (the ceiling) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_min_active_zero_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\nmin_active = \"0s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("min_active")),
+            "min_active = 0s must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_call_roles_empty_element_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\ncall_roles = [\"\"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("call_roles")),
+            "empty string in call_roles must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_pw_dump_command_empty_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\npw_dump_command = \"\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("pw_dump_command")),
+            "empty pw_dump_command must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_empty_list_rejected() {
+        // F16 — Some([]) silently disables playback inhibition; reject it.
+        let errors = validate_str("config_version = 1\n[audio]\nplayback_roles = []\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("playback_roles")),
+            "playback_roles = [] must be rejected (F16), got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_unset_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("playback_roles")),
+            "unset playback_roles must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_nonempty_accepted() {
+        let errors = validate_str("config_version = 1\n[audio]\nplayback_roles = [\"Movie\"]\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("playback_roles")),
+            "playback_roles = [\"Movie\"] must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_roles_empty_string_element_rejected() {
+        let errors = validate_str("config_version = 1\n[audio]\nplayback_roles = [\"\"]\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("playback_roles")),
+            "playback_roles = [\"\"] must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_inhibitor_literal_accepted_by_rule_validation() {
+        let mut cfg = valid_full_config();
+        cfg.rules.get_mut("office_blank").unwrap().inhibitors = vec!["audio-playback".into()];
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.what == "unknown inhibitor"),
+            "\"audio-playback\" must be a recognized inhibitor literal, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn call_inhibitor_literal_accepted_by_rule_validation() {
+        let mut cfg = valid_full_config();
+        cfg.rules.get_mut("office_blank").unwrap().inhibitors = vec!["call".into()];
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            !errors.iter().any(|e| e.what == "unknown inhibitor"),
+            "\"call\" must be a recognized inhibitor literal, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_playback_underscore_typo_still_rejected() {
+        let mut cfg = valid_full_config();
+        cfg.rules.get_mut("office_blank").unwrap().inhibitors = vec!["audio_playback".into()];
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|e| e.what == "unknown inhibitor"),
+            "underscore typo \"audio_playback\" must still be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn audio_all_keys_known_in_strict_mode() {
+        let toml = "config_version = 1\n\
+             [audio]\n\
+             poll_interval = \"5s\"\n\
+             min_active = \"3s\"\n\
+             call_roles = [\"Communication\"]\n\
+             playback_roles = [\"Movie\", \"Music\"]\n\
+             capture_is_call = false\n\
+             pw_dump_command = \"pw-dump\"\n";
+        assert!(
+            load_str_strict(toml).is_ok(),
+            "all [audio] keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn audio_unknown_key_rejected_strict() {
+        let result = load_str_strict("config_version = 1\n[audio]\nbogus_key = 1\n");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("audio.bogus_key"),
+            "expected error mentioning audio.bogus_key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn audio_unknown_key_warned_in_warn_mode() {
+        let (_, warnings) = load_str("config_version = 1\n[audio]\nbogus_key = 1\n").unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.key_path.contains("audio.bogus_key")),
+            "expected a warning mentioning audio.bogus_key, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn audio_all_keys_known_in_warn_mode_no_warnings() {
+        let toml = "config_version = 1\n\
+             [audio]\n\
+             poll_interval = \"5s\"\n\
+             min_active = \"3s\"\n\
+             call_roles = [\"Communication\"]\n\
+             playback_roles = [\"Movie\", \"Music\"]\n\
+             capture_is_call = false\n\
+             pw_dump_command = \"pw-dump\"\n";
+        let (_, warnings) = load_str(toml).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "all [audio] keys must be recognized, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn valid_inhibitors_round_trips_through_inhibitor_kind_from_config() {
+        // P7/P13 — VALID_INHIBITORS must not drift from InhibitorKind::from_config:
+        // every literal that maps through from_config to Some(..) must be in
+        // VALID_INHIBITORS, and vice versa for the audio/activity literals
+        // ("manual-pause" is the one deliberate exception — accepted but unwired).
+        for literal in VALID_INHIBITORS {
+            if *literal == "manual-pause" {
+                assert_eq!(
+                    crate::rules::InhibitorKind::from_config(literal),
+                    None,
+                    "'manual-pause' is accepted-but-unwired and must NOT map to an InhibitorKind"
+                );
+                continue;
+            }
+            assert!(
+                crate::rules::InhibitorKind::from_config(literal).is_some(),
+                "VALID_INHIBITORS literal '{literal}' does not map through \
+                 InhibitorKind::from_config — the const recomposition has drifted"
+            );
+        }
+        assert_eq!(
+            crate::rules::InhibitorKind::from_config("audio_playback"),
+            None,
+            "underscore typo must not parse"
         );
     }
 
@@ -1957,6 +2430,8 @@ gracee_period = "60s"
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
             notifications: super::super::schema::NotificationsConfig::default(),
+            watchdog: super::super::schema::WatchdogConfig::default(),
+            audio: super::super::schema::AudioConfig::default(),
         }
     }
 
@@ -2079,6 +2554,8 @@ gracee_period = "60s"
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
             notifications: super::super::schema::NotificationsConfig::default(),
+            watchdog: super::super::schema::WatchdogConfig::default(),
+            audio: super::super::schema::AudioConfig::default(),
         }
     }
 
@@ -2474,6 +2951,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -2529,6 +3008,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -2704,6 +3185,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2727,6 +3210,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2759,6 +3244,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let samsung_errors: Vec<_> = errors
@@ -2790,6 +3277,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2813,6 +3302,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let restore_errors: Vec<_> = errors
@@ -2840,6 +3331,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -2863,6 +3356,8 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
+            audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4121,6 +4616,82 @@ kind = "power_off"
         );
     }
 
+    // ── [watchdog] validation ─────────────────────────────────────────────
+
+    #[test]
+    fn watchdog_defaults_when_section_absent() {
+        let (cfg, warnings) = load_str("config_version = 1\n").unwrap();
+        assert!(warnings.is_empty());
+        // Literal values, NOT the defaults:: consts — comparing against the
+        // same symbol that produced the value would be tautological and
+        // couldn't catch a drifted const (spec §7 pins true / true / 5m).
+        assert!(cfg.watchdog.lkg_enabled);
+        assert!(cfg.watchdog.lkg_rollback_enabled);
+        assert_eq!(
+            cfg.watchdog.stability_window,
+            std::time::Duration::from_secs(5 * 60)
+        );
+    }
+
+    #[test]
+    fn watchdog_defaults_when_section_empty() {
+        let (cfg, warnings) = load_str("config_version = 1\n[watchdog]\n").unwrap();
+        assert!(warnings.is_empty());
+        // Literal values — see watchdog_defaults_when_section_absent.
+        assert!(cfg.watchdog.lkg_enabled);
+        assert!(cfg.watchdog.lkg_rollback_enabled);
+        assert_eq!(
+            cfg.watchdog.stability_window,
+            std::time::Duration::from_secs(5 * 60)
+        );
+    }
+
+    #[test]
+    fn watchdog_stability_window_below_floor_rejected() {
+        let errors = validate_str("config_version = 1\n[watchdog]\nstability_window = \"10s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("stability_window")),
+            "stability_window = 10s (below the 30s floor) must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn watchdog_stability_window_at_floor_accepted() {
+        let errors = validate_str("config_version = 1\n[watchdog]\nstability_window = \"30s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("stability_window")),
+            "stability_window = 30s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn watchdog_all_keys_known_in_strict_mode() {
+        let toml_str = "config_version = 1\n\
+             [watchdog]\n\
+             lkg_enabled = true\n\
+             lkg_rollback_enabled = true\n\
+             stability_window = \"5m\"\n";
+        assert!(
+            load_str_strict(toml_str).is_ok(),
+            "all [watchdog] keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn watchdog_unknown_key_rejected_strict() {
+        let result = load_str_strict("config_version = 1\n[watchdog]\nbogus = 1\n");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("watchdog.bogus"),
+            "expected error mentioning watchdog.bogus, got: {err}"
+        );
+    }
+
     // ── [sensors.<id>] availability_* validation ────────────────────────────
 
     fn availability_config(toml_str: &str) -> Config {
@@ -4390,5 +4961,188 @@ availability_payload_offline = "down"
             crate::config::schema::SensorConfig::Ha(_) => {} // field dropped, as expected
             other => panic!("expected Ha sensor, got {other:?}"),
         }
+    }
+
+    // ── Task 1: STRUCTURAL_RESERVED_NAMES + predicate refactor (P1/P10) ────
+
+    #[test]
+    fn structural_reserved_names_contains_all_five() {
+        for n in ["weights", "source", "ladder", "blank_data", "wake_data"] {
+            assert!(
+                STRUCTURAL_RESERVED_NAMES.contains(&n),
+                "STRUCTURAL_RESERVED_NAMES missing {n}"
+            );
+        }
+        assert_eq!(STRUCTURAL_RESERVED_NAMES.len(), 5);
+    }
+
+    // Byte-identical behavior pins for the refactored predicates (existing
+    // unknown-key-walker tests above — passthrough_data_subkeys_not_flagged
+    // et al. — already exercise these indirectly; these pin the raw fns).
+    #[test]
+    fn is_weights_level_matches_dot_weights_suffix_only() {
+        assert!(is_weights_level("zones.media.weights"));
+        assert!(!is_weights_level("zones.media.weightsx"));
+        assert!(!is_weights_level("weights")); // bare root — no leading dot, not a suffix match
+    }
+
+    #[test]
+    fn is_array_of_tables_parent_matches_ladder_and_source_suffixes() {
+        assert!(is_array_of_tables_parent("displays.tv.ladder"));
+        assert!(is_array_of_tables_parent("displays.tv.screensaver.source"));
+        assert!(!is_array_of_tables_parent("displays.tv.laddery"));
+    }
+
+    #[test]
+    fn is_passthrough_data_key_exact_equality_only() {
+        assert!(is_passthrough_data_key("blank_data"));
+        assert!(is_passthrough_data_key("wake_data"));
+        assert!(!is_passthrough_data_key("blank_data_extra"));
+        assert!(!is_passthrough_data_key("wake_data2"));
+    }
+
+    // Cross-predicate non-overlap pins (P10) — an accidental broadening (e.g.
+    // a shared blanket loop instead of per-predicate consts) fails HERE, at
+    // the unit where it would be introduced, not downstream.
+    #[test]
+    fn is_weights_level_rejects_ladder_suffix() {
+        assert!(!is_weights_level("displays.x.ladder"));
+    }
+
+    #[test]
+    fn is_array_of_tables_parent_rejects_weights_suffix() {
+        assert!(!is_array_of_tables_parent("displays.x.weights"));
+    }
+
+    #[test]
+    fn is_passthrough_data_key_rejects_near_miss_suffix() {
+        assert!(!is_passthrough_data_key("blank_data_extra"));
+        // Both broadening directions (reviewer pin): a prefix-style broadening
+        // is caught above; an ends_with-style broadening is caught here.
+        assert!(!is_passthrough_data_key("evil_blank_data"));
+        assert!(!is_passthrough_data_key("x.wake_data"));
+    }
+
+    // Each predicate's accepted names ⊆ STRUCTURAL_RESERVED_NAMES, ENUMERATED
+    // EXPLICITLY BY NAME per predicate (cold-gate Gemini Should) — a unit
+    // test cannot reflectively discover a predicate function it was never
+    // told about, so a genuinely NEW 7th predicate needs its own enumerated
+    // test line added here at write time; this is not automatic discovery.
+    #[test]
+    fn weights_level_accepted_names_are_subset_of_structural_reserved_names() {
+        // Single-name enumeration (not a loop, clippy::single_element_loop) —
+        // still an explicit, by-name pin, not a reference to the const it
+        // checks against.
+        assert!(STRUCTURAL_RESERVED_NAMES.contains(&"weights"));
+    }
+
+    #[test]
+    fn array_of_tables_parent_accepted_names_are_subset_of_structural_reserved_names() {
+        for n in ["ladder", "source"] {
+            assert!(STRUCTURAL_RESERVED_NAMES.contains(&n));
+        }
+    }
+
+    #[test]
+    fn passthrough_data_key_accepted_names_are_subset_of_structural_reserved_names() {
+        for n in ["blank_data", "wake_data"] {
+            assert!(STRUCTURAL_RESERVED_NAMES.contains(&n));
+        }
+    }
+
+    // ── Task 1: daemon.entity_crud_enabled / pairing_enabled / pair_timeout ─
+    // `load_str`/`load_str_strict`/`validate_str` live at the audio-test
+    // module above (merge-resolved — byte-identical duplicates collapsed).
+
+    #[test]
+    fn daemon_section_absent_uses_literal_defaults() {
+        // [daemon] entirely absent — Config::daemon's #[serde(default)] must
+        // produce DaemonConfig::default(). Literal pins, NOT compared against
+        // defaults::* consts — a comparison against the same const the impl
+        // reads from would be a tautology unable to catch a wrong literal in
+        // either the const or the Default impl.
+        let (cfg, _warnings) = load_str("config_version = 1\n").unwrap();
+        assert!(cfg.daemon.entity_crud_enabled);
+        assert!(cfg.daemon.pairing_enabled);
+        assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn daemon_section_present_but_empty_uses_literal_defaults() {
+        // [daemon] present with zero keys. DaemonConfig::socket_path is
+        // `Option<PathBuf>` with no `#[serde(default)]` attribute (checked
+        // against the live struct, per the plan's "test what's true"
+        // instruction) — TOML/serde treats a missing Option field as None
+        // without one (the same pattern already relied on by DisplayConfig's
+        // `output`/`host`/etc. fields), so an empty `[daemon]` table still
+        // deserializes cleanly.
+        let (cfg, _warnings) = load_str("config_version = 1\n[daemon]\n").unwrap();
+        assert!(cfg.daemon.entity_crud_enabled);
+        assert!(cfg.daemon.pairing_enabled);
+        assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn pair_timeout_floor_29s_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"29s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("pair_timeout")),
+            "pair_timeout below the 30s floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn pair_timeout_floor_30s_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"30s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("pair_timeout")),
+            "pair_timeout = 30s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn pair_timeout_ceiling_300s_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"300s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("pair_timeout")),
+            "pair_timeout = 300s (the ceiling) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn pair_timeout_ceiling_301s_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\npair_timeout = \"301s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("pair_timeout")),
+            "pair_timeout above the 300s ceiling must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn daemon_new_keys_accepted_in_strict_mode() {
+        let result = load_str_strict(
+            "config_version = 1\n\
+             [daemon]\n\
+             entity_crud_enabled = false\n\
+             pairing_enabled = false\n\
+             pair_timeout = \"60s\"\n",
+        );
+        assert!(
+            result.is_ok(),
+            "the three new daemon keys must be in KNOWN_KEYS, got: {:?}",
+            result.err()
+        );
+        let (cfg, _warnings) = result.unwrap();
+        assert!(!cfg.daemon.entity_crud_enabled);
+        assert!(!cfg.daemon.pairing_enabled);
+        assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(60));
     }
 }

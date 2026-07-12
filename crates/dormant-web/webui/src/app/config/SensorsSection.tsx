@@ -5,11 +5,14 @@
  * is rendered as a read-only label (not editable in v1).
  * broker_url / url fields are locked when the path is redacted.
  */
+import { useState } from "react";
 import FormSection from "./FormSection";
 import { DurationField, EnumField, NumberField, TextField } from "./fields";
 import type { FieldProps } from "./fields";
 import type { PatchStore } from "./patch";
-import type { SensorConfig } from "../../api/types";
+import type { SensorConfig, ZoneConfig } from "../../api/types";
+import CreateEntityForm from "./CreateEntityForm";
+import { referencingEntities } from "./entityCrud";
 
 interface SensorsSectionProps {
   sensors: Record<string, SensorConfig>;
@@ -17,6 +20,10 @@ interface SensorsSectionProps {
   redactedPaths: string[][];
   onDirty: () => void;
   fieldErrors: Record<string, string | undefined>;
+  /** Whether entity create/delete is enabled (`daemon.entity_crud_enabled`, spec §2/§10). Defaults to true when omitted (pre-feature callers). */
+  entityCrudEnabled?: boolean;
+  /** Live zones inventory — used to compute the delete-confirm references warning (spec §7). */
+  zones?: Record<string, ZoneConfig>;
 }
 
 /** Fields rendered per sensor type — only keys that make sense to edit. */
@@ -48,9 +55,30 @@ const PLACEHOLDER: Record<string, string> = {
   availability_payload_offline: "offline",
 };
 
-export default function SensorsSection({ sensors, store, redactedPaths, onDirty, fieldErrors }: SensorsSectionProps) {
+export default function SensorsSection({
+  sensors,
+  store,
+  redactedPaths,
+  onDirty,
+  fieldErrors,
+  entityCrudEnabled = true,
+  zones = {},
+}: SensorsSectionProps) {
   const ids = Object.keys(sensors);
-  if (ids.length === 0) return null;
+  const [showCreate, setShowCreate] = useState(false);
+
+  if (ids.length === 0 && !entityCrudEnabled) return null;
+
+  function handleDelete(id: string) {
+    const refs = referencingEntities("sensors", id, { zones, rules: {} });
+    const msg = refs.length > 0
+      ? `Delete sensor "${id}"? It is referenced by ${refs.join(", ")} — deleting it may make those entities invalid.`
+      : `Delete sensor "${id}"?`;
+    if (window.confirm(msg)) {
+      store.trackDelete("sensors", id);
+      onDirty();
+    }
+  }
 
   return (
     <FormSection title="Sensors">
@@ -66,6 +94,15 @@ export default function SensorsSection({ sensors, store, redactedPaths, onDirty,
                 type: {cfg.type}
                 <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
               </span>
+              {entityCrudEnabled && (
+                <button
+                  type="button"
+                  className="cf-apply__btn cf-apply__btn--danger cf-card__delete"
+                  onClick={() => handleDelete(id)}
+                >
+                  Delete
+                </button>
+              )}
             </div>
 
             <div className="cf-card__fields">
@@ -130,6 +167,25 @@ export default function SensorsSection({ sensors, store, redactedPaths, onDirty,
           </div>
         );
       })}
+
+      {entityCrudEnabled && (
+        showCreate ? (
+          <CreateEntityForm
+            collection="sensors"
+            existingIds={ids}
+            onCreate={(id, value) => {
+              store.trackCreate("sensors", id, value);
+              onDirty();
+              setShowCreate(false);
+            }}
+            onCancel={() => setShowCreate(false)}
+          />
+        ) : (
+          <button type="button" className="cf-apply__btn cf-card__add" onClick={() => setShowCreate(true)}>
+            + Add sensor
+          </button>
+        )
+      )}
     </FormSection>
   );
 }

@@ -22,6 +22,8 @@ import type {
   ApplyResponse,
   WearListResponse,
   WearDetail,
+  PairAccepted,
+  PairStatus,
 } from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -121,6 +123,41 @@ export function postReload(): Promise<void> {
 /** POST /api/doctor — run the diagnosis probes. */
 export function runDoctor(): Promise<DoctorReport> {
   return request<DoctorReport>("/doctor", { method: "POST", headers: JSON_CT, body: "{}" });
+}
+
+/**
+ * POST /api/pair/samsung — start a Samsung Tizen pairing attempt
+ * (spec §8). Returns 202 + `{ pair_id }` immediately; the actual TV I/O
+ * runs in a spawned server-side task, polled via `getPairStatus`.
+ *
+ * Errors surface as `ApiError` (409 `pairing_in_progress`, 403
+ * `feature_disabled`/`web_reject_origin`, 413 body-too-large) —
+ * identical error-handling contract to `postConfigApply`.
+ */
+export async function postPairSamsung(host: string): Promise<PairAccepted> {
+  const res = await fetch(BASE + "/pair/samsung", {
+    method: "POST",
+    headers: JSON_CT,
+    body: JSON.stringify({ host }),
+  });
+
+  const body = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    throw new ApiError(res.status, body);
+  }
+
+  return body as PairAccepted;
+}
+
+/**
+ * GET /api/pair/samsung/{id} — poll a pairing attempt's status
+ * (spec §8.2). The response NEVER carries a token field, by server-side
+ * construction — this is a read route (weaker-origin-OK), safe to poll
+ * on an interval.
+ */
+export function getPairStatus(pairId: string): Promise<PairStatus> {
+  return request<PairStatus>(`/pair/samsung/${encodeURIComponent(pairId)}`);
 }
 
 /** POST /api/config/apply — apply a set of patches to the live config. */

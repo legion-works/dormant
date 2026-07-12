@@ -38,6 +38,8 @@ mod tests {
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -54,21 +56,22 @@ mod tests {
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        })
+        WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ))
     }
 
     /// Spawn a fake engine that responds to `Snapshot`.

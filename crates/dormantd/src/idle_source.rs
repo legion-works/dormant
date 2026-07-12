@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use dormant_core::config::IdleTimeUnit;
-use dormant_core::rules::ControlMsg;
+use dormant_core::rules::{ControlMsg, InhibitorKind};
 use dormant_core::types::RuleId;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -325,6 +325,7 @@ fn publish(
     if ctl
         .try_send(ControlMsg::SetInhibited {
             rule: Some(rule.clone()),
+            kind: InhibitorKind::UserActivity,
             inhibited,
         })
         .is_ok()
@@ -705,6 +706,7 @@ async fn wayland_run(
                             let inhibited = !idled;
                             let _ = ctl.try_send(ControlMsg::SetInhibited {
                                 rule: Some(r.rule.clone()),
+                                kind: InhibitorKind::UserActivity,
                                 inhibited,
                             });
                         }
@@ -725,6 +727,7 @@ async fn wayland_run(
                         for r in &rules {
                             let _ = ctl.try_send(ControlMsg::SetInhibited {
                                 rule: Some(r.rule.clone()),
+                                kind: InhibitorKind::UserActivity,
                                 inhibited: false,
                             });
                         }
@@ -922,6 +925,7 @@ mod tests {
                 // Pretend each event publishes to all rules (just one in tests).
                 let _ = ctl.try_send(ControlMsg::SetInhibited {
                     rule: Some(RuleId("test".into())),
+                    kind: InhibitorKind::UserActivity,
                     inhibited,
                 });
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1026,6 +1030,7 @@ mod tests {
             // Simulate a broken probe: immediately set all rules inactive, then exit.
             let _ = ctl.try_send(ControlMsg::SetInhibited {
                 rule: Some(RuleId("test".into())),
+                kind: InhibitorKind::UserActivity,
                 inhibited: false,
             });
             cancel.cancelled().await;

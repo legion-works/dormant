@@ -301,6 +301,18 @@ export interface ConfigInventory {
    * TOML section. Optional in fixtures/older payloads, mirroring `wear`;
    * the NotificationsSection form treats absence as `{}`. */
   notifications?: Record<string, unknown>;
+  /** rust: config/schema.rs WatchdogConfig — the `[watchdog]` TOML section
+   * (crash-loop watchdog / last-known-good rollback). Optional in
+   * fixtures/older payloads, mirroring `wear`/`notifications`; the
+   * WatchdogSection form treats absence as `{}`. */
+  watchdog?: Record<string, unknown>;
+  /** rust: config/schema.rs AudioConfig — the `[audio]` TOML section
+   * (global PipeWire audio-inhibitor config). Optional in fixtures/older
+   * payloads, mirroring `wear`/`notifications`; the AudioSection form
+   * treats absence as `{}`. `playback_roles` is `Option<Vec<String>>` on
+   * the wire (`null` or a string array); `pw_dump_command` is rendered
+   * read-only per the T7 security fold (spec §6#10). */
+  audio?: Record<string, unknown>;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
@@ -435,10 +447,22 @@ export interface DisplayConfig {
 // rust: config_apply.rs + config_patch.rs + error.rs
 // Serde: Patch uses tag="op", rename_all="lowercase".
 
-/** rust: config_patch.rs Patch, serde(tag = "op", rename_all = "lowercase") */
+/**
+ * rust: config_patch.rs Patch, serde(tag = "op", rename_all = "lowercase")
+ *
+ * `CreateEntity`/`DeleteEntity` (config-crud-wizard spec §3) need an
+ * EXPLICIT `#[serde(rename = "...")]` on the Rust side — `rename_all =
+ * "lowercase"` would otherwise produce `"createentity"`/`"deleteentity"`
+ * (it lowercases the whole variant name, not `snake_case`s it), not the
+ * `"create_entity"`/`"delete_entity"` ops actually on the wire. Fields
+ * are TOP-LEVEL (`collection`/`id`/`value`), NOT path-based like
+ * `Set`/`Remove` — mirrors `config_patch.rs:37-60` exactly.
+ */
 export type ConfigPatch =
   | { op: "set"; path: string[]; value: unknown }
-  | { op: "remove"; path: string[] };
+  | { op: "remove"; path: string[] }
+  | { op: "create_entity"; collection: string; id: string; value: unknown }
+  | { op: "delete_entity"; collection: string; id: string };
 
 /** rust: config_apply.rs ApplyRequest */
 export interface ApplyRequest {
@@ -490,6 +514,45 @@ export interface RuleConfig {
   wake_retries?: number;
   wake_retry_backoff?: unknown;
   wake_retry_interval?: unknown;
+}
+
+/**
+ * rust: config/schema.rs DaemonConfig — entity_crud_enabled/pairing_enabled/
+ * pair_timeout (config-crud-wizard spec §10, `#[serde(default)]`, all three
+ * `true`/`true`/`"120s"` by default).
+ *
+ * `ConfigInventory.daemon` stays `Record<string, unknown>` (the settings
+ * form renders every `[daemon]` key generically, `DaemonSection.tsx`) —
+ * this interface documents the three CRUD-relevant keys' shape for call
+ * sites that read them explicitly (`entityCrud.ts`'s
+ * `isEntityCrudEnabled`/`isPairingEnabled`); it is not itself the wire
+ * type of `daemon` (which stays loose).
+ */
+export interface DaemonCrudFlags {
+  entity_crud_enabled?: boolean;
+  pairing_enabled?: boolean;
+  /** humantime string, e.g. "120s". */
+  pair_timeout?: string;
+}
+
+/** rust: routes/pair.rs PairRequest — POST /api/pair/samsung body. */
+export interface PairRequest {
+  host: string;
+}
+
+/** rust: routes/pair.rs PairAccepted — POST /api/pair/samsung 202 response. */
+export interface PairAccepted {
+  pair_id: string;
+}
+
+/**
+ * rust: routes/pair.rs PairStatus — GET /api/pair/samsung/{id} response.
+ * `state` is one of "pairing" | "paired" | "timeout" | "error". Never
+ * carries a token field, by construction (spec §8/§9 invariant #5).
+ */
+export interface PairStatus {
+  state: "pairing" | "paired" | "timeout" | "error";
+  detail?: string | null;
 }
 
 /**

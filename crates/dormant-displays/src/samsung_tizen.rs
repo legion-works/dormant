@@ -1268,19 +1268,37 @@ impl DisplayController for SamsungTizenController {
 
 // ── Pairing ─────────────────────────────────────────────────────────────────────
 
-/// Pair with a Samsung Tizen TV and return the granted access token.
+/// Injectable connect seam for [`pair_with_connect`] — abstracts *how* the
+/// pairing WebSocket connects and waits for the TV to grant a token, so
+/// tests can substitute a scripted fake
+/// (`dormant_displays::test_support::FakePairConnect`, gated behind the
+/// `test-util` feature) instead of touching real hardware or network.
 ///
-/// Connects to the TV without a token, waits for the user to accept the
-/// pairing request on the TV, and returns the token for future authenticated
-/// connections.  The caller supplies a [`Duration`] timeout bounding the
-/// entire connect+handshake; a typical interactive pairing uses 60–120 s.
+/// Implementations must NOT enforce their own timeout in `connect`: the
+/// `timeout` parameter is advisory/contextual only (real implementations
+/// may ignore it entirely). [`pair_with_connect`] is solely responsible for
+/// bounding the call via `tokio::time::timeout` — that is what lets a fake
+/// whose `connect` never resolves still exercise the timeout error path
+/// deterministically, regardless of what it does with the parameter.
+#[async_trait]
+pub trait PairConnect: Send + Sync {
+    /// Connect to `host` and wait for the TV to grant a pairing token.
+    async fn connect(&self, host: &str, timeout: Duration) -> Result<String, DormantError>;
+}
+
+/// Production [`PairConnect`]: opens the real self-signed-TLS pairing
+/// WebSocket to the TV and waits for the `ms.channel.connect`-style
+/// pairing event.
 ///
-/// # Errors
-///
-/// Returns a [`DormantError`] if the connection fails or the pairing
-/// handshake times out.
-pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantError> {
-    tokio::time::timeout(timeout_dur, async {
+/// TLS posture is UNCHANGED from the pre-seam `pair()`: this uses
+/// `pair_connector()` (built from `pair_tls_config()`, which delegates to
+/// `RealTvTransport::tls_config()`) — the same self-signed-certificate
+/// acceptance the persistent control-channel connection uses.
+pub struct RealPairConnect;
+
+#[async_trait]
+impl PairConnect for RealPairConnect {
+    async fn connect(&self, host: &str, _timeout: Duration) -> Result<String, DormantError> {
         let url = format!(
             "wss://{host}:{WS_PORT}{WS_PATH}?name={}",
             base64::engine::general_purpose::STANDARD.encode(DEVICE_NAME)
@@ -1294,13 +1312,11 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
                 detail: format!("failed to build pair request: {e}"),
             })?;
 
-        let connector = tokio_tungstenite::Connector::Rustls(RealTvTransport::tls_config());
-
         let (mut ws, _response) = tokio_tungstenite::connect_async_tls_with_config(
             request,
             None,  // WebSocketConfig — use defaults
             false, // disable_nagle
-            Some(connector),
+            Some(pair_connector()),
         )
         .await
         .map_err(|e| DormantError::DisplayIo {
@@ -1310,7 +1326,7 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
 
         // The TV sends back JSON events during pairing. The token arrives in
         // the "data" field of a message with event "ms.channel.connect" or
-        // similar. The caller-supplied `timeout_dur` bounds the entire handshake.
+        // similar.
         loop {
             let msg = ws
                 .next()
@@ -1331,15 +1347,66 @@ pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantEr
                 }
             }
         }
-    })
-    .await
-    .map_err(|_| DormantError::DisplayIo {
-        controller: SamsungTizenController::NAME.into(),
-        detail: format!(
-            "no response from TV within {timeout_dur:?} — \
-             accept the 'Allow' prompt on the TV?"
-        ),
-    })?
+    }
+}
+
+/// The `rustls::ClientConfig` used for the pairing WebSocket's TLS
+/// connector — a direct delegation to [`RealTvTransport::tls_config`] so
+/// pairing and the persistent control channel always share one TLS trust
+/// posture (self-signed-certificate acceptance). See the TLS-posture pin
+/// tests in this module's test suite for what that coupling proves.
+fn pair_tls_config() -> Arc<rustls::ClientConfig> {
+    RealTvTransport::tls_config()
+}
+
+/// The `tokio-tungstenite` connector [`RealPairConnect`] uses for the
+/// pairing WebSocket. Always the `Rustls` variant wrapping
+/// [`pair_tls_config`] — never a plaintext or native-tls-rooted connector.
+fn pair_connector() -> tokio_tungstenite::Connector {
+    tokio_tungstenite::Connector::Rustls(pair_tls_config())
+}
+
+/// Pair with a Samsung Tizen TV using an injected [`PairConnect`], bounding
+/// the whole connect+handshake by `timeout_dur`.
+///
+/// This is the seam [`pair`] delegates to (via [`RealPairConnect`]); tests
+/// call it directly with a
+/// `dormant_displays::test_support::FakePairConnect` to avoid real network
+/// I/O.
+///
+/// # Errors
+///
+/// Returns a [`DormantError::DisplayIo`] if `connect` fails or does not
+/// resolve within `timeout_dur`.
+pub async fn pair_with_connect(
+    host: &str,
+    timeout_dur: Duration,
+    connect: Arc<dyn PairConnect>,
+) -> Result<String, DormantError> {
+    tokio::time::timeout(timeout_dur, connect.connect(host, timeout_dur))
+        .await
+        .map_err(|_| DormantError::DisplayIo {
+            controller: SamsungTizenController::NAME.into(),
+            detail: format!(
+                "no response from TV within {timeout_dur:?} — \
+                 accept the 'Allow' prompt on the TV?"
+            ),
+        })?
+}
+
+/// Pair with a Samsung Tizen TV and return the granted access token.
+///
+/// Connects to the TV without a token, waits for the user to accept the
+/// pairing request on the TV, and returns the token for future authenticated
+/// connections.  The caller supplies a [`Duration`] timeout bounding the
+/// entire connect+handshake; a typical interactive pairing uses 60–120 s.
+///
+/// # Errors
+///
+/// Returns a [`DormantError`] if the connection fails or the pairing
+/// handshake times out.
+pub async fn pair(host: &str, timeout_dur: Duration) -> Result<String, DormantError> {
+    pair_with_connect(host, timeout_dur, Arc::new(RealPairConnect)).await
 }
 
 // ── Doctor shims — best-effort network probes exposed for dormant-doctor ─────────
@@ -2233,6 +2300,78 @@ mod tests {
             .expect("mock TLS server task panicked");
     }
 
+    /// TLS-posture pin, behavioral half (S6): `pair_tls_config()` — what
+    /// `RealPairConnect` actually uses — accepts the SAME self-signed
+    /// certificate `RealTvTransport::tls_config()` does. `pair_tls_config`
+    /// is a one-line delegation to `RealTvTransport::tls_config` (see its
+    /// source right above `pair_connector`), so this is somewhat redundant
+    /// with `tls_handshake_with_self_signed_cert` above by construction —
+    /// but it exercises the exact fn `RealPairConnect` calls, not merely
+    /// something that happens to be identical today, so a future edit that
+    /// makes `pair_tls_config` diverge (e.g. reimplements a "hardened"
+    /// config for pairing specifically) fails HERE with a real TLS
+    /// handshake rejection, not later against live hardware.
+    #[tokio::test]
+    #[cfg(feature = "rcgen-test")]
+    async fn pair_tls_config_accepts_self_signed_cert() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let cert_params =
+            rcgen::CertificateParams::new(["localhost".into()]).expect("rcgen params");
+        let key_pair = rcgen::KeyPair::generate().expect("rcgen keypair");
+        let cert = cert_params
+            .self_signed(&key_pair)
+            .expect("rcgen self-signed cert");
+
+        let cert_der = cert.der().clone();
+        let key_der = key_pair.serialize_der();
+
+        let provider: Arc<rustls::crypto::CryptoProvider> =
+            rustls::crypto::ring::default_provider().into();
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("safe default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert_der.to_vec())],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key_der.clone()),
+                ),
+            )
+            .expect("server config");
+
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+
+        // The fn under test: exactly what `pair_connector()`/`RealPairConnect`
+        // use, not a re-derived equivalent.
+        let client_config = pair_tls_config();
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let result = connector.connect(server_name, tcp).await;
+        assert!(
+            result.is_ok(),
+            "pair_tls_config() should accept a self-signed cert same as RealTvTransport::tls_config(): {:?}",
+            result.err()
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("mock TLS server did not observe the expected handshake within 5s")
+            .expect("mock TLS server task panicked");
+    }
+
     // ── Cold-start socket priming ────────────────────────────────────────────
 
     /// On a fresh daemon start the WS cache is `None` — `ws_send_with_retry`
@@ -2624,6 +2763,94 @@ mod tests {
     async fn pair_timeout_fails_fast() {
         let result = pair("192.0.2.1", Duration::from_millis(50)).await;
         assert!(result.is_err(), "expected Err against unreachable host");
+    }
+
+    // ── Injectable connect seam (Task 4) ────────────────────────────────────
+
+    /// `pair_with_connect` with a fake that yields a scripted token returns
+    /// that token — the seam works independent of `RealPairConnect`.
+    #[tokio::test]
+    #[cfg(feature = "test-util")]
+    async fn pair_with_connect_returns_fake_token() {
+        use crate::test_support::FakePairConnect;
+
+        let fake: Arc<dyn PairConnect> = Arc::new(FakePairConnect::yielding("fake-token-1"));
+        let result = pair_with_connect("192.0.2.1", Duration::from_secs(5), fake).await;
+        assert_eq!(result.unwrap(), "fake-token-1");
+    }
+
+    /// A fake connect that never resolves is bounded by `pair_with_connect`'s
+    /// OWN timeout — not by anything the fake does with the `timeout`
+    /// parameter it's handed — and produces the same error class the
+    /// pre-seam `pair()` produced on timeout: `DormantError::DisplayIo`.
+    #[tokio::test]
+    #[cfg(feature = "test-util")]
+    async fn pair_with_connect_times_out_on_never_resolving_fake() {
+        use crate::test_support::FakePairConnect;
+
+        let fake: Arc<dyn PairConnect> = Arc::new(FakePairConnect::never());
+        let start = tokio::time::Instant::now();
+        let result = pair_with_connect("192.0.2.1", Duration::from_millis(50), fake).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "did not time out promptly: {elapsed:?}"
+        );
+        match result {
+            Err(DormantError::DisplayIo { controller, detail }) => {
+                assert_eq!(controller, SamsungTizenController::NAME);
+                assert!(
+                    detail.contains("no response from TV"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected DisplayIo timeout error, got {other:?}"),
+        }
+    }
+
+    /// `pair()`'s public signature is unchanged and it still delegates to
+    /// `RealPairConnect` via `pair_with_connect` — a compile-level (the call
+    /// below only type-checks if `RealPairConnect` implements `PairConnect`
+    /// and `pair_with_connect` has the P5 signature) + behavioral regression
+    /// check, paired with the pre-existing `pair_timeout_fails_fast` /
+    /// `pair_extracts_token_from_server_frame` tests above which exercise
+    /// `pair()` end-to-end and stay green after this refactor.
+    #[tokio::test]
+    async fn pair_delegates_to_pair_with_connect_and_real_pair_connect() {
+        let direct = pair_with_connect(
+            "192.0.2.1",
+            Duration::from_millis(50),
+            Arc::new(RealPairConnect),
+        )
+        .await;
+        let via_pair = pair("192.0.2.1", Duration::from_millis(50)).await;
+        assert!(
+            direct.is_err() && via_pair.is_err(),
+            "both should time out against a TEST-NET-1 reserved-range host"
+        );
+    }
+
+    // ── TLS-posture pin (S6), structural half ────────────────────────────────
+
+    /// `pair_connector()` — what `RealPairConnect` uses — is always the
+    /// `Rustls` variant, never a plaintext/native-tls connector.
+    ///
+    /// What this proves: the connector *kind* is pinned, and `pair_tls_config`
+    /// is a one-line delegation to `RealTvTransport::tls_config` (see its
+    /// source), coupling pairing and the persistent control channel at a
+    /// single call site. It does NOT diff `rustls::ClientConfig` internals
+    /// (no `PartialEq` impl exists for it) — `pair_tls_config_accepts_self_signed_cert`
+    /// (`rcgen-test`-gated, near `tls_handshake_with_self_signed_cert` above)
+    /// covers the behavioral half: `pair_tls_config()` actually accepts a
+    /// self-signed cert via a real local TLS handshake.
+    #[test]
+    fn pair_connector_is_rustls_variant() {
+        let connector = pair_connector();
+        assert!(
+            matches!(connector, tokio_tungstenite::Connector::Rustls(_)),
+            "pairing connector must stay Rustls (self-signed-accepting), not plain/native-tls"
+        );
     }
 
     // ── Wake-safety regressions ───────────────────────────────────────────────

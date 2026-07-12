@@ -55,11 +55,36 @@ config_version = 1
 # cooldown = "15m"                 # minimum time between repeat notices per display (>= 1m)
 # notify_recovery = true           # send a Normal-urgency notice when a failing display recovers
 
+# ── Watchdog and rollback ────────────────────────────────────────────────────
+#
+# Optional: last-known-good (LKG) config snapshotting, boot-time rollback on
+# a bad config or a crash/wedge loop, and systemd watchdog pings (Type=notify
+# unit only — see crates/dormantd/systemd/dormant.service). See
+# docs/src/watchdog-rollback.md. Enabled by default; every key below shows
+# its default, so this section can be omitted entirely. WatchdogSec and ping
+# cadence are NOT config here — they come from systemd's own environment.
+# [watchdog]
+# lkg_enabled = true           # last-known-good snapshotting + boot rollback
+# lkg_rollback_enabled = true  # counted crash-loop rollback; disable during rapid restart debugging
+# stability_window = "5m"      # healthy runtime before a config is promoted to LKG (>= 30s)
+
 [daemon]
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"
 log_level = "info"
 socket_path = "/run/user/1000/dormant.sock"
+
+# ── Web UI config editor: entity CRUD + the Samsung pairing wizard ─────────
+#
+# Only relevant when the web UI is enabled (daemon.web_port set, see
+# docs/src/web-ui.md). Both default to on; set to false to hide/reject the
+# corresponding affordance without disabling the rest of the web UI. The
+# server enforces these independently of what the UI shows — flipping a
+# switch off returns 403 "feature_disabled" for the gated routes, not just
+# a hidden button.
+# entity_crud_enabled = true     # web create/delete of sensors/zones/displays/rules
+# pairing_enabled = true         # the Samsung pairing wizard (POST /api/pair/samsung)
+# pair_timeout = "120s"          # how long the wizard waits for the TV to accept (30s..=300s)
 
 # ── Sensors ────────────────────────────────────────────────────────────────────
 

@@ -38,6 +38,7 @@ mod tests {
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),

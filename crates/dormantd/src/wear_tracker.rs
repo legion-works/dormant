@@ -897,6 +897,7 @@ mod tests {
             rules: indexmap::IndexMap::new(),
             wear: WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
         }
     }
 

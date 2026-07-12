@@ -1568,20 +1568,24 @@ fn build_render_sinks(
             None
         };
 
-        // Shift settings (OLED-health T10): derived DIRECTLY from
-        // `dc.screensaver`, independent of whether the ladder reaches
-        // `RenderScreensaver` — only the screensaver surface shifts
-        // (U5: the black overlay never shifts).  A display with no
-        // `[displays.<id>.screensaver]` table at all gets `None` here
-        // (never a `set_shift` call), so the sink's shift stays fully
-        // disabled (`ShiftSettings::default`).
-        let shift_settings: Option<dormant_render::ShiftSettings> =
+        // Shift settings (OLED-health T10): derived from
+        // `dc.screensaver` ONLY when the ladder reaches
+        // `RenderScreensaver` — the black overlay never shifts (U5).
+        // A display with no `[displays.<id>.screensaver]` table, or a
+        // ladder that never reaches `RenderScreensaver`, gets `None`.
+        let shift_settings: Option<dormant_render::ShiftSettings> = if ladder
+            .iter()
+            .any(|s| s.kind == dormant_core::types::StageKind::RenderScreensaver)
+        {
             dc.screensaver
                 .as_ref()
                 .map(|ss| dormant_render::ShiftSettings {
                     shift_px: ss.shift_px,
                     shift_interval: ss.shift_interval,
-                });
+                })
+        } else {
+            None
+        };
 
         if let Some(output_name) = &dc.output {
             let ss_ref = screensaver_settings.as_ref();
@@ -2295,20 +2299,17 @@ mod render_tests {
         drop(input_wake_rx);
     }
 
-    /// OLED-health T10, core adjudicated decision: pixel-shift settings
-    /// must reach the sink even when the display's ladder is
-    /// black-only (no `RenderScreensaver` stage) — the screensaver
-    /// surface shifts, and shift is derived from `dc.screensaver`
-    /// independently of the ladder (U5: the black overlay never
-    /// shifts).  This is the scenario `ScreensaverSettings` deliberately
-    /// does NOT cover (it's only built when the ladder reaches
-    /// `RenderScreensaver` — see
-    /// the doc on `build_render_sinks`), which is exactly why shift is
-    /// threaded as a separate parameter/command instead of a field on
-    /// `ScreensaverSettings`.
+    /// OLED-health T10, U5 + reviewer should-fix: pixel-shift settings
+    /// must NOT reach the sink when the display's ladder is black-only
+    /// (no `RenderScreensaver` stage) — the black overlay never shifts,
+    /// so shift settings are useless without a screensaver stage.
+    /// Shift is still threaded as a separate parameter/command rather
+    /// than a field on `ScreensaverSettings` because it is per-display
+    /// (not per-show) config; but `build_render_sinks` only sends it
+    /// when the ladder actually contains `RenderScreensaver`.
     #[tokio::test]
     #[cfg(feature = "render")]
-    async fn build_render_sinks_passes_shift_settings_through_even_without_screensaver_stage() {
+    async fn build_render_sinks_withholds_shift_for_black_only_ladder() {
         use dormant_core::config::schema::{DisplayConfig, ScreensaverConfig, ScreensaverSource};
         use dormant_core::fakes::RecordingRenderSink;
         use dormant_core::types::{LadderStage, StageKind};
@@ -2338,9 +2339,8 @@ mod render_tests {
                     ],
                     // The screensaver table IS present (with shift
                     // configured) even though the ladder never reaches
-                    // RenderScreensaver — this is the realistic shape
-                    // an operator would write to get shift on a
-                    // black-only display.
+                    // RenderScreensaver — the realistic shape an operator
+                    // would write.  U5: shift must NOT be sent here.
                     screensaver: Some(ScreensaverConfig {
                         trigger: "vacancy".into(),
                         audio: false,
@@ -2389,13 +2389,13 @@ mod render_tests {
             captured_ss.lock().expect("capture").take().is_none(),
             "ScreensaverSettings must stay None — the ladder never reaches RenderScreensaver"
         );
-        let shift = captured_shift
-            .lock()
-            .expect("capture")
-            .take()
-            .expect("shift settings must reach the sink even on a black-only ladder");
-        assert_eq!(shift.shift_px, 3);
-        assert_eq!(shift.shift_interval, Duration::from_secs(45));
+        // U5 + reviewer should-fix: shift settings must NOT reach a
+        // sink whose ladder never reaches RenderScreensaver — the
+        // black overlay never shifts regardless of config.
+        assert!(
+            captured_shift.lock().expect("capture").take().is_none(),
+            "shift settings must NOT reach the sink for a black-only ladder (U5)"
+        );
     }
 
     /// The dual of the above: a display with NO `[displays.<id>.

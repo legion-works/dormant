@@ -186,7 +186,7 @@ async fn validate_display_exists(
 /// for HTTP-level tests via `oneshot`.
 #[cfg(test)]
 fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
-    use crate::state::WebStateInner;
+    use crate::state::{WebStateInner, WebStateInnerParams};
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -202,6 +202,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
         wear: dormant_core::config::schema::WearConfig::default(),
         notifications: dormant_core::config::schema::NotificationsConfig::default(),
         watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+        audio: dormant_core::config::schema::AudioConfig::default(),
         sensors: IndexMap::default(),
         zones: IndexMap::default(),
         displays: IndexMap::default(),
@@ -218,7 +219,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     let doctor =
         dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-    let state = WebState::new(WebStateInner {
+    let state = WebState::new(WebStateInner::new_for_test(WebStateInnerParams {
         ctl_tx,
         reload_trigger: reload_trigger_tx,
         reload_rx,
@@ -226,13 +227,12 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
         creds_rx,
         config_path: std::path::PathBuf::from("/dev/null"),
         creds_path: std::path::PathBuf::from("/dev/null"),
-        apply_lock: tokio::sync::Mutex::new(()),
         doctor,
         wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         cancel,
         reload_timeout: Duration::from_secs(10),
-    });
+    }));
 
     // Keep the reload trigger receiver alive in a spawned task so the
     // sender never errors.
@@ -300,6 +300,7 @@ mod tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -316,21 +317,22 @@ mod tests {
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        })
+        WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ))
     }
 
     fn snapshot_with_displays(ids: &[&str]) -> StateSnapshot {
@@ -581,6 +583,7 @@ mod tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -597,21 +600,22 @@ mod tests {
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
 
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx: ctl_tx.clone(),
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path: std::path::PathBuf::from("/dev/null"),
-            creds_path: std::path::PathBuf::from("/dev/null"),
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx: ctl_tx.clone(),
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: std::path::PathBuf::from("/dev/null"),
+                creds_path: std::path::PathBuf::from("/dev/null"),
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ));
 
         let router = axum::Router::new()
             .route("/api/reload", axum::routing::post(post_reload))

@@ -17,10 +17,21 @@ use serde_json::json;
 
 /// A single config patch.
 ///
-/// Serde auto-discriminates on the `op` field (lowercase).  A `Set`
-/// carries a JSON value; it replaces the target wholesale (arrays
-/// replace whole; arrays-of-tables match the original form).
-/// A `Remove` deletes the leaf key from its parent table.
+/// Serde auto-discriminates on the `op` field.  A `Set` carries a JSON
+/// value; it replaces the target wholesale (arrays replace whole;
+/// arrays-of-tables match the original form).  A `Remove` deletes the
+/// leaf key from its parent table.  `CreateEntity`/`DeleteEntity` mint or
+/// remove a whole entity table under one of the four CRUD collections
+/// (spec §3/§4) — `Set`/`Remove` can never do this (container-Set stays
+/// denied, invariant #2).
+///
+/// `Set`/`Remove` rely on `rename_all = "lowercase"` (`set`/`remove`,
+/// pre-existing wire compat).  `CreateEntity`/`DeleteEntity` need an
+/// EXPLICIT `#[serde(rename = "...")]` — `rename_all = "lowercase"`
+/// would otherwise produce `"createentity"`/`"deleteentity"` (it lowercases
+/// the whole variant name, it does not `snake_case` it), not the
+/// `"create_entity"`/`"delete_entity"` ops the spec requires (§3). Pinned
+/// by `deserialize_create_entity_patch`/`deserialize_delete_entity_patch`.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Patch {
@@ -30,6 +41,22 @@ pub enum Patch {
     },
     Remove {
         path: Vec<String>,
+    },
+    /// Create a NEW entity table under a collection.  `value` is the
+    /// entity's initial contents (an object including its discriminator,
+    /// e.g. `type` for sensors).
+    #[serde(rename = "create_entity")]
+    CreateEntity {
+        collection: String,
+        id: String,
+        value: serde_json::Value,
+    },
+    /// Delete a whole entity table.  Cross-reference orphaning is caught
+    /// by the daemon-identical validate step at apply time, not here.
+    #[serde(rename = "delete_entity")]
+    DeleteEntity {
+        collection: String,
+        id: String,
     },
 }
 
@@ -44,6 +71,8 @@ pub enum PatchError {
     EntityUnknown(String),
     /// A JSON value could not be converted to TOML (e.g. `null`).
     ValueRejected(String),
+    /// `CreateEntity` targeted an id that already exists in the collection.
+    EntityExists(String),
 }
 
 // ── Canonical pipeline (spec §5, EXACT order) ──────────────────────────────
@@ -64,31 +93,48 @@ pub fn check_patches(
     redacted: &[Vec<String>],
 ) -> Result<(), PatchError> {
     for patch in patches {
-        let path = match patch {
-            Patch::Set { path, .. } | Patch::Remove { path } => path,
-        };
+        match patch {
+            // CreateEntity/DeleteEntity route to their own gates (spec §4,
+            // C-M3) BEFORE the Set/Remove 5-stage pipeline — the
+            // container-Set rejection below would deny the table shape a
+            // create needs, and entity-existence would reject the
+            // not-yet-existing id.
+            Patch::CreateEntity {
+                collection,
+                id,
+                value,
+            } => {
+                check_create_entity(collection, id, value, current)?;
+            }
+            Patch::DeleteEntity { collection, id } => {
+                check_delete_entity(collection, id, current)?;
+            }
+            Patch::Set { path, .. } | Patch::Remove { path } => {
+                // 1. Hygiene — reject dangerous segments.
+                check_hygiene(path)?;
 
-        // 1. Hygiene — reject dangerous segments.
-        check_hygiene(path)?;
+                // 2. Known-path structural check.
+                let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
+                if !is_known_config_path(&path_strs) {
+                    return Err(PatchError::PathDenied(format!(
+                        "unknown config path: {}",
+                        path_strs.join(".")
+                    )));
+                }
 
-        // 2. Known-path structural check.
-        let path_strs: Vec<&str> = path.iter().map(String::as_str).collect();
-        if !is_known_config_path(&path_strs) {
-            return Err(PatchError::PathDenied(format!(
-                "unknown config path: {}",
-                path_strs.join(".")
-            )));
+                // 3. Editable-subset — locked leaves, container-Set
+                //    rejection, optional-only removal, recursive payload
+                //    check.
+                check_editable_subset(patch, current)?;
+
+                // 4. Redacted-reject — prefix-aware in both directions.
+                check_redacted(&path_strs, redacted)?;
+
+                // 5. Entity-existence — collection ids + array-of-tables
+                //    indices.
+                check_entity_existence(&path_strs, current)?;
+            }
         }
-
-        // 3. Editable-subset — locked leaves, container-Set rejection,
-        //    optional-only removal, recursive payload check.
-        check_editable_subset(patch, current)?;
-
-        // 4. Redacted-reject — prefix-aware in both directions.
-        check_redacted(&path_strs, redacted)?;
-
-        // 5. Entity-existence — collection ids + array-of-tables indices.
-        check_entity_existence(&path_strs, current)?;
     }
     Ok(())
 }
@@ -114,6 +160,7 @@ const REMOVABLE_KEYS: &[&str] = &[
     "output",
     "wol_mac",
     "host",
+    "playback_roles",
 ];
 
 /// v1-locked leaves — may never be written or removed through the patch API.
@@ -158,6 +205,9 @@ fn check_editable_subset(p: &Patch, current: &toml_edit::DocumentMut) -> Result<
     let (path, is_remove) = match p {
         Patch::Set { path, .. } => (path, false),
         Patch::Remove { path } => (path, true),
+        Patch::CreateEntity { .. } | Patch::DeleteEntity { .. } => {
+            unreachable!("check_patches only calls check_editable_subset from the Set|Remove arm")
+        }
     };
 
     // Locked leaves — never editable via patch API.
@@ -416,6 +466,279 @@ fn aot_index_exists(current: &toml_edit::DocumentMut, path_to_aot: &[&str], inde
         .is_some_and(|aot| index < aot.len())
 }
 
+// ── CreateEntity / DeleteEntity gates (spec §4/§5) ──────────────────────────
+
+/// The four collections that support entity create/delete.  Deliberately
+/// closed — `CREATABLE_FIELDS`'s key-space is exactly this set (invariant
+/// 2c) so a future `daemon`/`web`/`audio`-style section can never become
+/// reachable from `CreateEntity`/`DeleteEntity` by construction.
+const CRUD_COLLECTIONS: &[&str] = &["sensors", "zones", "displays", "rules"];
+
+/// Per-collection closed field allowlists for `CreateEntity` payloads
+/// (spec §4). The discriminator field (`type` for sensors) is included
+/// here — step 4 of `check_create_entity` treats it like any other
+/// allowed top-level key — but is exempted from the recursive
+/// locked-leaf walk in `check_create_entity`'s own split-contract step
+/// (B-M1), never from this membership check.
+///
+/// `blank_command`/`wake_command` are DELIBERATELY OMITTED from
+/// `displays` (cold-gate M3 Must-1) — they are daemon-executed `sh -c`
+/// commands (`schema.rs` `DisplayConfig::blank_command`/`wake_command`);
+/// a web-created display may not carry an arbitrary shell command in v1.
+/// Pinned by `create_display_with_blank_command_denied`.
+static CREATABLE_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "sensors",
+        &[
+            "type",
+            "kind",
+            "hold_time",
+            "stale_timeout",
+            // mqtt
+            "broker_url",
+            "topic",
+            "field",
+            "payload_on",
+            "payload_off",
+            // ha
+            "url",
+            "entity",
+            // usb-ld2410
+            "port",
+            "baud",
+        ],
+    ),
+    (
+        "zones",
+        &["mode", "members", "unavailable_policy", "weights"],
+    ),
+    (
+        "displays",
+        &[
+            "controllers",
+            "host",
+            "blank_mode",
+            "output",
+            "ddc_display",
+            "wol_mac",
+            "samsung_restore_backlight",
+            "restore_brightness",
+            "treat_unreachable_as_blanked",
+            "command_timeout",
+        ],
+    ),
+    (
+        "rules",
+        &[
+            "zone",
+            "displays",
+            "grace_period",
+            "inhibitors",
+            "min_blank_time",
+            "min_wake_time",
+            "activity_idle_threshold",
+            "activity_poll_interval",
+            "wake_retries",
+            "wake_retry_backoff",
+            "wake_retry_interval",
+        ],
+    ),
+];
+
+/// Look up the creatable-field allowlist for `collection`, or `None` when
+/// `collection` isn't one of [`CRUD_COLLECTIONS`].
+fn creatable_fields_for(collection: &str) -> Option<&'static [&'static str]> {
+    CREATABLE_FIELDS
+        .iter()
+        .find(|(c, _)| *c == collection)
+        .map(|(_, fields)| *fields)
+}
+
+/// Every entity id string that ANY gate in this file — or in
+/// `dormant_core::config::validate`'s `is_known_config_path` internals —
+/// special-cases by literal name (spec §5, R2-M1/B-M2/B-S2, the
+/// load-bearing security fix).  An entity created with one of these ids
+/// would defeat a gate that assumes the name never collides with a real
+/// entity id (e.g. a `weights`-named sensor makes `is_known_config_path`
+/// accept an arbitrary unchecked key beneath it — `weights_named_entity_cannot_smuggle_unknown_key`).
+///
+/// Superset of (verified at build time by
+/// `reserved_ids_superset_of_all_special_cases`):
+///   - `dormant_core::config::STRUCTURAL_RESERVED_NAMES` — the REAL,
+///     re-exported source of truth (`weights`, `source`, `ladder`,
+///     `blank_data`, `wake_data`) driving `is_weights_level`,
+///     `is_array_of_tables_parent`, `is_passthrough_data_key`.
+///   - this module's [`LOCKED_LEAVES`] (`type`, `blank_data`, `wake_data`
+///     — the latter two already members of `STRUCTURAL_RESERVED_NAMES`
+///     above; listed again here as a flat literal set, not a second
+///     union — see the cross-check test's own comment for why a literal
+///     `∪ {"source","ladder"}` union is NOT re-added).
+///   - this module's [`REMOVABLE_KEYS`] (14 optional-leaf names).
+static RESERVED_ENTITY_IDS: &[&str] = &[
+    // STRUCTURAL_RESERVED_NAMES (dormant-core, re-exported)
+    "weights",
+    "source",
+    "ladder",
+    "blank_data",
+    "wake_data",
+    // LOCKED_LEAVES (only "type" is new here — blank_data/wake_data above)
+    "type",
+    // REMOVABLE_KEYS
+    "blank_mode",
+    "degraded_mode",
+    "dwell",
+    "order",
+    "image_duration",
+    "scale_mode",
+    "transition",
+    "transition_duration",
+    "hold_time",
+    "stale_timeout",
+    "ddc_display",
+    "output",
+    "wol_mac",
+    "host",
+    "playback_roles",
+];
+
+/// Entity-id hygiene (spec §5, greenfield — no prior charset validation
+/// existed anywhere for a dynamic TOML key).
+///
+/// Charset `[a-z0-9_-]`, first char `[a-z]`, length 1–64; the reserved-name
+/// ban (`RESERVED_ENTITY_IDS`) applies unconditionally.
+fn validate_entity_id(id: &str) -> Result<(), PatchError> {
+    if id.is_empty() {
+        return Err(PatchError::PathDenied("entity id must not be empty".into()));
+    }
+    if id.chars().count() > 64 {
+        return Err(PatchError::PathDenied(format!(
+            "entity id '{id}' exceeds the maximum length of 64"
+        )));
+    }
+    let first_ok = id.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+    if !first_ok {
+        return Err(PatchError::PathDenied(format!(
+            "entity id '{id}' must start with a lowercase ASCII letter"
+        )));
+    }
+    let charset_ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !charset_ok {
+        return Err(PatchError::PathDenied(format!(
+            "entity id '{id}' contains characters outside [a-z0-9_-]"
+        )));
+    }
+    if RESERVED_ENTITY_IDS.contains(&id) {
+        return Err(PatchError::PathDenied(format!(
+            "entity id '{id}' is a reserved config key name"
+        )));
+    }
+    Ok(())
+}
+
+/// Gate for [`Patch::CreateEntity`] (spec §4). `current` LAST — matches
+/// `check_entity_existence`/`check_collection_entity`'s convention and the
+/// spec's own §4 dispatch code (cold-gate deepseek M1).
+fn check_create_entity(
+    collection: &str,
+    id: &str,
+    value: &serde_json::Value,
+    current: &toml_edit::DocumentMut,
+) -> Result<(), PatchError> {
+    // 1. Collection scope.
+    if !CRUD_COLLECTIONS.contains(&collection) {
+        return Err(PatchError::PathDenied(format!(
+            "'{collection}' is not a CRUD collection"
+        )));
+    }
+
+    // 2. Id hygiene (charset + reserved-name ban).
+    validate_entity_id(id)?;
+
+    // 3. Not already present.
+    let already_exists = current
+        .get(collection)
+        .and_then(|item| item.as_table())
+        .is_some_and(|tbl| tbl.contains_key(id));
+    if already_exists {
+        return Err(PatchError::EntityExists(format!(
+            "entity '{id}' already exists in '{collection}'"
+        )));
+    }
+
+    // 4. Per-collection creatable-field allowlist — closed enumeration,
+    //    no "etc." (cold-gate M3 Must-1).
+    let allowed = creatable_fields_for(collection).ok_or_else(|| {
+        PatchError::PathDenied(format!(
+            "no creatable-field allowlist defined for '{collection}'"
+        ))
+    })?;
+
+    let obj = value
+        .as_object()
+        .ok_or_else(|| PatchError::PathDenied("create payload must be a JSON object".into()))?;
+
+    for (key, field_value) in obj {
+        if !allowed.contains(&key.as_str()) {
+            return Err(PatchError::PathDenied(format!(
+                "'{key}' is not a creatable field for '{collection}'"
+            )));
+        }
+
+        // 5. Locked-leaf recursion, split contract (B-M1): the
+        //    discriminator top-level key (`type`) is checked ONLY for
+        //    allowlist membership above — never recursed through
+        //    `check_payload_for_locked_leaves`, which would reject it (it
+        //    IS a `LOCKED_LEAVES` member).  Every OTHER top-level field's
+        //    VALUE is recursed through the unmodified shared check, so a
+        //    locked leaf nested inside e.g. an object value still can't
+        //    smuggle through.
+        if key != "type" {
+            check_payload_for_locked_leaves(field_value)?;
+        }
+    }
+
+    // 6. Full shape is NOT re-validated here — the daemon-identical
+    //    `validate()` at the temp-file step is the authoritative check
+    //    (config_apply.rs).
+    Ok(())
+}
+
+/// Gate for [`Patch::DeleteEntity`] (spec §4, R2-M2). Collection scope is
+/// checked FIRST, identically to `check_create_entity` — without it,
+/// `DeleteEntity{collection:"daemon", id:"web_allow_nonloopback"}` would
+/// delete a security toggle: a valid-charset, existing, non-referential
+/// key, routing around `REMOVABLE_KEYS`' deliberate curation.
+fn check_delete_entity(
+    collection: &str,
+    id: &str,
+    current: &toml_edit::DocumentMut,
+) -> Result<(), PatchError> {
+    // 1. Collection scope.
+    if !CRUD_COLLECTIONS.contains(&collection) {
+        return Err(PatchError::PathDenied(format!(
+            "'{collection}' is not a CRUD collection"
+        )));
+    }
+
+    // 2. Id hygiene.
+    validate_entity_id(id)?;
+
+    // 3. Existence.
+    let exists = current
+        .get(collection)
+        .and_then(|item| item.as_table())
+        .is_some_and(|tbl| tbl.contains_key(id));
+    if !exists {
+        return Err(PatchError::EntityUnknown(format!(
+            "entity '{id}' not found in '{collection}'"
+        )));
+    }
+
+    Ok(())
+}
+
 // ── Apply patches ──────────────────────────────────────────────────────────
 
 /// Apply a batch of already-checked patches to `doc`.
@@ -430,11 +753,76 @@ pub fn apply_patches(
 ) -> Result<(), PatchError> {
     for patch in patches {
         match patch {
+            Patch::CreateEntity {
+                collection,
+                id,
+                value,
+            } => apply_create_entity(doc, collection, id, value),
+            Patch::DeleteEntity { collection, id } => apply_delete_entity(doc, collection, id),
             Patch::Set { path, value } => apply_set(doc, path, value)?,
             Patch::Remove { path } => apply_remove(doc, path)?,
         }
     }
     Ok(())
+}
+
+/// Apply a pre-checked [`Patch::CreateEntity`].
+///
+/// Mirrors `upsert_samsung_token`'s pattern (`config/mod.rs`), bypassing
+/// `walk_table` entirely (it refuses collection-child creation, C-M2).
+///
+/// # Ordering (load-bearing, not just style — C-S round 3)
+///
+/// `doc[collection]` MUST be ensured as an explicit non-inline
+/// [`toml_edit::Table`] BEFORE the entity is inserted into it.
+/// `toml_edit`'s `Index`/`IndexMut` auto-vivifies a missing intermediate
+/// into an `InlineTable`, not a `Table` — so indexing `doc[collection][id]`
+/// directly (a one-liner) when `[collection]` doesn't yet exist (e.g. the
+/// very first sensor in a config with no `[sensors]` section) would
+/// corrupt the section into inline form.  This two-step order avoids it;
+/// do not collapse it into a one-liner.
+///
+/// # Panics
+///
+/// Contract-panics if `doc[collection]` exists but is not a table — this
+/// cannot happen for a caller that ran [`check_patches`] first (which only
+/// ever reaches here for `CRUD_COLLECTIONS`, always tables on a valid
+/// document).
+fn apply_create_entity(
+    doc: &mut toml_edit::DocumentMut,
+    collection: &str,
+    id: &str,
+    value: &serde_json::Value,
+) {
+    // Step 1: ensure the collection table exists as an EXPLICIT Table —
+    // strictly before any indexing into it.
+    if doc.get(collection).is_none() {
+        let mut tbl = toml_edit::Table::new();
+        tbl.set_implicit(false);
+        doc[collection] = toml_edit::Item::Table(tbl);
+    }
+
+    // Step 2: insert the new entity as its own explicit Table (renders as
+    // `[collection.id]`, NOT an inline table).
+    let entity_table = json_to_toml_table(value);
+    let collection_table = doc
+        .get_mut(collection)
+        .and_then(|item| item.as_table_mut())
+        .expect("collection table ensured explicit above");
+    collection_table.insert(id, toml_edit::Item::Table(entity_table));
+}
+
+/// Apply a pre-checked [`Patch::DeleteEntity`].
+///
+/// # Panics
+///
+/// Will panic if `collection`/`id` does not exist — callers MUST run
+/// [`check_patches`] first (same contract as [`apply_patches`]).
+fn apply_delete_entity(doc: &mut toml_edit::DocumentMut, collection: &str, id: &str) {
+    doc.get_mut(collection)
+        .and_then(|item| item.as_table_mut())
+        .expect("collection exists — check_delete_entity ran first")
+        .remove(id);
 }
 
 fn apply_set(
@@ -707,6 +1095,32 @@ fn json_to_toml_value(v: &serde_json::Value) -> Result<toml_edit::Value, PatchEr
     }
 }
 
+/// Convert a JSON object into a [`toml_edit::Table`] (NOT an
+/// [`toml_edit::InlineTable`], distinct from [`json_to_toml_value`]) — the
+/// converter [`apply_create_entity`] uses so a new entity renders as its
+/// own `[collection.id]` section, matching every existing entity's style.
+///
+/// A JSON `null` field value is treated as "not set" and OMITTED from the
+/// table (mirroring an absent `Option<T>` field) rather than rejected —
+/// `CreateEntity` payloads legitimately carry explicit `null` for unset
+/// optional fields (e.g. a client-side form submitting `payload_on:
+/// null`). A non-object `value` (already rejected by `check_create_entity`
+/// for a checked caller) yields an empty table.
+fn json_to_toml_table(value: &serde_json::Value) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    if let serde_json::Value::Object(obj) = value {
+        for (key, field_value) in obj {
+            if field_value.is_null() {
+                continue;
+            }
+            if let Ok(toml_value) = json_to_toml_value(field_value) {
+                table.insert(key, toml_edit::Item::Value(toml_value));
+            }
+        }
+    }
+    table
+}
+
 /// Convert a JSON array of objects into a TOML [`ArrayOfTables`](toml_edit::ArrayOfTables).
 fn json_to_array_of_tables(
     value: &serde_json::Value,
@@ -811,6 +1225,9 @@ kind = "power_off"
 zone = "office"
 displays = ["tv"]
 grace_period = "30s"
+
+[audio]
+playback_roles = ["Movie"]
 "#)
     }
 
@@ -1141,6 +1558,12 @@ grace_period = "30s"
         check_ok(&[remove(&["displays", "tv", "host"])], &cur, &[]);
     }
 
+    #[test]
+    fn remove_playback_roles_is_allowed() {
+        let cur = minimal_config();
+        check_ok(&[remove(&["audio", "playback_roles"])], &cur, &[]);
+    }
+
     // ==================================================================
     // 4. Entity-existence tests
     // ==================================================================
@@ -1449,6 +1872,31 @@ grace_period = "30s" # trailing grace_period comment
     }
 
     #[test]
+    fn remove_playback_roles_actually_unsets_key() {
+        let mut doc = doc(r#"
+config_version = 1
+
+[audio]
+poll_interval = "5s"
+playback_roles = ["Movie", "Music"]
+capture_is_call = false
+"#);
+
+        let patches = [remove(&["audio", "playback_roles"])];
+        check_ok(&patches, &doc, &[]);
+        apply_patches(&mut doc, &patches).unwrap();
+
+        let after = doc.to_string();
+        assert!(
+            !after.contains("playback_roles"),
+            "playback_roles key should be fully removed, got: {after}"
+        );
+        // Neighboring keys survive the removal untouched.
+        assert!(after.contains("poll_interval = \"5s\""));
+        assert!(after.contains("capture_is_call = false"));
+    }
+
+    #[test]
     fn humantime_values_stay_quoted_strings() {
         let mut doc = doc(GOLDEN_FIXTURE);
 
@@ -1670,5 +2118,499 @@ grace_period = "30s" # trailing grace_period comment
                 path: p(&["displays", "tv", "blank_mode"]),
             }
         );
+    }
+
+    #[test]
+    fn deserialize_create_entity_patch() {
+        // Wire-string pin: rename_all="lowercase" alone would produce
+        // "createentity" (it lowercases the whole variant name, it does
+        // NOT snake_case it) — the explicit #[serde(rename="create_entity")]
+        // is load-bearing.
+        let json = r#"{"op":"create_entity","collection":"sensors","id":"desk2","value":{"type":"mqtt","broker_url":"mqtt://x","topic":"t"}}"#;
+        let patch: Patch = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            patch,
+            Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "desk2".into(),
+                value: json!({"type":"mqtt","broker_url":"mqtt://x","topic":"t"}),
+            }
+        );
+    }
+
+    #[test]
+    fn deserialize_delete_entity_patch() {
+        let json = r#"{"op":"delete_entity","collection":"sensors","id":"desk2"}"#;
+        let patch: Patch = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            patch,
+            Patch::DeleteEntity {
+                collection: "sensors".into(),
+                id: "desk2".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn create_entity_op_string_is_not_lowercased_variant_name() {
+        // Documents the exact failure mode the rename guards against: the
+        // naive rename_all=lowercase output would be "createentity", which
+        // must NOT deserialize successfully as a distinct correct op.
+        let naive = r#"{"op":"createentity","collection":"sensors","id":"x","value":{}}"#;
+        assert!(serde_json::from_str::<Patch>(naive).is_err());
+    }
+
+    // ==================================================================
+    // 10. THE SECURITY MATRIX (Task 2 — the load-bearing tests, plan
+    //     lines 100-157, copied faithfully incl. comments).
+    // ==================================================================
+
+    // --- reserved-name cross-check (R2-M1, the load-bearing one) ---
+    #[test]
+    fn reserved_ids_superset_of_all_special_cases() {
+        // P1: references the REAL symbol, not a copy
+        use dormant_core::config::STRUCTURAL_RESERVED_NAMES;
+        for n in STRUCTURAL_RESERVED_NAMES {
+            assert!(RESERVED_ENTITY_IDS.contains(n));
+        }
+        for n in LOCKED_LEAVES {
+            assert!(RESERVED_ENTITY_IDS.contains(n));
+        }
+        for n in REMOVABLE_KEYS {
+            assert!(RESERVED_ENTITY_IDS.contains(n));
+        }
+        // source/ladder are in STRUCTURAL_RESERVED_NAMES; nothing hand-copied. A new
+        // dormant-core predicate that extends the const but not RESERVED_ENTITY_IDS →
+        // RED here.
+        // (cold-gate deepseek S1: no separate `∪ {"source","ladder"}` union here —
+        // those two names are already members of STRUCTURAL_RESERVED_NAMES, checked
+        // in the first loop above; a literal extra union would be a no-op.
+        // Intentionally not added — don't "restore" it as belt-and-suspenders, it
+        // would just be dead code.)
+    }
+
+    #[test]
+    fn create_reserved_id_rejected() {
+        let cur = minimal_config();
+        for id in [
+            "type",
+            "source",
+            "ladder",
+            "host",
+            "output",
+            "weights",
+            "blank_data",
+        ] {
+            assert!(
+                matches!(
+                    check_create_entity("sensors", id, &json!({"type": "mqtt"}), &cur),
+                    Err(PatchError::PathDenied(_))
+                ),
+                "expected id '{id}' to be rejected as reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_named_entity_cannot_smuggle_unknown_key() {
+        // R2-M1 functional pin. cold-gate M3 Should-3: the original body was
+        // comments-only (asserted nothing, passed vacuously) — now makes two
+        // real assertions per M3's prescribed fix.
+        let cur = minimal_config();
+        assert!(matches!(
+            check_create_entity("sensors", "weights", &json!({"type": "mqtt"}), &cur),
+            Err(PatchError::PathDenied(_))
+        )); // create id="weights" is REJECTED (reserved) — the Set(["sensors","weights","evil"]) path never opens.
+        assert!(dormant_core::config::is_known_config_path(&[
+            "sensors", "weights", "evil"
+        ]));
+        // The documenting belt: is_known_config_path's suffix rule WOULD accept an
+        // arbitrary "evil" key under a "weights"-named entity absent the create-time
+        // ban above — proving the ban is load-bearing, not decorative.
+    }
+
+    // --- DeleteEntity collection scope (R2-M2) ---
+    #[test]
+    fn delete_non_crud_collection_rejected() {
+        let cur = minimal_config();
+        assert!(matches!(
+            check_delete_entity("daemon", "web_allow_nonloopback", &cur),
+            Err(PatchError::PathDenied(_))
+        ));
+        // RED if the collection-enum check is omitted → a security toggle gets deleted.
+    }
+
+    // --- create-gate ---
+    #[test]
+    fn create_sensor_happy_path() {
+        let cur = minimal_config();
+        assert!(
+            check_create_entity(
+                "sensors",
+                "newsensor",
+                &json!({"type": "mqtt", "broker_url": "mqtt://localhost", "topic": "presence/new"}),
+                &cur,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn create_with_blank_data_top_level_denied() {
+        // Independent exclusion (B-M1) — blank_data is not in
+        // CREATABLE_FIELDS[sensors], so it's denied at the allowlist step
+        // regardless of the locked-leaf recursion.
+        let cur = minimal_config();
+        let err = check_create_entity(
+            "sensors",
+            "newsensor",
+            &json!({
+                "type": "mqtt",
+                "broker_url": "mqtt://localhost",
+                "topic": "t",
+                "blank_data": {"x": 1},
+            }),
+            &cur,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::PathDenied(_)));
+    }
+
+    #[test]
+    fn create_display_with_type_denied() {
+        // Displays have no `type` discriminator (A-M) — it's simply absent
+        // from CREATABLE_FIELDS[displays]'s closed enumeration.
+        let cur = minimal_config();
+        let err = check_create_entity(
+            "displays",
+            "newdisplay",
+            &json!({"controllers": ["kwin-dpms"], "type": "foo"}),
+            &cur,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::PathDenied(_)));
+    }
+
+    #[test]
+    fn create_unknown_top_field_denied() {
+        let cur = minimal_config();
+        let err = check_create_entity(
+            "sensors",
+            "newsensor",
+            &json!({"type": "mqtt", "broker_url": "x", "topic": "t", "bogus_field": "z"}),
+            &cur,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::PathDenied(_)));
+    }
+
+    #[test]
+    fn create_existing_id_is_entity_exists() {
+        let cur = minimal_config();
+        let err = check_create_entity(
+            "sensors",
+            "desk", // already present in minimal_config()
+            &json!({"type": "mqtt", "broker_url": "x", "topic": "t"}),
+            &cur,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::EntityExists(_)));
+    }
+
+    #[test]
+    fn container_set_still_denied() {
+        // The old regression tests stay green — assert explicitly (they
+        // also live under "8. Container-Set bypass regression tests"
+        // above; this re-asserts the property survives the CreateEntity
+        // dispatch restructure).
+        let cur = minimal_config();
+        let err = check_patches(
+            &[set(
+                &["sensors"],
+                json!({"desk": {"type": "ha", "broker_url": "x", "topic": "t", "field": "f"}}),
+            )],
+            &cur,
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::PathDenied(_)));
+    }
+
+    // --- command-execution field exclusion (cold-gate M3 Must-1, spec §4/§11 invariant 2c) ---
+    #[test]
+    fn create_display_with_blank_command_denied() {
+        // blank_command/wake_command are NOT in CREATABLE_FIELDS[displays]'s closed
+        // enumeration — a web-created display cannot carry a daemon-executed shell
+        // command in v1.
+        let cur = minimal_config();
+        let v = json!({"controllers": ["command"], "blank_command": "echo hi"});
+        assert!(matches!(
+            check_create_entity("displays", "x", &v, &cur),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn create_display_with_wake_command_denied() {
+        let cur = minimal_config();
+        let v = json!({"controllers": ["command"], "wake_command": "echo hi"});
+        assert!(matches!(
+            check_create_entity("displays", "x", &v, &cur),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn creatable_fields_key_space_is_closed_to_crud_collections() {
+        // Structural pin, not name-based: CREATABLE_FIELDS covers EXACTLY the 4 CRUD
+        // collections and nothing else — so a future `audio.pw_dump_command` (feature
+        // 03, not yet in-tree) is unreachable from CreateEntity by construction, no
+        // code review needed to remember to exclude it. See spec §4/§11 invariant 2c.
+        let collections: Vec<&str> = CREATABLE_FIELDS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(collections, vec!["sensors", "zones", "displays", "rules"]);
+    }
+
+    // ==================================================================
+    // 11. Entity-id hygiene (spec §5 charset + reserved-name ban).
+    // ==================================================================
+
+    #[test]
+    fn validate_entity_id_accepts_valid_ids() {
+        for id in [
+            "desk", "office", "tv", "r", "sensor-2", "zone_a", "a1b2c3", "x",
+        ] {
+            assert!(
+                validate_entity_id(id).is_ok(),
+                "expected '{id}' to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_empty() {
+        assert!(matches!(
+            validate_entity_id(""),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_accepts_max_length_64() {
+        let id = "a".repeat(64);
+        assert!(validate_entity_id(&id).is_ok());
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_too_long_65() {
+        let id = "a".repeat(65);
+        assert!(matches!(
+            validate_entity_id(&id),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_leading_digit() {
+        // Subsumed by "first char [a-z]" — a digit id is structurally
+        // indistinguishable from an AOT index (is_digit_segment /
+        // aot_index_exists) — the ambiguity class is removed entirely.
+        assert!(matches!(
+            validate_entity_id("1sensor"),
+            Err(PatchError::PathDenied(_))
+        ));
+        assert!(matches!(
+            validate_entity_id("123"),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_uppercase() {
+        assert!(matches!(
+            validate_entity_id("Desk"),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_space() {
+        assert!(matches!(
+            validate_entity_id("my sensor"),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_dot() {
+        assert!(matches!(
+            validate_entity_id("my.sensor"),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_unicode() {
+        assert!(matches!(
+            validate_entity_id("s\u{e9}nsor"),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    #[test]
+    fn validate_entity_id_rejects_all_reserved_names() {
+        for id in RESERVED_ENTITY_IDS {
+            assert!(
+                matches!(validate_entity_id(id), Err(PatchError::PathDenied(_))),
+                "expected reserved id '{id}' to be rejected"
+            );
+        }
+    }
+
+    // ==================================================================
+    // 12. Delete-gate tests.
+    // ==================================================================
+
+    #[test]
+    fn delete_sensor_happy_path() {
+        let cur = minimal_config();
+        assert!(check_delete_entity("sensors", "desk", &cur).is_ok());
+    }
+
+    #[test]
+    fn delete_missing_entity_is_entity_unknown() {
+        let cur = minimal_config();
+        assert!(matches!(
+            check_delete_entity("sensors", "nonexistent", &cur),
+            Err(PatchError::EntityUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn delete_reserved_id_rejected_even_if_hygiene_only() {
+        // A hand-authored entity legitimately named e.g. "host" pre-dates
+        // this feature's charset validation (spec §5 "forward-only
+        // residual") — it is NOT deletable via the new API (validate_entity_id
+        // rejects the reserved name on delete too, same as create).
+        let cur = minimal_config();
+        assert!(matches!(
+            check_delete_entity("sensors", "host", &cur),
+            Err(PatchError::PathDenied(_))
+        ));
+    }
+
+    // ==================================================================
+    // 13. apply_create_entity / apply_delete_entity + json_to_toml_table.
+    // ==================================================================
+
+    #[test]
+    fn apply_create_entity_renders_explicit_table_not_inline() {
+        let mut d = doc("config_version = 1\n");
+        apply_create_entity(
+            &mut d,
+            "sensors",
+            "newsensor",
+            &json!({"type": "mqtt", "broker_url": "mqtt://x", "topic": "t"}),
+        );
+        let out = d.to_string();
+        assert!(
+            out.contains("[sensors.newsensor]"),
+            "expected an explicit [sensors.newsensor] section, got:\n{out}"
+        );
+        assert!(
+            !out.contains("newsensor = {"),
+            "must not render as an inline table, got:\n{out}"
+        );
+        assert!(out.contains(r#"type = "mqtt""#));
+    }
+
+    #[test]
+    fn apply_create_entity_first_in_empty_collection_still_explicit_table() {
+        // The very-first-entity case: [collection] doesn't exist at all yet.
+        // Ordering-critical (C-S round 3) — a one-liner index would
+        // auto-vivify [collection] as an InlineTable, corrupting the section.
+        let mut d = doc("config_version = 1\n");
+        assert!(d.get("sensors").is_none());
+        apply_create_entity(
+            &mut d,
+            "sensors",
+            "first",
+            &json!({"type": "mqtt", "broker_url": "mqtt://x", "topic": "t"}),
+        );
+        let out = d.to_string();
+        assert!(out.contains("[sensors.first]"), "got:\n{out}");
+        assert!(!out.contains("sensors = {"), "got:\n{out}");
+    }
+
+    #[test]
+    fn apply_create_entity_omits_null_fields() {
+        let mut d = doc("config_version = 1\n");
+        apply_create_entity(
+            &mut d,
+            "sensors",
+            "s",
+            &json!({"type": "mqtt", "broker_url": "x", "topic": "t", "payload_on": null}),
+        );
+        let out = d.to_string();
+        assert!(!out.contains("payload_on"), "got:\n{out}");
+    }
+
+    #[test]
+    fn apply_delete_entity_removes_only_target() {
+        let mut cur = minimal_config();
+        apply_delete_entity(&mut cur, "sensors", "desk");
+        assert!(
+            cur.get("sensors")
+                .and_then(|i| i.as_table())
+                .is_some_and(|t| !t.contains_key("desk"))
+        );
+    }
+
+    #[test]
+    fn json_to_toml_table_converts_scalar_and_array_fields() {
+        let t = json_to_toml_table(&json!({
+            "mode": "any",
+            "members": ["a", "b"],
+        }));
+        assert_eq!(t.get("mode").and_then(|i| i.as_str()), Some("any"));
+        assert!(t.get("members").and_then(|i| i.as_array()).is_some());
+    }
+
+    // ==================================================================
+    // 14. check_patches dispatch — CreateEntity/DeleteEntity end to end.
+    // ==================================================================
+
+    #[test]
+    fn check_patches_create_entity_end_to_end_ok() {
+        let cur = minimal_config();
+        let patches = [Patch::CreateEntity {
+            collection: "zones".into(),
+            id: "newzone".into(),
+            value: json!({"mode": "any", "members": ["desk"]}),
+        }];
+        assert!(check_patches(&patches, &cur, &[]).is_ok());
+    }
+
+    #[test]
+    fn check_patches_delete_entity_end_to_end_ok() {
+        let cur = minimal_config();
+        let patches = [Patch::DeleteEntity {
+            collection: "rules".into(),
+            id: "r".into(),
+        }];
+        assert!(check_patches(&patches, &cur, &[]).is_ok());
+    }
+
+    #[test]
+    fn check_patches_create_entity_reserved_collection_rejected() {
+        let cur = minimal_config();
+        let patches = [Patch::CreateEntity {
+            collection: "daemon".into(),
+            id: "evil".into(),
+            value: json!({"web_port": 9999}),
+        }];
+        assert!(matches!(
+            check_patches(&patches, &cur, &[]),
+            Err(PatchError::PathDenied(_))
+        ));
     }
 }

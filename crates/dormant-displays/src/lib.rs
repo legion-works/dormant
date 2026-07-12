@@ -20,4 +20,6 @@ pub mod kwin_dpms;
 pub mod registry;
 pub mod samsung_ip;
 pub mod samsung_tizen;
+#[cfg(feature = "test-util")]
+pub mod test_support;
 pub mod vcp_ops;

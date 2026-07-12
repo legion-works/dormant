@@ -580,21 +580,22 @@ impl App {
         let web_handle: Option<tokio::task::JoinHandle<()>> = {
             if let Some(port) = cfg_clone.daemon.web_port {
                 let addr = std::net::SocketAddr::new(cfg_clone.daemon.web_bind, port);
-                let web_state = dormant_web::WebState::new(dormant_web::WebStateInner {
-                    ctl_tx: front_ctl_tx.clone(),
-                    reload_trigger: reload_trigger_tx.clone(),
-                    reload_rx: reload_tx.subscribe(),
-                    config_rx: config_rx.clone(),
-                    creds_rx: creds_rx.clone(),
-                    config_path: self.config_path.clone(),
-                    creds_path: self.creds_path.clone(),
-                    apply_lock: tokio::sync::Mutex::new(()),
-                    doctor: doctor_service.clone(),
-                    wear: wear_handle.clone(),
-                    web_bind: addr,
-                    cancel: root.clone(),
-                    reload_timeout: std::time::Duration::from_secs(10),
-                });
+                let web_state = dormant_web::WebState::new(dormant_web::WebStateInner::new(
+                    dormant_web::WebStateInnerParams {
+                        ctl_tx: front_ctl_tx.clone(),
+                        reload_trigger: reload_trigger_tx.clone(),
+                        reload_rx: reload_tx.subscribe(),
+                        config_rx: config_rx.clone(),
+                        creds_rx: creds_rx.clone(),
+                        config_path: self.config_path.clone(),
+                        creds_path: self.creds_path.clone(),
+                        doctor: doctor_service.clone(),
+                        wear: wear_handle.clone(),
+                        web_bind: addr,
+                        cancel: root.clone(),
+                        reload_timeout: std::time::Duration::from_secs(10),
+                    },
+                ));
                 match dormant_web::spawn(addr, web_state).await {
                     Ok((handle, _addr)) => Some(handle),
                     Err(e) => {
@@ -2804,6 +2805,7 @@ mod render_tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::new(),
             zones: IndexMap::new(),
             displays: {
@@ -2912,6 +2914,7 @@ mod render_tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -3001,6 +3004,7 @@ mod render_tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -3097,6 +3101,7 @@ mod render_tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(
@@ -3184,6 +3189,7 @@ mod render_tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: indexmap::IndexMap::new(),
             zones: indexmap::IndexMap::new(),
             displays: indexmap::IndexMap::from([(

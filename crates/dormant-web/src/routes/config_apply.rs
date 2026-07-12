@@ -87,6 +87,13 @@ fn rand4() -> String {
 
 // ── Handler ────────────────────────────────────────────────────────────────
 
+// This handler is a single linear, explicitly step-numbered pipeline (see
+// the step comments below and the module doc comment) — splitting it up
+// would scatter one atomic operation across several functions for no
+// readability gain. It sat right at clippy's 100-line pedantic threshold
+// before this change; the `entity_created`/`entity_deleted` audit-log call
+// (spec §11 invariant 8, §14) tips it to 101.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn post_apply(
     State(state): State<WebState>,
     Json(body): Json<ApplyRequest>,
@@ -119,6 +126,23 @@ pub(crate) async fn post_apply(
 
     let mut cfg: dormant_core::config::schema::Config = toml::from_str(&raw)
         .map_err(|e| WebError::ConfigReadError(format!("config deserialize error: {e}")))?;
+
+    // ── Step 2b: entity_crud_enabled gate (spec §2) ─────────────────────
+    // The switch gates the CRUD *verbs* (CreateEntity/DeleteEntity), not
+    // ordinary edits — Set/Remove ride the existing 5-stage pipeline
+    // unchanged (spec §11 invariant 2, §0: "the existing 5-stage
+    // pipeline, UNCHANGED"). Read from `cfg`, the SAME just-re-read,
+    // fingerprint-matched bytes `check_patches` below validates against
+    // (not the live `config_rx` watch, which could momentarily lag a
+    // concurrent on-disk edit) — this is the strictest, race-free read of
+    // "current" available in this handler.
+    let wants_entity_crud = body
+        .patches
+        .iter()
+        .any(|p| matches!(p, Patch::CreateEntity { .. } | Patch::DeleteEntity { .. }));
+    if wants_entity_crud && !cfg.daemon.entity_crud_enabled {
+        return Err(WebError::EntityCrudFeatureDisabled);
+    }
 
     // ── Step 3: redact for redacted-path checking ──────────────────────
     let redacted = redact_config_secrets(&mut cfg);
@@ -182,6 +206,9 @@ pub(crate) async fn post_apply(
         WebError::ConfigReadError(format!("rename failed: {e}"))
     })?;
     sync_dir(config_dir)?;
+    // Step 8b: audit-log, now that steps 4-8 have ALL succeeded (spec §11
+    // invariant 8, §14; see `log_entity_audit_events`'s doc comment).
+    log_entity_audit_events(&body.patches);
 
     // ── Step 9: subscribe to reload outcome, wait for it ─────────────────
     // Subscribe AFTER the rename but INSIDE the apply_lock so concurrent
@@ -233,6 +260,30 @@ fn patch_error_to_web(e: PatchError) -> WebError {
         PatchError::RedactedPath(msg) => WebError::RedactedPathTargeted(msg),
         PatchError::EntityUnknown(msg) => WebError::EntityUnknown(msg),
         PatchError::ValueRejected(msg) => WebError::PatchValueRejected(msg),
+        PatchError::EntityExists(msg) => WebError::EntityExists(msg),
+    }
+}
+
+/// Emit `entity_created`/`entity_deleted` audit events for every
+/// [`Patch::CreateEntity`]/[`Patch::DeleteEntity`] in `patches` (spec §11
+/// invariant 8, §14 — grep-stable literal event names).
+///
+/// Callers MUST only invoke this once the patch set has been fully applied
+/// AND durably written to disk — never on a rejected patch. Deliberately
+/// logs `collection`+`id` ONLY: an entity's `value` can carry secrets
+/// (broker URLs, hostnames, tokens) and must never reach a log line (same
+/// concern [`redact_config_secrets`] handles for reads).
+fn log_entity_audit_events(patches: &[Patch]) {
+    for patch in patches {
+        match patch {
+            Patch::CreateEntity { collection, id, .. } => {
+                tracing::info!(event = "entity_created", collection = %collection, id = %id);
+            }
+            Patch::DeleteEntity { collection, id } => {
+                tracing::info!(event = "entity_deleted", collection = %collection, id = %id);
+            }
+            Patch::Set { .. } | Patch::Remove { .. } => {}
+        }
     }
 }
 
@@ -364,10 +415,13 @@ mod tests {
     };
     use dormant_core::reload::ReloadOutcome;
     use indexmap::IndexMap;
+    use serde_json::json;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::broadcast;
+
+    use crate::test_support::{start_capturing, take_captured};
 
     // ── Test helpers ────────────────────────────────────────────────────────
 
@@ -405,21 +459,22 @@ mod tests {
         let config_path = config_dir.join("config.toml");
         let creds_path = config_dir.join("config.creds.toml");
 
-        WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path,
-            creds_path,
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
-            cancel,
-            reload_timeout: Duration::from_secs(10),
-        })
+        WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path,
+                creds_path,
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
+                cancel,
+                reload_timeout: Duration::from_secs(10),
+            },
+        ))
     }
 
     /// Like [`test_state`] but returns the [`broadcast::Sender`]`<`[`ReloadOutcome`]`>`
@@ -448,21 +503,22 @@ mod tests {
         let config_path = config_dir.join("config.toml");
         let creds_path = config_dir.join("config.creds.toml");
 
-        let state = WebState::new(crate::state::WebStateInner {
-            ctl_tx,
-            reload_trigger: reload_trigger_tx,
-            reload_rx,
-            config_rx,
-            creds_rx,
-            config_path,
-            creds_path,
-            apply_lock: tokio::sync::Mutex::new(()),
-            doctor,
-            wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
-            cancel,
-            reload_timeout,
-        });
+        let state = WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_trigger: reload_trigger_tx,
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path,
+                creds_path,
+                doctor,
+                wear: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port),
+                cancel,
+                reload_timeout,
+            },
+        ));
 
         (state, reload_tx)
     }
@@ -475,6 +531,7 @@ mod tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -519,6 +576,7 @@ mod tests {
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors: IndexMap::default(),
             zones,
             displays: IndexMap::default(),
@@ -758,6 +816,7 @@ field = "/val"
             wear: dormant_core::config::schema::WearConfig::default(),
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
             sensors,
             zones: IndexMap::default(),
             displays: IndexMap::default(),
@@ -1382,5 +1441,522 @@ field = "/val"
         let result = handle.await.unwrap().unwrap();
         assert!(result.applied);
         assert_eq!(result.reload, "pending");
+    }
+
+    // ── Task 2 Step 5: CreateEntity/DeleteEntity apply integration ──────────
+    // (the daemon-identical-validate net — config_apply.rs is the ONLY place
+    // that runs the real dormant_core::config::validate() on a patched doc)
+
+    #[tokio::test]
+    async fn create_display_unknown_controllers_422_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n[daemon]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "displays".into(),
+                id: "tv".into(),
+                value: json!({
+                    "controllers": ["nonexistent-controller"],
+                    "blank_mode": "power_off",
+                }),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown controller must fail the daemon-identical validate"
+        );
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when validate rejects the create"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_zone_referenced_by_rule_422_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"
+config_version = 1
+
+[zones.myzone]
+mode = "any"
+members = []
+
+[rules.myrule]
+zone = "myzone"
+displays = []
+"#;
+        write_config(dir.path(), content);
+
+        let (cfg, _rule_id) = config_with_rule();
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::DeleteEntity {
+                collection: "zones".into(),
+                id: "myzone".into(),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "deleting a zone still referenced by a rule must fail the reference-integrity net"
+        );
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when the delete orphans a reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_then_delete_entity_round_trip_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "# top comment\nconfig_version = 1\n\n# sensors section\n[sensors]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+
+        // ── Step 1: create a sensor ─────────────────────────────────────
+        let fingerprint = get_fingerprint(&state);
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "newsensor".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/new",
+                }),
+            }],
+        };
+        let result = post_apply(State(state.clone()), axum::Json(req)).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+
+        let after_create = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            after_create.contains("# top comment"),
+            "comment preserved after create"
+        );
+        assert!(
+            after_create.contains("# sensors section"),
+            "comment preserved after create"
+        );
+        assert!(
+            after_create.contains("[sensors.newsensor]"),
+            "created entity present:\n{after_create}"
+        );
+
+        let backups_dir = dir.path().join("backups");
+        let backup_count_after_create = std::fs::read_dir(&backups_dir).unwrap().count();
+        assert_eq!(
+            backup_count_after_create, 1,
+            "create backed up the pre-create file"
+        );
+
+        // ── Step 2: delete the same sensor ──────────────────────────────
+        let fingerprint2 = get_fingerprint(&state);
+        let req2 = ApplyRequest {
+            fingerprint: fingerprint2,
+            patches: vec![Patch::DeleteEntity {
+                collection: "sensors".into(),
+                id: "newsensor".into(),
+            }],
+        };
+        let result2 = post_apply(State(state), axum::Json(req2)).await;
+        assert!(
+            result2.is_ok(),
+            "delete should succeed: {:?}",
+            result2.err()
+        );
+
+        let after_delete = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            after_delete.contains("# top comment"),
+            "comment preserved after delete"
+        );
+        assert!(
+            after_delete.contains("# sensors section"),
+            "comment preserved after delete"
+        );
+        assert!(
+            !after_delete.contains("newsensor"),
+            "deleted entity gone:\n{after_delete}"
+        );
+
+        let backup_count_after_delete = std::fs::read_dir(&backups_dir).unwrap().count();
+        assert_eq!(
+            backup_count_after_delete, 2,
+            "delete backed up the post-create file (atomic rename on both legs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_sensor_renders_as_explicit_table_not_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "golden".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/golden",
+                }),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+
+        let after = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        // Golden assertion: an explicit `[sensors.golden]` section, never a
+        // one-line inline table (`golden = { ... }`).
+        assert!(
+            after.contains("[sensors.golden]"),
+            "expected explicit [sensors.golden] section, got:\n{after}"
+        );
+        assert!(
+            !after.contains("golden = {"),
+            "must not render as an inline table, got:\n{after}"
+        );
+        assert!(after.contains(r#"type = "mqtt""#));
+        assert!(after.contains(r#"broker_url = "mqtt://localhost""#));
+    }
+
+    // ── entity_crud_enabled server-side enforcement (cross-task Must) ───────
+    // T1 shipped `daemon.entity_crud_enabled` (default true) with zero
+    // server-side gate: `check_create_entity`/`check_delete_entity` never
+    // consulted it, so a client could POST create_entity/delete_entity with
+    // the flag off and succeed. Spec §2: "When a switch is false, the route
+    // returns 403 `feature_disabled` ... the UI hides the affordance but the
+    // server is the boundary." `Set`/`Remove` patches are NOT gated by this
+    // flag (spec §2 talks about "the route" for the CRUD verbs; §11
+    // invariant 2 confirms ordinary `Set`/`Remove` editing is unrelated,
+    // pre-existing behaviour this spec does not touch).
+
+    fn minimal_config_crud_disabled() -> Config {
+        let mut cfg = minimal_config();
+        cfg.daemon.entity_crud_enabled = false;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn create_entity_denied_when_crud_disabled_403_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // post_apply re-parses `cfg` fresh from THIS on-disk content (not
+        // from the in-memory `Config` handed to `test_state`, which only
+        // seeds `config_rx`) — the flag must live in the file.
+        let content = "config_version = 1\n[daemon]\nentity_crud_enabled = false\n[sensors]\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_crud_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "newsensor".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/new",
+                }),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "create_entity must be denied 403 when daemon.entity_crud_enabled is false"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "feature_disabled");
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when entity CRUD is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_denied_when_crud_disabled_403_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // post_apply re-parses `cfg` fresh from THIS on-disk content (not
+        // from the in-memory `Config` handed to `test_state`) — the flag
+        // must live in the file.
+        let content = r#"
+config_version = 1
+
+[daemon]
+entity_crud_enabled = false
+
+[zones.myzone]
+mode = "any"
+members = []
+"#;
+        write_config(dir.path(), content);
+
+        let mut cfg = minimal_config();
+        cfg.daemon.entity_crud_enabled = false;
+        let mut zones = IndexMap::new();
+        zones.insert(
+            "myzone".into(),
+            ZoneConfig {
+                mode: "any".into(),
+                members: vec![],
+                quorum: None,
+                threshold: None,
+                weights: IndexMap::default(),
+                unavailable_policy: dormant_core::zone::UnavailablePolicy::Present,
+            },
+        );
+        cfg.zones = zones;
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::DeleteEntity {
+                collection: "zones".into(),
+                id: "myzone".into(),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "delete_entity must be denied 403 when daemon.entity_crud_enabled is false"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "feature_disabled");
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when entity CRUD is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_patch_unaffected_by_crud_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // entity_crud_enabled = false in the ACTUAL on-disk content (what
+        // post_apply re-parses `cfg` from) — a plain Set must still work.
+        let content = "config_version = 1\n[daemon]\nentity_crud_enabled = false\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_crud_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "log_level".into()],
+                value: serde_json::Value::String("debug".into()),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(
+            result.is_ok(),
+            "an ordinary Set patch must still succeed when entity_crud_enabled is false \
+             (the flag gates create_entity/delete_entity only, not Set/Remove): {:?}",
+            result.err()
+        );
+    }
+
+    // ── entity_created / entity_deleted audit events (spec §11 invariant 8,
+    // §14) ────────────────────────────────────────────────────────────────
+    // These literal `event = "entity_created"` / `event = "entity_deleted"`
+    // tracing events are grep-stable per spec but, prior to this fix, were
+    // never emitted anywhere. The capture layer is shared with
+    // `routes::pair`'s tests via `crate::test_support` — see that module's
+    // comment for why a per-module `Once`-gated global subscriber would
+    // race and silently blind whichever module lost.
+
+    #[tokio::test]
+    async fn successful_create_emits_entity_created_not_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n[sensors]\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        start_capturing();
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "golden".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://s3cret-host-must-not-leak",
+                    "topic": "presence/golden",
+                }),
+            }],
+        };
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let events = take_captured();
+
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+        let joined = events.join("\n");
+        assert!(
+            joined.contains("entity_created"),
+            "missing entity_created in: {joined}"
+        );
+        assert!(
+            joined.contains("collection=sensors"),
+            "missing collection field in: {joined}"
+        );
+        assert!(
+            joined.contains("id=golden"),
+            "missing id field in: {joined}"
+        );
+        assert!(
+            !joined.contains("s3cret-host-must-not-leak"),
+            "entity value payload must never be logged: {joined}"
+        );
+        assert!(
+            !joined.contains("broker_url"),
+            "entity value payload must never be logged: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_delete_emits_entity_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n[sensors]\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+
+        // Create first (uncaptured) so there's something to delete.
+        let fingerprint = get_fingerprint(&state);
+        let create_req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                collection: "sensors".into(),
+                id: "todelete".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/todelete",
+                }),
+            }],
+        };
+        let result = post_apply(State(state.clone()), axum::Json(create_req)).await;
+        assert!(result.is_ok(), "create should succeed: {:?}", result.err());
+
+        start_capturing();
+        let fingerprint2 = get_fingerprint(&state);
+        let delete_req = ApplyRequest {
+            fingerprint: fingerprint2,
+            patches: vec![Patch::DeleteEntity {
+                collection: "sensors".into(),
+                id: "todelete".into(),
+            }],
+        };
+        let result2 = post_apply(State(state), axum::Json(delete_req)).await;
+        let events = take_captured();
+
+        assert!(
+            result2.is_ok(),
+            "delete should succeed: {:?}",
+            result2.err()
+        );
+        let joined = events.join("\n");
+        assert!(
+            joined.contains("entity_deleted"),
+            "missing entity_deleted in: {joined}"
+        );
+        assert!(
+            joined.contains("collection=sensors"),
+            "missing collection field in: {joined}"
+        );
+        assert!(
+            joined.contains("id=todelete"),
+            "missing id field in: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_create_reserved_id_emits_no_entity_created() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config_version = 1\n[sensors]\n");
+
+        let state = test_state(dir.path(), minimal_config(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        start_capturing();
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::CreateEntity {
+                // "type" is in RESERVED_ENTITY_IDS — rejected by
+                // check_patches, BEFORE apply_patches ever runs.
+                collection: "sensors".into(),
+                id: "type".into(),
+                value: json!({
+                    "type": "mqtt",
+                    "broker_url": "mqtt://localhost",
+                    "topic": "presence/x",
+                }),
+            }],
+        };
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let events = take_captured();
+
+        assert!(
+            result.is_err(),
+            "create with a reserved id must be rejected"
+        );
+        let joined = events.join("\n");
+        assert!(
+            !joined.contains("entity_created"),
+            "a rejected create must never emit entity_created: {joined}"
+        );
     }
 }

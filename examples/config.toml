@@ -74,6 +74,18 @@ stale_sensor_timeout = "5m"
 log_level = "info"
 socket_path = "/run/user/1000/dormant.sock"
 
+# ── Web UI config editor: entity CRUD + the Samsung pairing wizard ─────────
+#
+# Only relevant when the web UI is enabled (daemon.web_port set, see
+# docs/src/web-ui.md). Both default to on; set to false to hide/reject the
+# corresponding affordance without disabling the rest of the web UI. The
+# server enforces these independently of what the UI shows — flipping a
+# switch off returns 403 "feature_disabled" for the gated routes, not just
+# a hidden button.
+# entity_crud_enabled = true     # web create/delete of sensors/zones/displays/rules
+# pairing_enabled = true         # the Samsung pairing wizard (POST /api/pair/samsung)
+# pair_timeout = "120s"          # how long the wizard waits for the TV to accept (30s..=300s)
+
 # ── Sensors ────────────────────────────────────────────────────────────────────
 
 # Desk occupancy over MQTT (e.g. an ESPresence / mmWave node publishing JSON).

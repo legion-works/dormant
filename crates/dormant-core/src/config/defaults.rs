@@ -86,6 +86,17 @@ pub const AVAILABILITY_PAYLOAD_OFFLINE: &str = "offline";
 /// Default web-UI bind address — loopback only (operator tool).
 pub const WEB_BIND_DEFAULT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
+/// Whether the web UI's entity create/delete affordances are enabled by
+/// default.
+pub const ENTITY_CRUD_ENABLED: bool = true;
+
+/// Whether the Samsung pairing wizard route is enabled by default.
+pub const PAIRING_ENABLED: bool = true;
+
+/// Default timeout for a single pairing-wizard attempt (validated to
+/// `30s..=300s` — see [`mod@super::validate`]).
+pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Default duration each screensaver source image is displayed (8 seconds).
 pub const IMAGE_DURATION: Duration = Duration::from_secs(8);
 
@@ -186,3 +197,22 @@ pub const SHIFT_PX: u8 = 2;
 
 /// Default interval between successive pixel shifts.
 pub const SHIFT_INTERVAL: Duration = Duration::from_secs(120);
+
+// ── [audio] section defaults ────────────────────────────────────────────────
+
+/// How often the audio inhibitor polls `pw_dump_command` for the current
+/// `PipeWire` graph state.
+pub const AUDIO_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Minimum continuous stream activity before the audio inhibitor asserts
+/// inhibition (debounces transient blips; bypassed once at poller startup
+/// for a stream already running when the daemon starts — see the audio
+/// source's `startup_grace`).
+pub const AUDIO_MIN_ACTIVE: Duration = Duration::from_secs(3);
+
+/// `media.role` values that mean "this running stream is a call".
+pub const AUDIO_CALL_ROLES: &[&str] = &["Communication"];
+
+/// Default `pw-dump` invocation (resolved via `$PATH`); override via
+/// `[audio].pw_dump_command` — the test/override seam.
+pub const AUDIO_PW_DUMP_COMMAND: &str = "pw-dump";

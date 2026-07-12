@@ -74,6 +74,23 @@ pub(crate) enum WebError {
     PatchValueRejected(String),
     /// The request exceeds the maximum allowed patch count (256).
     PatchCapExceeded(u32),
+    /// `CreateEntity` targeted an id that already exists in the collection.
+    EntityExists(String),
+    /// A `CreateEntity`/`DeleteEntity` patch was submitted to
+    /// `/api/config/apply` while `daemon.entity_crud_enabled = false`
+    /// (spec §2: "the UI hides the affordance but the server is the
+    /// boundary"). `Set`/`Remove` patches are unaffected.
+    EntityCrudFeatureDisabled,
+    /// `POST /api/pair/samsung` was called while
+    /// `daemon.pairing_enabled = false`.
+    PairFeatureDisabled,
+    /// A pairing attempt is already in flight (`pair_lock` `try_lock`
+    /// failed).
+    PairInProgress,
+    /// `GET /api/pair/samsung/{id}` referenced an id with no matching
+    /// entry (never existed, or already swept as an expired terminal
+    /// entry — see `routes::pair::sweep_expired`).
+    PairNotFound,
 }
 
 impl IntoResponse for WebError {
@@ -151,6 +168,21 @@ impl IntoResponse for WebError {
                 }] });
                 return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
             }
+            WebError::EntityExists(detail) => {
+                let body = serde_json::json!({ "errors": [{
+                    "what": "entity_exists",
+                    "detail": detail
+                }] });
+                return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
+            }
+            WebError::EntityCrudFeatureDisabled => {
+                (StatusCode::FORBIDDEN, "feature_disabled", None)
+            }
+
+            // ── Pairing-wizard variants (Task 5) ───────────────────────────────
+            WebError::PairFeatureDisabled => (StatusCode::FORBIDDEN, "feature_disabled", None),
+            WebError::PairInProgress => (StatusCode::CONFLICT, "pairing_in_progress", None),
+            WebError::PairNotFound => (StatusCode::NOT_FOUND, "pair_not_found", None),
         };
         let mut body = serde_json::json!({ "error": event });
         if let Some(d) = detail {

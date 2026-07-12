@@ -23,7 +23,7 @@ pub use schema::{
     Config, Credentials, DaemonConfig, DisplayConfig, IdleSource, IdleTimeUnit, MqttCredential,
     RuleConfig, SensorConfig, SensorKind, Strictness, ValidationError, Warning, ZoneConfig,
 };
-pub use validate::{is_known_config_path, validate};
+pub use validate::{STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate};
 
 use std::path::Path;
 

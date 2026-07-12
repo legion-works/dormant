@@ -124,7 +124,7 @@ describe("WatchdogSection — settings form", () => {
 
     const patches = store.buildPatches();
     expect(patches).toHaveLength(3);
-    const paths = patches.map((p) => p.path.join("."));
+    const paths = patches.filter((p) => "path" in p).map((p) => p.path.join("."));
     expect(paths.sort()).toEqual(
       ["watchdog.lkg_enabled", "watchdog.lkg_rollback_enabled", "watchdog.stability_window"].sort(),
     );

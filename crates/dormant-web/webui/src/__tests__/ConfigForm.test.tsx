@@ -640,9 +640,14 @@ describe("SettingsForm", () => {
       expect(screen.getByText(/reloaded/)).toBeInTheDocument();
     });
 
-    // beforeunload removed after apply success (dirty count → 0)
-    const removeCalls = removeSpy.mock.calls.filter(([ev]) => ev === "beforeunload");
-    expect(removeCalls.length).toBeGreaterThanOrEqual(1);
+    // beforeunload removed after apply success (dirty count → 0).
+    // The removal runs in a React effect cleanup scheduled after the
+    // DOM commit, which may not have fired when the "reloaded" banner
+    // first appears — waitFor retries until the cleanup runs.
+    await waitFor(() => {
+      const removeCalls = removeSpy.mock.calls.filter(([ev]) => ev === "beforeunload");
+      expect(removeCalls.length).toBeGreaterThanOrEqual(1);
+    });
 
     removeSpy.mockRestore();
   });

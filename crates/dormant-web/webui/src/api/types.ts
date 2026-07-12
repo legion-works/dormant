@@ -301,6 +301,11 @@ export interface ConfigInventory {
    * TOML section. Optional in fixtures/older payloads, mirroring `wear`;
    * the NotificationsSection form treats absence as `{}`. */
   notifications?: Record<string, unknown>;
+  /** rust: config/schema.rs WatchdogConfig — the `[watchdog]` TOML section
+   * (crash-loop watchdog / last-known-good rollback). Optional in
+   * fixtures/older payloads, mirroring `wear`/`notifications`; the
+   * WatchdogSection form treats absence as `{}`. */
+  watchdog?: Record<string, unknown>;
   /** rust: config/schema.rs AudioConfig — the `[audio]` TOML section
    * (global PipeWire audio-inhibitor config). Optional in fixtures/older
    * payloads, mirroring `wear`/`notifications`; the AudioSection form

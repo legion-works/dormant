@@ -370,7 +370,16 @@ fn validate_only_exit_codes() {
 // ── 3: reload swaps behavior ───────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_swap() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -562,7 +571,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn removed_display_verified_wake() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
@@ -621,7 +639,16 @@ async fn removed_display_verified_wake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn removed_display_wake_failure_aborts() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
@@ -692,7 +719,16 @@ async fn removed_display_wake_failure_aborts() {
 // ── Retained dark display gets a defensive wake on reload ──────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_defensive_wake_retained() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -745,7 +781,16 @@ async fn reload_defensive_wake_retained() {
 /// now manual-only — its phase is preserved across reload (no defensive wake).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn ruleless_display_preserves_phase_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
@@ -831,7 +876,16 @@ async fn ruleless_display_preserves_phase_on_reload() {
 // ── 8: config_watch updates on successful reload only ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn config_watch_updates_on_successful_reload_only() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -917,7 +971,16 @@ async fn config_watch_updates_on_successful_reload_only() {
 // ── 9: creds_watch updates on successful reload only ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn creds_watch_updates_on_successful_reload_only() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -1034,7 +1097,16 @@ async fn web_nonloopback_warning_fires_at_startup() {
 // ── 11: web_bind_change_ignored fires on reload without rebinding ──────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn web_bind_change_ignored_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     install_capture_subscriber();
 
     let dir = TempDir::new().unwrap();
@@ -1403,7 +1475,16 @@ wake_retry_interval = "1s"
     /// count gate.
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+                  count step-boundary tests it would otherwise contaminate — test-local, always \
+                  released promptly at test end"
+    )]
     async fn rollback_input_wake_routes_through_drain() {
+        let _capture_guard = capture_count_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = TempDir::new().unwrap();
         let m1 = dir.path().join("mon1");
         let m2 = dir.path().join("mon2");
@@ -1803,7 +1884,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn manual_only_display_no_defensive_wake_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
@@ -1922,7 +2012,16 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
 // ── 15: rule-driven dark display defensive-woken on reload (regression) ─────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn rule_driven_dark_display_defensive_woken_on_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -1983,7 +2082,16 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
 /// manual command (tracked in issue #9).
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn manual_only_display_full_lifecycle_across_reload() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
@@ -2310,6 +2418,13 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
     let _guard = wear_env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // This test drives 3 back-to-back reloads (below) — each is a real
+    // Runner::reload() call that emits the same step-boundary markers the
+    // exact-count watchdog tests count, so it also serializes on
+    // capture_count_lock (see that lock's doc comment).
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state_home = TempDir::new().unwrap();
     let _env = XdgStateHomeGuard::set(state_home.path());
 
@@ -2536,6 +2651,13 @@ async fn wear_shutdown_persists_final_ledger() {
 )]
 async fn wear_park_persists_final_ledger() {
     let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The [wear].enabled = false reload below is a real Runner::reload()
+    // call that emits the same step-boundary markers the exact-count
+    // watchdog tests count, so it also serializes on capture_count_lock
+    // (see that lock's doc comment).
+    let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state_home = TempDir::new().unwrap();
@@ -2859,7 +2981,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() calls against the exact- \
+              count step-boundary tests they would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let flag = dir.path().join("blank_ok_flag"); // never created in this test
@@ -3074,7 +3205,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
+              count step-boundary tests it would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
 
@@ -3305,7 +3445,16 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes this test's reload() calls against the exact- \
+              count step-boundary tests they would otherwise contaminate — test-local, always \
+              released promptly at test end"
+)]
 async fn reload_carries_sensor_reported_until_own_config_edit() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let cfg_path = write_file(
         dir.path(),
@@ -3502,4 +3651,769 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
     );
 
     shutdown(handle, join).await;
+}
+
+// ── Watchdog probe arm + LKG promotion (T4) ─────────────────────────────────
+//
+// `.disable_ipc()` throughout (Global Constraints). `XDG_STATE_HOME` is
+// process-global, so every test below serializes on `wear_env_lock()` (the
+// SAME lock the wear tests already use for the same env var — a single
+// dedicated lock per env var, not one per feature). `WATCHDOG_USEC` is
+// NEVER touched (Global Constraints); cadence is controlled entirely via
+// `App::with_watchdog_interval` + `SdNotify::from_socket_for_test`
+// (`test-util` feature — see `Cargo.toml`/`sd_notify.rs` T4 fix).
+//
+// Timing (reported in the T4 write-up): `stability_window = "30s"` is the
+// validated floor (`validate.rs`); `watchdog_healthy_run_writes_lkg_and_sidecar`
+// and `watchdog_reload_mid_window_resets_candidate` each wait close to that
+// floor and are run with their OWN `timeout 42` invocation, never inside
+// either of the two bulk runs below, to stay inside the 42s harness budget.
+//
+// F5 (T4 review): once this file grew enough `watchdog_*` step-boundary
+// tests, running "every test except the two long ones" as a single
+// `--test-threads=4` invocation risked busting the 42s cap the moment any
+// more watchdog coverage landed. The fix is a STABLE two-half split by
+// name, not a shrinking act — CI, reviewers, and operators re-running this
+// file locally all use the exact same two commands:
+//
+//   1) watchdog smoke half (all `watchdog_*` tests EXCEPT the two long
+//      ones above, which keep their own individual `timeout 42` runs):
+//        timeout 42 cargo test -p dormantd --test daemon_smoke \
+//          --all-features -- --test-threads=4 watchdog_ \
+//          --skip watchdog_healthy_run_writes_lkg_and_sidecar \
+//          --skip watchdog_reload_mid_window_resets_candidate
+//      Measured on the sandbox's 2-core box: ~2.7s.
+//
+//   2) everything else (every non-`watchdog_*` test in this file —
+//      `--skip watchdog_` substring-matches and excludes ALL of them,
+//      including the two long ones, so this half never touches them):
+//        timeout 42 cargo test -p dormantd --test daemon_smoke \
+//          --all-features -- --test-threads=4 --skip watchdog_
+//      Measured on the sandbox's 2-core box: ~40-41s across repeated runs
+//      — inside the 42s cap but with LESS headroom than half (1). This is
+//      a PRE-EXISTING characteristic of the legacy (pre-T4) test bucket,
+//      not a regression from this fix: none of the tests added by this
+//      commit land in half (2), and its runtime is unchanged from before
+//      this branch. A real-time-heavy handful (e.g.
+//      `wear_park_persists_final_ledger`'s fixed 7s settle sleep) account
+//      for most of the margin loss; rebalancing that legacy weight is
+//      out of scope here — flagged as a follow-up, not fixed in this
+//      watchdog-focused change.
+//
+// A new smoke test belongs in half (1) if its name starts with
+// `watchdog_`, half (2) otherwise — no other bookkeeping needed as the
+// suite keeps growing. A new HEAVY (multi-second real sleep) test in half
+// (2) should be weighed against that shrinking margin before it lands.
+
+use dormantd::sd_notify::SdNotify;
+
+/// `install_capture_subscriber`'s buffer is process-global and, once
+/// installed, becomes the default subscriber for EVERY test in this
+/// binary (not just ones that call it) — the existing hazard test (22)
+/// documents the residual race and bounds its window instead of trying to
+/// eliminate it entirely.
+///
+/// The three EXACT-COUNT / ordered step-boundary tests
+/// (`watchdog_in_reload_pings_healthy_boundaries`,
+/// `watchdog_ping_before_rebuild_old_on_verified_wake_failure`,
+/// `watchdog_ping_before_rebuild_old_on_spawn_generation_failure`) are far
+/// more sensitive to that race than a substring check: `Runner::reload()`
+/// logs the SAME `after_assemble`/`after_quiesce`/`before_teardown`/
+/// `removed_display_wake`/`reload_end` step markers (`app.rs`'s
+/// `Runner::ping`) on every single reload it runs, whether or not the
+/// caller cares about watchdog pings — so any OTHER test in this binary
+/// that drives a real `Runner::reload()` (`trigger_reload()` or a file-
+/// watcher-triggered reload) while a step-boundary test's capture window
+/// is open can inject a foreign marker into the count/order the reader is
+/// asserting on.
+///
+/// Mirrors `boot_rollback.rs`'s fix for the identical mechanism there
+/// (`config_rollback_boot`): every reload-driving test in this binary that
+/// can emit these markers takes this lock for its own reload work, not
+/// just the readers — a non-emitting test needs no lock (its own log
+/// lines never match the readers' substrings). This trades away
+/// cross-test parallelism for these particular tests in exchange for
+/// eliminating the collision outright; the binary has ample real-time
+/// headroom (see the two-half split above) to absorb it.
+static CAPTURE_COUNT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn capture_count_lock() -> &'static Mutex<()> {
+    CAPTURE_COUNT_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// [`one_display_config`] plus a `[watchdog]` section.
+fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> String {
+    format!(
+        "{}\n[watchdog]\nlkg_enabled = {lkg_enabled}\nstability_window = \"{stability_window}\"\n",
+        one_display_config(marker, "0s"),
+    )
+}
+
+/// Bind a fresh `UnixDatagram` "systemd" listener at a tempdir path and
+/// build an `SdNotify` targeting it (the `from_socket_for_test` seam,
+/// R2-M8/T4 fix).
+fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotify) {
+    let path = dir.join("notify.sock");
+    let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+    // Deliberately SHORT: the daemon under test keeps sending on its own
+    // cadence (as fast as every ~150ms in the cadence test below) for as
+    // long as it runs, so a long read-timeout here would never see a real
+    // gap and `drain_datagrams` would block the calling OS thread
+    // indefinitely (this is a blocking std call inside an async test body
+    // — bounding it tightly is load-bearing, not cosmetic).
+    listener
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let addr = std::os::unix::net::SocketAddr::from_pathname(&path).unwrap();
+    let sd = SdNotify::from_socket_for_test(&addr);
+    (listener, sd)
+}
+
+/// Drain every currently-queued datagram off `listener` and return the
+/// count. Blocks the calling OS thread for up to one read-timeout waiting
+/// for the queue to run dry — see the tight timeout note on
+/// [`fake_systemd_socket`].
+fn drain_datagrams(listener: &std::os::unix::net::UnixDatagram) -> usize {
+    let mut buf = [0u8; 64];
+    let mut n = 0;
+    while listener.recv_from(&mut buf).is_ok() {
+        n += 1;
+    }
+    n
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "wear_env_lock + capture_count_lock serialize test-local state and are \
+              always released promptly at test end"
+)]
+async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
+    let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state_home = TempDir::new().unwrap();
+    let _env = XdgStateHomeGuard::set(state_home.path());
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &watchdog_config(&marker, "30s", true),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_millis(500));
+    let (handle, join) = app.start().await.expect("start app");
+
+    let lkg_path = state_home
+        .path()
+        .join("dormant")
+        .join("last-known-good.toml");
+    let meta_path = state_home
+        .path()
+        .join("dormant")
+        .join("last-known-good.meta.json");
+    let ok = wait_for(
+        || lkg_path.exists() && meta_path.exists(),
+        Duration::from_secs(35),
+    )
+    .await;
+
+    shutdown(handle, join).await;
+
+    assert!(
+        ok,
+        "last-known-good.toml + .meta.json must appear after a stable window"
+    );
+    let lkg_bytes = fs::read(&lkg_path).unwrap();
+    assert!(
+        !lkg_bytes.is_empty(),
+        "LKG copy must be a non-empty verbatim config copy"
+    );
+    let meta = read(&meta_path);
+    assert!(
+        meta.contains("\"source\": \"boot\""),
+        "the first candidate's sidecar source must be \"boot\": {meta}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
+              body (app lifetime included) — test-local, always released promptly at test end"
+)]
+async fn watchdog_lkg_disabled_writes_nothing() {
+    let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state_home = TempDir::new().unwrap();
+    let _env = XdgStateHomeGuard::set(state_home.path());
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &watchdog_config(&marker, "30s", false),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_millis(100));
+    let (handle, join) = app.start().await.expect("start app");
+
+    // Several ticks' worth of real time — long enough that a buggy
+    // "tracks anyway" implementation would have written something.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    shutdown(handle, join).await;
+
+    let lkg_path = state_home
+        .path()
+        .join("dormant")
+        .join("last-known-good.toml");
+    assert!(
+        !lkg_path.exists(),
+        "watchdog.lkg_enabled = false must never write last-known-good.toml"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
+              body (app lifetime included) — test-local, always released promptly at test end"
+)]
+async fn watchdog_reload_mid_window_resets_candidate() {
+    let _wear_guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Serialize against the count-sensitive watchdog tests: this test does
+    // a reload which emits the same step-boundary markers
+    // (after_assemble/after_quiesce/before_teardown/reload_end) that
+    // watchdog_in_reload_pings_healthy_boundaries counts — without this
+    // lock, a parallel reload from this test contaminates that count.
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state_home = TempDir::new().unwrap();
+    let _env = XdgStateHomeGuard::set(state_home.path());
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &watchdog_config(&marker, "30s", true),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_millis(500));
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    // Reload well inside the 30s window (same watchdog settings — a valid,
+    // accepted reload) — this must reset the candidate's window start.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    fs::write(&cfg_path, watchdog_config(&marker, "30s", true)).unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    // From the reload, wait LESS than the full 30s window: if the reload
+    // had NOT reset the candidate, the original (pre-reload) candidate
+    // would already be > 30s old by now and would have promoted.
+    tokio::time::sleep(Duration::from_secs(24)).await;
+
+    let lkg_path = state_home
+        .path()
+        .join("dormant")
+        .join("last-known-good.toml");
+    let premature = lkg_path.exists();
+
+    shutdown(handle, join).await;
+
+    assert!(
+        !premature,
+        "a reload mid-window must reset the LKG candidate — no premature promotion"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_ping_cadence_grows_on_healthy_ticks() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (listener, sd) = fake_systemd_socket(dir.path());
+
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_millis(150));
+    let (handle, join) = app.start().await.expect("start app");
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let n1 = drain_datagrams(&listener);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let n2 = drain_datagrams(&listener);
+
+    shutdown(handle, join).await;
+
+    assert!(
+        n1 >= 3,
+        "expected several WATCHDOG=1 datagrams by ~900ms, got {n1}"
+    );
+    assert!(
+        n2 >= 3,
+        "datagram count must keep growing on later healthy ticks, got {n2}"
+    );
+}
+
+/// Three-display config where `mon2`/`mon3` can be dropped from the rule
+/// (and, via `include_displays`, from `[displays]` entirely) on reload —
+/// enough removed displays to distinguish "one ping per removed display"
+/// from "one ping for the whole loop" (P9).
+fn three_display_config(
+    m1: &Path,
+    m2: &Path,
+    m3: &Path,
+    wake2: &str,
+    wake3: &str,
+    include_displays: bool,
+    include_in_rule: bool,
+) -> String {
+    let extra_displays = if include_displays {
+        format!(
+            r#"
+[displays.mon2]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m2}'"
+wake_command = "{w2}"
+modes = ["power_off"]
+
+[displays.mon3]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m3}'"
+wake_command = "{w3}"
+modes = ["power_off"]
+"#,
+            m2 = m2.display(),
+            w2 = wake2,
+            m3 = m3.display(),
+            w3 = wake3,
+        )
+    } else {
+        String::new()
+    };
+    let displays = if include_in_rule {
+        r#"["mon1", "mon2", "mon3"]"#
+    } else {
+        r#"["mon1"]"#
+    };
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon1]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m1}'"
+wake_command = "printf W >> '{m1}'"
+modes = ["power_off"]
+{extra_displays}
+[rules.r]
+zone = "office"
+displays = {displays}
+grace_period = "120ms"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        m1 = m1.display(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "F2: exact-count + strict-ordering assertions across seven step-boundary markers \
+              read better linearly than split across helper fns for a single-purpose test"
+)]
+async fn watchdog_in_reload_pings_healthy_boundaries() {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let m1 = dir.path().join("mon1");
+    let m2 = dir.path().join("mon2");
+    let m3 = dir.path().join("mon3");
+    let wake2 = format!("printf W >> '{}'", m2.display());
+    let wake3 = format!("printf W >> '{}'", m3.display());
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &three_display_config(&m1, &m2, &m3, &wake2, &wake3, true, true),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    // Long interval — the periodic tick arm must not fire during this
+    // short test, so every "watchdog_ping" marker observed is attributable
+    // to the in-reload step boundaries alone (P9's per-step, not
+    // aggregate, requirement).
+    .with_watchdog_interval(Duration::from_secs(120));
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(
+            || count(&m1, 'B') >= 1 && count(&m2, 'B') >= 1 && count(&m3, 'B') >= 1,
+            Duration::from_secs(3)
+        )
+        .await,
+        "all three displays should blank before reload"
+    );
+
+    drain_capture(); // discard startup noise
+
+    // Drop mon2 + mon3 (both removed + dark): the verified-wake loop must
+    // ping once per removed display, plus the shared before-teardown and
+    // reload-end boundaries.
+    // Rely SOLELY on the file watcher (no `handle.trigger_reload()`): the
+    // IPC trigger and the watcher fire on independent channels, and
+    // `debounce()` only drains the watcher's — pairing both here would
+    // fire a SECOND (no-op) reload after the first, double-counting every
+    // step-boundary marker below.
+    fs::write(
+        &cfg_path,
+        three_display_config(&m1, &m2, &m3, &wake2, &wake3, false, false),
+    )
+    .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    let output = drain_capture();
+    shutdown(handle, join).await;
+
+    // NOTE: `tracing_subscriber::fmt`'s default ANSI colouring inserts
+    // escape codes BETWEEN the `step` key, `=`, and its value, so a
+    // literal "step=before_teardown" substring never matches the raw
+    // captured bytes even though it renders contiguously — match on the
+    // (sufficiently distinctive) bare step-name token instead.
+    assert_eq!(
+        output.matches("after_assemble").count(),
+        1,
+        "after_assemble must fire exactly once (spec §6.3: distinct from after_quiesce): {output}"
+    );
+    assert_eq!(
+        output.matches("after_quiesce").count(),
+        1,
+        "after_quiesce must fire exactly once (spec §6.3: distinct from after_assemble): {output}"
+    );
+    assert_eq!(
+        output.matches("before_teardown").count(),
+        1,
+        "before_teardown must fire exactly once: {output}"
+    );
+    assert_eq!(
+        output.matches("removed_display_wake").count(),
+        2,
+        "removed_display_wake must fire once PER removed display (2 removed), not once for \
+         the whole loop: {output}"
+    );
+    assert_eq!(
+        output.matches("reload_end").count(),
+        1,
+        "reload_end must fire exactly once on a successful reload: {output}"
+    );
+
+    // Order matters as much as presence (spec §6.3 names these as an
+    // ordered sequence of boundaries): after_assemble -> after_quiesce ->
+    // before_teardown -> removed_display_wake (xN) -> reload_end.
+    let pos = |needle: &str| {
+        output
+            .find(needle)
+            .unwrap_or_else(|| panic!("marker {needle} missing from captured output: {output}"))
+    };
+    let p_assemble = pos("after_assemble");
+    let p_quiesce = pos("after_quiesce");
+    let p_teardown = pos("before_teardown");
+    let p_wake_first = pos("removed_display_wake");
+    let p_reload_end = pos("reload_end");
+    assert!(
+        p_assemble < p_quiesce,
+        "after_assemble must fire before after_quiesce: {output}"
+    );
+    assert!(
+        p_quiesce < p_teardown,
+        "after_quiesce must fire before before_teardown: {output}"
+    );
+    assert!(
+        p_teardown < p_wake_first,
+        "before_teardown must fire before removed_display_wake: {output}"
+    );
+    assert!(
+        p_wake_first < p_reload_end,
+        "removed_display_wake must fire before reload_end: {output}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
+)]
+async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let m1 = dir.path().join("mon1");
+    let m2 = dir.path().join("mon2");
+    let m3 = dir.path().join("mon3");
+    // mon3's wake command always fails — the verified-wake loop must abort
+    // on it (after successfully pinging for mon2, processed first).
+    let wake2 = format!("printf W >> '{}'", m2.display());
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &three_display_config(&m1, &m2, &m3, &wake2, "false", true, true),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_secs(120));
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(
+            || count(&m1, 'B') >= 1 && count(&m2, 'B') >= 1 && count(&m3, 'B') >= 1,
+            Duration::from_secs(3)
+        )
+        .await,
+        "all three displays should blank before reload"
+    );
+
+    drain_capture();
+
+    // Watcher-only trigger — see the sibling test's comment on why pairing
+    // this with `handle.trigger_reload()` would double-fire.
+    fs::write(
+        &cfg_path,
+        three_display_config(&m1, &m2, &m3, &wake2, "false", false, false),
+    )
+    .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected (mon3 verified wake fails)"),
+    }
+
+    let output = drain_capture();
+    shutdown(handle, join).await;
+
+    // See the sibling test's note: matching on the bare step-name token,
+    // not "step=X" (ANSI escape codes split the key/value pair in the raw
+    // captured bytes).
+    assert_eq!(
+        output.matches("before_teardown").count(),
+        1,
+        "before_teardown must still fire: {output}"
+    );
+    assert!(
+        output.contains("before_rebuild_old_wake_failure"),
+        "the rebuild_old(wake-failure) call site must be pinged first: {output}"
+    );
+    assert!(
+        !output.contains("reload_end"),
+        "an aborted reload must never reach the reload_end boundary: {output}"
+    );
+}
+
+/// F1 (T4 review): the `before_rebuild_old_spawn_failure` boundary (the
+/// ACCEPTED-config `spawn_generation` call failing, distinct from the
+/// verified-wake failure covered by the sibling test above) had NO
+/// coverage. No config-only edit can drive a REAL `spawn_generation`
+/// failure past `validate()` here — `ZoneEngine::new` runs the identical
+/// deterministic construction `validate()` already ran on the same `cfg`,
+/// and `RulesEngine::new`'s only fallible check can't fire because
+/// `assemble_static` is fail-fast (an incomplete executor/machine map never
+/// reaches `spawn_generation`). This test uses the `App::
+/// with_test_force_reload_spawn_failure` seam (test-util feature, same
+/// pattern as `SdNotify::from_socket_for_test`) to force the REAL `Err(e)`
+/// arm in `Runner::reload` to run, with a synthetic cause — everything
+/// downstream of that point (the ping, `rebuild_old`, the `Rejected`
+/// outcome) is production code, unmodified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
+)]
+async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", script),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_secs(120))
+    .with_test_force_reload_spawn_failure();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "display should blank before reload"
+    );
+
+    drain_capture(); // discard startup noise
+
+    // Any accepted-shape edit triggers a reload attempt; the seam forces
+    // spawn_generation to fail regardless of content.
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    match outcome {
+        ReloadOutcome::Rejected(_) => {}
+        ReloadOutcome::Reloaded => panic!("expected Rejected (forced spawn_generation failure)"),
+    }
+
+    let output = drain_capture();
+    shutdown(handle, join).await;
+
+    assert!(
+        output.contains("before_rebuild_old_spawn_failure"),
+        "the accepted-spawn failure boundary must fire: {output}"
+    );
+    assert!(
+        !output.contains("reload_end"),
+        "an aborted reload must never reach the reload_end boundary: {output}"
+    );
 }

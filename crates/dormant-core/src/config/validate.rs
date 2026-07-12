@@ -52,6 +52,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "rules",
             "wear",
             "notifications",
+            "watchdog",
             "audio",
         ],
     ),
@@ -66,6 +67,11 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "capture_is_call",
             "pw_dump_command",
         ],
+    ),
+    // ── watchdog ────────────────────────────────────────────────────────────
+    (
+        "watchdog",
+        &["lkg_enabled", "lkg_rollback_enabled", "stability_window"],
     ),
     // ── wear ────────────────────────────────────────────────────────────────
     (
@@ -497,6 +503,8 @@ pub fn validate(
     // ── [notifications] validation ────────────────────────────────────────
     validate_notifications(cfg, &mut errors);
 
+    // ── [watchdog] validation ───────────────────────────────────────────
+    validate_watchdog(cfg, &mut errors);
     // ── [audio] validation ──────────────────────────────────────────────
     validate_audio(cfg, &mut errors);
 
@@ -671,12 +679,24 @@ fn validate_notifications(cfg: &Config, errors: &mut Vec<ValidationError>) {
     }
 }
 
+/// Validate the `[watchdog]` section: `stability_window` floor.
+fn validate_watchdog(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    let watchdog = &cfg.watchdog;
+    if watchdog.stability_window < Duration::from_secs(30) {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "watchdog.stability_window {:?} is below the 30s floor",
+                watchdog.stability_window
+            ),
+        });
+    }
+}
 /// Validate the `[audio]` section: duration floors/ceilings, non-empty role
 /// strings, the F16 `playback_roles = []` trap, and a non-empty
 /// `pw_dump_command`.
 fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let audio = &cfg.audio;
-
     if audio.poll_interval < Duration::from_secs(1) {
         errors.push(ValidationError {
             what: "E_CONFIG_INVALID".into(),
@@ -686,7 +706,6 @@ fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
             ),
         });
     }
-
     let ten_times_poll = audio.poll_interval.saturating_mul(10);
     if audio.min_active > ten_times_poll {
         errors.push(ValidationError {
@@ -697,7 +716,6 @@ fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
             ),
         });
     }
-
     for role in &audio.call_roles {
         if role.is_empty() {
             errors.push(ValidationError {
@@ -707,7 +725,6 @@ fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
             break;
         }
     }
-
     if let Some(roles) = &audio.playback_roles {
         if roles.is_empty() {
             errors.push(ValidationError {
@@ -724,7 +741,6 @@ fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
             });
         }
     }
-
     if audio.pw_dump_command.is_empty() {
         errors.push(ValidationError {
             what: "E_CONFIG_INVALID".into(),
@@ -1785,7 +1801,7 @@ gracee_period = "60s"
     }
 
     /// Write `toml` to a fresh tempfile and load it via [`crate::config::load_config`]
-    /// in [`Strictness::Warn`] mode. Shared helper for `[audio]` config tests
+    /// in [`Strictness::Warn`] mode. Shared helper for config tests
     /// that need real unknown-key-walk behavior (not just `toml::from_str`).
     fn load_str(
         toml: &str,
@@ -1809,7 +1825,7 @@ gracee_period = "60s"
 
     /// Parse `toml` directly (no unknown-key walk) and run cross-reference
     /// [`validate`] against it with the standard test capabilities/creds
-    /// fixtures. Shared helper for `[audio]` range-check tests.
+    /// fixtures.
     fn validate_str(toml: &str) -> Vec<ValidationError> {
         let cfg: Config = toml::from_str(toml).unwrap();
         validate(&cfg, &test_capabilities(), &test_creds())
@@ -2414,6 +2430,7 @@ gracee_period = "60s"
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
             notifications: super::super::schema::NotificationsConfig::default(),
+            watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
         }
     }
@@ -2537,6 +2554,7 @@ gracee_period = "60s"
             rules: IndexMap::new(),
             wear: super::super::schema::WearConfig::default(),
             notifications: super::super::schema::NotificationsConfig::default(),
+            watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
         }
     }
@@ -2933,6 +2951,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let creds = Credentials::default();
@@ -2989,6 +3008,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
 
@@ -3165,6 +3185,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3189,6 +3210,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3222,6 +3244,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3254,6 +3277,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3278,6 +3302,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3306,6 +3331,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3330,6 +3356,7 @@ password = "test-pass"
             rules: IndexMap::new(),
             wear: crate::config::schema::WearConfig::default(),
             notifications: crate::config::schema::NotificationsConfig::default(),
+            watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -4586,6 +4613,82 @@ kind = "power_off"
             !errors.iter().any(|e| e.detail.contains("cooldown")),
             "cooldown = 1m (the floor) must be accepted, got: {:?}",
             errors
+        );
+    }
+
+    // ── [watchdog] validation ─────────────────────────────────────────────
+
+    #[test]
+    fn watchdog_defaults_when_section_absent() {
+        let (cfg, warnings) = load_str("config_version = 1\n").unwrap();
+        assert!(warnings.is_empty());
+        // Literal values, NOT the defaults:: consts — comparing against the
+        // same symbol that produced the value would be tautological and
+        // couldn't catch a drifted const (spec §7 pins true / true / 5m).
+        assert!(cfg.watchdog.lkg_enabled);
+        assert!(cfg.watchdog.lkg_rollback_enabled);
+        assert_eq!(
+            cfg.watchdog.stability_window,
+            std::time::Duration::from_secs(5 * 60)
+        );
+    }
+
+    #[test]
+    fn watchdog_defaults_when_section_empty() {
+        let (cfg, warnings) = load_str("config_version = 1\n[watchdog]\n").unwrap();
+        assert!(warnings.is_empty());
+        // Literal values — see watchdog_defaults_when_section_absent.
+        assert!(cfg.watchdog.lkg_enabled);
+        assert!(cfg.watchdog.lkg_rollback_enabled);
+        assert_eq!(
+            cfg.watchdog.stability_window,
+            std::time::Duration::from_secs(5 * 60)
+        );
+    }
+
+    #[test]
+    fn watchdog_stability_window_below_floor_rejected() {
+        let errors = validate_str("config_version = 1\n[watchdog]\nstability_window = \"10s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("stability_window")),
+            "stability_window = 10s (below the 30s floor) must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn watchdog_stability_window_at_floor_accepted() {
+        let errors = validate_str("config_version = 1\n[watchdog]\nstability_window = \"30s\"\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("stability_window")),
+            "stability_window = 30s (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn watchdog_all_keys_known_in_strict_mode() {
+        let toml_str = "config_version = 1\n\
+             [watchdog]\n\
+             lkg_enabled = true\n\
+             lkg_rollback_enabled = true\n\
+             stability_window = \"5m\"\n";
+        assert!(
+            load_str_strict(toml_str).is_ok(),
+            "all [watchdog] keys must be in KNOWN_KEYS"
+        );
+    }
+
+    #[test]
+    fn watchdog_unknown_key_rejected_strict() {
+        let result = load_str_strict("config_version = 1\n[watchdog]\nbogus = 1\n");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("watchdog.bogus"),
+            "expected error mentioning watchdog.bogus, got: {err}"
         );
     }
 

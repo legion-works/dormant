@@ -13,6 +13,7 @@ import type { PatchStore } from "./patch";
 import DaemonSection from "./DaemonSection";
 import WearSection from "./WearSection";
 import NotificationsSection from "./NotificationsSection";
+import WatchdogSection from "./WatchdogSection";
 import AudioSection from "./AudioSection";
 import SensorsSection from "./SensorsSection";
 import ZonesSection from "./ZonesSection";
@@ -241,6 +242,13 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         fieldErrors={fieldErrors}
       />
 
+      <WatchdogSection
+        watchdog={inv.watchdog}
+        store={store}
+        redactedPaths={config.redacted_paths}
+        onDirty={onDirty}
+        fieldErrors={fieldErrors}
+      />
       <AudioSection
         audio={inv.audio}
         store={store}

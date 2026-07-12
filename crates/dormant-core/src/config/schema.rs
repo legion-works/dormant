@@ -93,6 +93,9 @@ pub struct Config {
     #[serde(default)]
     pub notifications: NotificationsConfig,
 
+    /// Crash-loop watchdog / last-known-good rollback configuration.
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
     /// Global `PipeWire` audio-inhibitor configuration.
     #[serde(default)]
     pub audio: AudioConfig,
@@ -332,8 +335,39 @@ impl Default for NotificationsConfig {
     }
 }
 
-// ── AudioConfig ─────────────────────────────────────────────────────────────────
+// ── WatchdogConfig ──────────────────────────────────────────────────────────────
+/// Crash-loop watchdog / last-known-good rollback configuration (the
+/// `[watchdog]` TOML section).
+///
+/// Governs whether the boot guard tracks a last-known-good (LKG) config
+/// generation, whether a detected crash loop is allowed to trigger an
+/// automatic rollback to that generation, and how long a boot must stay up
+/// before it counts as "stable" for LKG purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WatchdogConfig {
+    /// Track a last-known-good config generation. Enabled by default.
+    #[serde(default = "default_lkg_enabled")]
+    pub lkg_enabled: bool,
+    /// Allow a detected crash loop to trigger an automatic rollback to the
+    /// last-known-good generation. Enabled by default.
+    #[serde(default = "default_lkg_rollback_enabled")]
+    pub lkg_rollback_enabled: bool,
+    /// How long a boot must stay up before it counts as stable for LKG
+    /// purposes.
+    #[serde(default = "default_lkg_stability_window", with = "humantime_serde")]
+    pub stability_window: Duration,
+}
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            lkg_enabled: defaults::LKG_ENABLED,
+            lkg_rollback_enabled: defaults::LKG_ROLLBACK_ENABLED,
+            stability_window: defaults::LKG_STABILITY_WINDOW,
+        }
+    }
+}
 
+// ── AudioConfig ─────────────────────────────────────────────────────────────────
 /// Global `PipeWire` audio-inhibitor configuration (the `[audio]` TOML
 /// section).
 ///
@@ -347,18 +381,15 @@ pub struct AudioConfig {
     /// How often to poll `pw_dump_command` for the current `PipeWire` graph.
     #[serde(default = "default_audio_poll_interval", with = "humantime_serde")]
     pub poll_interval: Duration,
-
     /// Minimum continuous stream activity before the audio inhibitor
     /// asserts (debounces transient blips such as a notification chime).
     /// Deassertion is immediate — the debounce is asymmetric on purpose,
     /// fail-toward-blanking.
     #[serde(default = "default_audio_min_active", with = "humantime_serde")]
     pub min_active: Duration,
-
     /// `media.role` values that mean "this running stream is a call".
     #[serde(default = "default_audio_call_roles")]
     pub call_roles: Vec<String>,
-
     /// Optional narrowing filter for the `"audio-playback"` kind: when set,
     /// only running output streams whose `media.role` is in this list
     /// inhibit. Unset (the default) means every non-call running output
@@ -368,7 +399,6 @@ pub struct AudioConfig {
     /// inhibition).
     #[serde(default)]
     pub playback_roles: Option<Vec<String>>,
-
     /// Whether a running INPUT stream (an open microphone) counts as a
     /// call. Defaults to `false`: `PipeWire` input nodes commonly sit
     /// `running` for hours under ordinary setups (idling Discord/Teams,
@@ -377,7 +407,6 @@ pub struct AudioConfig {
     /// wide slice of users. Opt in deliberately.
     #[serde(default)]
     pub capture_is_call: bool,
-
     /// Override for the `pw-dump` invocation. Split with
     /// `str::split_whitespace()` — no shell, no quoting support; paths
     /// containing spaces are unsupported. This is the test/override seam
@@ -385,7 +414,6 @@ pub struct AudioConfig {
     #[serde(default = "default_audio_pw_dump_command")]
     pub pw_dump_command: String,
 }
-
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
@@ -1166,6 +1194,15 @@ fn default_notify_cooldown() -> Duration {
 }
 fn default_notify_recovery() -> bool {
     defaults::NOTIFY_RECOVERY
+}
+fn default_lkg_enabled() -> bool {
+    defaults::LKG_ENABLED
+}
+fn default_lkg_rollback_enabled() -> bool {
+    defaults::LKG_ROLLBACK_ENABLED
+}
+fn default_lkg_stability_window() -> Duration {
+    defaults::LKG_STABILITY_WINDOW
 }
 fn default_audio_poll_interval() -> Duration {
     defaults::AUDIO_POLL_INTERVAL

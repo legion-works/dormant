@@ -1328,6 +1328,26 @@ playback_roles = ["Movie"]
     }
 
     #[test]
+    fn watchdog_stability_window_set_patch_accepted() {
+        // watchdog.* keys are made known via KNOWN_KEYS in
+        // dormant_core::config::validate (added alongside the WatchdogConfig
+        // schema in an earlier watchdog-rollback commit). None of the three
+        // watchdog leaves (lkg_enabled, lkg_rollback_enabled,
+        // stability_window) are in LOCKED_LEAVES, so they are editable
+        // by the same "known leaf, not locked" default that already makes
+        // wear.* / notifications.* keys editable — no section allowlist
+        // exists in this module to extend. This pins that the patch
+        // pipeline accepts a watchdog.stability_window Set without any
+        // config_patch.rs code change.
+        let cur = minimal_config();
+        check_ok(
+            &[set(&["watchdog", "stability_window"], json!("60s"))],
+            &cur,
+            &[],
+        );
+    }
+
+    #[test]
     fn daemon_new_enum_and_duration_fields_accepted() {
         let cur = minimal_config();
         // idle_time_unit — enum (auto/ms/s), added to known-keys tree at daemon level.

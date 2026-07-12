@@ -5,7 +5,7 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-Type=simple
+Type=notify
 # Cap glibc malloc arenas so freed screensaver/render heap is returned to the OS
 # instead of retained per-thread (pairs with the daemon's worker_threads=2 and the
 # malloc_trim after screensaver teardown — see crates/dormantd/src/main.rs).
@@ -14,6 +14,32 @@ ExecStart=%h/.local/bin/dormantd
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
+# ── Watchdog executor semantics ──────────────────────────────────────────
+# The daemon sends WATCHDOG=1 pings gated on controller-probed health (see
+# crates/dormantd — engine-probed watchdog pings). A missed deadline means a
+# controller chain is stuck, not merely that a ping was skipped.
+#
+# One backoff series is budgeted per burst (a burst = one contiguous run of
+# retries against a single stuck controller chain), not per individual rule
+# or per individual retry. WatchdogSec below is sized against the worst-case
+# single-burst backoff series, not against the sum of unrelated bursts.
+#
+# Bounded worst-case backoff series (rule retry defaults), by chain length:
+#   generic 10s-slot controllers (e.g. ddcci/kwin_dpms):
+#     1 slot  -> 54s worst case
+#     2 slots -> 94s worst case
+#     3 slots -> 134s worst case
+#   Samsung-IP / Home Assistant 5s-slot controllers:
+#     1 slot  -> 34s worst case
+#     2 slots -> 54s worst case
+#     3 slots -> 74s worst case
+#
+# WatchdogSec=150 = the 3-generic-slot bounded worst case (134s) + margin.
+#
+# Chains longer than three generic (10s) slots — or rule configs with raised
+# retry counts — exceed this budget and require tuning WatchdogSec upward
+# (and re-deriving the bounded-worst-case numbers above) to match.
+WatchdogSec=150
 
 [Install]
 WantedBy=graphical-session.target

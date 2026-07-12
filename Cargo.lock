@@ -1052,6 +1052,7 @@ dependencies = [
  "dormant-sensors",
  "dormant-web",
  "dormantctl",
+ "dormantd",
  "indexmap",
  "libc",
  "notify",

@@ -45,12 +45,19 @@ rustix = { version = "1", default-features = false, features = [
 [features]
 web-ui = ["dep:dormant-web"]
 render = ["dep:dormant-render", "dormant-core/render"]
+# Exposes cfg(test)-only test seams (currently `SdNotify::from_socket_for_test`)
+# to the crate's OWN external integration tests (`tests/daemon_smoke.rs`),
+# which link the library WITHOUT `--cfg test` (only the lib's own unittest
+# build gets that). Enabled solely via the self dev-dependency below; never
+# a production feature.
+test-util = []
 
 [dev-dependencies]
 async-trait = { workspace = true }
 dormant-core = { path = "../dormant-core", features = ["test-fakes"] }
 dormant-doctor = { path = "../dormant-doctor" }
 dormantctl = { path = "../dormantctl" }
+dormantd = { path = ".", features = ["test-util"] }
 indexmap = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }

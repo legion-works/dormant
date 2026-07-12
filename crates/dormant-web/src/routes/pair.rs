@@ -592,6 +592,7 @@ mod tests {
             wear: WearConfig::default(),
             notifications: NotificationsConfig::default(),
             audio: AudioConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),

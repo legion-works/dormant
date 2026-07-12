@@ -23,26 +23,15 @@
 //! background task later polls it, so an unreachable `tcp://localhost:1883`
 //! broker never blocks `App::build`/`App::start`.
 //!
-//! **Required invocation — `--test-threads=1`:** two tests
+//! **Parallel-execution safety:** `install_capture_subscriber` installs a
+//! process-global subscriber whose buffer is shared by every test in this
+//! binary. The three tests that emit or assert on `config_rollback_boot`
 //! (`bad_config_with_lkg_immediate_rollback`,
-//! `counted_rollback_never_attempts_chosen`) install a process-global
-//! capture subscriber (`daemon_smoke.rs`'s `install_capture_subscriber`
-//! shape) and assert on its content; `tracing::subscriber::set_global_default`
-//! is genuinely process-wide, so once installed it captures EVERY test's
-//! log output for the rest of the process, not just the installing test's —
-//! running in parallel (`--test-threads>1`, the default) lets unrelated
-//! concurrently-running tests' log lines land in the buffer mid-assertion
-//! and flake the two capture-reading tests. Single-threaded, the whole
-//! suite is trivially fast (measured ~0.08s), so there is no benefit to
-//! chasing a `Mutex`-serialized parallel scheme instead — exact invocation
-//! (plain comment, not rustdoc, so clippy's `doc_markdown` leaves the shell
-//! command alone):
-//
-//   timeout 42 cargo test -p dormantd --test boot_rollback --all-features \
-//     -- --test-threads=1
-//
-// Measured wall time on the sandbox's 2-core box: ~0.4s including process
-// startup.
+//! `bad_config_and_bad_lkg_build_failed`,
+//! `counted_rollback_never_attempts_chosen`) serialize via a shared
+//! [`capture_lock`] — the same pattern `daemon_smoke.rs` uses for its
+//! count-sensitive capture tests. Every other test in this file emits only
+//! event names that do not collide with the assertions of those three.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -104,6 +93,21 @@ fn drain_capture() -> String {
         guard.clear();
         s
     })
+}
+
+/// Serializes the three tests that emit or read the `config_rollback_boot`
+/// event — they share a process-global capture buffer (see
+/// [`install_capture_subscriber`]), and a parallel sibling test that also
+/// calls `boot()` with a bad-config+LKG config can emit the event into the
+/// buffer between a capture-reader's `drain_capture()` and its assertion.
+///
+/// The poison-recovery idiom matches `daemon_smoke.rs`'s
+/// `CAPTURE_COUNT_LOCK` — a panicking test must not wedge the rest of the
+/// binary.
+static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn capture_lock() -> &'static Mutex<()> {
+    CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 // ── Config fixtures ──────────────────────────────────────────────────────
@@ -310,7 +314,15 @@ async fn shutdown(handle: AppHandle, join: tokio::task::JoinHandle<()>) {
 /// (not deferred — this failure is discovered live, after `prepare` already
 /// returned `Proceed`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes the three config_rollback_boot-sensitive tests and is \
+              always released promptly at test end — see the lock's doc comment"
+)]
 async fn bad_config_with_lkg_immediate_rollback() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     install_capture_subscriber();
     drain_capture();
     let h = Harness::new();
@@ -379,8 +391,21 @@ async fn bad_config_no_lkg_build_failed() {
 
 /// Bad chosen config AND a bad (unbuildable) LKG → `BuildFailed` (spec
 /// §5.1 point 3's "if THAT also fails" branch).
+///
+/// This test EMITS `config_rollback_boot` via the immediate-rollback branch
+/// (the first build fails, the LKG also fails) — it is serialized under
+/// [`capture_lock`] against the two capture-reader tests so its event cannot
+/// contaminate a parallel assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes the three config_rollback_boot-sensitive tests and is \
+              always released promptly at test end — see the lock's doc comment"
+)]
 async fn bad_config_and_bad_lkg_build_failed() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     // An LKG with DIFFERENT, but ALSO invalid, bytes.
@@ -398,7 +423,15 @@ async fn bad_config_and_bad_lkg_build_failed() {
 /// because `App::build(plan.chosen_config)` — the LKG, per `prepare`'s
 /// verdict — succeeds on the first try).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes the three config_rollback_boot-sensitive tests and is \
+              always released promptly at test end — see the lock's doc comment"
+)]
 async fn counted_rollback_never_attempts_chosen() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     install_capture_subscriber();
     drain_capture();
     let h = Harness::new();

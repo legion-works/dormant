@@ -194,7 +194,7 @@ describe("CreateEntityForm — displays", () => {
 });
 
 describe("CreateEntityForm — rules", () => {
-  it("renders zone select, displays multi-select, and inhibitors multi-select from THIS branch's VALID_INHIBITORS", () => {
+  it("renders zone select, displays multi-select, and inhibitors multi-select from VALID_INHIBITORS", () => {
     render(
       <CreateEntityForm
         collection="rules"
@@ -208,7 +208,8 @@ describe("CreateEntityForm — rules", () => {
     expect(screen.getByLabelText("zone")).toBeInTheDocument();
     expect(screen.getByLabelText("displays: aoc-main")).toBeInTheDocument();
     expect(screen.getByLabelText("inhibitors: user-activity")).toBeInTheDocument();
+    expect(screen.getByLabelText("inhibitors: audio-playback")).toBeInTheDocument();
+    expect(screen.getByLabelText("inhibitors: call")).toBeInTheDocument();
     expect(screen.getByLabelText("inhibitors: manual-pause")).toBeInTheDocument();
-    expect(screen.queryByLabelText(/inhibitors: audio/i)).not.toBeInTheDocument();
   });
 });

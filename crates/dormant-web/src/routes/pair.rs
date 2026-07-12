@@ -554,7 +554,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use dormant_core::config::schema::{
-        Config, Credentials, DaemonConfig, NotificationsConfig, WearConfig,
+        AudioConfig, Config, Credentials, DaemonConfig, NotificationsConfig, WearConfig,
     };
     use dormant_core::rules::ControlMsg;
     use dormant_displays::samsung_tizen::PairConnect;
@@ -591,6 +591,7 @@ mod tests {
             daemon,
             wear: WearConfig::default(),
             notifications: NotificationsConfig::default(),
+            audio: AudioConfig::default(),
             sensors: IndexMap::default(),
             zones: IndexMap::default(),
             displays: IndexMap::default(),

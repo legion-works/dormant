@@ -93,9 +93,11 @@ describe("RulesSection — cross-ref fields unlock under entity_crud_enabled (sp
     expect(screen.getByLabelText("displays: samsung-tv")).toBeInTheDocument();
   });
 
-  it("inhibitors renders as a multi-select from THIS branch's VALID_INHIBITORS", () => {
+  it("inhibitors renders as a multi-select from VALID_INHIBITORS", () => {
     renderSection();
     expect(screen.getByLabelText("inhibitors: user-activity")).toBeInTheDocument();
+    expect(screen.getByLabelText("inhibitors: audio-playback")).toBeInTheDocument();
+    expect(screen.getByLabelText("inhibitors: call")).toBeInTheDocument();
     expect(screen.getByLabelText("inhibitors: manual-pause")).toBeInTheDocument();
   });
 

@@ -159,7 +159,7 @@ describe("AudioSection — settings form", () => {
     }
 
     const patches = store.buildPatches();
-    expect(patches.some((p) => p.path.join(".") === "audio.pw_dump_command")).toBe(false);
+    expect(patches.some((p) => "path" in p && p.path.join(".") === "audio.pw_dump_command")).toBe(false);
   });
 
   it("playback_roles unset renders as an 'any role' state and emits no patch until explicitly set", () => {
@@ -220,7 +220,7 @@ describe("AudioSection — settings form", () => {
     fireEvent.click(screen.getByLabelText(/playback_roles/)); // check, no roles added yet
 
     expect(
-      store.buildPatches().some((p) => p.path.join(".") === "audio.playback_roles"),
+      store.buildPatches().some((p) => "path" in p && p.path.join(".") === "audio.playback_roles"),
     ).toBe(false);
 
     fireEvent.change(screen.getByLabelText("playback_roles"), { target: { value: "Movie" } });

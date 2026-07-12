@@ -82,18 +82,19 @@ export const RESERVED_ENTITY_IDS: readonly string[] = [
   "output",
   "wol_mac",
   "host",
+  "playback_roles",
 ];
 
 /**
  * rust: crates/dormant-core/src/config/validate.rs VALID_INHIBITORS (:392)
  *
- * THIS BRANCH ONLY (`feat/config-crud-wizard`) — a sibling branch
- * (feature 03, audio-aware-blanking) adds audio-playback inhibitor
- * literals that do NOT exist on this branch's `validate.rs`. Do not add
- * them here; this mirror must match what THIS branch's server actually
- * accepts, not a future merge.
+ * Composed from the single-definition-site consts in `rules.rs` plus
+ * the local `"manual-pause"` literal (accepted-but-unwired). Kept in
+ * the same order as the Rust recomposition:
+ * INHIBITOR_USER_ACTIVITY / INHIBITOR_AUDIO_PLAYBACK / INHIBITOR_CALL /
+ * "manual-pause".
  */
-export const VALID_INHIBITORS = ["user-activity", "manual-pause"] as const;
+export const VALID_INHIBITORS = ["user-activity", "audio-playback", "call", "manual-pause"] as const;
 
 /** rust: crates/dormant-displays/src/samsung_tizen.rs SamsungTizenController::NAME (:770) */
 export const SAMSUNG_TIZEN_CONTROLLER = "samsung-tizen";

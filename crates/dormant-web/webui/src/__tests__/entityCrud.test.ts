@@ -9,7 +9,7 @@
  *   crates/dormant-web/src/config_patch.rs:488-545  CREATABLE_FIELDS
  *   crates/dormant-web/src/config_patch.rs:576-600  RESERVED_ENTITY_IDS
  *   crates/dormant-web/src/config_patch.rs:607-636  validate_entity_id
- *   crates/dormant-core/src/config/validate.rs:392  VALID_INHIBITORS (THIS BRANCH)
+ *   crates/dormant-core/src/config/validate.rs:392  VALID_INHIBITORS (post audio merge)
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -75,8 +75,8 @@ describe("RESERVED_ENTITY_IDS — mirror of config_patch.rs:576-600", () => {
     }
   });
 
-  it("has exactly 20 entries — a change here must be a deliberate, reviewed mirror update", () => {
-    expect(RESERVED_ENTITY_IDS).toHaveLength(20);
+  it("has exactly 21 entries — a change here must be a deliberate, reviewed mirror update", () => {
+    expect(RESERVED_ENTITY_IDS).toHaveLength(21);
   });
 });
 
@@ -127,9 +127,9 @@ describe("validateEntityId — mirror of config_patch.rs:607-636", () => {
   });
 });
 
-describe("VALID_INHIBITORS — THIS BRANCH mirror of validate.rs:392", () => {
-  it("is exactly user-activity + manual-pause (no audio literals on this branch)", () => {
-    expect(VALID_INHIBITORS).toEqual(["user-activity", "manual-pause"]);
+describe("VALID_INHIBITORS — mirror of validate.rs:392 (post audio merge)", () => {
+  it("is exactly user-activity, audio-playback, call, manual-pause", () => {
+    expect(VALID_INHIBITORS).toEqual(["user-activity", "audio-playback", "call", "manual-pause"]);
   });
 });
 

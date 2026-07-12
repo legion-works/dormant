@@ -598,6 +598,7 @@ static RESERVED_ENTITY_IDS: &[&str] = &[
     "output",
     "wol_mac",
     "host",
+    "playback_roles",
 ];
 
 /// Entity-id hygiene (spec §5, greenfield — no prior charset validation

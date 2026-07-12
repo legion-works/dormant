@@ -1554,7 +1554,6 @@ mod tests {
     use super::*;
     use crate::config::DaemonConfig;
     use crate::config::Strictness;
-    use crate::config::Warning;
     use crate::config::schema::{RuleConfig, ZoneConfig};
     use crate::types::BlankMode;
     use indexmap::IndexMap;
@@ -4949,33 +4948,8 @@ availability_payload_offline = "down"
     }
 
     // ── Task 1: daemon.entity_crud_enabled / pairing_enabled / pair_timeout ─
-
-    // `load_str`/`load_str_strict`/`validate_str` do not exist elsewhere on
-    // this branch — other tests in this module (e.g. `wear_unknown_key_
-    // rejected_strict`) inline the same tempfile + load_config sequence
-    // without a shared helper. Collected here per the established recipe;
-    // expected to textually collide with sibling feature branches at merge
-    // time (kept byte-similar intentionally, not a bug).
-    fn load_str(toml_str: &str) -> Result<(Config, Vec<Warning>), crate::error::DormantError> {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, toml_str).unwrap();
-        crate::config::load_config(&path, Strictness::Warn)
-    }
-
-    fn load_str_strict(
-        toml_str: &str,
-    ) -> Result<(Config, Vec<Warning>), crate::error::DormantError> {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, toml_str).unwrap();
-        crate::config::load_config(&path, Strictness::Strict)
-    }
-
-    fn validate_str(toml_str: &str) -> Vec<ValidationError> {
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        validate(&cfg, &test_capabilities(), &test_creds())
-    }
+    // `load_str`/`load_str_strict`/`validate_str` live at the audio-test
+    // module above (merge-resolved — byte-identical duplicates collapsed).
 
     #[test]
     fn daemon_section_absent_uses_literal_defaults() {

@@ -25,17 +25,32 @@
 //!
 //! **Parallel-execution safety:** `install_capture_subscriber` installs a
 //! process-global subscriber whose buffer is shared by every test in this
-//! binary. The three tests that emit or assert on `config_rollback_boot`
-//! (`bad_config_with_lkg_immediate_rollback`,
-//! `bad_config_and_bad_lkg_build_failed`,
-//! `counted_rollback_never_attempts_chosen`) serialize via a shared
-//! [`capture_lock`] — the same pattern `daemon_smoke.rs` uses for its
-//! count-sensitive capture tests. Every other test in this file emits only
-//! event names that do not collide with the assertions of those three.
+//! binary. Two overlapping reasons put a test under the shared
+//! [`capture_lock`] (the same pattern `daemon_smoke.rs` uses for its
+//! count-sensitive capture tests):
+//!
+//! - it emits or asserts on `config_rollback_boot`/"config validation
+//!   failed at boot" — every test that boots from a bad config with a
+//!   DIFFERING LKG present takes this immediate-rollback branch
+//!   (`bad_config_with_lkg_immediate_rollback`,
+//!   `bad_config_and_bad_lkg_build_failed`,
+//!   `counted_rollback_never_attempts_chosen` — which asserts the literal
+//!   is ABSENT — plus every rollback-recovery test below that boots the
+//!   same way);
+//! - it edits its own OPERATOR config file after boot while the real file
+//!   watcher is installed: a genuine inotify event fires independently of
+//!   whatever triggered the reload under test, logging
+//!   `reload_trigger source="watcher"` into the SAME shared buffer
+//!   (`accepted_reload_recovers_from_rollback_without_restart`,
+//!   `rejected_reload_during_rollback_leaves_rollback_state_untouched`, and
+//!   the Task 3 watcher-drill tests below).
+//!
+//! Every other test in this file emits only event names that do not
+//! collide with any capture-reading assertion.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dormant_core::config::Strictness;
 use dormant_core::rules::{ControlMsg, StateSnapshot};
@@ -55,9 +70,17 @@ static CAPTURE: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 
 fn install_capture_subscriber() {
     CAPTURE.get_or_init(|| Mutex::new(Vec::new()));
+    // `with_ansi(false)`: the capture buffer is asserted on via plain
+    // substring `.contains()` checks (Task 3's `source="watcher"` among
+    // them) — ANSI color codes interposed between a field's key, `=`, and
+    // value (tracing-subscriber's default when it can't detect the custom
+    // `CaptureWriter` is a non-tty) would silently break any check that
+    // spans a `key=value` boundary, even though single-token checks like
+    // `contains("config_rollback_boot")` happened to survive it.
     let _ = tracing::subscriber::set_global_default(
         tracing_subscriber::fmt()
             .with_writer(CaptureWriter)
+            .with_ansi(false)
             .finish(),
     );
 }
@@ -108,6 +131,27 @@ static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn capture_lock() -> &'static Mutex<()> {
     CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Bounded-poll [`drain_capture`] (accumulating what's drained across
+/// polls, since each call clears the buffer) until `needle` appears or
+/// `timeout` elapses — Task 3 §3's "bounded polling... never sleep-and-
+/// assume" applied to the tracing capture rather than a `ControlMsg`
+/// snapshot (`daemon_smoke.rs`'s `wait_for` is the same idiom over a
+/// predicate).
+async fn wait_for_capture(needle: &str, timeout: Duration) -> String {
+    let start = Instant::now();
+    let mut acc = String::new();
+    loop {
+        acc.push_str(&drain_capture());
+        if acc.contains(needle) {
+            return acc;
+        }
+        if start.elapsed() >= timeout {
+            return acc;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // ── Config fixtures ──────────────────────────────────────────────────────
@@ -196,6 +240,64 @@ wake_retry_interval = "1s"
 "#,
         sock = socket_path.display(),
     )
+}
+
+/// [`good_config`]'s shape with two additions the Task 3 watcher drill
+/// needs: a fast `daemon.reload_debounce` (the real watcher-triggered
+/// reload must fire promptly under this file's bounded polling — the
+/// schema default of 500ms would push the drill toward its own timeout),
+/// and an explicit `daemon.log_level` the caller controls — the LKG and
+/// the fixed operator content pass DIFFERENT values so a live
+/// `handle.config_watch()` read after recovery can prove WHICH bytes fed
+/// the running generation, independent of the byte-identity check the
+/// LKG-candidate seam already gives.
+fn watcher_drill_config(socket_path: &Path, log_level: &str) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+reload_debounce = "10ms"
+log_level = "{log_level}"
+socket_path = "{sock}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "true"
+wake_command = "true"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "0s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        sock = socket_path.display(),
+    )
+}
+
+/// Replace `path`'s contents via a sibling temp file + rename — the
+/// editor/`install(1)` pattern `reload::config_watcher`'s own module doc
+/// names as the reason it watches the config file's PARENT DIRECTORY
+/// rather than the file's inode (Task 3 §3: "make file replacement
+/// watcher-safe").
+fn replace_watched_file(path: &Path, contents: &str) {
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    std::fs::write(&tmp, contents).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
 }
 
 // ── Harness ──────────────────────────────────────────────────────────────
@@ -422,7 +524,17 @@ async fn bad_config_with_lkg_immediate_rollback() {
 /// one fresh LKG candidate is armed from the newly-accepted operator
 /// bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
+              or edits its own watched operator config post-boot against the tests that assert on \
+              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
+              see the module doc comment"
+)]
 async fn accepted_reload_recovers_from_rollback_without_restart() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     let lkg_path = h.write_lkg(&good_config(&h.socket_path()));
@@ -523,7 +635,17 @@ async fn accepted_reload_recovers_from_rollback_without_restart() {
 /// no candidate is armed. Sibling of the accepted-reload recovery test
 /// above; this one edits the operator file with STILL-invalid bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
+              or edits its own watched operator config post-boot against the tests that assert on \
+              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
+              see the module doc comment"
+)]
 async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     let bad_bytes = std::fs::read(&bad).unwrap();
@@ -580,6 +702,219 @@ async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
         state.rolled_back_from,
         Some(bad_fp),
         "rolled_back_from must NOT change on a rejected reload"
+    );
+}
+
+/// Rollback-recovery plan Task 3 §1: the full LKG drill through the REAL
+/// file watcher, in-process — no LIVE-daemon drill (operator-gated,
+/// morning work, out of scope here). Distinct from Task 2's own
+/// `accepted_reload_recovers_from_rollback_without_restart`: this test
+/// never calls `trigger_reload()` — the fixed operator bytes reach the
+/// daemon only through a real filesystem event on the OPERATOR path (a
+/// sibling-temp + rename, matching `reload::config_watcher`'s own watched-
+/// directory reasoning), and the bounded-polled tracing capture proves the
+/// watcher actually fired before the reload outcome is awaited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
+              or edits its own watched operator config post-boot against the tests that assert on \
+              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
+              see the module doc comment"
+)]
+async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+    drain_capture();
+
+    let h = Harness::new();
+    let bad = h.write_bad();
+    let lkg_contents = watcher_drill_config(&h.socket_path(), "info");
+    let lkg_path = h.write_lkg(&lkg_contents);
+
+    let plan = boot_guard::prepare(&bad, &h.creds_path, &h.state_dir, Strictness::Strict, true);
+    let outcome = boot::boot(plan, h.inputs()).await.expect("boot");
+    let BootOutcome::Started {
+        handle,
+        join,
+        used_config,
+        rolled_back,
+    } = outcome
+    else {
+        panic!("expected Started");
+    };
+    assert_eq!(used_config, lkg_path, "generation 0 must boot from the LKG");
+    assert!(rolled_back);
+
+    // Pre-fix sanity: generation 0 is running the LKG's own bytes
+    // (`log_level = "info"`, distinct from the fixed operator content
+    // below), the pending-reload banner is set, and the crash-loop JSON
+    // records an active rollback — all BEFORE the watcher ever fires.
+    assert_eq!(
+        handle.config_watch().borrow().daemon.log_level,
+        "info",
+        "generation 0 must be assembled from the LKG's own bytes"
+    );
+    assert!(
+        pending_reload_of(&handle).await.is_some(),
+        "pending banner must be set immediately after a rollback boot"
+    );
+    let state: CrashLoopState = serde_json::from_str(
+        &std::fs::read_to_string(h.state_dir.join("crash-loop.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state.rollback_active,
+        "crash-loop JSON must be active before the fix"
+    );
+    assert!(state.rolled_back_from.is_some());
+    assert!(
+        !handle.lkg_candidate_observed().armed,
+        "no LKG candidate may be armed before recovery"
+    );
+
+    // The operator fixes the broken OPERATOR file — watcher-safe
+    // replacement, a DIFFERENT `log_level` from the LKG's so the live
+    // config assertion below is provably fed by these bytes. Subscribe to
+    // reload outcomes BEFORE the edit: the watcher's own reload is async
+    // and unprompted, unlike `trigger_reload()`'s directly-awaited send.
+    let fixed = watcher_drill_config(&h.socket_path(), "debug");
+    let mut reloads = handle.subscribe_reload();
+    replace_watched_file(&bad, &fixed);
+
+    // Bounded-poll the capture for the real watcher firing — proof this
+    // reload was never manually triggered (no `trigger_reload()` call
+    // anywhere in this test).
+    let log = wait_for_capture(r#"source="watcher""#, Duration::from_secs(5)).await;
+    assert!(
+        log.contains("reload_trigger") && log.contains(r#"source="watcher""#),
+        "expected a real watcher-driven reload_trigger, got: {log}"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome within timeout")
+        .expect("reload broadcast channel open");
+    assert_eq!(
+        outcome,
+        dormantd::app::ReloadOutcome::Reloaded,
+        "got {outcome:?}"
+    );
+
+    assert_eq!(
+        handle.config_watch().borrow().daemon.log_level,
+        "debug",
+        "live config watch must reflect the fixed OPERATOR value, not the LKG's"
+    );
+    assert_eq!(
+        pending_reload_of(&handle).await,
+        None,
+        "pending_reload banner must clear on a watcher-driven recovery reload"
+    );
+
+    let observed = handle.lkg_candidate_observed();
+    assert!(
+        observed.armed,
+        "a fresh LKG candidate must be armed after recovery"
+    );
+    assert_eq!(observed.source, Some("reload"));
+    assert_eq!(
+        observed.bytes.as_deref(),
+        Some(fixed.as_bytes()),
+        "exactly one candidate must be armed from the OPERATOR bytes"
+    );
+
+    let state: CrashLoopState = serde_json::from_str(
+        &std::fs::read_to_string(h.state_dir.join("crash-loop.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !state.rollback_active,
+        "rollback_active must clear after watcher-driven recovery"
+    );
+    assert_eq!(
+        state.rolled_back_from, None,
+        "rolled_back_from must clear after watcher-driven recovery"
+    );
+
+    shutdown(handle, join).await;
+}
+
+/// Rollback-recovery plan Task 3 §2's sibling rejected-reload assertion,
+/// driven through the real watcher rather than `trigger_reload()` — the
+/// same differentiator as the drill above, rather than duplicating Task
+/// 2's own manual-trigger
+/// `rejected_reload_during_rollback_leaves_rollback_state_untouched`. A
+/// second, STILL invalid edit to the operator file (through the same
+/// watcher-safe replacement) while a boot-time rollback is active must
+/// leave every piece of rollback state untouched: the pending banner
+/// stays set, the crash-loop JSON stays active, and no candidate is
+/// armed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
+              or edits its own watched operator config post-boot against the tests that assert on \
+              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
+              see the module doc comment"
+)]
+async fn rollback_boot_watcher_rejects_still_bad_operator_edit() {
+    let _guard = capture_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let h = Harness::new();
+    let bad = h.write_bad();
+    let bad_bytes = std::fs::read(&bad).unwrap();
+    let bad_fp = fingerprint_bytes(&bad_bytes);
+    h.write_lkg(&watcher_drill_config(&h.socket_path(), "info"));
+
+    let plan = boot_guard::prepare(&bad, &h.creds_path, &h.state_dir, Strictness::Strict, true);
+    let outcome = boot::boot(plan, h.inputs()).await.expect("boot");
+    let BootOutcome::Started { handle, join, .. } = outcome else {
+        panic!("expected Started");
+    };
+
+    // A second, still-broken edit (different bytes, still an undefined
+    // zone reference) — delivered ONLY through the watcher, never
+    // `trigger_reload()`.
+    let still_bad = bad_config(&h.socket_path()).replace("does-not-exist", "still-missing");
+    let mut reloads = handle.subscribe_reload();
+    replace_watched_file(&bad, &still_bad);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome within timeout (watcher-triggered)")
+        .expect("reload broadcast channel open");
+    assert!(
+        matches!(outcome, dormantd::app::ReloadOutcome::Rejected(_)),
+        "got {outcome:?}"
+    );
+
+    assert!(
+        pending_reload_of(&handle).await.is_some(),
+        "pending banner must remain set after a rejected watcher-triggered reload"
+    );
+    assert!(
+        !handle.lkg_candidate_observed().armed,
+        "no candidate may be armed by a rejected reload"
+    );
+
+    shutdown(handle, join).await;
+
+    let state: CrashLoopState = serde_json::from_str(
+        &std::fs::read_to_string(h.state_dir.join("crash-loop.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state.rollback_active,
+        "rollback_active must NOT clear on a rejected watcher-triggered reload"
+    );
+    assert_eq!(
+        state.rolled_back_from,
+        Some(bad_fp),
+        "rolled_back_from must NOT change on a rejected watcher-triggered reload"
     );
 }
 

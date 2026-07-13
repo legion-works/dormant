@@ -281,9 +281,19 @@ pub enum DeferredEvent {
 /// Deliberately carries NO write-back intent fields (P12 reversal) —
 /// `prepare` performs every verdict-driven `crash-loop.json` write itself,
 /// in the same atomic rewrite as the start-entry record.
+///
+/// `operator_config` (rollback-recovery plan, Task 1) is the REAL operator
+/// config path — always `config_path` as passed into `prepare()`,
+/// regardless of verdict. `chosen_config` may diverge from it (the LKG
+/// substitute, on `RollBack`/`ContinueRollback`); `operator_config` never
+/// does. `boot()` threads this into the boot-only `App` builder so every
+/// runtime consumer added after generation 0 (the watcher, Web UI,
+/// `Runner`, `AppHandle`) keeps watching/reloading the operator's actual
+/// file.
 #[derive(Clone, PartialEq, Debug)]
 pub struct BootPlan {
     pub chosen_config: PathBuf,
+    pub operator_config: PathBuf,
     pub nonce: u64,
     pub deferred_events: Vec<DeferredEvent>,
     pub pending_message: Option<String>,
@@ -588,6 +598,7 @@ pub fn prepare(
 
     BootPlan {
         chosen_config,
+        operator_config: config_path.to_path_buf(),
         nonce,
         deferred_events,
         pending_message,
@@ -1130,6 +1141,24 @@ mod tests {
             state_dir: PathBuf::from("/tmp/state"),
             lock_path: PathBuf::from("/tmp/dormant.lock"),
             sd_notify: SdNotify::from_env(),
+        };
+    }
+
+    #[test]
+    fn boot_plan_field_list_is_minimal() {
+        // Pins the rollback-recovery plan's Task 1 field list:
+        // chosen_config, operator_config, nonce, deferred_events,
+        // pending_message. `operator_config` is the new field (two
+        // explicit path roles — see the struct doc); if this literal
+        // fails to compile, the field list has drifted from this pin and
+        // the test must be amended alongside the code change (P12: still
+        // no write-back intent field).
+        let _plan = BootPlan {
+            chosen_config: PathBuf::from("/tmp/config.toml"),
+            operator_config: PathBuf::from("/tmp/config.toml"),
+            nonce: 0,
+            deferred_events: Vec::new(),
+            pending_message: None,
         };
     }
 

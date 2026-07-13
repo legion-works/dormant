@@ -344,6 +344,43 @@ async fn bad_config_with_lkg_immediate_rollback() {
         } => {
             assert_eq!(used_config, lkg_path);
             assert!(rolled_back);
+
+            // Two explicit path roles (rollback-recovery plan, Task 1):
+            // `used_config`/generation-0 assembly is the LKG (asserted
+            // above), but the OPERATOR path retained by `AppHandle` (for
+            // the watcher/Web UI/manual reload) must remain the original,
+            // still-broken `bad` file — never silently swapped to the LKG
+            // substitute.
+            assert_eq!(
+                handle.config_path(),
+                bad.as_path(),
+                "AppHandle must retain the operator config path across a rollback boot"
+            );
+
+            // Generation 0 itself must be assembled from the LKG's bytes,
+            // not the broken operator bytes: `good_config`'s rule
+            // references the real `office` zone, while `bad_config`'s
+            // rule references a nonexistent `does-not-exist` zone — a
+            // directly assertable, queryable fingerprint of WHICH source
+            // fed `load_cfg_creds`/`assemble_static`.
+            let live_cfg = handle.config_watch().borrow().clone();
+            assert_eq!(
+                live_cfg.rules.get("r").map(|r| r.zone.as_str()),
+                Some("office"),
+                "generation 0 must be assembled from LKG-derived config values"
+            );
+
+            // Coupling-hazard suppression (plan Task 1 §5): arming an
+            // initial LKG candidate from the OPERATOR path during a
+            // rollback boot would track the broken bytes just rolled away
+            // from — once healthy + `stability_window` elapse, `lkg_tick`
+            // would promote them and corrupt `last-known-good.toml`. No
+            // candidate must be armed at all while `rollback_active`.
+            assert!(
+                !handle.lkg_candidate_observed().armed,
+                "no LKG candidate may be armed after a rollback boot"
+            );
+
             let pending = pending_reload_of(&handle).await;
             assert!(
                 pending
@@ -463,6 +500,27 @@ async fn counted_rollback_never_attempts_chosen() {
         } => {
             assert_eq!(used_config, lkg_path);
             assert!(rolled_back);
+
+            // Same two-path-role + coupling-hazard pins as
+            // `bad_config_with_lkg_immediate_rollback`, for the COUNTED
+            // rollback route (`prepare` chose the LKG up front, rather
+            // than `boot()` discovering the failure live).
+            assert_eq!(
+                handle.config_path(),
+                bad.as_path(),
+                "AppHandle must retain the operator config path across a counted rollback boot"
+            );
+            let live_cfg = handle.config_watch().borrow().clone();
+            assert_eq!(
+                live_cfg.rules.get("r").map(|r| r.zone.as_str()),
+                Some("office"),
+                "generation 0 must be assembled from LKG-derived config values"
+            );
+            assert!(
+                !handle.lkg_candidate_observed().armed,
+                "no LKG candidate may be armed after a counted rollback boot"
+            );
+
             shutdown(handle, join).await;
         }
         BootOutcome::LockFailed => panic!("expected Started, got LockFailed"),

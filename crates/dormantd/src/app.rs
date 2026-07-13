@@ -204,8 +204,30 @@ pub fn validate_only(
 
 /// The daemon application: config paths + the sensor-source factory.
 pub struct App {
+    /// The generation-0 (boot) source: the already-validated config used
+    /// ONLY to assemble the first generation in [`App::start`]. Ordinary
+    /// callers ([`App::build`]/[`App::build_with_sources`]) set this equal
+    /// to `operator_config_path`; a rollback boot sets it to the LKG
+    /// substitute while `operator_config_path` keeps pointing at the real
+    /// (possibly still-broken) operator config (rollback-recovery plan,
+    /// Task 1: two explicit path roles).
     config_path: PathBuf,
+    /// The operator source: the real config path retained by the watcher,
+    /// Web UI, manual reload, `Runner`, `AppHandle`, and future LKG
+    /// candidates. Equal to `config_path` for every non-boot caller; only
+    /// [`App::with_boot_source`] (boot-only, called by [`crate::boot::boot`]
+    /// after a successful build) ever diverges the two.
+    operator_config_path: PathBuf,
     creds_path: PathBuf,
+    /// Whether THIS boot is a rollback (running generation 0 from the LKG
+    /// substitute rather than the operator path). `false` for every
+    /// ordinary caller; set by [`App::with_boot_source`]. Gates the
+    /// initial LKG-candidate arming in [`App::start`] (coupling-hazard
+    /// suppression, plan Task 1 §5): arming a candidate from the operator
+    /// path's still-broken bytes during a rollback boot would let
+    /// `lkg_tick` promote them once healthy, corrupting the very LKG file
+    /// the rollback is anchored on.
+    rollback_active: bool,
     strictness: Strictness,
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
@@ -262,8 +284,10 @@ impl App {
             dormant_sensors::registry::build(&cfg.sensors, creds).map_err(anyhow::Error::from)
         });
         Ok(Self {
+            operator_config_path: config_path.clone(),
             config_path,
             creds_path,
+            rollback_active: false,
             strictness,
             source_builder,
             #[cfg(feature = "render")]
@@ -294,8 +318,10 @@ impl App {
     {
         Self::validate_or_bail(&config_path, &creds_path, strictness)?;
         Ok(Self {
+            operator_config_path: config_path.clone(),
             config_path,
             creds_path,
+            rollback_active: false,
             strictness,
             source_builder: Arc::new(factory),
             #[cfg(feature = "render")]
@@ -353,6 +379,33 @@ impl App {
     #[must_use]
     pub fn with_sd_notify(mut self, sd: SdNotify) -> Self {
         self.sd_notify = sd;
+        self
+    }
+
+    /// Boot-only setter (rollback-recovery plan, Task 1 §3): called by
+    /// [`crate::boot::boot`] immediately after it has successfully built
+    /// `Self` from whichever source `prepare()`/immediate-rollback chose
+    /// (`self.config_path`, unchanged — the generation-0/boot source).
+    /// Records the REAL operator config path (`BootPlan::operator_config`)
+    /// separately, so every runtime consumer added in `App::start`
+    /// (the file watcher, Web UI, `Runner`, `AppHandle`) keeps watching
+    /// and reloading the operator's actual file rather than the LKG
+    /// substitute that only assembled generation 0. `rollback_active`
+    /// records whether THIS boot is a rollback — `boot()` computes it
+    /// locally (never a `BootInputs` field) — and gates the initial LKG
+    /// candidate arming in `App::start` (§5's coupling-hazard
+    /// suppression). Every non-boot caller ([`App::build`]/
+    /// [`App::build_with_sources`]) never calls this, so `config_path ==
+    /// operator_config_path` and `rollback_active == false` for them,
+    /// preserving today's behavior exactly.
+    #[must_use]
+    pub(crate) fn with_boot_source(
+        mut self,
+        operator_config_path: PathBuf,
+        rollback_active: bool,
+    ) -> Self {
+        self.operator_config_path = operator_config_path;
+        self.rollback_active = rollback_active;
         self
     }
 
@@ -556,8 +609,8 @@ impl App {
             );
         }
 
-        let watcher =
-            reload::config_watcher(&self.config_path).context("install config file watcher")?;
+        let watcher = reload::config_watcher(&self.operator_config_path)
+            .context("install config file watcher")?;
 
         // The doctor service is shared by the IPC server (for
         // `IpcRequest::Doctor`) and the web server (for the
@@ -602,7 +655,7 @@ impl App {
                         reload_rx: reload_tx.subscribe(),
                         config_rx: config_rx.clone(),
                         creds_rx: creds_rx.clone(),
-                        config_path: self.config_path.clone(),
+                        config_path: self.operator_config_path.clone(),
                         creds_path: self.creds_path.clone(),
                         doctor: doctor_service.clone(),
                         wear: wear_handle.clone(),
@@ -642,8 +695,29 @@ impl App {
         // Mechanism: "set at startup completion"). `None` when
         // `watchdog.lkg_enabled` is false — no candidate tracking, no
         // files written, ever, until the config re-enables it on a reload.
-        let lkg_candidate =
-            new_lkg_candidate(&self.config_path, cfg_clone.watchdog.lkg_enabled, "boot");
+        //
+        // Coupling-hazard suppression (rollback-recovery plan, Task 1 §5):
+        // this now reads the OPERATOR path (post path-split), which during
+        // a rollback boot is exactly the broken bytes the daemon just
+        // rolled away from. Arming a candidate from them would let
+        // `lkg_tick` promote them once `stability_window` + healthy
+        // displays elapse, corrupting `last-known-good.toml` — the very
+        // anchor the rollback depends on. So: no candidate at all while
+        // `rollback_active`; `Runner::reload`'s successful-recovery path
+        // (a later task) arms the first post-rollback candidate instead.
+        let lkg_candidate = if self.rollback_active {
+            None
+        } else {
+            new_lkg_candidate(
+                &self.operator_config_path,
+                cfg_clone.watchdog.lkg_enabled,
+                "boot",
+            )
+        };
+        #[cfg(any(test, feature = "test-util"))]
+        let lkg_observed = Arc::new(Mutex::new(LkgCandidateObserved::from_candidate(
+            lkg_candidate.as_ref(),
+        )));
 
         // READY=1 (spec §6.2 F1): the TRUE end of `App::start` — after the
         // IPC listener spawn AND the web spawn above, immediately before
@@ -661,7 +735,7 @@ impl App {
         self.sd_notify.ready();
 
         let runner = Runner {
-            config_path: self.config_path.clone(),
+            config_path: self.operator_config_path.clone(),
             creds_path: self.creds_path.clone(),
             strictness: self.strictness,
             source_builder: self.source_builder,
@@ -699,10 +773,12 @@ impl App {
             root,
             config_rx,
             creds_rx,
-            config_path: self.config_path.clone(),
+            config_path: self.operator_config_path.clone(),
             doctor_service,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
+            #[cfg(any(test, feature = "test-util"))]
+            lkg_observed,
         };
 
         Ok((handle, join))
@@ -744,10 +820,18 @@ pub struct AppHandle {
     root: CancellationToken,
     config_rx: watch::Receiver<Arc<Config>>,
     creds_rx: watch::Receiver<Arc<Credentials>>,
+    /// The OPERATOR config path (rollback-recovery plan, Task 1) — the
+    /// real file the operator edits, watches, and reloads; NOT necessarily
+    /// the path generation 0 was assembled from (a rollback boot assembles
+    /// from the LKG substitute instead, `App::config_path`).
     config_path: PathBuf,
     doctor_service: DoctorService,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
+    /// Test-only LKG-candidate observation seam — see
+    /// [`LkgCandidateObserved`].
+    #[cfg(any(test, feature = "test-util"))]
+    lkg_observed: Arc<Mutex<LkgCandidateObserved>>,
 }
 
 impl AppHandle {
@@ -793,7 +877,10 @@ impl AppHandle {
         self.creds_rx.clone()
     }
 
-    /// The resolved config path (for M2 web UI `WebState`).
+    /// The OPERATOR config path (for M2 web UI `WebState`; rollback-
+    /// recovery plan Task 1) — the real file the operator edits/watches/
+    /// reloads. Distinct from whatever generation 0 was actually assembled
+    /// from during a rollback boot (see `App::config_path`'s doc).
     #[must_use]
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
@@ -805,6 +892,19 @@ impl AppHandle {
     #[must_use]
     pub fn doctor_service(&self) -> DoctorService {
         self.doctor_service.clone()
+    }
+
+    /// Test-util seam (rollback-recovery plan, Task 1 §5 / Task 2): a
+    /// point-in-time snapshot of the `Runner`'s current LKG-candidate
+    /// state. Used to prove whether a candidate is armed and, if so, from
+    /// which bytes/source — without a 5-minute `stability_window` wait.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn lkg_candidate_observed(&self) -> LkgCandidateObserved {
+        self.lkg_observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -888,6 +988,46 @@ struct LkgCandidate {
     dirty_logged: bool,
     health_deferred_logged: bool,
     save_failed_logged: bool,
+}
+
+/// Test-only snapshot of the `Runner`'s current LKG-candidate state
+/// (rollback-recovery plan, Task 1 §5 / Task 2 candidate-observation seam —
+/// mirrors the `force_reload_spawn_failure` precedent, `App`'s field doc
+/// above). Exposes armed-state plus enough identity (the candidate's own
+/// `source` tag and its captured bytes) to prove WHICH generation a
+/// candidate is tracking, without exposing the private `LkgCandidate` type
+/// itself across the `dormantd::app` boundary.
+///
+/// Committed here (Task 1) because Task 1's own coupling-hazard RED test
+/// (§5: "no candidate armed" after a rollback boot) needs it; Task 2 and
+/// Task 3 reuse this SAME type/accessor for their own candidate-arming
+/// assertions rather than adding a second seam.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LkgCandidateObserved {
+    /// Whether a candidate is currently armed.
+    pub armed: bool,
+    /// The armed candidate's `source` tag (`"boot"`/`"reload"`), or `None`
+    /// when nothing is armed.
+    pub source: Option<&'static str>,
+    /// The armed candidate's captured bytes, or `None` when nothing is
+    /// armed — lets a test assert WHICH bytes (e.g. the operator file's
+    /// current contents) a candidate was armed from.
+    pub bytes: Option<Vec<u8>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl LkgCandidateObserved {
+    fn from_candidate(candidate: Option<&LkgCandidate>) -> Self {
+        match candidate {
+            Some(c) => Self {
+                armed: true,
+                source: Some(c.source),
+                bytes: Some(c.bytes.clone()),
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 /// Build the initial (or post-reload) LKG candidate for `config_path`, or

@@ -164,6 +164,12 @@ fn main() -> ExitCode {
 /// split out of `main` purely to keep `main` under the line-count gate; no
 /// behavioral seam.
 async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
+    // Captured before `plan` moves into `boot::boot` below (rollback-
+    // recovery plan, Task 1 §6): the REAL operator path, for the
+    // `reload_config` log field — distinct from `used_config`, which keeps
+    // reporting whichever source actually booted generation 0 (unchanged
+    // meaning).
+    let operator_config = plan.operator_config.clone();
     match boot::boot(plan, inputs).await {
         Ok(BootOutcome::LockFailed) => ExitCode::from(1),
         Ok(BootOutcome::BuildFailed(msg)) => {
@@ -180,6 +186,7 @@ async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
             tracing::info!(
                 event = "daemon_starting",
                 config = %used_config.display(),
+                reload_config = %operator_config.display(),
                 rolled_back,
             );
             let result = join.await.context("run loop panicked");

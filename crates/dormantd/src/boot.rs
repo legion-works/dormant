@@ -159,13 +159,19 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
 
     let app = app
         .with_sd_notify(inputs.sd_notify)
-        // Rollback-recovery plan, Task 1 §3/§5: tell `App` the REAL
-        // operator path (may differ from `plan.chosen_config`, which this
-        // `app` was actually built from — see the three branches above)
-        // and whether this boot is a rollback. `rolled_back` is computed
+        // Rollback-recovery plan, Task 1 §3/§5 (state_dir threading added
+        // Task 2 §2): tell `App` the REAL operator path (may differ from
+        // `plan.chosen_config`, which this `app` was actually built from —
+        // see the three branches above), whether this boot is a rollback,
+        // and the crash-loop-state directory this boot's `prepare()`/
+        // immediate-rollback write already used. `rolled_back` is computed
         // locally above (never a `BootInputs` field) precisely so this
         // threading is possible without widening `BootInputs`.
-        .with_boot_source(plan.operator_config.clone(), rolled_back);
+        .with_boot_source(
+            plan.operator_config.clone(),
+            rolled_back,
+            inputs.state_dir.clone(),
+        );
 
     // P1+P15: the single flock acquire, immediately before the single
     // `App::start()` call site below, regardless of which of the three

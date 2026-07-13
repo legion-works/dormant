@@ -411,6 +411,178 @@ async fn bad_config_with_lkg_immediate_rollback() {
     );
 }
 
+/// Rollback-recovery plan Task 2 §3/§4/§6: an ACCEPTED reload from the
+/// operator path while a boot-time rollback is active is the live-reload
+/// sibling of `boot_guard`'s `ContinueRollback -> Proceed` transition. The
+/// operator fixes the broken file (distinct valid bytes from the LKG, so
+/// the reload's effect is distinguishable from the boot-time rollback's),
+/// triggers a manual reload (mirrors `dormantctl reload`; the file-watcher
+/// path is Task 3's job), and recovers WITHOUT a restart: the persisted
+/// crash-loop state clears, the pending-reload banner clears, and exactly
+/// one fresh LKG candidate is armed from the newly-accepted operator
+/// bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_reload_recovers_from_rollback_without_restart() {
+    let h = Harness::new();
+    let bad = h.write_bad();
+    let lkg_path = h.write_lkg(&good_config(&h.socket_path()));
+
+    let plan = boot_guard::prepare(&bad, &h.creds_path, &h.state_dir, Strictness::Strict, true);
+    let outcome = boot::boot(plan, h.inputs()).await.expect("boot");
+    let BootOutcome::Started {
+        handle,
+        join,
+        used_config,
+        rolled_back,
+    } = outcome
+    else {
+        panic!("expected Started");
+    };
+    assert_eq!(used_config, lkg_path, "generation 0 must boot from the LKG");
+    assert!(rolled_back);
+
+    // Pre-recovery sanity: banner set, no candidate armed (Task 1 §5 gate).
+    assert!(
+        pending_reload_of(&handle).await.is_some(),
+        "pending banner must be set immediately after a rollback boot"
+    );
+    assert!(
+        !handle.lkg_candidate_observed().armed,
+        "no LKG candidate may be armed before recovery"
+    );
+
+    // The operator fixes the broken file — a DIFFERENT valid config from
+    // the LKG's own bytes (a shorter `startup_holdoff`), so every
+    // assertion below is provably fed by the fresh reload, not a residual
+    // LKG-derived value.
+    let fixed = good_config(&h.socket_path()).replacen(
+        "startup_holdoff = \"0s\"",
+        "startup_holdoff = \"0ms\"",
+        1,
+    );
+    std::fs::write(&bad, &fixed).unwrap();
+
+    let mut reloads = handle.subscribe_reload();
+    assert!(handle.trigger_reload().await, "trigger_reload must send");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome within timeout")
+        .expect("reload broadcast channel open");
+    assert_eq!(
+        outcome,
+        dormantd::app::ReloadOutcome::Reloaded,
+        "got {outcome:?}"
+    );
+
+    // The pending-reload banner clears on the newly-installed engine
+    // (Task 2 §3: `ControlMsg::SetPendingReload(None)` before the
+    // broadcast above).
+    assert_eq!(
+        pending_reload_of(&handle).await,
+        None,
+        "pending_reload banner must clear on an accepted recovery reload"
+    );
+
+    // Exactly one fresh LKG candidate armed from the accepted operator
+    // bytes (Task 2 §6) — via the committed test-util seam, never the
+    // 5-minute stability_window wait.
+    let observed = handle.lkg_candidate_observed();
+    assert!(
+        observed.armed,
+        "a fresh LKG candidate must be armed after recovery"
+    );
+    assert_eq!(observed.source, Some("reload"));
+    assert_eq!(
+        observed.bytes.as_deref(),
+        Some(fixed.as_bytes()),
+        "the fresh candidate must be armed from the newly-accepted operator bytes"
+    );
+
+    shutdown(handle, join).await;
+
+    // The persisted crash-loop state clears (Task 2 §3/§4): both
+    // `rollback_active` and `rolled_back_from`, atomically, via
+    // `clear_rollback_after_reload`.
+    let state: CrashLoopState = serde_json::from_str(
+        &std::fs::read_to_string(h.state_dir.join("crash-loop.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !state.rollback_active,
+        "rollback_active must clear after an accepted recovery reload"
+    );
+    assert_eq!(
+        state.rolled_back_from, None,
+        "rolled_back_from must clear after an accepted recovery reload"
+    );
+}
+
+/// Rollback-recovery plan Task 2 §5: a REJECTED reload while rollback is
+/// active must leave every piece of rollback state byte-for-byte
+/// untouched — pending banner stays set, crash-loop JSON stays active, and
+/// no candidate is armed. Sibling of the accepted-reload recovery test
+/// above; this one edits the operator file with STILL-invalid bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
+    let h = Harness::new();
+    let bad = h.write_bad();
+    let bad_bytes = std::fs::read(&bad).unwrap();
+    let bad_fp = fingerprint_bytes(&bad_bytes);
+    h.write_lkg(&good_config(&h.socket_path()));
+
+    let plan = boot_guard::prepare(&bad, &h.creds_path, &h.state_dir, Strictness::Strict, true);
+    let outcome = boot::boot(plan, h.inputs()).await.expect("boot");
+    let BootOutcome::Started { handle, join, .. } = outcome else {
+        panic!("expected Started");
+    };
+
+    // A second, still-broken edit (different bytes, still an undefined
+    // zone reference) — `load_and_assemble` must reject it before ever
+    // touching the running generation.
+    let still_bad = bad_config(&h.socket_path()).replace("does-not-exist", "still-missing");
+    std::fs::write(&bad, &still_bad).unwrap();
+
+    let mut reloads = handle.subscribe_reload();
+    assert!(handle.trigger_reload().await, "trigger_reload must send");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome within timeout")
+        .expect("reload broadcast channel open");
+    assert!(
+        matches!(outcome, dormantd::app::ReloadOutcome::Rejected(_)),
+        "got {outcome:?}"
+    );
+
+    // Banner remains set — a rejected reload's own `Err` arm re-parks it
+    // with the NEW rejection detail (`Runner::reload`'s early-return `Err`
+    // arm sends `SetPendingReload(Some(detail))` before returning), so it
+    // is never cleared to `None` the way an ACCEPTED recovery reload does.
+    assert!(
+        pending_reload_of(&handle).await.is_some(),
+        "pending banner must remain set after a rejected reload"
+    );
+    assert!(
+        !handle.lkg_candidate_observed().armed,
+        "no candidate may be armed by a rejected reload"
+    );
+
+    shutdown(handle, join).await;
+
+    let state: CrashLoopState = serde_json::from_str(
+        &std::fs::read_to_string(h.state_dir.join("crash-loop.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state.rollback_active,
+        "rollback_active must NOT clear on a rejected reload"
+    );
+    assert_eq!(
+        state.rolled_back_from,
+        Some(bad_fp),
+        "rolled_back_from must NOT change on a rejected reload"
+    );
+}
+
 /// Bad chosen config, no LKG at all → `BuildFailed` (regression pin: today's
 /// "no fallback" behavior, unchanged).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

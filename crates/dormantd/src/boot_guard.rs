@@ -782,6 +782,30 @@ pub(crate) fn load_crash_loop_state(state_dir: &Path) -> CrashLoopState {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+// ── live-reload rollback recovery (rollback-recovery plan, Task 2) ─────
+
+/// Clear rollback bookkeeping in `crash-loop.json` after a config reload
+/// the operator has fixed and the engine has ACCEPTED (Task 2 §1/§3): the
+/// live-reload sibling of the boot-time `clear_rollback_active` legs
+/// `decide` already computes (F2's bytes-changed leg, the LKG-missing
+/// disarm, and the quiet-retry leg). Loads the current state, clears
+/// `rollback_active`/`rolled_back_from`, and rewrites the file atomically
+/// via the same [`write_atomic_json`] every other verdict-driven write
+/// uses — every other field (`schema_version`, `starts`) is carried
+/// through untouched, never reset.
+///
+/// Returns the write's `Result` (unlike `prepare`'s own best-effort
+/// swallow-on-failure writes): `Runner::reload`'s accepted-reload arm
+/// (Task 2 §4) branches on success/failure to decide whether to arm its
+/// `rollback_state_clear_pending` retry flag, so the failure must be
+/// observable here, not swallowed.
+pub(crate) fn clear_rollback_after_reload(state_dir: &Path) -> std::io::Result<()> {
+    let mut state = load_crash_loop_state(state_dir);
+    state.rollback_active = false;
+    state.rolled_back_from = None;
+    write_atomic_json(state_dir, CRASH_LOOP_FILE, &state)
+}
+
 // ── discount files ───────────────────────────────────────────────────────
 
 /// Create `state_dir()/discount-<nonce>` — an atomic, uniquely-named create
@@ -1552,6 +1576,149 @@ mod tests {
             plan.chosen_config, config,
             "discounted start must not trigger rollback"
         );
+    }
+
+    // ── Task 2 §1 RED: live-reload rollback-recovery helper ─────────────
+
+    #[test]
+    fn clear_rollback_after_reload_clears_persisted_state() {
+        // RED (rollback-recovery plan, Task 2 §1): seeds `crash-loop.json`
+        // with `rollback_active: true` + `rolled_back_from: Some(fp)` (the
+        // state a boot-time rollback leaves behind) and asserts the
+        // live-reload sibling helper clears both fields, atomically,
+        // while preserving every other field (`starts`) untouched. Pre-fix
+        // this fails to COMPILE (`clear_rollback_after_reload` does not
+        // exist yet); once stubbed in, it must clear the two fields
+        // exactly (never touch `starts`/`schema_version`).
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let fp = fingerprint_bytes(b"broken-operator-bytes");
+        let seeded = CrashLoopState {
+            schema_version: 1,
+            starts: vec![entry(1_000, fp, 1)],
+            rollback_active: true,
+            rolled_back_from: Some(fp),
+        };
+        write_atomic_json(&state_dir, CRASH_LOOP_FILE, &seeded).unwrap();
+
+        clear_rollback_after_reload(&state_dir)
+            .expect("clear must succeed on a writable state_dir");
+
+        let raw = std::fs::read_to_string(state_dir.join(CRASH_LOOP_FILE)).unwrap();
+        let state: CrashLoopState = serde_json::from_str(&raw).unwrap();
+        assert!(
+            !state.rollback_active,
+            "rollback_active must clear to false"
+        );
+        assert_eq!(
+            state.rolled_back_from, None,
+            "rolled_back_from must clear to None"
+        );
+        assert_eq!(
+            state.starts.len(),
+            1,
+            "start history must be preserved, not clobbered"
+        );
+        assert_eq!(state.starts[0].nonce, 1);
+    }
+
+    #[test]
+    fn clear_rollback_after_reload_surfaces_write_failure() {
+        // Task 2 §4's failure-policy branch point: the caller (`Runner`)
+        // distinguishes success from failure to decide whether to arm the
+        // `rollback_state_clear_pending` retry flag — so the helper must
+        // surface a write failure as `Err`, never silently swallow it
+        // (unlike `prepare`'s own best-effort `crash-loop.json` write,
+        // which is allowed to swallow because nothing downstream retries
+        // it). Point `state_dir` at a path whose PARENT is a plain file —
+        // `create_dir_all` inside `write_atomic_bytes` cannot create a
+        // directory there, guaranteeing a deterministic `Err`.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let unwritable_state_dir = blocker.join("state");
+
+        let err = clear_rollback_after_reload(&unwritable_state_dir);
+        assert!(
+            err.is_err(),
+            "a blocked state_dir must surface Err, not swallow the failure"
+        );
+    }
+
+    // ── Task 2 §7: ContinueRollback sibling regression (council Should) ──
+
+    #[test]
+    fn continue_rollback_survives_repeated_crash_loop_storm() {
+        // A rollback-active daemon that crashes CRASH_LOOP_THRESHOLD MORE
+        // times inside the window (operator path still broken, same
+        // fingerprint every time) must keep resolving the sticky
+        // `ContinueRollback` leg (decide step 4) on EVERY one of those
+        // restarts under the two-path model — never re-derive a fresh
+        // `RollBack` event (which would shift `rolled_back_from`) and
+        // never touch `last-known-good.toml` itself: `prepare()` only
+        // ever READS the LKG file (the only writer is `App::start`'s
+        // coupling-hazard suppression, Task 1 §5, which never arms a
+        // candidate at all while `rollback_active` — so nothing in this
+        // storm can promote the still-broken operator bytes over the
+        // LKG). Simulated as repeated `prepare()` calls against the same
+        // broken operator config, the way `dormantd` would restart-loop
+        // under systemd.
+        let dir = tempfile::tempdir().unwrap();
+        let bad_bytes = b"config_version = 1\nbroken = true\n";
+        let config = write_config(dir.path(), bad_bytes);
+        let creds = dir.path().join("credentials.toml");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let fp = fingerprint_bytes(bad_bytes);
+        let lkg_bytes = b"config_version = 1\n";
+        let lkg_path = state_dir.join(LKG_FILE);
+        std::fs::write(&lkg_path, lkg_bytes).unwrap();
+
+        let seeded = CrashLoopState {
+            schema_version: 1,
+            starts: vec![entry(now_epoch_s() - 30, fp, 9001)],
+            rollback_active: true,
+            rolled_back_from: Some(fp),
+        };
+        write_atomic_json(&state_dir, CRASH_LOOP_FILE, &seeded).unwrap();
+
+        for i in 0..CRASH_LOOP_THRESHOLD {
+            let plan = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
+            assert_eq!(
+                plan.chosen_config, lkg_path,
+                "storm iteration {i}: must keep choosing the LKG substitute"
+            );
+            assert_eq!(
+                plan.deferred_events,
+                vec![DeferredEvent::RollbackContinued],
+                "storm iteration {i}: must resolve the sticky ContinueRollback leg, not a \
+                 fresh RollBack"
+            );
+
+            let state: CrashLoopState = serde_json::from_str(
+                &std::fs::read_to_string(state_dir.join(CRASH_LOOP_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                state.rollback_active,
+                "storm iteration {i}: must stay active"
+            );
+            assert_eq!(
+                state.rolled_back_from,
+                Some(fp),
+                "storm iteration {i}: rolled_back_from must not shift to a new RollBack event"
+            );
+
+            assert_eq!(
+                std::fs::read(&lkg_path).unwrap(),
+                lkg_bytes,
+                "storm iteration {i}: last-known-good.toml must stay byte-identical across the \
+                 storm"
+            );
+        }
     }
 }
 

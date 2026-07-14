@@ -19,7 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `dormantctl emergency-wake`, which tries IPC first and falls back to direct controller access when the daemon is unavailable.
 - `dormantctl doctor exercise <display>` for blank/read/wake/read/restore control-path verification.
 - Samsung `brightness_zero` blanking over IP Control G2 port 1516, preserving source audio while dimming the panel near-black.
-- Audio-aware blanking groundwork: `[audio]` schema and validation, web settings, and accepted `"audio-playback"` / `"call"` inhibitor names. Runtime PipeWire detection is not shipped yet.
+- Audio- and call-aware blanking: a `pw-dump`-polling PipeWire inhibitor (`"audio-playback"` / `"call"` rule literals) that holds a display awake while a running output stream plays or a call is active, independently of and combinable with the existing user-activity inhibitor. Configured through the global `[audio]` section (`poll_interval`, `min_active`, `call_roles`, `playback_roles`, `capture_is_call`, `pw_dump_command`); fails toward blanking on any probe error (missing binary, timeout, malformed output, or a bounded-retry circuit breaker after repeated unreapable subprocesses). `capture_is_call` (microphone-as-call) defaults to `false` to avoid false positives from idling mic-capable apps.
 
 ### Changed
 

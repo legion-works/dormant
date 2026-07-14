@@ -68,6 +68,24 @@ config_version = 1
 # lkg_rollback_enabled = true  # counted crash-loop rollback; disable during rapid restart debugging
 # stability_window = "5m"      # healthy runtime before a config is promoted to LKG (>= 30s)
 
+# ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────
+#
+# Optional, global (one PipeWire instance, one poller — unlike the per-rule
+# activity_* settings): polls pw_dump_command for the running PipeWire graph
+# and lets rules opt into "audio-playback" / "call" inhibitors via their own
+# `inhibitors` list. See docs/src/configuration.md's `[audio]` section,
+# including the capture_is_call false-positive warning. Enabled by default
+# (schema-wise); every key below shows its default, so this section can be
+# omitted entirely — but no rule inhibits on audio/call unless it lists
+# "audio-playback"/"call" in `inhibitors`.
+# [audio]
+# poll_interval = "5s"                    # how often to invoke pw_dump_command (>= 1s)
+# min_active = "3s"                       # continuous activity required before asserting (<= 10x poll_interval)
+# call_roles = ["Communication"]          # media.role values that mean "this running stream is a call"
+# playback_roles = ["Movie", "Music"]     # unset (default) = every non-call running output stream inhibits; [] is rejected
+# capture_is_call = false                 # opt-in: a running microphone counts as a call — see the false-positive warning in the docs
+# pw_dump_command = "pw-dump"             # override = the test/fake-script seam; whitespace-split argv, no shell, no quoting
+
 [daemon]
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"

@@ -163,19 +163,22 @@ controller chain. See [Failure notifications](./failure-notifications.md).
 **Symptom:** `dormantctl status` or the web UI says the current config was
 rolled back, and edits to the original config do not take effect after reload.
 
-**Cause:** the daemon booted from `last-known-good.toml`. Due to
-[issue #53](https://github.com/legion-works/dormant/issues/53), the running
-file watcher still follows the LKG path for that process.
+**Cause:** the daemon booted from `last-known-good.toml` because the operator
+config failed validation during a crash loop.
 
-Fix the intended config, then restart the service:
+Fix the intended config, then reload — the daemon watches the operator config
+even after a rollback boot, so the watcher picks the fix up on save (or run
+`dormantctl reload` explicitly):
 
 ```bash
 dormantctl validate
-systemctl --user restart dormant
+dormantctl reload
 ```
 
-Do not rely on `dormantctl reload` for recovery from a rollback boot until
-issue #53 is fixed. See [Watchdog + last-known-good rollback](./watchdog-rollback.md).
+A successful reload of the fixed config clears the rollback state and the
+banner (`config_rollback_recovered` in the journal). A service restart also
+works, as the fallback path. See
+[Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
 ## Logging
 

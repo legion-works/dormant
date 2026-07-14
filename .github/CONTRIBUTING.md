@@ -74,6 +74,64 @@ The CI jobs in `.github/workflows/ci.yml` are:
 Run the platform-specific and integration jobs when your change touches those
 paths. CI remains the final matrix.
 
+## Known dependency warnings
+
+`cargo check`/`cargo build`/`cargo test` print a future-incompatibility
+warning for `nom v3.2.1`:
+
+```
+warning: the following packages contain code that will be rejected by a future version of Rust: nom v3.2.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id <id>`
+```
+
+**Dependency chain** (`cargo tree -i nom@3.2.1`):
+
+```
+nom v3.2.1
+├── edid v0.3.0
+│   └── ddc-hi v0.4.1
+│       └── dormant-displays v0.1.0
+├── mccs-caps v0.1.3
+│   └── ddc-hi v0.4.1 (*)
+└── mccs-db v0.1.3
+    └── ddc-hi v0.4.1 (*)
+```
+
+`ddc-hi` is `dormant-displays`'s DDC/CI backend (`vcp_ops.rs`) and is
+hardware-verified against real monitors (see `docs/research/`); `0.4.1` is
+still its latest published release, so there is no newer `ddc-hi` to move to.
+The lint itself (`trailing semicolon in macro used in expression position`,
+rust-lang/rust#79813) is cosmetic — old macro-generated code inside `nom`
+3.2.1, not a soundness issue in `dormant`. Forking `ddc-hi`/`nom` or adding a
+`[patch.crates-io]` override to silence a cosmetic warning is disproportionate
+next to the risk of touching a verified DDC/CI code path, so the warning is
+recorded and left visible rather than papered over.
+
+We checked whether Cargo (1.96-era) supports acknowledging or suppressing
+this warning for `nom` alone: `cargo report future-incompatibilities --id
+<id> -p nom@3.2.1` only filters which package's *report detail* is printed
+for a report that already exists — it doesn't stop the warning from
+appearing on the next build. The only build-wide switch is the
+`[future-incompat-report] frequency` config key (`always`/`never`), which is
+all-or-nothing across every dependency, not package-scoped, so it is
+intentionally not used here. There is no `[patch.crates-io]` fork in this
+repo for `nom`/`ddc-hi`.
+
+**Chase condition** — re-evaluate when either happens:
+
+- `ddc-hi` releases a version above `0.4.1` (check for a `nom` bump), or
+- a future `rustc` turns this lint into a hard error (the build will fail
+  instead of warning, forcing the issue).
+
+**Maintenance check:**
+
+```bash
+cargo tree -i nom@3.2.1
+```
+
+If this command errors (no matching package), `nom 3.2.1` is gone from the
+tree and this note can be deleted.
+
 ## TDD expectation
 
 Tests are co-located with source: `#[cfg(test)] mod tests { ... }` at the bottom of each `.rs` file, plus integration tests in `tests/` named by the feature they cover (e.g., `tests/rule_grace_period.rs`). Write a failing test first, then implement. The workspace uses `proptest` for property-based testing where input space is large.

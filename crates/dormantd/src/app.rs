@@ -506,6 +506,17 @@ impl App {
     pub async fn start(mut self) -> Result<(AppHandle, JoinHandle<()>)> {
         let root = CancellationToken::new();
 
+        // #47 fix: resolve the wear-tracker state directory ONCE,
+        // synchronously, as the very first thing `start` does — before any
+        // `.await` point in this function and long before the tracker task
+        // is spawned below. Reading `XDG_STATE_HOME`/`HOME` here rather than
+        // inside the later-spawned detached task means a concurrent
+        // process/test that mutates this same process-global env var after
+        // this point can never redirect an in-flight tracker's persistence
+        // (see `wear_tracker::WearTrackerDeps::dir`'s doc comment for the
+        // full mechanism this closes).
+        let wear_dir = dormant_core::paths::wear_state_dir();
+
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
         let socket_path =
             dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
@@ -598,13 +609,15 @@ impl App {
         // over the front ctl channel (rides `forward_ctl`'s
         // `deliver_or_drop` across generation swaps), sees the current
         // generation's executors via the watch seeded above.
-        let _wear_tracker = crate::wear_tracker::spawn(crate::wear_tracker::WearTrackerDeps {
-            config_rx: config_rx.clone(),
-            ctl_tx: front_ctl_tx.clone(),
-            executors_rx: executors_rx.clone(),
-            handle: wear_handle.clone(),
-            cancel: root.clone(),
-        });
+        let wear_tracker_handle =
+            crate::wear_tracker::spawn(crate::wear_tracker::WearTrackerDeps {
+                config_rx: config_rx.clone(),
+                ctl_tx: front_ctl_tx.clone(),
+                executors_rx: executors_rx.clone(),
+                handle: wear_handle.clone(),
+                cancel: root.clone(),
+                dir: wear_dir,
+            });
 
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
@@ -769,6 +782,7 @@ impl App {
             config_tx,
             creds_tx,
             generation: spawn.generation,
+            wear_tracker_handle,
             started_web_port,
             started_web_bind,
             panel_locks,
@@ -962,6 +976,11 @@ struct Runner {
     config_tx: watch::Sender<Arc<Config>>,
     creds_tx: watch::Sender<Arc<Credentials>>,
     generation: Generation,
+    /// The wear tracker's `JoinHandle` (#47 fix, secondary hardening):
+    /// retained (no longer fire-and-forget) so `run_loop` can bound-await
+    /// its cancellation-triggered final persist during shutdown, mirroring
+    /// [`teardown`]'s bounded-join-then-abort pattern for the engine task.
+    wear_tracker_handle: JoinHandle<()>,
     /// Port the web UI was started with (for reload change-detection).
     started_web_port: Option<u16>,
     /// Bind address the web UI was started with (for reload change-detection).
@@ -1960,7 +1979,26 @@ async fn run_loop(
         }
     }
 
-    teardown(&mut runner.generation).await;
+    // #47 fix (secondary hardening): the wear tracker's cancellation
+    // branch (`deps.cancel.cancelled()`, `wear_tracker.rs`) does its own
+    // final persist — but `root` was only just cancelled (either by the
+    // signal handler above or by `AppHandle::shutdown`), and that persist
+    // races this function's return unless something here waits for it.
+    // Bound-await it concurrently with the current generation's engine
+    // teardown, using the same bounded-join-then-abort shape as
+    // `teardown` itself: a stuck tracker must never hang daemon shutdown.
+    let wear_tracker_handle = runner.wear_tracker_handle;
+    let wear_teardown = async {
+        let abort = wear_tracker_handle.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(5), wear_tracker_handle)
+            .await
+            .is_err()
+        {
+            abort.abort();
+            tracing::warn!(event = "wear_tracker_abort_forced");
+        }
+    };
+    tokio::join!(teardown(&mut runner.generation), wear_teardown);
     tracing::info!(event = "daemon_stopped");
 }
 

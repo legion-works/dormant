@@ -42,9 +42,12 @@ function getEffectiveStages(displayId: string, fetched: LadderStage[], store: Pa
 }
 
 /**
- * Whether a value represents "no input" — null from the server's JSON
- * serialisation of Rust Option::None, or an empty/whitespace string
- * from a cleared input field.
+ * Whether a value represents "no input" — an empty/whitespace string
+ * from a cleared input field, or an explicit `null`.  The server omits
+ * absent `Option` fields entirely rather than serialising them as JSON
+ * `null` (see `skip_serializing_if` on `LadderStage::dwell` in
+ * `dormant-core/src/types.rs`), so `null` here is a defensive-compat
+ * case: older daemons or manually-crafted patch objects may still send it.
  */
 function isAbsentInput(v: unknown): boolean {
   return v === null || (typeof v === "string" && v.trim() === "");

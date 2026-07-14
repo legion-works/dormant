@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="MSRV 1.88">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux">
+  <a href="https://github.com/legion-works/dormant/releases/latest"><img src="https://img.shields.io/github/v/release/legion-works/dormant" alt="Latest release"></a>
 </p>
 
 ---

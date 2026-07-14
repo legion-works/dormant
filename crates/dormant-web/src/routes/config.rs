@@ -924,4 +924,184 @@ field = "/val"
         // display_rules must be from last-applied (coherent with inventory).
         assert!(resp.display_rules.is_empty());
     }
+
+    // ── Absent-optional serialization (#40) ────────────────────────────────
+
+    /// A display with every display-level `Option` field absent, no ladder,
+    /// no screensaver.
+    fn display_all_optionals_absent(controller: &str) -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec![controller.into()],
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: std::time::Duration::from_secs(5),
+            restore_brightness: 100,
+            samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: false,
+            panel_type: dormant_core::wear::PanelType::default(),
+        }
+    }
+
+    /// A display with a no-dwell ladder stage and a screensaver whose only
+    /// source has `path`/`order`/`image_duration` absent; everything else
+    /// display-level absent, per [`display_all_optionals_absent`].
+    fn display_with_ladder_and_screensaver_source(controller: &str) -> DisplayConfig {
+        use dormant_core::types::{LadderStage, StageKind};
+
+        let source = ScreensaverSource {
+            path: None,
+            urls: vec!["http://example.com/img.jpg".into()],
+            recurse: false,
+            shuffle: false,
+            order: None,
+            image_duration: None,
+        };
+        let screensaver = ScreensaverConfig {
+            trigger: "vacancy".into(),
+            audio: false,
+            source: vec![source],
+            scale_mode: None,
+            transition: None,
+            transition_duration: None,
+            shift_px: defaults::SHIFT_PX,
+            shift_interval: defaults::SHIFT_INTERVAL,
+        };
+        DisplayConfig {
+            ladder: vec![LadderStage {
+                kind: StageKind::RenderScreensaver,
+                dwell: None,
+            }],
+            screensaver: Some(screensaver),
+            ..display_all_optionals_absent(controller)
+        }
+    }
+
+    fn config_with_displays(displays: IndexMap<String, DisplayConfig>) -> Config {
+        Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays,
+            rules: IndexMap::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_omits_absent_optional_fields_instead_of_null() {
+        let mut displays: IndexMap<String, DisplayConfig> = IndexMap::new();
+        displays.insert("tv".into(), display_all_optionals_absent("kwin-dpms"));
+        displays.insert(
+            "proj".into(),
+            display_with_ladder_and_screensaver_source("command"),
+        );
+
+        let (_dir, path) = write_temp_config("config_version = 1\n");
+        let state = test_config_state(path, config_with_displays(displays));
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+
+        let inventory_value = serde_json::to_value(&resp.inventory).unwrap();
+        let tv_obj = inventory_value["displays"]["tv"]
+            .as_object()
+            .expect("tv display must be an object");
+
+        for key in [
+            "blank_mode",
+            "degraded_mode",
+            "screensaver",
+            "output",
+            "ddc_display",
+            "host",
+            "wol_mac",
+            "blank_command",
+            "wake_command",
+            "modes",
+            "ha_url",
+            "blank_service",
+            "blank_data",
+            "wake_service",
+            "wake_data",
+        ] {
+            assert!(
+                !tv_obj.contains_key(key),
+                "expected key '{key}' to be ABSENT from displays.tv, but it is present as {:?}",
+                tv_obj.get(key)
+            );
+        }
+
+        let proj = &inventory_value["displays"]["proj"];
+        let stage0_obj = proj["ladder"][0]
+            .as_object()
+            .expect("ladder stage must be an object");
+        assert!(
+            !stage0_obj.contains_key("dwell"),
+            "expected key 'dwell' to be ABSENT from displays.proj.ladder[0], but it is present as {:?}",
+            stage0_obj.get("dwell")
+        );
+
+        let source0_obj = proj["screensaver"]["source"][0]
+            .as_object()
+            .expect("source[0] must be an object");
+        for key in ["path", "order", "image_duration"] {
+            assert!(
+                !source0_obj.contains_key(key),
+                "expected key '{key}' to be ABSENT from displays.proj.screensaver.source[0], but it is present as {:?}",
+                source0_obj.get(key)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_round_trips_absent_optionals_through_json() {
+        let original = display_with_ladder_and_screensaver_source("command");
+
+        // Direct struct round-trip: the absent optionals must be omitted on
+        // the wire (proven above) and still deserialize back to `None` —
+        // this is additive omission, not a config-version change.
+        let json = serde_json::to_string(&original).unwrap();
+        let round_tripped: DisplayConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, original);
+        assert_eq!(round_tripped.ladder[0].dwell, None);
+        assert_eq!(
+            round_tripped.screensaver.as_ref().unwrap().source[0].path,
+            None
+        );
+
+        // Also exercise the whole-Config round trip via the endpoint path.
+        let mut displays: IndexMap<String, DisplayConfig> = IndexMap::new();
+        displays.insert("proj".into(), original);
+        let (_dir, path) = write_temp_config("config_version = 1\n");
+        let state = test_config_state(path, config_with_displays(displays));
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+        let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
+        let round_tripped_inventory: Config = serde_json::from_str(&inventory_json).unwrap();
+        let round_tripped_display = round_tripped_inventory.displays.get("proj").unwrap();
+        assert_eq!(round_tripped_display.blank_mode, None);
+        assert_eq!(round_tripped_display.output, None);
+        assert_eq!(round_tripped_display.ladder[0].dwell, None);
+        assert_eq!(
+            round_tripped_display.screensaver.as_ref().unwrap().source[0].path,
+            None
+        );
+    }
 }

@@ -83,7 +83,7 @@ function ShellInner() {
           <span className="brand-mark" aria-hidden="true">☽</span>
           <div>
             <div className="brand-wordmark">dormant</div>
-            <div className="brand-sub">v0.1.0 · pre-alpha</div>
+            <div className="brand-sub">{`v${__DORMANT_VERSION__}`}</div>
           </div>
         </div>
 

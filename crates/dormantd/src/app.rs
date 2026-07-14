@@ -54,7 +54,7 @@ use dormant_core::config::{
 };
 use dormant_core::ownership::AlwaysOwned;
 use dormant_core::rules::{
-    ControlMsg, DisplayRuntimeCfg, RuleRuntimeCfg, RulesEngine, RulesEngineConfig,
+    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RuleRuntimeCfg, RulesEngine, RulesEngineConfig,
     SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
@@ -74,6 +74,7 @@ use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::inhibit_activity::{self, ActivityRule};
+use crate::inhibit_audio::{self, AudioRule};
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
 use crate::sd_notify::{self, SdNotify};
@@ -1960,6 +1961,140 @@ fn activity_rules(cfg: &Config) -> (Vec<ActivityRule>, Option<Duration>) {
     (rules, min_poll)
 }
 
+/// Extract the rules that declare an audio-related inhibitor kind
+/// (`"audio-playback"` and/or `"call"`), filtering via
+/// [`InhibitorKind::from_config`] — NEVER raw string literals (spec F7: a
+/// third independent literal copy here would reproduce the `"manual-pause"`
+/// silent-no-op hazard for the two new kinds).
+///
+/// Shaped after `activity_rules` above, but returns a BARE `Vec` (P12):
+/// unlike per-rule activity polling, audio classification is one global
+/// system-wide fact driven by the single `[audio]` section — there is no
+/// per-rule interval to reduce to a minimum.
+fn audio_rules(cfg: &Config) -> Vec<AudioRule> {
+    cfg.rules
+        .iter()
+        .filter_map(|(id, rc)| {
+            let kinds: Vec<InhibitorKind> = rc
+                .inhibitors
+                .iter()
+                .filter_map(|s| InhibitorKind::from_config(s))
+                .filter(|k| matches!(k, InhibitorKind::AudioPlayback | InhibitorKind::Call))
+                .collect();
+            if kinds.is_empty() {
+                None
+            } else {
+                Some(AudioRule {
+                    rule: RuleId(id.clone()),
+                    kinds,
+                })
+            }
+        })
+        .collect()
+}
+
+/// F7's dormantd-side round-trip pin (T5, closing the three-checkpoint
+/// chain: T1 pinned `INHIBITOR_*` consts ⟺ `from_config`; T2 pinned
+/// `VALID_INHIBITORS` ⟺ `from_config`; this pins `audio_rules()` against the
+/// SAME consts — never a raw string literal, so a typo on any of the three
+/// surfaces goes RED here or upstream).
+#[cfg(test)]
+mod audio_rules_tests {
+    use super::*;
+    use dormant_core::config::schema::{
+        AudioConfig, DaemonConfig, NotificationsConfig, WatchdogConfig, WearConfig,
+    };
+    use dormant_core::rules::{INHIBITOR_AUDIO_PLAYBACK, INHIBITOR_CALL, INHIBITOR_USER_ACTIVITY};
+    use indexmap::IndexMap;
+
+    fn rule_cfg(inhibitors: Vec<String>) -> RuleConfig {
+        RuleConfig {
+            zone: "z".into(),
+            displays: vec![],
+            grace_period: Duration::from_secs(30),
+            min_blank_time: Duration::from_secs(0),
+            min_wake_time: Duration::from_secs(0),
+            inhibitors,
+            activity_idle_threshold: Duration::from_secs(60),
+            activity_poll_interval: Duration::from_secs(5),
+            wake_retries: 0,
+            wake_retry_backoff: Duration::from_millis(10),
+            wake_retry_interval: Duration::from_secs(1),
+        }
+    }
+
+    fn cfg_with_rules(rules: IndexMap<String, RuleConfig>) -> Config {
+        Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::new(),
+            rules,
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            watchdog: WatchdogConfig::default(),
+            audio: AudioConfig::default(),
+        }
+    }
+
+    #[test]
+    fn audio_rules_recognizes_exactly_the_declared_kind_literals() {
+        let mut rules = IndexMap::new();
+        rules.insert(
+            "playback".into(),
+            rule_cfg(vec![INHIBITOR_AUDIO_PLAYBACK.to_string()]),
+        );
+        rules.insert("call".into(), rule_cfg(vec![INHIBITOR_CALL.to_string()]));
+        rules.insert(
+            "both".into(),
+            rule_cfg(vec![
+                INHIBITOR_AUDIO_PLAYBACK.to_string(),
+                INHIBITOR_CALL.to_string(),
+                INHIBITOR_USER_ACTIVITY.to_string(),
+            ]),
+        );
+        // Neither audio-related kind declared — must be excluded entirely.
+        rules.insert(
+            "activity_only".into(),
+            rule_cfg(vec![INHIBITOR_USER_ACTIVITY.to_string()]),
+        );
+        // A typo'd/unknown literal — `from_config` returns `None`, filtered.
+        rules.insert("typo".into(), rule_cfg(vec!["audio_playback".to_string()]));
+
+        let cfg = cfg_with_rules(rules);
+        let extracted = audio_rules(&cfg);
+
+        let find = |id: &str| extracted.iter().find(|r| r.rule == RuleId(id.to_string()));
+
+        assert_eq!(
+            find("playback").map(|r| r.kinds.clone()),
+            Some(vec![InhibitorKind::AudioPlayback])
+        );
+        assert_eq!(
+            find("call").map(|r| r.kinds.clone()),
+            Some(vec![InhibitorKind::Call])
+        );
+        assert_eq!(
+            find("both").map(|r| r.kinds.clone()),
+            Some(vec![InhibitorKind::AudioPlayback, InhibitorKind::Call])
+        );
+        assert!(
+            find("activity_only").is_none(),
+            "a rule declaring only user-activity must not appear in audio_rules()"
+        );
+        assert!(
+            find("typo").is_none(),
+            "an unrecognized inhibitor literal must not appear in audio_rules()"
+        );
+        assert_eq!(
+            extracted.len(),
+            3,
+            "exactly the three audio-declaring rules"
+        );
+    }
+}
+
 /// Build render sinks for every display whose ladder contains a render
 /// stage.  Returns the sink map and a fresh `UnboundedReceiver` for the
 /// `InputWake` drain task.  Failures are non-fatal — the engine's empty-sink
@@ -2198,6 +2333,19 @@ fn spawn_generation(
         poll,
         idle_source,
         idle_unit,
+        ctl_tx.clone(),
+        token.clone(),
+    );
+
+    // Audio/call inhibitor (spec §4.3) — global `[audio]` section, so the
+    // rule list is derived straight from `assembly.cfg` here rather than
+    // threaded through `StaticAssembly` like `activity_rules`/`activity_poll`
+    // (there is no per-rule interval to carry). `None` when no rule opts in
+    // (`inhibit_activity::spawn`'s own precedent, mirrored by
+    // `inhibit_audio::spawn`).
+    let _audio_inhibitor = inhibit_audio::spawn(
+        audio_rules(&assembly.cfg),
+        assembly.cfg.audio.clone(),
         ctl_tx.clone(),
         token.clone(),
     );

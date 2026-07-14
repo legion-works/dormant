@@ -908,6 +908,7 @@ dependencies = [
 name = "dormant-doctor"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dormant-core",
  "dormant-displays",
  "dormant-sensors",

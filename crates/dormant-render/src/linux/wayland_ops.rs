@@ -35,7 +35,7 @@
 //! duplication for tests to pin while production silently stops calling
 //! it (see `state.rs`'s `ViewportStateView` docs for why that shape is
 //! forbidden). Real `WlBuffer`/`RawPool` access for the per-frame mmap
-//! writes and `wl_surface.attach` calls stays behind [`real_pool`] /
+//! writes and `wl_surface.attach` calls stays behind [`real_pool_with_region_mut`] /
 //! [`real_buffer`] — real-only accessors that panic if ever called on a
 //! recorder handle, exactly mirroring `RealWaylandOps`'s viewport
 //! downcasts below. The black-transition attach/commit ordering is a
@@ -59,6 +59,7 @@
 
 use std::any::Any;
 use std::fmt;
+use std::io;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -91,7 +92,7 @@ pub(super) trait ViewportHandle: Send + Sync + fmt::Debug {
 /// `RawPool` (behind a mutex — `RawPool::mmap`/`create_buffer` need
 /// `&mut self`); the recorder implementation is an identity tag with
 /// no live pool behind it. Never downcast in shared/test code — only
-/// [`real_pool`] (real-only, panics otherwise) and `RealWaylandOps`'s
+/// [`real_pool_with_region_mut`] (real-only, panics otherwise) and `RealWaylandOps`'s
 /// own trait methods downcast this.
 pub(super) trait PoolHandle: Send + Sync + fmt::Debug {
     fn as_any(&self) -> &dyn Any;
@@ -205,7 +206,7 @@ impl RealPoolHandle {
     /// Real-only accessor: run `f` against the `[offset, offset+len)`
     /// byte region of the pool's mmap. Only ever called from
     /// production code in `state.rs` (`on_mpv_wakeup`,
-    /// `on_transition_tick`) via [`real_pool`] — never from a
+    /// `on_transition_tick`) via [`real_pool_with_region_mut`] — never from a
     /// recorder-backed test, which never holds a `RealPoolHandle` to
     /// downcast to.
     ///
@@ -572,15 +573,18 @@ impl WaylandOps for RecordingWaylandOps {
 /// # Errors
 ///
 /// Returns the underlying `wl_shm` allocation error (real impl only —
-/// the recorder impl never fails).
+/// the recorder impl never fails), or `CreatePoolError::Create` if
+/// `2 * stride * height` overflows `u64` — physically unreachable for
+/// any real display size, but reported gracefully rather than
+/// panicking since this runs inside the Wayland dispatch callback.
 ///
 /// # Panics
 ///
-/// Panics if `2 * stride * height` (as `u64`) or the second buffer's
-/// offset (`stride * height`, cast to `i32`) overflow — physically
-/// unreachable for any real display size (mirrors the existing
-/// `i32::try_from(...).expect(...)` invariant this function replaces
-/// at the `create_dual_buffers` call site).
+/// Panics if the second buffer's offset (`stride * height`, cast to
+/// `i32`) overflows — physically unreachable for any real display
+/// size (mirrors the existing `i32::try_from(...).expect(...)`
+/// invariant this function replaces at the `create_dual_buffers` call
+/// site).
 /// The screensaver's allocated pool handle plus its two buffer
 /// handles (`buf0` at offset 0, `buf1` at offset `stride * height`).
 pub(super) type ScreensaverBuffers = (Arc<dyn PoolHandle>, [Arc<dyn BufferHandle>; 2]);
@@ -592,10 +596,13 @@ pub(super) fn create_screensaver_buffers(
     stride: u32,
 ) -> Result<ScreensaverBuffers, CreatePoolError> {
     let buf1_offset_bytes = dual_buf_second_offset(stride, height);
-    let pool_byte_len = usize::try_from(buf1_offset_bytes.checked_mul(2).expect(
-        "pool byte length (2 * stride * height) must fit in u64 for any real display size",
-    ))
-    .expect("pool byte length must fit in usize");
+    let pool_byte_len_bytes = buf1_offset_bytes.checked_mul(2).ok_or_else(|| {
+        CreatePoolError::Create(io::Error::other(
+            "pool byte length (2 * stride * height) overflowed u64",
+        ))
+    })?;
+    let pool_byte_len =
+        usize::try_from(pool_byte_len_bytes).expect("pool byte length must fit in usize");
     let pool = ops.create_shm_pool(pool_byte_len)?;
     let fmt = wl_shm::Format::Xrgb8888;
     let w = width.cast_signed();
@@ -655,6 +662,32 @@ mod tests {
             "must allocate a pool of 2*stride*height bytes and issue exactly two \
              create_buffer requests at offsets [0, stride*height], both XRGB8888 \
              with identical width/height/stride"
+        );
+    }
+
+    #[test]
+    fn create_screensaver_buffers_reports_pool_size_overflow_as_err() {
+        // RED (fix round 1): `2 * stride * height` overflowing `u64`
+        // must surface as `Err(CreatePoolError::Create(_))` -- a
+        // graceful `CmdFailure`-style path -- not a panic. Pre-migration
+        // this was `checked_mul(2)` feeding a `CmdFailure`; the
+        // migration to `WaylandOps` briefly regressed it to
+        // `.expect(...)`, which aborts the process because this runs
+        // inside the Wayland dispatch callback. `stride == height ==
+        // u32::MAX` makes `stride * height` (as u64) exceed
+        // `u64::MAX / 2`, so `checked_mul(2)` overflows on the FIRST
+        // checked op this function performs (the `i32::try_from` on
+        // the offset, later in the function, is never reached).
+        let ops = RecordingWaylandOps::new();
+        let (width, height, stride) = (640u32, u32::MAX, u32::MAX);
+        let result = create_screensaver_buffers(&ops, width, height, stride);
+        assert!(
+            matches!(result, Err(CreatePoolError::Create(_))),
+            "expected Err(CreatePoolError::Create(_)) for an overflowing pool size, got {result:?}"
+        );
+        assert!(
+            ops.take_call_log().is_empty(),
+            "must fail before issuing any WaylandOps call"
         );
     }
 

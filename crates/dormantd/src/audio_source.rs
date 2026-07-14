@@ -1001,24 +1001,31 @@ mod poller_tests {
         let script = write_script(dir.path(), "pw-dump", &cat_script(MOVIE));
         let (ctl, mut ctl_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
+        // min_active is set far larger than a single tick's real overhead
+        // (~100ms in this sandbox) so ordinary debounce -- which would need
+        // a FRESH min_active to elapse since active_since before asserting
+        // -- cannot possibly land inside the tight deadline below; only the
+        // startup_grace exemption's immediate assert can.
+        let min_active = Duration::from_millis(2500);
         let deps = AudioDeps {
             ctl,
-            cfg: cfg(
-                &script,
-                Duration::from_millis(500),
-                Duration::from_millis(300),
-            ),
+            cfg: cfg(&script, Duration::from_millis(500), min_active),
             rules: vec![rule("r1", &[InhibitorKind::AudioPlayback])],
         };
+        let start = tokio::time::Instant::now();
         let handle = tokio::spawn(run_loop(deps, production_reap_probe(), cancel.clone()));
 
-        let asserted = wait_for_msg(&mut ctl_rx, Duration::from_secs(2), |_, k, v| {
+        let asserted = wait_for_msg(&mut ctl_rx, Duration::from_secs(1), |_, k, v| {
             k == InhibitorKind::AudioPlayback && v
         })
         .await;
         assert!(
             asserted,
-            "first tick on a running stream must assert immediately"
+            "first tick on a running stream must assert immediately, without waiting min_active"
+        );
+        assert!(
+            start.elapsed() < min_active,
+            "assert must land well before a full min_active window elapses"
         );
 
         cancel.cancel();
@@ -1033,28 +1040,34 @@ mod poller_tests {
         let script = write_script(dir.path(), "pw-dump", "#!/bin/sh\nexit 1\n");
         let (ctl, mut ctl_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
+        // min_active is set far larger than a single tick's real overhead
+        // so ordinary debounce (a fresh min_active wait since active_since)
+        // cannot land inside the tight deadline below -- only startup_grace,
+        // never consumed by the two leading failures, can.
+        let min_active = Duration::from_millis(2500);
         let deps = AudioDeps {
             ctl,
-            cfg: cfg(
-                &script,
-                Duration::from_millis(60),
-                Duration::from_millis(300),
-            ),
+            cfg: cfg(&script, Duration::from_millis(60), min_active),
             rules: vec![rule("r1", &[InhibitorKind::AudioPlayback])],
         };
         let handle = tokio::spawn(run_loop(deps, production_reap_probe(), cancel.clone()));
 
         // Two failing ticks, then swap to a running stream.
         tokio::time::sleep(Duration::from_millis(150)).await;
+        let swap_at = tokio::time::Instant::now();
         rewrite_script(&script, &cat_script(MOVIE));
 
-        let asserted = wait_for_msg(&mut ctl_rx, Duration::from_secs(2), |_, k, v| {
+        let asserted = wait_for_msg(&mut ctl_rx, Duration::from_secs(1), |_, k, v| {
             k == InhibitorKind::AudioPlayback && v
         })
         .await;
         assert!(
             asserted,
             "startup_grace must survive leading failures and assert on first success"
+        );
+        assert!(
+            swap_at.elapsed() < min_active,
+            "assert must land well before a full min_active window elapses"
         );
 
         cancel.cancel();
@@ -1261,9 +1274,14 @@ mod poller_tests {
         let (ctl, mut ctl_rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let poll = Duration::from_millis(20);
+        // min_active is set far larger than the breaker-recovery tick's own
+        // overhead so ordinary debounce (a fresh min_active wait since
+        // active_since) could never land inside the tight deadline below --
+        // only startup_grace, untouched by the breaker episode, can.
+        let min_active = Duration::from_secs(4);
         let deps = AudioDeps {
             ctl,
-            cfg: cfg(&script, poll, Duration::from_millis(50)),
+            cfg: cfg(&script, poll, min_active),
             rules: vec![rule("r1", &[InhibitorKind::AudioPlayback])],
         };
         let handle = tokio::spawn(run_loop(deps, always_unreapable_probe(), cancel.clone()));
@@ -1275,19 +1293,26 @@ mod poller_tests {
 
         // Swap to the movie fixture while the breaker is tripped — the swap
         // only takes effect once spawning resumes.
+        let swap_at = tokio::time::Instant::now();
         rewrite_script(&script, &cat_script(MOVIE));
 
-        // Recovery: the 8 fake children (0.5s sleep) exit on their own; once
+        // Recovery: the 8 fake children (3s sleep) exit on their own; once
         // the reap list drains below cap, spawning resumes and the movie
         // fixture must assert IMMEDIATELY (startup_grace survived both the
-        // failures and the breaker episode).
-        let asserted = wait_for_msg(&mut ctl_rx, Duration::from_secs(6), |_, k, v| {
+        // failures and the breaker episode) -- well inside this tight
+        // deadline, whereas ordinary debounce would need an extra
+        // min_active (4s) on top of the recovery tick and blow it.
+        let asserted = wait_for_msg(&mut ctl_rx, Duration::from_millis(3500), |_, k, v| {
             k == InhibitorKind::AudioPlayback && v
         })
         .await;
         assert!(
             asserted,
             "post-breaker recovery with a running stream must assert immediately"
+        );
+        assert!(
+            swap_at.elapsed() < min_active,
+            "assert must land well before a full min_active window elapses"
         );
 
         cancel.cancel();

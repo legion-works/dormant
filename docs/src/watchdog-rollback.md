@@ -51,18 +51,39 @@ dashboard show the pending rollback state.
 
 ### Recovery after a rollback boot
 
-Fix the intended config, validate it, then restart the daemon:
+Fix the intended config, validate it, then either let the file watcher pick
+it up or reload explicitly:
 
 ```bash
 dormantctl validate
-systemctl --user restart dormant
+dormantctl reload
 ```
 
-Do not use `dormantctl reload` as the recovery step. In the current release,
-the rollback process watches and reloads the LKG path until it is restarted,
-even though the banner says "fix it and reload." This is tracked in
-[issue #53](https://github.com/legion-works/dormant/issues/53). The restart is
-the working recovery path.
+The running daemon's file watcher follows the OPERATOR config path (the file
+you edit) even while it is booted from the LKG substitute, so saving the fix
+from an editor triggers the same recovery without running `dormantctl
+reload` at all. Either way this is a live, in-place reload — no restart, no
+dropped engine state.
+
+A reload that validates and builds successfully while a rollback is active
+clears the pending-reload banner, logs `config_rollback_recovered`, and
+atomically clears the persisted crash-loop state (`rollback_active` back to
+`false`, `rolled_back_from` back to `null` in `crash-loop.json`). Confirm
+recovery with:
+
+```bash
+dormantctl status
+```
+
+The banner disappearing (and `status` no longer reporting a rollback)
+confirms the fix took effect. A reload that still fails validation changes
+nothing: the daemon keeps running from the LKG, the banner and crash-loop
+state stay exactly as they were, and no LKG candidate is armed from the
+still-broken bytes.
+
+Restarting the daemon (`systemctl --user restart dormant`) still works and
+remains a safe fallback — for example if the file watcher isn't running for
+some other reason — but it is no longer the required recovery step.
 
 ### Counted-rollback gate
 

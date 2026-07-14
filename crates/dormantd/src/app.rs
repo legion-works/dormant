@@ -204,8 +204,42 @@ pub fn validate_only(
 
 /// The daemon application: config paths + the sensor-source factory.
 pub struct App {
+    /// The generation-0 (boot) source: the already-validated config used
+    /// ONLY to assemble the first generation in [`App::start`]. Ordinary
+    /// callers ([`App::build`]/[`App::build_with_sources`]) set this equal
+    /// to `operator_config_path`; a rollback boot sets it to the LKG
+    /// substitute while `operator_config_path` keeps pointing at the real
+    /// (possibly still-broken) operator config (rollback-recovery plan,
+    /// Task 1: two explicit path roles).
     config_path: PathBuf,
+    /// The operator source: the real config path retained by the watcher,
+    /// Web UI, manual reload, `Runner`, `AppHandle`, and future LKG
+    /// candidates. Equal to `config_path` for every non-boot caller; only
+    /// [`App::with_boot_source`] (boot-only, called by [`crate::boot::boot`]
+    /// after a successful build) ever diverges the two.
+    operator_config_path: PathBuf,
     creds_path: PathBuf,
+    /// Whether THIS boot is a rollback (running generation 0 from the LKG
+    /// substitute rather than the operator path). `false` for every
+    /// ordinary caller; set by [`App::with_boot_source`]. Gates the
+    /// initial LKG-candidate arming in [`App::start`] (coupling-hazard
+    /// suppression, plan Task 1 §5): arming a candidate from the operator
+    /// path's still-broken bytes during a rollback boot would let
+    /// `lkg_tick` promote them once healthy, corrupting the very LKG file
+    /// the rollback is anchored on.
+    rollback_active: bool,
+    /// The daemon's crash-loop/rollback state directory (rollback-recovery
+    /// plan, Task 2 §2) — where `crash-loop.json` lives. Defaults to the
+    /// canonical [`dormant_core::paths::state_dir`] for every non-boot
+    /// caller ([`App::build`]/[`App::build_with_sources`]); `rollback_active`
+    /// is always `false` for those callers, so the accepted-reload
+    /// rollback-recovery transition in `Runner::reload` (which is the only
+    /// consumer of this field) never actually fires for them regardless of
+    /// the value. [`App::with_boot_source`] overrides it with
+    /// `BootInputs::state_dir` — the SAME directory `boot_guard::prepare`
+    /// and `boot()`'s own immediate-rollback write already used for this
+    /// boot, so the live-reload clear lands in the identical file.
+    state_dir: PathBuf,
     strictness: Strictness,
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
@@ -262,8 +296,11 @@ impl App {
             dormant_sensors::registry::build(&cfg.sensors, creds).map_err(anyhow::Error::from)
         });
         Ok(Self {
+            operator_config_path: config_path.clone(),
             config_path,
             creds_path,
+            rollback_active: false,
+            state_dir: dormant_core::paths::state_dir(),
             strictness,
             source_builder,
             #[cfg(feature = "render")]
@@ -294,8 +331,11 @@ impl App {
     {
         Self::validate_or_bail(&config_path, &creds_path, strictness)?;
         Ok(Self {
+            operator_config_path: config_path.clone(),
             config_path,
             creds_path,
+            rollback_active: false,
+            state_dir: dormant_core::paths::state_dir(),
             strictness,
             source_builder: Arc::new(factory),
             #[cfg(feature = "render")]
@@ -353,6 +393,39 @@ impl App {
     #[must_use]
     pub fn with_sd_notify(mut self, sd: SdNotify) -> Self {
         self.sd_notify = sd;
+        self
+    }
+
+    /// Boot-only setter (rollback-recovery plan, Task 1 §3): called by
+    /// [`crate::boot::boot`] immediately after it has successfully built
+    /// `Self` from whichever source `prepare()`/immediate-rollback chose
+    /// (`self.config_path`, unchanged — the generation-0/boot source).
+    /// Records the REAL operator config path (`BootPlan::operator_config`)
+    /// separately, so every runtime consumer added in `App::start`
+    /// (the file watcher, Web UI, `Runner`, `AppHandle`) keeps watching
+    /// and reloading the operator's actual file rather than the LKG
+    /// substitute that only assembled generation 0. `rollback_active`
+    /// records whether THIS boot is a rollback — `boot()` computes it
+    /// locally (never a `BootInputs` field) — and gates the initial LKG
+    /// candidate arming in `App::start` (§5's coupling-hazard
+    /// suppression). Every non-boot caller ([`App::build`]/
+    /// [`App::build_with_sources`]) never calls this, so `config_path ==
+    /// operator_config_path` and `rollback_active == false` for them,
+    /// preserving today's behavior exactly. `state_dir` (Task 2 §2) is
+    /// `BootInputs::state_dir` — the same crash-loop-state directory this
+    /// boot's `boot_guard::prepare`/`boot()` already used, so the
+    /// accepted-reload rollback-recovery clear (`Runner::reload`) rewrites
+    /// the identical `crash-loop.json`.
+    #[must_use]
+    pub(crate) fn with_boot_source(
+        mut self,
+        operator_config_path: PathBuf,
+        rollback_active: bool,
+        state_dir: PathBuf,
+    ) -> Self {
+        self.operator_config_path = operator_config_path;
+        self.rollback_active = rollback_active;
+        self.state_dir = state_dir;
         self
     }
 
@@ -556,8 +629,8 @@ impl App {
             );
         }
 
-        let watcher =
-            reload::config_watcher(&self.config_path).context("install config file watcher")?;
+        let watcher = reload::config_watcher(&self.operator_config_path)
+            .context("install config file watcher")?;
 
         // The doctor service is shared by the IPC server (for
         // `IpcRequest::Doctor`) and the web server (for the
@@ -602,7 +675,7 @@ impl App {
                         reload_rx: reload_tx.subscribe(),
                         config_rx: config_rx.clone(),
                         creds_rx: creds_rx.clone(),
-                        config_path: self.config_path.clone(),
+                        config_path: self.operator_config_path.clone(),
                         creds_path: self.creds_path.clone(),
                         doctor: doctor_service.clone(),
                         wear: wear_handle.clone(),
@@ -642,8 +715,29 @@ impl App {
         // Mechanism: "set at startup completion"). `None` when
         // `watchdog.lkg_enabled` is false — no candidate tracking, no
         // files written, ever, until the config re-enables it on a reload.
-        let lkg_candidate =
-            new_lkg_candidate(&self.config_path, cfg_clone.watchdog.lkg_enabled, "boot");
+        //
+        // Coupling-hazard suppression (rollback-recovery plan, Task 1 §5):
+        // this now reads the OPERATOR path (post path-split), which during
+        // a rollback boot is exactly the broken bytes the daemon just
+        // rolled away from. Arming a candidate from them would let
+        // `lkg_tick` promote them once `stability_window` + healthy
+        // displays elapse, corrupting `last-known-good.toml` — the very
+        // anchor the rollback depends on. So: no candidate at all while
+        // `rollback_active`; `Runner::reload`'s successful-recovery path
+        // (a later task) arms the first post-rollback candidate instead.
+        let lkg_candidate = if self.rollback_active {
+            None
+        } else {
+            new_lkg_candidate(
+                &self.operator_config_path,
+                cfg_clone.watchdog.lkg_enabled,
+                "boot",
+            )
+        };
+        #[cfg(any(test, feature = "test-util"))]
+        let lkg_observed = Arc::new(Mutex::new(LkgCandidateObserved::from_candidate(
+            lkg_candidate.as_ref(),
+        )));
 
         // READY=1 (spec §6.2 F1): the TRUE end of `App::start` — after the
         // IPC listener spawn AND the web spawn above, immediately before
@@ -661,7 +755,7 @@ impl App {
         self.sd_notify.ready();
 
         let runner = Runner {
-            config_path: self.config_path.clone(),
+            config_path: self.operator_config_path.clone(),
             creds_path: self.creds_path.clone(),
             strictness: self.strictness,
             source_builder: self.source_builder,
@@ -685,6 +779,12 @@ impl App {
             lkg_candidate,
             lkg_defer_count: 0,
             probe_failed_warned: false,
+            state_dir: self.state_dir.clone(),
+            rollback_active: self.rollback_active,
+            rollback_state_clear_pending: false,
+            rollback_state_clear_warned: false,
+            #[cfg(any(test, feature = "test-util"))]
+            lkg_observed: lkg_observed.clone(),
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: self.force_reload_spawn_failure,
         };
@@ -699,10 +799,12 @@ impl App {
             root,
             config_rx,
             creds_rx,
-            config_path: self.config_path.clone(),
+            config_path: self.operator_config_path.clone(),
             doctor_service,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
+            #[cfg(any(test, feature = "test-util"))]
+            lkg_observed,
         };
 
         Ok((handle, join))
@@ -744,10 +846,18 @@ pub struct AppHandle {
     root: CancellationToken,
     config_rx: watch::Receiver<Arc<Config>>,
     creds_rx: watch::Receiver<Arc<Credentials>>,
+    /// The OPERATOR config path (rollback-recovery plan, Task 1) — the
+    /// real file the operator edits, watches, and reloads; NOT necessarily
+    /// the path generation 0 was assembled from (a rollback boot assembles
+    /// from the LKG substitute instead, `App::config_path`).
     config_path: PathBuf,
     doctor_service: DoctorService,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
+    /// Test-only LKG-candidate observation seam — see
+    /// [`LkgCandidateObserved`].
+    #[cfg(any(test, feature = "test-util"))]
+    lkg_observed: Arc<Mutex<LkgCandidateObserved>>,
 }
 
 impl AppHandle {
@@ -793,7 +903,10 @@ impl AppHandle {
         self.creds_rx.clone()
     }
 
-    /// The resolved config path (for M2 web UI `WebState`).
+    /// The OPERATOR config path (for M2 web UI `WebState`; rollback-
+    /// recovery plan Task 1) — the real file the operator edits/watches/
+    /// reloads. Distinct from whatever generation 0 was actually assembled
+    /// from during a rollback boot (see `App::config_path`'s doc).
     #[must_use]
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
@@ -806,10 +919,31 @@ impl AppHandle {
     pub fn doctor_service(&self) -> DoctorService {
         self.doctor_service.clone()
     }
+
+    /// Test-util seam (rollback-recovery plan, Task 1 §5 / Task 2): a
+    /// point-in-time snapshot of the `Runner`'s current LKG-candidate
+    /// state. Used to prove whether a candidate is armed and, if so, from
+    /// which bytes/source — without a 5-minute `stability_window` wait.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn lkg_candidate_observed(&self) -> LkgCandidateObserved {
+        self.lkg_observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 // ── Runner (owns the run loop + reload) ────────────────────────────────────────
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent, orthogonal piece of run-loop state \
+              (probe-failure warn-once, rollback-active, rollback-clear-pending, \
+              rollback-clear-warn-once, plus a test-only seam) — a state-machine \
+              enum would need to represent their cross-product, which does not \
+              exist here (they vary independently), not collapse it"
+)]
 struct Runner {
     config_path: PathBuf,
     creds_path: PathBuf,
@@ -866,6 +1000,44 @@ struct Runner {
     /// CURRENT run of consecutive probe failures (spec §6.3: warn once per
     /// failure streak, not once per failed tick).
     probe_failed_warned: bool,
+    /// The crash-loop/rollback state directory (rollback-recovery plan,
+    /// Task 2 §2) — threaded unchanged from `App::state_dir`. The target
+    /// of `boot_guard::clear_rollback_after_reload` on an accepted reload
+    /// while `rollback_active`.
+    state_dir: PathBuf,
+    /// Whether this daemon is CURRENTLY running under an active rollback
+    /// (rollback-recovery plan, Task 2 §2) — the `Runner`-local copy of
+    /// `App::rollback_active`, threaded once at construction. Set back to
+    /// `false` by `Runner::reload`'s accepted-reload arm the first time a
+    /// reload succeeds (the `ContinueRollback` → Proceed transition, Task 2
+    /// §3) — never re-derived from the persisted `crash-loop.json`, so a
+    /// persisted-write failure (§4) can never re-arm it.
+    rollback_active: bool,
+    /// Set when the accepted-reload rollback-recovery transition's
+    /// `crash-loop.json` clear (Task 2 §4) failed to write. Runtime
+    /// recovery is already complete at that point (`rollback_active` is
+    /// already `false`) — this flag only drives a best-effort RETRY of the
+    /// same atomic clear from every subsequent watchdog/LKG tick, so the
+    /// persisted state doesn't stay permanently stuck at
+    /// `rollback_active: true` after a transient write failure.
+    rollback_state_clear_pending: bool,
+    /// Warn-once latch for `config_rollback_state_clear_failed` (Task 2
+    /// §4): the retry fires on EVERY watchdog tick while
+    /// `rollback_state_clear_pending`, so an unlatched `WARN` would flood
+    /// the journal until the write finally succeeds. Reset to `false`
+    /// whenever the retry succeeds (so a LATER failure streak, from a
+    /// future rollback, warns again).
+    rollback_state_clear_warned: bool,
+    /// Test-util seam (rollback-recovery plan, Task 2 §6): the SAME
+    /// `Arc<Mutex<LkgCandidateObserved>>` `AppHandle::lkg_candidate_observed`
+    /// reads. `App::start` seeds it with the boot-time snapshot, but only
+    /// `Runner` ever changes `lkg_candidate` afterwards (a fresh reload
+    /// arm, or a successful promotion clearing it) — so `Runner` must hold
+    /// its own handle to the SAME `Arc` and push every such change through
+    /// [`Runner::sync_lkg_observed`], or the seam would forever report
+    /// stale boot-time state to any test observing it after a reload.
+    #[cfg(any(test, feature = "test-util"))]
+    lkg_observed: Arc<Mutex<LkgCandidateObserved>>,
     /// Test seam (F1) — see `App::force_reload_spawn_failure`.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_spawn_failure: bool,
@@ -888,6 +1060,46 @@ struct LkgCandidate {
     dirty_logged: bool,
     health_deferred_logged: bool,
     save_failed_logged: bool,
+}
+
+/// Test-only snapshot of the `Runner`'s current LKG-candidate state
+/// (rollback-recovery plan, Task 1 §5 / Task 2 candidate-observation seam —
+/// mirrors the `force_reload_spawn_failure` precedent, `App`'s field doc
+/// above). Exposes armed-state plus enough identity (the candidate's own
+/// `source` tag and its captured bytes) to prove WHICH generation a
+/// candidate is tracking, without exposing the private `LkgCandidate` type
+/// itself across the `dormantd::app` boundary.
+///
+/// Committed here (Task 1) because Task 1's own coupling-hazard RED test
+/// (§5: "no candidate armed" after a rollback boot) needs it; Task 2 and
+/// Task 3 reuse this SAME type/accessor for their own candidate-arming
+/// assertions rather than adding a second seam.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LkgCandidateObserved {
+    /// Whether a candidate is currently armed.
+    pub armed: bool,
+    /// The armed candidate's `source` tag (`"boot"`/`"reload"`), or `None`
+    /// when nothing is armed.
+    pub source: Option<&'static str>,
+    /// The armed candidate's captured bytes, or `None` when nothing is
+    /// armed — lets a test assert WHICH bytes (e.g. the operator file's
+    /// current contents) a candidate was armed from.
+    pub bytes: Option<Vec<u8>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl LkgCandidateObserved {
+    fn from_candidate(candidate: Option<&LkgCandidate>) -> Self {
+        match candidate {
+            Some(c) => Self {
+                armed: true,
+                source: Some(c.source),
+                bytes: Some(c.bytes.clone()),
+            },
+            None => Self::default(),
+        }
+    }
 }
 
 /// Build the initial (or post-reload) LKG candidate for `config_path`, or
@@ -1164,6 +1376,61 @@ impl Runner {
         match spawn_result {
             Ok(spawn) => {
                 self.install_generation(spawn);
+
+                // Rollback recovery (rollback-recovery plan, Task 2 §3): a
+                // successful reload from the operator path while a
+                // boot-time rollback is active is the live-reload sibling
+                // of `boot_guard`'s `ContinueRollback -> Proceed`
+                // transition (Context). Gated on `self.rollback_active` so
+                // an ordinary (non-rollback) accepted reload is completely
+                // unaffected — no persisted write, no event, no banner
+                // send beyond what already happens today.
+                if self.rollback_active {
+                    // Clear the just-installed engine's pending-reload
+                    // banner explicitly, before broadcasting `Reloaded`
+                    // below (Context: "clears the engine's pending-reload
+                    // banner"). The fresh engine above was already spawned
+                    // with `pending: None`, so this is belt-and-suspenders
+                    // — it makes the transition's specified shape explicit
+                    // rather than relying on `spawn_generation`'s literal
+                    // staying `None` forever.
+                    let new_ctl = self.engine_ctl.borrow().clone();
+                    let _ = new_ctl.send(ControlMsg::SetPendingReload(None)).await;
+
+                    // Persist the crash-loop-state clear (Task 2 §4: a
+                    // write failure here must NOT roll back this
+                    // physically successful reload). The runner flag
+                    // flips to `false` only AFTER the write attempt,
+                    // regardless of its outcome — runtime recovery is
+                    // complete either way; only the PERSISTED clear can
+                    // lag, and is retried from subsequent watchdog/LKG
+                    // ticks (`Runner::retry_rollback_state_clear`).
+                    match boot_guard::clear_rollback_after_reload(&self.state_dir) {
+                        Ok(()) => {
+                            self.rollback_state_clear_pending = false;
+                            self.rollback_state_clear_warned = false;
+                        }
+                        Err(e) => {
+                            self.rollback_state_clear_pending = true;
+                            if !self.rollback_state_clear_warned {
+                                tracing::warn!(
+                                    event = "config_rollback_state_clear_failed",
+                                    error = %e,
+                                    "reload recovered but the persisted crash-loop state failed \
+                                     to clear; retrying from subsequent watchdog ticks"
+                                );
+                                self.rollback_state_clear_warned = true;
+                            }
+                        }
+                    }
+                    self.rollback_active = false;
+
+                    tracing::info!(
+                        event = "config_rollback_recovered",
+                        config = %self.config_path.display(),
+                    );
+                }
+
                 // Re-check the hazard pairing against the NEW config on every
                 // accepted reload (mirrors the startup check in
                 // `App::start`) — an edit can introduce (or remove) an
@@ -1213,6 +1480,8 @@ impl Runner {
                     self.generation.cfg.watchdog.lkg_enabled,
                     "reload",
                 );
+                #[cfg(any(test, feature = "test-util"))]
+                self.sync_lkg_observed();
                 // Step-boundary ping 7/7 (spec §6.3): reload end. Fires
                 // BEFORE the reload-outcome broadcast (not after): on the
                 // real multi-threaded runtime a receiver parked on
@@ -1351,6 +1620,14 @@ impl Runner {
     /// SAME `request_snapshot` idiom `reload()` uses, ping only on success,
     /// and run the §4 LKG-promotion check on every healthy tick.
     async fn watchdog_tick(&mut self) {
+        // Rollback-recovery retry (Task 2 §4): fires on EVERY watchdog
+        // tick, independent of probe health — the pending clear is a
+        // plain filesystem write, unrelated to whether the engine answers
+        // a snapshot round-trip. Placed before the probe so a wedged
+        // engine (which starves the rest of this function below) never
+        // starves the retry too.
+        self.retry_rollback_state_clear();
+
         let ctl = self.engine_ctl.borrow().clone();
         let probe_result = watchdog_probe(&ctl).await;
         if ping_if_healthy(&mut self.sd, probe_result.as_ref()) {
@@ -1375,6 +1652,54 @@ impl Runner {
                 self.probe_failed_warned = true;
             }
         }
+    }
+
+    /// Retry the accepted-reload rollback-recovery's persisted
+    /// `crash-loop.json` clear (Task 2 §4) after a prior write failure. A
+    /// no-op when nothing is pending — the common case, every tick a
+    /// rollback isn't in a write-failure streak. Runtime recovery
+    /// (`rollback_active`) is ALREADY `false` by the time this can ever
+    /// have something pending (`Runner::reload`'s accepted-reload arm
+    /// flips it before this flag can even be set) — this only chases the
+    /// PERSISTED state until it agrees.
+    fn retry_rollback_state_clear(&mut self) {
+        if !self.rollback_state_clear_pending {
+            return;
+        }
+        match boot_guard::clear_rollback_after_reload(&self.state_dir) {
+            Ok(()) => {
+                self.rollback_state_clear_pending = false;
+                self.rollback_state_clear_warned = false;
+            }
+            Err(e) => {
+                if !self.rollback_state_clear_warned {
+                    tracing::warn!(
+                        event = "config_rollback_state_clear_failed",
+                        error = %e,
+                        "retry of the persisted crash-loop state clear failed again; still \
+                         retrying"
+                    );
+                    self.rollback_state_clear_warned = true;
+                }
+            }
+        }
+    }
+
+    /// Test-util seam sync (rollback-recovery plan, Task 2 §6): push the
+    /// current `self.lkg_candidate` into the shared
+    /// `AppHandle::lkg_candidate_observed()` snapshot. Must be called at
+    /// every site that changes `lkg_candidate`'s presence/identity — a
+    /// fresh reload arm and a successful promotion clearing it are the two
+    /// RUNTIME sites (the boot-time value is already captured directly by
+    /// `App::start` when it constructs the `Arc<Mutex<_>>`, so no call is
+    /// needed there).
+    #[cfg(any(test, feature = "test-util"))]
+    fn sync_lkg_observed(&self) {
+        *self
+            .lkg_observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            LkgCandidateObserved::from_candidate(self.lkg_candidate.as_ref());
     }
 
     /// The §4 LKG-promotion check, run on every healthy probe tick. A
@@ -1457,6 +1782,8 @@ impl Runner {
                         tracing::info!(event = "lkg_saved");
                         self.lkg_defer_count = 0;
                         self.lkg_candidate = None;
+                        #[cfg(any(test, feature = "test-util"))]
+                        self.sync_lkg_observed();
                     }
                     Err(e) => {
                         if let Some(candidate) = self.lkg_candidate.as_mut()

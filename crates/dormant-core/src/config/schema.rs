@@ -163,6 +163,11 @@ pub struct DaemonConfig {
     /// `30s..=300s`.
     #[serde(default = "default_pair_timeout", with = "humantime_serde")]
     pub pair_timeout: Duration,
+
+    /// Post-wake settle window for the doctor exercise's bounded retry
+    /// read (`dormantctl doctor --exercise`). Validated to `100ms..=30s`.
+    #[serde(default = "default_doctor_wake_settle", with = "humantime_serde")]
+    pub doctor_wake_settle: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -181,6 +186,7 @@ impl Default for DaemonConfig {
             entity_crud_enabled: defaults::ENTITY_CRUD_ENABLED,
             pairing_enabled: defaults::PAIRING_ENABLED,
             pair_timeout: defaults::PAIR_TIMEOUT,
+            doctor_wake_settle: defaults::DOCTOR_WAKE_SETTLE,
         }
     }
 }
@@ -1140,6 +1146,9 @@ fn default_pairing_enabled() -> bool {
 }
 fn default_pair_timeout() -> Duration {
     defaults::PAIR_TIMEOUT
+}
+fn default_doctor_wake_settle() -> Duration {
+    defaults::DOCTOR_WAKE_SETTLE
 }
 fn default_trigger() -> String {
     defaults::SCREENSAVER_TRIGGER.into()

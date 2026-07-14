@@ -843,6 +843,49 @@ describe("Config tab-switch guard", () => {
     expect(s.isLocked(["daemon", "stale_sensor_timeout"], noRedacted)).toBe(false);
   });
 
+  // ── doctor_wake_settle (#34) ─────────────────────────────────────────────
+
+  it("renders doctor_wake_settle as a duration input", async () => {
+    const cfg: ConfigResponse = {
+      ...SAMPLE_CONFIG,
+      fingerprint: "fe01aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc",
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        daemon: {
+          ...SAMPLE_CONFIG.inventory.daemon,
+          doctor_wake_settle: "3s",
+        },
+      },
+    };
+
+    render(<SettingsForm config={cfg} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    const settleInput = screen.getByLabelText("doctor_wake_settle") as HTMLInputElement;
+    expect(settleInput.tagName).toBe("INPUT");
+    expect(settleInput.type).toBe("text"); // DurationField is a text input
+    expect(settleInput.value).toBe("3s");
+  });
+
+  it("editing doctor_wake_settle creates a valid, unlocked patch", async () => {
+    const { createPatchStore } = await import("../app/config/patch");
+
+    const s = createPatchStore();
+    s.trackEdit(["daemon", "doctor_wake_settle"], "5s");
+
+    const patches = s.buildPatches();
+    expect(patches).toHaveLength(1);
+
+    const paths = patches.map((p) => ("path" in p ? p.path.join(".") : ""));
+    expect(paths).toContain("daemon.doctor_wake_settle");
+
+    const noRedacted: string[][] = [];
+    expect(s.isLocked(["daemon", "doctor_wake_settle"], noRedacted)).toBe(false);
+  });
+
   // ── DurationField placeholder ──
 
   it("DurationField shows persistent placeholder when placeholder prop given", async () => {

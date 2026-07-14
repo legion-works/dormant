@@ -43,7 +43,7 @@ use crate::config::SensorKind;
 use crate::error::DormantError;
 use crate::ownership::OwnershipGate;
 use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
-use crate::traits::{CommandSink, PanelState, RenderSink};
+use crate::traits::{CommandSink, PanelState, PowerState, RenderSink};
 use crate::types::{
     BlankMode, CmdFailure, DisplayId, LadderStage, PresenceEvent, RuleId, SensorId, SensorState,
     StageKind, Tick, Timestamp, ZoneId,
@@ -585,6 +585,12 @@ pub struct RulesEngineConfig {
     /// All sensors (must include every sensor referenced by any zone spec
     /// passed to [`RulesEngine::new`]).
     pub sensors: Vec<SensorRuntimeCfg>,
+    /// Post-wake settle window for the doctor exercise's bounded retry
+    /// read (`daemon.doctor_wake_settle`, default `3s`). When the first
+    /// post-wake read is absent or still non-`On`, the exercise sleeps
+    /// this long and performs exactly one more bounded read before
+    /// classifying the wake step.
+    pub doctor_wake_settle: Duration,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -1470,6 +1476,7 @@ impl RulesEngine {
         // alive.  This mirrors how `process_effect` clones `results_tx`
         // for spawned blank/wake tasks.
         let results_tx = self.results_tx.clone();
+        let wake_settle = self.cfg.doctor_wake_settle;
 
         tokio::spawn(async move {
             let report = run_exercise_sequence(
@@ -1478,6 +1485,7 @@ impl RulesEngine {
                 pre_phase,
                 rules_to_resume.clone(),
                 target,
+                wake_settle,
             )
             .await;
 
@@ -1963,6 +1971,48 @@ async fn bounded_read_state(sink: Arc<dyn CommandSink>) -> Option<PanelState> {
     }
 }
 
+/// Read the panel state after `wake()` returns, retrying once after a
+/// settle window if the first read is absent or still non-`On`.
+///
+/// Some panels haven't finished powering on by the time the wake command
+/// returns — an immediate readback can report absent or a stale non-`On`
+/// state even though the wake will shortly succeed.  Rather than false-
+/// negative the wake step, this gives the panel one settle window
+/// (`daemon.doctor_wake_settle`) and one bounded retry read before the
+/// caller classifies the step.  No delay when the first read already
+/// confirms `On`.
+///
+/// Classifies from the best/last observation: the retry read is the
+/// freshest data and wins when present; falls back to the first read
+/// (which may itself be a non-`On` observation, still more informative
+/// than nothing) when the retry produced no readback.
+async fn read_after_wake_with_settle(
+    sink: &Arc<dyn CommandSink>,
+    display: &DisplayId,
+    wake_settle: Duration,
+) -> Option<PanelState> {
+    let first_read = bounded_read_state(sink.clone()).await;
+    let confirmed_on = matches!(
+        first_read.as_ref().and_then(|s| s.power),
+        Some(PowerState::On)
+    );
+    if confirmed_on {
+        return first_read;
+    }
+
+    let display_for_log = display;
+    tracing::info!(
+        event = "control_path_exercise",
+        display = %display_for_log,
+        post_wake_retry = true,
+        settle_ms = wake_settle.as_millis(),
+        "exercise: first post-wake read absent or non-On; retrying after panel settle",
+    );
+    tokio::time::sleep(wake_settle).await;
+    let retry_read = bounded_read_state(sink.clone()).await;
+    retry_read.or(first_read)
+}
+
 /// Drive the [`ControlMsg::Exercise`] sequence against `sink` and return the
 /// aggregated [`ExerciseReport`].
 ///
@@ -1981,6 +2031,7 @@ async fn run_exercise_sequence(
     pre_phase: String,
     paused_rules: Vec<RuleId>,
     display: DisplayId,
+    wake_settle: Duration,
 ) -> ExerciseReport {
     let mode = effective_mode.unwrap_or(BlankMode::PowerOff);
     let mut steps: Vec<ExerciseStep> = Vec::new();
@@ -2015,9 +2066,13 @@ async fn run_exercise_sequence(
     });
 
     // 3. wake() → read.  Confirmed iff the panel state returned to the
-    //    ORIGINAL baseline — the wake-path restoration check.
+    //    ORIGINAL baseline — the wake-path restoration check.  A panel
+    //    that hasn't finished powering on yet may report absent or a
+    //    non-`On` readback immediately after the wake command returns —
+    //    `read_after_wake_with_settle` gives it exactly one bounded
+    //    retry after `wake_settle` before classifying.
     let wake_result = sink.wake().await;
-    let state_after_wake = bounded_read_state(sink.clone()).await;
+    let state_after_wake = read_after_wake_with_settle(sink, &display, wake_settle).await;
     let wake_verdict = restore_verdict(
         &wake_result,
         baseline.as_ref(),
@@ -2371,6 +2426,7 @@ mod tests {
             "active".to_string(),
             Vec::new(),
             DisplayId("mon".into()),
+            Duration::ZERO,
         )
         .await;
 
@@ -2411,6 +2467,88 @@ mod tests {
         );
     }
 
+    /// Post-wake settle retry (#34): the first post-wake read is absent,
+    /// so the exercise must sleep `doctor_wake_settle` and perform
+    /// exactly one bounded retry read before classifying the wake step.
+    /// Paused Tokio time proves the retry genuinely waits for the
+    /// configured settle duration — not a scheduling accident — by
+    /// asserting the spawned sequence is still unfinished right before
+    /// the deadline and only completes once the clock crosses it.
+    #[tokio::test(start_paused = true)]
+    async fn exercise_sequence_confirms_wake_after_settle_retry() {
+        use crate::fakes::ExerciseSink;
+
+        let sink = Arc::new(ExerciseSink::new());
+        let on = Some(PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(80),
+        });
+        let standby = Some(PanelState {
+            power: Some(PowerState::Standby),
+            brightness: Some(0),
+        });
+
+        // Script: pre-read On, blank-read Off, first post-wake read
+        // None, retry read On, restore read On.
+        sink.push_read_state(on.clone()); // baseline: On
+        sink.push_read_state(standby); // post-blank: Off
+        sink.push_read_state(None); // first post-wake read: absent
+        sink.push_read_state(on.clone()); // retry read: On
+        sink.push_read_state(on); // restore read: On
+
+        let settle = Duration::from_secs(3);
+        let sink_dyn: Arc<dyn CommandSink> = sink.clone();
+        let handle = tokio::spawn(async move {
+            run_exercise_sequence(
+                &sink_dyn,
+                Some(BlankMode::PowerOff),
+                "active".to_string(),
+                Vec::new(),
+                DisplayId("mon".into()),
+                settle,
+            )
+            .await
+        });
+
+        // Let the spawned task run its synchronous prefix (baseline
+        // read, blank, first post-wake read) up to the point where it
+        // blocks on the settle sleep.
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "exercise task must be blocked on the settle sleep before the \
+             configured duration elapses, not finished early"
+        );
+
+        // Advancing by less than the full settle duration must not be
+        // enough to unblock the retry.
+        tokio::time::advance(settle.checked_sub(Duration::from_millis(1)).unwrap()).await;
+        assert!(
+            !handle.is_finished(),
+            "exercise task must still be waiting just before the settle \
+             deadline"
+        );
+
+        // Crossing the configured settle duration fires the sleep and
+        // lets the retry read run to completion.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            handle.is_finished(),
+            "exercise task must complete once the settle duration elapses"
+        );
+
+        let report = handle.await.expect("exercise task panicked");
+
+        assert_eq!(report.steps[2].command, "wake");
+        assert_eq!(
+            report.steps[2].verdict,
+            ExerciseVerdict::Confirmed,
+            "wake verdict must be Confirmed only after the settle retry \
+             observes On"
+        );
+    }
+
     /// Decisive test: a controller that returns Ok but whose panel state
     /// does NOT change across the blank → wake sequence.  The blank
     /// step's verdict is `Failed` and the restore step is also `Failed`
@@ -2438,6 +2576,7 @@ mod tests {
             "active".to_string(),
             Vec::new(),
             DisplayId("mon".into()),
+            Duration::ZERO,
         )
         .await;
 
@@ -2473,6 +2612,7 @@ mod tests {
             "active".to_string(),
             Vec::new(),
             DisplayId("mon".into()),
+            Duration::ZERO,
         )
         .await;
 
@@ -2509,6 +2649,7 @@ mod tests {
             "active".to_string(),
             Vec::new(),
             DisplayId("mon".into()),
+            Duration::ZERO,
         )
         .await;
 
@@ -2560,6 +2701,7 @@ mod tests {
             "blanked".to_string(), // restore must re-blank
             Vec::new(),
             DisplayId("mon".into()),
+            Duration::ZERO,
         )
         .await;
 
@@ -2599,6 +2741,7 @@ mod tests {
             "active".to_string(),
             rules.clone(),
             DisplayId("mon".into()),
+            Duration::ZERO,
         )
         .await;
 
@@ -2817,6 +2960,7 @@ mod tests {
                     hold_time: None,
                     stale_timeout: Duration::from_secs(3600),
                 }],
+                doctor_wake_settle: Duration::from_secs(3),
             },
             ZoneEngine::new(vec![], &[sid]).expect("single-sensor empty-zone engine is valid"),
             HashMap::new(),
@@ -2900,6 +3044,7 @@ mod tests {
                     hold_time: Some(hold),
                     stale_timeout: Duration::from_secs(3600),
                 }],
+                doctor_wake_settle: Duration::from_secs(3),
             },
             ZoneEngine::new(vec![], &[sid]).expect("single-sensor empty-zone engine is valid"),
             HashMap::new(),
@@ -3027,6 +3172,7 @@ mod tests {
                 rules: vec![],
                 displays: vec![],
                 sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
             },
             ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
             HashMap::new(),
@@ -3119,6 +3265,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
             rules: vec![],
             displays: vec![],
             sensors: vec![],
+            doctor_wake_settle: Duration::from_secs(3),
         },
         zone_engine,
         machines,
@@ -3217,6 +3364,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
             rules: vec![],
             displays: vec![],
             sensors: vec![],
+            doctor_wake_settle: Duration::from_secs(3),
         },
         zone_engine,
         machines,

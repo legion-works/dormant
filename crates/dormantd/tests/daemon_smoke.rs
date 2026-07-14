@@ -4418,3 +4418,252 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
         "an aborted reload must never reach the reload_end boundary: {output}"
     );
 }
+
+// ── T6: audio/call inhibitor — first inhibitor smoke coverage ──────────────────
+//
+// (a) grace-freeze: a running stream keeps the display's grace countdown
+//     frozen past its own expiry; swapping to an idle fixture unfreezes it
+//     and the blank proceeds (`state_machine.rs:1213-1237`'s full-remaining
+//     pre-freeze when the inhibitor is already asserted at `Grace` entry).
+// (b) reload-mid-movie (spec F2/R2-M1, anti-tautology per plan P4):
+//     `min_active = "5s"` is set STRICTLY greater than the post-reload
+//     observation window (`grace = "3s"`), so ordinary debounce cannot
+//     re-freeze the new generation's display in time — only the FRESH
+//     `startup_grace` exemption on the new poller's first successful tick
+//     can. A missing exemption lets the zone's own live Absent edge run an
+//     unfrozen grace countdown that expires before ordinary debounce would
+//     ever assert, and the display blanks — visibly RED.
+
+const AUDIO_MOVIE_FIXTURE: &str = include_str!("fixtures/pw_dump/movie.json");
+const AUDIO_IDLE_FIXTURE: &str = include_str!("fixtures/pw_dump/idle.json");
+
+/// Wrap a raw `pw-dump` JSON fixture in a `#!/bin/sh` script that `cat`s it
+/// verbatim (the `audio_source.rs` poller-test precedent, same mechanism).
+fn audio_cat_script(json: &str) -> String {
+    format!("#!/bin/sh\ncat <<'AUDIO_FIXTURE_EOF'\n{json}\nAUDIO_FIXTURE_EOF\n")
+}
+
+/// Write a fake `pw-dump` script emitting `json`, executable (0o755 — the
+/// `write_credentials` `PermissionsExt` precedent above; same mechanism,
+/// 0o755 not 0o600 because this file must be executable).
+fn write_pw_dump_script(dir: &Path, json: &str) -> PathBuf {
+    let path = dir.join("pw-dump");
+    fs::write(&path, audio_cat_script(json)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// Atomically swap a running fake `pw-dump` script's fixture output:
+/// write-temp + `chmod` 0o755 BEFORE rename — rename carries the temp's
+/// mode, so losing the exec bit would silently flip the poller onto its
+/// failure path (R2-N, `audio_source.rs`'s `rewrite_script` precedent).
+fn rewrite_pw_dump_script(path: &Path, json: &str) {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, audio_cat_script(json)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::rename(&tmp, path).unwrap();
+}
+
+/// One ruled `command` display opting into `inhibitors = ["audio-playback"]`,
+/// with a global `[audio]` section pointed at the fake `pw-dump` script.
+/// `poll_interval` is fixed at `"1s"` (P3 — the validation floor is `>= 1s`);
+/// `grace`/`min_active` are tunable per case (P3/P4); `log_level` is the
+/// unrelated daemon-level knob the reload test flips (`reload_carry_config`
+/// precedent above).
+fn audio_rule_config(
+    marker: &Path,
+    script: &Path,
+    grace: &str,
+    min_active: &str,
+    log_level: &str,
+) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+log_level = "{log_level}"
+
+[audio]
+poll_interval = "1s"
+min_active = "{min_active}"
+pw_dump_command = "{script}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "printf B >> '{m}'"
+wake_command = "printf W >> '{m}'"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "{g}"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+inhibitors = ["audio-playback"]
+"#,
+        log_level = log_level,
+        min_active = min_active,
+        script = script.display(),
+        m = marker.display(),
+        g = grace,
+    )
+}
+
+// ── (a) grace-freeze then blank on idle ─────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let script = write_pw_dump_script(dir.path(), AUDIO_MOVIE_FIXTURE);
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &audio_rule_config(&marker, &script, "3s", "0s", "info"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    // The zone's own `Absent` edge is delayed well past the poller's first
+    // (immediate-at-spawn) tick, so `enter_grace` always observes the
+    // inhibitor already asserted and pre-freezes with the FULL grace period
+    // (`state_machine.rs:1213-1237`) — deterministic regardless of tick
+    // jitter, rather than racing a partial freeze.
+    let sensor_script = vec![(Duration::from_millis(800), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", sensor_script),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    // Grace (3s) would expire at ~3.8s if unfrozen (800ms Absent edge + 3s
+    // grace); wait comfortably past that. The movie fixture never changes
+    // in this phase, so the display must still be grace-frozen: no blank.
+    let blanked_early = wait_for(
+        || count(&marker, 'B') >= 1,
+        Duration::from_millis(800 + 3000 + 1500),
+    )
+    .await;
+    assert!(
+        !blanked_early,
+        "movie fixture must keep the display grace-frozen past grace expiry"
+    );
+
+    // Swap the fixture to idle — the poller's next tick deasserts
+    // immediately (asymmetric debounce), unfreezing the countdown from its
+    // full stored remaining duration; the blank must now proceed.
+    rewrite_pw_dump_script(&script, AUDIO_IDLE_FIXTURE);
+    assert!(
+        wait_for(
+            || count(&marker, 'B') >= 1,
+            // 1s tick delay + 3s grace remaining + 2s margin = 6s.
+            Duration::from_secs(6),
+        )
+        .await,
+        "idle fixture must unfreeze grace and let the blank proceed"
+    );
+
+    shutdown(handle, join).await;
+}
+
+// ── (b) reload-mid-movie (F2/R2-M1, anti-tautology per P4) ──────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let script = write_pw_dump_script(dir.path(), AUDIO_MOVIE_FIXTURE);
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &audio_rule_config(&marker, &script, "3s", "5s", "info"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+
+    // `fake_factory` replays this SAME script from t=0 on every (re)build
+    // (see its doc comment) — so each generation's own zone-absent edge
+    // lands 800ms after ITS OWN start, giving that generation's poller the
+    // same ordering-safety margin as case (a) above.
+    let sensor_script = vec![(Duration::from_millis(800), ev("desk", SensorState::Absent))];
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", sensor_script),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    // Pre-reload sanity: the first generation's own startup_grace exemption
+    // should already have the display grace-frozen on the movie fixture.
+    assert!(
+        !wait_for(|| count(&marker, 'B') >= 1, Duration::from_millis(1500)).await,
+        "pre-reload generation must already be grace-frozen on the movie fixture"
+    );
+
+    // Unrelated-key reload — `log_level` only; same display/rule/audio block.
+    fs::write(
+        &cfg_path,
+        audio_rule_config(&marker, &script, "3s", "5s", "debug"),
+    )
+    .unwrap();
+    assert!(handle.trigger_reload().await);
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(
+        outcome,
+        ReloadOutcome::Reloaded,
+        "the unrelated log_level edit must be accepted"
+    );
+
+    // Anti-tautology pin (P4): min_active (5s) is set strictly greater than
+    // the post-reload observation window (grace 3s, zone-absent at 800ms).
+    // A missing startup_grace exemption on the NEW generation's poller
+    // would leave `overlays.inhibited` false when the zone's own fresh
+    // Absent edge arrives, so `enter_grace` starts a LIVE (unfrozen)
+    // countdown expiring at ~3.8s post-reload — long before ordinary
+    // debounce (5s) could ever assert — and the display blanks. The
+    // exemption must instead re-freeze grace before that, so no blank must
+    // appear even comfortably past that deadline.
+    assert!(
+        !wait_for(
+            || count(&marker, 'B') >= 1,
+            Duration::from_millis(800 + 3000 + 2000),
+        )
+        .await,
+        "the new generation's poller must re-freeze grace via its own fresh \
+         startup_grace exemption — grace must never expire"
+    );
+
+    shutdown(handle, join).await;
+}

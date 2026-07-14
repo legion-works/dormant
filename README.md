@@ -20,6 +20,14 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 
 `dormant` is a Rust daemon that reads those sensors and blanks your displays only when the room is actually empty, then wakes them the instant someone walks back in. It runs your PC monitors and your TVs, over local buses and over the network, on rules you write per display.
 
+<p align="center">
+  <img src="design/screenshots/dashboard.png" alt="dormant web dashboard — displays, sensors, zones, signal flow, and panel-exposure summary" width="820">
+</p>
+
+<p align="center">
+  <img src="design/screenshots/tray.png" alt="dormant KDE tray applet — status tooltip and pause/blank/wake menu" width="620">
+</p>
+
 ## Why it exists
 
 The whole point is protecting OLEDs *without* the usual trade-offs — no black bars burned into the panel, no audio cutting out when the TV screen goes dark, no three-second wait to see your desktop again. Every blank mode makes a different bargain:

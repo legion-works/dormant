@@ -250,8 +250,11 @@ fn probe_config(args: &DoctorArgs) -> (Vec<ProbeResult>, Option<String>) {
 
 // ── Table printing ──────────────────────────────────────────────────────────────
 
-/// Print a table of probe results.
-fn print_table(results: &[ProbeResult]) {
+/// Render probe results as a table, returning the rendered text.
+///
+/// Extracted from `print_table` so it can be exercised directly in tests
+/// without capturing stdout.
+fn format_table(results: &[ProbeResult]) -> String {
     let mut table = Table::new();
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
@@ -271,7 +274,12 @@ fn print_table(results: &[ProbeResult]) {
         ]));
     }
 
-    println!("{table}");
+    table.to_string()
+}
+
+/// Print a table of probe results.
+fn print_table(results: &[ProbeResult]) {
+    println!("{}", format_table(results));
 }
 
 /// Determine the overall outcome from probe results.
@@ -412,36 +420,24 @@ mod tests {
     // ── Table formatting ────────────────────────────────────────────────────
 
     #[test]
-    fn table_contains_glyphs() {
+    fn format_table_contains_glyphs_and_names() {
         let results = vec![
             ProbeResult::pass("test-pass", "all good"),
             ProbeResult::fail("test-fail", "something broke"),
             ProbeResult::skip("test-skip", "not applicable"),
             ProbeResult::not_supported("test-na", "not on this platform"),
+            ProbeResult::fail("test-multiline", "line one\nline two"),
         ];
 
-        // Print to string and check glyphs.
-        let mut table = Table::new();
-        table
-            .set_content_arrangement(ContentArrangement::Dynamic)
-            .set_header(vec!["Probe", "Status", "Detail"]);
-        for r in &results {
-            let (glyph, color) = match r.status {
-                ProbeStatus::Pass => ("✓", Color::Green),
-                ProbeStatus::Fail => ("✗", Color::Red),
-                ProbeStatus::Skip => ("-", Color::Yellow),
-                ProbeStatus::NotSupported => ("N/A", Color::Yellow),
-            };
-            table.add_row(Row::from(vec![
-                Cell::new(&r.name),
-                Cell::new(glyph).fg(color),
-                Cell::new(&r.detail),
-            ]));
-        }
+        let output = format_table(&results);
 
-        let output = table.to_string();
         assert!(output.contains('✓'), "table should contain checkmark");
         assert!(output.contains('✗'), "table should contain X mark");
+        assert!(output.contains('-'), "table should contain skip dash");
+        assert!(
+            output.contains("N/A"),
+            "table should contain NotSupported glyph"
+        );
         assert!(
             output.contains("test-pass"),
             "table should contain probe name"
@@ -455,8 +451,20 @@ mod tests {
             "table should contain probe name"
         );
         assert!(
-            output.contains("N/A"),
-            "table should contain NotSupported glyph"
+            output.contains("test-na"),
+            "table should contain probe name"
+        );
+        assert!(
+            output.contains("all good"),
+            "table should contain probe detail"
+        );
+        assert!(
+            output.contains("line one"),
+            "table should contain first line of multiline detail"
+        );
+        assert!(
+            output.contains("line two"),
+            "table should contain second line of multiline detail"
         );
     }
 

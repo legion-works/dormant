@@ -389,9 +389,25 @@ A rule links a zone to one or more displays with timing parameters.
 | `wake_retry_backoff` | duration | `"2s"` | Backoff before the first wake retry |
 | `wake_retry_interval` | duration | `"60s"` | Interval between successive wake retries |
 
-`"audio-playback"` and `"call"` are accepted for forward-compatible config,
-but the PipeWire poller is not shipped. They do not currently inhibit a rule.
-See the `[audio]` section below.
+`"manual-pause"` is accepted in this list but is a deliberate no-op: it is
+never mapped to an inhibitor check, so listing it changes nothing. Manual
+pause is a real, separate mechanism — `dormantctl pause`/`resume`, the web
+UI's pause/resume action, or `POST`/`GET` `/api/pause`/`/api/resume` — which
+sets the display's `Overlays.paused` state directly and freezes the blank
+path independently of `inhibitors`.
+
+`"audio-playback"` and `"call"` are backed by the PipeWire poller described
+in the `[audio]` section below; a rule only reacts to a kind it lists here.
+
+**Recommendation: one rule per display when using inhibitors.** Two rules
+that both target the same display each track and publish their OWN
+inhibitor state for it, and whichever rule's update lands second silently
+overwrites the first's effective value at the display level — a
+pre-existing limitation (per-display combination across rules does not
+exist), not fixed by this feature. This feature raises the odds of hitting
+it, since inhibitors are its whole point and a movie rule and a work rule
+sharing one TV is a realistic config. Give each inhibitor-using display
+exactly one rule.
 
 ## `[wear]` — panel-wear tracking
 
@@ -437,20 +453,51 @@ failure banner remain active. See [Failure notifications](./failure-notification
 The systemd watchdog interval comes from the unit, not this table. See
 [Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
-## `[audio]` — reserved audio-aware blanking settings
+## `[audio]` — PipeWire audio- and call-aware blanking
 
-The schema, validation, and web settings are shipped, but audio detection is
-not. No PipeWire poller runs in this release, so these settings and the
-`"audio-playback"` / `"call"` inhibitors have no runtime effect yet.
+Global (not per-rule) settings for the `pw-dump`-polling audio inhibitor.
+Stream classification is a system-wide fact about one PipeWire instance, so
+this section is global; rules opt into it by listing `"audio-playback"`
+and/or `"call"` in their own `inhibitors`. The poller polls
+`pw_dump_command` on an interval, classifies the running PipeWire graph, and
+asserts/deasserts each kind independently — the screen stays awake while
+ANY declared kind (user activity, audio playback, or a call) is active.
+
+Corked, paused, idle, and suspended streams never inhibit — only a
+`"running"` stream does. Deassertion is immediate on the poll after activity
+stops; assertion (other than at daemon/generation startup, where an
+already-running stream is trusted immediately) waits for `min_active` of
+continuous activity, so a short notification chime does not hold a display
+awake.
+
+Failure modes (missing `pw-dump` binary, a timeout, malformed output, or the
+poller's internal circuit breaker tripping after repeated unreapable
+subprocesses) always fail toward blanking: both kinds are published
+`false`, never toward holding the screen on indefinitely. A single failed
+poll is tolerated without changing state (jitter allowance); two
+consecutive failures deassert both kinds.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `poll_interval` | duration | `"5s"` | Reserved PipeWire graph polling interval |
-| `min_active` | duration | `"3s"` | Reserved stream-activity debounce |
-| `call_roles` | []string | `["Communication"]` | Reserved `media.role` values classified as calls |
-| `playback_roles` | []string | unset | Optional reserved playback-role filter; an empty list is invalid |
-| `capture_is_call` | boolean | `false` | Reserved microphone-as-call classification |
-| `pw_dump_command` | string | `"pw-dump"` | Reserved poller command |
+| `poll_interval` | duration | `"5s"` | How often to invoke `pw_dump_command`; minimum `1s` |
+| `min_active` | duration | `"3s"` | Continuous stream activity required before asserting (deassertion is immediate); must not exceed `10 ×` `poll_interval` |
+| `call_roles` | []string | `["Communication"]` | `media.role` values that mean "this running stream is a call" |
+| `playback_roles` | []string | unset | Optional narrowing filter for `"audio-playback"`: unset means every non-call running output stream inhibits; when set, only listed roles do. An explicitly empty list (`[]`) is rejected — it would silently disable playback inhibition |
+| `capture_is_call` | boolean | `false` | Whether a running INPUT stream (an open microphone) counts as a call — see the warning below |
+| `pw_dump_command` | string | `"pw-dump"` | Override invocation, split on whitespace with no shell and no quoting (paths with spaces are unsupported); primarily the test/fake-script seam |
+
+> **Warning: `capture_is_call` false positives.** PipeWire input nodes
+> commonly sit in the `"running"` state for hours under ordinary setups —
+> an idling Discord/Teams call, an OBS microphone source, a wake-word
+> assistant, or a browser tab holding a granted mic permission. Enabling
+> `capture_is_call` treats all of these as an active call and can hold a
+> display awake indefinitely. It defaults to `false` (call detection is
+> role-based via `call_roles` out of the box); enable it only if you
+> understand your system's microphone-node behavior.
+
+The poller never touches the wake path (wake is never gated by any
+inhibitor) and its task lives and dies with its config generation, exactly
+like the user-activity inhibitor.
 
 ## `[credentials]` — credentials file
 
@@ -556,7 +603,7 @@ modes = ["power_off"]
 zone = "desk"
 displays = ["desk_monitor"]
 grace_period = "30s"
-inhibitors = ["user-activity", "manual-pause"]
+inhibitors = ["user-activity", "manual-pause", "audio-playback", "call"]
 
 [rules.living_blank]
 zone = "living_room"

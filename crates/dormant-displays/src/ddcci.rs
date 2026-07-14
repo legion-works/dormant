@@ -401,6 +401,19 @@ impl DisplayController for DdcciController {
         // samsung-tizen pattern).
         if result.is_ok() {
             let mut state = self.state.lock().unwrap();
+            // A successful non-brightness blank (#33: mode switch) leaves
+            // any previously saved brightness stale — it describes a panel
+            // state from a DIFFERENT blank cycle. Clear it BEFORE recording
+            // `last_blank_mode` so the next `BrightnessZero` blank re-saves
+            // fresh instead of skipping the save (its `is_none()` guard)
+            // and later restoring the stale value on wake. A FAILED write
+            // must NOT reach this arm (guarded by `result.is_ok()` above):
+            // the prior successful brightness-zero state may still
+            // describe the physical panel and remains the safest wake
+            // fallback.
+            if mode != BlankMode::BrightnessZero {
+                state.saved_brightness = None;
+            }
             state.last_blank_mode = Some(mode);
         }
         result
@@ -950,6 +963,125 @@ mod tests {
         );
     }
 
+    /// RED regression for #33: a mode switch between two `BrightnessZero`
+    /// blanks must not leak stale `saved_brightness` across the
+    /// intervening successful non-brightness blank. Sequence:
+    /// `BrightnessZero` at 75 -> successful `PowerOff` -> `BrightnessZero`
+    /// at 60 -> wake. Wake must restore the FRESH 60 (saved by the second
+    /// brightness-zero blank), not the stale 75 saved before the mode
+    /// switch.
+    #[tokio::test]
+    async fn mode_switch_clears_stale_saved_brightness() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // First BrightnessZero blank at 75 -> saves 75.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
+
+        // Mode switch: a successful PowerOff blank must clear the stale
+        // saved_brightness.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            None,
+            "a successful non-brightness blank must clear stale saved_brightness"
+        );
+
+        // Second BrightnessZero blank at 60 -- must re-save fresh (60),
+        // not skip saving because a stale saved_brightness was still Some.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(60));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(60));
+
+        // Wake -- must restore 60, not stale 75. Only 60 is scripted: if
+        // the fake observes a set_vcp(0x10, 75) call instead, wake()
+        // surfaces that as a CmdFailure and this unwrap panics.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 60, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("60")),
+            "wake should restore fresh 60, not stale 75: {log:?}"
+        );
+    }
+
+    /// Failure sibling of `mode_switch_clears_stale_saved_brightness`: if
+    /// the intervening non-brightness blank FAILS (D6 write error), the
+    /// prior successful brightness-zero save must survive -- it may still
+    /// describe the physical panel and remains the safest wake fallback.
+    #[tokio::test]
+    async fn failed_mode_switch_preserves_saved_brightness() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // BrightnessZero blank at 75 -> saves 75.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
+
+        // Failed PowerOff blank -- the D6-off write itself errors.
+        fake.expect_set(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_POWER,
+            D6_OFF,
+            Err("write failed".into()),
+        );
+        let err = ctrl.blank(BlankMode::PowerOff).await.unwrap_err();
+        assert!(
+            err.error.contains("failed to set power off"),
+            "blank failure should mention power-off write: {err}"
+        );
+
+        // saved_brightness (and last_blank_mode) must survive the failed
+        // blank -- a failed D6 write must NOT clear the safest fallback.
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            Some(75),
+            "a failed non-brightness blank must NOT clear saved_brightness"
+        );
+        assert_eq!(
+            ctrl.state.lock().unwrap().last_blank_mode,
+            Some(BlankMode::BrightnessZero),
+            "a failed blank must not overwrite last_blank_mode"
+        );
+
+        // Wake still restores 75.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 75, Ok(()));
+        ctrl.wake().await.unwrap();
+    }
+
     /// After a daemon restart the saved brightness is gone (in-memory
     /// state is lost). For a `BrightnessZero`-primary display, the wake
     /// path must still bring the panel to the operator-tuned
@@ -1044,6 +1176,68 @@ mod tests {
             !log.iter()
                 .any(|l| l.contains("set_vcp") && l.contains("0x10")),
             "wake after a PowerOff blank must NOT write brightness (0x10): {log:?}"
+        );
+    }
+
+    /// Pin (#32): if the D6-on write itself fails on wake, that failure
+    /// must propagate as a `CmdFailure` carrying `E_DISPLAY_IO` and the
+    /// underlying write error -- not be swallowed. Only one D6-on write
+    /// should be attempted, and (since the preceding blank was `PowerOff`,
+    /// which never touches brightness) no brightness write should happen
+    /// either.
+    #[tokio::test]
+    async fn wake_after_power_off_propagates_d6_on_error() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // Blank with PowerOff -- succeeds.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+
+        // Wake's D6-on write fails.
+        fake.expect_set(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_POWER,
+            D6_ON,
+            Err("write failed".into()),
+        );
+        let err = ctrl.wake().await.unwrap_err();
+        assert!(
+            err.error.contains("E_DISPLAY_IO"),
+            "wake failure must carry E_DISPLAY_IO: {err}"
+        );
+        assert!(
+            err.error.contains("failed to set power on: write failed"),
+            "wake failure must surface the underlying write error: {err}"
+        );
+
+        let log = fake.take_call_log();
+        // The blank() call above also logs a `0xD6` write (D6_OFF, value
+        // 5); filter on the D6_ON value (1) specifically, same idiom as
+        // `wake_after_power_off_sends_d6_on_only`, so this only counts
+        // wake's D6-on attempt.
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains("set_vcp") && l.contains("0xD6") && l.contains('1'))
+                .count(),
+            1,
+            "wake should attempt the D6-on write exactly once: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10")),
+            "a failed D6-on write must not fall through to a brightness write: {log:?}"
         );
     }
 

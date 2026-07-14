@@ -97,6 +97,14 @@ pub const PAIRING_ENABLED: bool = true;
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Default post-wake settle window for the doctor exercise's bounded
+/// retry read (validated to `100ms..=30s` — see [`mod@super::validate`]).
+/// When the exercise's first post-wake read is absent or still non-`On`,
+/// it sleeps this long and performs exactly one more bounded retry read
+/// before classifying the wake step — some panels need a moment after
+/// the wake command returns before their readback reflects `On`.
+pub const DOCTOR_WAKE_SETTLE: Duration = Duration::from_secs(3);
+
 /// Default duration each screensaver source image is displayed (8 seconds).
 pub const IMAGE_DURATION: Duration = Duration::from_secs(8);
 

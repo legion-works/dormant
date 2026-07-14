@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 dormant-core = { path = "../dormant-core" }
+async-trait = { workspace = true }
 dormant-sensors = { path = "../dormant-sensors" }
 dormant-displays = { path = "../dormant-displays" }
 tokio = { workspace = true }

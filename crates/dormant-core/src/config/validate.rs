@@ -116,6 +116,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "entity_crud_enabled",
             "pairing_enabled",
             "pair_timeout",
+            "doctor_wake_settle",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────
@@ -637,7 +638,8 @@ fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
     }
 }
 
-/// Validate the `[daemon]` section: `pair_timeout` bounds.
+/// Validate the `[daemon]` section: `pair_timeout` and
+/// `doctor_wake_settle` bounds.
 fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let daemon = &cfg.daemon;
 
@@ -649,6 +651,18 @@ fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
             detail: format!(
                 "daemon.pair_timeout {:?} is out of range — allowed: 30s..=300s",
                 daemon.pair_timeout
+            ),
+        });
+    }
+
+    if daemon.doctor_wake_settle < Duration::from_millis(100)
+        || daemon.doctor_wake_settle > Duration::from_secs(30)
+    {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "daemon.doctor_wake_settle {:?} is out of range — allowed: 100ms..=30s",
+                daemon.doctor_wake_settle
             ),
         });
     }
@@ -5144,5 +5158,81 @@ availability_payload_offline = "down"
         assert!(!cfg.daemon.entity_crud_enabled);
         assert!(!cfg.daemon.pairing_enabled);
         assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(60));
+    }
+
+    // ── Task 4: daemon.doctor_wake_settle (#34) ─────────────────────────────
+
+    #[test]
+    fn doctor_wake_settle_absent_uses_literal_default() {
+        // [daemon] entirely absent — literal pin, not compared against
+        // defaults::DOCTOR_WAKE_SETTLE (same tautology concern as the
+        // pair_timeout default test above).
+        let (cfg, _warnings) = load_str("config_version = 1\n").unwrap();
+        assert_eq!(cfg.daemon.doctor_wake_settle, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn doctor_wake_settle_floor_99ms_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\ndoctor_wake_settle = \"99ms\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("doctor_wake_settle")),
+            "doctor_wake_settle below the 100ms floor must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn doctor_wake_settle_floor_100ms_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\ndoctor_wake_settle = \"100ms\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("doctor_wake_settle")),
+            "doctor_wake_settle = 100ms (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn doctor_wake_settle_ceiling_30s_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\ndoctor_wake_settle = \"30s\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("doctor_wake_settle")),
+            "doctor_wake_settle = 30s (the ceiling) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn doctor_wake_settle_ceiling_30s_1ms_rejected() {
+        let errors =
+            validate_str("config_version = 1\n[daemon]\ndoctor_wake_settle = \"30001ms\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("doctor_wake_settle")),
+            "doctor_wake_settle above the 30s ceiling must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn doctor_wake_settle_accepted_in_strict_mode_and_known_keys() {
+        let result = load_str_strict(
+            "config_version = 1\n\
+             [daemon]\n\
+             doctor_wake_settle = \"5s\"\n",
+        );
+        assert!(
+            result.is_ok(),
+            "doctor_wake_settle must be in KNOWN_KEYS, got: {:?}",
+            result.err()
+        );
+        let (cfg, _warnings) = result.unwrap();
+        assert_eq!(cfg.daemon.doctor_wake_settle, Duration::from_secs(5));
     }
 }

@@ -1143,6 +1143,25 @@ impl DisplayController for SamsungTizenController {
         // to pick the right wake path. Recording AFTER success means a
         // failed blank doesn't poison the wake path for the next attempt.
         if result.is_ok() {
+            // A successful non-brightness (key-based) blank (#33: mode
+            // switch) leaves any previously saved backlight stale — it
+            // describes a panel state from a DIFFERENT blank cycle. Clear
+            // it BEFORE recording `last_blank_mode` so the next
+            // `BrightnessZero` blank re-saves fresh instead of skipping
+            // the save (its `is_none()` guard in `blank_backlight`) and
+            // later restoring the stale value on wake. The key-send arm
+            // above reaches this point via `.map_err(...)` (not `?`), so
+            // a FAILED key send produces `result = Err(..)` here and is
+            // excluded by the `result.is_ok()` guard rather than by an
+            // early return: the prior successful brightness-zero state
+            // may still describe the physical panel and remains the
+            // safest wake fallback.
+            if mode != BlankMode::BrightnessZero {
+                *self
+                    .saved_backlight
+                    .lock()
+                    .expect("saved_backlight poisoned") = None;
+            }
             *self
                 .last_blank_mode
                 .lock()
@@ -1942,6 +1961,161 @@ mod tests {
         assert!(
             tv_fake.take_sent_keys().is_empty(),
             "wake after BrightnessZero must not send KEY_RETURN"
+        );
+    }
+
+    /// RED regression for #33 (Samsung side): a mode switch between two
+    /// `BrightnessZero` blanks must not leak stale `saved_backlight` across
+    /// the intervening successful key-based blank. Sequence:
+    /// `BrightnessZero` at 42 -> successful `ScreenOffAudioOn` ->
+    /// `BrightnessZero` at 35 -> wake. Wake must restore the FRESH 35
+    /// (saved by the second brightness-zero blank), not the stale 42 saved
+    /// before the mode switch.
+    #[tokio::test]
+    async fn mode_switch_clears_stale_saved_backlight() {
+        let tv_fake = Arc::new(FakeTvTransport::new());
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
+        );
+
+        // First BrightnessZero blank at 42 -> saves 42.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-1".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(42)); // current
+        bl_fake.set_results.lock().unwrap().push(Ok(())); // set to 0
+        bl_fake.get_results.lock().unwrap().push(Ok(0)); // confirm readback
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(42));
+
+        // Mode switch: a successful ScreenOffAudioOn (key-based) blank must
+        // clear the stale saved_backlight.
+        ctrl.blank(BlankMode::ScreenOffAudioOn).await.unwrap();
+        assert_eq!(
+            *ctrl.saved_backlight.lock().unwrap(),
+            None,
+            "a successful key-based blank must clear stale saved_backlight"
+        );
+
+        // Second BrightnessZero blank at 35 -- must re-save fresh (35), not
+        // skip saving because a stale saved_backlight was still Some.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-2".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(35)); // current
+        bl_fake.set_results.lock().unwrap().push(Ok(())); // set to 0
+        bl_fake.get_results.lock().unwrap().push(Ok(0)); // confirm readback
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(35));
+
+        // Wake -- must restore 35, not stale 42. Only 35 is scripted as
+        // the readback-confirm value: if the fake's target does not match
+        // (stale 42 vs the scripted 35 confirm), set_and_confirm_backlight
+        // retries once and then persists in mismatch, surfacing a
+        // CmdFailure -- either way the final recorded set call reveals
+        // which target was actually used.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-3".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(())); // set target
+        bl_fake.get_results.lock().unwrap().push(Ok(35)); // confirm readback
+        let wake_result = ctrl.wake().await;
+        assert!(
+            wake_result.is_ok(),
+            "wake should cleanly restore fresh 35: {wake_result:?}"
+        );
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap().last().unwrap(),
+            ("192.0.2.7".to_string(), 35),
+            "wake should restore fresh 35, not stale 42"
+        );
+    }
+
+    /// Failure sibling of `mode_switch_clears_stale_saved_backlight`: if
+    /// the intervening key-based blank FAILS (the WS `send_key` errors),
+    /// the prior successful brightness-zero save must survive -- it may
+    /// still describe the physical panel and remains the safest wake
+    /// fallback.
+    #[tokio::test]
+    async fn failed_mode_switch_preserves_saved_backlight() {
+        let tv_fake = Arc::new(FakeTvTransport::with_send_key_results(vec![Err(
+            "broken pipe".into(),
+        )]));
+        let bl_fake = Arc::new(FakeBacklightTransport::new());
+
+        let ctrl = SamsungTizenController::with_transports_mode(
+            "192.0.2.7".into(),
+            "ws-token".into(),
+            None,
+            true,
+            tv_fake.clone(),
+            bl_fake.clone(),
+            BlankMode::BrightnessZero,
+            DEFAULT_RESTORE_BACKLIGHT,
+        );
+
+        // BrightnessZero blank at 42 -> saves 42.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-1".into()));
+        bl_fake.get_results.lock().unwrap().push(Ok(42));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(0));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(*ctrl.saved_backlight.lock().unwrap(), Some(42));
+
+        // Failed ScreenOffAudioOn blank -- the key send itself errors. The
+        // TV is reachable (FakeTvTransport defaults connect to true), so
+        // this actually exercises the send_key error path rather than the
+        // unreachable-noop early return.
+        let err = ctrl.blank(BlankMode::ScreenOffAudioOn).await.unwrap_err();
+        assert!(
+            err.error.contains("broken pipe"),
+            "blank failure should mention the key-send error: {err}"
+        );
+
+        // saved_backlight (and last_blank_mode) must survive the failed
+        // blank -- a failed key send must NOT clear the safest fallback.
+        assert_eq!(
+            *ctrl.saved_backlight.lock().unwrap(),
+            Some(42),
+            "a failed key-based blank must NOT clear saved_backlight"
+        );
+        assert_eq!(
+            *ctrl.last_blank_mode.lock().unwrap(),
+            Some(BlankMode::BrightnessZero),
+            "a failed blank must not overwrite last_blank_mode"
+        );
+
+        // Wake still restores 42 via the backlight path.
+        bl_fake
+            .acquire_results
+            .lock()
+            .unwrap()
+            .push(Ok("tok-2".into()));
+        bl_fake.set_results.lock().unwrap().push(Ok(()));
+        bl_fake.get_results.lock().unwrap().push(Ok(42));
+        ctrl.wake().await.unwrap();
+        assert_eq!(
+            *bl_fake.set_calls.lock().unwrap().last().unwrap(),
+            ("192.0.2.7".to_string(), 42)
         );
     }
 

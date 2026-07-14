@@ -2255,6 +2255,7 @@ async fn assemble_static(
         rules: rules_runtime,
         displays: display_runtime,
         sensors: sensors_runtime,
+        doctor_wake_settle: cfg.daemon.doctor_wake_settle,
     };
 
     Ok(StaticAssembly {
@@ -4189,6 +4190,7 @@ mod restore_tests {
                 timings: DisplayRuntimeCfg::manual_defaults(Duration::from_secs(0)),
             }],
             sensors: vec![],
+            doctor_wake_settle: Duration::from_secs(3),
         }
     }
 

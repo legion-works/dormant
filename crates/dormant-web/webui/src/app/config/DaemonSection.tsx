@@ -27,6 +27,7 @@ const KNOWN_FIELDS: Record<string, { kind: "enum" | "number" | "duration" | "tex
   idle_time_unit: { kind: "enum", options: IDLE_TIME_UNITS },
   idle_source: { kind: "enum", options: IDLE_SOURCES },
   stale_sensor_timeout: { kind: "duration" },
+  doctor_wake_settle: { kind: "duration" },
 };
 
 /** Per-field help text — accurate to the real config semantics. */
@@ -38,6 +39,8 @@ const FIELD_HELP: Record<string, string> = {
   idle_time_unit: "How to read the compositor's idle-time reply. auto detects the unit; override only if detection is wrong.",
   idle_source: "Idle-detection backend for the user-activity inhibitor.",
   stale_sensor_timeout: "A sensor silent this long becomes unavailable.",
+  doctor_wake_settle:
+    "Doctor exercise: settle time before retrying the post-wake panel readback (100ms\u201330s).",
 };
 
 /** Placeholder text for empty inputs — the real default value. */
@@ -45,6 +48,7 @@ const FIELD_PLACEHOLDER: Record<string, string> = {
   startup_holdoff: "30s",
   reload_debounce: "500ms",
   stale_sensor_timeout: "300s",
+  doctor_wake_settle: "3s",
 };
 
 export default function DaemonSection({ daemon, store, redactedPaths, onDirty, fieldErrors }: DaemonSectionProps) {

@@ -229,6 +229,7 @@ async fn clear_grace_blank_then_instant_wake() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Present@0, Absent@10s, Present@100s.
@@ -381,6 +382,7 @@ async fn exercise_handler_resumes_rule_even_when_reply_receiver_dropped() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let harness = spawn_engine(cfg, zones, execs, vec![]);
@@ -489,6 +491,7 @@ async fn exercise_sequence_unconfirmable_when_read_state_hangs() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let harness = spawn_engine(cfg, zones, execs, vec![]);
@@ -563,6 +566,7 @@ async fn broker_loss_never_blanks() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Script: only Unavailable events over 10 virtual minutes.
@@ -618,6 +622,7 @@ async fn stale_sensor_sweeper_marks_unavailable() {
             None,
             Duration::from_millis(500),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![(
@@ -677,6 +682,7 @@ async fn pause_control_msg_blocks_blank_until_resume() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@10s only — drives the display into Grace.
@@ -753,6 +759,7 @@ async fn motion_sensor_hold_time_stretches_pulse() {
             Some(Duration::from_secs(30)),
             Duration::from_secs(60),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![
@@ -833,6 +840,7 @@ async fn wake_failure_retries_until_success() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![
@@ -914,6 +922,7 @@ async fn force_blank_and_snapshot() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let harness = spawn_engine(cfg, zones, execs, vec![]);
@@ -986,6 +995,7 @@ async fn motion_sensor_hold_time_stretches_pulse_multiple() {
             Some(Duration::from_secs(30)),
             Duration::from_secs(60),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![
@@ -1048,6 +1058,7 @@ async fn pause_double_application_bug() {
             None,
             Duration::from_secs(60),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![
@@ -1127,6 +1138,7 @@ async fn hold_rearm_extends_stretch() {
             Some(Duration::from_secs(30)),
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Present@0  → arms hold to t=30, pending_absent cleared.
@@ -1224,6 +1236,7 @@ async fn pause_does_not_lose_zone_edges() {
                 None,
                 Duration::from_secs(3600),
             )],
+            doctor_wake_settle: Duration::from_secs(3),
         };
 
         // Present@0 then Absent@10.
@@ -1306,6 +1319,7 @@ async fn pause_does_not_lose_zone_edges() {
                 None,
                 Duration::from_secs(3600),
             )],
+            doctor_wake_settle: Duration::from_secs(3),
         };
 
         // Absent@0s, then Present after the blank has fired.
@@ -1394,6 +1408,7 @@ async fn set_inhibited_freezes_grace_until_released() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Present@0, Absent@10s → grace runs until ~70s.
@@ -1488,6 +1503,7 @@ async fn second_inhibitor_kind_does_not_clobber_first() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Present@0, Absent@10s → grace runs until ~70s.
@@ -1615,6 +1631,7 @@ async fn none_rule_updates_each_rules_own_effective() {
                 Duration::from_secs(3600),
             ),
         ],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Both zones: Present@0, Absent@10s → both graces run until ~70s.
@@ -1725,6 +1742,7 @@ async fn manual_only_display_gets_no_inhibitor_input_on_none() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
     let zones = zone_with_sensor("desk", "office");
 
@@ -1789,6 +1807,7 @@ async fn set_pending_reload_surfaces_in_snapshot() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let harness = spawn_engine(cfg, zones, execs, vec![]);
@@ -1879,6 +1898,7 @@ async fn retained_vacant_worst_case_timeline() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // The retained-vacant shape: Absent is the VERY FIRST event this sensor
@@ -2003,6 +2023,7 @@ async fn never_owns_blocks_blanking() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@0 → should drive grace → expiry, but NeverOwns gates entry.
@@ -2056,6 +2077,7 @@ async fn always_owned_lets_it_blank() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@0 → grace expires → blank (AlwaysOwned always permits).
@@ -2133,6 +2155,7 @@ async fn flip_gate_during_grace_blocks_blank() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@0 → enters Grace (owned=seed true → proceeds).
@@ -2200,6 +2223,7 @@ async fn flip_gate_control_blank_fires_when_owned() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![(
@@ -2278,6 +2302,7 @@ async fn render_ladder_drives_render_sink() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@10s → grace 60s → show triggered at ~70s.
@@ -2408,6 +2433,7 @@ async fn render_failure_falls_through_to_controller() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let script = vec![(
@@ -2495,6 +2521,7 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@10s → grace 60s → ladder entry at ~70s.
@@ -2649,6 +2676,7 @@ async fn repeated_identical_set_inhibited_causes_no_extra_display_step() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Absent@10s → grace 60s → ladder (Staged, RenderBlack, dwell 30s) entry
@@ -2827,6 +2855,7 @@ async fn emergency_wake_handler_wakes_every_display_and_pauses_all_rules() {
                 Duration::from_secs(3600),
             ),
         ],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Empty event script — engine stays quiet until we send the
@@ -3013,6 +3042,7 @@ async fn emergency_wake_handler_dispatches_displays_concurrently() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     // Empty script — engine stays quiet until the EmergencyWake.
@@ -3169,6 +3199,7 @@ async fn exercise_handler_pauses_target_rule_and_unpauses_after() {
             None,
             Duration::from_secs(3600),
         )],
+        doctor_wake_settle: Duration::from_secs(3),
     };
 
     let harness = spawn_engine(cfg, zones, execs, vec![]);
@@ -3274,6 +3305,7 @@ async fn exercise_handler_runs_for_manual_only_display_with_empty_paused_rules()
         rules: vec![],
         displays: vec![display_cfg("manual_only")],
         sensors: vec![],
+        doctor_wake_settle: Duration::from_secs(3),
     };
     let zones = ZoneEngine::new(Vec::new(), &[]).expect("empty zone engine");
     let harness = spawn_engine(cfg, zones, execs, vec![]);
@@ -3329,6 +3361,7 @@ fn manual_cfg(display_id: &str) -> (RulesEngineConfig, ZoneEngine) {
         rules: vec![],
         displays: vec![display_cfg(display_id)],
         sensors: vec![],
+        doctor_wake_settle: Duration::from_secs(3),
     };
     let zones = ZoneEngine::new(Vec::new(), &[]).expect("empty zone engine is valid");
     (cfg, zones)

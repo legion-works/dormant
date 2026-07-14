@@ -401,6 +401,22 @@ async fn run_tick(
 /// stream asserts WITHOUT waiting `min_active` (F2/R2-M1 — its prior
 /// duration is unknown; `min_active` debounces NEW blips, not pre-existing
 /// streams). Deassertion is always immediate (asymmetric on purpose).
+///
+/// `entry.effective` is monotonic while `active` stays continuously true:
+/// once asserted (via the `startup_grace` exemption OR by `min_active`
+/// having elapsed), it STAYS asserted -- it is never recomputed back to
+/// `false` just because a later tick's `elapsed_since(active_since)` is
+/// smaller than `min_active` would otherwise require. Only the `active =
+/// false` branch below (an actual deassert) or the transient-failure reset
+/// (`reset_debounce`, spec F11) ever clears it. Without the `entry.effective
+/// ||` latch, a stream that asserts via `startup_grace` on tick 1 would
+/// spuriously flip back to unasserted on tick 2 (since `elapsed_since
+/// (active_since) < min_active` still holds one poll cycle later) and only
+/// re-assert once `min_active` naturally elapsed -- re-opening exactly the
+/// reload-mid-movie window the exemption exists to close whenever
+/// `min_active > poll_interval` (`daemon_smoke`'s reload-mid-movie anti-
+/// tautology test, T6, caught this: grace could expire in the false-flip
+/// gap before the natural reassert).
 #[cfg(target_os = "linux")]
 fn apply_success(
     states: KindStates,
@@ -418,11 +434,9 @@ fn apply_success(
             if entry.active_since.is_none() {
                 entry.active_since = Some(now);
             }
-            entry.effective = if startup_grace {
-                true
-            } else {
-                now.saturating_duration_since(entry.active_since.unwrap_or(now)) >= min_active
-            };
+            entry.effective = entry.effective
+                || startup_grace
+                || now.saturating_duration_since(entry.active_since.unwrap_or(now)) >= min_active;
         } else {
             entry.active_since = None;
             entry.effective = false;

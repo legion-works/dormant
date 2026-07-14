@@ -49,7 +49,10 @@ use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 use super::blend::{self, T_MAX};
 #[cfg(test)]
 use super::wayland_ops::RecordingWaylandOps;
-use super::wayland_ops::{ViewportHandle, WaylandOps};
+use super::wayland_ops::{
+    BufferHandle, PoolHandle, ViewportHandle, WaylandOps, create_screensaver_buffers, real_buffer,
+    real_pool_with_region_mut,
+};
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
 use crate::screensaver::{MpvItemEvent, MpvPlayer};
@@ -138,52 +141,6 @@ fn make_wakeup_pipe() -> Result<(OwnedFd, OwnedFd), CmdFailure> {
     let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
     let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
     Ok((read_fd, write_fd))
-}
-
-/// Pure-arithmetic core of [`create_dual_buffers`]: computes the two
-/// buffer offsets (`0` and `stride * height`) and calls `create` once
-/// per offset.  Production passes a closure that wraps
-/// `RawPool::create_buffer`; tests pass a recorder closure to verify
-/// the offset values without constructing real Wayland objects.
-///
-/// Returns `(buf0, buf1)` — the closure's return type is opaque so the
-/// caller controls what `(T, T)` represents.
-fn create_dual_buffers_core<T>(
-    stride: u32,
-    height: u32,
-    mut create: impl FnMut(i32) -> T,
-) -> (T, T) {
-    let buf0 = create(0);
-    let buf1_offset = i32::try_from(dual_buf_second_offset(stride, height))
-        .expect("second buffer offset must fit in i32");
-    let buf1 = create(buf1_offset);
-    (buf0, buf1)
-}
-
-/// Build two `WlBuffer`s from a single `RawPool` — `buf0` at offset 0,
-/// `buf1` at offset `stride * height`.  Together they cover the full
-/// pool so mpv can ping-pong writes without overwriting a buffer the
-/// compositor is still reading.
-fn create_dual_buffers(
-    pool: &mut smithay_client_toolkit::shm::raw::RawPool,
-    qh: &QueueHandle<WaylandState>,
-    width: u32,
-    height: u32,
-    stride: u32,
-) -> (WlBuffer, WlBuffer) {
-    let stride_i32 = stride.cast_signed();
-    // XRGB8888 — NOT ARGB8888.  mpv's `bgr0` SW format writes bytes
-    // [B,G,R,X] with X = 0x00; under ARGB8888 the compositor reads that
-    // byte as alpha=0 and composites every frame fully transparent
-    // (the desktop shows through — invisible screensaver).  XRGB8888
-    // declares "the 4th byte is ignored"; the same byte stream is
-    // correct content either way.
-    let fmt = wayland_client::protocol::wl_shm::Format::Xrgb8888;
-    let w = width.cast_signed();
-    let h = height.cast_signed();
-    create_dual_buffers_core(stride, height, |offset| {
-        pool.create_buffer(offset, w, h, stride_i32, fmt, (), qh)
-    })
 }
 
 /// Byte offset within the pool for the second buffer in a
@@ -408,13 +365,17 @@ fn capture_front_into_transition(session: &mut ScreensaverSession) {
     }
     let front_idx = 1 - session.next_render_idx;
     let front_offset = front_idx * buf_len;
-    let mmap = session.pool.mmap();
-    // SAFETY: pool was built with 2*buf_len bytes; reading
-    // `buf_len` bytes from `front_offset` cannot overrun.
-    let front_slice = unsafe {
-        std::slice::from_raw_parts(mmap.as_ptr().cast::<u8>().add(front_offset), buf_len)
-    };
-    tr.capture.copy_from_slice(front_slice);
+    // Real mmap access goes through `real_pool_with_region_mut`
+    // (test-seam #55, Task 2) — pool was built with 2*buf_len bytes,
+    // so reading `buf_len` bytes from `front_offset` cannot overrun.
+    real_pool_with_region_mut(
+        session.pool.as_ref(),
+        front_offset,
+        buf_len,
+        |front_slice| {
+            tr.capture.copy_from_slice(front_slice);
+        },
+    );
 }
 
 /// Remove the crossfade timer from calloop if one is armed.
@@ -563,10 +524,17 @@ pub(super) struct TransitionState {
 /// written buffer to the surface and flip the index.
 pub(super) struct ScreensaverSession {
     pub(super) player: MpvPlayer,
-    /// Owned single `RawPool` covering both buffers (`2 * stride * height` bytes).
-    pub(super) pool: smithay_client_toolkit::shm::raw::RawPool,
-    /// `buffers[0]` lives at offset 0, `buffers[1]` at offset `stride * height`.
-    pub(super) buffers: [WlBuffer; 2],
+    /// Opaque handle to the owned pool covering both buffers
+    /// (`2 * stride * height` bytes) — real (production) or recorder
+    /// (tests), created via [`create_screensaver_buffers`]. Real mmap
+    /// access for per-frame writes goes through
+    /// [`real_pool_with_region_mut`]; never downcast directly.
+    pub(super) pool: Arc<dyn PoolHandle>,
+    /// `buffers[0]` lives at offset 0, `buffers[1]` at offset
+    /// `stride * height`. Opaque handles — real `WlBuffer` access for
+    /// attach/dispatch goes through [`real_buffer`]; never downcast
+    /// directly.
+    pub(super) buffers: [Arc<dyn BufferHandle>; 2],
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) stride: u32,
@@ -1469,25 +1437,29 @@ impl WaylandState {
         };
 
         // ── double-buffered shm pool ────────────────────────────────
-        let pool_byte_len = (stride as usize)
-            .checked_mul(height as usize)
-            .and_then(|x| x.checked_mul(2))
-            .ok_or_else(|| cmd_failure("screensaver", "shm pool size overflow"))?;
-        let mut pool =
-            smithay_client_toolkit::shm::raw::RawPool::new(pool_byte_len, &self.shm_state)
-                .map_err(|e| {
+        // `create_screensaver_buffers` (test-seam #55, Task 2) is the
+        // SAME function `wayland_ops::tests::
+        // create_screensaver_buffers_allocates_pool_and_two_buffers`
+        // exercises through a recorder — it owns the pool-size
+        // (`2 * stride * height`) and buffer-offset (`0`, `stride *
+        // height`) arithmetic AND issues the real `RawPool::new` +
+        // both `create_buffer` calls via `self.wayland_ops`, so
+        // reverting either the arithmetic or the call sites fails
+        // that recorder test, not just an arithmetic-only unit test.
+        let (pool, [buf0, buf1]) =
+            create_screensaver_buffers(self.wayland_ops.as_ref(), width, height, stride).map_err(
+                |e| {
                     // player drops (closes write fd).
                     cmd_failure("screensaver", &format!("RawPool::new: {e}"))
-                })?;
-        let qh = self.queue_handle.clone();
-        let (buf0, buf1) = create_dual_buffers(&mut pool, &qh, width, height, stride);
+                },
+            )?;
 
         // Attach the first back buffer (all zeros — opaque black under
         // XRGB8888) and commit.  mpv's first wakeup will follow shortly
         // and overwrite it; the wakeup is the source of the
         // `pending_reply.send(Ok(()))` that resolves the show.
         let wl_surface = layer_surface.wl_surface();
-        wl_surface.attach(Some(&buf0), 0, 0);
+        wl_surface.attach(Some(real_buffer(buf0.as_ref())), 0, 0);
         wl_surface.damage_buffer(0, 0, width.cast_signed(), height.cast_signed());
         wl_surface.commit();
 
@@ -1732,19 +1704,25 @@ impl WaylandState {
         // tick).  We treat  and  identically
         // here: the buffer is fresh either way.
         let back_offset = back_idx * buf_len;
-        let mut back_buf: Option<*mut u8> = {
-            let mmap = session.pool.mmap();
-            // SAFETY: offset is within the pool; slice length matches.
-            let back_slice = unsafe {
-                std::slice::from_raw_parts_mut(mmap.as_ptr().cast_mut().add(back_offset), buf_len)
-            };
-            back_slice.fill(0);
-            match session.player.render_frame_into(back_slice) {
-                Ok(_) => Some(back_slice.as_mut_ptr()),
-                Err(e) => {
-                    self.fail_screensaver_to_black(&format!("{e}"));
-                    return;
+        // The pool's real mmap access goes through `real_pool_with_region_mut`
+        // (test-seam #55, Task 2) — the closure returns a raw pointer
+        // that outlives the mutex guard exactly as the pre-migration
+        // code let it outlive the `&mut session.pool` borrow: the
+        // underlying pool memory is owned by `session.pool` for the
+        // rest of this function, so the pointer stays valid.
+        let render_result: Result<*mut u8, String> =
+            real_pool_with_region_mut(session.pool.as_ref(), back_offset, buf_len, |back_slice| {
+                back_slice.fill(0);
+                match session.player.render_frame_into(back_slice) {
+                    Ok(_) => Ok(back_slice.as_mut_ptr()),
+                    Err(e) => Err(format!("{e}")),
                 }
+            });
+        let mut back_buf: Option<*mut u8> = match render_result {
+            Ok(ptr) => Some(ptr),
+            Err(e) => {
+                self.fail_screensaver_to_black(&e);
+                return;
             }
         };
 
@@ -1793,7 +1771,7 @@ impl WaylandState {
                 Some(s) => s.wl_surface().clone(),
                 None => return,
             };
-            wl_surface.attach(Some(&session.buffers[back_idx]), 0, 0);
+            wl_surface.attach(Some(real_buffer(session.buffers[back_idx].as_ref())), 0, 0);
             wl_surface.damage_buffer(
                 0,
                 0,
@@ -1936,19 +1914,24 @@ impl WaylandState {
         // `Ok` variants identically here: the buffer is fresh either
         // way.  (Mechanism (a) for the buffer-correctness constraint —
         // see module header.)
-        let back_ptr = {
-            let mmap = session.pool.mmap();
-            // SAFETY: offset is within the pool; slice length matches.
-            let back_slice = unsafe {
-                std::slice::from_raw_parts_mut(mmap.as_ptr().cast_mut().add(back_offset), buf_len)
-            };
-            back_slice.fill(0);
-            match session.player.render_frame_into(back_slice) {
-                Ok(_) => back_slice.as_mut_ptr(),
-                Err(e) => {
-                    self.fail_screensaver_to_black(&format!("{e}"));
-                    return;
+        // See `on_mpv_wakeup`'s matching block: the pool's real mmap
+        // access goes through `real_pool_with_region_mut` (test-seam
+        // #55, Task 2); the raw pointer returned outlives the mutex
+        // guard exactly as it outlived the `&mut session.pool` borrow
+        // pre-migration.
+        let render_result: Result<*mut u8, String> =
+            real_pool_with_region_mut(session.pool.as_ref(), back_offset, buf_len, |back_slice| {
+                back_slice.fill(0);
+                match session.player.render_frame_into(back_slice) {
+                    Ok(_) => Ok(back_slice.as_mut_ptr()),
+                    Err(e) => Err(format!("{e}")),
                 }
+            });
+        let back_ptr = match render_result {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                self.fail_screensaver_to_black(&e);
+                return;
             }
         };
 
@@ -1994,7 +1977,7 @@ impl WaylandState {
             Some(s) => s.wl_surface().clone(),
             None => return,
         };
-        wl_surface.attach(Some(&session.buffers[back_idx]), 0, 0);
+        wl_surface.attach(Some(real_buffer(session.buffers[back_idx].as_ref())), 0, 0);
         wl_surface.damage_buffer(
             0,
             0,
@@ -2149,9 +2132,13 @@ impl WaylandState {
             {
                 drop(read_fd);
             }
-            // pool + buffers drop here; RawPool's Drop destroys the
-            // wl_shm_pool, which in turn releases the WlBuffers.  The
-            // transition field's capture Vec drops here too (~21 MiB at
+            // pool + buffers drop here (opaque `Arc<dyn PoolHandle>` /
+            // `[Arc<dyn BufferHandle>; 2]` — test-seam #55, Task 2); in
+            // production these are the sole references, so dropping
+            // them drops the wrapped `RawPool`, whose own `Drop`
+            // destroys the `wl_shm_pool` and in turn releases the
+            // `WlBuffer`s.  The transition field's capture Vec drops
+            // here too (~21 MiB at
             // 4K); Rust's struct field drop order runs it before pool
             // because we declared `transition` AFTER `pool` in the
             // struct.  Doesn't actually matter for correctness — both
@@ -2901,30 +2888,15 @@ mod tests {
         );
     }
 
-    /// Drive [`create_dual_buffers_core`] through its closure seam with
-    /// a recorder and assert the TWO actual creation calls receive
-    /// exactly `[0, stride×height]` for the AOC geometry.  This catches
-    /// a regression where ONLY the arithmetic helper is correct but the
-    /// call-site wiring still passes the wrong offset (the U5-round
-    /// failure class — constants test passes, wiring doesn't use them).
-    #[test]
-    fn dual_buf_creation_offsets_are_zero_and_stride_times_height() {
-        let stride: u32 = 12_352;
-        let height: u32 = 1744;
-        let mut offsets = Vec::new();
-        super::create_dual_buffers_core(stride, height, |offset| {
-            offsets.push(offset);
-        });
-        let buf1_expected: i32 = 21_541_888;
-        assert_eq!(
-            offsets,
-            vec![0, buf1_expected],
-            "create_dual_buffers_core must call the closure with offsets [0, stride×height]; \
-             got {offsets:?}.  If buf1 offset is {stride} (= stride, one row) instead of \
-             {buf1_expected} (= stride×height), the fix was only applied to the helper, \
-             not the call-site wiring."
-        );
-    }
+    // `create_dual_buffers_core`'s closure-driven recorder test
+    // (`dual_buf_creation_offsets_are_zero_and_stride_times_height`,
+    // PR #57's ad-hoc seam) is DELETED here — retired now that
+    // `create_screensaver_buffers` (`wayland_ops.rs`) routes
+    // `RawPool::new` and both real `create_buffer` calls through
+    // `WaylandOps`, and
+    // `wayland_ops::tests::create_screensaver_buffers_allocates_pool_and_two_buffers`
+    // asserts the SAME offsets/format/dims against the real call chain
+    // `complete_screensaver_show` runs, not a disconnected closure.
 }
 
 // ── SCTK delegate impls ───────────────────────────────────────────────────────
@@ -3180,9 +3152,9 @@ impl Dispatch<WlBuffer, ()> for WaylandState {
             && let Some(session) = state.screensaver_session.as_mut()
         {
             let id = proxy.id();
-            if session.buffers[0].id() == id {
+            if real_buffer(session.buffers[0].as_ref()).id() == id {
                 session.buffers_busy[0] = false;
-            } else if session.buffers[1].id() == id {
+            } else if real_buffer(session.buffers[1].as_ref()).id() == id {
                 session.buffers_busy[1] = false;
             }
         }

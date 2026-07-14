@@ -163,6 +163,12 @@ fn init(
         controller: "render-black".into(),
         error: format!("{E_RENDER_UNAVAILABLE}: shm bind: {e}"),
     })?;
+    // `RealWaylandOps` needs its own `Shm`/`QueueHandle` clones for the
+    // shm-pool seam (test-seam #55, Task 2) — both are cheap proxy/handle
+    // clones, not duplicated live resources. Cloned BEFORE `shm_state` /
+    // `queue_handle` are moved into `WaylandState::new` below.
+    let wayland_ops_shm = Shm::from(shm_state.wl_shm().clone());
+    let wayland_ops_queue_handle = queue_handle.clone();
     let output_state = OutputState::new(&globals, &queue_handle);
     let layer_shell = LayerShell::bind(&globals, &queue_handle).map_err(|e| CmdFailure {
         controller: "render-black".into(),
@@ -211,7 +217,10 @@ fn init(
         input_wake_tx,
         queue_handle,
         loop_should_exit.clone(),
-        Arc::new(RealWaylandOps),
+        Arc::new(RealWaylandOps::new(
+            wayland_ops_shm,
+            wayland_ops_queue_handle,
+        )),
     );
     // Inject the loop handle so the screensaver install path can register
     // its wakeup source mid-flight (the install is invoked from inside

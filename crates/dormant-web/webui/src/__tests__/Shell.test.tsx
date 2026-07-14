@@ -64,7 +64,9 @@ describe("Shell", () => {
     render(<Shell />);
 
     expect(document.querySelector(".brand-wordmark")?.textContent).toBe("dormant");
-    expect(document.querySelector(".brand-sub")?.textContent).toBe("v0.1.0 · pre-alpha");
+    const brandSub = document.querySelector(".brand-sub")?.textContent;
+    expect(brandSub).toBe(`v${__DORMANT_VERSION__}`);
+    expect(brandSub).not.toContain("pre-alpha");
 
     const navEl = document.querySelector(".sidebar-nav")!;
     const navLabels = ["Dashboard", "Displays", "Events", "Config", "Doctor"];

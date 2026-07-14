@@ -38,6 +38,8 @@ Binaries land in `~/.local/bin/` — make sure this is on your `PATH`.
 pause/resume + blank/wake controls, riding the daemon's Unix socket in
 the background.
 
+![The dormant tray applet: status tooltip and pause/blank/wake menu](images/tray.png)
+
 ```bash
 install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 ```

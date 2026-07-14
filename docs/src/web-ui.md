@@ -63,6 +63,8 @@ The SPA has five views, selected from a left-hand navigation sidebar.
 
 ### Dashboard
 
+![The dormant dashboard: stat row, signal-flow grid, and panel-exposure summary](images/dashboard.png)
+
 The landing page. Shows a stat row (displays count with active/blanked split, sensor online/unavailable split, zone occupied/vacant split, OLED guard status), a three-column signal-flow grid (Sensors → Zones → Displays), and a recent-activity feed.
 
 Each sensor row shows its id, type, state, and last-seen age. An unavailable sensor that has not delivered data since daemon start is marked "no data since start" from its `reported` diagnostic. Zone rows show occupancy, fusion mode, and members. Display rows show phase, blank mode, controller chain, and blank/wake controls. Failing displays appear in a dashboard banner; tracked displays also get a panel-exposure card.
@@ -184,8 +186,13 @@ The web doctor view does not run the destructive control-path exercise. Use
 `dormantctl doctor exercise <display>` when you need to prove that a real panel
 blanked and woke.
 
-## Audio settings are reserved
+## Audio-aware blanking
 
 The Settings form renders the `[audio]` section, and rule editors accept
-`"audio-playback"` and `"call"` inhibitors. The PipeWire poller is not shipped,
-so those settings do not affect blanking in this release.
+`"audio-playback"` and `"call"` inhibitors. A rule that declares either kind
+spawns a PipeWire poller (`pw-dump` every `[audio].poll_interval`): while a
+matching stream is playing, the rule is inhibited and its displays stay awake
+even when the room reads vacant. Deassertion is immediate when playback stops.
+A rule that declares no audio inhibitor spawns no poller. See
+[Configuration → `[audio]`](./configuration.md) for the classification knobs
+(`call_roles`, `playback_roles`, `capture_is_call`, `min_active`).

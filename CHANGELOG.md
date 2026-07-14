@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-14
+
 ### Added
 
 - Panel-wear tracking with brightness-weighted on-hours, local JSON ledgers, DDC/CI VCP `0xC0` seeding, `GET /api/wear`, panel-exposure cards, `wear.*` settings, and `displays.<id>.panel_type`. v1 attribution is panel-wide and advisory.
@@ -63,5 +65,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/legion-works/dormant/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/legion-works/dormant/releases/tag/v0.1.0

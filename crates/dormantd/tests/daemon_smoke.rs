@@ -2367,6 +2367,26 @@ async fn wear_disabled_creates_nothing() {
     let _guard = wear_env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #47 fix (§1 — test determinism): this test used to prove absence with
+    // a flat `sleep(300ms)` then a directory read. That 300ms had NO
+    // synchronization with the tracker's own lifecycle — it was purely a
+    // best-effort margin against the OLD bug (an unrelated test's tracker,
+    // spawned with `wear.enabled` defaulting `true`, reading
+    // `wear_state_dir()` — i.e. `XDG_STATE_HOME` — from inside its own
+    // detached task and landing inside THIS test's `wear_env_lock`-protected
+    // env mutation window; see `WearTrackerDeps::dir`'s doc comment). Now
+    // that the state directory is resolved synchronously in `App::start`
+    // and threaded through as a plain `PathBuf` — no component under test
+    // ever reads `XDG_STATE_HOME` again — the sleep's only remaining job is
+    // "give the disabled tracker's own first tick time to park", which IS
+    // observable: it logs `event = "wear_tracker_parked"` from the very
+    // tick this test cares about. Block on that event instead of a fixed
+    // wall-clock guess, and name the actual owner (tracker parked or not,
+    // which path leaked) in the failure message rather than a bare
+    // left/right mismatch.
+    install_capture_subscriber();
+    drain_capture(); // discard startup/prior-test noise
+
     let state_home = TempDir::new().unwrap();
     let _env = XdgStateHomeGuard::set(state_home.path());
 
@@ -2391,19 +2411,43 @@ async fn wear_disabled_creates_nothing() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    // The tracker's first tick fires immediately regardless of
-    // sample_interval — a disabled tracker parks on that very first tick,
-    // so a short real-time wait is enough to prove no file ever appears.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Block on the tracker's own `wear_tracker_parked` event (its first
+    // tick fires immediately regardless of `sample_interval`, so this
+    // resolves almost instantly in the common case) instead of guessing a
+    // fixed sleep duration. Only `wear_disabled_creates_nothing` and
+    // `wear_park_persists_final_ledger` can ever emit this event, and
+    // `wear_env_lock` (held for this test's whole body) already excludes
+    // the latter from running concurrently — so this substring check
+    // cannot be contaminated by a sibling wear test.
+    let mut captured = String::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let parked = loop {
+        captured.push_str(&drain_capture());
+        if captured.contains("wear_tracker_parked") {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
 
     let wear_dir = state_home.path().join("dormant").join("wear");
-    let entries = fs::read_dir(&wear_dir).map_or(0, Iterator::count);
+    let entries: Vec<PathBuf> = fs::read_dir(&wear_dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
 
     shutdown(handle, join).await;
 
-    assert_eq!(
-        entries, 0,
-        "wear.enabled = false must create no files under the wear state dir"
+    assert!(
+        parked,
+        "disabled tracker never logged wear_tracker_parked within 2s — cannot prove the \
+         directory check below observed a settled tracker; captured trace:\n{captured}"
+    );
+    assert!(
+        entries.is_empty(),
+        "wear.enabled = false must create no files under the wear state dir; found {entries:?} \
+         (tracker reported parked={parked})"
     );
 }
 
@@ -2515,18 +2559,22 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
 /// accumulated wear to disk, not leave the file stuck at whatever
 /// `sample_count` the last periodic persist wrote.
 ///
-/// **Post-shutdown poll, not an immediate read**: `App::start`'s wear-
-/// tracker `JoinHandle` is intentionally fire-and-forget (never joined —
-/// dropping a `JoinHandle` doesn't abort the task; see `app.rs`'s wiring
-/// notes). `shutdown()` only awaits the daemon's main `run_loop` task, so
-/// it can return before the SEPARATE wear-tracker task has finished
-/// executing its own cancellation-triggered `persist_all_dirty` — reading
-/// the file immediately after `shutdown()` races that fire-and-forget
+/// **Immediate read, not a post-shutdown poll (#47 fix, plan Task 5 §4)**:
+/// this test used to poll (bounded, up to 8s) after `shutdown()` because
+/// `App::start`'s wear-tracker `JoinHandle` was fire-and-forget (dropped,
+/// never joined) — `shutdown()` only awaited the daemon's main `run_loop`
+/// task, which could return before the SEPARATE wear-tracker task finished
+/// its own cancellation-triggered `persist_all_dirty`, so reading the file
+/// immediately after `shutdown()` used to race that fire-and-forget
 /// completion (confirmed via a temporary `tracing`-capture diagnostic run:
 /// the in-memory ledger's `sample_count` climbed correctly tick-by-tick,
 /// but the file still showed the stale pre-shutdown value on the losing
-/// side of the race). A short bounded poll after `shutdown()` accommodates
-/// this without weakening what the test actually proves.
+/// side of the race). `run_loop` now retains the tracker's `JoinHandle` and
+/// bounded-awaits it (mirroring the engine's own bounded-join-then-abort
+/// teardown) before returning, so by the time `shutdown()`'s `join.await`
+/// resolves, the tracker's final persist has already either landed or been
+/// force-aborted after its own 5s grace window — there is no longer a
+/// window to poll for. A direct read replaces the old workaround.
 ///
 /// **G1 review fix (margin widened)**: the pre-shutdown wait used to be a
 /// fixed `sleep(7s)` against a 5s `sample_interval` — only a ~2s margin
@@ -2607,28 +2655,18 @@ async fn wear_shutdown_persists_final_ledger() {
     // fixed 7s.
     tokio::time::sleep(sample_interval * 3 + Duration::from_secs(5)).await;
 
+    // #47 fix (§4): `shutdown()`'s `join.await` now only returns once
+    // `run_loop` has itself bounded-awaited the wear tracker's cancellation-
+    // triggered final persist (see doc comment above) — no more fire-and-
+    // forget race, so a direct read replaces the old post-shutdown poll.
     shutdown(handle, join).await;
-
-    // Bounded poll (see doc comment above) for the wear tracker's own
-    // fire-and-forget cancellation-triggered flush to land on disk. Widened
-    // from 3s to 8s (G1 review fix) — this only costs time on the losing
-    // side (predicate already true returns immediately), so it's a free
-    // safety margin for a loaded CI runner.
-    let ok = wait_for(
-        || {
-            serde_json::from_str::<dormant_core::wear::WearLedger>(&read(&wear_file))
-                .is_ok_and(|l| l.sample_count > sample_count_at_first_persist)
-        },
-        Duration::from_secs(8),
-    )
-    .await;
 
     let contents = read(&wear_file);
     let ledger: dormant_core::wear::WearLedger =
         serde_json::from_str(&contents).expect("ledger file must still parse after shutdown");
 
     assert!(
-        ok && ledger.sample_count > sample_count_at_first_persist,
+        ledger.sample_count > sample_count_at_first_persist,
         "shutdown must flush wear accumulated since the last periodic persist \
          (at first persist={sample_count_at_first_persist}, after shutdown={})",
         ledger.sample_count
@@ -3978,7 +4016,27 @@ async fn watchdog_reload_mid_window_resets_candidate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
+              body (app lifetime included) — test-local, always released promptly at test end. \
+              #47 fix: this test builds an App (default `wear.enabled = true` spawns a real \
+              tracker that reads XDG_STATE_HOME once at startup) but never mutated the env \
+              itself, so it used to run WITHOUT this lock — the section-header comment above \
+              already documented that every test here must hold it, but this one didn't. That \
+              gap let this test's own tracker capture `wear_disabled_creates_nothing`'s \
+              temp directory whenever this test's `App::start` happened to land inside that \
+              test's `wear_env_lock`-protected `XDG_STATE_HOME` mutation window, producing a \
+              real `wear-mon.json` there (both configs use the same `[displays.mon]` key) even \
+              after WearTrackerDeps::dir closed the OTHER half of the race (a later env \
+              mutation redirecting an already-running tracker). Taking the lock here closes \
+              this half: it excludes this test from running concurrently with any test that \
+              mutates XDG_STATE_HOME at all, not just ones sharing a directory with it."
+)]
 async fn watchdog_ping_cadence_grows_on_healthy_ticks() {
+    let _guard = wear_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(

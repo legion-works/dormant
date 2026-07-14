@@ -103,6 +103,26 @@ pub struct WearTrackerDeps {
     pub handle: WearHandle,
     /// Daemon-lifetime cancellation token.
     pub cancel: CancellationToken,
+    /// The wear state directory, resolved ONCE and synchronously by
+    /// `app.rs` (from `dormant_core::paths::wear_state_dir()`, i.e.
+    /// `XDG_STATE_HOME`/`HOME`) before this tracker is spawned — never
+    /// re-derived here.
+    ///
+    /// #47 fix: the tracker previously called `wear_state_dir()` itself,
+    /// inside the detached `tokio::spawn`ed task, at first-tick time — a
+    /// SECOND, unsynchronized read of the same process-global env var
+    /// `App::start` had already consulted moments earlier. Under test
+    /// concurrency (every App-building test spawns a tracker; `wear.enabled`
+    /// defaults to `true`, see `defaults.rs`), an unrelated test's tracker
+    /// could have its own env-dependent read land inside a DIFFERENT test's
+    /// `wear_env_lock`-protected `XDG_STATE_HOME` mutation window and get
+    /// redirected into that other test's temp directory, writing a real
+    /// `wear-mon.json` there. Resolving the directory synchronously in
+    /// `App::start`, before any `.await` and before the tracker task even
+    /// exists, and threading the resulting `PathBuf` through this struct
+    /// closes that window entirely: nothing in `wear_tracker.rs` ever reads
+    /// an env var again.
+    pub dir: std::path::PathBuf,
 }
 
 /// Spawn the wear tracker. Runs until `deps.cancel` fires.
@@ -120,7 +140,10 @@ type EnabledHistory = Option<bool>;
 async fn run(mut deps: WearTrackerDeps) {
     let mut state = TrackerState::default();
     let mut was_enabled: EnabledHistory = None;
-    let dir = dormant_core::paths::wear_state_dir();
+    // #47 fix: NOT `dormant_core::paths::wear_state_dir()` — see
+    // `WearTrackerDeps::dir`'s doc comment. `deps.dir` was resolved
+    // synchronously by the caller before this task was ever spawned.
+    let dir = deps.dir.clone();
 
     let mut interval = new_interval(deps.config_rx.borrow().wear.sample_interval);
 
@@ -1116,6 +1139,113 @@ mod tests {
         ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
 
         assert_eq!(state.native_max.get(&display).copied(), Some(50));
+    }
+
+    // ── #47 fix: `run` must not re-read `XDG_STATE_HOME` after spawn ────────
+
+    /// Regression pin for the diagnosed `wear_disabled_creates_nothing`
+    /// flake (#47, plan Task 5 §3): before this fix, `run` resolved its
+    /// state directory itself, INSIDE the detached spawned task
+    /// (`dormant_core::paths::wear_state_dir()`, reading the process-global
+    /// `XDG_STATE_HOME`/`HOME` env), racing every other App-building test's
+    /// own env mutations (`wear.enabled` defaults `true`, so every such test
+    /// spawns a tracker). The fix resolves the directory ONCE, synchronously,
+    /// in `App::start` before the tracker is ever spawned, and threads the
+    /// resulting `PathBuf` through as `WearTrackerDeps::dir` — `run` now
+    /// only ever reads `deps.dir`.
+    ///
+    /// Proves it directly: point `XDG_STATE_HOME` at a decoy directory
+    /// AFTER the tracker task is already running (simulating an unrelated
+    /// test/process racing in), and confirm the ledger lands under the
+    /// `dir` injected at spawn time, never under the decoy.
+    #[tokio::test]
+    async fn tracker_persists_to_injected_dir_even_if_xdg_state_home_changes_after_spawn() {
+        let injected_dir = tempfile::tempdir().unwrap();
+        let decoy_dir = tempfile::tempdir().unwrap();
+
+        // SAFETY: the only call site that ever read `XDG_STATE_HOME` inside
+        // this crate's lib target was `run`'s own (now-removed)
+        // `wear_state_dir()` call — no other unit test in this binary reads
+        // that env var, so mutating it here without a cross-test lock
+        // cannot race any other test's assertions.
+        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", decoy_dir.path());
+        }
+
+        let display = DisplayId("mon".into());
+        let mut cfg = minimal_config();
+        cfg.wear.enabled = true;
+        cfg.wear.sample_interval = Duration::from_millis(5);
+        cfg.displays.insert(
+            "mon".to_string(),
+            display_config_with_controllers(&["command"]),
+        );
+        let (_config_tx, config_rx) = watch::channel(Arc::new(cfg));
+        let executors = fake_executors(&[(&display, None)]);
+        let (_executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let wear_handle: WearHandle = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let cancel = CancellationToken::new();
+
+        // Minimal `Snapshot` responder standing in for the real engine —
+        // just enough to let `ensure_ledgers_loaded`/`tick` run for the one
+        // configured display on every tick.
+        let responder_display = display.clone();
+        let responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                if let ControlMsg::Snapshot(tx) = msg {
+                    let _ = tx.send(snapshot_with(&responder_display, "active", None));
+                }
+            }
+        });
+
+        let join = spawn(WearTrackerDeps {
+            config_rx,
+            ctl_tx,
+            executors_rx,
+            handle: wear_handle,
+            cancel: cancel.clone(),
+            dir: injected_dir.path().to_path_buf(),
+        });
+
+        // Mutate the env var AGAIN now that the tracker is definitely
+        // running, belt-and-braces against the exact race this test pins:
+        // even a mutation landing while the tracker's first tick is in
+        // flight must not matter, because nothing in `run` looks at the
+        // env after spawn.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", decoy_dir.path());
+        }
+
+        let expected_file = injected_dir.path().join("wear-mon.json");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !expected_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
+        responder.abort();
+
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+
+        assert!(
+            expected_file.exists(),
+            "ledger must persist under the WearTrackerDeps::dir injected at spawn ({}) — it \
+             never appeared",
+            injected_dir.path().display()
+        );
+        let decoy_wear_file = decoy_dir.path().join("wear-mon.json");
+        assert!(
+            !decoy_wear_file.exists(),
+            "ledger must NOT appear under the decoy directory pointed to by XDG_STATE_HOME \
+             AFTER spawn ({}) — `run` must never re-read XDG_STATE_HOME",
+            decoy_wear_file.display()
+        );
     }
 
     // ── T7 fix M1: ledger identity = panel identity, not config key ──────────

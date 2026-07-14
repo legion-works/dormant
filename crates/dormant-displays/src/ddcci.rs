@@ -401,6 +401,19 @@ impl DisplayController for DdcciController {
         // samsung-tizen pattern).
         if result.is_ok() {
             let mut state = self.state.lock().unwrap();
+            // A successful non-brightness blank (#33: mode switch) leaves
+            // any previously saved brightness stale — it describes a panel
+            // state from a DIFFERENT blank cycle. Clear it BEFORE recording
+            // `last_blank_mode` so the next `BrightnessZero` blank re-saves
+            // fresh instead of skipping the save (its `is_none()` guard)
+            // and later restoring the stale value on wake. A FAILED write
+            // must NOT reach this arm (guarded by `result.is_ok()` above):
+            // the prior successful brightness-zero state may still
+            // describe the physical panel and remains the safest wake
+            // fallback.
+            if mode != BlankMode::BrightnessZero {
+                state.saved_brightness = None;
+            }
             state.last_blank_mode = Some(mode);
         }
         result
@@ -948,6 +961,125 @@ mod tests {
             Some(90),
             "second blank should re-save fresh brightness 90"
         );
+    }
+
+    /// RED regression for #33: a mode switch between two `BrightnessZero`
+    /// blanks must not leak stale `saved_brightness` across the
+    /// intervening successful non-brightness blank. Sequence:
+    /// `BrightnessZero` at 75 -> successful `PowerOff` -> `BrightnessZero`
+    /// at 60 -> wake. Wake must restore the FRESH 60 (saved by the second
+    /// brightness-zero blank), not the stale 75 saved before the mode
+    /// switch.
+    #[tokio::test]
+    async fn mode_switch_clears_stale_saved_brightness() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // First BrightnessZero blank at 75 -> saves 75.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
+
+        // Mode switch: a successful PowerOff blank must clear the stale
+        // saved_brightness.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            None,
+            "a successful non-brightness blank must clear stale saved_brightness"
+        );
+
+        // Second BrightnessZero blank at 60 -- must re-save fresh (60),
+        // not skip saving because a stale saved_brightness was still Some.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(60));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(60));
+
+        // Wake -- must restore 60, not stale 75. Only 60 is scripted: if
+        // the fake observes a set_vcp(0x10, 75) call instead, wake()
+        // surfaces that as a CmdFailure and this unwrap panics.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 60, Ok(()));
+        ctrl.wake().await.unwrap();
+
+        let log = fake.take_call_log();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("60")),
+            "wake should restore fresh 60, not stale 75: {log:?}"
+        );
+    }
+
+    /// Failure sibling of `mode_switch_clears_stale_saved_brightness`: if
+    /// the intervening non-brightness blank FAILS (D6 write error), the
+    /// prior successful brightness-zero save must survive -- it may still
+    /// describe the physical panel and remains the safest wake fallback.
+    #[tokio::test]
+    async fn failed_mode_switch_preserves_saved_brightness() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // BrightnessZero blank at 75 -> saves 75.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
+
+        // Failed PowerOff blank -- the D6-off write itself errors.
+        fake.expect_set(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_POWER,
+            D6_OFF,
+            Err("write failed".into()),
+        );
+        let err = ctrl.blank(BlankMode::PowerOff).await.unwrap_err();
+        assert!(
+            err.error.contains("failed to set power off"),
+            "blank failure should mention power-off write: {err}"
+        );
+
+        // saved_brightness (and last_blank_mode) must survive the failed
+        // blank -- a failed D6 write must NOT clear the safest fallback.
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            Some(75),
+            "a failed non-brightness blank must NOT clear saved_brightness"
+        );
+        assert_eq!(
+            ctrl.state.lock().unwrap().last_blank_mode,
+            Some(BlankMode::BrightnessZero),
+            "a failed blank must not overwrite last_blank_mode"
+        );
+
+        // Wake still restores 75.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_ON, Ok(()));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 75, Ok(()));
+        ctrl.wake().await.unwrap();
     }
 
     /// After a daemon restart the saved brightness is gone (in-memory

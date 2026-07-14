@@ -84,13 +84,41 @@ trait DdcutilOps: Send + Sync {
 /// [`format_second_opinion`]; it is never retried with different arguments
 /// or through a shell.
 #[cfg(target_os = "linux")]
-struct RealDdcutil;
+struct RealDdcutil {
+    /// Program name/path passed to `Command::new`. Production code always
+    /// uses the default `"ddcutil"` (a bare name resolved via `PATH` at
+    /// spawn time, unchanged from before this seam existed); tests point
+    /// this at an absolute path to a scripted fake binary instead, so the
+    /// timeout test never needs to mutate the process-wide `PATH` env var.
+    program: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl RealDdcutil {
+    /// Production constructor: resolves `ddcutil` via `PATH` at spawn time,
+    /// exactly as before this seam existed.
+    fn new() -> Self {
+        Self {
+            program: std::path::PathBuf::from("ddcutil"),
+        }
+    }
+
+    /// Test-only constructor: points at an explicit (typically absolute)
+    /// path instead of doing a `PATH` lookup, so tests can hand it a
+    /// scripted fake binary without mutating the process-wide `PATH`.
+    #[cfg(test)]
+    fn at(program: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[async_trait::async_trait]
 impl DdcutilOps for RealDdcutil {
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome {
-        let child = tokio::process::Command::new("ddcutil")
+        let child = tokio::process::Command::new(&self.program)
             .args(["detect", "--brief"])
             .kill_on_drop(true)
             .output();
@@ -148,7 +176,7 @@ fn format_second_opinion(outcome: &DdcutilOutcome) -> String {
 /// `ddcutil`-backed implementations; tests inject fakes for both instead.
 #[cfg(target_os = "linux")]
 pub async fn probe_ddcci() -> ProbeResult {
-    probe_ddcci_with(&RealVcp, &RealDdcutil, DDCUTIL_TIMEOUT).await
+    probe_ddcci_with(&RealVcp, &RealDdcutil::new(), DDCUTIL_TIMEOUT).await
 }
 
 /// Probe DDC/CI-capable displays via `ops`, plus an advisory `ddcutil`
@@ -387,7 +415,9 @@ mod tests {
     /// implementation genuinely returns `NotInstalled` without any script.
     #[tokio::test]
     async fn real_ddcutil_reports_not_installed_in_this_sandbox() {
-        let outcome = RealDdcutil.detect_brief(Duration::from_secs(5)).await;
+        let outcome = RealDdcutil::new()
+            .detect_brief(Duration::from_secs(5))
+            .await;
         assert_eq!(outcome, DdcutilOutcome::NotInstalled);
     }
 
@@ -512,24 +542,18 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&script_path, perms).expect("chmod");
 
-        let original_path = std::env::var("PATH").unwrap_or_default();
-        // SAFETY: this test does not run concurrently with other PATH
-        // reads/writes across threads within this process (tokio single
-        // test task) and restores PATH before returning.
-        unsafe {
-            std::env::set_var("PATH", format!("{}:{original_path}", dir.path().display()));
-        }
-
+        // Point `RealDdcutil` straight at the scripted fake binary's
+        // absolute path instead of mutating the process-wide `PATH` env
+        // var: tests run as threads within one process (not separate
+        // processes), so a `PATH` mutation here would race the sibling
+        // `real_ddcutil_reports_not_installed_in_this_sandbox` test's
+        // concurrent PATH-dependent spawn.
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            RealDdcutil.detect_brief(Duration::from_millis(100)),
+            RealDdcutil::at(&script_path).detect_brief(Duration::from_millis(100)),
         )
         .await
         .expect("RealDdcutil.detect_brief must return within its own bounded timeout");
-
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
 
         assert_eq!(outcome, DdcutilOutcome::TimedOut);
     }

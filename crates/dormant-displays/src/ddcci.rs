@@ -1047,6 +1047,68 @@ mod tests {
         );
     }
 
+    /// Pin (#32): if the D6-on write itself fails on wake, that failure
+    /// must propagate as a `CmdFailure` carrying `E_DISPLAY_IO` and the
+    /// underlying write error -- not be swallowed. Only one D6-on write
+    /// should be attempted, and (since the preceding blank was `PowerOff`,
+    /// which never touches brightness) no brightness write should happen
+    /// either.
+    #[tokio::test]
+    async fn wake_after_power_off_propagates_d6_on_error() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // Blank with PowerOff -- succeeds.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+
+        // Wake's D6-on write fails.
+        fake.expect_set(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_POWER,
+            D6_ON,
+            Err("write failed".into()),
+        );
+        let err = ctrl.wake().await.unwrap_err();
+        assert!(
+            err.error.contains("E_DISPLAY_IO"),
+            "wake failure must carry E_DISPLAY_IO: {err}"
+        );
+        assert!(
+            err.error.contains("failed to set power on: write failed"),
+            "wake failure must surface the underlying write error: {err}"
+        );
+
+        let log = fake.take_call_log();
+        // The blank() call above also logs a `0xD6` write (D6_OFF, value
+        // 5); filter on the D6_ON value (1) specifically, same idiom as
+        // `wake_after_power_off_sends_d6_on_only`, so this only counts
+        // wake's D6-on attempt.
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains("set_vcp") && l.contains("0xD6") && l.contains('1'))
+                .count(),
+            1,
+            "wake should attempt the D6-on write exactly once: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10")),
+            "a failed D6-on write must not fall through to a brightness write: {log:?}"
+        );
+    }
+
     /// RED-first regression for the live-caught bug: `wake()` used to
     /// unconditionally restore brightness even when the preceding blank
     /// was `PowerOff` (which never touched brightness), silently

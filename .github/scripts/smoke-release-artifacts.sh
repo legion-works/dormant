@@ -113,39 +113,34 @@ stage_binary() {
     mkdir -p "$extract_dir"
     tar -xf "$archive_path" -C "$extract_dir" 2>/dev/null || die "missing packaged binary: $app"
 
+    # cargo-dist nests the binary under a "<app>-<triple>/" prefix directory
+    # inside the tarball, but the manifest's asset `.path` reports only the
+    # bare in-archive basename (e.g. "dormantd", not
+    # "dormantd-x86_64-unknown-linux-gnu/dormantd"). Trusting `.path` as an
+    # extract-relative path therefore misses the real file. Prefer the manifest
+    # path if it happens to land (future-proof against a flat layout), else
+    # locate the executable by its basename anywhere under the extract dir.
     extracted_exe="$extract_dir/$exe_in_archive"
-    [ -f "$extracted_exe" ] || die "missing packaged binary: $app"
+    if [ ! -f "$extracted_exe" ]; then
+        extracted_exe="$(find "$extract_dir" -type f -name "$(basename "$exe_in_archive")" 2>/dev/null | head -n1)"
+    fi
+    [ -n "$extracted_exe" ] && [ -f "$extracted_exe" ] || die "missing packaged binary: $app"
 
     install -m 755 "$extracted_exe" "$PREFIX/bin/$app"
 }
 
-# Cargo-dist's shell-installer naming convention is "<app>-installer.sh",
-# keyed exactly that way in the manifest's .artifacts map. We look the key up
-# directly instead of scanning/sorting all "kind == installer" entries, so
-# picking dormantd's installer never depends on how many other apps
-# (dormant-tray, dormantctl, ...) also ship one.
-check_installer_payload() {
-    app="$1"
-    installer_name="${app}-installer.sh"
-
-    kind="$(jq -r --arg name "$installer_name" '.artifacts[$name].kind // empty' "$MANIFEST")"
-    [ "$kind" = "installer" ] || die "missing packaged installer: $installer_name"
-
-    triples="$(jq -r --arg name "$installer_name" --arg triple "$TARGET_TRIPLE" '
-        .artifacts[$name].target_triples // [] | index($triple)
-    ' "$MANIFEST")"
-    [ "$triples" != "null" ] || die "missing packaged installer: $installer_name (does not target $TARGET_TRIPLE)"
-
-    installer_path="$ARTIFACTS_DIR/$installer_name"
-    [ -s "$installer_path" ] || die "missing packaged installer: $installer_name"
-    head -c2 "$installer_path" | grep -q '^#!' || die "missing packaged installer: $installer_name (no shebang)"
-}
-
 # Order matters: dormantd is checked first so an empty fixture's first
 # failure is deterministically "missing packaged binary: dormantd".
+#
+# We deliberately do NOT smoke the shell installer here: it is a cargo-dist
+# *global* artifact (built by build-global-artifacts), while this job depends
+# only on `plan` and receives the per-target build-local archives — the
+# installer file is not present in ARTIFACTS_DIR. It is also generated
+# boilerplate that merely curls the published release, so its integrity is
+# cargo-dist's concern, not ours; the value of this gate is proving the
+# packaged BINARIES extract and run before `host` publishes.
 stage_binary "dormantd"
 stage_binary "dormantctl"
-check_installer_payload "dormantd"
 
 CONFIG_FILE="$WORKDIR/config.toml"
 CREDENTIALS_FILE="$WORKDIR/credentials.toml" # intentionally never created:

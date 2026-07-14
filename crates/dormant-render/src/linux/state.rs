@@ -50,8 +50,8 @@ use super::blend::{self, T_MAX};
 #[cfg(test)]
 use super::wayland_ops::RecordingWaylandOps;
 use super::wayland_ops::{
-    BufferHandle, PoolHandle, ViewportHandle, WaylandOps, create_screensaver_buffers, real_buffer,
-    real_pool_with_region_mut,
+    BufferHandle, PoolHandle, SurfaceHandle, ViewportHandle, WaylandOps,
+    create_screensaver_buffers, real_buffer, real_pool_with_region_mut, wrap_real_buffer,
 };
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
@@ -1123,6 +1123,62 @@ pub(super) trait ViewportStateView {
             dest.1.saturating_add(2 * margin_px),
         ))
     }
+
+    /// Swap the surface's attached buffer to `black_buffer`: unset any
+    /// live viewport source crop (via [`Self::reset_shift`] — this
+    /// calls that SAME shared chokepoint, not a re-implementation of
+    /// its unset request), THEN attach `black_buffer` at `(0, 0)`,
+    /// THEN commit. This exact order is the fix for the
+    /// `out_of_buffer` protocol-error class (issue #56, the
+    /// originating regression for this whole test-seam, #55): a
+    /// stale oversized shift source-rect left over from the
+    /// screensaver, still in effect when a much-smaller (or 1×1
+    /// single-pixel) black buffer is attached and committed, is a
+    /// fatal Wayland protocol error the compositor kills the client
+    /// connection for.
+    ///
+    /// `WaylandState::fail_screensaver_to_black` and the black
+    /// content-swap branch of `WaylandState::handle_show`
+    /// (`StageKind::RenderBlack` reaching a surface that's already
+    /// up) both call this directly as
+    /// `self.swap_surface_to_black(...)` — it IS their shared
+    /// attach/commit orchestration, not a wrapper either call site
+    /// could quietly stop calling while the other still does (see
+    /// this trait's docs above `impl ViewportStateView for
+    /// WaylandState` for the method-delegation shape this whole trait
+    /// replaces, and `super::wayland_ops`'s module docs for why
+    /// `WaylandState` cannot be constructed in a unit test to
+    /// exercise those two call sites directly).
+    ///
+    /// **Not unit-testable: the two OUTER call sites.** The
+    /// `self.swap_surface_to_black(...)` call EXPRESSIONS themselves
+    /// — and the black-buffer construction that runs just before each
+    /// of them (the single-pixel-vs-shm-fallback branch) — sit on the
+    /// SCTK/compositor boundary (`WaylandState` needs a live
+    /// `wayland_client::Connection` to construct at all) and so
+    /// cannot be exercised by a test. This method's BODY is what both
+    /// call sites run verbatim; the recorder tests in `tests` below
+    /// (`swap_surface_to_black_*`) pin that shared body — deleting
+    /// `self.reset_shift()` from it, or reordering it after the
+    /// attach/commit calls, fails those tests. Whether both
+    /// production call sites still actually REACH
+    /// `self.swap_surface_to_black(...)` (rather than a call site
+    /// being edited to reimplement attach/commit inline, bypassing
+    /// this method and its `reset_shift` call entirely) is NOT
+    /// provable by any unit test in this crate — that is exactly the
+    /// residual risk `super::wayland_ops`'s module docs describe, and
+    /// relies on review vigilance: a `grep -n swap_surface_to_black
+    /// state.rs` should show exactly this definition plus the two
+    /// call sites, both as `self.swap_surface_to_black(...)`.
+    fn swap_surface_to_black(
+        &mut self,
+        surface: &dyn SurfaceHandle,
+        black_buffer: &dyn BufferHandle,
+    ) {
+        self.reset_shift();
+        self.ops().surface_attach(surface, black_buffer, 0, 0);
+        self.ops().surface_commit(surface);
+    }
 }
 
 impl ViewportStateView for WaylandState {
@@ -2020,14 +2076,19 @@ impl WaylandState {
             reason = reason,
         );
 
-        // U5: black overlay never shifts — reset any shift state the
-        // screensaver path set up before building the fallback buffer.
-        self.reset_shift();
-
         // Build a black buffer on demand if the screensaver was the
         // first stage (no prior `RenderBlack` show to create one).
         // Use the single-pixel + viewporter path when available,
-        // otherwise the shm fallback.
+        // otherwise the shm fallback. (The standalone `self.reset_shift()`
+        // that used to run here, before this block, is now issued by
+        // `swap_surface_to_black` below, immediately before the
+        // attach it must precede — moving it is protocol-safe: a
+        // `wp_viewport`'s pending state, like a `wl_surface`'s, is
+        // double-buffered and only takes effect at the next
+        // `wl_surface.commit()`, so this block's `set_destination`
+        // request (single-pixel branch) and `swap_surface_to_black`'s
+        // unset request apply atomically at the SAME commit
+        // regardless of which request was issued first.)
         let dest = self.configured_size;
         if self.black_buffer.is_none()
             && let Some(surface) = self.layer_surface.as_ref()
@@ -2064,11 +2125,16 @@ impl WaylandState {
         // the calloop wakeup source, removes the deadline timer.
         self.destroy_screensaver_session();
 
-        // Re-attach the now-guaranteed black buffer.
+        // Re-attach the now-guaranteed black buffer: unset any live
+        // shift viewport crop, THEN attach, THEN commit — see
+        // `ViewportStateView::swap_surface_to_black`'s docs for why
+        // this exact order matters (`out_of_buffer` protocol-error
+        // class, issue #56).
         if let (Some(surface), Some(black)) = (&self.layer_surface, &self.black_buffer) {
-            let wl_surface = surface.wl_surface();
-            wl_surface.attach(Some(black), 0, 0);
-            wl_surface.commit();
+            let wl_surface = surface.wl_surface().clone();
+            let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
+            let buffer_handle = wrap_real_buffer(black.clone());
+            self.swap_surface_to_black(surface_handle.as_ref(), buffer_handle.as_ref());
         }
     }
 
@@ -2300,10 +2366,13 @@ impl WaylandState {
                     // U5: the black overlay never shifts — build
                     // (or reuse) a black buffer via the single-pixel
                     // fast path when available, or shm fallback.
+                    // (The standalone `self.reset_shift()` that used
+                    // to run here is now issued by
+                    // `swap_surface_to_black` below, immediately
+                    // before the attach it must precede — see that
+                    // method's docs for why moving it is
+                    // protocol-safe.)
                     let dest = self.configured_size;
-                    // Disarm and reset any shift state the screensaver
-                    // may have left active — U5: black never shifts.
-                    self.reset_shift();
                     if self.black_buffer.is_none() {
                         if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                             let buffer = self
@@ -2327,9 +2396,16 @@ impl WaylandState {
                         }
                     }
 
-                    if let Some(black) = self.black_buffer.as_ref() {
-                        wl_surface.attach(Some(black), 0, 0);
-                        wl_surface.commit();
+                    if let Some(black) = self.black_buffer.clone() {
+                        // Unset any live shift viewport crop, THEN
+                        // attach, THEN commit — see
+                        // `ViewportStateView::swap_surface_to_black`'s
+                        // docs for why this exact order matters
+                        // (`out_of_buffer` protocol-error class,
+                        // issue #56).
+                        let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
+                        let buffer_handle = wrap_real_buffer(black);
+                        self.swap_surface_to_black(surface_handle.as_ref(), buffer_handle.as_ref());
                         tracing::info!(
                             event = "render_black_swap",
                             display_id = %self.display_id,
@@ -2533,20 +2609,32 @@ mod tests {
         );
     }
 
-    // ── black_attach_strategy (U5: black never shifts) ────────────────
+    // ── black_attach_strategy: pure selection-logic unit coverage
+    //    (U5: black never shifts) ────────────────────────────────────
     //
-    // These tests verify the U5 invariant: the black overlay always
-    // prefers the single-pixel fast path regardless of shift_px.
-    // Before the U5 restore, the black overlay would choose
-    // `OversizedShm` when `shift_px > 0` — these tests assert the
-    // inverse, so they must be RED against the pre-fix both-surfaces
-    // code and GREEN once the black path stops consulting shift.
+    // Renamed (test-seam #55, Task 3, item 3) from `black_attach_*` to
+    // `black_attach_strategy_*`: the ORIGINAL names/doc comments read
+    // as though they proved the black overlay's actual protocol
+    // behaviour ("the black overlay uses single-pixel..."). They
+    // never did — `black_attach_strategy` is a pure function over
+    // three `bool`/`u8` constants; these tests only pin ITS selection
+    // logic, never that the compositor actually receives a
+    // single-pixel or shm-fallback attach. That protocol-level proof
+    // is what `swap_surface_to_black_*` (below) and the recorder in
+    // `wayland_ops.rs` provide — for the buffer CONSTRUCTION step
+    // (which strategy is chosen) there is deliberately no equivalent
+    // recorder assertion yet, since `create_u32_rgba_buffer` /
+    // `create_shm_black_buffer` aren't behind `WaylandOps` in this
+    // pass (out of scope — see this trait's `swap_surface_to_black`
+    // docs on what's testable).
 
     #[test]
-    fn black_attach_with_shift_enabled_always_uses_single_pixel() {
-        // U5: even when shift_px > 0 AND the compositor supports
-        // single_pixel + viewporter, the black overlay uses the
-        // single-pixel fast path — never the oversized-shm shift path.
+    fn black_attach_strategy_selects_single_pixel_when_shift_enabled() {
+        // Pure logic only: even when shift_px > 0 AND both
+        // single_pixel_manager/viewporter inputs are true, the
+        // function's return value is `SinglePixel` — never
+        // `OversizedShm`. Does not prove the compositor ever receives
+        // this attach.
         let strategy = super::black_attach_strategy(
             2,    // shift_px > 0, shift IS configured
             true, // single_pixel_manager available
@@ -2555,16 +2643,16 @@ mod tests {
         assert_eq!(
             strategy,
             super::BlackAttachStrategy::SinglePixel,
-            "U5: black overlay MUST use single-pixel path when available, \
+            "U5: black_attach_strategy MUST select SinglePixel when available, \
              even when shift_px > 0"
         );
     }
 
     #[test]
-    fn black_attach_with_shift_enabled_falls_back_to_shm() {
-        // When single_pixel is unavailable but shift is configured,
-        // the black overlay still uses the plain SHM fallback — NOT
-        // an oversized shift buffer.
+    fn black_attach_strategy_selects_shm_fallback_without_single_pixel() {
+        // Pure logic only: when the single_pixel input is false but
+        // shift is configured, the function selects `ShmFallback` —
+        // never an oversized shift buffer.
         let strategy = super::black_attach_strategy(
             2,     // shift_px > 0, shift IS configured
             false, // single_pixel_manager unavailable
@@ -2573,25 +2661,23 @@ mod tests {
         assert_eq!(
             strategy,
             super::BlackAttachStrategy::ShmFallback,
-            "U5: black overlay MUST use shm fallback (not oversized shift) \
+            "U5: black_attach_strategy MUST select ShmFallback (not oversized shift) \
              when single_pixel is unavailable, even when shift_px > 0"
         );
     }
 
     #[test]
-    fn black_attach_without_shift_uses_single_pixel() {
-        // Sanity: when shift is disabled (shift_px = 0), the black
-        // overlay uses single_pixel — this was correct before and
-        // must stay correct.
+    fn black_attach_strategy_selects_single_pixel_without_shift() {
+        // Sanity: shift_px = 0 with both inputs true still selects
+        // SinglePixel — this was correct before and must stay correct.
         let strategy = super::black_attach_strategy(0, true, true);
         assert_eq!(strategy, super::BlackAttachStrategy::SinglePixel);
     }
 
     #[test]
-    fn black_attach_without_viewporter_uses_shm() {
-        // When viewporter is unavailable, the black overlay falls
-        // back to SHM regardless of shift_px — this path is shared
-        // and must stay intact.
+    fn black_attach_strategy_selects_shm_fallback_without_viewporter() {
+        // When the viewporter input is false, the function selects
+        // ShmFallback regardless of shift_px.
         let strategy = super::black_attach_strategy(0, true, false);
         assert_eq!(strategy, super::BlackAttachStrategy::ShmFallback);
     }
@@ -2695,6 +2781,21 @@ mod tests {
         /// `ensure_viewport` call.
         fn seed_viewport(&mut self) {
             self.viewport = Some(self.recorder.seed_viewport());
+        }
+
+        /// Seed a recorder surface handle, standing in for
+        /// `WaylandState.layer_surface` already being a live surface
+        /// (see `RecordingWaylandOps::seed_surface`'s docs).
+        fn seed_surface(&self) -> Arc<dyn SurfaceHandle> {
+            self.recorder.seed_surface()
+        }
+
+        /// Seed a recorder buffer handle, standing in for the black
+        /// buffer that production wraps via `wrap_real_buffer` before
+        /// calling `swap_surface_to_black` (see
+        /// `RecordingWaylandOps::seed_buffer`'s docs).
+        fn seed_buffer(&self) -> Arc<dyn BufferHandle> {
+            self.recorder.seed_buffer()
         }
 
         fn take_call_log(&self) -> Vec<String> {
@@ -2836,6 +2937,141 @@ mod tests {
         let dims = fake.reaim_shift_viewport(6, 10, (1920, 1080), 4);
         assert_eq!(dims, None);
         assert!(fake.take_call_log().is_empty());
+    }
+
+    #[test]
+    fn normal_shift_tick_does_not_issue_unset_tuple() {
+        // Negative companion to `swap_surface_to_black_*` below
+        // (test-seam #55, Task 3, item 4): a normal (non-transition)
+        // shift-timer re-aim must call `viewport_set_source` with the
+        // LIVE offset, never the `(-1, -1, -1, -1)` unset tuple —
+        // guards against an implementation that "plays safe" by
+        // unsetting on every frame, which would defeat the whole
+        // point of pinning unset-only-immediately-before-a-BLACK-attach.
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        let _ = fake.reaim_shift_viewport(6, 10, (1920, 1080), 4);
+        let log = fake.take_call_log();
+        assert_eq!(
+            log,
+            vec!["viewport_set_source(#0, 6, 10, 1920, 1080)".to_string()],
+            "a normal shifted-frame re-aim must issue exactly the live-offset set_source call"
+        );
+        assert!(
+            log.iter().all(|entry| !entry.contains("-1, -1, -1, -1")),
+            "a normal shift tick must never emit the unset tuple: {log:?}"
+        );
+    }
+
+    // ── `swap_surface_to_black` recorder: black-transition ordering
+    //    (test-seam #55, Task 3) ─────────────────────────────────
+    //
+    // `WaylandState::fail_screensaver_to_black` and the black
+    // content-swap branch of `WaylandState::handle_show` both call
+    // `self.swap_surface_to_black(...)` directly — the SAME provided
+    // `ViewportStateView` method `FakeShiftView` runs here via the
+    // trait, not a disconnected copy of it (see that method's docs).
+    // These two tests correspond to the plan's two named RED cases:
+    // the shifted screensaver → black content-swap path, and the
+    // `fail_screensaver_to_black` failure path — both routes converge
+    // on the identical shared body, so pinning that body's
+    // unset-before-attach-before-commit order closes both holes at
+    // once. Deleting `self.reset_shift()` from `swap_surface_to_black`
+    // (or reordering it after the attach/commit calls) fails both
+    // tests below.
+
+    #[test]
+    fn swap_surface_to_black_unsets_shifted_viewport_before_attach_and_commit() {
+        // RED (test-seam #55, Task 3, item 1): pins the screensaver→black
+        // content-swap path (`WaylandState::handle_show`'s
+        // `StageKind::RenderBlack` branch, reached when a live surface
+        // with an ACTIVE shift source crop is already up — a shifted
+        // screensaver swapping to black on the same surface without a
+        // teardown). Seed a viewport, install an initial shift crop,
+        // then re-aim it off-centre (mirrors a live raster-walk mid-tick)
+        // — the "shifted screensaver" precondition — before running
+        // `swap_surface_to_black`, the exact orchestration
+        // `handle_show`'s black content-swap branch calls.
+        let mut fake = FakeShiftView::new(4);
+        fake.seed_viewport();
+        fake.apply_shift_destination_and_initial_source((1920, 1080));
+        fake.reaim_shift_viewport(6, 10, (1920, 1080), 4);
+        fake.take_call_log(); // drain setup calls; only the swap under test matters below
+
+        let surface = fake.seed_surface();
+        let buffer = fake.seed_buffer();
+        fake.swap_surface_to_black(surface.as_ref(), buffer.as_ref());
+
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                "viewport_set_source(#0, -1, -1, -1, -1)".to_string(),
+                "surface_attach(#1, buffer=#2, 0, 0)".to_string(),
+                "surface_commit(#1)".to_string(),
+            ],
+            "black content-swap must unset the shifted viewport source crop BEFORE              attaching the black buffer, BEFORE committing — reversing this order (or              dropping the unset) reproduces the out_of_buffer protocol-error class from              issue #56"
+        );
+        assert!(
+            fake.shift_state.is_none(),
+            "swapping to black must clear the raster-walk state (U5: black never shifts)"
+        );
+    }
+
+    #[test]
+    fn swap_surface_to_black_pins_fail_screensaver_to_black_unset_order() {
+        // RED (test-seam #55, Task 3, item 2): pins
+        // `WaylandState::fail_screensaver_to_black`'s tail — reached
+        // when mpv reports a render error, or the first-frame
+        // deadline elapses, while the screensaver was rendering
+        // shifted content; the failure path swaps to a guaranteed
+        // black buffer on the same surface. T1's confirm-review
+        // proved deleting `self.reset_shift()` from
+        // `fail_screensaver_to_black` left every test green THEN
+        // (there was no recorder assertion on its attach/commit
+        // call). Now that both `fail_screensaver_to_black` and the
+        // content-swap branch route through the identical
+        // `swap_surface_to_black` shared body, this test closes
+        // exactly that hole: it fails if `reset_shift()` is removed
+        // from that shared body, or reordered after the attach.
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        fake.apply_shift_destination_and_initial_source((3072, 1728));
+        fake.take_call_log();
+
+        let surface = fake.seed_surface();
+        let buffer = fake.seed_buffer();
+        fake.swap_surface_to_black(surface.as_ref(), buffer.as_ref());
+
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                "viewport_set_source(#0, -1, -1, -1, -1)".to_string(),
+                "surface_attach(#1, buffer=#2, 0, 0)".to_string(),
+                "surface_commit(#1)".to_string(),
+            ],
+            "fail_screensaver_to_black's black-buffer re-attach must unset the viewport              source crop before attach/commit; deleting swap_surface_to_black's              reset_shift() call must fail this test (it did not, pre-seam)"
+        );
+    }
+
+    #[test]
+    fn swap_surface_to_black_attaches_and_commits_even_without_viewport() {
+        // Edge case: no viewport was ever bound (shift disabled, or
+        // no wp_viewporter) — `reset_shift` is then a no-op for the
+        // unset call (mirrors `reset_shift_is_noop_when_no_viewport_bound`),
+        // but the attach/commit must still happen: a display with
+        // shift disabled must still be able to swap to black.
+        let mut fake = FakeShiftView::new(0);
+        let surface = fake.seed_surface();
+        let buffer = fake.seed_buffer();
+        fake.swap_surface_to_black(surface.as_ref(), buffer.as_ref());
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                "surface_attach(#0, buffer=#1, 0, 0)".to_string(),
+                "surface_commit(#0)".to_string(),
+            ],
+            "no viewport bound → no set_source call, but attach/commit must still run"
+        );
     }
 
     // ── dual-buffer pool layout (regression: #56) ─────────────────

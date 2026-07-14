@@ -35,13 +35,20 @@
 //! duplication for tests to pin while production silently stops calling
 //! it (see `state.rs`'s `ViewportStateView` docs for why that shape is
 //! forbidden). Real `WlBuffer`/`RawPool` access for the per-frame mmap
-//! writes and `wl_surface.attach` calls stays behind [`real_pool_with_region_mut`] /
-//! [`real_buffer`] — real-only accessors that panic if ever called on a
-//! recorder handle, exactly mirroring `RealWaylandOps`'s viewport
-//! downcasts below. The black-transition attach/commit ordering is a
-//! follow-up seam on the same trait (tracked separately) — this trait is
-//! deliberately narrow, mirroring `VcpOps` rather than genericising the
-//! whole of `WaylandState`.
+//! writes stays behind [`real_pool_with_region_mut`] / [`real_buffer`]
+//! — real-only accessors that panic if ever called on a recorder
+//! handle, exactly mirroring `RealWaylandOps`'s viewport downcasts
+//! below. This pass (test-seam #55, Task 3) adds the black-transition
+//! attach/commit ordering: [`WaylandOps::surface_attach`] /
+//! [`WaylandOps::surface_commit`], against an opaque [`SurfaceHandle`]
+//! (mirroring [`ViewportHandle`]/[`PoolHandle`]/[`BufferHandle`]), so
+//! `state.rs`'s `ViewportStateView::swap_surface_to_black` — the
+//! shared black-transition orchestration `fail_screensaver_to_black`
+//! and the black content-swap branch of `handle_show` both call — can
+//! be exercised by a recorder test end to end: unset the live
+//! viewport source crop, attach the black buffer, commit, in that
+//! order. This trait is deliberately narrow, mirroring `VcpOps` rather
+//! than genericising the whole of `WaylandState`.
 //!
 //! ### Why `create_shm_pool` / `pool_create_buffer` take no `Shm` / `QueueHandle` parameter
 //!
@@ -108,6 +115,18 @@ pub(super) trait BufferHandle: Send + Sync + fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Opaque handle to a live `wl_surface`. Mirrors [`ViewportHandle`] /
+/// [`BufferHandle`]: `ViewportStateView::swap_surface_to_black`
+/// (`state.rs`) attaches/commits against THIS handle, never a raw
+/// `WlSurface` — so a compositor-free recorder test can exercise the
+/// exact same black-transition orchestration production runs. Real
+/// implementation wraps the actual `WlSurface` proxy (cloned — cheap,
+/// proxies are thin IDs); recorder implementation is an identity tag
+/// with no live protocol object behind it.
+pub(super) trait SurfaceHandle: Send + Sync + fmt::Debug {
+    fn as_any(&self) -> &dyn Any;
+}
+
 /// Abstract `wp_viewport` operations — real or scripted.
 ///
 /// `Send + Sync` so `Arc<dyn WaylandOps>` can be shared with
@@ -167,6 +186,30 @@ pub(super) trait WaylandOps: Send + Sync {
         stride: i32,
         format: wl_shm::Format,
     ) -> Arc<dyn BufferHandle>;
+
+    /// Wrap a live `wl_surface` proxy as an opaque [`SurfaceHandle`]
+    /// for [`Self::surface_attach`] / [`Self::surface_commit`]. Real
+    /// impl clones the proxy; mirrors [`Self::create_viewport`]'s
+    /// wrap-a-real-proxy shape. Recorder tests never call this — no
+    /// real `WlSurface` exists in a compositor-free test; they seed a
+    /// handle via `RecordingWaylandOps::seed_surface` instead (see
+    /// that method's docs, which mirror `seed_viewport`'s).
+    fn surface_handle(&self, wl_surface: &WlSurface) -> Arc<dyn SurfaceHandle>;
+
+    /// `wl_surface.attach(Some(buffer), x, y)`. The black-transition
+    /// orchestration (`state.rs`'s
+    /// `ViewportStateView::swap_surface_to_black`) is the sole caller
+    /// of this method in production.
+    fn surface_attach(
+        &self,
+        surface: &dyn SurfaceHandle,
+        buffer: &dyn BufferHandle,
+        x: i32,
+        y: i32,
+    );
+
+    /// `wl_surface.commit()`.
+    fn surface_commit(&self, surface: &dyn SurfaceHandle);
 }
 
 // ── RealWaylandOps — forwards to the live `WpViewport` proxy ──────────────────
@@ -230,6 +273,18 @@ impl BufferHandle for RealBufferHandle {
     }
 }
 
+/// Real handle: wraps the actual `WlSurface` proxy (cloned — cheap,
+/// proxies are thin IDs) a black-transition attach/commit runs
+/// against.
+#[derive(Debug)]
+struct RealSurfaceHandle(WlSurface);
+
+impl SurfaceHandle for RealSurfaceHandle {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Real-only: downcast an opaque pool handle back to the concrete
 /// `RawPool` it wraps, and run `f` against `[offset, offset+len)` of
 /// its mmap. The sole callers (`state.rs`'s `on_mpv_wakeup` and
@@ -270,6 +325,22 @@ pub(super) fn real_buffer(handle: &dyn BufferHandle) -> &WlBuffer {
         .downcast_ref::<RealBufferHandle>()
         .expect("real_buffer called on a non-Real buffer handle outside production")
         .0
+}
+
+/// Real-only: the inverse of [`real_buffer`] — wrap an already-created
+/// `WlBuffer` (e.g. from
+/// `wp_single_pixel_buffer_manager_v1::create_u32_rgba_buffer` or
+/// `crate::linux::surface::create_shm_black_buffer`; neither goes
+/// through [`WaylandOps::pool_create_buffer`], since the black
+/// overlay's buffer isn't part of the screensaver's double-buffer
+/// pool) as an opaque [`BufferHandle`] so
+/// `state.rs`'s `ViewportStateView::swap_surface_to_black` can attach
+/// it through [`WaylandOps::surface_attach`] like any other buffer.
+/// Real-only — the sole callers (`state.rs`'s `fail_screensaver_to_black`
+/// and the black content-swap branch of `handle_show`) only ever run
+/// in production.
+pub(super) fn wrap_real_buffer(buffer: WlBuffer) -> Arc<dyn BufferHandle> {
+    Arc::new(RealBufferHandle(buffer))
 }
 
 /// Production `WaylandOps` — the viewport methods forward straight to
@@ -363,6 +434,36 @@ impl WaylandOps for RealWaylandOps {
         );
         Arc::new(RealBufferHandle(buffer))
     }
+
+    fn surface_handle(&self, wl_surface: &WlSurface) -> Arc<dyn SurfaceHandle> {
+        Arc::new(RealSurfaceHandle(wl_surface.clone()))
+    }
+
+    fn surface_attach(
+        &self,
+        surface: &dyn SurfaceHandle,
+        buffer: &dyn BufferHandle,
+        x: i32,
+        y: i32,
+    ) {
+        let real_surface = surface
+            .as_any()
+            .downcast_ref::<RealSurfaceHandle>()
+            .expect("RealWaylandOps always receives a RealSurfaceHandle it created");
+        let real_buf = buffer
+            .as_any()
+            .downcast_ref::<RealBufferHandle>()
+            .expect("RealWaylandOps always receives a RealBufferHandle it created");
+        real_surface.0.attach(Some(&real_buf.0), x, y);
+    }
+
+    fn surface_commit(&self, surface: &dyn SurfaceHandle) {
+        let real_surface = surface
+            .as_any()
+            .downcast_ref::<RealSurfaceHandle>()
+            .expect("RealWaylandOps always receives a RealSurfaceHandle it created");
+        real_surface.0.commit();
+    }
 }
 
 // ── RecordingWaylandOps — scripted, for tests ──────────────────────────────────
@@ -395,18 +496,28 @@ impl PoolHandle for RecordingPoolHandle {
 }
 
 /// Recorder handle: carries only an identity — no live `WlBuffer`
-/// behind it. `id` is never read back out today (no test currently
-/// needs to distinguish one recorded buffer handle from another by
-/// identity — only the call log's `#{id}` text matters), but is kept
-/// for structural symmetry with `RecordingViewportHandle` /
-/// `RecordingPoolHandle` and any future test that does.
+/// behind it. `id` is read back by [`RecordingWaylandOps::surface_attach`]
+/// so the call log's `buffer=#{id}` text can distinguish which
+/// recorded buffer a black-transition attach targeted.
 #[derive(Debug)]
 pub(super) struct RecordingBufferHandle {
-    #[allow(dead_code)]
     id: u64,
 }
 
 impl BufferHandle for RecordingBufferHandle {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Recorder handle: carries only an identity — no live `WlSurface`
+/// behind it (there is no compositor in tests to bind one against).
+#[derive(Debug)]
+pub(super) struct RecordingSurfaceHandle {
+    id: u64,
+}
+
+impl SurfaceHandle for RecordingSurfaceHandle {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -440,6 +551,33 @@ impl RecordingWaylandOps {
     /// runs.
     pub(super) fn seed_viewport(&self) -> Arc<dyn ViewportHandle> {
         self.next_handle()
+    }
+
+    /// Allocate a fresh recorder surface-handle identity without going
+    /// through [`WaylandOps::surface_handle`] — production only calls
+    /// that with a real `WlSurface`, which a compositor-free test
+    /// can't construct. Mirrors [`Self::seed_viewport`]: this stands
+    /// in for `WaylandState.layer_surface` already being `Some` (a
+    /// live layer surface up) at the point the black-transition
+    /// orchestration under test runs.
+    pub(super) fn seed_surface(&self) -> Arc<dyn SurfaceHandle> {
+        Arc::new(RecordingSurfaceHandle {
+            id: self.alloc_id(),
+        })
+    }
+
+    /// Allocate a fresh recorder buffer-handle identity without going
+    /// through [`WaylandOps::pool_create_buffer`] — this stands in for
+    /// the black buffer, which production builds via
+    /// `wp_single_pixel_buffer_manager_v1` / `create_shm_black_buffer`
+    /// (neither goes through the screensaver's dual-buffer pool seam)
+    /// and wraps with `wrap_real_buffer` before calling
+    /// `swap_surface_to_black`. Mirrors [`Self::seed_viewport`] /
+    /// [`Self::seed_surface`].
+    pub(super) fn seed_buffer(&self) -> Arc<dyn BufferHandle> {
+        Arc::new(RecordingBufferHandle {
+            id: self.alloc_id(),
+        })
     }
 
     fn next_handle(&self) -> Arc<dyn ViewportHandle> {
@@ -544,6 +682,43 @@ impl WaylandOps for RecordingWaylandOps {
         ));
         Arc::new(RecordingBufferHandle { id })
     }
+
+    fn surface_handle(&self, _wl_surface: &WlSurface) -> Arc<dyn SurfaceHandle> {
+        // Never actually called by a test (see `seed_surface`'s docs) —
+        // implemented for trait-object completeness only.
+        self.seed_surface()
+    }
+
+    fn surface_attach(
+        &self,
+        surface: &dyn SurfaceHandle,
+        buffer: &dyn BufferHandle,
+        x: i32,
+        y: i32,
+    ) {
+        let surface_id = surface
+            .as_any()
+            .downcast_ref::<RecordingSurfaceHandle>()
+            .map_or(u64::MAX, |h| h.id);
+        let buffer_id = buffer
+            .as_any()
+            .downcast_ref::<RecordingBufferHandle>()
+            .map_or(u64::MAX, |h| h.id);
+        self.call_log.lock().unwrap().push(format!(
+            "surface_attach(#{surface_id}, buffer=#{buffer_id}, {x}, {y})"
+        ));
+    }
+
+    fn surface_commit(&self, surface: &dyn SurfaceHandle) {
+        let surface_id = surface
+            .as_any()
+            .downcast_ref::<RecordingSurfaceHandle>()
+            .map_or(u64::MAX, |h| h.id);
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(format!("surface_commit(#{surface_id})"));
+    }
 }
 
 // ── Shared screensaver dual-buffer orchestration (prod + recorder tests) ──
@@ -629,6 +804,26 @@ mod tests {
             vec![
                 "viewport_set_destination(#0, 100, 200)".to_string(),
                 "viewport_set_source(#0, 1, 2, 3, 4)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recorder_logs_surface_attach_and_commit_in_order() {
+        // Test-seam #55, Task 3: the black-transition orchestration
+        // needs `surface_attach` / `surface_commit` recordable in the
+        // exact order production issues them (see `state.rs`'s
+        // `ViewportStateView::swap_surface_to_black`).
+        let ops = RecordingWaylandOps::new();
+        let surface = ops.seed_surface();
+        let buffer = ops.seed_buffer();
+        ops.surface_attach(surface.as_ref(), buffer.as_ref(), 0, 0);
+        ops.surface_commit(surface.as_ref());
+        assert_eq!(
+            ops.take_call_log(),
+            vec![
+                "surface_attach(#0, buffer=#1, 0, 0)".to_string(),
+                "surface_commit(#0)".to_string(),
             ]
         );
     }

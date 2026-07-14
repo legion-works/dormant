@@ -854,16 +854,13 @@ impl WaylandState {
         dest: (u32, u32),
     ) -> Option<Arc<dyn ViewportHandle>> {
         self.shift_geometry(dest)?;
-        let viewport = self.ensure_viewport(wl_surface)?;
-        let shift_px = self.shift_settings.shift_px;
-        apply_shift_destination_and_initial_source(
-            self.wayland_ops.as_ref(),
-            viewport.as_ref(),
-            dest,
-            shift_px,
-            &mut self.shift_state,
-        );
-        Some(viewport)
+        self.ensure_viewport(wl_surface)?;
+        // `Some(viewport)` can ONLY come from
+        // `apply_shift_destination_and_initial_source`'s body actually
+        // running — there is deliberately no local `viewport` binding
+        // left over from `ensure_viewport` above for a deleted call to
+        // fall back on. See `ViewportStateView`'s docs.
+        self.apply_shift_destination_and_initial_source(dest)
     }
 
     /// Arm the shift timer exactly once per surface lifetime — the
@@ -923,37 +920,16 @@ impl WaylandState {
         }
     }
 
-    /// Remove the shift timer's calloop registration if one is armed.
-    /// Idempotent.  Does NOT touch `shift_state` — [`Self::reset_shift`]
-    /// (full surface teardown) clears that separately.
-    fn disarm_shift_timer(&mut self) {
-        if let (Some(token), Some(handle)) =
-            (self.shift_timer_token.take(), self.loop_handle.as_ref())
-        {
-            handle.remove(token);
-        }
-    }
-
-    /// Full shift reset: disarm the timer, drop the walk state, and
-    /// unset any live viewport source rectangle so a subsequent 1×1
-    /// single-pixel black-buffer attach does not trigger a fatal
-    /// `wp_viewport.out_of_buffer` protocol error (the old source rect
-    /// from the screensaver's oversized buffer extends past the 1×1
-    /// buffer boundary).
-    ///
-    /// Called from [`Self::destroy_surface`] (full teardown) and every
-    /// screensaver→black transition path (content-swap,
-    /// `fail_screensaver_to_black`).
-    pub(super) fn reset_shift(&mut self) {
-        self.disarm_shift_timer();
-        self.shift_state = None;
-        // Unset any live viewport source rect via `self.wayland_ops` —
-        // the protocol-documented unset is `set_source(-1, -1, -1,
-        // -1)`.  Without this, a screensaver's oversized-buffer crop
-        // survives into the next black-buffer attach and extends past
-        // a 1×1 buffer boundary.
-        unset_viewport(self.wayland_ops.as_ref(), self.viewport.as_deref());
-    }
+    // `disarm_shift_timer` and `reset_shift` used to live here as
+    // inherent methods, each delegating one internal line to an
+    // extracted free function purely for recorder-test coverage —
+    // exactly the "production call site removed, tests stay green"
+    // shape this pass closes (see `ViewportStateView` below). They
+    // now live as one shared implementation: `disarm_shift_timer` as
+    // this impl's `ViewportStateView` accessor (just below), and
+    // `reset_shift` as `ViewportStateView`'s provided (default,
+    // never-overridden) method, which `WaylandState`'s call sites
+    // invoke directly as `self.reset_shift()`.
 
     /// Shift timer tick: advance the walk one step, re-aim the live
     /// viewport's source rect, damage the full (oversized) buffer, and
@@ -974,16 +950,19 @@ impl WaylandState {
         let (ox, oy) = shift_state.advance();
         let margin_px = shift_state.margin_px();
         let dest = self.configured_size;
-        let Some(viewport) = self.viewport.as_ref() else {
+        // `(ow, oh)` below can ONLY come from `reaim_shift_viewport`
+        // actually issuing the re-aim through `WaylandOps` — there is
+        // no local computation of the oversized dims left in this
+        // function for a deleted call to fall back on, so deleting it
+        // breaks `damage_buffer`'s arguments rather than silently
+        // no-op'ing (see `ViewportStateView`'s docs).
+        let Some((ow, oh)) = self.reaim_shift_viewport(ox, oy, dest, margin_px) else {
             return;
         };
-        apply_shift_tick_source(self.wayland_ops.as_ref(), viewport.as_ref(), ox, oy, dest);
         let Some(surface) = self.layer_surface.as_ref() else {
             return;
         };
         let wl_surface = surface.wl_surface();
-        let ow = dest.0.saturating_add(2 * margin_px);
-        let oh = dest.1.saturating_add(2 * margin_px);
         wl_surface.damage_buffer(0, 0, ow.cast_signed(), oh.cast_signed());
         wl_surface.commit();
         tracing::trace!(
@@ -1035,88 +1014,173 @@ pub(super) fn black_attach_strategy(
     }
 }
 
-// ── Production orchestration extracted for recorder tests ────────────────────
+// ── Shared viewport-orchestration bodies (prod + recorder tests) ──────────
 //
 // `WaylandState` cannot be constructed in a unit test — its SCTK
 // fields (`CompositorState`, `Shm`, `OutputState`, `RegistryState`,
-// `LayerShell`) all require a live `wayland_client::Connection`
-// bound via `registry_queue_init`'s real roundtrip, and there is no
+// `LayerShell`) all require a live `wayland_client::Connection` bound
+// via `registry_queue_init`'s real roundtrip, and there is no
 // compositor in the test/sandbox environment (nor should tests ever
 // open a real connection — see `super::wayland_ops` module docs).
-// The viewport-touching bodies of `reset_shift`, `ensure_shift_viewport`,
-// and `on_shift_tick` are therefore factored into these free functions,
-// taking only `&dyn WaylandOps` plus the narrow explicit state they
-// need. `WaylandState`'s methods call these exact functions — a
-// recorder test invoking them directly runs the SAME production
-// orchestration, just with `RecordingWaylandOps` standing in for
-// `RealWaylandOps`.
+//
+// An earlier pass factored the viewport-touching bodies of
+// `reset_shift`, `ensure_shift_viewport`, and `on_shift_tick` into
+// free functions, with each method containing one internal line that
+// called the matching free function. That left a method → free-fn
+// *boundary*: deleting the internal call from e.g. `reset_shift`
+// compiled fine and left every test green, because the recorder tests
+// invoked the free function directly, never through `reset_shift`
+// itself — the exact "production call site removed, tests stay
+// green" tautology this seam exists to kill.
+//
+// `ViewportStateView` replaces that shape with ONE implementation per
+// behaviour: the three bodies below are PROVIDED (default) trait
+// methods. `WaylandState` implements the trait by supplying only the
+// narrow accessors each body needs (`ops`, `viewport_handle`,
+// `shift_state_mut`, `shift_px`, `disarm_shift_timer`) and never
+// overrides a provided method, so `self.reset_shift()` etc. at
+// `WaylandState`'s production call sites run this exact code — not a
+// copy of it. Recorder tests implement the same trait on a trivial
+// fake (`FakeShiftView`, in `tests` below) backed by
+// `RecordingWaylandOps` and call the SAME provided methods. There is
+// no longer a free-function copy for tests to pin while production
+// silently stops calling it.
+pub(super) trait ViewportStateView {
+    /// The `WaylandOps` seam every viewport request must go through.
+    fn ops(&self) -> &Arc<dyn WaylandOps>;
 
-/// Unset `viewport`'s crop rectangle via `ops` — the
-/// protocol-documented `set_source(-1, -1, -1, -1)` — if a viewport is
-/// bound; a no-op otherwise. Called by [`WaylandState::reset_shift`]
-/// before a black-buffer attach to prevent `wp_viewport.out_of_buffer`
-/// when the previous surface (screensaver) had an oversized-buffer
-/// source crop.
-///
-/// Replaces the deleted `unset_viewport_source()` helper, which only
-/// ever asserted its own literal return tuple `(-1.0, -1.0, -1.0,
-/// -1.0)` — a tautology that stayed green even if `reset_shift`
-/// stopped calling it. This function actually issues the request
-/// (through `ops`), so a recorder test asserting on its call log pins
-/// the real protocol effect, not just the constant.
-pub(super) fn unset_viewport(ops: &dyn WaylandOps, viewport: Option<&dyn ViewportHandle>) {
-    if let Some(viewport) = viewport {
-        ops.viewport_set_source(viewport, -1.0, -1.0, -1.0, -1.0);
+    /// The bound `wp_viewport` handle, if any (cloned out — cheap,
+    /// `Arc`).
+    fn viewport_handle(&self) -> Option<Arc<dyn ViewportHandle>>;
+
+    /// Mutable access to the raster-walk cursor.
+    fn shift_state_mut(&mut self) -> &mut Option<ShiftState>;
+
+    /// Current `shift_px` setting (0 = disabled).
+    fn shift_px(&self) -> u8;
+
+    /// Disarm whatever timer mechanism re-arms shift ticks. A no-op
+    /// for state that has none (e.g. the recorder-backed test fake,
+    /// which owns no calloop timer at all).
+    fn disarm_shift_timer(&mut self);
+
+    /// Full shift reset: disarm the timer, drop the walk state, and
+    /// unset any live viewport source rectangle via `ops` — the
+    /// protocol-documented `set_source(-1, -1, -1, -1)` — so a
+    /// subsequent 1×1 single-pixel black-buffer attach does not
+    /// trigger a fatal `wp_viewport.out_of_buffer` protocol error (the
+    /// old source rect from the screensaver's oversized buffer
+    /// extends past the 1×1 buffer boundary).
+    ///
+    /// `WaylandState` calls this directly as `self.reset_shift()` from
+    /// `destroy_surface`, `fail_screensaver_to_black`, and the
+    /// compositor-initiated-close path — this provided method IS what
+    /// those call sites run, not a wrapper around it.
+    fn reset_shift(&mut self) {
+        self.disarm_shift_timer();
+        *self.shift_state_mut() = None;
+        if let Some(viewport) = self.viewport_handle() {
+            self.ops()
+                .viewport_set_source(viewport.as_ref(), -1.0, -1.0, -1.0, -1.0);
+        }
     }
-}
 
-/// Set `viewport`'s destination to `dest` via `ops`, and — the FIRST
-/// time this runs for a given surface lifetime (`shift_state` is
-/// still `None`) — initialise the raster-walk state and set the
-/// initial (centred) source rect via `ops` too. Called by
-/// [`WaylandState::ensure_shift_viewport`].
-pub(super) fn apply_shift_destination_and_initial_source(
-    ops: &dyn WaylandOps,
-    viewport: &dyn ViewportHandle,
-    dest: (u32, u32),
-    shift_px: u8,
-    shift_state: &mut Option<ShiftState>,
-) {
-    ops.viewport_set_destination(viewport, dest.0.cast_signed(), dest.1.cast_signed());
-    if shift_state.is_none() {
-        let state = ShiftState::new(shift_px);
-        let (ox, oy) = state.source_origin();
-        ops.viewport_set_source(
-            viewport,
+    /// Set the bound viewport's destination to `dest`, and — the
+    /// FIRST time this runs for a given surface lifetime
+    /// (`shift_state` still `None`) — initialise the raster-walk
+    /// state and set the initial (centred) source rect too.
+    ///
+    /// Returns the bound viewport back to the caller (pass-through):
+    /// [`WaylandState::ensure_shift_viewport`]'s `Some(viewport)`
+    /// result can ONLY come from this body actually running — there
+    /// is no local `viewport` binding left in `ensure_shift_viewport`
+    /// for a deleted call to fall back on, so deleting the call is a
+    /// compile error there, not a silent no-op.
+    fn apply_shift_destination_and_initial_source(
+        &mut self,
+        dest: (u32, u32),
+    ) -> Option<Arc<dyn ViewportHandle>> {
+        let viewport = self.viewport_handle()?;
+        self.ops().viewport_set_destination(
+            viewport.as_ref(),
+            dest.0.cast_signed(),
+            dest.1.cast_signed(),
+        );
+        if self.shift_state_mut().is_none() {
+            let shift_px = self.shift_px();
+            let state = ShiftState::new(shift_px);
+            let (ox, oy) = state.source_origin();
+            self.ops().viewport_set_source(
+                viewport.as_ref(),
+                f64::from(ox),
+                f64::from(oy),
+                f64::from(dest.0),
+                f64::from(dest.1),
+            );
+            *self.shift_state_mut() = Some(state);
+        }
+        Some(viewport)
+    }
+
+    /// Re-aim the bound viewport's source rect for one shift-timer
+    /// tick (offset `(ox, oy)` within the oversized `dest`-sized
+    /// canvas), and hand back the oversized buffer dims
+    /// `(width, height)` the caller needs for `damage_buffer`.
+    ///
+    /// [`WaylandState::on_shift_tick`]'s damage/commit calls consume
+    /// THIS return value directly — there is no separate local
+    /// computation of the oversized dims for a deleted call to fall
+    /// back on, so deleting the call breaks compilation there rather
+    /// than silently no-op'ing. The surrounding damage/commit calls
+    /// against the real `WlSurface` stay inline in `on_shift_tick`
+    /// (unmigrated in this pass — see `wayland_ops` module docs on
+    /// scope).
+    fn reaim_shift_viewport(
+        &mut self,
+        ox: u32,
+        oy: u32,
+        dest: (u32, u32),
+        margin_px: u32,
+    ) -> Option<(u32, u32)> {
+        let viewport = self.viewport_handle()?;
+        self.ops().viewport_set_source(
+            viewport.as_ref(),
             f64::from(ox),
             f64::from(oy),
             f64::from(dest.0),
             f64::from(dest.1),
         );
-        *shift_state = Some(state);
+        Some((
+            dest.0.saturating_add(2 * margin_px),
+            dest.1.saturating_add(2 * margin_px),
+        ))
     }
 }
 
-/// Re-aim `viewport`'s source rect via `ops` for one shift-timer tick
-/// (offset `(ox, oy)` within the oversized `dest`-sized canvas).
-/// Called by [`WaylandState::on_shift_tick`]; the surrounding
-/// damage/commit calls against the real `WlSurface` stay inline in
-/// `on_shift_tick` (unmigrated in this pass — see `wayland_ops`
-/// module docs on scope).
-pub(super) fn apply_shift_tick_source(
-    ops: &dyn WaylandOps,
-    viewport: &dyn ViewportHandle,
-    ox: u32,
-    oy: u32,
-    dest: (u32, u32),
-) {
-    ops.viewport_set_source(
-        viewport,
-        f64::from(ox),
-        f64::from(oy),
-        f64::from(dest.0),
-        f64::from(dest.1),
-    );
+impl ViewportStateView for WaylandState {
+    fn ops(&self) -> &Arc<dyn WaylandOps> {
+        &self.wayland_ops
+    }
+
+    fn viewport_handle(&self) -> Option<Arc<dyn ViewportHandle>> {
+        self.viewport.clone()
+    }
+
+    fn shift_state_mut(&mut self) -> &mut Option<ShiftState> {
+        &mut self.shift_state
+    }
+
+    fn shift_px(&self) -> u8 {
+        self.shift_settings.shift_px
+    }
+
+    fn disarm_shift_timer(&mut self) {
+        if let (Some(token), Some(handle)) =
+            (self.shift_timer_token.take(), self.loop_handle.as_ref())
+        {
+            handle.remove(token);
+        }
+    }
 }
 
 impl WaylandState {
@@ -2591,30 +2655,101 @@ mod tests {
         assert_eq!(surface_match(pending, live, &event), SurfaceMatch::Stale);
     }
 
-    // ── WaylandOps recorder: viewport requests (test-seam #55) ────────
+    // ── ViewportStateView recorder: viewport requests (test-seam #55) ──
     //
-    // These tests call the SAME free functions `WaylandState::reset_shift`,
-    // `ensure_shift_viewport`, and `on_shift_tick` call in production
-    // (`unset_viewport`, `apply_shift_destination_and_initial_source`,
-    // `apply_shift_tick_source`), through a `RecordingWaylandOps`
-    // instead of `RealWaylandOps` — no `WaylandState` instance, no
-    // Wayland connection, no compositor. Before this seam existed,
-    // `reset_shift` called `WpViewport::set_source` directly and the
-    // only coverage was `unset_viewport_source_is_negative_ones`
-    // (deleted), which asserted its own literal return tuple and would
-    // stay green even if `reset_shift` stopped calling it. These
-    // recorder tests assert on the actual call log the orchestration
-    // produced, so deleting the production call site fails them.
+    // `FakeShiftView` implements the SAME `ViewportStateView` trait as
+    // `WaylandState` — no `WaylandState` instance, no Wayland
+    // connection, no compositor needed. These tests call the exact
+    // provided (default) trait methods (`reset_shift`,
+    // `apply_shift_destination_and_initial_source`,
+    // `reaim_shift_viewport`) that `WaylandState`'s production call
+    // sites invoke directly (see the `ViewportStateView` docs above
+    // `impl ViewportStateView for WaylandState`) — there is only ONE
+    // implementation of each body, so a test asserting on the
+    // `RecordingWaylandOps` call log pins the same code path
+    // production runs, not a disconnected copy of it. Before this
+    // trait existed, `reset_shift` etc. each had an internal line
+    // delegating to an extracted free function that only these tests
+    // called directly — deleting that internal line compiled fine and
+    // left every test green. That delegation line no longer exists:
+    // deleting anything inside a provided method here changes the
+    // body these tests exercise.
+
+    /// Minimal `ViewportStateView` impl for recorder tests: a bound
+    /// (or unbound) viewport, a `shift_state` cursor, and a
+    /// `shift_px` knob — backed by `RecordingWaylandOps` instead of a
+    /// real Wayland connection. `disarm_shift_timer` just flips a
+    /// flag; there is no calloop timer to unregister in a test.
+    struct FakeShiftView {
+        ops: Arc<dyn WaylandOps>,
+        recorder: Arc<RecordingWaylandOps>,
+        viewport: Option<Arc<dyn ViewportHandle>>,
+        shift_state: Option<ShiftState>,
+        shift_px: u8,
+        timer_disarmed: bool,
+    }
+
+    impl FakeShiftView {
+        fn new(shift_px: u8) -> Self {
+            let recorder = Arc::new(RecordingWaylandOps::new());
+            let ops: Arc<dyn WaylandOps> = recorder.clone();
+            Self {
+                ops,
+                recorder,
+                viewport: None,
+                shift_state: None,
+                shift_px,
+                timer_disarmed: false,
+            }
+        }
+
+        /// Bind a recorder-seeded viewport, mirroring `WaylandState`
+        /// having a live `wp_viewport` already bound via a prior
+        /// `ensure_viewport` call.
+        fn seed_viewport(&mut self) {
+            self.viewport = Some(self.recorder.seed_viewport());
+        }
+
+        fn take_call_log(&self) -> Vec<String> {
+            self.recorder.take_call_log()
+        }
+    }
+
+    impl ViewportStateView for FakeShiftView {
+        fn ops(&self) -> &Arc<dyn WaylandOps> {
+            &self.ops
+        }
+
+        fn viewport_handle(&self) -> Option<Arc<dyn ViewportHandle>> {
+            self.viewport.clone()
+        }
+
+        fn shift_state_mut(&mut self) -> &mut Option<ShiftState> {
+            &mut self.shift_state
+        }
+
+        fn shift_px(&self) -> u8 {
+            self.shift_px
+        }
+
+        fn disarm_shift_timer(&mut self) {
+            self.timer_disarmed = true;
+        }
+    }
 
     #[test]
     fn reset_shift_unsets_viewport_source_via_ops() {
-        let ops = RecordingWaylandOps::new();
-        let viewport = ops.seed_viewport();
-        unset_viewport(&ops, Some(viewport.as_ref()));
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        fake.reset_shift();
         assert_eq!(
-            ops.take_call_log(),
+            fake.take_call_log(),
             vec!["viewport_set_source(#0, -1, -1, -1, -1)".to_string()],
             "reset_shift's orchestration must issue the protocol-documented unset tuple through WaylandOps, not skip it"
+        );
+        assert!(
+            fake.timer_disarmed,
+            "reset_shift must disarm the shift timer"
         );
     }
 
@@ -2623,28 +2758,37 @@ mod tests {
         // Negative companion: a surface that never bound a viewport
         // (shift disabled, or no wp_viewporter) must not spuriously
         // call set_source at all.
-        let ops = RecordingWaylandOps::new();
-        unset_viewport(&ops, None);
+        let mut fake = FakeShiftView::new(2);
+        fake.reset_shift();
         assert!(
-            ops.take_call_log().is_empty(),
+            fake.take_call_log().is_empty(),
             "no viewport bound → no set_source call should be issued"
         );
     }
 
     #[test]
+    fn reset_shift_clears_shift_state() {
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        fake.shift_state = Some(ShiftState::new(2));
+        fake.reset_shift();
+        assert!(
+            fake.shift_state.is_none(),
+            "reset_shift must clear shift_state"
+        );
+    }
+
+    #[test]
     fn ensure_shift_viewport_sets_destination_then_initial_source_on_first_install() {
-        let ops = RecordingWaylandOps::new();
-        let viewport = ops.seed_viewport();
-        let mut shift_state: Option<ShiftState> = None;
-        apply_shift_destination_and_initial_source(
-            &ops,
-            viewport.as_ref(),
-            (1920, 1080),
-            2,
-            &mut shift_state,
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        let result = fake.apply_shift_destination_and_initial_source((1920, 1080));
+        assert!(
+            result.is_some(),
+            "must return the bound viewport back to the caller"
         );
         assert_eq!(
-            ops.take_call_log(),
+            fake.take_call_log(),
             vec![
                 "viewport_set_destination(#0, 1920, 1080)".to_string(),
                 "viewport_set_source(#0, 4, 4, 1920, 1080)".to_string(),
@@ -2652,7 +2796,7 @@ mod tests {
             "first install must set destination THEN the initial centred source rect"
         );
         assert!(
-            shift_state.is_some(),
+            fake.shift_state.is_some(),
             "shift_state must be initialised on first install"
         );
     }
@@ -2663,47 +2807,48 @@ mod tests {
         // re-installing must only re-aim the destination — resetting
         // the source here would snap a live raster-walk back to centre
         // every time the screensaver install path re-runs.
-        let ops = RecordingWaylandOps::new();
-        let viewport = ops.seed_viewport();
-        let mut shift_state = Some(ShiftState::new(2));
-        apply_shift_destination_and_initial_source(
-            &ops,
-            viewport.as_ref(),
-            (1920, 1080),
-            2,
-            &mut shift_state,
-        );
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        fake.shift_state = Some(ShiftState::new(2));
+        fake.apply_shift_destination_and_initial_source((1920, 1080));
         assert_eq!(
-            ops.take_call_log(),
+            fake.take_call_log(),
             vec!["viewport_set_destination(#0, 1920, 1080)".to_string()],
             "subsequent installs must not re-issue set_source"
         );
     }
 
     #[test]
+    fn ensure_shift_viewport_is_noop_when_no_viewport_bound() {
+        let mut fake = FakeShiftView::new(2);
+        let result = fake.apply_shift_destination_and_initial_source((1920, 1080));
+        assert!(result.is_none());
+        assert!(fake.take_call_log().is_empty());
+    }
+
+    #[test]
     fn shift_tick_reaims_viewport_source() {
-        let ops = RecordingWaylandOps::new();
-        let viewport = ops.seed_viewport();
-        apply_shift_tick_source(&ops, viewport.as_ref(), 6, 10, (1920, 1080));
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        let dims = fake.reaim_shift_viewport(6, 10, (1920, 1080), 4);
         assert_eq!(
-            ops.take_call_log(),
+            dims,
+            Some((1928, 1088)),
+            "must return the oversized (dest + 2*margin) dims for damage_buffer"
+        );
+        assert_eq!(
+            fake.take_call_log(),
             vec!["viewport_set_source(#0, 6, 10, 1920, 1080)".to_string()],
             "a shift-timer tick must re-aim the viewport's source rect through WaylandOps"
         );
     }
 
     #[test]
-    fn reset_shift_clears_shift_state() {
-        // The Rust-side state must be None after reset — verified
-        // indirectly: ShiftState::new(2) is enabled, ShiftState::new(0)
-        // is disabled, and reset_shift sets shift_state = None.
-        // This test pins that the reset clears the cursor (which
-        // black_attach_strategy also ignores via _shift_px).
-        let enabled = crate::shift::ShiftState::new(2);
-        assert!(enabled.enabled());
-        let disabled = crate::shift::ShiftState::new(0);
-        assert!(!disabled.enabled());
-        // reset_shift() clears shift_state → equivalent to ShiftState::new(0).
+    fn shift_tick_reaim_is_noop_when_no_viewport_bound() {
+        let mut fake = FakeShiftView::new(2);
+        let dims = fake.reaim_shift_viewport(6, 10, (1920, 1080), 4);
+        assert_eq!(dims, None);
+        assert!(fake.take_call_log().is_empty());
     }
 
     // ── dual-buffer pool layout (regression: #56) ─────────────────

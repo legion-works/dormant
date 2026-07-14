@@ -720,6 +720,7 @@ fn parse_member(raw: &str) -> Result<ZoneMember, DormantError> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScreensaverSource {
     /// Local filesystem path to a directory of images or a playlist file.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
     /// Remote URLs pointing to image or video files.
@@ -738,10 +739,15 @@ pub struct ScreensaverSource {
     /// Explicit ordering strategy (`"sequential"`).
     /// Mutually exclusive with `shuffle`; validation rejects a config
     /// that sets both.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<String>,
 
     /// How long each image is displayed before advancing.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(
+        default,
+        with = "humantime_serde::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image_duration: Option<Duration>,
 }
 
@@ -832,12 +838,12 @@ pub struct DisplayConfig {
     /// Primary blank mode to use.  Must be set unless `ladder` is provided.
     /// When `ladder` is present this field is ignored — the first
     /// `Controller(_)` stage in the ladder serves as the primary mode.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blank_mode: Option<BlankMode>,
 
     /// Fallback blank mode if the primary is unsupported (best-effort).
     /// Cannot be set when `ladder` is present.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_mode: Option<BlankMode>,
 
     /// Ordered escalation ladder (replaces `blank_mode`).  Each rung is a
@@ -848,46 +854,58 @@ pub struct DisplayConfig {
 
     /// Software screensaver configuration, required when a ladder includes
     /// a [`StageKind::RenderScreensaver`] stage.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screensaver: Option<ScreensaverConfig>,
 
     /// `KWin` output name (e.g. `"DP-1"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 
     /// DDC/CI display identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ddc_display: Option<String>,
 
     /// Hostname or IP for network-controllable displays (Samsung Tizen,
     /// LG webOS).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
 
     /// MAC address for Wake-on-LAN displays.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wol_mac: Option<String>,
 
     /// Shell command to blank the display.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blank_command: Option<String>,
 
     /// Shell command to wake the display.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_command: Option<String>,
 
     /// Supported blank modes for `"command"` / `"ha-passthrough"` controllers
     /// (the static capability set for these controllers is empty; the user
     /// declares supported modes here).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<Vec<BlankMode>>,
 
     /// Home Assistant URL for `"ha-passthrough"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ha_url: Option<String>,
 
     /// HA service to call for blanking.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blank_service: Option<String>,
 
     /// HA service data for blanking (arbitrary TOML value).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blank_data: Option<toml::Value>,
 
     /// HA service to call for waking.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_service: Option<String>,
 
     /// HA service data for waking (arbitrary TOML value).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wake_data: Option<toml::Value>,
 
     /// Timeout for a single blank/wake command.

@@ -12,15 +12,16 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerSurface,
 };
 
+use std::sync::Arc;
+
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use wayland_protocols::wp::viewporter::client::{
-    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
-};
+use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::linux::state::WaylandState;
+use crate::linux::wayland_ops::ViewportHandle;
 
 /// Opaque black in `u32` ARGB host order, matching
 /// `WpSinglePixelBufferManagerV1::create_u32_rgba_buffer`.
@@ -77,6 +78,14 @@ pub(super) fn create_layer_surface(
 
 /// Attach a 1×1 opaque-black buffer via `wp_viewporter::set_destination`
 /// so the compositor scales it to fill the configured `width × height`.
+///
+/// Routes the viewport bind + `set_destination` through
+/// `state.wayland_ops` (not `Dispatch`/SCTK-required — see the
+/// `wayland_ops` module docs) — this is the ONE call site that binds a
+/// viewport before `WaylandState::ensure_viewport` has ever run (the
+/// very first black show on a fresh surface); the returned handle is
+/// cached into `state.viewport` by the caller so every later request
+/// reuses it via `ensure_viewport`.
 #[must_use]
 pub(super) fn attach_single_pixel_black(
     single_pixel_manager: &crate::linux::state::SinglePixelBufferManager,
@@ -85,15 +94,21 @@ pub(super) fn attach_single_pixel_black(
     width: u32,
     height: u32,
     state: &WaylandState,
-) -> (WlBuffer, WpViewport) {
+) -> (WlBuffer, Arc<dyn ViewportHandle>) {
     let qh = state.queue_handle.clone();
     // Per-channel u32 values scaled over the full u32 range — NOT a
     // packed ARGB8888 pixel.  The `OPAQUE_BLACK_U32` constant is for the
     // shm path (a packed pixel written into the buffer); passing it as the
     // `r` channel here would give ~99.6% red.
     let buffer = single_pixel_manager.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &qh, ());
-    let viewport = viewporter.get_viewport(wl_surface, &qh, ());
-    viewport.set_destination(width.cast_signed(), height.cast_signed());
+    let viewport = state
+        .wayland_ops
+        .create_viewport(viewporter, wl_surface, &qh);
+    state.wayland_ops.viewport_set_destination(
+        viewport.as_ref(),
+        width.cast_signed(),
+        height.cast_signed(),
+    );
     wl_surface.attach(Some(&buffer), 0, 0);
     wl_surface.commit();
     (buffer, viewport)

@@ -9,6 +9,7 @@ mod blend;
 mod connection;
 mod state;
 mod surface;
+mod wayland_ops;
 
 use std::fmt;
 

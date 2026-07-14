@@ -70,6 +70,7 @@ use dormant_core::types::{CmdFailure, DisplayId};
 
 use crate::command::RenderCommand;
 use crate::linux::state::{CONFIGURE_TIMEOUT, WaylandState};
+use crate::linux::wayland_ops::RealWaylandOps;
 
 /// Spawn the dedicated Wayland thread and return a [`Sender`] that the
 /// handle uses to enqueue [`RenderCommand`]s.
@@ -210,6 +211,7 @@ fn init(
         input_wake_tx,
         queue_handle,
         loop_should_exit.clone(),
+        Arc::new(RealWaylandOps),
     );
     // Inject the loop handle so the screensaver install path can register
     // its wakeup source mid-flight (the install is invoked from inside

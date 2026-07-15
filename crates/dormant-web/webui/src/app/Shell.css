@@ -29,9 +29,8 @@
 }
 
 .brand-mark {
-  font-size: 26px;
-  line-height: 1;
-  color: var(--success);
+  width: 26px;
+  height: 26px;
   flex-shrink: 0;
 }
 
@@ -71,7 +70,9 @@
   border: none;
   cursor: pointer;
   text-align: left;
+  text-decoration: none;
   width: 100%;
+  box-sizing: border-box;
   font-family: var(--font-ui);
   transition: background-color var(--dur-fast) var(--ease),
               color var(--dur-fast) var(--ease);
@@ -117,6 +118,16 @@
   background-color: var(--success-muted);
 }
 
+.nav-badge--count {
+  color: var(--text-faint);
+  background-color: var(--bg-sunken);
+}
+
+.nav-badge--rollback {
+  color: var(--danger);
+  background-color: var(--danger-muted);
+}
+
 .sidebar-footer {
   display: flex;
   align-items: center;
@@ -146,11 +157,19 @@
   color: var(--text-muted);
 }
 
+.footer-fleet-mark {
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+
 .footer-github {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  margin-left: auto;
+  margin-left: 8px;
   font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--text-faint);
@@ -185,6 +204,14 @@
   display: flex;
   align-items: baseline;
   gap: 10px;
+  min-width: 0;
+}
+
+.topbar-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
 }
 
 .topbar-title {
@@ -218,6 +245,15 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.topbar-config-path {
+  font-size: 11px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
 }
 
 .topbar-clock {

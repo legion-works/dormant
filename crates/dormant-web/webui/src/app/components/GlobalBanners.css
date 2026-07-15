@@ -1,0 +1,156 @@
+/* Global safety chrome — rollback banner, emergency-wake control, and
+   the shared `.global-banner` shell reused by Shell's own transient
+   poll-warning/pending-reload banners. All color/spacing/radius values
+   use DS tokens; no hardcoded hex/rgba. */
+
+.global-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin-bottom: 14px;
+  font-size: 13px;
+}
+
+.global-banner__body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.global-banner__title {
+  font-size: 13.5px;
+  color: var(--text-strong);
+}
+
+.global-banner__detail {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.global-banner__action {
+  flex-shrink: 0;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  background: var(--danger-muted);
+  color: var(--danger);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease);
+}
+
+.global-banner__action:hover {
+  background: color-mix(in oklab, var(--danger) 26%, transparent);
+}
+
+.global-banner--rollback {
+  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  background: color-mix(in oklab, var(--danger) 10%, transparent);
+}
+
+.rollback-banner__fingerprints {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.global-banner--poll {
+  border: 1px solid color-mix(in oklab, var(--warning) 40%, transparent);
+  background: color-mix(in oklab, var(--warning) 10%, transparent);
+  color: var(--text-body);
+}
+
+.global-banner--pending {
+  border: 1px solid var(--border-accent);
+  background: var(--accent-muted);
+  color: var(--text-body);
+  font-family: var(--font-mono);
+}
+
+/* Emergency wake control — topbar-mounted, guarded by the shared
+   ConfirmDialog. */
+.emergency-wake {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.emergency-wake__button {
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  background: var(--danger-muted);
+  color: var(--danger);
+  transition: background-color var(--dur-fast) var(--ease);
+}
+
+.emergency-wake__button:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--danger) 26%, transparent);
+}
+
+.emergency-wake__button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.emergency-wake__status,
+.emergency-wake__alert {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 260px;
+  text-align: right;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.emergency-wake__status {
+  color: var(--text-faint);
+}
+
+.emergency-wake__alert {
+  color: var(--danger);
+}
+
+.emergency-wake__spinner {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  border-top-color: var(--danger);
+  animation: emergency-wake-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+.emergency-wake__failures {
+  margin: 0;
+  padding-left: 14px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--danger);
+  text-align: left;
+}
+
+@keyframes emergency-wake-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .emergency-wake__spinner {
+    animation: none;
+  }
+}

@@ -6,7 +6,7 @@
  * `derive_icon_state` Failure predicate.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import { LiveStateProvider } from "../app/state";
 import { useLiveState } from "../app/hooks/useLiveState";
 import FailureBanner from "../app/components/FailureBanner";
@@ -87,7 +87,7 @@ describe("FailureBanner", () => {
 
     render(
       <LiveStateProvider>
-        <FailureBanner />
+        <FailureBanner onInspect={vi.fn()} />
       </LiveStateProvider>,
     );
 
@@ -118,7 +118,7 @@ describe("FailureBanner", () => {
 
     render(
       <LiveStateProvider>
-        <FailureBanner />
+        <FailureBanner onInspect={vi.fn()} />
       </LiveStateProvider>,
     );
 
@@ -162,7 +162,7 @@ describe("FailureBanner", () => {
 
     render(
       <LiveStateProvider>
-        <FailureBanner />
+        <FailureBanner onInspect={vi.fn()} />
       </LiveStateProvider>,
     );
 
@@ -193,7 +193,7 @@ describe("FailureBanner", () => {
     const { container } = render(
       <LiveStateProvider>
         <LoadedMarker />
-        <FailureBanner />
+        <FailureBanner onInspect={vi.fn()} />
       </LiveStateProvider>,
     );
 
@@ -222,7 +222,7 @@ describe("FailureBanner", () => {
     const { container } = render(
       <LiveStateProvider>
         <LoadedMarker />
-        <FailureBanner />
+        <FailureBanner onInspect={vi.fn()} />
       </LiveStateProvider>,
     );
 
@@ -230,5 +230,31 @@ describe("FailureBanner", () => {
       expect(screen.getByTestId("loaded")).toHaveTextContent("yes");
     });
     expect(container.querySelector("[data-testid='failure-banner']")).toBeNull();
+  });
+
+  it("opens the failing display detail from the global action", async () => {
+    const onInspect = vi.fn();
+    mocks.getState.mockResolvedValue(stateWith([
+      [
+        "main",
+        {
+          phase: "active",
+          inhibited: false,
+          paused: false,
+          cmd_gen: 1,
+          controllers: [{ name: "ddcci", role: "primary", healthy: false, detail: "timeout" }],
+          wake_attempts: 0,
+          last_blank_failed: true,
+        },
+      ],
+    ]));
+    render(
+      <LiveStateProvider>
+        <FailureBanner onInspect={onInspect} />
+      </LiveStateProvider>,
+    );
+    await screen.findByRole("button", { name: "Inspect main" });
+    fireEvent.click(screen.getByRole("button", { name: "Inspect main" }));
+    expect(onInspect).toHaveBeenCalledWith("main");
   });
 });

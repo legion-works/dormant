@@ -1,75 +1,58 @@
 /**
- * Displays view — full per-display detail cards with operator controls.
+ * Displays view — list mode with per-display cards, or a single-display
+ * detail mode (wear heat map + summaries + guarded controls) when
+ * `selectedDisplay` is set.
  *
  * Data: /api/state (phase, inhibited, paused, cmd_gen, controllers[])
- * + /api/config (blank_mode, zone/rule via display_rules reverse lookup).
+ * + /api/config (blank_mode, zone/rule via display_rules reverse lookup)
+ * + /api/wear/:display (wear detail, keyed by display_name — provider-owned).
  *
  * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 190-248.
+ *
+ * List-card actions (Force blank/wake, Pause/Resume) share ONE
+ * `useConfirmDialog` instance across every card — only one confirmation
+ * can be pending at a time, so every card's action row hides while any
+ * dialog is open (`dialogOpen`), leaving the dialog's own button as the
+ * sole element with that accessible name.
  */
 import { useLiveState } from "../hooks/useLiveState";
-import { Card, StatusChip, HealthChip, phaseChipLabel } from "../components";
+import { Card, StatusChip, HealthChip, phaseChipLabel, useConfirmDialog } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { DisplaySnapshot } from "../../api/types";
+import DisplayDetail from "./DisplayDetail";
 import "./Displays.css";
 
-
-type ActionState = { loading: boolean; error?: string };
 
 interface DisplayCardProps {
   id: string;
   snap: DisplaySnapshot;
   blankMode: string;
   zone: string;
-  rule: string;
+  rule: string | undefined;
+  dialogOpen: boolean;
+  error?: string;
+  onOpenDetail: (id: string) => void;
+  onBlank: (id: string) => void;
+  onWake: (id: string) => void;
+  onPause: (id: string, rule: string) => void;
+  onResume: (id: string, rule: string) => void;
 }
 
-function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
-  const [blankState, setBlankState] = useState<ActionState>({ loading: false });
-  const [wakeState, setWakeState] = useState<ActionState>({ loading: false });
-  const [pauseState, setPauseState] = useState<ActionState>({ loading: false });
-  const [resumeState, setResumeState] = useState<ActionState>({ loading: false });
-
-  const handleBlank = useCallback(async () => {
-    setBlankState({ loading: true });
-    try {
-      await postBlank(id);
-      setBlankState({ loading: false });
-    } catch (err: unknown) {
-      setBlankState({ loading: false, error: err instanceof Error ? err.message : "Failed" });
-    }
-  }, [id]);
-
-  const handleWake = useCallback(async () => {
-    setWakeState({ loading: true });
-    try {
-      await postWake(id);
-      setWakeState({ loading: false });
-    } catch (err: unknown) {
-      setWakeState({ loading: false, error: err instanceof Error ? err.message : "Failed" });
-    }
-  }, [id]);
-
-  const handlePause = useCallback(async () => {
-    setPauseState({ loading: true });
-    try {
-      await postPause({ rule });
-      setPauseState({ loading: false });
-    } catch (err: unknown) {
-      setPauseState({ loading: false, error: err instanceof Error ? err.message : "Failed" });
-    }
-  }, [rule]);
-
-  const handleResume = useCallback(async () => {
-    setResumeState({ loading: true });
-    try {
-      await postResume({ rule });
-      setResumeState({ loading: false });
-    } catch (err: unknown) {
-      setResumeState({ loading: false, error: err instanceof Error ? err.message : "Failed" });
-    }
-  }, [rule]);
-
+function DisplayCard({
+  id,
+  snap,
+  blankMode,
+  zone,
+  rule,
+  dialogOpen,
+  error,
+  onOpenDetail,
+  onBlank,
+  onWake,
+  onPause,
+  onResume,
+}: DisplayCardProps) {
   // Screen preview glyph by phase
   const previewGlyph = (() => {
     switch (snap.phase) {
@@ -104,6 +87,14 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
             <StatusChip kind={snap.phase} label={phaseChipLabel(snap.phase, snap.stage)} />
             {isPaused && <StatusChip kind="paused" />}
             {snap.inhibited && <StatusChip kind="inhibited" />}
+            <button
+              type="button"
+              className="display-card__open-detail"
+              aria-label={`Open ${id} detail`}
+              onClick={() => onOpenDetail(id)}
+            >
+              Open detail →
+            </button>
           </div>
 
           {/* Metric grid */}
@@ -118,7 +109,7 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
             </div>
             <div className="display-metric">
               <div className="display-metric__label">Rule</div>
-              <div className="display-metric__value">{rule || "—"}</div>
+              <div className="display-metric__value">{rule ?? "—"}</div>
             </div>
             <div className="display-metric">
               <div className="display-metric__label">Cmd gen</div>
@@ -139,47 +130,51 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
           )}
 
           {/* Action error */}
-          {(blankState.error || wakeState.error || pauseState.error || resumeState.error) && (
+          {error && (
             <div className="display-card__action-error">
-              {blankState.error || wakeState.error || pauseState.error || resumeState.error}
+              {error}
             </div>
           )}
         </div>
 
         {/* Actions column */}
-        <div className="display-card__actions">
-          <button
-            className="display-action display-action--blank"
-            onClick={handleBlank}
-            disabled={blankState.loading}
-          >
-            {blankState.loading ? "…" : "Force blank"}
-          </button>
-          <button
-            className="display-action display-action--wake"
-            onClick={handleWake}
-            disabled={wakeState.loading}
-          >
-            {wakeState.loading ? "…" : "Force wake"}
-          </button>
-          {isPaused ? (
+        {!dialogOpen && (
+          <div className="display-card__actions">
             <button
-              className="display-action display-action--resume"
-              onClick={handleResume}
-              disabled={resumeState.loading}
+              type="button"
+              className="display-action display-action--blank"
+              onClick={() => onBlank(id)}
             >
-              {resumeState.loading ? "…" : "Resume rule"}
+              Force blank
             </button>
-          ) : (
             <button
-              className="display-action display-action--pause"
-              onClick={handlePause}
-              disabled={pauseState.loading}
+              type="button"
+              className="display-action display-action--wake"
+              onClick={() => onWake(id)}
             >
-              {pauseState.loading ? "…" : "Pause rule"}
+              Force wake
             </button>
-          )}
-        </div>
+            {isPaused ? (
+              <button
+                type="button"
+                className="display-action display-action--resume"
+                onClick={() => rule && onResume(id, rule)}
+                disabled={!rule}
+              >
+                Resume rule
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="display-action display-action--pause"
+                onClick={() => rule && onPause(id, rule)}
+                disabled={!rule}
+              >
+                Pause rule
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </Card>
   );
@@ -187,7 +182,102 @@ function DisplayCard({ id, snap, blankMode, zone, rule }: DisplayCardProps) {
 
 
 export default function Displays() {
-  const { loading, error, snapshot, config, displayConfigs, displayRules } = useLiveState();
+  const {
+    loading,
+    error,
+    snapshot,
+    displayConfigs,
+    displayRules,
+    wearDetails,
+    selectedDisplay,
+    selectDisplay,
+  } = useLiveState();
+  const { confirm, dialog } = useConfirmDialog();
+  const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
+
+  const displays = snapshot?.displays ?? [];
+  const selectedSnap = selectedDisplay
+    ? displays.find(([id]) => id === selectedDisplay)?.[1]
+    : undefined;
+
+  // If the selected display disappears from the snapshot (e.g. removed by
+  // a config reload), fall back to the list rather than getting stuck on
+  // a detail view for an id that no longer exists.
+  useEffect(() => {
+    if (selectedDisplay && !selectedSnap) {
+      selectDisplay(null);
+    }
+  }, [selectedDisplay, selectedSnap, selectDisplay]);
+
+  const clearActionError = useCallback((id: string) => {
+    setActionErrors((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, []);
+
+  const handleBlank = useCallback(async (id: string) => {
+    const accepted = await confirm({
+      title: `Force blank ${id}?`,
+      description: `Immediately blanks ${id}, bypassing the normal presence rules.`,
+      confirmLabel: "Force blank",
+      tone: "danger",
+    });
+    if (!accepted) return;
+    clearActionError(id);
+    try {
+      await postBlank(id);
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Force blank failed" }));
+    }
+  }, [confirm, clearActionError]);
+
+  const handleWake = useCallback(async (id: string) => {
+    const accepted = await confirm({
+      title: `Force wake ${id}?`,
+      description: `Immediately wakes ${id}, bypassing the normal presence rules.`,
+      confirmLabel: "Force wake",
+    });
+    if (!accepted) return;
+    clearActionError(id);
+    try {
+      await postWake(id);
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Force wake failed" }));
+    }
+  }, [confirm, clearActionError]);
+
+  const handlePause = useCallback(async (id: string, rule: string) => {
+    const accepted = await confirm({
+      title: `Pause ${rule}?`,
+      description: `Pauses rule "${rule}" until manually resumed.`,
+      confirmLabel: "Pause rule",
+    });
+    if (!accepted) return;
+    clearActionError(id);
+    try {
+      await postPause({ rule });
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Pause rule failed" }));
+    }
+  }, [confirm, clearActionError]);
+
+  const handleResume = useCallback(async (id: string, rule: string) => {
+    const accepted = await confirm({
+      title: `Resume ${rule}?`,
+      description: `Resumes rule "${rule}" immediately.`,
+      confirmLabel: "Resume rule",
+    });
+    if (!accepted) return;
+    clearActionError(id);
+    try {
+      await postResume({ rule });
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Resume rule failed" }));
+    }
+  }, [confirm, clearActionError]);
 
   if (loading) {
     return <div className="displays-loading">Loading daemon state…</div>;
@@ -197,11 +287,22 @@ export default function Displays() {
     return <div className="displays-error">Daemon unreachable: {error}</div>;
   }
 
-  if (!snapshot || !config) {
+  if (!snapshot) {
     return <div className="displays-error">No data received from daemon.</div>;
   }
 
-  const { displays } = snapshot;
+  if (selectedDisplay && selectedSnap) {
+    return (
+      <DisplayDetail
+        id={selectedDisplay}
+        snapshot={selectedSnap}
+        config={displayConfigs[selectedDisplay]}
+        rule={displayRules[selectedDisplay]}
+        wear={wearDetails[selectedDisplay]}
+        onBack={() => selectDisplay(null)}
+      />
+    );
+  }
 
   return (
     <div className="displays">
@@ -215,10 +316,18 @@ export default function Displays() {
             snap={snap}
             blankMode={dc?.blank_mode ?? "—"}
             zone={dr?.zone ?? "—"}
-            rule={dr?.rule ?? "—"}
+            rule={dr?.rule}
+            dialogOpen={!!dialog}
+            error={actionErrors[id]}
+            onOpenDetail={selectDisplay}
+            onBlank={handleBlank}
+            onWake={handleWake}
+            onPause={handlePause}
+            onResume={handleResume}
           />
         );
       })}
+      {dialog}
     </div>
   );
 }

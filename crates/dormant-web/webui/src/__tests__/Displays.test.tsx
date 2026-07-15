@@ -1,10 +1,15 @@
 /**
- * Displays component test — renders per-display cards with actions.
+ * Displays component test — renders per-display cards with actions,
+ * plus the list/detail-mode switch.
  */
+import { useState } from "react";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { act, render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import Displays from "../app/views/Displays";
 import { LiveStateProvider } from "../app/state";
+import { LiveStateContext } from "../app/hooks/useLiveState";
+import { liveStateFixture } from "./fixtures/live-state";
+import type { DisplayConfig } from "../api/types";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
@@ -179,7 +184,7 @@ describe("Displays", () => {
     expect(screen.getAllByText("office-rule").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("calls postBlank/postWake/postPause/postResume with correct ids", async () => {
+  it("calls postBlank/postWake/postPause/postResume with correct ids, guarded by confirmation", async () => {
     render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
@@ -187,28 +192,59 @@ describe("Displays", () => {
     });
     expect(screen.getByText("samsung-tv")).toBeInTheDocument();
 
-    // First card (aoc-main): not paused → "Pause rule", "Force blank", "Force wake"
-    const blankBtns = screen.getAllByText("Force blank");
-    const wakeBtns = screen.getAllByText("Force wake");
-    const pauseBtns = screen.getAllByText("Pause rule");
-    const resumeBtns = screen.getAllByText("Resume rule");
-
-    // Click Force blank on first display
-    fireEvent.click(blankBtns[0]);
+    // First card (aoc-main): not paused → "Pause rule", "Force blank", "Force wake".
+    // Every action shares one confirm dialog, so each trigger click hides
+    // every card's action row — the dialog's own button is the sole
+    // remaining element with that accessible name.
+    fireEvent.click(screen.getAllByText("Force blank")[0]);
+    expect(screen.getByRole("alertdialog", { name: "Force blank aoc-main?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
     await waitFor(() => expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main"));
 
-    // Click Force wake on first display
-    fireEvent.click(wakeBtns[0]);
+    fireEvent.click(screen.getAllByText("Force wake")[0]);
+    expect(screen.getByRole("alertdialog", { name: "Force wake aoc-main?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Force wake" }));
     await waitFor(() => expect(mocks.postWake).toHaveBeenCalledWith("aoc-main"));
 
-    // Click Pause rule on first display (aoc-main → rule "office-rule")
-    fireEvent.click(pauseBtns[0]);
+    // Pause rule on first display (aoc-main → rule "office-rule")
+    fireEvent.click(screen.getAllByText("Pause rule")[0]);
+    expect(screen.getByRole("alertdialog", { name: "Pause office-rule?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Pause rule" }));
     await waitFor(() => expect(mocks.postPause).toHaveBeenCalledWith({ rule: "office-rule" }));
 
-    // Click Resume rule on second display (samsung-tv is paused → rule "tv-rule")
+    // Resume rule on the paused display (samsung-tv → rule "tv-rule")
+    const resumeBtns = screen.getAllByText("Resume rule");
     expect(resumeBtns.length).toBeGreaterThanOrEqual(1);
     fireEvent.click(resumeBtns[0]);
+    expect(screen.getByRole("alertdialog", { name: "Resume tv-rule?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume rule" }));
     await waitFor(() => expect(mocks.postResume).toHaveBeenCalledWith({ rule: "tv-rule" }));
+  });
+
+  it("does not post when the force blank confirmation is cancelled", async () => {
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("aoc-main")).toBeInTheDocument();
+    });
+
+    // `confirm()`'s promise resolves synchronously inside the Cancel
+    // button's onClick (useConfirmDialog's `finish`), so the `.then`
+    // continuation that would call postBlank is only scheduled as a
+    // microtask — it hasn't run yet immediately after `fireEvent.click`
+    // returns. Flush microtasks before asserting "not called" so a
+    // mutant that ignores `accepted` doesn't pass by accident.
+    const flush = () => act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getAllByText("Force blank")[0]);
+    expect(screen.getByRole("alertdialog", { name: "Force blank aoc-main?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await flush();
+    expect(mocks.postBlank).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   it("has Force wake and Pause/Resume buttons for each display", async () => {
@@ -253,3 +289,51 @@ describe("Displays", () => {
     const stageLabels = screen.getAllByText(/render black/);
     expect(stageLabels).toHaveLength(1);
   });
+
+function DisplaysDetailHarness() {
+  const [selectedDisplay, selectDisplay] = useState<string | null>(null);
+  const state = liveStateFixture({
+    snapshot: {
+      sensors: [],
+      zones: [],
+      displays: [["main", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [{ name: "ddcci", role: "primary", healthy: true }],
+      }]],
+      pending_reload: null,
+    },
+    displayConfigs: {
+      main: { controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig,
+    },
+    displayRules: { main: { rule: "office-rule", zone: "office" } },
+    wearDetails: {
+      main: {
+        display: "panel-main",
+        display_name: "main",
+        panel_type: "woled",
+        total_on_hours: 4,
+        sample_count: 8,
+        advisory: false,
+        hours_since_long_dwell: 1,
+        grid_rows: 1,
+        grid_cols: 2,
+        cells: [1, 2],
+        heat: [0, 1],
+      },
+    },
+    selectedDisplay,
+    selectDisplay,
+  });
+  return <LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>;
+}
+
+it("switches between the display list and selected detail in one view", () => {
+  render(<DisplaysDetailHarness />);
+  fireEvent.click(screen.getByRole("button", { name: "Open main detail" }));
+  expect(screen.getByRole("grid", { name: "main panel wear heat map" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "← Displays" }));
+  expect(screen.getByRole("button", { name: "Open main detail" })).toBeInTheDocument();
+});

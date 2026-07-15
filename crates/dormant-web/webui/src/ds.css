@@ -34,3 +34,14 @@
    Legion cyan = system chrome only (reload, clock, live pulse).
 */
 @import url("../design/_ds/legion-works-design-system-0c4db072-51f8-49a7-8d0b-1e2ffd2d90cf/styles.css");
+
+/* Feature heat tokens — wear heat map ramp (C5/R3 token-boundary
+   reconciliation: raw hex lives here ONLY; every component consumes
+   these via var(...)). */
+:root {
+  --wear-heat-0: #232A34;
+  --wear-heat-1: #3D5045;
+  --wear-heat-2: #767D54;
+  --wear-heat-3: #C3A46C;
+  --wear-heat-4: #FF966C;
+}

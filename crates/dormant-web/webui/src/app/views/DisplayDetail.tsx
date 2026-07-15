@@ -23,6 +23,7 @@ import {
   useConfirmDialog,
   normalizeWearGrid,
   WearHeatMap,
+  ExerciseRunner,
 } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
 import type { DisplayConfig, DisplayRuleInfo, DisplaySnapshot, WearDetail } from "../../api/types";
@@ -245,8 +246,8 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
                 )}
               </>
             )}
-            <div data-testid="exercise-slot" />
           </div>
+          <ExerciseRunner display={id} compact />
         </Card>
       </div>
 

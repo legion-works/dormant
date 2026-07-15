@@ -9,8 +9,39 @@ const api = vi.hoisted(() => ({
   postWake: vi.fn().mockResolvedValue(undefined),
   postPause: vi.fn().mockResolvedValue(undefined),
   postResume: vi.fn().mockResolvedValue(undefined),
+  postExercise: vi.fn().mockResolvedValue({
+    display: "main",
+    pre_phase: "active",
+    paused_rules: [],
+    steps: [],
+  }),
+  // Adaptation: explicit-field mock class — see ExerciseRunner.test.tsx's
+  // comment (tsconfig `erasableSyntaxOnly` rejects parameter properties).
+  ApiError: class ApiError extends Error {
+    status: number;
+    body: unknown;
+    constructor(status: number, body: unknown) {
+      super(`API ${status}`);
+      this.status = status;
+      this.body = body;
+    }
+  },
 }));
+
 vi.mock("../api/client", () => api);
+vi.mock("../app/hooks/useLiveState", () => ({
+  useLiveState: () => ({
+    operations: {
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
+    },
+    operationsRequestId: 1,
+    refreshOperations: vi.fn().mockResolvedValue({
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
+    }),
+  }),
+}));
 
 const snapshot = {
   phase: "active",
@@ -60,6 +91,7 @@ describe("DisplayDetail", () => {
     expect(screen.getByText("kwin-dpms")).toBeInTheDocument();
     expect(screen.getByText("timeout")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /emergency wake/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
     expect(screen.getByRole("alertdialog", { name: "Force blank main?" })).toBeInTheDocument();

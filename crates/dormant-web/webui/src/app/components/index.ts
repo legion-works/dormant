@@ -18,3 +18,5 @@ export type { ConfirmOptions, ConfirmDialogProps } from "./ConfirmDialog";
 export { useConfirmDialog } from "./useConfirmDialog";
 export { WearHeatMap, normalizeWearGrid, WEAR_HEAT_COLORS } from "./WearHeatMap";
 export type { NormalizedWearGrid } from "./WearHeatMap";
+export { default as ExerciseRunner, aggregateExerciseVerdict } from "./ExerciseRunner";
+export type { ExerciseRunnerProps } from "./ExerciseRunner";

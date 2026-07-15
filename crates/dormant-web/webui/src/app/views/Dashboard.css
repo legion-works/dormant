@@ -301,34 +301,62 @@
   color: var(--text-muted);
 }
 
-.dash-display-row__actions {
+/* Quick actions — paired Blank/Wake chips, one shared confirm dialog,
+   36px minimum hit height, wraps on narrow viewports. */
+.quick-actions {
   display: flex;
-  align-items: center;
-  gap: 7px;
-  margin-top: 9px;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 14px 15px;
 }
 
-.dash-btn {
-  flex: 1;
+.quick-actions__group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.quick-actions__id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-strong);
+  white-space: nowrap;
+}
+
+.quick-actions__chips {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.quick-chip {
+  min-height: 36px;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-body);
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 6px 0;
+  padding: 6px 14px;
   cursor: pointer;
+  white-space: nowrap;
   transition: border-color var(--dur-fast) var(--ease);
 }
-.dash-btn:hover:not(:disabled) {
+.quick-chip:hover:not(:disabled) {
   border-color: var(--border-strong);
 }
-.dash-btn:disabled {
+.quick-chip:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
-.dash-btn--neutral {
-  color: var(--text-body);
+
+.quick-actions__error {
+  flex-basis: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--danger);
 }
 
 

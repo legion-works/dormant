@@ -138,15 +138,23 @@ describe("Dashboard", () => {
     expect(screen.getByText("ANY")).toBeInTheDocument();
   });
 
-  it("renders display rows with blank/wake buttons and config metadata", async () => {
+  // T6: force-blank/wake moved from a per-row hook pair into the shared
+  // "Quick actions" section (`Blank ${id}` / `Wake ${id}` chips, one
+  // in-flight state for the whole section) — the signal-grid display
+  // row itself is informational-only now (id, phase chip, blank_mode,
+  // controller chain).
+  it("renders display rows with config metadata and Quick action chips per display", async () => {
     render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
-      expect(screen.getByText("aoc-main")).toBeInTheDocument();
+      expect(screen.getAllByText("aoc-main").length).toBeGreaterThanOrEqual(1);
     });
 
-    expect(screen.getAllByText("blank").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("wake").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("Quick actions")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Blank aoc-main" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Wake aoc-main" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Blank samsung-tv" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Wake samsung-tv" })).toBeInTheDocument();
 
     // MUST 1: blank_mode and controller chain from config
     expect(screen.getAllByText("power_off").length).toBeGreaterThanOrEqual(1);
@@ -210,7 +218,9 @@ describe("Dashboard", () => {
     render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
-      expect(screen.getByText("lg-oled")).toBeInTheDocument();
+      // "lg-oled" now also appears as a Quick actions group label —
+      // assert on the signal-grid row's id, at least one match.
+      expect(screen.getAllByText("lg-oled").length).toBeGreaterThanOrEqual(1);
     });
 
     // The staged display chip shows "staged · render screensaver".
@@ -221,7 +231,9 @@ describe("Dashboard", () => {
     render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
 
     await waitFor(() => {
-      expect(screen.getByText("aoc-main")).toBeInTheDocument();
+      // "aoc-main" now also appears as a Quick actions group label —
+      // assert on the signal-grid row's id, at least one match.
+      expect(screen.getAllByText("aoc-main").length).toBeGreaterThanOrEqual(1);
     });
 
     // The active display chip label is "active", not a stage label.

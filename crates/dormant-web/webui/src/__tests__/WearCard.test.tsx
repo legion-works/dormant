@@ -1,269 +1,144 @@
 /**
  * WearCard tests — Dashboard panel-exposure summary.
  *
- * Fetches GET /api/wear (mocked) and renders per-display summaries.
- * The advisory line/banner is driven primarily by the fetched `advisory`
- * flag, and nudged live by `wear_snapshot` (patches on-hours/sample_count)
- * and `compensation_advisory` (nudges the advisory line) WS events.
+ * T6 rewrite: WearCard no longer fetches privately (`GET /api/wear` now
+ * lives in `LiveStateProvider.refreshWear`) — it just renders whatever
+ * `useLiveState()` currently holds. These tests mock `useLiveState`
+ * directly (via the shared `liveStateFixture` helper) with the exact
+ * provider shapes T4 introduced (`wear`, `wearError`, `selectDisplay`)
+ * instead of mocking the API client / WS layer.
  */
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
-import { LiveStateProvider } from "../app/state";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import WearCard from "../app/components/WearCard";
-import type { WearListResponse } from "../api/types";
+import { liveStateFixture } from "./fixtures/live-state";
+import type { WearSummary } from "../api/types";
 
-const { mocks } = vi.hoisted(() => {
-  let capturedOnMessage: ((data: unknown) => void) | null = null;
+const mocks = vi.hoisted(() => ({
+  selectDisplay: vi.fn(),
+  state: { current: null as unknown },
+}));
 
-  const useEventsImpl = vi.fn(
-    (opts: { onMessage: (data: unknown) => void; onConnect?: () => void }) => {
-      capturedOnMessage = opts.onMessage;
-      return { connected: true, close: vi.fn() };
-    },
-  );
-
-  const getWear = vi.fn();
-  const getWearDetail = vi.fn(async (display: string) => ({
-    display,
-    display_name: display,
-    panel_type: "unknown" as const,
-    total_on_hours: 0,
-    sample_count: 0,
-    advisory: false,
-    hours_since_long_dwell: 0,
-    grid_rows: 1,
-    grid_cols: 1,
-    cells: [0],
-    heat: [0],
-  }));
-  const getOperations = vi.fn().mockResolvedValue({
-    exercise_in_flight: [],
-    emergency_wake_in_flight: false,
-  });
-  const getState = vi.fn().mockResolvedValue({
-    sensors: [],
-    zones: [],
-    displays: [],
-    pending_reload: null,
-  });
-  const getConfig = vi.fn().mockResolvedValue({
-    path: "/tmp/c.toml",
-    config_version: 1,
-    source: "last_applied",
-    raw_toml: "",
-    inventory: {
-      config_version: 1,
-      daemon: {},
-      sensors: {},
-      zones: {},
-      displays: {},
-      rules: {},
-    },
-    validation: { ok: true, warnings: [], errors: [] },
-    display_rules: {},
-  });
-
+vi.mock("../app/hooks/useLiveState", async () => {
+  const { liveStateFixture: fixture } = await import("./fixtures/live-state");
   return {
-    mocks: {
-      useEventsImpl,
-      getWear,
-      getWearDetail,
-      getOperations,
-      getState,
-      getConfig,
-      get onMessage() {
-        return capturedOnMessage;
-      },
-    },
+    useLiveState: () => mocks.state.current ?? fixture(),
   };
 });
-
-vi.mock("../api/ws", () => ({
-  useEvents: mocks.useEventsImpl,
-}));
-
-vi.mock("../api/client", () => ({
-  getState: mocks.getState,
-  getConfig: mocks.getConfig,
-  getWear: mocks.getWear,
-  getWearDetail: mocks.getWearDetail,
-  getOperations: mocks.getOperations,
-}));
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  mocks.state.current = null;
+  window.location.hash = "";
 });
 
-const NOW = Math.floor(Date.now() / 1000);
-
-function sample(overrides: Partial<WearListResponse["displays"][number]> = {}): WearListResponse {
+function summary(overrides: Partial<WearSummary> = {}): WearSummary {
   return {
-    displays: [
-      {
-        display: "ddc-aoc-1",
-        display_name: "Office Monitor",
-        panel_type: "qd-oled",
-        total_on_hours: 123.4,
-        seeded_usage_hours: 50,
-        sample_count: 42,
-        last_sample_at_epoch_s: NOW,
-        last_long_dwell_epoch_s: NOW - 600, // 10 minutes ago
-        advisory: false,
-        hours_since_long_dwell: 0,
-        ...overrides,
-      },
-    ],
+    display: "panel-office",
+    display_name: "Office Monitor",
+    panel_type: "qd-oled",
+    total_on_hours: 123.4,
+    sample_count: 42,
+    advisory: false,
+    hours_since_long_dwell: 0,
+    ...overrides,
   };
 }
 
+function setState(overrides: Parameters<typeof liveStateFixture>[0]) {
+  mocks.state.current = liveStateFixture({ selectDisplay: mocks.selectDisplay, ...overrides });
+}
+
 describe("WearCard", () => {
-  it("renders the title, honesty-rule caption, and per-display summary", async () => {
-    mocks.getWear.mockResolvedValue(sample());
+  it("renders the title, honesty-rule caption (no spatial attribution), and per-display summary", () => {
+    setState({ wear: { displays: [summary()] } });
 
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
+    render(<WearCard />);
 
-    await waitFor(() => {
-      expect(screen.getByText("Panel exposure")).toBeInTheDocument();
-    });
-    expect(
-      screen.getByText(/no spatial attribution yet — arrives with content-aware tracking \(v2\)/),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Panel exposure")).toBeInTheDocument();
+    expect(screen.getByText("on-time, sampling, and compensation status")).toBeInTheDocument();
+    expect(screen.queryByText(/spatial attribution/i)).not.toBeInTheDocument();
     expect(screen.getByText("Office Monitor")).toBeInTheDocument();
-    expect(screen.getByText(/123\.4h total on-time/)).toBeInTheDocument();
-    expect(screen.getByText(/\+50h seeded/)).toBeInTheDocument();
+    expect(screen.getByText("123.4h total on-time")).toBeInTheDocument();
+    expect(screen.getByText("42 samples")).toBeInTheDocument();
   });
 
-  it("does not show an advisory line when the fetch reports advisory=false", async () => {
-    mocks.getWear.mockResolvedValue(sample({ advisory: false }));
+  it("applies the success tone and 'compensation window healthy' when advisory is false", () => {
+    setState({ wear: { displays: [summary({ advisory: false })] } });
 
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
+    render(<WearCard />);
 
-    await waitFor(() => {
-      expect(screen.getByText("Office Monitor")).toBeInTheDocument();
-    });
-    expect(screen.queryByText(/no long standby window/)).toBeNull();
+    expect(screen.getByTestId("wear-row-Office Monitor")).toHaveClass("wear-row--success");
+    expect(screen.getByText("compensation window healthy")).toBeInTheDocument();
+    expect(screen.queryByText(/no long standby window/)).not.toBeInTheDocument();
   });
 
-  it("shows the advisory line worded exactly 'no long standby window in N days' when the fetch reports advisory=true", async () => {
-    mocks.getWear.mockResolvedValue(
-      sample({
-        advisory: true,
-        last_long_dwell_epoch_s: NOW - 4 * 86400,
-        hours_since_long_dwell: 4 * 24,
-      }),
-    );
-
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText(/no long standby window in 4 days/)).toBeInTheDocument();
+  it("applies the warning tone and exact 'no long standby window in N days' wording when advisory is true", () => {
+    setState({
+      wear: {
+        displays: [summary({ advisory: true, hours_since_long_dwell: 4 * 24 })],
+      },
     });
+
+    render(<WearCard />);
+
+    expect(screen.getByTestId("wear-row-Office Monitor")).toHaveClass("wear-row--warning");
+    expect(screen.getByText("no long standby window in 4 days")).toBeInTheDocument();
   });
 
-  it("shows a real day count (not '?') when advisory=true but no long dwell has ever been observed (baseline-only)", async () => {
-    // T8 review Should-fix: the baseline-only case (a display that has
-    // never had an observed long dwell — the common first-load case)
-    // must still render a real day count derived from
-    // `hours_since_long_dwell` (server-computed from
-    // `advisory_baseline_epoch_s`), not fall back to "?".
-    mocks.getWear.mockResolvedValue(
-      sample({
-        advisory: true,
-        last_long_dwell_epoch_s: null,
-        hours_since_long_dwell: 5 * 24,
-      }),
-    );
-
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText(/no long standby window in 5 days/)).toBeInTheDocument();
+  it("shows a real day count (not '?') when advisory is true but no long dwell has ever been observed (baseline-only)", () => {
+    // T8 review Should-fix, carried forward: `hours_since_long_dwell` is
+    // always a real server-derived number (baseline or observed), so
+    // this never falls back to a "?" day count.
+    setState({
+      wear: {
+        displays: [summary({ advisory: true, hours_since_long_dwell: 5 * 24 })],
+      },
     });
-    expect(screen.queryByText(/no long standby window in \? days/)).toBeNull();
+
+    render(<WearCard />);
+
+    expect(screen.getByText("no long standby window in 5 days")).toBeInTheDocument();
+    expect(screen.queryByText(/no long standby window in \? days/)).not.toBeInTheDocument();
   });
 
-  it("compensation_advisory WS event nudges the advisory banner into view", async () => {
-    mocks.getWear.mockResolvedValue(sample({ advisory: false }));
-
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText("Office Monitor")).toBeInTheDocument();
-    });
-    expect(screen.queryByText(/no long standby window/)).toBeNull();
-
-    act(() => {
-      mocks.onMessage?.({
-        event: "compensation_advisory",
-        display: "ddc-aoc-1",
-        hours_since_long_dwell: 120,
-      });
+  it("applies the error tone and a top-level message when wearError is set", () => {
+    setState({
+      wear: { displays: [summary({ advisory: false })] },
+      wearError: "3 wear detail requests failed",
     });
 
-    await waitFor(() => {
-      expect(screen.getByText(/no long standby window in 5 days/)).toBeInTheDocument();
-    });
+    render(<WearCard />);
+
+    expect(screen.getByText("Wear data unavailable: 3 wear detail requests failed")).toBeInTheDocument();
+    expect(screen.getByTestId("wear-row-Office Monitor")).toHaveClass("wear-row--error");
   });
 
-  it("wear_snapshot WS event patches the displayed on-hours in place", async () => {
-    mocks.getWear.mockResolvedValue(sample());
+  it("renders a loading state while wear has not been fetched yet", () => {
+    setState({ wear: null });
 
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
+    render(<WearCard />);
 
-    await waitFor(() => {
-      expect(screen.getByText(/123\.4h total on-time/)).toBeInTheDocument();
-    });
-
-    act(() => {
-      mocks.onMessage?.({
-        event: "wear_snapshot",
-        display: "ddc-aoc-1",
-        total_on_hours: 200.5,
-        sample_count: 99,
-      });
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText(/200\.5h total on-time/)).toBeInTheDocument();
-    });
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
   });
 
-  it("renders an empty state when no displays are tracked yet", async () => {
-    mocks.getWear.mockResolvedValue({ displays: [] });
+  it("renders an empty state when no displays are tracked yet", () => {
+    setState({ wear: { displays: [] } });
 
-    render(
-      <LiveStateProvider>
-        <WearCard />
-      </LiveStateProvider>,
-    );
+    render(<WearCard />);
 
-    await waitFor(() => {
-      expect(screen.getByText("No tracked displays yet.")).toBeInTheDocument();
-    });
+    expect(screen.getByText("No tracked displays yet.")).toBeInTheDocument();
+  });
+
+  it("clicking a summary selects the display and navigates to the Displays view", () => {
+    setState({ wear: { displays: [summary()] } });
+
+    render(<WearCard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Office Monitor panel detail" }));
+
+    expect(mocks.selectDisplay).toHaveBeenCalledWith("Office Monitor");
+    expect(window.location.hash).toBe("#/displays");
   });
 });

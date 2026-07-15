@@ -33,52 +33,70 @@
   color: var(--danger);
 }
 
+/* Each row is left-bordered by tone (success/warning/error) — the
+   only panel-health signal this card invents is the color, never a
+   numeric threshold. */
 .wear-row {
   padding: 12px 15px;
   border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+  border-left: 3px solid transparent;
 }
 .wear-row:last-child {
   border-bottom: none;
 }
+.wear-row--success {
+  border-left-color: var(--success);
+}
+.wear-row--warning {
+  border-left-color: var(--warning);
+}
+.wear-row--error {
+  border-left-color: var(--danger);
+}
 
-.wear-row__top {
+.wear-row__summary {
   display: flex;
-  align-items: center;
-  gap: 9px;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+.wear-row__summary:hover .wear-row__name {
+  color: var(--accent);
 }
 
 .wear-row__name {
   font-weight: 500;
   font-size: 13px;
   color: var(--text-strong);
+  transition: color var(--dur-fast) var(--ease);
 }
 
-.wear-row__panel {
-  margin-left: auto;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-muted);
-  background: var(--bg-sunken);
-  padding: 2px 7px;
-  border-radius: var(--radius-sm);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.wear-row__stats {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-top: 6px;
+.wear-row__stat {
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--text-muted);
 }
 
-.wear-row__advisory {
+.wear-row__tone {
   margin-top: 8px;
   font-family: var(--font-mono);
   font-size: 11px;
+}
+.wear-row__tone--success {
+  color: var(--success);
+}
+.wear-row__tone--warning {
   color: var(--warning);
+}
+.wear-row__tone--error {
+  color: var(--danger);
 }

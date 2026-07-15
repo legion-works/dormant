@@ -210,7 +210,7 @@ describe("Dashboard", () => {
     await waitFor(() => {
       expect(screen.getByText("desk-mmwave → present")).toBeInTheDocument();
     });
-    expect(screen.getByText("sensor")).toBeInTheDocument();
+    expect(screen.getByText("sensor_changed")).toBeInTheDocument();
   });
 });
 

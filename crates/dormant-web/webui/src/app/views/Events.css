@@ -68,7 +68,7 @@
 
 .events-row {
   display: grid;
-  grid-template-columns: 82px 118px 1fr;
+  grid-template-columns: 82px 148px 1fr;
   align-items: center;
   gap: 14px;
   padding: 9px 16px;

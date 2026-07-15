@@ -15,7 +15,7 @@ use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
-use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
+use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{App, ReloadOutcome, validate_only};
@@ -4475,6 +4475,64 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
         !output.contains("reload_end"),
         "an aborted reload must never reach the reload_end boundary: {output}"
     );
+}
+
+/// Rollback-recovery plan Task 1 §8: `rebuild_old` must carry
+/// Runner-OWNED rollback status (`self.rollback_status.clone()`) even when
+/// the preliminary snapshot request timed out — `rebuild_old` never derives
+/// rollback presentation from `snapshot.and_then(...)`, which would be
+/// `None` here by construction (`with_test_force_reload_snapshot_timeout`).
+/// Combined with `with_test_force_reload_spawn_failure` to force the
+/// accepted-spawn `Err` arm (so this reload actually reaches
+/// `rebuild_old`), matching the sibling test above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let status = RollbackStatus {
+        failed_fp: "12:deadbeef".to_string(),
+        lkg_fp: "11:cafebabe".to_string(),
+        detail: "running last-known-good".to_string(),
+    };
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_rollback_status(status.clone(), dir.path().to_path_buf())
+    .with_test_force_reload_snapshot_timeout()
+    .with_test_force_reload_spawn_failure()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+    handle
+        .control_sender()
+        .send(ControlMsg::SetRollback(Some(status.clone())))
+        .await
+        .expect("park boot rollback for the direct-App test");
+    let mut reloads = handle.subscribe_reload();
+
+    std::fs::write(&cfg_path, one_display_config(&marker, "100ms")).unwrap();
+    assert!(handle.trigger_reload().await);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+            .await
+            .expect("reload outcome")
+            .expect("reload bus"),
+        ReloadOutcome::Rejected(_)
+    ));
+
+    let snapshot = snapshot_with_retry(&handle.control_sender()).await;
+    assert_eq!(snapshot.rollback, Some(status));
+    shutdown(handle, join).await;
 }
 
 // ── T6: audio/call inhibitor — first inhibitor smoke coverage ──────────────────

@@ -344,6 +344,7 @@ mod tests {
             zones: vec![],
             displays,
             pending_reload: None,
+            rollback: None,
         }
     }
 

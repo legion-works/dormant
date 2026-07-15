@@ -182,6 +182,7 @@ mod tests {
                 ),
             ],
             pending_reload: None,
+            rollback: None,
         }
     }
 
@@ -250,6 +251,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         };
 
         let d = &snap.displays[0].1;
@@ -283,6 +285,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         };
 
         // Must exercise the production rendering path, not a helper — a

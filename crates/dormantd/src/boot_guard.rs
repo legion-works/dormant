@@ -30,10 +30,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use dormant_core::config::{Strictness, load_config};
-use dormant_core::rules::StateSnapshot;
+use dormant_core::rules::{RollbackStatus, StateSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::sd_notify::SdNotify;
@@ -185,6 +187,16 @@ pub(crate) fn fingerprint_file(path: &Path) -> Fingerprint {
     std::fs::read(path).map_or(Fingerprint::Unreadable, |bytes| fingerprint_bytes(&bytes))
 }
 
+/// Stable, human-readable label for a [`Fingerprint`], used in
+/// [`RollbackStatus`] presentation fields.
+#[must_use]
+pub(crate) fn fingerprint_label(fp: Fingerprint) -> String {
+    match fp {
+        Fingerprint::Bytes { len, hash64 } => format!("{len}:{hash64:016x}"),
+        Fingerprint::Unreadable => "unreadable".to_string(),
+    }
+}
+
 // ── Persisted state ──────────────────────────────────────────────────────
 
 /// One recorded daemon start (spec §3 `crash-loop.json.starts[]`).
@@ -297,6 +309,7 @@ pub struct BootPlan {
     pub nonce: u64,
     pub deferred_events: Vec<DeferredEvent>,
     pub pending_message: Option<String>,
+    pub rollback_status: Option<RollbackStatus>,
 }
 
 /// Runtime-only bundle `boot()` (T5, `dormantd/src/boot.rs`) needs (spec
@@ -471,6 +484,13 @@ fn same_fingerprint_window_stats(
 /// `crash-loop.json` write — sync, no logging (spec §5.1: called before
 /// logging is initialised; events are deferred into the returned
 /// [`BootPlan`]).
+///
+/// # Panics
+///
+/// Panics if `decide` returns `Action::ContinueRollback` without
+/// `state.rolled_back_from` set — `ContinueRollback` is only reachable when
+/// a prior `RollBack` already recorded the failed fingerprint in-memory, so
+/// this is an invariant violation, not an expected runtime condition.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -538,9 +558,9 @@ pub fn prepare(
     // Unconditional write, BEFORE any build attempt (spec §3): a corrupt
     // write attempt must never block boot, so failures are swallowed here
     // exactly like the samsung_ip token-state precedent.
-    let _ = write_atomic_json(state_dir, CRASH_LOOP_FILE, &state);
+    let _ = persist_crash_loop_state(state_dir, &state);
 
-    let (chosen_config, pending_message, deferred_events) = match verdict.action {
+    let (chosen_config, pending_message, deferred_events, rollback_status) = match verdict.action {
         Action::RollBack => {
             let lkg_fp = fingerprint_file(&lkg_path);
             let detail = format!(
@@ -548,6 +568,11 @@ pub fn prepare(
                 config_path.display()
             );
             let message = pending_message_for_rollback(&detail);
+            let status = RollbackStatus {
+                failed_fp: fingerprint_label(current_fp),
+                lkg_fp: fingerprint_label(lkg_fp),
+                detail: message.clone(),
+            };
             (
                 lkg_path.clone(),
                 Some(message),
@@ -556,18 +581,30 @@ pub fn prepare(
                     lkg_fp,
                     detail,
                 }],
+                Some(status),
             )
         }
-        Action::ContinueRollback => (
-            lkg_path.clone(),
-            Some(
+        Action::ContinueRollback => {
+            let message =
                 "sticky rollback active; latest config is still being held back — edit it, \
-                 wait past CRASH_LOOP_WINDOW for a loud retry, or set \
-                 watchdog.lkg_rollback_enabled = false while debugging"
-                    .to_string(),
-            ),
-            vec![DeferredEvent::RollbackContinued],
-        ),
+                           wait past CRASH_LOOP_WINDOW for a loud retry, or set \
+                           watchdog.lkg_rollback_enabled = false while debugging"
+                    .to_string();
+            let failed = state
+                .rolled_back_from
+                .expect("ContinueRollback requires the in-memory failed fingerprint");
+            let status = RollbackStatus {
+                failed_fp: fingerprint_label(failed),
+                lkg_fp: fingerprint_label(fingerprint_file(&lkg_path)),
+                detail: message.clone(),
+            };
+            (
+                lkg_path.clone(),
+                Some(message),
+                vec![DeferredEvent::RollbackContinued],
+                Some(status),
+            )
+        }
         Action::Proceed if verdict.retry_after_quiet => {
             let message = "retrying latest config after a quiet period; to stop this cycle, \
                             edit the config, wait past CRASH_LOOP_WINDOW between restarts, or \
@@ -577,12 +614,14 @@ pub fn prepare(
                 config_path.to_path_buf(),
                 Some(message.clone()),
                 vec![DeferredEvent::RollbackRetry { message }],
+                None,
             )
         }
         Action::Proceed if verdict.lkg_missing_disarmed => (
             config_path.to_path_buf(),
             None,
             vec![DeferredEvent::LkgMissingRollbackDisarmed],
+            None,
         ),
         Action::Proceed => {
             let (total, matching) =
@@ -592,7 +631,7 @@ pub fn prepare(
             } else {
                 Vec::new()
             };
-            (config_path.to_path_buf(), None, events)
+            (config_path.to_path_buf(), None, events, None)
         }
     };
 
@@ -602,7 +641,47 @@ pub fn prepare(
         nonce,
         deferred_events,
         pending_message,
+        rollback_status,
     }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+static FAIL_CRASH_LOOP_WRITES_FOR_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-util"))]
+fn failed_write_dirs() -> &'static Mutex<HashSet<PathBuf>> {
+    FAIL_CRASH_LOOP_WRITES_FOR_DIRS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Test-only seam: mark `state_dir` so the NEXT `crash-loop.json` write
+/// fails, proving rollback presentation state survives a persistence
+/// failure (it lives in memory, not in the write that just failed).
+#[cfg(any(test, feature = "test-util"))]
+pub fn fail_next_crash_loop_write_for_test(state_dir: &Path) {
+    failed_write_dirs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(state_dir.to_path_buf());
+}
+
+fn persist_crash_loop_state(state_dir: &Path, state: &CrashLoopState) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        let should_fail = failed_write_dirs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(state_dir);
+        if should_fail {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "test-injected crash-loop write failure for {}",
+                    state_dir.display()
+                ),
+            ));
+        }
+    }
+    write_atomic_json(state_dir, CRASH_LOOP_FILE, state)
 }
 
 /// The spec §5.1 point 6 (F11) pending-reload banner text for a rollback
@@ -1183,6 +1262,7 @@ mod tests {
             nonce: 0,
             deferred_events: Vec::new(),
             pending_message: None,
+            rollback_status: None,
         };
     }
 
@@ -1769,6 +1849,7 @@ mod promote_tests {
                 .map(|(id, d)| (id.to_string(), d))
                 .collect(),
             pending_reload: None,
+            rollback: None,
         }
     }
 

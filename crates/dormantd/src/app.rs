@@ -41,7 +41,9 @@
 //! wake is fully implemented.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,8 +56,8 @@ use dormant_core::config::{
 };
 use dormant_core::ownership::AlwaysOwned;
 use dormant_core::rules::{
-    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RuleRuntimeCfg, RulesEngine, RulesEngineConfig,
-    SensorRuntimeCfg, StateSnapshot,
+    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
+    RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
@@ -204,6 +206,13 @@ pub fn validate_only(
 // ── App ────────────────────────────────────────────────────────────────────────
 
 /// The daemon application: config paths + the sensor-source factory.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent, orthogonal builder/test-seam flag \
+              (rollback-active, disable-ipc, plus two test-only forced-failure \
+              seams) — a state-machine enum would need to represent their \
+              cross-product, which does not exist here"
+)]
 pub struct App {
     /// The generation-0 (boot) source: the already-validated config used
     /// ONLY to assemble the first generation in [`App::start`]. Ordinary
@@ -241,6 +250,12 @@ pub struct App {
     /// and `boot()`'s own immediate-rollback write already used for this
     /// boot, so the live-reload clear lands in the identical file.
     state_dir: PathBuf,
+    /// Runner-owned rollback presentation status (rollback-recovery plan,
+    /// Task 1 §7): `None` for every non-boot caller; set alongside
+    /// `rollback_active` by [`App::with_boot_source`]. Carried into every
+    /// [`Runner`] generation swap as a `spawn_generation` parameter rather
+    /// than re-read from disk or reconstructed from a snapshot.
+    rollback_status: Option<RollbackStatus>,
     strictness: Strictness,
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
@@ -270,6 +285,12 @@ pub struct App {
     /// black-box config edit provably cannot reach.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_spawn_failure: bool,
+    /// Test seam (rollback-recovery plan, Task 1 §8): forces `Runner::reload`
+    /// to treat the preliminary snapshot request as timed out (`None`),
+    /// proving `rebuild_old` still carries Runner-owned rollback status even
+    /// when `snapshot.and_then(...)` would have been `None` anyway.
+    #[cfg(any(test, feature = "test-util"))]
+    force_reload_snapshot_timeout: bool,
 }
 
 /// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
@@ -302,6 +323,7 @@ impl App {
             creds_path,
             rollback_active: false,
             state_dir: dormant_core::paths::state_dir(),
+            rollback_status: None,
             strictness,
             source_builder,
             #[cfg(feature = "render")]
@@ -312,6 +334,8 @@ impl App {
             watchdog_interval: None,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: false,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_snapshot_timeout: false,
         })
     }
 
@@ -337,6 +361,7 @@ impl App {
             creds_path,
             rollback_active: false,
             state_dir: dormant_core::paths::state_dir(),
+            rollback_status: None,
             strictness,
             source_builder: Arc::new(factory),
             #[cfg(feature = "render")]
@@ -347,6 +372,8 @@ impl App {
             watchdog_interval: None,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: false,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_snapshot_timeout: false,
         })
     }
 
@@ -421,11 +448,12 @@ impl App {
     pub(crate) fn with_boot_source(
         mut self,
         operator_config_path: PathBuf,
-        rollback_active: bool,
+        rollback_status: Option<RollbackStatus>,
         state_dir: PathBuf,
     ) -> Self {
         self.operator_config_path = operator_config_path;
-        self.rollback_active = rollback_active;
+        self.rollback_active = rollback_status.is_some();
+        self.rollback_status = rollback_status;
         self.state_dir = state_dir;
         self
     }
@@ -450,6 +478,28 @@ impl App {
     #[must_use]
     pub fn with_test_force_reload_spawn_failure(mut self) -> Self {
         self.force_reload_spawn_failure = true;
+        self
+    }
+
+    /// Force `Runner::reload`'s preliminary snapshot request to behave as
+    /// though it timed out (test seam — see `App::force_reload_snapshot_timeout`).
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_force_reload_snapshot_timeout(mut self) -> Self {
+        self.force_reload_snapshot_timeout = true;
+        self
+    }
+
+    /// Seed a Runner-owned rollback status without touching disk (test
+    /// seam — mirrors what `App::with_boot_source` does on a real rollback
+    /// boot, for tests that drive `App::build`/`build_with_sources`
+    /// directly instead of going through `crate::boot::boot`).
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_rollback_status(mut self, status: RollbackStatus, state_dir: PathBuf) -> Self {
+        self.rollback_active = true;
+        self.rollback_status = Some(status);
+        self.state_dir = state_dir;
         self
     }
 
@@ -562,6 +612,7 @@ impl App {
         let spawn = spawn_generation(
             &root,
             assembly,
+            None,
             None,
             None,
             notify_state.clone(),
@@ -796,12 +847,15 @@ impl App {
             probe_failed_warned: false,
             state_dir: self.state_dir.clone(),
             rollback_active: self.rollback_active,
+            rollback_status: self.rollback_status.clone(),
             rollback_state_clear_pending: false,
             rollback_state_clear_warned: false,
             #[cfg(any(test, feature = "test-util"))]
             lkg_observed: lkg_observed.clone(),
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: self.force_reload_spawn_failure,
+            #[cfg(any(test, feature = "test-util"))]
+            force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
         };
 
         let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
@@ -1033,6 +1087,13 @@ struct Runner {
     /// §3) — never re-derived from the persisted `crash-loop.json`, so a
     /// persisted-write failure (§4) can never re-arm it.
     rollback_active: bool,
+    /// Runner-owned rollback presentation status (rollback-recovery plan,
+    /// Task 1 §7) — mirrors `rollback_active`'s lifecycle exactly (seeded
+    /// once at construction from `App::rollback_status`, cleared in the
+    /// SAME accepted-reload arm that flips `rollback_active` to `false`).
+    /// Threaded into every `spawn_generation` call as the sibling `rollback`
+    /// parameter; never re-read from disk or reconstructed from a snapshot.
+    rollback_status: Option<RollbackStatus>,
     /// Set when the accepted-reload rollback-recovery transition's
     /// `crash-loop.json` clear (Task 2 §4) failed to write. Runtime
     /// recovery is already complete at that point (`rollback_active` is
@@ -1061,6 +1122,9 @@ struct Runner {
     /// Test seam (F1) — see `App::force_reload_spawn_failure`.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_spawn_failure: bool,
+    /// Test seam — see `App::force_reload_snapshot_timeout`.
+    #[cfg(any(test, feature = "test-util"))]
+    force_reload_snapshot_timeout: bool,
 }
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
@@ -1177,6 +1241,13 @@ impl Runner {
     #[allow(clippy::too_many_lines)]
     async fn reload(&mut self) {
         let old_ctl = self.engine_ctl.borrow().clone();
+        #[cfg(any(test, feature = "test-util"))]
+        let preliminary = if self.force_reload_snapshot_timeout {
+            None
+        } else {
+            request_snapshot(&old_ctl).await
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
         let preliminary = request_snapshot(&old_ctl).await;
 
         // Validate + assemble the NEW config BEFORE touching the running
@@ -1370,10 +1441,12 @@ impl Runner {
             reload::zero_changed_sensor_reported(&displays_filtered, &self.generation.cfg, &new_cfg)
         });
 
-        let spawn_result = spawn_generation(
+        let spawn_result = spawn_generation_for_reload(
+            &self.state_dir,
             &self.root,
             new_assembly,
             restore_snapshot.as_ref(),
+            None,
             None,
             self.notify_state.clone(),
             self.notify_sink.clone(),
@@ -1443,6 +1516,7 @@ impl Runner {
                             }
                         }
                     }
+                    self.rollback_status = None;
                     self.rollback_active = false;
 
                     tracing::info!(
@@ -1611,11 +1685,13 @@ impl Runner {
             #[cfg(feature = "render")]
             input_wake_rx: Some(input_wake_rx),
         };
-        match spawn_generation(
+        match spawn_generation_for_reload(
+            &self.state_dir,
             &self.root,
             assembly,
             snapshot,
             pending,
+            self.rollback_status.clone(),
             self.notify_state.clone(),
             self.notify_sink.clone(),
         ) {
@@ -2631,6 +2707,7 @@ fn spawn_generation(
     assembly: StaticAssembly,
     restore: Option<&StateSnapshot>,
     pending: Option<String>,
+    rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
 ) -> Result<GenSpawn> {
@@ -2658,6 +2735,9 @@ fn spawn_generation(
 
     if let Some(detail) = pending {
         engine.set_pending_reload(Some(detail));
+    }
+    if let Some(status) = rollback {
+        engine.set_rollback(Some(status));
     }
     if let Some(snapshot) = restore {
         apply_restore(&mut engine, snapshot, &assembly.engine_cfg);
@@ -2744,6 +2824,101 @@ fn spawn_generation(
         ctl_tx,
         events_tx,
     })
+}
+
+#[cfg(any(test, feature = "test-util"))]
+static RELOAD_SPAWN_ROLLBACK_CAPTURES: OnceLock<
+    Mutex<HashMap<PathBuf, Vec<Option<RollbackStatus>>>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-util"))]
+fn reload_spawn_captures() -> &'static Mutex<HashMap<PathBuf, Vec<Option<RollbackStatus>>>> {
+    RELOAD_SPAWN_ROLLBACK_CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Test-only seam (rollback-recovery plan, Task 1 §9): register `state_dir`
+/// so every subsequent `spawn_generation_for_reload` call for that exact
+/// state dir records the `rollback` argument it actually received. Path-
+/// keyed so parallel reload tests (each with their own temporary
+/// `state_dir`) cannot consume or pollute another test's capture.
+#[cfg(any(test, feature = "test-util"))]
+pub fn begin_reload_spawn_rollback_capture_for_test(state_dir: &Path) {
+    reload_spawn_captures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(state_dir.to_path_buf(), Vec::new());
+}
+
+/// Test-only seam: drain and return every captured `rollback` argument for
+/// `state_dir` since the matching `begin_reload_spawn_rollback_capture_for_test`
+/// call.
+///
+/// # Panics
+///
+/// Panics if the capture was never registered for `state_dir` — a test that
+/// calls this without first calling
+/// `begin_reload_spawn_rollback_capture_for_test` has a bug, not a
+/// legitimate empty case.
+#[cfg(any(test, feature = "test-util"))]
+pub fn take_reload_spawn_rollback_capture_for_test(
+    state_dir: &Path,
+) -> Vec<Option<RollbackStatus>> {
+    reload_spawn_captures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(state_dir)
+        .expect("reload spawn capture was not registered for this state dir")
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn record_reload_spawn_rollback_for_test(state_dir: &Path, rollback: Option<&RollbackStatus>) {
+    if let Some(captures) = reload_spawn_captures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(state_dir)
+    {
+        captures.push(rollback.cloned());
+    }
+}
+
+/// Reload-path wrapper around [`spawn_generation`] (rollback-recovery plan,
+/// Task 1 §9): both `Runner` reload call sites (accepted candidate,
+/// `rebuild_old`) go through this so a test can capture the ACTUAL
+/// `rollback` argument reaching `spawn_generation`, rather than sampling a
+/// forwarding channel that could observe a later, unrelated state.
+/// Generation 0 (`App::start`) calls `spawn_generation` directly — it is
+/// boot-parked via `ControlMsg::SetRollback` after `App::start` returns, not
+/// spawned with a rollback argument.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(any(test, feature = "test-util")),
+    allow(
+        unused_variables,
+        reason = "state_dir is only consulted by the test-util capture seam"
+    )
+)]
+fn spawn_generation_for_reload(
+    state_dir: &Path,
+    root: &CancellationToken,
+    assembly: StaticAssembly,
+    restore: Option<&StateSnapshot>,
+    pending: Option<String>,
+    rollback: Option<RollbackStatus>,
+    notify_state: Arc<Mutex<NotifyState>>,
+    notify_sink: Arc<dyn NotifySink>,
+) -> Result<GenSpawn> {
+    #[cfg(any(test, feature = "test-util"))]
+    record_reload_spawn_rollback_for_test(state_dir, rollback.as_ref());
+
+    spawn_generation(
+        root,
+        assembly,
+        restore,
+        pending,
+        rollback,
+        notify_state,
+        notify_sink,
+    )
 }
 
 /// Restore display phases across a reload.
@@ -3071,6 +3246,7 @@ mod watchdog_tests {
                     zones: Vec::new(),
                     displays: Vec::new(),
                     pending_reload: None,
+                    rollback: None,
                 });
             }
         });
@@ -3128,6 +3304,7 @@ mod watchdog_tests {
             zones: Vec::new(),
             displays: Vec::new(),
             pending_reload: None,
+            rollback: None,
         };
         let sent = ping_if_healthy(&mut sd, Some(&snapshot));
 
@@ -4373,6 +4550,7 @@ mod restore_tests {
                 display_snapshot(phase, wake_attempts, last_blank_failed),
             )],
             pending_reload: None,
+            rollback: None,
         }
     }
 

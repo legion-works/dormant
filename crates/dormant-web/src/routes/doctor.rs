@@ -94,6 +94,7 @@ mod tests {
             zones: vec![],
             displays: vec![],
             pending_reload: None,
+            rollback: None,
         };
         let ctl_tx = spawn_fake_engine(snapshot);
         let state = test_web_state(ctl_tx);

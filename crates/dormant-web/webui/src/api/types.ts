@@ -125,6 +125,13 @@ export interface DisplaySnapshot {
   stage?: { idx: number; kind: StageKind } | null;
 }
 
+/** rust: rules.rs RollbackStatus */
+export interface RollbackStatus {
+  failed_fp: string;
+  lkg_fp: string;
+  detail: string;
+}
+
 /**
  * rust: rules.rs StateSnapshot
  * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
@@ -135,6 +142,8 @@ export interface StateSnapshot {
   zones: ZoneSnapshot[];
   displays: [string, DisplaySnapshot][];
   pending_reload: string | null;
+  /** Omitted when the daemon is not running from a rollback. */
+  rollback?: RollbackStatus;
 }
 
 /**

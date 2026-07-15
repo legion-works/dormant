@@ -73,6 +73,7 @@ pub enum IconState {
 ///         },
 ///     )],
 ///     pending_reload: None,
+///     rollback: None,
 /// };
 /// assert_eq!(derive_icon_state(&snap), IconState::Attention);
 /// ```
@@ -129,6 +130,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         }
     }
 
@@ -150,6 +152,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         }
     }
 
@@ -176,6 +179,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         }
     }
 
@@ -212,6 +216,7 @@ mod tests {
                 ),
             ],
             pending_reload: None,
+            rollback: None,
         }
     }
 
@@ -222,6 +227,7 @@ mod tests {
             zones: vec![],
             displays: vec![],
             pending_reload: None,
+            rollback: None,
         };
         assert_eq!(derive_icon_state(&snap), IconState::Normal);
     }

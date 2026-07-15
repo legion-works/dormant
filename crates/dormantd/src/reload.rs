@@ -364,6 +364,7 @@ mod dispatch_gate_tests {
                 .map(|(id, attempts, failed)| (id.to_string(), display_snapshot(attempts, failed)))
                 .collect(),
             pending_reload: None,
+            rollback: None,
         }
     }
 
@@ -459,6 +460,7 @@ mod dispatch_gate_tests {
             zones: Vec::new(),
             displays: Vec::new(),
             pending_reload: None,
+            rollback: None,
         }
     }
 

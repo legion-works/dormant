@@ -102,6 +102,12 @@ vi.mock("../api/client", () => ({
   postWake: mocks.postWake,
   postPause: mocks.postPause,
   postResume: mocks.postResume,
+  getWear: vi.fn().mockResolvedValue({ displays: [] }),
+  getWearDetail: vi.fn().mockRejectedValue(new Error("unexpected wear detail request")),
+  getOperations: vi.fn().mockResolvedValue({
+    exercise_in_flight: [],
+    emergency_wake_in_flight: false,
+  }),
 }));
 
 vi.mock("../api/ws", () => ({

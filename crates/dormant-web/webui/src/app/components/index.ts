@@ -9,3 +9,6 @@ export { default as Card } from "./Card";
 export { default as HealthChip } from "./HealthChip";
 export { default as WearCard } from "./WearCard";
 export { default as FailureBanner } from "./FailureBanner";
+export { default as ConfirmDialog } from "./ConfirmDialog";
+export type { ConfirmOptions, ConfirmDialogProps } from "./ConfirmDialog";
+export { useConfirmDialog } from "./useConfirmDialog";

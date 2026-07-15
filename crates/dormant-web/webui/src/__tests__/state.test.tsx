@@ -79,6 +79,12 @@ vi.mock("../api/ws", () => ({
 vi.mock("../api/client", () => ({
   getState: vi.fn().mockResolvedValue(fixtures.state),
   getConfig: vi.fn().mockResolvedValue(fixtures.config),
+  getWear: vi.fn().mockResolvedValue({ displays: [] }),
+  getWearDetail: vi.fn().mockRejectedValue(new Error("unexpected wear detail request")),
+  getOperations: vi.fn().mockResolvedValue({
+    exercise_in_flight: [],
+    emergency_wake_in_flight: false,
+  }),
 }));
 
 afterEach(() => {

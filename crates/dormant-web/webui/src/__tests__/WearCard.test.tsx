@@ -23,6 +23,23 @@ const { mocks } = vi.hoisted(() => {
   );
 
   const getWear = vi.fn();
+  const getWearDetail = vi.fn(async (display: string) => ({
+    display,
+    display_name: display,
+    panel_type: "unknown" as const,
+    total_on_hours: 0,
+    sample_count: 0,
+    advisory: false,
+    hours_since_long_dwell: 0,
+    grid_rows: 1,
+    grid_cols: 1,
+    cells: [0],
+    heat: [0],
+  }));
+  const getOperations = vi.fn().mockResolvedValue({
+    exercise_in_flight: [],
+    emergency_wake_in_flight: false,
+  });
   const getState = vi.fn().mockResolvedValue({
     sensors: [],
     zones: [],
@@ -50,6 +67,8 @@ const { mocks } = vi.hoisted(() => {
     mocks: {
       useEventsImpl,
       getWear,
+      getWearDetail,
+      getOperations,
       getState,
       getConfig,
       get onMessage() {
@@ -67,6 +86,8 @@ vi.mock("../api/client", () => ({
   getState: mocks.getState,
   getConfig: mocks.getConfig,
   getWear: mocks.getWear,
+  getWearDetail: mocks.getWearDetail,
+  getOperations: mocks.getOperations,
 }));
 
 afterEach(() => {

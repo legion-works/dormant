@@ -111,6 +111,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = route_post!(api, "/resume", post(command::post_resume));
     let api = route_post!(api, "/reload", post(command::post_reload));
     let api = route_post!(api, "/doctor", post(doctor::post_doctor));
+    let api = route_post!(api, "/emergency-wake", post(command::post_emergency_wake));
     let api = route_post!(
         api,
         "/pair/samsung",
@@ -196,7 +197,8 @@ mod tests {
     use tower::util::ServiceExt;
 
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
-    use dormant_core::rules::ControlMsg;
+    use dormant_core::rules::{ControlMsg, EmergencyWakeReport, EmergencyWakeResult};
+    use dormant_core::types::DisplayId;
     use dormant_doctor::DoctorService;
 
     use crate::WebState;
@@ -206,10 +208,16 @@ mod tests {
     /// The API routes will fail if called (no real engine behind the
     /// channels), but the security guard and SPA fallback work
     /// independently of the engine.
-    fn test_web_state_with_bind(bind: SocketAddr) -> (WebState, CancellationToken) {
+    fn test_web_state_with_bind(
+        bind: SocketAddr,
+    ) -> (
+        WebState,
+        CancellationToken,
+        tokio::sync::mpsc::Receiver<ControlMsg>,
+    ) {
         let cancel = CancellationToken::new();
 
-        let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<ControlMsg>(8);
+        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::channel::<ControlMsg>(8);
         let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
 
@@ -251,7 +259,7 @@ mod tests {
             reload_timeout: Duration::from_secs(10),
         }));
 
-        (state, cancel)
+        (state, cancel, ctl_rx)
     }
 
     // ── Security guard covers static/SPA paths ────────────────────────────
@@ -259,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn security_guard_rejects_foreign_host_on_root() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let router = build_router(state);
 
         let req = Request::builder()
@@ -280,7 +288,7 @@ mod tests {
     #[tokio::test]
     async fn security_guard_rejects_foreign_host_on_spa_route() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let router = build_router(state);
 
         let req = Request::builder()
@@ -301,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn security_guard_allows_loopback_host_on_root() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let router = build_router(state);
 
         let req = Request::builder()
@@ -339,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn derived_post_routes_cover_all_known_post_mounts() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         // Building the router runs every route_post! call site, populating
         // the derived registry.
         let _router = build_router(state);
@@ -359,6 +367,7 @@ mod tests {
             "/api/resume",
             "/api/reload",
             "/api/doctor",
+            "/api/emergency-wake",
         ];
         for known in known_post_routes {
             assert!(
@@ -377,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn derived_post_routes_are_classified_strict_or_weak() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let _router = build_router(state);
 
         let derived = registered_post_routes();
@@ -393,5 +402,53 @@ mod tests {
                  decision"
             );
         }
+    }
+
+    // ── Emergency-wake route (Task 2) ──────────────────────────────────────
+
+    /// Exercises the endpoint through the real `build_router` (not the
+    /// `command_test_router` test mount) — full production wiring: engine
+    /// channel, security guard, JSON body extraction, wire-shape response.
+    #[tokio::test]
+    async fn build_router_mounts_emergency_wake_and_returns_wire_report() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel, mut ctl_rx) = test_web_state_with_bind(bind);
+        tokio::spawn(async move {
+            let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
+                panic!("expected EmergencyWake");
+            };
+            let _ = reply.send(EmergencyWakeReport {
+                paused: true,
+                displays: vec![EmergencyWakeResult {
+                    display: DisplayId("studio".to_string()),
+                    ok: true,
+                    error: None,
+                }],
+            });
+        });
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/emergency-wake")
+                    .header("Host", "127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "paused": true,
+                "displays": [{"display": "studio", "ok": true}]
+            })
+        );
     }
 }

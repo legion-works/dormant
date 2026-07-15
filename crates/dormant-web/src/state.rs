@@ -48,10 +48,10 @@ pub struct WebState {
 /// `WebStateInner::new_for_test` / `WebStateInner::new_for_test_with_pairing`
 /// (`#[cfg(test)]`-only, hence plain code spans rather than doc-links here)
 /// — never a bare struct literal; several fields
-/// (`apply_lock`, `pairing`, `pair_lock`, `pair_connect`, `upsert_token`)
-/// are either always freshly constructed or given a constructor-specific
-/// default that a hand-written literal would have to duplicate at every
-/// call site.
+/// (`apply_lock`, `pairing`, `pair_lock`, `pair_connect`, `upsert_token`,
+/// `emergency_wake_lock`) are either always freshly constructed or given a
+/// constructor-specific default that a hand-written literal would have to
+/// duplicate at every call site.
 pub struct WebStateInner {
     /// Engine control channel — used by routes that need a live snapshot
     /// (`/api/state`) or a control action (`/api/blank`, etc.).
@@ -138,6 +138,13 @@ pub struct WebStateInner {
     /// substitute a closure that records `(path, host, token)` calls
     /// instead of touching the filesystem.
     pub(crate) upsert_token: UpsertToken,
+
+    /// Web-scoped single-flight guard for global emergency wake.
+    ///
+    /// The owned guard moves into the reply-monitor task, so an HTTP report
+    /// timeout does not admit a second web request while the engine
+    /// operation continues.
+    pub(crate) emergency_wake_lock: Arc<Mutex<()>>,
 }
 
 /// The subset of [`WebStateInner`]'s fields that vary across construction
@@ -217,8 +224,8 @@ impl WebStateInner {
     }
 
     /// Shared assembly — every constructor bottoms out here so the
-    /// always-fresh fields (`apply_lock`, `pairing`, `pair_lock`) are
-    /// built exactly once, in exactly one place.
+    /// always-fresh fields (`apply_lock`, `pairing`, `pair_lock`,
+    /// `emergency_wake_lock`) are built exactly once, in exactly one place.
     fn assemble(
         params: WebStateInnerParams,
         pair_connect: Arc<dyn PairConnect>,
@@ -242,6 +249,7 @@ impl WebStateInner {
             pair_lock: Arc::new(Mutex::new(())),
             pair_connect,
             upsert_token,
+            emergency_wake_lock: Arc::new(Mutex::new(())),
         }
     }
 }

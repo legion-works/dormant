@@ -133,6 +133,26 @@ export interface RollbackStatus {
 }
 
 /**
+ * rust: rules.rs EmergencyWakeResult
+ * serde: `error` is `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+ */
+export interface EmergencyWakeResult {
+  display: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * rust: rules.rs EmergencyWakeReport — response body of
+ * `POST /api/emergency-wake`.
+ * serde: field names match exactly (no rename).
+ */
+export interface EmergencyWakeReport {
+  paused: boolean;
+  displays: EmergencyWakeResult[];
+}
+
+/**
  * rust: rules.rs StateSnapshot
  * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
  * `pending_reload` is `Option<String>` → null or string.

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use dormant_core::rules::ControlMsg;
+use dormant_core::rules::{ControlMsg, EmergencyWakeReport};
 use dormant_core::types::{DisplayId, RuleId, Timestamp};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
@@ -18,6 +18,13 @@ use crate::error::WebError;
 
 /// Maximum time to wait for a snapshot before rejecting a command.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time the web layer waits for a global emergency-wake report
+/// before returning 504. The engine-side IPC bound
+/// (`dormantd/src/ipc.rs::EMERGENCY_WAKE_IPC_TIMEOUT`) is also 2 s; kept in
+/// sync deliberately, not derived, since the two crates do not share a
+/// dependency edge for this constant.
+const EMERGENCY_WAKE_WEB_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ── Request bodies ──────────────────────────────────────────────────────────
 
@@ -145,6 +152,43 @@ pub(crate) async fn post_reload(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+/// `POST /api/emergency-wake` — pause every rule and wake every display.
+///
+/// The route intentionally has no secondary fallback. It already runs inside
+/// `dormantd` and shares the engine channel; a second wake path would race the
+/// engine-owned all-rule pause and produce a less trustworthy report.
+pub(crate) async fn post_emergency_wake(
+    State(state): State<WebState>,
+) -> Result<Json<EmergencyWakeReport>, WebError> {
+    let guard = state
+        .inner
+        .emergency_wake_lock
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| WebError::EmergencyWakeInProgress)?;
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    // Spawn before the channel send: if the HTTP task is cancelled while send
+    // is pending, this detached monitor still owns the web single-flight guard.
+    let mut completion = tokio::spawn(async move {
+        let result = reply_rx.await;
+        drop(guard);
+        result
+    });
+    state
+        .inner
+        .ctl_tx
+        .send(ControlMsg::EmergencyWake { reply: reply_tx })
+        .await
+        .map_err(|_| WebError::EngineUnavailable)?;
+
+    match tokio::time::timeout(EMERGENCY_WAKE_WEB_TIMEOUT, &mut completion).await {
+        Ok(Ok(Ok(report))) => Ok(Json(report)),
+        Ok(Ok(Err(_)) | Err(_)) => Err(WebError::EmergencyWakeCancelled),
+        Err(_) => Err(WebError::EmergencyWakeReportTimeout),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Fetch a snapshot from the engine (bounded), mirroring `ipc.rs`'s
@@ -246,6 +290,10 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
         .route("/api/pause", axum::routing::post(post_pause))
         .route("/api/resume", axum::routing::post(post_resume))
         .route("/api/reload", axum::routing::post(post_reload))
+        .route(
+            "/api/emergency-wake",
+            axum::routing::post(post_emergency_wake),
+        )
         .with_state(state)
 }
 
@@ -256,6 +304,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use axum::response::IntoResponse;
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
     use indexmap::IndexMap;
@@ -636,5 +685,123 @@ mod tests {
             .await
             .is_ok();
         assert!(triggered, "reload trigger should have been signalled");
+    }
+
+    // ── Emergency-wake tests ────────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn emergency_wake_times_out_after_two_seconds() {
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let state = test_web_state(ctl_tx);
+        let err = post_emergency_wake(State(state)).await.unwrap_err();
+        assert!(matches!(err, WebError::EmergencyWakeReportTimeout));
+    }
+
+    #[tokio::test]
+    async fn emergency_wake_dropped_reply_maps_to_500_json() {
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
+                panic!("expected EmergencyWake");
+            };
+            drop(reply);
+        });
+        let response = command_test_router(ctl_tx)
+            .oneshot(
+                Request::post("/api/emergency-wake")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "emergency_wake_cancelled"})
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_emergency_wake_is_rejected_while_first_reply_is_pending() {
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let state = test_web_state(ctl_tx);
+        let first_state = state.clone();
+        let first = tokio::spawn(async move { post_emergency_wake(State(first_state)).await });
+        let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
+            panic!("expected first EmergencyWake");
+        };
+
+        let second = post_emergency_wake(State(state)).await.unwrap_err();
+        assert!(matches!(second, WebError::EmergencyWakeInProgress));
+        let _ = reply.send(EmergencyWakeReport {
+            paused: true,
+            displays: Vec::new(),
+        });
+        let _ = first.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emergency_wake_guard_survives_http_report_timeout() {
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let state = test_web_state(ctl_tx);
+        let first_state = state.clone();
+        let first = tokio::spawn(async move { post_emergency_wake(State(first_state)).await });
+        let reply = match ctl_rx.recv().await.unwrap() {
+            ControlMsg::EmergencyWake { reply } => reply,
+            other => panic!("expected EmergencyWake, got {other:?}"),
+        };
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(matches!(
+            first.await.unwrap().unwrap_err(),
+            WebError::EmergencyWakeReportTimeout
+        ));
+        assert!(matches!(
+            post_emergency_wake(State(state)).await.unwrap_err(),
+            WebError::EmergencyWakeInProgress
+        ));
+        drop(reply);
+    }
+
+    #[tokio::test]
+    async fn emergency_wake_cancelled_maps_to_500_json_exactly() {
+        let response = WebError::EmergencyWakeCancelled.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "emergency_wake_cancelled"})
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_wake_report_timeout_maps_to_504_json_exactly() {
+        let response = WebError::EmergencyWakeReportTimeout.into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "emergency_wake_report_timeout"})
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_wake_in_progress_maps_to_409_json_exactly() {
+        let response = WebError::EmergencyWakeInProgress.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "emergency_wake_in_progress"})
+        );
     }
 }

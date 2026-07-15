@@ -66,6 +66,7 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/resume",
     "/api/reload",
     "/api/doctor",
+    "/api/emergency-wake",
 ];
 
 /// Reject any request whose `Host` header is not in the allow-list.
@@ -647,6 +648,15 @@ mod tests {
             "/api/pair/samsung must be pre-classified strict so the route \
              is strict-by-construction the moment it is mounted"
         );
+    }
+
+    /// M3 Must-2 counterpart for the global emergency-wake route: a direct
+    /// membership assertion pinning it to the weak (same-origin) set, not
+    /// merely coverage by the `⊆ STRICT ∪ WEAK` union check in `server.rs`.
+    #[test]
+    fn emergency_wake_is_explicitly_acknowledged_weak() {
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/emergency-wake"));
+        assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/emergency-wake"));
     }
 
     /// Structural comment-test (no path-normalization layer): the guard

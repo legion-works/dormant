@@ -91,9 +91,22 @@ pub(crate) enum WebError {
     /// entry (never existed, or already swept as an expired terminal
     /// entry — see `routes::pair::sweep_expired`).
     PairNotFound,
+    /// Another web emergency-wake request is still in flight.
+    EmergencyWakeInProgress,
+    /// The engine dropped an emergency-wake reply.
+    EmergencyWakeCancelled,
+    /// The engine did not return a global emergency-wake report within the
+    /// web bound.
+    EmergencyWakeReportTimeout,
 }
 
 impl IntoResponse for WebError {
+    // The Task 2 emergency-wake variants pushed this match past clippy's
+    // pedantic 100-line threshold; every arm maps one enum variant to one
+    // (status, event, detail) tuple or an early-return literal JSON body —
+    // splitting it would scatter that 1:1 mapping across functions for no
+    // readability gain.
+    #[allow(clippy::too_many_lines)]
     fn into_response(self) -> Response {
         let (status, event, detail) = match self {
             WebError::EngineUnavailable => {
@@ -183,6 +196,21 @@ impl IntoResponse for WebError {
             WebError::PairFeatureDisabled => (StatusCode::FORBIDDEN, "feature_disabled", None),
             WebError::PairInProgress => (StatusCode::CONFLICT, "pairing_in_progress", None),
             WebError::PairNotFound => (StatusCode::NOT_FOUND, "pair_not_found", None),
+
+            // ── Global emergency-wake variants (Task 2) ────────────────────────
+            WebError::EmergencyWakeInProgress => {
+                (StatusCode::CONFLICT, "emergency_wake_in_progress", None)
+            }
+            WebError::EmergencyWakeCancelled => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "emergency_wake_cancelled",
+                None,
+            ),
+            WebError::EmergencyWakeReportTimeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "emergency_wake_report_timeout",
+                None,
+            ),
         };
         let mut body = serde_json::json!({ "error": event });
         if let Some(d) = detail {

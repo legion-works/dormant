@@ -8,5 +8,6 @@ pub(crate) mod config;
 pub(crate) mod config_apply;
 pub(crate) mod doctor;
 pub(crate) mod events;
+pub(crate) mod operations;
 pub(crate) mod pair;
 pub(crate) mod wear;

@@ -98,6 +98,12 @@ pub(crate) enum WebError {
     /// The engine did not return a global emergency-wake report within the
     /// web bound.
     EmergencyWakeReportTimeout,
+    /// This display already has a web exercise in flight.
+    ExerciseInProgress,
+    /// The engine dropped a control-path exercise reply.
+    ExerciseCancelled,
+    /// The engine did not return an exercise report within the web bound.
+    ExerciseReportTimeout,
 }
 
 impl IntoResponse for WebError {
@@ -211,6 +217,17 @@ impl IntoResponse for WebError {
                 "emergency_wake_report_timeout",
                 None,
             ),
+
+            // ── Per-display exercise variants (Task 3) ─────────────────────────
+            WebError::ExerciseInProgress => (StatusCode::CONFLICT, "exercise_in_progress", None),
+            WebError::ExerciseCancelled => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exercise_cancelled",
+                None,
+            ),
+            WebError::ExerciseReportTimeout => {
+                (StatusCode::GATEWAY_TIMEOUT, "exercise_report_timeout", None)
+            }
         };
         let mut body = serde_json::json!({ "error": event });
         if let Some(d) = detail {

@@ -6,7 +6,7 @@
 //! `dormant-doctor`-owned type — no `dormantd`-local type, so there is
 //! no dependency cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::error::DormantError;
 use dormant_core::reload::ReloadOutcome;
 use dormant_core::rules::ControlMsg;
+use dormant_core::types::DisplayId;
 use dormant_core::wear::WearHandle;
 use dormant_displays::samsung_tizen::{PairConnect, RealPairConnect};
 use dormant_doctor::DoctorService;
@@ -145,6 +146,11 @@ pub struct WebStateInner {
     /// timeout does not admit a second web request while the engine
     /// operation continues.
     pub(crate) emergency_wake_lock: Arc<Mutex<()>>,
+
+    /// Displays with a web control-path exercise still awaiting an engine reply.
+    ///
+    /// Entries are removed by the detached reply monitor, not by the HTTP timeout.
+    pub(crate) exercise_in_flight: Arc<Mutex<HashSet<DisplayId>>>,
 }
 
 /// The subset of [`WebStateInner`]'s fields that vary across construction
@@ -250,6 +256,7 @@ impl WebStateInner {
             pair_connect,
             upsert_token,
             emergency_wake_lock: Arc::new(Mutex::new(())),
+            exercise_in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }

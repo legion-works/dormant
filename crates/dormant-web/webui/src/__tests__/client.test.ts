@@ -15,6 +15,8 @@ import {
   postReload,
   runDoctor,
   postEmergencyWake,
+  postExercise,
+  getOperations,
 } from "../api/client";
 
 describe("API client POST helpers", () => {
@@ -123,5 +125,74 @@ describe("postEmergencyWake", () => {
 
     await expect(postEmergencyWake()).rejects.toMatchObject({ status: 409 });
     await expect(postEmergencyWake()).rejects.toMatchObject({ status: 504 });
+  });
+});
+
+describe("postExercise / getOperations", () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("posts a URL-encoded display exercise and returns the report", async () => {
+    const report = {
+      display: "main panel",
+      pre_phase: "active",
+      paused_rules: ["office_blank"],
+      steps: [],
+    };
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(report), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(postExercise("main panel")).resolves.toEqual(report);
+    expect(fetchSpy).toHaveBeenCalledWith("/api/doctor/exercise/main%20panel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  });
+
+  it("preserves exercise 409 and report-timeout 504 statuses", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "exercise_in_progress" }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "exercise_report_timeout" }), {
+          status: 504,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    await expect(postExercise("main")).rejects.toMatchObject({ status: 409 });
+    await expect(postExercise("main")).rejects.toMatchObject({ status: 504 });
+  });
+
+  it("gets authoritative web-operation guard status", async () => {
+    const status = {
+      exercise_in_flight: ["main"],
+      emergency_wake_in_flight: true,
+    };
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(status), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    await expect(getOperations()).resolves.toEqual(status);
+    expect(fetchSpy).toHaveBeenCalledWith("/api/operations", undefined);
   });
 });

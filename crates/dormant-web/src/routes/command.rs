@@ -210,7 +210,7 @@ async fn request_snapshot(
 /// Validate that a display name exists in the current engine snapshot.
 /// Returns `WebError::UnknownDisplay` if the display is unknown, mirroring
 /// the IPC server's `validate_display_name`.
-async fn validate_display_exists(
+pub(super) async fn validate_display_exists(
     ctl_tx: &mpsc::Sender<ControlMsg>,
     display: &str,
 ) -> Result<(), WebError> {

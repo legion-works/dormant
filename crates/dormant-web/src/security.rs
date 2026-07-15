@@ -67,6 +67,7 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/reload",
     "/api/doctor",
     "/api/emergency-wake",
+    "/api/doctor/exercise/:display",
 ];
 
 /// Reject any request whose `Host` header is not in the allow-list.
@@ -657,6 +658,12 @@ mod tests {
     fn emergency_wake_is_explicitly_acknowledged_weak() {
         assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/emergency-wake"));
         assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/emergency-wake"));
+    }
+
+    #[test]
+    fn exercise_is_explicitly_acknowledged_weak() {
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/doctor/exercise/:display"));
+        assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/doctor/exercise/:display"));
     }
 
     /// Structural comment-test (no path-normalization layer): the guard

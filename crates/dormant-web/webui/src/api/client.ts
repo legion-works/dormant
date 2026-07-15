@@ -11,6 +11,8 @@
  *   POST /api/reload  → no body extractor; Content-Type header required by guard
  *   POST /api/doctor  → no body extractor; Content-Type header required by guard
  *   POST /api/emergency-wake → no body extractor; returns EmergencyWakeReport
+ *   POST /api/doctor/exercise/:display → no body extractor; returns ExerciseReport
+ *   GET  /api/operations → OperationsStatus
  *
  * All POSTs MUST send Content-Type: application/json — the security
  * guard (security.rs:60-71) rejects POSTs without it (415).
@@ -26,6 +28,8 @@ import type {
   PairAccepted,
   PairStatus,
   EmergencyWakeReport,
+  ExerciseReport,
+  OperationsStatus,
 } from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -200,4 +204,14 @@ async function postJsonReport<T>(url: string): Promise<T> {
 /** POST /api/emergency-wake — pause every rule and wake every configured display. */
 export function postEmergencyWake(): Promise<EmergencyWakeReport> {
   return postJsonReport<EmergencyWakeReport>("/emergency-wake");
+}
+
+/** POST /api/doctor/exercise/:display — run the real blank/read/wake/read/restore sequence. */
+export function postExercise(display: string): Promise<ExerciseReport> {
+  return postJsonReport<ExerciseReport>(`/doctor/exercise/${encodeURIComponent(display)}`);
+}
+
+/** GET /api/operations — authoritative WebState single-flight guard status. */
+export function getOperations(): Promise<OperationsStatus> {
+  return request<OperationsStatus>("/operations");
 }

@@ -6,8 +6,8 @@
  * references-warning confirm; `members` unlocks to a multi-select
  * under entity_crud_enabled (was read-only/locked before this feature).
  */
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, waitFor, fireEvent, cleanup, within, act } from "@testing-library/react";
 import ZonesSection from "../app/config/ZonesSection";
 import { createPatchStore } from "../app/config/patch";
 import type { ZoneConfig, RuleConfig } from "../api/types";
@@ -97,30 +97,29 @@ describe("ZonesSection — Add affordance", () => {
 });
 
 describe("ZonesSection — Delete affordance", () => {
-  it("shows a Delete button per zone card that confirms and warns about referencing rules", () => {
+  it("confirms with the referencing rule before tracking a zone delete", async () => {
     const { store } = renderSection();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(confirmSpy.mock.calls[0][0]).toMatch(/office-rule/);
-
-    const patches = store.buildPatches();
-    expect(patches).toHaveLength(1);
-    expect(patches[0]).toEqual({ op: "delete_entity", collection: "zones", id: "office" });
-
-    confirmSpy.mockRestore();
+    const dialog = screen.getByRole("alertdialog", { name: 'Delete zone "office"?' });
+    expect(dialog).toHaveTextContent('rule "office-rule"');
+    fireEvent.click(screen.getByRole("button", { name: "Delete zone" }));
+    await waitFor(() => expect(store.buildPatches()).toEqual([
+      { op: "delete_entity", collection: "zones", id: "office" },
+    ]));
   });
 
-  it("does not track a delete when the confirm is dismissed", () => {
+  it("does not track a zone delete when the dialog is cancelled", async () => {
     const { store } = renderSection();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-
     fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-
-    expect(store.buildPatches()).toHaveLength(0);
-    confirmSpy.mockRestore();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // Flush the microtask the async confirm() continuation runs on — see
+    // SensorsSection.test.tsx's cancel test for why this is required to
+    // actually bite a mutant that ignores `accepted` (C6 precedent).
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(store.buildPatches()).toEqual([]);
   });
 });
 

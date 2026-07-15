@@ -5,8 +5,8 @@
  * `create_entity` via the store; per-card delete with a
  * references-warning confirm naming referencing rules.
  */
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import DisplaysSection from "../app/config/DisplaysSection";
 import { createPatchStore } from "../app/config/patch";
 import type { DisplayConfig, RuleConfig } from "../api/types";
@@ -88,18 +88,30 @@ describe("DisplaysSection — pairing wizard hand-off (spec §8.3)", () => {
 });
 
 describe("DisplaysSection — Delete affordance", () => {
-  it("confirms and warns about referencing rules before tracking a delete", () => {
+  it("confirms with the referencing rule before tracking a display delete", async () => {
     const { store } = renderSection();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(confirmSpy.mock.calls[0][0]).toMatch(/office-rule/);
-    expect(store.buildPatches()).toEqual([
+    const dialog = screen.getByRole("alertdialog", { name: 'Delete display "aoc-main"?' });
+    expect(dialog).toHaveTextContent('rule "office-rule"');
+    fireEvent.click(screen.getByRole("button", { name: "Delete display" }));
+    await waitFor(() => expect(store.buildPatches()).toEqual([
       { op: "delete_entity", collection: "displays", id: "aoc-main" },
-    ]);
+    ]));
+  });
 
-    confirmSpy.mockRestore();
+  it("does not track a display delete when the dialog is cancelled", async () => {
+    const { store } = renderSection();
+    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // Flush the microtask the async confirm() continuation runs on — see
+    // SensorsSection.test.tsx's cancel test for why this is required to
+    // actually bite a mutant that ignores `accepted` (C6 precedent). This
+    // cancel test did not exist before this task — added to mirror the
+    // coverage the other three entity sections have.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(store.buildPatches()).toEqual([]);
   });
 });

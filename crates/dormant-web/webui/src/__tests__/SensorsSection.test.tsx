@@ -7,8 +7,8 @@
  * (same "render + fireEvent + buildPatches" shape as ConfigForm.test.tsx's
  * DisplaysSection mode-switch tests).
  */
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, waitFor, fireEvent, cleanup, within } from "@testing-library/react";
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, waitFor, fireEvent, cleanup, within, act } from "@testing-library/react";
 import SensorsSection from "../app/config/SensorsSection";
 import { createPatchStore } from "../app/config/patch";
 import type { SensorConfig, ZoneConfig } from "../api/types";
@@ -210,28 +210,30 @@ describe("SensorsSection — CRUD affordances", () => {
     expect(screen.getByRole("button", { name: /create/i })).toBeDisabled();
   });
 
-  it("delete confirms and warns about the referencing zone, then tracks the delete", () => {
+  it("confirms with the referencing zone before tracking a sensor delete", async () => {
     const store = renderWithCrud(true);
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(confirmSpy.mock.calls[0][0]).toMatch(/office/);
-    expect(store.buildPatches()).toEqual([
+    const dialog = screen.getByRole("alertdialog", { name: 'Delete sensor "living-room"?' });
+    expect(dialog).toHaveTextContent('zone "office"');
+    fireEvent.click(screen.getByRole("button", { name: "Delete sensor" }));
+    await waitFor(() => expect(store.buildPatches()).toEqual([
       { op: "delete_entity", collection: "sensors", id: "living-room" },
-    ]);
-
-    confirmSpy.mockRestore();
+    ]));
   });
 
-  it("does not track a delete when the confirm is dismissed", () => {
+  it("does not track a sensor delete when the dialog is cancelled", async () => {
     const store = renderWithCrud(true);
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-
     fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // `confirm()`'s promise resolves synchronously inside Cancel's onClick
+    // (useConfirmDialog's `finish`), so the `.then` continuation that would
+    // call trackDelete is only scheduled as a microtask — flush before
+    // asserting "not tracked" so a mutant that ignores `accepted` doesn't
+    // pass by accident (C6 precedent, T6/T7/T8).
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(store.buildPatches()).toEqual([]);
-    confirmSpy.mockRestore();
   });
 });

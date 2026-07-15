@@ -19,6 +19,7 @@ import type { DisplayConfig, LadderStage, RuleConfig } from "../../api/types";
 import type { PatchStore } from "./patch";
 import CreateEntityForm from "./CreateEntityForm";
 import { referencingEntities } from "./entityCrud";
+import { useConfirmDialog } from "../components";
 
 const BLANK_MODE_OPTIONS = ["power_off", "screen_off_audio_on", "brightness_zero"] as const;
 
@@ -86,20 +87,28 @@ export default function DisplaysSection({
     if (createPrefill) setShowCreate(true);
   }, [createPrefill]);
 
+  const { confirm, dialog } = useConfirmDialog();
+
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     const refs = referencingEntities("displays", id, { zones: {}, rules });
-    const msg = refs.length > 0
-      ? `Delete display "${id}"? It is referenced by ${refs.join(", ")} — deleting it may make those entities invalid.`
-      : `Delete display "${id}"?`;
-    if (window.confirm(msg)) {
+    const accepted = await confirm({
+      title: `Delete display "${id}"?`,
+      description: refs.length > 0
+        ? `Referenced by ${refs.join(", ")}. Deleting it may make the pending config invalid.`
+        : "Nothing else references displays.",
+      confirmLabel: "Delete display",
+      tone: "danger",
+    });
+    if (accepted) {
       store.trackDelete("displays", id);
       onDirty();
     }
   }
 
   return (
+    <>
     <FormSection title="Displays">
       {ids.map((id) => {
         const cfg = displays[id];
@@ -266,6 +275,8 @@ export default function DisplaysSection({
         )
       )}
     </FormSection>
+    {dialog}
+    </>
   );
 }
 

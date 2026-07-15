@@ -13,6 +13,7 @@ import type { PatchStore } from "./patch";
 import type { RuleConfig } from "../../api/types";
 import CreateEntityForm from "./CreateEntityForm";
 import { VALID_INHIBITORS } from "./entityCrud";
+import { useConfirmDialog } from "../components";
 
 /** Per-key help for rule scalar fields — accurate to the real config semantics. */
 const RULE_HELP: Record<string, string> = {
@@ -49,20 +50,28 @@ export default function RulesSection({
 }: RulesSectionProps) {
   const ids = Object.keys(rules);
   const [showCreate, setShowCreate] = useState(false);
+  const { confirm, dialog } = useConfirmDialog();
 
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     // Nothing in the schema references a rule (rules reference zones/
     // displays, never the reverse) — no client-side references warning
     // needed, unlike zones/sensors/displays.
-    if (window.confirm(`Delete rule "${id}"?`)) {
+    const accepted = await confirm({
+      title: `Delete rule "${id}"?`,
+      description: "Nothing else references rules.",
+      confirmLabel: "Delete rule",
+      tone: "danger",
+    });
+    if (accepted) {
       store.trackDelete("rules", id);
       onDirty();
     }
   }
 
   return (
+    <>
     <FormSection title="Rules">
       {ids.map((id) => {
         const cfg = rules[id];
@@ -202,5 +211,7 @@ export default function RulesSection({
         )
       )}
     </FormSection>
+    {dialog}
+    </>
   );
 }

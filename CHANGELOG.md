@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Web UI v2 parity and polish: persistent boot-rollback/failure banners, global emergency wake, browser-launched control-path exercise, per-display wear heat maps and exposure summaries, guarded quick controls, exact event badges, and shared confirmation dialogs.
+
 ## [0.2.0] - 2026-07-14
 
 ### Added

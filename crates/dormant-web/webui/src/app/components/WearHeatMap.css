@@ -1,16 +1,20 @@
 /* Wear heat map — per-cell brightness-weighted on-hours grid.
-   All colors use DS tokens (the five --wear-heat-N feature tokens for
-   cell fill; everything else via existing DS tokens). */
+   Cell fill comes from `heatColor()` (WearHeatMap.tsx) — the design
+   handoff's ramp is literal RGB stops with no DS token, so those raw
+   values live in the component, not here. The sunken tile + hairline
+   border below use existing DS tokens. */
 
 .wear-heat-map {
   display: grid;
   gap: 2px;
+  padding: 8px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
 .wear-heat-map__cell {
-  aspect-ratio: 1;
   border-radius: 2px;
 }
 

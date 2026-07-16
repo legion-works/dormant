@@ -13,13 +13,47 @@
 import type { WearDetail } from "../../api/types";
 import "./WearHeatMap.css";
 
-export const WEAR_HEAT_COLORS = [
-  "var(--wear-heat-0)",
-  "var(--wear-heat-1)",
-  "var(--wear-heat-2)",
-  "var(--wear-heat-3)",
-  "var(--wear-heat-4)",
-] as const;
+/**
+ * Heat-map ramp stops, per the design handoff ("Design tokens" §Heat-map
+ * ramp): `[v, r, g, b]`. No DS token exists for these — the handoff gives
+ * literal ramp values with no token, so the raw RGB triples live here as
+ * the single source (both `heatColor` and the legend gradient CSS derive
+ * from the same five stops).
+ */
+const HEAT_RAMP_STOPS: readonly [number, number, number, number][] = [
+  [0.0, 60, 70, 90],
+  [0.32, 195, 232, 141], // #C3E88D
+  [0.62, 255, 199, 119], // #FFC777
+  [0.82, 255, 150, 108], // #FF966C
+  [1.0, 255, 117, 127], // #FF757F
+];
+
+/**
+ * Continuous heat ramp: clamps `v` to 0..1, linearly interpolates the RGB
+ * between the bracketing stops, and derives alpha as `0.22 + v*0.78` — at
+ * `v=0` every cell still renders at 0.22 alpha (visible on the sunken
+ * tile), never a black void, so the uniform/all-zero case reads as a
+ * legible cold map instead of nothing.
+ */
+export function heatColor(value: number): string {
+  const v = Math.max(0, Math.min(1, value));
+  let lo = HEAT_RAMP_STOPS[0];
+  let hi = HEAT_RAMP_STOPS[HEAT_RAMP_STOPS.length - 1];
+  for (let i = 0; i < HEAT_RAMP_STOPS.length - 1; i++) {
+    if (v >= HEAT_RAMP_STOPS[i][0] && v <= HEAT_RAMP_STOPS[i + 1][0]) {
+      lo = HEAT_RAMP_STOPS[i];
+      hi = HEAT_RAMP_STOPS[i + 1];
+      break;
+    }
+  }
+  const span = hi[0] - lo[0];
+  const t = span === 0 ? 0 : (v - lo[0]) / span;
+  const r = Math.round(lo[1] + (hi[1] - lo[1]) * t);
+  const g = Math.round(lo[2] + (hi[2] - lo[2]) * t);
+  const b = Math.round(lo[3] + (hi[3] - lo[3]) * t);
+  const alpha = Math.round((0.22 + v * 0.78) * 100) / 100;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
 
 export interface NormalizedWearGrid {
   rows: number;
@@ -86,7 +120,11 @@ export function WearHeatMap({ display, grid }: { display: string; grid: Normaliz
       className="wear-heat-map"
       role="grid"
       aria-label={`${display} panel wear heat map`}
-      style={{ gridTemplateColumns: `repeat(${grid.cols}, minmax(0, 1fr))` }}
+      style={{
+        gridTemplateColumns: `repeat(${grid.cols}, minmax(0, 1fr))`,
+        gridTemplateRows: `repeat(${grid.rows}, 1fr)`,
+        aspectRatio: `${grid.cols} / ${grid.rows}`,
+      }}
     >
       {grid.heat.map((intensity, index) => {
         const row = Math.floor(index / grid.cols) + 1;
@@ -94,15 +132,14 @@ export function WearHeatMap({ display, grid }: { display: string; grid: Normaliz
         const hours = grid.weightedHours[index];
         const percent = Math.round(intensity * 100);
         const label = `row ${row}, column ${col}: ${hours.toFixed(2)} brightness-weighted hours at ${percent} percent normalized heat`;
-        const colorIndex = Math.min(4, Math.floor(intensity * 5));
         return (
           <div
             key={index}
             role="gridcell"
             aria-label={label}
-            title={label}
+            title={`${hours.toFixed(1)} on-hours`}
             className="wear-heat-map__cell"
-            style={{ backgroundColor: WEAR_HEAT_COLORS[colorIndex] }}
+            style={{ backgroundColor: heatColor(intensity) }}
           />
         );
       })}

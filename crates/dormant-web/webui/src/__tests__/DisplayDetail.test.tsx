@@ -85,13 +85,31 @@ describe("DisplayDetail", () => {
 
     expect(screen.getByRole("grid", { name: "main panel wear heat map" })).toBeInTheDocument();
     expect(screen.getAllByRole("gridcell")).toHaveLength(4);
+
+    // Heat card eyebrow, caption, panel-type chip, legend, honesty note (F2).
+    expect(screen.getByText("PANEL WEAR HEAT MAP", { exact: false, selector: ".display-detail__eyebrow" })).toBeInTheDocument();
+    expect(screen.getByText("2×2 grid · per-cell brightness-weighted on-hours")).toBeInTheDocument();
+    expect(screen.getAllByText("WOLED").length).toBeGreaterThan(0);
+    expect(screen.getByText("low")).toBeInTheDocument();
+    expect(screen.getByText("high")).toBeInTheDocument();
+    expect(screen.getByText(/v1 attribution is panel-wide and advisory/)).toBeInTheDocument();
+
+    // Exposure summary tiles (F3).
     expect(screen.getByText("321.3h")).toBeInTheDocument();
-    expect(screen.getByText("45% average hotness")).toBeInTheDocument();
-    expect(screen.getByText("no long standby window in 5 days")).toBeInTheDocument();
+    expect(screen.getByText("not seeded")).toBeInTheDocument();
+    expect(screen.getByText("444")).toBeInTheDocument();
+    expect(screen.getByText("5d")).toBeInTheDocument();
+    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(screen.getByText("45%")).toBeInTheDocument();
+
     expect(screen.getByText("kwin-dpms")).toBeInTheDocument();
     expect(screen.getByText("timeout")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /emergency wake/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
+
+    // F4 — Cmd gen fact value is the bare number, not "Command generation N".
+    expect(screen.getByText("41", { selector: ".display-detail__fact-value" })).toBeInTheDocument();
+    expect(screen.queryByText(/Command generation/)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
     expect(screen.getByRole("alertdialog", { name: "Force blank main?" })).toBeInTheDocument();

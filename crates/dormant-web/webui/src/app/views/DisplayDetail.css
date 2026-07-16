@@ -28,7 +28,7 @@
 
 .display-detail__columns {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: 1.35fr 1fr;
   gap: 16px;
   align-items: start;
 }
@@ -39,9 +39,44 @@
   }
 }
 
+.display-detail__left-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 .display-detail__heat-card,
+.display-detail__exposure-card,
 .display-detail__info-card {
   padding: 20px 22px;
+}
+
+.display-detail__heat-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.display-detail__eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+.display-detail__panel-chip {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 10px;
+  white-space: nowrap;
 }
 
 .display-detail__heat-map-wrap {
@@ -52,6 +87,47 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-faint);
+  margin-top: 4px;
+}
+
+.display-detail__legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.display-detail__legend-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* Literal ramp stops (design handoff "Design tokens" §Heat-map ramp) —
+   mirrors WearHeatMap.tsx's heatColor() stops; no DS token covers a
+   continuous ramp gradient. */
+.display-detail__legend-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    rgba(60, 70, 90, 0.6),
+    #c3e88d 32%,
+    #ffc777 62%,
+    #ff966c 82%,
+    #ff757f
+  );
+}
+
+.display-detail__honesty-note {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-style: italic;
 }
 
 .display-detail__metrics {
@@ -70,6 +146,44 @@
 .display-detail__metric--muted {
   color: var(--text-faint);
   font-size: 12px;
+  margin-top: 12px;
+}
+
+.display-detail__tiles {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.display-detail__tile {
+  padding: 10px 12px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.display-detail__tile-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.display-detail__tile-value {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin-top: 5px;
+}
+
+.display-detail__tile--warning .display-detail__tile-value {
+  color: var(--warning);
+}
+.display-detail__tile--success .display-detail__tile-value {
+  color: var(--success);
 }
 
 .display-detail__advisory {

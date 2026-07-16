@@ -13,6 +13,7 @@
  *   POST /api/emergency-wake → no body extractor; returns EmergencyWakeReport
  *   POST /api/doctor/exercise/:display → no body extractor; returns ExerciseReport
  *   GET  /api/operations → OperationsStatus
+ *   GET  /api/daemon → DaemonIdentity
  *
  * All POSTs MUST send Content-Type: application/json — the security
  * guard (security.rs:60-71) rejects POSTs without it (415).
@@ -30,6 +31,7 @@ import type {
   EmergencyWakeReport,
   ExerciseReport,
   OperationsStatus,
+  DaemonIdentity,
 } from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -214,4 +216,9 @@ export function postExercise(display: string): Promise<ExerciseReport> {
 /** GET /api/operations — authoritative WebState single-flight guard status. */
 export function getOperations(): Promise<OperationsStatus> {
   return request<OperationsStatus>("/operations");
+}
+
+/** GET /api/daemon — daemon process identity (pid, uptime, version, socket). */
+export function getDaemon(): Promise<DaemonIdentity> {
+  return request<DaemonIdentity>("/daemon");
 }

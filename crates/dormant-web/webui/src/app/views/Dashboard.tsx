@@ -138,9 +138,29 @@ interface DashDisplayRowProps {
   blankMode: string;
   /** Configured controller names from config. */
   controllers: string[];
+  /** `true` when this display's wear summary is under advisory (from
+   * `GET /api/wear`, keyed by display name — same source WearCard reads). */
+  wearAdvisory: boolean;
 }
 
-function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProps) {
+/** Live status-chip row beneath the id/phase — same derivation the
+ * Displays cards use for paused/inhibited (`snap.paused`/`snap.inhibited`),
+ * extended with blank-failed (`FailureBanner`'s `last_blank_failed ?? false`
+ * predicate) and wear advisory (`WearCard`'s `summary.advisory`). */
+function DashDisplayChips({ snap, wearAdvisory }: { snap: DisplaySnapshot; wearAdvisory: boolean }) {
+  const blankFailed = snap.last_blank_failed ?? false;
+  if (!snap.paused && !snap.inhibited && !blankFailed && !wearAdvisory) return null;
+  return (
+    <div className="dash-display-row__chips">
+      {snap.paused && <StatusChip kind="paused" />}
+      {snap.inhibited && <StatusChip kind="inhibited" />}
+      {blankFailed && <StatusChip kind="blank_failed" />}
+      {wearAdvisory && <StatusChip kind="wear_advisory" />}
+    </div>
+  );
+}
+
+function DashDisplayRow({ id, snap, blankMode, controllers, wearAdvisory }: DashDisplayRowProps) {
   // Force-blank/wake moved to the "Quick actions" section (single shared
   // confirm + one `{ display, action }` in-flight state, not a hook per
   // row) — this row is informational only now.
@@ -150,6 +170,7 @@ function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProp
         <span className="dash-display-row__id">{id}</span>
         <StatusChip kind={snap.phase} label={phaseChipLabel(snap.phase, snap.stage)} />
       </div>
+      <DashDisplayChips snap={snap} wearAdvisory={wearAdvisory} />
       <div className="dash-display-row__meta">
         <span className="dash-display-row__blank">{blankMode}</span>
         {controllers.length > 0 && (
@@ -173,11 +194,13 @@ interface QuickActionsProps {
 }
 
 /**
- * Paired Blank/Wake chips for every display, guarded by a shared
- * confirmation dialog. Single `{ display, action } | null` in-flight
- * state (not one hook per display) disables only the button that is
- * actually running; a `Record<string, string>` error map surfaces each
- * display's own failure without hiding any other display's actions.
+ * Paired Blank/Wake chips for every display. Force blank (destructive —
+ * can strand the panel dark) shares one confirmation dialog; Force wake
+ * is non-destructive and un-gated (P1-F). Single `{ display, action } |
+ * null` in-flight state (not one hook per display) disables only the
+ * button that is actually running; a `Record<string, string>` error map
+ * surfaces each display's own failure without hiding any other display's
+ * actions.
  *
  * Recovery actions are never hidden based on `StateSnapshot.phase` —
  * live state can lag the operator's physical panel, so both Blank and
@@ -189,18 +212,19 @@ function QuickActions({ displayIds }: QuickActionsProps) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const { confirm, dialog } = useConfirmDialog();
 
+  // Force blank is destructive (can strand the panel dark) and stays
+  // gated; force wake is non-destructive — un-gated per P1-F.
   const run = useCallback(async (display: string, action: QuickAction) => {
     const verb = action === "blank" ? "Force blank" : "Force wake";
-    const accepted = await confirm({
-      title: `${verb} ${display}?`,
-      description:
-        action === "blank"
-          ? `Immediately blanks ${display}, bypassing the normal presence rules.`
-          : `Immediately wakes ${display}, bypassing the normal presence rules.`,
-      confirmLabel: verb,
-      tone: action === "blank" ? "danger" : "default",
-    });
-    if (!accepted) return;
+    if (action === "blank") {
+      const accepted = await confirm({
+        title: `${verb} ${display}?`,
+        description: `Immediately blanks ${display}, bypassing the normal presence rules.`,
+        confirmLabel: verb,
+        tone: "danger",
+      });
+      if (!accepted) return;
+    }
 
     setErrors((prev) => {
       if (!(display in prev)) return prev;
@@ -226,7 +250,7 @@ function QuickActions({ displayIds }: QuickActionsProps) {
 
   return (
     <>
-      <SectionHeader title="Quick actions" caption="force blank or wake, guarded by confirmation" />
+      <SectionHeader title="Quick actions" caption="force blank (confirmed) or wake" />
       <Card opaque>
         <div className="quick-actions">
           {displayIds.map((id) => {
@@ -267,7 +291,7 @@ function QuickActions({ displayIds }: QuickActionsProps) {
 
 
 export default function Dashboard() {
-  const { loading, error, snapshot, config, sensorConfigs, zoneConfigs, displayConfigs } = useLiveState();
+  const { loading, error, snapshot, config, sensorConfigs, zoneConfigs, displayConfigs, wear } = useLiveState();
   const { events } = useEventLog();
   const navigate = useNavigate();
 
@@ -365,6 +389,7 @@ export default function Dashboard() {
             const dc = displayConfigs[id];
             const blankMode = dc?.blank_mode ?? "—";
             const controllers = dc?.controllers ?? [];
+            const wearAdvisory = wear?.displays.some((d) => d.display_name === id && d.advisory) ?? false;
             return (
               <DashDisplayRow
                 key={id}
@@ -372,6 +397,7 @@ export default function Dashboard() {
                 snap={snap}
                 blankMode={blankMode}
                 controllers={controllers}
+                wearAdvisory={wearAdvisory}
               />
             );
           })}

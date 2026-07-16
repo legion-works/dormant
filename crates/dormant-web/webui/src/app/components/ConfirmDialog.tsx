@@ -1,12 +1,25 @@
 import { useEffect, useRef } from "react";
 import "./ConfirmDialog.css";
 
+export type ConfirmTone = "default" | "danger" | "warm" | "info";
+
 export interface ConfirmOptions {
   title: string;
   description: string;
   confirmLabel: string;
-  tone?: "default" | "danger";
+  tone?: ConfirmTone;
 }
+
+/** Per-tone icon glyph + accent CSS variable name — mirrors the proto's
+ * `dialogIcons`/`dialogKindC` mapping (Dormant Dashboard.dc.html). `default`
+ * has no icon tile (matches the current no-icon look for un-toned confirms
+ * like Pause/Delete-adjacent generic actions). */
+const TONE_ICON: Record<ConfirmTone, string | null> = {
+  default: null,
+  danger: "\u2715",
+  warm: "\u26A0",
+  info: "\u24D8",
+};
 
 export interface ConfirmDialogProps extends ConfirmOptions {
   open: boolean;
@@ -25,6 +38,7 @@ export default function ConfirmDialog({
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
+  const icon = TONE_ICON[tone];
   const dialogRef = useRef<HTMLElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
 
@@ -64,13 +78,20 @@ export default function ConfirmDialog({
     >
       <section
         ref={dialogRef}
-        className="confirm-dialog"
+        className={`confirm-dialog confirm-dialog--${tone}`}
         role="alertdialog"
         aria-modal="true"
         aria-labelledby="confirm-dialog-title"
         aria-describedby="confirm-dialog-description"
       >
-        <h2 id="confirm-dialog-title">{title}</h2>
+        <div className="confirm-dialog__header">
+          {icon && (
+            <span className={`confirm-dialog__icon confirm-dialog__icon--${tone}`} aria-hidden="true">
+              {icon}
+            </span>
+          )}
+          <h2 id="confirm-dialog-title">{title}</h2>
+        </div>
         <p id="confirm-dialog-description">{description}</p>
         <div className="confirm-dialog__actions">
           <button ref={cancelRef} type="button" onClick={onCancel} disabled={busy}>

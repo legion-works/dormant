@@ -207,6 +207,17 @@ export interface OperationsStatus {
 }
 
 /**
+ * rust: dormant_web::routes::daemon::DaemonIdentity — response body of
+ * `GET /api/daemon`.
+ */
+export interface DaemonIdentity {
+  pid: number;
+  started_epoch_s: number;
+  version: string;
+  socket: string;
+}
+
+/**
  * rust: rules.rs StateSnapshot
  * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
  * `pending_reload` is `Option<String>` → null or string.

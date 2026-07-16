@@ -58,6 +58,12 @@ vi.mock("../api/client", () => ({
     exercise_in_flight: [],
     emergency_wake_in_flight: false,
   }),
+  getDaemon: vi.fn().mockResolvedValue({
+    pid: 48213,
+    started_epoch_s: Math.floor(Date.now() / 1000) - 6 * 3600,
+    version: "0.2.0",
+    socket: "/tmp/dormant.sock",
+  }),
 }));
 
 afterEach(() => {

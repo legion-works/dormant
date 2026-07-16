@@ -42,6 +42,8 @@ const STATE_LABELS: Record<string, string> = {
   wake_retry: "retry",
   skip: "skip",
   not_supported: "n/a",
+  blank_failed: "blank failed",
+  wear_advisory: "wear advisory",
 };
 
 export function statusLabel(kind: StatusKind): string {

@@ -26,7 +26,7 @@ import {
   ExerciseRunner,
 } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
-import type { DisplayConfig, DisplayRuleInfo, DisplaySnapshot, WearDetail } from "../../api/types";
+import type { DisplayConfig, DisplayRuleInfo, DisplaySnapshot, PanelType, WearDetail } from "../../api/types";
 import "./DisplayDetail.css";
 
 export interface DisplayDetailProps {
@@ -41,6 +41,33 @@ export interface DisplayDetailProps {
 function blankModeLabel(mode: string | undefined): string {
   if (!mode) return "—";
   return mode.split("_").map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
+}
+
+/** rust: wear.rs PanelType — display label for the heat-card chip. */
+const PANEL_TYPE_LABELS: Record<PanelType, string> = {
+  woled: "WOLED",
+  "qd-oled": "QD-OLED",
+  unknown: "Unknown",
+};
+
+function panelTypeLabel(panelType: PanelType): string {
+  return PANEL_TYPE_LABELS[panelType] ?? panelType;
+}
+
+interface ExposureTileProps {
+  label: string;
+  value: string;
+  tone?: "warning" | "success";
+}
+
+/** One metric tile in the Exposure summary 2-col grid (F3). */
+function ExposureTile({ label, value, tone }: ExposureTileProps) {
+  return (
+    <div className={`display-detail__tile${tone ? ` display-detail__tile--${tone}` : ""}`}>
+      <div className="display-detail__tile-label">{label}</div>
+      <div className="display-detail__tile-value">{value}</div>
+    </div>
+  );
 }
 
 export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack }: DisplayDetailProps) {
@@ -123,45 +150,83 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
       </button>
 
       <div className="display-detail__columns">
-        <Card className="display-detail__heat-card">
-          <div className="display-detail__heat-map-wrap">
-            <WearHeatMap display={id} grid={grid} />
-          </div>
-          {wear && (
-            <div className="display-detail__heat-caption">
-              {grid.cols}×{grid.rows} grid · per-cell brightness-weighted on-hours
+        <div className="display-detail__left-column">
+          <Card className="display-detail__heat-card">
+            <div className="display-detail__heat-header">
+              <div>
+                <div className="display-detail__eyebrow">Panel wear heat map</div>
+                {wear && (
+                  <div className="display-detail__heat-caption">
+                    {grid.cols}×{grid.rows} grid · per-cell brightness-weighted on-hours
+                  </div>
+                )}
+              </div>
+              {wear && (
+                <span className="display-detail__panel-chip">{panelTypeLabel(wear.panel_type)}</span>
+              )}
             </div>
-          )}
 
-          <div className="display-detail__metrics">
+            <div className="display-detail__heat-map-wrap">
+              <WearHeatMap display={id} grid={grid} />
+            </div>
+
+            {grid.hasGridSamples || grid.hasHeatSamples ? (
+              <div className="display-detail__legend">
+                <span className="display-detail__legend-label">low</span>
+                <div className="display-detail__legend-bar" />
+                <span className="display-detail__legend-label">high</span>
+              </div>
+            ) : null}
+
+            <div className="display-detail__honesty-note">
+              v1 attribution is panel-wide and advisory — spatial variation appears only once
+              per-region sampling ships.
+            </div>
+          </Card>
+
+          <Card className="display-detail__exposure-card">
+            <div className="display-detail__eyebrow">Exposure summary</div>
             {wear ? (
-              <>
-                <div className="display-detail__metric">{wear.total_on_hours.toFixed(1)}h</div>
+              <div className="display-detail__tiles">
+                <ExposureTile label="Total on-hours" value={`${wear.total_on_hours.toFixed(1)}h`} />
+                <ExposureTile
+                  label="Seeded prior"
+                  value={
+                    wear.seeded_usage_hours != null
+                      ? `${wear.seeded_usage_hours}h · VCP 0xC0 seed`
+                      : "not seeded"
+                  }
+                />
+                <ExposureTile label="Samples" value={wear.sample_count.toLocaleString()} />
+                <ExposureTile
+                  label="Since long-dwell"
+                  value={`${Math.floor(wear.hours_since_long_dwell / 24)}d`}
+                  tone={wear.advisory ? "warning" : undefined}
+                />
+                <ExposureTile label="Panel type" value={panelTypeLabel(wear.panel_type)} />
+                <ExposureTile
+                  label="Advisory"
+                  value={wear.advisory ? "Active" : "Clear"}
+                  tone={wear.advisory ? "warning" : "success"}
+                />
                 {grid.hasHeatSamples && averagePercent !== null && uniformityPercent !== null ? (
                   <>
-                    <div className="display-detail__metric">{averagePercent}% average hotness</div>
-                    <div className="display-detail__metric">{uniformityPercent}% uniform</div>
+                    <ExposureTile label="Average hotness" value={`${averagePercent}%`} />
+                    <ExposureTile label="Uniformity" value={`${uniformityPercent}%`} />
                   </>
                 ) : (
                   <div className="display-detail__metric display-detail__metric--muted">
                     Heat metrics unavailable — no valid samples.
                   </div>
                 )}
-                <div
-                  className={`display-detail__advisory display-detail__advisory--${wear.advisory ? "warning" : "success"}`}
-                >
-                  {wear.advisory
-                    ? `no long standby window in ${Math.floor(wear.hours_since_long_dwell / 24)} days`
-                    : "compensation window healthy"}
-                </div>
-              </>
+              </div>
             ) : (
               <div className="display-detail__metric display-detail__metric--muted">
                 Heat metrics unavailable — no valid samples.
               </div>
             )}
-          </div>
-        </Card>
+          </Card>
+        </div>
 
         <Card className="display-detail__info-card">
           <div className="display-detail__title-row">
@@ -186,7 +251,7 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
             </div>
             <div className="display-detail__fact">
               <div className="display-detail__fact-label">Cmd gen</div>
-              <div className="display-detail__fact-value">Command generation {snapshot.cmd_gen}</div>
+              <div className="display-detail__fact-value">{snapshot.cmd_gen}</div>
             </div>
           </div>
 

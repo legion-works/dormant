@@ -64,7 +64,7 @@ export default function Shell() {
 function ShellInner() {
   const [activeView, setActiveView] = useState<ViewId>(getViewFromHash);
   const [clock, setClock] = useState(formatClock);
-  const { connected, snapshot, config, pollWarning, doctorReport, selectDisplay } = useLiveState();
+  const { connected, snapshot, config, pollWarning, doctorReport, selectDisplay, selectedDisplay } = useLiveState();
 
   useEffect(() => {
     const onHashChange = () => setActiveView(getViewFromHash());
@@ -117,6 +117,13 @@ function ShellInner() {
   const showPendingReloadBanner = Boolean(snapshot?.pending_reload) && !rollbackActive;
 
   const ActiveComponent = VIEW_COMPONENTS[activeView];
+
+  // Per handoff §3: when the Displays view has drilled into a single
+  // display's detail, the topbar swaps to that display's id + a
+  // detail-specific subtitle instead of the generic Displays heading.
+  const inDisplayDetail = activeView === "displays" && Boolean(selectedDisplay);
+  const topbarTitle = inDisplayDetail ? (selectedDisplay as string) : VIEW_LABELS[activeView];
+  const topbarSub = inDisplayDetail ? "panel wear & controls" : VIEW_SUBTITLES[activeView];
 
   return (
     <div className="shell lw-aurora lw-aurora--drift" data-theme="default">
@@ -185,8 +192,8 @@ function ShellInner() {
         <header className="topbar">
           <div className="topbar-left">
             <div className="topbar-heading">
-              <h1 className="topbar-title">{VIEW_LABELS[activeView]}</h1>
-              <span className="topbar-sub">{VIEW_SUBTITLES[activeView]}</span>
+              <h1 className="topbar-title">{topbarTitle}</h1>
+              <span className="topbar-sub">{topbarSub}</span>
             </div>
           </div>
           <div className="topbar-right">

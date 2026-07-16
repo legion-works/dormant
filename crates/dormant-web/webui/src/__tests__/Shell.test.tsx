@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, waitFor, cleanup } from "@testing-library/react";
+import { render, waitFor, cleanup, fireEvent, screen } from "@testing-library/react";
 import Shell from "../app/Shell";
+import type { StateSnapshot } from "../api/types";
 
 
 const { SAMPLE_STATE, ZERO_DISPLAY_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
@@ -16,7 +17,7 @@ const { SAMPLE_STATE, ZERO_DISPLAY_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
         "d1",
         { phase: "active" as const, inhibited: false, paused: false, cmd_gen: 1, controllers: [] },
       ],
-    ],
+    ] as StateSnapshot["displays"],
     pending_reload: null,
   },
   ZERO_DISPLAY_STATE: {
@@ -137,6 +138,29 @@ describe("Shell", () => {
       expect(badge).toBeInTheDocument();
       expect(badge?.textContent).toBe("0");
     });
+  });
+
+  it("swaps the topbar to the display id + 'panel wear & controls' when a display detail is open (F5)", async () => {
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(SAMPLE_STATE);
+
+    render(<Shell />);
+
+    await waitFor(() => {
+      expect(document.querySelector(".nav-badge")?.textContent).toBe("1");
+    });
+
+    const displaysNav = Array.from(document.querySelectorAll(".nav-item")).find(
+      (item) => item.querySelector(".nav-label")?.textContent === "Displays",
+    )!;
+    fireEvent.click(displaysNav);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Open d1 detail" }));
+
+    await waitFor(() => {
+      expect(document.querySelector(".topbar-title")?.textContent).toBe("d1");
+    });
+    expect(document.querySelector(".topbar-sub")?.textContent).toBe("panel wear & controls");
   });
 
   it("renders the GitHub repository link in the sidebar footer", () => {

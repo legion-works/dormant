@@ -7,7 +7,7 @@
 .wear-heat-map {
   display: grid;
   gap: 2px;
-  padding: 8px;
+  padding: 2px;
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

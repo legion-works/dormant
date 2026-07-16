@@ -20,7 +20,9 @@ use tokio::sync::oneshot;
 use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
-use crate::routes::{command, config, config_apply, doctor, events, operations, pair, wear};
+use crate::routes::{
+    command, config, config_apply, daemon, doctor, events, operations, pair, wear,
+};
 use crate::security::security_guard;
 
 /// Duration the `/api/state` handler waits for a snapshot reply before
@@ -125,6 +127,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = api
         .route("/events", get(events::ws_events))
         .route("/operations", get(operations::get_operations))
+        .route("/daemon", get(daemon::get_daemon))
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
         .route("/pair/samsung/:id", get(pair::get_pair_samsung))
@@ -612,5 +615,68 @@ mod tests {
                 "steps": []
             })
         );
+    }
+
+    // ── Daemon identity route ────────────────────────────────────────────────
+
+    /// Exercises `GET /api/daemon` through the real `build_router` (not a
+    /// bare test mount) — full production wiring: security guard,
+    /// `Host`-header requirement, no-store header, wire shape.
+    #[tokio::test]
+    async fn build_router_daemon_returns_identity_with_no_store() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
+
+        let response = build_router(state)
+            .oneshot(
+                Request::get("/api/daemon")
+                    .header(axum::http::header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["pid"], serde_json::json!(std::process::id()));
+        assert_eq!(
+            body["version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(body["started_epoch_s"].as_u64().unwrap() > 0);
+        assert!(body["socket"].as_str().unwrap().ends_with("dormant.sock"));
+    }
+
+    /// `GET /api/daemon` with a foreign `Host` header is rejected — the
+    /// security guard applies to every route, including new GET-only ones
+    /// that need no `STRICT_ORIGIN_PATHS`/`ACKNOWLEDGED_WEAK_ROUTES`
+    /// classification (that registry is POST-only; see `route_post!`).
+    #[tokio::test]
+    async fn build_router_daemon_rejects_foreign_host() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
+
+        let response = build_router(state)
+            .oneshot(
+                Request::get("/api/daemon")
+                    .header(axum::http::header::HOST, "evil.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

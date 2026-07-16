@@ -33,6 +33,8 @@ export type StatusKind =
   | "wake_retry"
   | "skip"
   | "not_supported"
+  | "blank_failed"
+  | "wear_advisory"
   | string;
 
 interface StatusChipProps {
@@ -66,9 +68,12 @@ const STATUS_CLASS_MAP: Record<string, string> = {
   paused: "amber",
   // Purple — inhibited
   inhibited: "purple",
-  // Red — fail / wake_retry
+  // Red — fail / wake_retry / blank_failed
   fail: "danger",
   wake_retry: "danger",
+  blank_failed: "danger",
+  // Amber — wear_advisory (shares the paused amber tone — both are caution states)
+  wear_advisory: "amber",
   // Neutral — skip / not_supported (doctor checks)
   skip: "muted",
   not_supported: "muted",

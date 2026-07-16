@@ -95,6 +95,18 @@ vi.mock("../api/client", () => ({ postBlank: mocks.postBlank, postWake: mocks.po
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 describe("Dashboard v2", () => {
+  // P1-B: dashboard display rows carry the full live chip set (paused,
+  // inhibited, blank-failed, wear advisory) beneath the phase pill — the
+  // fixture's wear summary for "main" has advisory: true.
+  it("shows the wear-advisory chip on the signal-flow display row", async () => {
+    render(<Dashboard />);
+
+    await waitFor(() => {
+      expect(screen.getByText("main", { selector: ".dash-display-row__id" })).toBeInTheDocument();
+    });
+    expect(screen.getByText("wear advisory")).toBeInTheDocument();
+  });
+
   it("shows a guarded quick action and v2 exposure card", async () => {
     render(<Dashboard />);
 
@@ -112,13 +124,13 @@ describe("Dashboard v2", () => {
     expect(mocks.selectDisplay).toHaveBeenCalledWith("main");
   });
 
-  it("does not post when the blank/wake confirmation is cancelled", async () => {
+  it("does not post blank when the confirmation is cancelled", async () => {
     render(<Dashboard />);
 
     // `run()`'s `if (!accepted) return;` sits behind `await confirm(...)`,
     // whose promise is resolved *synchronously* inside the Cancel button's
     // onClick (see useConfirmDialog's `finish`). That means the `.then`
-    // continuation which would call postBlank/postWake is only scheduled
+    // continuation which would call postBlank is only scheduled
     // as a microtask — it hasn't run yet immediately after `fireEvent.click`
     // returns. An `act(async () => { await Promise.resolve() x2 })` flush
     // is required before asserting "not called", otherwise a mutant that
@@ -136,12 +148,14 @@ describe("Dashboard v2", () => {
     await flush();
     expect(mocks.postBlank).not.toHaveBeenCalled();
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  // P1-F: Force wake is non-destructive — un-gated, no confirm dialog.
+  it("posts wake immediately with no confirm dialog", async () => {
+    render(<Dashboard />);
 
     fireEvent.click(screen.getByRole("button", { name: "Wake main" }));
-    expect(screen.getByRole("alertdialog", { name: "Force wake main?" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    await flush();
-    expect(mocks.postWake).not.toHaveBeenCalled();
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.postWake).toHaveBeenCalledWith("main"));
   });
 });

@@ -279,6 +279,14 @@
   color: var(--text-strong);
 }
 
+.dash-display-row__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+  padding-left: 1px;
+}
+
 .dash-display-row__meta {
   display: flex;
   align-items: center;

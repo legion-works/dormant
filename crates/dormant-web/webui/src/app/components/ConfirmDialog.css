@@ -7,6 +7,7 @@
   padding: 24px;
   background: color-mix(in oklab, var(--bg-base) 72%, transparent);
   backdrop-filter: blur(8px);
+  animation: dmFade 0.16s var(--ease);
 }
 
 .confirm-dialog {
@@ -16,6 +17,53 @@
   border-radius: var(--radius-lg);
   background: var(--bg-overlay);
   box-shadow: var(--shadow-xl);
+  animation: dmRise 0.22s var(--ease);
+}
+
+/* Tone accent border — the icon-tile color repeated as a hairline
+   border on the panel (design handoff: "matching accent border"). */
+.confirm-dialog--danger {
+  border-color: color-mix(in oklab, var(--danger) 40%, var(--border-strong));
+}
+.confirm-dialog--warm {
+  border-color: color-mix(in oklab, var(--accent-warm) 40%, var(--border-strong));
+}
+.confirm-dialog--info {
+  border-color: color-mix(in oklab, var(--accent) 40%, var(--border-strong));
+}
+
+.confirm-dialog__header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.confirm-dialog__header h2 {
+  margin: 0;
+}
+
+.confirm-dialog__icon {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  font-size: 15px;
+}
+
+.confirm-dialog__icon--danger {
+  color: var(--danger);
+  background: var(--danger-muted);
+}
+.confirm-dialog__icon--warm {
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+}
+.confirm-dialog__icon--info {
+  color: var(--accent);
+  background: var(--accent-muted);
 }
 
 .confirm-dialog__actions {
@@ -26,4 +74,39 @@
 }
 
 .confirm-dialog__confirm--default { color: var(--accent); }
-.confirm-dialog__confirm--danger { color: var(--danger); }
+
+/* Filled confirm button (P2): background = tone color, dark text —
+   design handoff: "background:<tone>; color:#0e1017; weight 600". */
+.confirm-dialog__confirm--danger,
+.confirm-dialog__confirm--warm,
+.confirm-dialog__confirm--info {
+  color: #0e1017;
+  font-weight: 600;
+  border: none;
+}
+.confirm-dialog__confirm--danger {
+  background: var(--danger);
+}
+.confirm-dialog__confirm--warm {
+  background: var(--accent-warm);
+}
+.confirm-dialog__confirm--info {
+  background: var(--accent);
+}
+
+@keyframes dmFade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes dmRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .confirm-backdrop,
+  .confirm-dialog {
+    animation: none;
+  }
+}

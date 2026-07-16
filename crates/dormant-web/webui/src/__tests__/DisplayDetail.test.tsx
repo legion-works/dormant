@@ -117,6 +117,46 @@ describe("DisplayDetail", () => {
     await waitFor(() => expect(api.postBlank).toHaveBeenCalledWith("main"));
   });
 
+  // P1-F: Force wake is non-destructive — un-gated, no confirm dialog.
+  // Mirrors Displays.test.tsx's "posts wake/resume immediately with no
+  // confirm dialog" coverage at the detail-view level.
+  it("posts wake immediately with no confirm dialog", async () => {
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={wear}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Force wake" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(api.postWake).toHaveBeenCalledWith("main"));
+  });
+
+  // P1-F: Resume is non-destructive — un-gated, no confirm dialog. Only
+  // renders when the display is paused (the unpaused branch shows Pause
+  // rule instead, already exercised by the primary render test above).
+  it("posts resume immediately with no confirm dialog when the display is paused", async () => {
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={{ ...snapshot, paused: true }}
+        config={{ controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={wear}
+        onBack={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume rule" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(api.postResume).toHaveBeenCalledWith({ rule: "office_blank" }));
+  });
+
   it("does not post when the force blank confirmation is cancelled", async () => {
     render(
       <DisplayDetail

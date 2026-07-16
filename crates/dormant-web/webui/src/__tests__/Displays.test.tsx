@@ -184,7 +184,7 @@ describe("Displays", () => {
     expect(screen.getAllByText("office-rule").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("calls postBlank/postWake/postPause/postResume with correct ids, guarded by confirmation", async () => {
+  it("calls postBlank guarded by confirmation, and postPause guarded by confirmation, with correct ids", async () => {
     render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
@@ -193,31 +193,41 @@ describe("Displays", () => {
     expect(screen.getByText("samsung-tv")).toBeInTheDocument();
 
     // First card (aoc-main): not paused → "Pause rule", "Force blank", "Force wake".
-    // Every action shares one confirm dialog, so each trigger click hides
-    // every card's action row — the dialog's own button is the sole
+    // Force blank/Pause each share one confirm dialog, so each trigger click
+    // hides every card's action row — the dialog's own button is the sole
     // remaining element with that accessible name.
     fireEvent.click(screen.getAllByText("Force blank")[0]);
     expect(screen.getByRole("alertdialog", { name: "Force blank aoc-main?" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
     await waitFor(() => expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main"));
 
-    fireEvent.click(screen.getAllByText("Force wake")[0]);
-    expect(screen.getByRole("alertdialog", { name: "Force wake aoc-main?" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Force wake" }));
-    await waitFor(() => expect(mocks.postWake).toHaveBeenCalledWith("aoc-main"));
-
     // Pause rule on first display (aoc-main → rule "office-rule")
     fireEvent.click(screen.getAllByText("Pause rule")[0]);
     expect(screen.getByRole("alertdialog", { name: "Pause office-rule?" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Pause rule" }));
     await waitFor(() => expect(mocks.postPause).toHaveBeenCalledWith({ rule: "office-rule" }));
+  });
+
+  // P1-F: Force wake and Resume are non-destructive (wake just lights the
+  // panel) — the proto's friction model leaves them un-gated. No confirm
+  // dialog should appear; the click posts immediately.
+  it("calls postWake/postResume immediately with correct ids, no confirm dialog", async () => {
+    render(<LiveStateProvider><Displays /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("aoc-main")).toBeInTheDocument();
+    });
+    expect(screen.getByText("samsung-tv")).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByText("Force wake")[0]);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.postWake).toHaveBeenCalledWith("aoc-main"));
 
     // Resume rule on the paused display (samsung-tv → rule "tv-rule")
     const resumeBtns = screen.getAllByText("Resume rule");
     expect(resumeBtns.length).toBeGreaterThanOrEqual(1);
     fireEvent.click(resumeBtns[0]);
-    expect(screen.getByRole("alertdialog", { name: "Resume tv-rule?" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Resume rule" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     await waitFor(() => expect(mocks.postResume).toHaveBeenCalledWith({ rule: "tv-rule" }));
   });
 

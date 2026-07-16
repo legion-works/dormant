@@ -90,7 +90,7 @@ export default function EmergencyWakeControl() {
       description:
         "This pauses all rules and asks every configured display to wake. Use it when normal control has failed.",
       confirmLabel: "Wake every display",
-      tone: "danger",
+      tone: "warm",
     });
     if (!accepted) return;
 

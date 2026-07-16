@@ -126,7 +126,7 @@ export default function ExerciseRunner({ display, compact = false }: ExerciseRun
       title: `Exercise ${display}?`,
       description: `Proves the control path end-to-end: blank → read → wake → read → restore. ${display} will visibly go dark and back — do not run while the panel is in use.`,
       confirmLabel: "Run exercise",
-      tone: "danger",
+      tone: "warm",
     });
     if (!accepted) return;
 

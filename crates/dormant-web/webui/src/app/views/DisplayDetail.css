@@ -130,13 +130,6 @@
   font-style: italic;
 }
 
-.display-detail__metrics {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 16px;
-}
-
 .display-detail__metric {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -157,7 +150,7 @@
 }
 
 .display-detail__tile {
-  padding: 10px 12px;
+  padding: 13px 15px;
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -173,7 +166,7 @@
 
 .display-detail__tile-value {
   font-family: var(--font-display);
-  font-size: 15px;
+  font-size: 20px;
   font-weight: 600;
   color: var(--text-strong);
   margin-top: 5px;
@@ -211,7 +204,7 @@
 
 .display-detail__id {
   font-family: var(--font-display);
-  font-size: 17px;
+  font-size: 19px;
   font-weight: 600;
   color: var(--text-strong);
 }

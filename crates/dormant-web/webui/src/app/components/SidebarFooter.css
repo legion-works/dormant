@@ -1,0 +1,99 @@
+/* SidebarFooter — stacked daemon block (P1-D): connection row, mono
+   pid/uptime/socket lines, a hairline divider, then the fleet-mark row.
+   All colors via DS tokens; no hardcoded hex/rgba. */
+
+.sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+}
+
+.sidebar-footer__conn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--danger);
+  box-shadow: 0 0 6px var(--danger);
+  flex-shrink: 0;
+}
+
+.conn-dot--live {
+  background-color: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+
+.conn-label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.sidebar-footer__daemon {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-footer__daemon-line {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.sidebar-footer__daemon-socket {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-footer__divider {
+  height: 1px;
+  background: var(--border);
+}
+
+.sidebar-footer__fleet-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-footer__fleet-label {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.footer-fleet-mark {
+  width: 14px;
+  height: 14px;
+  opacity: 0.6;
+  flex-shrink: 0;
+}
+
+.footer-github {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.footer-github:hover {
+  color: var(--text-strong);
+}

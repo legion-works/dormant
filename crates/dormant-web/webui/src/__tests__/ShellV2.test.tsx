@@ -79,6 +79,12 @@ vi.mock("../api/client", () => ({
   },
   postEmergencyWake: mocks.postEmergencyWake,
   postReload: vi.fn().mockResolvedValue(undefined),
+  getDaemon: vi.fn().mockResolvedValue({
+    pid: 48213,
+    started_epoch_s: Math.floor(Date.now() / 1000) - 6 * 3600,
+    version: "0.2.0",
+    socket: "/tmp/dormant.sock",
+  }),
 }));
 vi.mock("../app/views/Dashboard", () => ({ default: () => <div>dashboard view</div> }));
 vi.mock("../app/views/Displays", () => ({ default: () => <div>displays view</div> }));

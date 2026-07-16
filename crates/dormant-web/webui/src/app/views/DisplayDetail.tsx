@@ -93,20 +93,15 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
     }
   }, [confirm, id]);
 
+  // Force wake is non-destructive — un-gated per P1-F.
   const handleWake = useCallback(async () => {
-    const accepted = await confirm({
-      title: `Force wake ${id}?`,
-      description: `Immediately wakes ${id}, bypassing the normal presence rules.`,
-      confirmLabel: "Force wake",
-    });
-    if (!accepted) return;
     setActionError(null);
     try {
       await postWake(id);
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : "Force wake failed");
     }
-  }, [confirm, id]);
+  }, [id]);
 
   const handlePause = useCallback(async () => {
     if (!ruleName) return;
@@ -124,21 +119,16 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
     }
   }, [confirm, ruleName]);
 
+  // Resume is non-destructive — un-gated per P1-F.
   const handleResume = useCallback(async () => {
     if (!ruleName) return;
-    const accepted = await confirm({
-      title: `Resume ${ruleName}?`,
-      description: `Resumes rule "${ruleName}" immediately.`,
-      confirmLabel: "Resume rule",
-    });
-    if (!accepted) return;
     setActionError(null);
     try {
       await postResume({ rule: ruleName });
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : "Resume rule failed");
     }
-  }, [confirm, ruleName]);
+  }, [ruleName]);
 
   const averagePercent = grid.averageHeat !== null ? Math.round(grid.averageHeat * 100) : null;
   const uniformityPercent = grid.uniformity !== null ? Math.round(grid.uniformity * 100) : null;

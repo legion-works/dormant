@@ -234,20 +234,17 @@ export default function Displays() {
     }
   }, [confirm, clearActionError]);
 
+  // Force wake is non-destructive — it just lights the panel — so it is
+  // un-gated per the proto's friction model (P1-F); Force blank keeps its
+  // confirm because it can strand the panel dark.
   const handleWake = useCallback(async (id: string) => {
-    const accepted = await confirm({
-      title: `Force wake ${id}?`,
-      description: `Immediately wakes ${id}, bypassing the normal presence rules.`,
-      confirmLabel: "Force wake",
-    });
-    if (!accepted) return;
     clearActionError(id);
     try {
       await postWake(id);
     } catch (err: unknown) {
       setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Force wake failed" }));
     }
-  }, [confirm, clearActionError]);
+  }, [clearActionError]);
 
   const handlePause = useCallback(async (id: string, rule: string) => {
     const accepted = await confirm({
@@ -264,20 +261,15 @@ export default function Displays() {
     }
   }, [confirm, clearActionError]);
 
+  // Resume is non-destructive — un-gated per P1-F, same rationale as wake.
   const handleResume = useCallback(async (id: string, rule: string) => {
-    const accepted = await confirm({
-      title: `Resume ${rule}?`,
-      description: `Resumes rule "${rule}" immediately.`,
-      confirmLabel: "Resume rule",
-    });
-    if (!accepted) return;
     clearActionError(id);
     try {
       await postResume({ rule });
     } catch (err: unknown) {
       setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Resume rule failed" }));
     }
-  }, [confirm, clearActionError]);
+  }, [clearActionError]);
 
   if (loading) {
     return <div className="displays-loading">Loading daemon state…</div>;

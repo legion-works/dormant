@@ -50,9 +50,26 @@
   background: color-mix(in oklab, var(--danger) 26%, transparent);
 }
 
+/* Rollback (P2): amber, not red — the proto reserves red for the
+   FAILURE banner (something is broken now); rollback means "you're safe
+   on last-known-good", which is attention, not alarm. */
 .global-banner--rollback {
-  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
-  background: color-mix(in oklab, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in oklab, var(--accent-warm) 42%, transparent);
+  background: color-mix(in oklab, var(--accent-warm) 10%, transparent);
+}
+
+.global-banner--rollback .global-banner__title {
+  color: color-mix(in oklab, var(--accent-warm) 70%, var(--text-strong));
+}
+
+.global-banner--rollback .global-banner__action {
+  border-color: color-mix(in oklab, var(--accent-warm) 40%, transparent);
+  background: var(--accent-warm-muted);
+  color: var(--accent-warm);
+}
+
+.global-banner--rollback .global-banner__action:hover {
+  background: color-mix(in oklab, var(--accent-warm) 26%, transparent);
 }
 
 .rollback-banner__fingerprints {
@@ -90,14 +107,14 @@
   font-weight: 600;
   padding: 6px 12px;
   border-radius: var(--radius-sm);
-  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
-  background: var(--danger-muted);
-  color: var(--danger);
+  border: 1px solid color-mix(in oklab, var(--accent-warm) 40%, transparent);
+  background: var(--accent-warm-muted);
+  color: var(--accent-warm);
   transition: background-color var(--dur-fast) var(--ease);
 }
 
 .emergency-wake__button:hover:not(:disabled) {
-  background: color-mix(in oklab, var(--danger) 26%, transparent);
+  background: color-mix(in oklab, var(--accent-warm) 26%, transparent);
 }
 
 .emergency-wake__button:disabled {

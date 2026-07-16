@@ -11,6 +11,9 @@ members = [
   "crates/dormant-web",
   "crates/dormant-tray",
 ]
+# vendor/ddc-macos is a vendored, patched fork (see vendor/ddc-macos/README.dormant.md) pinned
+# via [patch.crates-io] below. It has its own package metadata and is not a workspace member.
+exclude = ["vendor/ddc-macos"]
 
 [workspace.package]
 version = "0.2.0"
@@ -57,3 +60,8 @@ rand = "0.8"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Retry-safe, raw-VCP ddc-macos fork. See vendor/ddc-macos/README.dormant.md for the upstream
+# commit and the rationale (haimgel/ddc-macos-rs#8).
+[patch.crates-io]
+ddc-macos = { path = "vendor/ddc-macos" }

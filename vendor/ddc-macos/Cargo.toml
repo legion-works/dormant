@@ -1,0 +1,37 @@
+[package]
+name = "ddc-macos"
+version = "0.2.2"
+authors = ["Haim Gelfenbeyn <haim@g8n.me>"]
+description = "DDC/CI monitor control on MacOS"
+documentation = "https://haimgel.github.io/ddc-macos-rs/ddc_macos"
+readme = "README.md"
+repository = "https://github.com/haimgel/ddc-macos-rs"
+license = "MIT"
+keywords = ["ddc", "mccs", "vcp", "vesa", "macos"]
+categories = ["hardware-support", "os::macos-apis"]
+edition = "2021"
+
+[dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+core-graphics = "0.24"
+# ddc must stay on "0.2" till ddc-hi is also updated
+ddc = "0.2"
+io-kit-sys = "0.4"
+# Used to dlopen/dlsym CoreDisplay's private IOAVService* symbols at runtime instead of
+# hard-linking them. See README.dormant.md.
+libc = "0.2"
+mach2 = "0.4"
+thiserror = "1.0"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+# Dormant patch metadata. This crate is vendored and patched from upstream; see
+# README.dormant.md for the upstream commit, the tracking issue that motivated the patch, and
+# the m1ddc reference commit the ARM transaction shape was ported from.
+[package.metadata.dormant]
+patched = true
+upstream-repository = "https://github.com/haimgel/ddc-macos-rs"
+upstream-commit = "232c942fecb89a88cf19c854f12307722aae5318"
+notes = "README.dormant.md"

@@ -117,6 +117,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "pairing_enabled",
             "pair_timeout",
             "doctor_wake_settle",
+            "macos_idle_frozen_polls",
+            "macos_idle_sanity_cap",
+            "macos_idle_startup_grace",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────
@@ -638,8 +641,12 @@ fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
     }
 }
 
-/// Validate the `[daemon]` section: `pair_timeout` and
-/// `doctor_wake_settle` bounds.
+/// Validate the `[daemon]` section: `pair_timeout`, `doctor_wake_settle`,
+/// and the macOS idle-source (`macos_idle_*`) bounds. The macOS fields are
+/// validated unconditionally (not gated on `idle_source == "macos"`) — a
+/// bogus value sitting dormant in the config until the operator flips
+/// `idle_source` would surface as a startup failure at the worst possible
+/// time; validating always catches it at `config-validate` time instead.
 fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let daemon = &cfg.daemon;
 
@@ -664,6 +671,30 @@ fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 "daemon.doctor_wake_settle {:?} is out of range — allowed: 100ms..=30s",
                 daemon.doctor_wake_settle
             ),
+        });
+    }
+
+    if daemon.macos_idle_frozen_polls < 2 {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "daemon.macos_idle_frozen_polls {} is below the minimum of 2",
+                daemon.macos_idle_frozen_polls
+            ),
+        });
+    }
+
+    if daemon.macos_idle_sanity_cap.is_zero() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "daemon.macos_idle_sanity_cap must be > 0".into(),
+        });
+    }
+
+    if daemon.macos_idle_startup_grace.is_zero() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "daemon.macos_idle_startup_grace must be > 0".into(),
         });
     }
 }
@@ -5234,5 +5265,122 @@ availability_payload_offline = "down"
         );
         let (cfg, _warnings) = result.unwrap();
         assert_eq!(cfg.daemon.doctor_wake_settle, Duration::from_secs(5));
+    }
+
+    // ── Task 5: daemon.macos_idle_frozen_polls / macos_idle_sanity_cap /
+    //    macos_idle_startup_grace ──────────────────────────────────────────
+
+    #[test]
+    fn macos_idle_frozen_polls_floor_1_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_frozen_polls = 1\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("macos_idle_frozen_polls")),
+            "macos_idle_frozen_polls below the floor of 2 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_frozen_polls_floor_2_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_frozen_polls = 2\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("macos_idle_frozen_polls")),
+            "macos_idle_frozen_polls = 2 (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_sanity_cap_zero_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_sanity_cap = \"0s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("macos_idle_sanity_cap")),
+            "macos_idle_sanity_cap = 0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_sanity_cap_positive_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_sanity_cap = \"1s\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("macos_idle_sanity_cap")),
+            "macos_idle_sanity_cap > 0 must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_startup_grace_zero_rejected() {
+        let errors =
+            validate_str("config_version = 1\n[daemon]\nmacos_idle_startup_grace = \"0s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("macos_idle_startup_grace")),
+            "macos_idle_startup_grace = 0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_startup_grace_positive_accepted() {
+        let errors =
+            validate_str("config_version = 1\n[daemon]\nmacos_idle_startup_grace = \"1s\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("macos_idle_startup_grace")),
+            "macos_idle_startup_grace > 0 must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_keys_accepted_in_strict_mode_and_known_keys() {
+        let result = load_str_strict(
+            "config_version = 1\n\
+             [daemon]\n\
+             idle_source = \"macos\"\n\
+             macos_idle_frozen_polls = 4\n\
+             macos_idle_sanity_cap = \"12h\"\n\
+             macos_idle_startup_grace = \"5s\"\n",
+        );
+        assert!(
+            result.is_ok(),
+            "the three macos_idle_* keys must be in KNOWN_KEYS, got: {:?}",
+            result.err()
+        );
+        let (cfg, _warnings) = result.unwrap();
+        assert_eq!(cfg.daemon.macos_idle_frozen_polls, 4);
+        assert_eq!(
+            cfg.daemon.macos_idle_sanity_cap,
+            Duration::from_secs(12 * 60 * 60)
+        );
+        assert_eq!(cfg.daemon.macos_idle_startup_grace, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn macos_idle_defaults_pass_validation() {
+        // The shipped defaults (3 polls / 24h / 15s) must themselves be
+        // valid — a default that fails its own validator would brick every
+        // config that doesn't touch these keys.
+        let errors = validate_str("config_version = 1\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("macos_idle")),
+            "the macos_idle_* defaults must pass validation, got: {:?}",
+            errors
+        );
     }
 }

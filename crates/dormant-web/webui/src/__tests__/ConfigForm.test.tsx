@@ -809,11 +809,11 @@ describe("Config tab-switch guard", () => {
     const ituOptions = Array.from(ituSelect.options).map((o) => o.value);
     expect(ituOptions).toEqual(["auto", "ms", "s"]);
 
-    // idle_source — must render as a select with auto/wayland/dbus options
+    // idle_source — must render as a select with auto/wayland/dbus/macos options
     const isSelect = screen.getByLabelText("idle_source") as HTMLSelectElement;
     expect(isSelect.tagName).toBe("SELECT");
     const isOptions = Array.from(isSelect.options).map((o) => o.value);
-    expect(isOptions).toEqual(["auto", "wayland", "dbus"]);
+    expect(isOptions).toEqual(["auto", "wayland", "dbus", "macos"]);
 
     // stale_sensor_timeout — must render as a duration input
     const staleInput = screen.getByLabelText("stale_sensor_timeout") as HTMLInputElement;

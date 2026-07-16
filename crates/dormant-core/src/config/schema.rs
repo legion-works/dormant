@@ -168,6 +168,26 @@ pub struct DaemonConfig {
     /// read (`dormantctl doctor --exercise`). Validated to `100ms..=30s`.
     #[serde(default = "default_doctor_wake_settle", with = "humantime_serde")]
     pub doctor_wake_settle: Duration,
+
+    /// macOS `CoreGraphics` idle source: number of consecutive
+    /// identical-looking polls before a reading is treated as "frozen"
+    /// rather than genuine sustained idleness. Only consulted when
+    /// `idle_source = "macos"`. Validated to `>= 2`.
+    #[serde(default = "default_macos_idle_frozen_polls")]
+    pub macos_idle_frozen_polls: u32,
+
+    /// macOS `CoreGraphics` idle source: upper sanity bound on a single
+    /// idle-time reading — readings above this are treated as bogus rather
+    /// than genuine idle duration. Only consulted when
+    /// `idle_source = "macos"`. Validated to `> 0`.
+    #[serde(default = "default_macos_idle_sanity_cap", with = "humantime_serde")]
+    pub macos_idle_sanity_cap: Duration,
+
+    /// macOS `CoreGraphics` idle source: grace window after daemon startup
+    /// before idle readings are trusted. Only consulted when
+    /// `idle_source = "macos"`. Validated to `> 0`.
+    #[serde(default = "default_macos_idle_startup_grace", with = "humantime_serde")]
+    pub macos_idle_startup_grace: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -187,6 +207,9 @@ impl Default for DaemonConfig {
             pairing_enabled: defaults::PAIRING_ENABLED,
             pair_timeout: defaults::PAIR_TIMEOUT,
             doctor_wake_settle: defaults::DOCTOR_WAKE_SETTLE,
+            macos_idle_frozen_polls: defaults::MACOS_IDLE_FROZEN_POLLS,
+            macos_idle_sanity_cap: defaults::MACOS_IDLE_SANITY_CAP,
+            macos_idle_startup_grace: defaults::MACOS_IDLE_STARTUP_GRACE,
         }
     }
 }
@@ -217,6 +240,11 @@ pub enum IdleTimeUnit {
 /// * `Wayland` — force the Wayland idle notifier; the daemon will error at
 ///   startup if the compositor does not expose the protocol.
 /// * `Dbus` — always use the `DBus` screensaver poll.
+/// * `Macos` — use the macOS `CoreGraphics` idle-time source (see
+///   [`super::defaults::MACOS_IDLE_FROZEN_POLLS`] and friends for the
+///   accompanying `[daemon]` tunables). Additive: selecting this on a
+///   non-macOS build is a config error at the wiring layer, not here — this
+///   enum only describes what the TOML key accepts.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleSource {
@@ -228,6 +256,8 @@ pub enum IdleSource {
     /// Force `DBus` screensaver poll.
     #[serde(rename = "dbus")]
     Dbus,
+    /// Force the macOS `CoreGraphics` idle-time source.
+    Macos,
 }
 
 // ── WearConfig ──────────────────────────────────────────────────────────────────
@@ -1168,6 +1198,15 @@ fn default_pair_timeout() -> Duration {
 fn default_doctor_wake_settle() -> Duration {
     defaults::DOCTOR_WAKE_SETTLE
 }
+fn default_macos_idle_frozen_polls() -> u32 {
+    defaults::MACOS_IDLE_FROZEN_POLLS
+}
+fn default_macos_idle_sanity_cap() -> Duration {
+    defaults::MACOS_IDLE_SANITY_CAP
+}
+fn default_macos_idle_startup_grace() -> Duration {
+    defaults::MACOS_IDLE_STARTUP_GRACE
+}
 fn default_trigger() -> String {
     defaults::SCREENSAVER_TRIGGER.into()
 }
@@ -1829,5 +1868,42 @@ availability_payload_offline = "down"
         );
         assert_eq!(m.availability_payload_online, "up");
         assert_eq!(m.availability_payload_offline, "down");
+    }
+
+    // ── Task 5: macOS idle config additive surface ──────────────────────────
+
+    #[test]
+    fn macos_idle_config_is_additive_and_has_documented_defaults() {
+        let toml_str = r#"
+config_version = 1
+[daemon]
+idle_source = "macos"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.daemon.idle_source, IdleSource::Macos);
+        assert_eq!(cfg.daemon.macos_idle_frozen_polls, 3);
+        assert_eq!(
+            cfg.daemon.macos_idle_sanity_cap,
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(
+            cfg.daemon.macos_idle_startup_grace,
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn macos_idle_config_defaults_when_daemon_absent() {
+        let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
+        assert_eq!(cfg.daemon.idle_source, IdleSource::Auto);
+        assert_eq!(cfg.daemon.macos_idle_frozen_polls, 3);
+        assert_eq!(
+            cfg.daemon.macos_idle_sanity_cap,
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(
+            cfg.daemon.macos_idle_startup_grace,
+            std::time::Duration::from_secs(15)
+        );
     }
 }

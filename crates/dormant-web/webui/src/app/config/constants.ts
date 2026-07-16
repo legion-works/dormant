@@ -11,7 +11,7 @@ export const UNAVAILABLE_POLICIES = ["present", "absent"] as const;
 export const IDLE_TIME_UNITS = ["auto", "ms", "s"] as const;
 
 /** daemon.idle_source options. */
-export const IDLE_SOURCES = ["auto", "wayland", "dbus"] as const;
+export const IDLE_SOURCES = ["auto", "wayland", "dbus", "macos"] as const;
 
 /** displays.*.panel_type options. rust: wear.rs PanelType, kebab-case. */
 export const PANEL_TYPES = ["woled", "qd-oled", "unknown"] as const;

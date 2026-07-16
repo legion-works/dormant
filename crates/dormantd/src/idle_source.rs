@@ -800,6 +800,18 @@ pub fn create_source(
             dormant_core::config::IdleSource::Dbus
         }
         dormant_core::config::IdleSource::Dbus => dormant_core::config::IdleSource::Dbus,
+        // The CoreGraphics-backed macOS idle source itself lands in a later
+        // task (see Task 9 in the M1 macOS port plan); for now the config
+        // key is accepted (additive schema) but degrades to Dbus at
+        // selection time rather than failing to compile or panicking.
+        dormant_core::config::IdleSource::Macos => {
+            tracing::warn!(
+                event = "macos_idle_not_yet_wired",
+                "macos idle source selected but the CoreGraphics backend is not yet \
+                 implemented; falling back to dbus",
+            );
+            dormant_core::config::IdleSource::Dbus
+        }
     };
 
     match effective {

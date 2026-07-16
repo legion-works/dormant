@@ -224,3 +224,25 @@ pub const AUDIO_CALL_ROLES: &[&str] = &["Communication"];
 /// Default `pw-dump` invocation (resolved via `$PATH`); override via
 /// `[audio].pw_dump_command` — the test/override seam.
 pub const AUDIO_PW_DUMP_COMMAND: &str = "pw-dump";
+
+// ── macOS idle-source defaults (additive; consumed by the CoreGraphics idle
+// source landing in a later task — see [`super::schema::IdleSource::Macos`]) ──
+
+/// Number of consecutive identical-looking idle polls before the macOS idle
+/// source treats the reading as "frozen" (a stuck/non-updating
+/// `CGEventSourceSecondsSinceLastEventType` read) rather than genuine
+/// sustained idleness. Validated to `>= 2` — a threshold of 1 would flag the
+/// very first poll as frozen, which is never a meaningful signal.
+pub const MACOS_IDLE_FROZEN_POLLS: u32 = 3;
+
+/// Upper sanity bound on a single macOS idle-time reading. Readings above
+/// this are treated as bogus (clock jump, sleep/wake artifact) rather than
+/// genuine idle duration — 24h comfortably exceeds any real interactive
+/// idle window while still catching runaway/garbage values.
+pub const MACOS_IDLE_SANITY_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Grace window after daemon startup before the macOS idle source's readings
+/// are trusted — mirrors [`STARTUP_HOLDOFF`]'s rationale but scoped to idle
+/// detection specifically, since `CGEventSource` idle counters can report
+/// stale/pre-launch values immediately after process start.
+pub const MACOS_IDLE_STARTUP_GRACE: Duration = Duration::from_secs(15);

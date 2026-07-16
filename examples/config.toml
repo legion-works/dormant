@@ -92,6 +92,16 @@ stale_sensor_timeout = "5m"
 log_level = "info"
 socket_path = "/run/user/1000/dormant.sock"
 
+# idle_source: "auto" (default) | "wayland" | "dbus" | "macos"
+# "macos" selects the CoreGraphics idle-time source (macOS builds only —
+# see the macos_idle_* keys below, which tune that source's noise handling).
+# idle_source = "auto"
+#
+# macos_idle_frozen_polls = 3    # consecutive identical-looking polls before a reading is
+#                                 # treated as "frozen" rather than genuine idleness (>= 2)
+# macos_idle_sanity_cap = "24h"  # readings above this are treated as bogus, not real idle time (> 0)
+# macos_idle_startup_grace = "15s"  # readings are untrusted for this long after daemon startup (> 0)
+
 # ── Web UI config editor: entity CRUD + the Samsung pairing wizard ─────────
 #
 # Only relevant when the web UI is enabled (daemon.web_port set, see

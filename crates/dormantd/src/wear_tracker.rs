@@ -892,6 +892,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         }
     }
 

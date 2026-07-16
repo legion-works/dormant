@@ -7,23 +7,42 @@ import Doctor from "./views/Doctor";
 import { LiveStateProvider } from "./state";
 import { useLiveState } from "./hooks/useLiveState";
 import { postReload } from "../api/client";
+import { navItems, navBadgeText, type ViewId } from "./nav";
+import RollbackBanner from "./components/RollbackBanner";
+import FailureBanner from "./components/FailureBanner";
+import EmergencyWakeControl from "./components/EmergencyWakeControl";
 import "./Shell.css";
 
-const VIEWS = {
-  dashboard: { label: "Dashboard", icon: "▦", Component: Dashboard },
-  displays: { label: "Displays", icon: "▤", Component: Displays },
-  events: { label: "Events", icon: "≣", Component: Events, badge: "live" },
-  config: { label: "Config", icon: "{ }", Component: Config },
-  doctor: { label: "Doctor", icon: "✚", Component: Doctor },
-} as const;
+const VIEW_COMPONENTS: Record<ViewId, React.ComponentType> = {
+  dashboard: Dashboard,
+  displays: Displays,
+  events: Events,
+  config: Config,
+  doctor: Doctor,
+};
 
-type ViewKey = keyof typeof VIEWS;
+const VIEW_LABELS: Record<ViewId, string> = {
+  dashboard: "Dashboard",
+  displays: "Displays",
+  events: "Events",
+  config: "Config",
+  doctor: "Doctor",
+};
 
-const VIEW_KEYS = Object.keys(VIEWS) as ViewKey[];
+/** Topbar subtitle per view — a one-line reminder of what the view covers. */
+const VIEW_SUBTITLES: Record<ViewId, string> = {
+  dashboard: "live presence-to-display state",
+  displays: "per-display control & controller chains",
+  events: "daemon event stream",
+  config: "settings form, entity CRUD & validation",
+  doctor: "environment & integration diagnostics",
+};
 
-function getViewFromHash(): ViewKey {
+const VIEW_IDS = Object.keys(VIEW_COMPONENTS) as ViewId[];
+
+function getViewFromHash(): ViewId {
   const hash = window.location.hash.replace(/^#\/?/, "");
-  return hash in VIEWS ? (hash as ViewKey) : "dashboard";
+  return (VIEW_IDS as string[]).includes(hash) ? (hash as ViewId) : "dashboard";
 }
 
 function formatClock(): string {
@@ -43,9 +62,9 @@ export default function Shell() {
 }
 
 function ShellInner() {
-  const [activeView, setActiveView] = useState<ViewKey>(getViewFromHash);
+  const [activeView, setActiveView] = useState<ViewId>(getViewFromHash);
   const [clock, setClock] = useState(formatClock);
-  const { connected, snapshot } = useLiveState();
+  const { connected, snapshot, config, pollWarning, doctorReport, selectDisplay } = useLiveState();
 
   useEffect(() => {
     const onHashChange = () => setActiveView(getViewFromHash());
@@ -58,7 +77,7 @@ function ShellInner() {
     return () => clearInterval(id);
   }, []);
 
-  const navigate = useCallback((key: ViewKey) => {
+  const navigate = useCallback((key: ViewId) => {
     setActiveView(key);
     window.location.hash = `#/${key}`;
   }, []);
@@ -72,15 +91,38 @@ function ShellInner() {
     }
   }, []);
 
-  const displaysBadge = snapshot ? String(snapshot.displays.length) : undefined;
+  const handleInspect = useCallback((display: string) => {
+    selectDisplay(display);
+    navigate("displays");
+  }, [selectDisplay, navigate]);
 
-  const ActiveComponent = VIEWS[activeView].Component;
+  const handleReviewConfig = useCallback(() => {
+    navigate("config");
+  }, [navigate]);
+
+  const rollbackActive = snapshot?.rollback != null;
+  const doctorFailures = doctorReport?.checks.filter((c) => c.status === "fail").length ?? 0;
+
+  const items = navItems({
+    displayCount: snapshot ? snapshot.displays.length : 0,
+    eventsLive: connected,
+    rollbackActive,
+    doctorFailures,
+  });
+
+  // Generic pending-reload banner only surfaces when there's no rollback
+  // banner already explaining the same underlying event (a rollback
+  // *is* the outcome of a rejected reload) — showing both would be
+  // redundant noise for the same fact.
+  const showPendingReloadBanner = Boolean(snapshot?.pending_reload) && !rollbackActive;
+
+  const ActiveComponent = VIEW_COMPONENTS[activeView];
 
   return (
     <div className="shell lw-aurora lw-aurora--drift" data-theme="default">
       <aside className="sidebar">
         <div className="sidebar-brand">
-          <span className="brand-mark" aria-hidden="true">☽</span>
+          <img src="/mark.svg" alt="" aria-hidden="true" className="brand-mark" />
           <div>
             <div className="brand-wordmark">dormant</div>
             <div className="brand-sub">{`v${__DORMANT_VERSION__}`}</div>
@@ -88,26 +130,28 @@ function ShellInner() {
         </div>
 
         <nav className="sidebar-nav">
-          {VIEW_KEYS.map((key) => {
-            const v = VIEWS[key];
-            // Dynamic badge: Displays shows the live display count; Events keeps its "live" marker.
-            const badge = key === "displays" ? displaysBadge : ("badge" in v && v.badge != null ? v.badge : undefined);
-            return (
-              <button
-                key={key}
-                className={`nav-item${key === activeView ? " nav-item--active" : ""}`}
-                onClick={() => navigate(key)}
-              >
-                <span className="nav-icon">{v.icon}</span>
-                <span className="nav-label">{v.label}</span>
-                {badge != null && (
-                  <span className={`nav-badge${badge === "live" ? " nav-badge--live" : ""}`}>
-                    {badge}
+          {items.map((item) => (
+            <a
+              key={item.id}
+              href={`#/${item.id}`}
+              className={`nav-item${item.id === activeView ? " nav-item--active" : ""}`}
+              onClick={(event) => {
+                event.preventDefault();
+                navigate(item.id);
+              }}
+            >
+              <span className="nav-icon" aria-hidden="true">{item.icon}</span>
+              <span className="nav-label">{VIEW_LABELS[item.id]}</span>
+              {item.badge && (
+                <>
+                  {" "}
+                  <span className={`nav-badge nav-badge--${item.badge.kind}`}>
+                    {navBadgeText(item.badge)}
                   </span>
-                )}
-              </button>
-            );
-          })}
+                </>
+              )}
+            </a>
+          ))}
         </nav>
 
         <div className="sidebar-footer">
@@ -115,6 +159,7 @@ function ShellInner() {
           <span className="conn-label">
             {connected ? "dormantd running" : "connecting…"}
           </span>
+          <img src="/legion-mark.svg" alt="" aria-hidden="true" className="footer-fleet-mark" />
           <a
             href="https://github.com/legion-works/dormant"
             target="_blank"
@@ -139,14 +184,22 @@ function ShellInner() {
       <main className="main">
         <header className="topbar">
           <div className="topbar-left">
-            <h1 className="topbar-title">{VIEWS[activeView].label}</h1>
-            <span className="topbar-sub">dormant web dashboard</span>
+            <div className="topbar-heading">
+              <h1 className="topbar-title">{VIEW_LABELS[activeView]}</h1>
+              <span className="topbar-sub">{VIEW_SUBTITLES[activeView]}</span>
+            </div>
           </div>
           <div className="topbar-right">
+            {config && (
+              <span className="topbar-pill topbar-config-path" title={config.path}>
+                {config.path}
+              </span>
+            )}
             <span className="topbar-pill topbar-clock">
               <span className="clock-dot" />
               {clock}
             </span>
+            <EmergencyWakeControl />
             <button className="topbar-pill topbar-reload" onClick={handleReload}>
               <span aria-hidden="true">↻</span> Reload
             </button>
@@ -154,6 +207,18 @@ function ShellInner() {
         </header>
 
         <div className="content">
+          <RollbackBanner onReviewConfig={handleReviewConfig} />
+          <FailureBanner onInspect={handleInspect} />
+          {pollWarning && (
+            <div className="global-banner global-banner--poll" role="alert">
+              Live refresh delayed; showing the last snapshot — {pollWarning}
+            </div>
+          )}
+          {showPendingReloadBanner && (
+            <div className="global-banner global-banner--pending" role="status">
+              Config reload pending — {snapshot?.pending_reload}
+            </div>
+          )}
           <ActiveComponent />
         </div>
       </main>

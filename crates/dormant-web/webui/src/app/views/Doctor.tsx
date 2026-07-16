@@ -1,7 +1,29 @@
+/**
+ * Doctor view — diagnostics runner plus the control-path exercise
+ * launcher for a chosen display.
+ *
+ * The doctor report is provider-owned (`useLiveState().doctorReport` /
+ * `setDoctorReport`) rather than local `useState` so it survives view
+ * navigation the same way the rest of live state does; only the
+ * request-in-flight/error bookkeeping for the *current* run stays local.
+ *
+ * Four summary tiles: passing/warnings/skipped/failing. The real wire
+ * `CheckStatus` (crates/dormant-core/src/doctor.rs) is only
+ * `"ok" | "fail" | "skip" | "not_supported"` — there is no `"warn"`
+ * variant today. `not_supported` folds into "skipped" (a probe that
+ * couldn't run is not a failure). "warnings" is computed as
+ * `total - passing - skipped - failing` rather than a literal `"warn"`
+ * comparison: comparing `CheckStatus` (a closed union) against a string
+ * outside that union is a TypeScript error (no overlap), and inventing a
+ * status the backend never sends would be dishonest. The subtraction
+ * keeps the tile forward-compatible with a future real "warn" status
+ * without lying about today's wire shape.
+ */
 import { useState, useCallback, useRef } from "react";
 import { runDoctor } from "../../api/client";
-import type { DoctorReport, CheckStatus } from "../../api/types";
-import { Card, StatusChip } from "../components";
+import type { CheckStatus } from "../../api/types";
+import { Card, StatusChip, ExerciseRunner } from "../components";
+import { useLiveState } from "../hooks/useLiveState";
 import "./Doctor.css";
 
 interface CheckIcon {
@@ -46,10 +68,14 @@ function checkIcon(status: CheckStatus): CheckIcon {
 }
 
 export default function Doctor() {
-  const [report, setReport] = useState<DoctorReport | null>(null);
+  const { snapshot, doctorReport, setDoctorReport } = useLiveState();
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const runningRef = useRef(false);
+  const displayIds = snapshot?.displays.map(([id]) => id) ?? [];
+  const [selectedDisplay, setSelectedDisplay] = useState<string | null>(null);
+  const effectiveDisplay =
+    selectedDisplay && displayIds.includes(selectedDisplay) ? selectedDisplay : (displayIds[0] ?? null);
 
   const handleRun = useCallback(async () => {
     if (runningRef.current) return;
@@ -58,22 +84,25 @@ export default function Doctor() {
     setError(null);
     try {
       const r = await runDoctor();
-      setReport(r);
+      setDoctorReport(r);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Doctor runner failed");
-      setReport(null);
+      setDoctorReport(null);
     } finally {
       setRunning(false);
       runningRef.current = false;
     }
-  }, []);
+  }, [setDoctorReport]);
 
-  const passing = report ? report.checks.filter((c) => c.status === "ok").length : 0;
-  const failing = report ? report.checks.filter((c) => c.status === "fail").length : 0;
-  const skipped = report ? report.checks.filter((c) => c.status === "skip" || c.status === "not_supported").length : 0;
+  const checks = doctorReport?.checks ?? [];
+  const passing = checks.filter((c) => c.status === "ok").length;
+  const failing = checks.filter((c) => c.status === "fail").length;
+  const skipped = checks.filter((c) => c.status === "skip" || c.status === "not_supported").length;
+  const warnings = checks.length - passing - skipped - failing;
 
   const summaryCards = [
     { label: "Passing", count: passing, color: "var(--success)" },
+    { label: "Warnings", count: warnings, color: "var(--warning)" },
     { label: "Skipped", count: skipped, color: "var(--text-muted)" },
     { label: "Failing", count: failing, color: "var(--danger)" },
   ];
@@ -86,19 +115,19 @@ export default function Doctor() {
           onClick={handleRun}
           disabled={running}
         >
-          {running ? "Running…" : report ? "⟳ Run again" : "▶ Run doctor"}
+          {running ? "Running…" : doctorReport ? "Run again" : "Run doctor"}
         </button>
       </div>
 
       {error && <div className="doctor-error">Error: {error}</div>}
 
-      {!report && !running && !error && (
+      {!doctorReport && !running && !error && (
         <div className="doctor-empty">
           Run diagnostics to check daemon environment and integration health.
         </div>
       )}
 
-      {report && (
+      {doctorReport && (
         <>
           <div className="doctor-summary">
             {summaryCards.map((s) => (
@@ -114,7 +143,7 @@ export default function Doctor() {
           </div>
 
           <Card opaque>
-            {report.checks.map((c, i) => {
+            {doctorReport.checks.map((c, i) => {
               const icon = checkIcon(c.status);
               return (
                 <div key={`${c.name}-${i}`} className="doctor-check-row">
@@ -136,6 +165,29 @@ export default function Doctor() {
             })}
           </Card>
         </>
+      )}
+
+      {displayIds.length > 0 && effectiveDisplay && (
+        <Card className="doctor-exercise-card" opaque>
+          <div className="doctor-exercise-card__picker">
+            <label className="doctor-exercise-card__label" htmlFor="doctor-exercise-display">
+              Exercise display
+            </label>
+            <select
+              id="doctor-exercise-display"
+              className="doctor-exercise-card__select"
+              value={effectiveDisplay}
+              onChange={(e) => setSelectedDisplay(e.target.value)}
+            >
+              {displayIds.map((id) => (
+                <option key={id} value={id}>
+                  {id}
+                </option>
+              ))}
+            </select>
+          </div>
+          <ExerciseRunner display={effectiveDisplay} />
+        </Card>
       )}
     </div>
   );

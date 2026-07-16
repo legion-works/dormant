@@ -125,6 +125,87 @@ export interface DisplaySnapshot {
   stage?: { idx: number; kind: StageKind } | null;
 }
 
+/** rust: rules.rs RollbackStatus */
+export interface RollbackStatus {
+  failed_fp: string;
+  lkg_fp: string;
+  detail: string;
+}
+
+/**
+ * rust: rules.rs EmergencyWakeResult
+ * serde: `error` is `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+ */
+export interface EmergencyWakeResult {
+  display: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * rust: rules.rs EmergencyWakeReport — response body of
+ * `POST /api/emergency-wake`.
+ * serde: field names match exactly (no rename).
+ */
+export interface EmergencyWakeReport {
+  paused: boolean;
+  displays: EmergencyWakeResult[];
+}
+
+/**
+ * rust: traits.rs PowerState, serde(rename_all = "snake_case")
+ * Only two variants exist on the wire — there is no "off" state.
+ */
+export type PowerState = "on" | "standby";
+
+/**
+ * rust: traits.rs PanelState
+ * serde: both fields are `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+ */
+export interface PanelState {
+  power?: PowerState;
+  brightness?: number;
+}
+
+/** rust: rules.rs ExerciseVerdict, serde(rename_all = "snake_case") */
+export type ExerciseVerdict = "confirmed" | "unconfirmable" | "failed";
+
+/**
+ * rust: rules.rs ExerciseStep
+ * serde: `blank_mode`/`state_before`/`state_after`/`error` are
+ * `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+ */
+export interface ExerciseStep {
+  command: string;
+  blank_mode?: BlankMode;
+  returned_ok: boolean;
+  state_before?: PanelState;
+  state_after?: PanelState;
+  verdict: ExerciseVerdict;
+  error?: string;
+}
+
+/**
+ * rust: rules.rs ExerciseReport — response body of
+ * `POST /api/doctor/exercise/:display`.
+ * serde: `paused_rules` is `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
+ */
+export interface ExerciseReport {
+  display: string;
+  pre_phase: string;
+  paused_rules?: string[];
+  steps: ExerciseStep[];
+}
+
+/**
+ * rust: dormant_web::routes::operations::OperationsStatus — response body of
+ * `GET /api/operations`.
+ */
+export interface OperationsStatus {
+  exercise_in_flight: string[];
+  emergency_wake_in_flight: boolean;
+}
+
 /**
  * rust: rules.rs StateSnapshot
  * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
@@ -135,6 +216,8 @@ export interface StateSnapshot {
   zones: ZoneSnapshot[];
   displays: [string, DisplaySnapshot][];
   pending_reload: string | null;
+  /** Omitted when the daemon is not running from a rollback. */
+  rollback?: RollbackStatus;
 }
 
 /**

@@ -8,8 +8,8 @@
  * previously-locked `zone`/`displays`/`inhibitors` fields (RulesSection
  * `:62-108`) unlock to dropdowns/multi-selects under entity_crud_enabled.
  */
-import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, waitFor, fireEvent, cleanup, within, act } from "@testing-library/react";
 import RulesSection from "../app/config/RulesSection";
 import { createPatchStore } from "../app/config/patch";
 import type { RuleConfig } from "../api/types";
@@ -68,16 +68,31 @@ describe("RulesSection — Add affordance", () => {
 });
 
 describe("RulesSection — Delete affordance", () => {
-  it("deletes without a references-warning (nothing references a rule)", () => {
+  it("deletes without a references warning (nothing references a rule)", async () => {
     const { store } = renderSection();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     fireEvent.click(screen.getByRole("button", { name: /delete/i }));
-
-    expect(store.buildPatches()).toEqual([
+    const dialog = screen.getByRole("alertdialog", { name: 'Delete rule "office-rule"?' });
+    expect(dialog).toHaveTextContent("Nothing else references rules.");
+    fireEvent.click(screen.getByRole("button", { name: "Delete rule" }));
+    await waitFor(() => expect(store.buildPatches()).toEqual([
       { op: "delete_entity", collection: "rules", id: "office-rule" },
-    ]);
-    confirmSpy.mockRestore();
+    ]));
+  });
+
+  it("does not track a rule delete when the dialog is cancelled", async () => {
+    const { store } = renderSection();
+    fireEvent.click(screen.getByRole("button", { name: /delete/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // Flush the microtask the async confirm() continuation runs on — see
+    // SensorsSection.test.tsx's cancel test for why this is required to
+    // actually bite a mutant that ignores `accepted` (C6 precedent). This
+    // cancel test did not exist before this task — added to mirror the
+    // coverage the other three entity sections have.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(store.buildPatches()).toEqual([]);
   });
 });
 

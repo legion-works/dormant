@@ -77,6 +77,67 @@ A per-display card list. Each card shows a screen preview glyph (ON / grace / �
 
 A scrolling, auto-pruning event log. It shows presence changes, display phase transitions, wake retries, blank/wake failures and recoveries, panel-wear advisories, and config reloads. Timestamps use the browser's clock when each WebSocket message arrives. Reloading the page starts a fresh client-side log.
 
+### Display detail and panel exposure
+
+Select **Open detail** on any display card to inspect that display without leaving
+the Displays page. The detail surface combines live phase/controller health with
+the existing wear API:
+
+- total panel on-time and sample count;
+- average brightness-weighted hotness and current-grid uniformity;
+- the compensation advisory, when no long standby window has occurred;
+- a per-cell wear heat map from `GET /api/wear/:display`;
+- the configured controller chain in fallback order.
+
+An empty heat map means the daemon has not recorded spatial samples for that
+display. It is not replaced with demonstration data.
+
+### Control-path exercise
+
+The display detail and Doctor pages can run the daemon's real control-path
+exercise. The sequence is **blank → read → wake → read → restore**. The daemon
+pauses affected rules for the exercise window and always owns their release; the
+browser does not issue a separate resume request.
+
+The selected panel will visibly go dark and return. Run the exercise only when
+the panel is not in use. The report distinguishes confirmed movement,
+unconfirmable controllers without readback, and failures where a command returned
+success but the observed panel state did not move.
+
+A 504 is a report timeout, not an operation cancellation. The exercise may still
+be completing its restore and rule-release sequence; the browser keeps the action
+disabled until a `GET /api/operations` request started after the timeout reports
+that the display's server guard was released. A delayed response from a request
+started before the exercise cannot clear the warning. Display phase is not used
+for this decision because exercise drives the hardware directly. Do not retry
+while that warning is visible.
+
+### Emergency wake
+
+**Emergency wake** is a global shell action for recovery when normal control has
+failed. After confirmation it pauses every rule and asks every configured display
+to wake concurrently. The response is `{ paused, displays }`; each display result
+contains `{ display, ok, error? }`. A 504 means the report did not arrive within
+two seconds and the wake may still be running — it does not mean the operation was
+cancelled. The global action stays disabled until a `GET /api/operations`
+request started after the timeout reports that the emergency-wake guard was
+released; delayed pre-operation responses are ignored. Emergency wake is global
+by design; there is no per-display variant.
+
+Browser requests are single-flight, but issue #71 tracks the remaining daemon-wide
+limitations: CLI+web overlap, reload-generation races, engine-side exercise
+serialization, and panic-mid-exercise restore/resume hardening.
+
+### Rollback and failure banners
+
+A rollback banner appears above all pages when boot guard rejected a candidate
+configuration and the daemon is running the last-known-good configuration. It
+shows the failed and active fingerprints and links to Config. The banner clears
+only after the recovered configuration has been accepted successfully.
+
+Blank-chain exhaustion is also global. A separate failure banner identifies the
+affected display and controller evidence and links directly to its detail view.
+
 ### Config
 
 Two tabs: **Settings** (a form editor for live config changes without touching the TOML file) and **Raw TOML** (the original read-only syntax-highlighted viewer with inventory sidebar and a reload button).
@@ -140,6 +201,11 @@ config.toml.2026-07-07T14:22:03Z.a3f1
 The directory is created with mode `0o700` (owner-only). A rotation policy keeps at most **5** newest backups (sorted by filename, which encodes an RFC 3339 timestamp); older files are deleted after each new backup.
 
 The config-file watcher uses `RecursiveMode::NonRecursive` on the config directory — writes inside `backups/` do *not* trigger a reload.
+
+The Raw TOML tab also documents the atomic-apply backup policy: the last five
+backups are retained under `backups/config.toml.<timestamp>.<suffix>`. The Web API
+does not expose the live backup directory listing, so the UI shows the policy and
+naming shape rather than fabricated filenames.
 
 #### Entity create/delete
 

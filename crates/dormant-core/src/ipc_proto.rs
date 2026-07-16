@@ -350,6 +350,7 @@ mod tests {
             zones: vec![],
             displays: vec![],
             pending_reload: None,
+            rollback: None,
         };
         let resp = IpcResponse::ok(Some(snap));
         let json = serde_json::to_string(&resp).unwrap();

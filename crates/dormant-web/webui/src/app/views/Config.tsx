@@ -9,7 +9,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
 import type { ConfigResponse } from "../../api/types";
-import { Card, stageKindLabel } from "../components";
+import { Card, stageKindLabel, useConfirmDialog } from "../components";
 import { SettingsForm } from "../config/SettingsForm";
 import "./Config.css";
 import "../config/ConfigForm.css";
@@ -174,6 +174,17 @@ function RawTomlTab({ config: cfg, pendingReload, reloading, onReload }: {
             </div>
           </Card>
 
+          <Card>
+            <div className="config-inventory">
+              <div className="config-inventory__title">Backups</div>
+              <div className="config-backups">
+                <strong>Last 5 kept</strong>
+                <code>backups/config.toml.&lt;timestamp&gt;.&lt;suffix&gt;</code>
+                <span>Created before each successful atomic apply; live filenames are not exposed by the Web API.</span>
+              </div>
+            </div>
+          </Card>
+
           {/* Ladder & Screensaver per-display summary */}
           {Object.values(inv.displays ?? {}).some(
             (dc) => dc.ladder?.length || dc.screensaver,
@@ -284,6 +295,8 @@ export default function Config() {
     discard: () => void;
   } | null>(null);
 
+  const { confirm, dialog } = useConfirmDialog();
+
   const fetchData = useCallback(async () => {
     setState((prev) => ({ ...prev, error: null }));
     try {
@@ -325,17 +338,20 @@ export default function Config() {
 
   /** Tab click handler — guards against losing dirty edits on switch. */
   const handleTabClick = useCallback(
-    (targetTab: ConfigTab) => {
+    async (targetTab: ConfigTab) => {
       if (tab === "settings" && targetTab !== "settings" && navGuard) {
-        const ok = window.confirm(
-          `Discard ${navGuard.dirtyCount} unsaved change${navGuard.dirtyCount !== 1 ? "s" : ""}?`,
-        );
-        if (!ok) return;
+        const accepted = await confirm({
+          title: `Discard ${navGuard.dirtyCount} unsaved change${navGuard.dirtyCount === 1 ? "" : "s"}?`,
+          description: "Switching to Raw TOML discards the pending Settings edits.",
+          confirmLabel: "Discard changes",
+          tone: "danger",
+        });
+        if (!accepted) return;
         navGuard.discard();
       }
       setTab(targetTab);
     },
-    [tab, navGuard],
+    [tab, navGuard, confirm],
   );
 
   if (state.loading) {
@@ -377,6 +393,7 @@ export default function Config() {
           onReload={handleReload}
         />
       )}
+      {dialog}
     </div>
   );
 }

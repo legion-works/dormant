@@ -71,6 +71,7 @@ fn spawn_fake_engine() -> (
             ),
         ],
         pending_reload: None,
+        rollback: None,
     };
 
     let event_tx_for_spawn = event_tx.clone();

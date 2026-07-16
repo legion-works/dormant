@@ -79,6 +79,21 @@
   color: var(--text-strong);
 }
 
+.display-card__open-detail {
+  margin-left: auto;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.display-card__open-detail:hover {
+  color: var(--accent-strong);
+}
+
 
 .display-card__metrics {
   display: flex;

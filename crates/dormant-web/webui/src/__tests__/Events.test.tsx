@@ -90,7 +90,7 @@ describe("Events", () => {
     render(<Events />);
 
     expect(screen.getByText("desk-mmwave → present")).toBeInTheDocument();
-    expect(screen.getByText("sensor")).toBeInTheDocument();
+    expect(screen.getByText("sensor_changed")).toBeInTheDocument();
     expect(screen.getByText("1 events")).toBeInTheDocument();
   });
 
@@ -129,9 +129,9 @@ describe("Events", () => {
       screen.getByText("aoc-main: wake retry attempt 2"),
     ).toBeInTheDocument();
 
-    expect(screen.getByText("zone")).toBeInTheDocument();
-    expect(screen.getByText("config")).toBeInTheDocument();
-    expect(screen.getByText("retry")).toBeInTheDocument();
+    expect(screen.getByText("zone_changed")).toBeInTheDocument();
+    expect(screen.getByText("config_reloaded")).toBeInTheDocument();
+    expect(screen.getByText("wake_retry")).toBeInTheDocument();
   });
 
   it("shows lagged banner when lagged is true", () => {
@@ -189,7 +189,7 @@ describe("Events", () => {
         "config reload rejected: invalid sensor config: unknown type 'foo'",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("config")).toBeInTheDocument();
+    expect(screen.getByText("config_reload_rejected")).toBeInTheDocument();
     expect(screen.getByText("1 events")).toBeInTheDocument();
   });
 

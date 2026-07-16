@@ -370,6 +370,7 @@ mod tests {
                             zones: vec![],
                             displays: vec![],
                             pending_reload: None,
+                            rollback: None,
                         };
                         let json = serde_json::to_string(&IpcResponse::ok(Some(snap))).unwrap();
                         writer.write_all(json.as_bytes()).await.unwrap();

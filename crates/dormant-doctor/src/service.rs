@@ -277,6 +277,7 @@ fn empty_snapshot() -> StateSnapshot {
         zones: vec![],
         displays: vec![],
         pending_reload: None,
+        rollback: None,
     }
 }
 
@@ -423,6 +424,7 @@ mod tests {
                 },
             )],
             pending_reload: None,
+            rollback: None,
         }
     }
 

@@ -9,7 +9,7 @@
  */
 import { useNavigate } from "../nav";
 import { useLiveState, useEventLog } from "../hooks/useLiveState";
-import { Card, StatusChip, WearCard, FailureBanner, statusLabel, phaseChipLabel } from "../components";
+import { Card, StatusChip, WearCard, useConfirmDialog, statusLabel, phaseChipLabel } from "../components";
 import { badgeForEvent, messageForEvent } from "./eventFormat";
 import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot } from "../../api/types";
 import { postBlank, postWake } from "../../api/client";
@@ -141,21 +141,9 @@ interface DashDisplayRowProps {
 }
 
 function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProps) {
-  const [blanking, setBlanking] = useState(false);
-  const [waking, setWaking] = useState(false);
-
-  const handleBlank = useCallback(async () => {
-    setBlanking(true);
-    try { await postBlank(id); } catch { /* ignore — phase updates from next poll */ }
-    setBlanking(false);
-  }, [id]);
-
-  const handleWake = useCallback(async () => {
-    setWaking(true);
-    try { await postWake(id); } catch { /* ignore */ }
-    setWaking(false);
-  }, [id]);
-
+  // Force-blank/wake moved to the "Quick actions" section (single shared
+  // confirm + one `{ display, action }` in-flight state, not a hook per
+  // row) — this row is informational only now.
   return (
     <div className="dash-display-row">
       <div className="dash-display-row__top">
@@ -168,15 +156,112 @@ function DashDisplayRow({ id, snap, blankMode, controllers }: DashDisplayRowProp
           <span className="dash-display-row__ctl">{controllers.join(" → ")}</span>
         )}
       </div>
-      <div className="dash-display-row__actions">
-        <button className="dash-btn dash-btn--neutral" onClick={handleBlank} disabled={blanking}>
-          {blanking ? "…" : "blank"}
-        </button>
-        <button className="dash-btn dash-btn--neutral" onClick={handleWake} disabled={waking}>
-          {waking ? "…" : "wake"}
-        </button>
-      </div>
     </div>
+  );
+}
+
+
+type QuickAction = "blank" | "wake";
+
+interface QuickActionInFlight {
+  display: string;
+  action: QuickAction;
+}
+
+interface QuickActionsProps {
+  displayIds: string[];
+}
+
+/**
+ * Paired Blank/Wake chips for every display, guarded by a shared
+ * confirmation dialog. Single `{ display, action } | null` in-flight
+ * state (not one hook per display) disables only the button that is
+ * actually running; a `Record<string, string>` error map surfaces each
+ * display's own failure without hiding any other display's actions.
+ *
+ * Recovery actions are never hidden based on `StateSnapshot.phase` —
+ * live state can lag the operator's physical panel, so both Blank and
+ * Wake stay available for every display regardless of its last-known
+ * phase.
+ */
+function QuickActions({ displayIds }: QuickActionsProps) {
+  const [inFlight, setInFlight] = useState<QuickActionInFlight | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const { confirm, dialog } = useConfirmDialog();
+
+  const run = useCallback(async (display: string, action: QuickAction) => {
+    const verb = action === "blank" ? "Force blank" : "Force wake";
+    const accepted = await confirm({
+      title: `${verb} ${display}?`,
+      description:
+        action === "blank"
+          ? `Immediately blanks ${display}, bypassing the normal presence rules.`
+          : `Immediately wakes ${display}, bypassing the normal presence rules.`,
+      confirmLabel: verb,
+      tone: action === "blank" ? "danger" : "default",
+    });
+    if (!accepted) return;
+
+    setErrors((prev) => {
+      if (!(display in prev)) return prev;
+      const next = { ...prev };
+      delete next[display];
+      return next;
+    });
+    setInFlight({ display, action });
+    try {
+      if (action === "blank") await postBlank(display);
+      else await postWake(display);
+    } catch (err: unknown) {
+      setErrors((prev) => ({
+        ...prev,
+        [display]: err instanceof Error ? err.message : `${verb} failed`,
+      }));
+    } finally {
+      setInFlight(null);
+    }
+  }, [confirm]);
+
+  if (displayIds.length === 0) return null;
+
+  return (
+    <>
+      <SectionHeader title="Quick actions" caption="force blank or wake, guarded by confirmation" />
+      <Card opaque>
+        <div className="quick-actions">
+          {displayIds.map((id) => {
+            const blanking = inFlight?.display === id && inFlight.action === "blank";
+            const waking = inFlight?.display === id && inFlight.action === "wake";
+            const rowError = errors[id];
+            return (
+              <div className="quick-actions__group" key={id}>
+                <span className="quick-actions__id">{id}</span>
+                <div className="quick-actions__chips">
+                  <button
+                    type="button"
+                    className="quick-chip"
+                    onClick={() => void run(id, "blank")}
+                    disabled={blanking}
+                  >
+                    {blanking ? "Blanking…" : `Blank ${id}`}
+                  </button>
+                  <button
+                    type="button"
+                    className="quick-chip"
+                    onClick={() => void run(id, "wake")}
+                    disabled={waking}
+                  >
+                    {waking ? "Waking…" : `Wake ${id}`}
+                  </button>
+                </div>
+                {rowError && <div className="quick-actions__error">{rowError}</div>}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+      {dialog}
+    </>
   );
 }
 
@@ -230,15 +315,15 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard">
-      {/* Failure banner — surfaces displays failing to wake or blank. */}
-      <FailureBanner />
-
       {/* Stat row */}
       <div className="stat-row">
         {stats.map((s) => (
           <StatCard key={s.label} {...s} />
         ))}
       </div>
+
+      {/* Quick actions */}
+      <QuickActions displayIds={displays.map(([id]) => id)} />
 
       {/* Signal flow */}
       <SectionHeader title="Signal flow" caption="sensors → zones → displays" />

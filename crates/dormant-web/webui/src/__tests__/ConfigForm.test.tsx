@@ -3,7 +3,7 @@
  * conflict handling, inline validation errors, and navigation guard.
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent, act } from "@testing-library/react";
 import { SettingsForm } from "../app/config/SettingsForm";
 import Config from "../app/views/Config";
 import type { ConfigResponse, ApplyResponse, StateSnapshot } from "../api/types";
@@ -667,9 +667,7 @@ describe("Config tab-switch guard", () => {
     vi.clearAllMocks();
   });
 
-  it("shows confirm dialog when switching from dirty Settings to Raw TOML", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-
+  it("shows a shared confirm dialog when switching from dirty Settings to Raw TOML, and stays on Settings when cancelled", async () => {
     render(<Config />);
 
     // Wait for Settings tab to load
@@ -688,21 +686,28 @@ describe("Config tab-switch guard", () => {
     // Click Raw TOML tab
     fireEvent.click(screen.getByText("Raw TOML"));
 
-    // confirm should have been called
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(confirmSpy.mock.calls[0][0]).toMatch(/Discard.*unsaved/);
+    expect(screen.getByRole("alertdialog", { name: "Discard 1 unsaved change?" })).toBeInTheDocument();
 
-    // Since confirm returned false, we stay on Settings tab
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // `confirm()`'s promise resolves synchronously inside Cancel's onClick
+    // (useConfirmDialog's `finish`), so the `.then` continuation that would
+    // switch tabs is only scheduled as a microtask — flush before asserting
+    // "stayed on Settings" so a mutant that ignores `accepted` doesn't pass
+    // by accident (C6 precedent, T6/T7/T8).
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Since the dialog was cancelled, we stay on Settings tab
     expect(screen.getByText("Daemon")).toBeInTheDocument();
     // Raw TOML content should NOT be visible
     expect(screen.queryByText("Parsed inventory")).toBeNull();
-
-    confirmSpy.mockRestore();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   it("confirming discard switches tab and resets dirty state", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
     render(<Config />);
 
     await waitFor(() => {
@@ -719,8 +724,11 @@ describe("Config tab-switch guard", () => {
       expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
     });
 
-    // Click Raw TOML tab — confirm returns true
+    // Click Raw TOML tab — shows the shared dialog
     fireEvent.click(screen.getByText("Raw TOML"));
+    expect(screen.getByRole("alertdialog", { name: "Discard 1 unsaved change?" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
 
     // Should have switched to Raw TOML tab
     await waitFor(() => {
@@ -736,8 +744,6 @@ describe("Config tab-switch guard", () => {
 
     // Should show 0 unsaved (discard was called)
     expect(screen.getByText(/0 unsaved/)).toBeInTheDocument();
-
-    confirmSpy.mockRestore();
   });
 
   // ── Per-field guidance (help text) ──
@@ -913,8 +919,6 @@ describe("Config tab-switch guard", () => {
   });
 
   it("does not show confirm when switching while clean", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm");
-
     render(<Config />);
 
     await waitFor(() => {
@@ -928,9 +932,7 @@ describe("Config tab-switch guard", () => {
       expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
     });
 
-    expect(confirmSpy).not.toHaveBeenCalled();
-
-    confirmSpy.mockRestore();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 });
 

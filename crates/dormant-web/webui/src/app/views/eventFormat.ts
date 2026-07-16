@@ -14,27 +14,27 @@ export interface EventBadge {
 export function badgeForEvent(ev: DaemonEvent): EventBadge {
   switch (ev.event) {
     case "sensor_changed":
-      return { color: "var(--blue-400)", bg: "color-mix(in oklab, var(--blue-400) 14%, transparent)", label: "sensor" };
+      return { color: "var(--blue-400)", bg: "color-mix(in oklab, var(--blue-400) 14%, transparent)", label: "sensor_changed" };
     case "zone_changed":
-      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "zone" };
+      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "zone_changed" };
     case "display_phase":
-      return { color: "var(--text-muted)", bg: "color-mix(in oklab, var(--text-muted) 14%, transparent)", label: "display" };
+      return { color: "var(--text-muted)", bg: "color-mix(in oklab, var(--text-muted) 14%, transparent)", label: "display_phase" };
     case "wake_retry":
-      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "retry" };
+      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "wake_retry" };
     case "config_reloaded":
-      return { color: "var(--accent-warm)", bg: "var(--accent-warm-muted)", label: "config" };
+      return { color: "var(--accent-warm)", bg: "var(--accent-warm-muted)", label: "config_reloaded" };
     case "config_reload_rejected":
-      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "config" };
+      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "config_reload_rejected" };
     case "wear_snapshot":
-      return { color: "var(--text-muted)", bg: "color-mix(in oklab, var(--text-muted) 14%, transparent)", label: "wear" };
+      return { color: "var(--purple-400)", bg: "color-mix(in oklab, var(--purple-400) 14%, transparent)", label: "wear_snapshot" };
     case "compensation_advisory":
-      return { color: "var(--warning)", bg: "color-mix(in oklab, var(--warning) 14%, transparent)", label: "advisory" };
+      return { color: "var(--warning)", bg: "color-mix(in oklab, var(--warning) 14%, transparent)", label: "compensation_advisory" };
     case "blank_failure":
-      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "blank fail" };
+      return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "blank_failure" };
     case "blank_recovered":
-      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "recovered" };
+      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "blank_recovered" };
     case "wake_recovered":
-      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "recovered" };
+      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "wake_recovered" };
     default:
       return { color: "var(--text-muted)", bg: "var(--bg-sunken)", label: (ev as { event: string }).event };
   }

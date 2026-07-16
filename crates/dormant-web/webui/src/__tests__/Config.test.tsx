@@ -293,3 +293,13 @@ describe("Config", () => {
     // Ladder section should be absent.
     expect(screen.queryByText("Ladder & Screensaver")).toBeNull();
   });
+
+  it("shows the documented backup retention policy without inventing live filenames", async () => {
+    render(<Config />);
+    await openRawToml();
+
+    expect(await screen.findByText("Backups")).toBeInTheDocument();
+    expect(screen.getByText("Last 5 kept")).toBeInTheDocument();
+    expect(screen.getByText(/backups\/config\.toml\.<timestamp>\.<suffix>/)).toBeInTheDocument();
+    expect(screen.getByText(/filenames are not exposed by the Web API/i)).toBeInTheDocument();
+  });

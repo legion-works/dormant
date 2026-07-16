@@ -16,6 +16,10 @@ import type {
   ZoneConfig,
   DisplayConfig,
   DisplayRuleInfo,
+  DoctorReport,
+  OperationsStatus,
+  WearDetail,
+  WearListResponse,
 } from "../../api/types";
 
 /** Live-nudged numbers from `wear_snapshot` WS events, keyed by the wear
@@ -35,7 +39,10 @@ export interface StampedEvent {
 
 export interface LiveState {
   loading: boolean;
+  /** Fatal initial-load failure only (getState/getConfig on mount). */
   error: string | null;
+  /** Transient one-second poll failure while the last snapshot remains usable. */
+  pollWarning: string | null;
   snapshot: StateSnapshot | null;
   config: ConfigResponse | null;
   connected: boolean;
@@ -49,6 +56,22 @@ export interface LiveState {
    * keyed by wear-tracker storage key. A fresh `GET /api/wear` fetch
    * remains authoritative — this is a best-effort UI nudge only. */
   wearAdvisories: Record<string, number>;
+  /** Authoritative WebState guard status, fetched on mount and each one-second poll. */
+  operations: OperationsStatus | null;
+  /** Request id attached to the latest committed operations observation. */
+  operationsRequestId: number;
+  /** Starts an operations GET; `onStart` receives its id before network I/O. */
+  refreshOperations: (
+    onStart?: (requestId: number) => void,
+  ) => Promise<OperationsStatus>;
+  wear: WearListResponse | null;
+  wearDetails: Record<string, WearDetail>;
+  wearError: string | null;
+  selectedDisplay: string | null;
+  selectDisplay: (display: string | null) => void;
+  refreshWear: () => Promise<void>;
+  doctorReport: DoctorReport | null;
+  setDoctorReport: (report: DoctorReport | null) => void;
   refresh: () => void;
 }
 

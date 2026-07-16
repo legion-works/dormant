@@ -1,0 +1,184 @@
+/* Control-path exercise runner — DisplayDetail (compact) and Doctor
+   (full-size). All colors use DS tokens; no hardcoded hex/rgba. */
+
+.exercise-runner {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid color-mix(in oklab, var(--text-body) 8%, transparent);
+}
+
+.exercise-runner--compact {
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.exercise-runner__title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-strong);
+  margin: 0;
+}
+
+.exercise-runner__description {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin: 0;
+}
+
+.exercise-runner__button {
+  align-self: flex-start;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  padding: 9px 16px;
+  cursor: pointer;
+  border: 1px solid color-mix(in oklab, var(--danger) 40%, transparent);
+  background: var(--danger-muted);
+  color: var(--danger);
+  transition: background-color var(--dur-fast) var(--ease);
+}
+.exercise-runner__button:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--danger) 26%, transparent);
+}
+.exercise-runner__button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.exercise-runner__status,
+.exercise-runner__alert {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.exercise-runner__status {
+  color: var(--text-faint);
+}
+
+.exercise-runner__alert {
+  color: var(--danger);
+  background: var(--danger-muted);
+  border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  width: fit-content;
+}
+
+.exercise-runner__spinner {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in oklab, var(--text-faint) 40%, transparent);
+  border-top-color: var(--text-body);
+  animation: exercise-runner-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes exercise-runner-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .exercise-runner__spinner {
+    animation: none;
+  }
+}
+
+.exercise-runner__report {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.exercise-runner__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 22px;
+}
+
+.exercise-runner__meta-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.exercise-runner__meta-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.exercise-runner__meta-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-body);
+}
+
+.exercise-runner__verdict {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  width: fit-content;
+}
+.exercise-runner__verdict--confirmed { color: var(--success); }
+.exercise-runner__verdict--unconfirmable { color: var(--warning); }
+.exercise-runner__verdict--failed { color: var(--danger); }
+.exercise-runner__verdict--not_run { color: var(--text-faint); }
+
+.exercise-runner__steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.exercise-runner__step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-body);
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+  padding-bottom: 6px;
+}
+.exercise-runner__step:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.exercise-runner__step-command {
+  font-weight: 600;
+  color: var(--text-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.exercise-runner__step-blank-mode,
+.exercise-runner__step-transition,
+.exercise-runner__step-returned {
+  color: var(--text-muted);
+}
+
+.exercise-runner__step-verdict--confirmed { color: var(--success); }
+.exercise-runner__step-verdict--unconfirmable { color: var(--warning); }
+.exercise-runner__step-verdict--failed { color: var(--danger); }
+
+.exercise-runner__step-error {
+  color: var(--danger);
+}

@@ -52,13 +52,19 @@
 
 
 .doctor-summary {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
 
+@media (max-width: 640px) {
+  .doctor-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .doctor-summary-card {
-  flex: 1;
   padding: 15px 18px;
 }
 
@@ -131,6 +137,40 @@
   letter-spacing: 0.08em;
 }
 
+
+.doctor-exercise-card {
+  margin-top: 16px;
+  padding: 20px 22px;
+}
+
+.doctor-exercise-card__picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 260px;
+}
+
+.doctor-exercise-card__label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.doctor-exercise-card__select {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-body);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.doctor-exercise-card__select:hover {
+  border-color: var(--border-strong);
+}
 
 @keyframes dmRise {
   from { opacity: 0; transform: translateY(8px); }

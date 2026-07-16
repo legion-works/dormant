@@ -1,4 +1,10 @@
 include = ["**/*.toml"]
+# `.toolchain/` is a sandbox-local vendored cargo home (excluded only via the
+# machine-local `.git/info/exclude`, not the committed `.gitignore`, so
+# taplo's directory walker still visits its thousands of dependency
+# `Cargo.toml` files). Scoped exclude for the pre-commit `taplo fmt --check`
+# hook — this directory is never part of the tracked repository content.
+exclude = [".toolchain/**"]
 
 [formatting]
 align_entries = false

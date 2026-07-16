@@ -6,7 +6,7 @@
 //! `dormant-doctor`-owned type — no `dormantd`-local type, so there is
 //! no dependency cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::error::DormantError;
 use dormant_core::reload::ReloadOutcome;
 use dormant_core::rules::ControlMsg;
+use dormant_core::types::DisplayId;
 use dormant_core::wear::WearHandle;
 use dormant_displays::samsung_tizen::{PairConnect, RealPairConnect};
 use dormant_doctor::DoctorService;
@@ -48,10 +49,10 @@ pub struct WebState {
 /// `WebStateInner::new_for_test` / `WebStateInner::new_for_test_with_pairing`
 /// (`#[cfg(test)]`-only, hence plain code spans rather than doc-links here)
 /// — never a bare struct literal; several fields
-/// (`apply_lock`, `pairing`, `pair_lock`, `pair_connect`, `upsert_token`)
-/// are either always freshly constructed or given a constructor-specific
-/// default that a hand-written literal would have to duplicate at every
-/// call site.
+/// (`apply_lock`, `pairing`, `pair_lock`, `pair_connect`, `upsert_token`,
+/// `emergency_wake_lock`) are either always freshly constructed or given a
+/// constructor-specific default that a hand-written literal would have to
+/// duplicate at every call site.
 pub struct WebStateInner {
     /// Engine control channel — used by routes that need a live snapshot
     /// (`/api/state`) or a control action (`/api/blank`, etc.).
@@ -138,6 +139,18 @@ pub struct WebStateInner {
     /// substitute a closure that records `(path, host, token)` calls
     /// instead of touching the filesystem.
     pub(crate) upsert_token: UpsertToken,
+
+    /// Web-scoped single-flight guard for global emergency wake.
+    ///
+    /// The owned guard moves into the reply-monitor task, so an HTTP report
+    /// timeout does not admit a second web request while the engine
+    /// operation continues.
+    pub(crate) emergency_wake_lock: Arc<Mutex<()>>,
+
+    /// Displays with a web control-path exercise still awaiting an engine reply.
+    ///
+    /// Entries are removed by the detached reply monitor, not by the HTTP timeout.
+    pub(crate) exercise_in_flight: Arc<Mutex<HashSet<DisplayId>>>,
 }
 
 /// The subset of [`WebStateInner`]'s fields that vary across construction
@@ -217,8 +230,8 @@ impl WebStateInner {
     }
 
     /// Shared assembly — every constructor bottoms out here so the
-    /// always-fresh fields (`apply_lock`, `pairing`, `pair_lock`) are
-    /// built exactly once, in exactly one place.
+    /// always-fresh fields (`apply_lock`, `pairing`, `pair_lock`,
+    /// `emergency_wake_lock`) are built exactly once, in exactly one place.
     fn assemble(
         params: WebStateInnerParams,
         pair_connect: Arc<dyn PairConnect>,
@@ -242,6 +255,8 @@ impl WebStateInner {
             pair_lock: Arc::new(Mutex::new(())),
             pair_connect,
             upsert_token,
+            emergency_wake_lock: Arc::new(Mutex::new(())),
+            exercise_in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }

@@ -10,6 +10,9 @@
  *   POST /api/resume  → JSON { rule?: string }
  *   POST /api/reload  → no body extractor; Content-Type header required by guard
  *   POST /api/doctor  → no body extractor; Content-Type header required by guard
+ *   POST /api/emergency-wake → no body extractor; returns EmergencyWakeReport
+ *   POST /api/doctor/exercise/:display → no body extractor; returns ExerciseReport
+ *   GET  /api/operations → OperationsStatus
  *
  * All POSTs MUST send Content-Type: application/json — the security
  * guard (security.rs:60-71) rejects POSTs without it (415).
@@ -24,6 +27,9 @@ import type {
   WearDetail,
   PairAccepted,
   PairStatus,
+  EmergencyWakeReport,
+  ExerciseReport,
+  OperationsStatus,
 } from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -175,4 +181,37 @@ export async function postConfigApply(req: ApplyRequest): Promise<ApplyResponse>
   }
 
   return body as ApplyResponse;
+}
+
+/**
+ * Shared status-preserving POST helper for the bodyless report endpoints
+ * (currently just `postEmergencyWake`). Keeping the HTTP status in
+ * `ApiError` — rather than the older text-only `request()` error path —
+ * is required so a caller can distinguish 409 (already in progress) from
+ * 504 (report timed out; the operation may still be running).
+ */
+async function postJsonReport<T>(url: string): Promise<T> {
+  const res = await fetch(BASE + url, {
+    method: "POST",
+    headers: JSON_CT,
+    body: "{}",
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new ApiError(res.status, body);
+  return body as T;
+}
+
+/** POST /api/emergency-wake — pause every rule and wake every configured display. */
+export function postEmergencyWake(): Promise<EmergencyWakeReport> {
+  return postJsonReport<EmergencyWakeReport>("/emergency-wake");
+}
+
+/** POST /api/doctor/exercise/:display — run the real blank/read/wake/read/restore sequence. */
+export function postExercise(display: string): Promise<ExerciseReport> {
+  return postJsonReport<ExerciseReport>(`/doctor/exercise/${encodeURIComponent(display)}`);
+}
+
+/** GET /api/operations — authoritative WebState single-flight guard status. */
+export function getOperations(): Promise<OperationsStatus> {
+  return request<OperationsStatus>("/operations");
 }

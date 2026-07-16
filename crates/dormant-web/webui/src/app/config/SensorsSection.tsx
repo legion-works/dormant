@@ -13,6 +13,7 @@ import type { PatchStore } from "./patch";
 import type { SensorConfig, ZoneConfig } from "../../api/types";
 import CreateEntityForm from "./CreateEntityForm";
 import { referencingEntities } from "./entityCrud";
+import { useConfirmDialog } from "../components";
 
 interface SensorsSectionProps {
   sensors: Record<string, SensorConfig>;
@@ -66,21 +67,27 @@ export default function SensorsSection({
 }: SensorsSectionProps) {
   const ids = Object.keys(sensors);
   const [showCreate, setShowCreate] = useState(false);
+  const { confirm, dialog } = useConfirmDialog();
 
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     const refs = referencingEntities("sensors", id, { zones, rules: {} });
-    const msg = refs.length > 0
-      ? `Delete sensor "${id}"? It is referenced by ${refs.join(", ")} — deleting it may make those entities invalid.`
-      : `Delete sensor "${id}"?`;
-    if (window.confirm(msg)) {
-      store.trackDelete("sensors", id);
-      onDirty();
-    }
+    const accepted = await confirm({
+      title: `Delete sensor "${id}"?`,
+      description: refs.length > 0
+        ? `Referenced by ${refs.join(", ")}. Deleting it may make the pending config invalid.`
+        : "Nothing else references sensors.",
+      confirmLabel: "Delete sensor",
+      tone: "danger",
+    });
+    if (!accepted) return;
+    store.trackDelete("sensors", id);
+    onDirty();
   }
 
   return (
+    <>
     <FormSection title="Sensors">
       {ids.map((id) => {
         const cfg = sensors[id];
@@ -187,5 +194,7 @@ export default function SensorsSection({
         )
       )}
     </FormSection>
+    {dialog}
+    </>
   );
 }

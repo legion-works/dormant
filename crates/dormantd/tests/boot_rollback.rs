@@ -53,7 +53,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dormant_core::config::Strictness;
-use dormant_core::rules::{ControlMsg, StateSnapshot};
+use dormant_core::rules::{ControlMsg, RollbackStatus, StateSnapshot};
 use dormantd::app::AppHandle;
 use dormantd::boot::{self, BootOutcome};
 use dormantd::boot_guard::{
@@ -390,10 +390,20 @@ fn entry(epoch_s: u64, fp: Fingerprint, nonce: u64) -> StartEntry {
     }
 }
 
-/// Fetch the live `pending_reload` message off a running app via
+/// Stable, human-readable fingerprint label mirroring
+/// `boot_guard::fingerprint_label` (`pub(crate)`, unreachable from this
+/// external integration-test crate) — same format, computed independently.
+fn fp_label(fp: Fingerprint) -> String {
+    match fp {
+        Fingerprint::Bytes { len, hash64 } => format!("{len}:{hash64:016x}"),
+        Fingerprint::Unreadable => "unreadable".to_string(),
+    }
+}
+
+/// Fetch the live `pending_reload`/`rollback` fields off a running app via
 /// `ControlMsg::Snapshot` (`daemon_smoke`'s `snapshot_with_retry` pattern,
 /// single-shot — no reload generation-swap window to retry across here).
-async fn pending_reload_of(handle: &AppHandle) -> Option<String> {
+async fn status_of(handle: &AppHandle) -> (Option<String>, Option<RollbackStatus>) {
     let (tx, rx) = oneshot::channel();
     handle
         .control_sender()
@@ -401,7 +411,7 @@ async fn pending_reload_of(handle: &AppHandle) -> Option<String> {
         .await
         .expect("send snapshot request");
     let snap: StateSnapshot = rx.await.expect("recv snapshot");
-    snap.pending_reload
+    (snap.pending_reload, snap.rollback)
 }
 
 async fn shutdown(handle: AppHandle, join: tokio::task::JoinHandle<()>) {
@@ -483,13 +493,20 @@ async fn bad_config_with_lkg_immediate_rollback() {
                 "no LKG candidate may be armed after a rollback boot"
             );
 
-            let pending = pending_reload_of(&handle).await;
+            let (pending, rollback) = status_of(&handle).await;
             assert!(
                 pending
                     .as_deref()
                     .is_some_and(|m| m.contains("rolled back to last-known-good")),
                 "got {pending:?}"
             );
+            let rollback = rollback.expect("rollback status parked");
+            assert_eq!(rollback.failed_fp, fp_label(bad_fp));
+            assert_eq!(
+                rollback.lkg_fp,
+                fp_label(fingerprint_bytes(&std::fs::read(&lkg_path).unwrap()))
+            );
+            assert_eq!(rollback.detail, pending.unwrap());
             shutdown(handle, join).await;
         }
         BootOutcome::LockFailed | BootOutcome::BuildFailed(_) => panic!("expected Started"),
@@ -553,10 +570,11 @@ async fn accepted_reload_recovers_from_rollback_without_restart() {
     assert_eq!(used_config, lkg_path, "generation 0 must boot from the LKG");
     assert!(rolled_back);
 
-    // Pre-recovery sanity: banner set, no candidate armed (Task 1 §5 gate).
+    // Pre-recovery sanity: banner set, rollback status parked, no candidate
+    // armed (Task 1 §5 gate).
     assert!(
-        pending_reload_of(&handle).await.is_some(),
-        "pending banner must be set immediately after a rollback boot"
+        status_of(&handle).await.1.is_some(),
+        "rollback status must be parked immediately after a rollback boot"
     );
     assert!(
         !handle.lkg_candidate_observed().armed,
@@ -566,14 +584,16 @@ async fn accepted_reload_recovers_from_rollback_without_restart() {
     // The operator fixes the broken file — a DIFFERENT valid config from
     // the LKG's own bytes (a shorter `startup_holdoff`), so every
     // assertion below is provably fed by the fresh reload, not a residual
-    // LKG-derived value.
+    // LKG-derived value. Register the rollback-spawn capture BEFORE writing
+    // the fixed operator config, so both a watcher-triggered reload and the
+    // explicit trigger below are captured.
     let fixed = good_config(&h.socket_path()).replacen(
         "startup_holdoff = \"0s\"",
         "startup_holdoff = \"0ms\"",
         1,
     );
+    dormantd::app::begin_reload_spawn_rollback_capture_for_test(&h.state_dir);
     std::fs::write(&bad, &fixed).unwrap();
-
     let mut reloads = handle.subscribe_reload();
     assert!(handle.trigger_reload().await, "trigger_reload must send");
     let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
@@ -585,14 +605,28 @@ async fn accepted_reload_recovers_from_rollback_without_restart() {
         dormantd::app::ReloadOutcome::Reloaded,
         "got {outcome:?}"
     );
+    let captures = dormantd::app::take_reload_spawn_rollback_capture_for_test(&h.state_dir);
+    assert!(
+        !captures.is_empty(),
+        "accepted recovery must spawn a generation"
+    );
+    assert!(
+        captures.iter().all(Option::is_none),
+        "every accepted spawn after capture registration must receive rollback=None; got {captures:?}",
+    );
 
-    // The pending-reload banner clears on the newly-installed engine
-    // (Task 2 §3: `ControlMsg::SetPendingReload(None)` before the
-    // broadcast above).
-    assert_eq!(
-        pending_reload_of(&handle).await,
-        None,
+    // The pending-reload banner and rollback status clear on the newly-
+    // installed engine (Task 2 §3: `ControlMsg::SetPendingReload(None)`
+    // before the broadcast above; the fresh generation was also spawned
+    // with `rollback: None`).
+    let (pending, rollback) = status_of(&handle).await;
+    assert!(
+        pending.is_none(),
         "pending_reload banner must clear on an accepted recovery reload"
+    );
+    assert!(
+        rollback.is_none(),
+        "rollback status must clear with accepted recovery"
     );
 
     // Exactly one fresh LKG candidate armed from the accepted operator
@@ -661,6 +695,7 @@ async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
     // A second, still-broken edit (different bytes, still an undefined
     // zone reference) — `load_and_assemble` must reject it before ever
     // touching the running generation.
+    let before = status_of(&handle).await;
     let still_bad = bad_config(&h.socket_path()).replace("does-not-exist", "still-missing");
     std::fs::write(&bad, &still_bad).unwrap();
 
@@ -679,9 +714,16 @@ async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
     // with the NEW rejection detail (`Runner::reload`'s early-return `Err`
     // arm sends `SetPendingReload(Some(detail))` before returning), so it
     // is never cleared to `None` the way an ACCEPTED recovery reload does.
+    // The rollback status itself, however, is untouched by this path (no
+    // `SetRollback` send on a rejected reload) — same field, same value.
+    let after = status_of(&handle).await;
     assert!(
-        pending_reload_of(&handle).await.is_some(),
+        after.0.is_some(),
         "pending banner must remain set after a rejected reload"
+    );
+    assert_eq!(
+        after.1, before.1,
+        "rollback status must be byte-for-byte untouched by a rejected reload"
     );
     assert!(
         !handle.lkg_candidate_observed().armed,
@@ -758,7 +800,7 @@ async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart
         "generation 0 must be assembled from the LKG's own bytes"
     );
     assert!(
-        pending_reload_of(&handle).await.is_some(),
+        status_of(&handle).await.0.is_some(),
         "pending banner must be set immediately after a rollback boot"
     );
     let state: CrashLoopState = serde_json::from_str(
@@ -809,7 +851,7 @@ async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart
         "live config watch must reflect the fixed OPERATOR value, not the LKG's"
     );
     assert_eq!(
-        pending_reload_of(&handle).await,
+        status_of(&handle).await.0,
         None,
         "pending_reload banner must clear on a watcher-driven recovery reload"
     );
@@ -893,7 +935,7 @@ async fn rollback_boot_watcher_rejects_still_bad_operator_edit() {
     );
 
     assert!(
-        pending_reload_of(&handle).await.is_some(),
+        status_of(&handle).await.0.is_some(),
         "pending banner must remain set after a rejected watcher-triggered reload"
     );
     assert!(
@@ -931,6 +973,52 @@ async fn bad_config_no_lkg_build_failed() {
         matches!(outcome, BootOutcome::BuildFailed(_)),
         "no LKG must never roll back"
     );
+}
+
+/// Rollback-recovery plan Task 1 §6: a `crash-loop.json` write failure
+/// inside `prepare()` must never lose the in-memory rollback verdict —
+/// `BootPlan::rollback_status` is presentation state derived from the
+/// verdict already computed in memory, not read back from the file that
+/// just failed to write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn counted_rollback_banner_survives_prepare_state_write_failure() {
+    let h = Harness::new();
+    let bad = h.write_bad();
+    let bad_fp = fingerprint_bytes(&std::fs::read(&bad).unwrap());
+    let now = now_epoch_s();
+    h.seed_crash_loop(&CrashLoopState {
+        schema_version: 1,
+        starts: vec![entry(now - 60, bad_fp, 201), entry(now - 30, bad_fp, 202)],
+        rollback_active: false,
+        rolled_back_from: None,
+    });
+    let lkg_path = h.write_lkg(&good_config(&h.socket_path()));
+    let before = std::fs::read(h.state_dir.join("crash-loop.json")).unwrap();
+
+    boot_guard::fail_next_crash_loop_write_for_test(&h.state_dir);
+    let plan = boot_guard::prepare(&bad, &h.creds_path, &h.state_dir, Strictness::Strict, true);
+
+    assert_eq!(
+        std::fs::read(h.state_dir.join("crash-loop.json")).unwrap(),
+        before,
+        "the injected write failure must leave the persisted file untouched"
+    );
+    let expected = plan
+        .rollback_status
+        .clone()
+        .expect("in-memory verdict must carry rollback presentation status");
+    assert_eq!(expected.failed_fp, fp_label(bad_fp));
+    assert_eq!(
+        expected.lkg_fp,
+        fp_label(fingerprint_bytes(&std::fs::read(&lkg_path).unwrap()))
+    );
+
+    let outcome = boot::boot(plan, h.inputs()).await.expect("boot from LKG");
+    let BootOutcome::Started { handle, join, .. } = outcome else {
+        panic!("expected Started");
+    };
+    assert_eq!(status_of(&handle).await.1, Some(expected));
+    shutdown(handle, join).await;
 }
 
 /// Bad chosen config AND a bad (unbuildable) LKG → `BuildFailed` (spec
@@ -1076,12 +1164,16 @@ async fn sticky_continue_rollback_reparks_banner() {
     };
     assert_eq!(used_config, lkg_path);
     assert!(rolled_back);
-    let pending = pending_reload_of(&handle).await;
+    let (pending, rollback) = status_of(&handle).await;
     assert!(
         pending
             .as_deref()
             .is_some_and(|m| m.contains("sticky rollback")),
         "got {pending:?}"
+    );
+    assert!(
+        rollback.is_some(),
+        "sticky ContinueRollback must also park a rollback status"
     );
     shutdown(handle, join).await;
 }
@@ -1198,12 +1290,16 @@ async fn quiet_retry_reparks_banner() {
     };
     assert_eq!(used_config, good);
     assert!(!rolled_back);
-    let pending = pending_reload_of(&handle).await;
+    let (pending, rollback) = status_of(&handle).await;
     assert!(
         pending
             .as_deref()
             .is_some_and(|m| m.contains("retrying latest config after a quiet period")),
         "got {pending:?}"
+    );
+    assert!(
+        rollback.is_none(),
+        "a quiet-period retry is not a rollback — no status should be parked"
     );
     shutdown(handle, join).await;
 }

@@ -14,6 +14,7 @@ import {
   UNAVAILABLE_POLICIES,
   DAEMON_EVENT_TAGS,
 } from "../api/types";
+import type { RollbackStatus, StateSnapshot } from "../api/types";
 
 describe("enum arrays match Rust serde wire strings", () => {
   it("SensorState — serde(rename_all = 'lowercase')", () => {
@@ -56,4 +57,22 @@ describe("enum arrays match Rust serde wire strings", () => {
     const { PANEL_TYPES } = await import("../api/types");
     expect(PANEL_TYPES).toEqual(["woled", "qd-oled", "unknown"]);
   });
+});
+
+it("mirrors additive rollback status from rules.rs", () => {
+  const rollback = {
+    failed_fp: "12:00000000deadbeef",
+    lkg_fp: "11:00000000cafebabe",
+    detail: "rolled back to last-known-good",
+  } satisfies RollbackStatus;
+
+  const snapshot = {
+    sensors: [],
+    zones: [],
+    displays: [],
+    pending_reload: null,
+    rollback,
+  } satisfies StateSnapshot;
+
+  expect(snapshot.rollback.failed_fp).toContain("deadbeef");
 });

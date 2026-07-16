@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::task::JoinHandle;
 
-use dormant_core::rules::ControlMsg;
+use dormant_core::rules::{ControlMsg, RollbackStatus};
 
 use crate::app::{App, AppHandle};
 use crate::boot_guard::{self, BootInputs, BootPlan, Fingerprint};
@@ -107,8 +107,8 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
         inputs.strictness,
     );
 
-    let (app, used_config, rolled_back, immediate_pending) = match build {
-        Ok(app) => (app, plan.chosen_config.clone(), is_lkg_chosen, None),
+    let (app, used_config, rolled_back, immediate_pending, immediate_rollback) = match build {
+        Ok(app) => (app, plan.chosen_config.clone(), is_lkg_chosen, None, None),
         Err(build_err) => {
             if is_lkg_chosen {
                 // Spec §5.1 point 3's "if THAT also fails" branch: the LKG
@@ -143,12 +143,15 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
                         inputs.creds_path.clone(),
                         inputs.strictness,
                     ) {
-                        Ok(app) => (
-                            app,
-                            lkg_path.clone(),
-                            true,
-                            Some(boot_guard::pending_message_for_rollback(&detail)),
-                        ),
+                        Ok(app) => {
+                            let pending = boot_guard::pending_message_for_rollback(&detail);
+                            let rollback = RollbackStatus {
+                                failed_fp: boot_guard::fingerprint_label(current_fp),
+                                lkg_fp: boot_guard::fingerprint_label(lkg_fp),
+                                detail: pending.clone(),
+                            };
+                            (app, lkg_path.clone(), true, Some(pending), Some(rollback))
+                        }
                         Err(e2) => return Ok(BootOutcome::BuildFailed(e2.to_string())),
                     }
                 }
@@ -157,19 +160,23 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
         }
     };
 
+    let rollback_status = immediate_rollback.or_else(|| plan.rollback_status.clone());
+
     let app = app
         .with_sd_notify(inputs.sd_notify)
         // Rollback-recovery plan, Task 1 §3/§5 (state_dir threading added
         // Task 2 §2): tell `App` the REAL operator path (may differ from
         // `plan.chosen_config`, which this `app` was actually built from —
-        // see the three branches above), whether this boot is a rollback,
-        // and the crash-loop-state directory this boot's `prepare()`/
-        // immediate-rollback write already used. `rolled_back` is computed
+        // see the three branches above), the in-memory rollback status (if
+        // any) computed either here (immediate rollback) or by
+        // `boot_guard::prepare` (counted/sticky rollback), and the
+        // crash-loop-state directory this boot's `prepare()`/immediate-
+        // rollback write already used. `rollback_status` is computed
         // locally above (never a `BootInputs` field) precisely so this
         // threading is possible without widening `BootInputs`.
         .with_boot_source(
             plan.operator_config.clone(),
-            rolled_back,
+            rollback_status.clone(),
             inputs.state_dir.clone(),
         );
 
@@ -215,6 +222,16 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
         let _ = handle
             .control_sender()
             .send(ControlMsg::SetPendingReload(Some(msg)))
+            .await;
+    }
+
+    // Boot-only park of the rollback indicator (generation 0 only — every
+    // later generation receives Runner-owned status as a `spawn_generation`
+    // parameter instead; see `app.rs`).
+    if let Some(status) = rollback_status {
+        let _ = handle
+            .control_sender()
+            .send(ControlMsg::SetRollback(Some(status)))
             .await;
     }
 

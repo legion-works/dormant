@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
-use crate::routes::{command, config, config_apply, doctor, events, pair, wear};
+use crate::routes::{command, config, config_apply, doctor, events, operations, pair, wear};
 use crate::security::security_guard;
 
 /// Duration the `/api/state` handler waits for a snapshot reply before
@@ -111,13 +111,20 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = route_post!(api, "/resume", post(command::post_resume));
     let api = route_post!(api, "/reload", post(command::post_reload));
     let api = route_post!(api, "/doctor", post(doctor::post_doctor));
+    let api = route_post!(api, "/emergency-wake", post(command::post_emergency_wake));
     let api = route_post!(
         api,
         "/pair/samsung",
         post(pair::post_pair_samsung).layer(DefaultBodyLimit::max(4 * 1024))
     );
+    let api = route_post!(
+        api,
+        "/doctor/exercise/:display",
+        post(doctor::post_exercise)
+    );
     let api = api
         .route("/events", get(events::ws_events))
+        .route("/operations", get(operations::get_operations))
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
         .route("/pair/samsung/:id", get(pair::get_pair_samsung))
@@ -196,7 +203,11 @@ mod tests {
     use tower::util::ServiceExt;
 
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
-    use dormant_core::rules::ControlMsg;
+    use dormant_core::rules::{
+        ControlMsg, DisplaySnapshot, EmergencyWakeReport, EmergencyWakeResult, ExerciseReport,
+        StateSnapshot,
+    };
+    use dormant_core::types::DisplayId;
     use dormant_doctor::DoctorService;
 
     use crate::WebState;
@@ -206,10 +217,16 @@ mod tests {
     /// The API routes will fail if called (no real engine behind the
     /// channels), but the security guard and SPA fallback work
     /// independently of the engine.
-    fn test_web_state_with_bind(bind: SocketAddr) -> (WebState, CancellationToken) {
+    fn test_web_state_with_bind(
+        bind: SocketAddr,
+    ) -> (
+        WebState,
+        CancellationToken,
+        tokio::sync::mpsc::Receiver<ControlMsg>,
+    ) {
         let cancel = CancellationToken::new();
 
-        let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<ControlMsg>(8);
+        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::channel::<ControlMsg>(8);
         let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
 
@@ -251,7 +268,7 @@ mod tests {
             reload_timeout: Duration::from_secs(10),
         }));
 
-        (state, cancel)
+        (state, cancel, ctl_rx)
     }
 
     // ── Security guard covers static/SPA paths ────────────────────────────
@@ -259,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn security_guard_rejects_foreign_host_on_root() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let router = build_router(state);
 
         let req = Request::builder()
@@ -280,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn security_guard_rejects_foreign_host_on_spa_route() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let router = build_router(state);
 
         let req = Request::builder()
@@ -301,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn security_guard_allows_loopback_host_on_root() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let router = build_router(state);
 
         let req = Request::builder()
@@ -339,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn derived_post_routes_cover_all_known_post_mounts() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         // Building the router runs every route_post! call site, populating
         // the derived registry.
         let _router = build_router(state);
@@ -359,6 +376,8 @@ mod tests {
             "/api/resume",
             "/api/reload",
             "/api/doctor",
+            "/api/emergency-wake",
+            "/api/doctor/exercise/:display",
         ];
         for known in known_post_routes {
             assert!(
@@ -377,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn derived_post_routes_are_classified_strict_or_weak() {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let (state, _cancel) = test_web_state_with_bind(bind);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
         let _router = build_router(state);
 
         let derived = registered_post_routes();
@@ -393,5 +412,205 @@ mod tests {
                  decision"
             );
         }
+    }
+
+    // ── Emergency-wake route (Task 2) ──────────────────────────────────────
+
+    /// Exercises the endpoint through the real `build_router` (not the
+    /// `command_test_router` test mount) — full production wiring: engine
+    /// channel, security guard, JSON body extraction, wire-shape response.
+    #[tokio::test]
+    async fn build_router_mounts_emergency_wake_and_returns_wire_report() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel, mut ctl_rx) = test_web_state_with_bind(bind);
+        tokio::spawn(async move {
+            let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
+                panic!("expected EmergencyWake");
+            };
+            let _ = reply.send(EmergencyWakeReport {
+                paused: true,
+                displays: vec![EmergencyWakeResult {
+                    display: DisplayId("studio".to_string()),
+                    ok: true,
+                    error: None,
+                }],
+            });
+        });
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/emergency-wake")
+                    .header("Host", "127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "paused": true,
+                "displays": [{"display": "studio", "ok": true}]
+            })
+        );
+    }
+
+    // ── Operations guard-status route (Task 3) ──────────────────────────────
+
+    #[tokio::test]
+    async fn build_router_operations_reflects_web_guard_lifetimes() {
+        let (state, _cancel, _ctl_rx) =
+            test_web_state_with_bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        let emergency_guard = state.inner.emergency_wake_lock.clone().lock_owned().await;
+        state
+            .inner
+            .exercise_in_flight
+            .lock()
+            .await
+            .insert(DisplayId("studio".to_string()));
+        let router = build_router(state.clone());
+
+        let held = router
+            .clone()
+            .oneshot(
+                Request::get("/api/operations")
+                    .header(axum::http::header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(
+            held.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+        );
+        let held: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(held.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            held,
+            serde_json::json!({
+                "exercise_in_flight": ["studio"],
+                "emergency_wake_in_flight": true
+            })
+        );
+
+        drop(emergency_guard);
+        state.inner.exercise_in_flight.lock().await.clear();
+        let released = router
+            .oneshot(
+                Request::get("/api/operations")
+                    .header(axum::http::header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.status(), StatusCode::OK);
+        assert_eq!(
+            released
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+        );
+        let released: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(released.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            released,
+            serde_json::json!({
+                "exercise_in_flight": [],
+                "emergency_wake_in_flight": false
+            })
+        );
+    }
+
+    /// Exercises `POST /api/doctor/exercise/:display` through the real
+    /// `build_router` (not a bare test mount) — full production wiring:
+    /// engine channel, security guard, dynamic path segment, wire-shape
+    /// response.
+    #[tokio::test]
+    async fn build_router_mounts_display_exercise_and_returns_wire_report() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel, mut ctl_rx) = test_web_state_with_bind(bind);
+        tokio::spawn(async move {
+            while let Some(message) = ctl_rx.recv().await {
+                match message {
+                    ControlMsg::Snapshot(reply) => {
+                        let _ = reply.send(StateSnapshot {
+                            sensors: Vec::new(),
+                            zones: Vec::new(),
+                            displays: vec![(
+                                "main".to_string(),
+                                DisplaySnapshot {
+                                    phase: "active".to_string(),
+                                    inhibited: false,
+                                    paused: false,
+                                    cmd_gen: 1,
+                                    controllers: Vec::new(),
+                                    wake_attempts: 0,
+                                    last_blank_failed: false,
+                                    stage: None,
+                                },
+                            )],
+                            pending_reload: None,
+                            rollback: None,
+                        });
+                    }
+                    ControlMsg::Exercise { display, reply } => {
+                        let _ = reply.send(ExerciseReport {
+                            display,
+                            pre_phase: "active".to_string(),
+                            paused_rules: Vec::new(),
+                            steps: Vec::new(),
+                        });
+                        break;
+                    }
+                    other => panic!("unexpected route message: {other:?}"),
+                }
+            }
+        });
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/doctor/exercise/main")
+                    .header("Host", "127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "display": "main",
+                "pre_phase": "active",
+                "steps": []
+            })
+        );
     }
 }

@@ -13,6 +13,7 @@ import type { ZoneConfig, RuleConfig } from "../../api/types";
 import { FUSION_MODES, UNAVAILABLE_POLICIES } from "./fields";
 import CreateEntityForm from "./CreateEntityForm";
 import { referencingEntities } from "./entityCrud";
+import { useConfirmDialog } from "../components";
 
 interface ZonesSectionProps {
   zones: Record<string, ZoneConfig>;
@@ -40,21 +41,28 @@ export default function ZonesSection({
 }: ZonesSectionProps) {
   const ids = Object.keys(zones);
   const [showCreate, setShowCreate] = useState(false);
+  const { confirm, dialog } = useConfirmDialog();
 
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     const refs = referencingEntities("zones", id, { zones: {}, rules });
-    const msg = refs.length > 0
-      ? `Delete zone "${id}"? It is referenced by ${refs.join(", ")} — deleting it may make those entities invalid.`
-      : `Delete zone "${id}"?`;
-    if (window.confirm(msg)) {
+    const accepted = await confirm({
+      title: `Delete zone "${id}"?`,
+      description: refs.length > 0
+        ? `Referenced by ${refs.join(", ")}. Deleting it may make the pending config invalid.`
+        : "Nothing else references zones.",
+      confirmLabel: "Delete zone",
+      tone: "danger",
+    });
+    if (accepted) {
       store.trackDelete("zones", id);
       onDirty();
     }
   }
 
   return (
+    <>
     <FormSection title="Zones">
       {ids.map((id) => {
         const cfg = zones[id];
@@ -156,5 +164,7 @@ export default function ZonesSection({
         )
       )}
     </FormSection>
+    {dialog}
+    </>
   );
 }

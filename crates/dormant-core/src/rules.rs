@@ -136,6 +136,8 @@ pub enum ControlMsg {
     /// in [`StateSnapshot`]s). Lets the daemon flag a rejected reload without
     /// tearing down the running engine.
     SetPendingReload(Option<String>),
+    /// Set or clear boot-time rollback metadata in snapshots.
+    SetRollback(Option<RollbackStatus>),
     /// Input-wake event from the render surface — route to the display
     /// machine's [`Input::InputWake`].
     InputWake(DisplayId),
@@ -504,6 +506,17 @@ pub struct DisplaySnapshot {
     pub stage: Option<StageInfo>,
 }
 
+/// Boot-time rollback metadata surfaced to operators through [`StateSnapshot`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RollbackStatus {
+    /// Fingerprint of the operator config that failed.
+    pub failed_fp: String,
+    /// Fingerprint of the last-known-good config now running.
+    pub lkg_fp: String,
+    /// Human-readable rollback reason; matches the pending-reload rollback detail.
+    pub detail: String,
+}
+
 /// A point-in-time view of engine state, returned by [`ControlMsg::Snapshot`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StateSnapshot {
@@ -515,6 +528,9 @@ pub struct StateSnapshot {
     pub displays: Vec<(String, DisplaySnapshot)>,
     /// `Some(detail)` when a config reload is pending (operator feedback).
     pub pending_reload: Option<String>,
+    /// Boot-time rollback metadata, omitted when no rollback is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<RollbackStatus>,
 }
 
 // ── Per-runtime configuration shapes ─────────────────────────────────────────
@@ -748,6 +764,8 @@ pub struct RulesEngine {
     event_tx: broadcast::Sender<DaemonEvent>,
     /// Pending reload detail (operator feedback in snapshots).
     pending_reload: Option<String>,
+    /// Boot-time rollback metadata (operator feedback in snapshots).
+    rollback: Option<RollbackStatus>,
     /// Pre-run effects queued by [`RulesEngine::apply_restore_effects`].
     /// Drained into timer / dispatch structures at the start of
     /// [`RulesEngine::run`].
@@ -854,6 +872,7 @@ impl RulesEngine {
             results_tx,
             event_tx,
             pending_reload: None,
+            rollback: None,
             pending_restore: Vec::new(),
         })
     }
@@ -862,6 +881,11 @@ impl RulesEngine {
     /// [`StateSnapshot`]s).
     pub fn set_pending_reload(&mut self, detail: Option<String>) {
         self.pending_reload = detail;
+    }
+
+    /// Set or clear the rollback indicator exposed by [`StateSnapshot`].
+    pub fn set_rollback(&mut self, status: Option<RollbackStatus>) {
+        self.rollback = status;
     }
 
     /// Queue effects from a freshly-restored display machine.  Stored
@@ -1172,6 +1196,7 @@ impl RulesEngine {
                 self.handle_set_inhibited(rule.as_ref(), kind, inhibited);
             }
             ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
+            ControlMsg::SetRollback(status) => self.set_rollback(status),
             ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
             ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply),
         }
@@ -1612,6 +1637,7 @@ impl RulesEngine {
             zones,
             displays,
             pending_reload: self.pending_reload.clone(),
+            rollback: self.rollback.clone(),
         });
     }
 
@@ -3182,6 +3208,32 @@ mod tests {
         .expect("minimal engine config is valid")
     }
 
+    #[test]
+    fn state_snapshot_rollback_field_is_additive() {
+        let legacy = r#"{"sensors":[],"zones":[],"displays":[],"pending_reload":null}"#;
+        let parsed: StateSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.rollback.is_none());
+
+        let json = serde_json::to_value(parsed).unwrap();
+        assert!(json.get("rollback").is_none());
+    }
+
+    #[test]
+    fn rollback_status_parks_in_snapshot_and_clears() {
+        let mut engine = minimal_engine();
+        let status = RollbackStatus {
+            failed_fp: "12:deadbeef".to_string(),
+            lkg_fp: "11:cafebabe".to_string(),
+            detail: "rolled back to last-known-good".to_string(),
+        };
+
+        engine.set_rollback(Some(status.clone()));
+        assert_eq!(snapshot_of(&mut engine).rollback, Some(status));
+
+        engine.set_rollback(None);
+        assert!(snapshot_of(&mut engine).rollback.is_none());
+    }
+
     /// `ControlMsg::PublishDaemonEvent` is the tracker's publish path (P3):
     /// a daemon-lifetime tracker cannot hold the engine's private
     /// per-generation `event_tx`, so it publishes through this control
@@ -3287,6 +3339,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         results_tx,
         event_tx,
         pending_reload: None,
+        rollback: None,
         pending_restore: Vec::new(),
     };
 
@@ -3386,6 +3439,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         results_tx,
         event_tx,
         pending_reload: None,
+        rollback: None,
         pending_restore: Vec::new(),
     };
 

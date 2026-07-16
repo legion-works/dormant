@@ -1,0 +1,25 @@
+/* Wear heat map — per-cell brightness-weighted on-hours grid.
+   All colors use DS tokens (the five --wear-heat-N feature tokens for
+   cell fill; everything else via existing DS tokens). */
+
+.wear-heat-map {
+  display: grid;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.wear-heat-map__cell {
+  aspect-ratio: 1;
+  border-radius: 2px;
+}
+
+.wear-heat-map__empty {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: var(--space-6);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+}

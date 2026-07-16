@@ -101,16 +101,30 @@ jobs:
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-render
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo test -p dormant-core -p dormantd --features render --doc
 
-  portability:
-    strategy:
-      matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  windows-portability:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  macos-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --all-features --doc
+
+  macos-msrv:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
 
   deny:
     runs-on: ubuntu-latest

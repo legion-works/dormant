@@ -151,6 +151,13 @@ pub struct WebStateInner {
     ///
     /// Entries are removed by the detached reply monitor, not by the HTTP timeout.
     pub(crate) exercise_in_flight: Arc<Mutex<HashSet<DisplayId>>>,
+
+    /// Epoch seconds captured once, at `WebState` construction — `GET
+    /// /api/daemon`'s proxy for daemon start time. Captured here (rather
+    /// than read fresh per request) because the web server is spawned
+    /// during `dormantd::app::App::start`, so construction time already
+    /// tracks daemon start closely enough for a sidebar uptime display.
+    pub(crate) started_epoch_s: u64,
 }
 
 /// The subset of [`WebStateInner`]'s fields that vary across construction
@@ -257,8 +264,18 @@ impl WebStateInner {
             upsert_token,
             emergency_wake_lock: Arc::new(Mutex::new(())),
             exercise_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            started_epoch_s: now_epoch_s(),
         }
     }
+}
+
+/// Current wall-clock time as epoch seconds; `0` if the clock is somehow
+/// before the epoch (never in practice — defensive only). Mirrors
+/// `routes::wear::now_epoch_s` / `dormantd::wear_tracker::now_epoch_s`.
+fn now_epoch_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Test-only [`PairConnect`] whose `connect` panics unconditionally.

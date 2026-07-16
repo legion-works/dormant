@@ -110,6 +110,28 @@ pub(super) fn surface_match(
     }
 }
 
+/// Return the candidate whose advertised output name matches `want`.
+///
+/// This is independent of Wayland proxy types so output selection remains
+/// unit-testable without a compositor connection.
+pub(super) fn select_output_by_name<T, N>(
+    mut candidates: impl Iterator<Item = (T, Option<N>)>,
+    want: &str,
+) -> Option<T>
+where
+    N: AsRef<str>,
+{
+    candidates.find_map(|(candidate, name)| {
+        name.is_some_and(|name| name.as_ref() == want)
+            .then_some(candidate)
+    })
+}
+
+/// Return whether an output removal invalidates the cached target proxy.
+pub(super) fn should_clear_target<T: PartialEq>(destroyed_id: &T, cached_id: Option<&T>) -> bool {
+    cached_id == Some(destroyed_id)
+}
+
 /// Build a `CmdFailure` for one of the render sub-controllers.
 /// Centralised so the error sites in this file don't drift on the
 /// `E_RENDER_UNAVAILABLE` prefix or the controller tag.
@@ -2225,17 +2247,32 @@ impl WaylandState {
         }
     }
 
-    /// Locate the target output by connector name (called after the
-    /// initial roundtrip has populated output info).
+    /// Locate the target output by connector name.
     pub(super) fn locate_target_output(&mut self) -> Result<(), CmdFailure> {
-        for output in self.output_state.outputs() {
-            if let Some(info) = self.output_state.info(&output)
-                && info.name.as_deref() == Some(self.output_name.as_str())
+        let previous_output_id = self.target_output.as_ref().map(Proxy::id);
+        let target_output = select_output_by_name(
+            self.output_state.outputs().map(|output| {
+                let name = self.output_state.info(&output).and_then(|info| info.name);
+                (output, name)
+            }),
+            self.output_name.as_str(),
+        );
+
+        if let Some(target_output) = target_output {
+            if let Some(previous_output_id) = previous_output_id
+                && previous_output_id != target_output.id()
             {
-                self.target_output = Some(output);
-                return Ok(());
+                tracing::info!(
+                    event = "render_output_rebound",
+                    display_id = %self.display_id,
+                    output = %self.output_name,
+                );
             }
+
+            self.target_output = Some(target_output);
+            return Ok(());
         }
+
         Err(CmdFailure {
             controller: "render-black".into(),
             error: format!(
@@ -2338,6 +2375,11 @@ impl WaylandState {
     ) {
         match kind {
             StageKind::RenderBlack => {
+                if let Err(error) = self.locate_target_output() {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+
                 self.input_latch.reset();
 
                 // Content-swap path: the render→render advance contract
@@ -2494,6 +2536,11 @@ impl WaylandState {
     ) {
         self.input_latch.reset();
 
+        if let Err(error) = self.locate_target_output() {
+            let _ = reply.send(Err(error));
+            return;
+        }
+
         let Some(target_output) = self.target_output.clone() else {
             let _ = reply.send(Err(cmd_failure(
                 "render-screensaver",
@@ -2607,6 +2654,46 @@ mod tests {
             !stale_should_fail,
             "stale gen=1 timer must not fail gen=2's live pending show"
         );
+    }
+
+    // Issue #55: these unit tests cover only the pure selection and
+    // identity decisions. Rebinding an actual `WlOutput` after a compositor
+    // removes and re-adds it requires live compositor acceptance coverage.
+    #[test]
+    fn select_output_by_name_returns_matching_candidate() {
+        let outputs = [("DP-1", Some("DP-1")), ("HDMI-A-1", Some("HDMI-A-1"))];
+
+        assert_eq!(
+            select_output_by_name(outputs.into_iter(), "HDMI-A-1"),
+            Some("HDMI-A-1")
+        );
+    }
+
+    #[test]
+    fn select_output_by_name_returns_none_when_target_is_absent() {
+        let outputs = [("DP-1", Some("DP-1")), ("HDMI-A-1", None)];
+
+        assert_eq!(select_output_by_name(outputs.into_iter(), "eDP-1"), None);
+    }
+
+    #[test]
+    fn select_output_by_name_skips_nonmatching_candidates() {
+        let outputs = [
+            ("output-zero", Some("HDMI-A-1")),
+            ("output-one", Some("DP-1")),
+        ];
+
+        assert_eq!(
+            select_output_by_name(outputs.into_iter(), "DP-1"),
+            Some("output-one")
+        );
+    }
+
+    #[test]
+    fn should_clear_target_only_for_destroyed_cached_output() {
+        assert!(should_clear_target(&7_u32, Some(&7_u32)));
+        assert!(!should_clear_target(&7_u32, Some(&8_u32)));
+        assert!(!should_clear_target(&7_u32, None));
     }
 
     // ── black_attach_strategy: pure selection-logic unit coverage
@@ -3177,9 +3264,22 @@ impl OutputHandler for WaylandState {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
+    // Rebinding is deferred to show time because `OutputInfo.name` may not
+    // arrive until the compositor's done event.
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
+        let destroyed_id = output.id();
+        let cached_id = self.target_output.as_ref().map(Proxy::id);
+        if should_clear_target(&destroyed_id, cached_id.as_ref()) {
+            self.target_output = None;
+            tracing::info!(
+                event = "render_output_removed",
+                display_id = %self.display_id,
+                output = %self.output_name,
+            );
+        }
+    }
 }
 
 impl ShmHandler for WaylandState {

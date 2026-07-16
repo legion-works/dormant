@@ -68,7 +68,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
-          packages: libudev-dev libwayland-dev libmpv-dev pkg-config
+          # libblas3/liblapack3: runtime deps of the libmpv/ffmpeg stack. The
+          # cache action restores only LISTED packages (no apt dependency
+          # resolution on cache hit), and the runner image stopped shipping BLAS
+          # preinstalled — without them the compiled test binaries fail to load
+          # (libblas.so.3: cannot open shared object file, exit 127).
+          packages: libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
           version: "1"
       - uses: taiki-e/install-action@v2
         with:
@@ -85,7 +90,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
-          packages: libudev-dev libwayland-dev libmpv-dev pkg-config ffmpeg libavcodec-extra
+          # libblas3/liblapack3: see the test job's note — runtime deps the
+          # cache action won't transitively restore.
+          packages: libudev-dev libwayland-dev libmpv-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
           version: "1"
       - uses: taiki-e/install-action@v2
         with:

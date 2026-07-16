@@ -146,7 +146,10 @@ interface DashDisplayRowProps {
 /** Live status-chip row beneath the id/phase — same derivation the
  * Displays cards use for paused/inhibited (`snap.paused`/`snap.inhibited`),
  * extended with blank-failed (`FailureBanner`'s `last_blank_failed ?? false`
- * predicate) and wear advisory (`WearCard`'s `summary.advisory`). */
+ * predicate) and wear advisory (`WearCard`'s `summary.advisory`).
+ * Dashboard deliberately shows a richer set than the Displays card
+ * (adds blank_failed + wear_advisory) since it's the single at-a-glance
+ * summary view — same StatusChip component, same snapshot predicates. */
 function DashDisplayChips({ snap, wearAdvisory }: { snap: DisplaySnapshot; wearAdvisory: boolean }) {
   const blankFailed = snap.last_blank_failed ?? false;
   if (!snap.paused && !snap.inhibited && !blankFailed && !wearAdvisory) return null;

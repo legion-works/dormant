@@ -797,7 +797,8 @@ mod tests {
                 assert!(detail.contains("display 'main'"));
                 assert!(detail.contains("missing 'output'"));
             }
-            other => panic!("expected ConfigInvalid for missing output, got {other:?}"),
+            Err(other) => panic!("expected ConfigInvalid for missing output, got {other:?}"),
+            Ok(_) => panic!("expected ConfigInvalid for missing output, got Ok(controllers)"),
         }
     }
 

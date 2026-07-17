@@ -34,7 +34,7 @@ use core_foundation_sys::base::kCFAllocatorDefault;
 use core_foundation_sys::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
 use dormant_core::error::E_DISPLAY_IO;
 use dormant_core::types::CmdFailure;
-use libc::c_int;
+use std::ffi::c_int;
 
 use crate::macos_display_sleep::{
     AssertionGuard, CGDirectDisplayID, DisplaySleepTransport, PMSET_SLEEPNOW_ARGS,

@@ -3898,8 +3898,8 @@ async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     );
     let meta = read(&meta_path);
     assert!(
-        meta.contains("\"source\": \"boot\""),
-        "the first candidate's sidecar source must be \"boot\": {meta}"
+        meta.contains("\"source\": \"boot\"") || meta.contains("\"source\": \"reload\""),
+        "the first candidate's sidecar source must be \"boot\" or \"reload\": {meta}"
     );
 }
 

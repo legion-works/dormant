@@ -27,7 +27,14 @@ pub mod kwin_dpms;
 // reaches into `macos_display_catalog`.
 #[cfg(target_os = "macos")]
 pub mod macos_display_catalog;
+pub mod macos_display_sleep;
 pub mod macos_gamma_black;
+// `macos_power` is the thin macOS-only FFI backend for `macos_display_sleep`
+// (raw IOPM assertion + CoreGraphics per-display asleep readback calls) —
+// cfg-gated at the `mod` declaration for the same reason as
+// `macos_display_catalog` above.
+#[cfg(target_os = "macos")]
+pub mod macos_power;
 pub mod registry;
 pub mod samsung_ip;
 pub mod samsung_tizen;

@@ -33,6 +33,8 @@ use crate::ha_passthrough::HaPassthroughController;
 #[cfg(target_os = "linux")]
 use crate::kwin_dpms::KwinDpmsController;
 #[cfg(target_os = "macos")]
+use crate::macos_display_sleep::MacosDisplaySleepController;
+#[cfg(target_os = "macos")]
 use crate::macos_gamma_black::{GammaHoldRegistry, MacosGammaBlackController};
 use crate::samsung_tizen::SamsungTizenController;
 
@@ -162,6 +164,7 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "command",
     "ddcci",
     "ha-passthrough",
+    "macos-display-sleep",
     "macos-gamma-black",
     "samsung-tizen",
 ];
@@ -197,6 +200,12 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
         "macos-gamma-black".to_string(),
         vec![BlankMode::BrightnessZero],
     );
+    // Task 10: `macos-display-sleep` is a GLOBAL fallback (no per-display
+    // selector — see the module docs on `crate::macos_display_sleep`) with
+    // exactly one capability: PowerOff (it puts every display to sleep via
+    // `pmset displaysleepnow`, the coarsest possible blank).
+    #[cfg(target_os = "macos")]
+    m.insert("macos-display-sleep".to_string(), vec![BlankMode::PowerOff]);
     m.insert("ha-passthrough".to_string(), Vec::new());
     m.insert(
         "samsung-tizen".to_string(),
@@ -279,6 +288,19 @@ pub fn build_controllers(
                     selector,
                     Arc::clone(ctx.gamma_holds()),
                     Arc::clone(ctx.gamma_breadcrumb()),
+                )));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-display-sleep" => {
+                // GLOBAL fallback — no selector to wire (unlike ddcci /
+                // macos-gamma-black above); config validation
+                // (`dormant_core::config::validate`) already enforces that
+                // `output` is absent or the literal `"all"` for this
+                // controller, so `build_controllers` doesn't need to
+                // re-check it here (mirrors kwin-dpms / ddcci having no
+                // required fields beyond the defaults).
+                chain.push(Box::new(MacosDisplaySleepController::new(
+                    cfg.command_timeout,
                 )));
             }
             "command" => {
@@ -522,6 +544,31 @@ mod tests {
         );
     }
 
+    /// Task 10: `macos-display-sleep` is macOS-only (`pmset`/IOPM/
+    /// CoreGraphics are all macOS-specific). DEFERRED: PR CI — cannot run
+    /// in this Linux sandbox; written now for the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn controller_types_contains_macos_display_sleep_on_macos() {
+        assert!(
+            CONTROLLER_TYPES.contains(&"macos-display-sleep"),
+            "macos-display-sleep must be registered on macOS"
+        );
+    }
+
+    /// Task 10 RED-first (Linux-runnable half of the registry-drift pin):
+    /// `macos-display-sleep` must be absent from `CONTROLLER_TYPES` on
+    /// every platform except macOS — mirrors
+    /// `controller_types_excludes_macos_gamma_black_elsewhere` exactly.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn controller_types_excludes_macos_display_sleep_elsewhere() {
+        assert!(
+            !CONTROLLER_TYPES.contains(&"macos-display-sleep"),
+            "macos-display-sleep must NOT be registered off macOS"
+        );
+    }
+
     /// Task 6 RED-first test 1: `CONTROLLER_TYPES` and `capabilities()`
     /// must advertise EXACTLY the same set of controller type names for
     /// whichever target this crate is compiled for — a drift here means
@@ -586,6 +633,45 @@ mod tests {
             Some(&vec![BlankMode::BrightnessZero]),
             "macos-gamma-black capabilities must be exactly [BrightnessZero]"
         );
+    }
+
+    /// Task 10 RED-first: macOS advertises `macos-display-sleep` with
+    /// EXACTLY `[PowerOff]` — no `BrightnessZero`, no `ScreenOffAudioOn`:
+    /// this controller can only put displays fully to sleep (see the
+    /// module docs on why it is a global, coarse-grained fallback).
+    /// DEFERRED: PR CI — cannot run in this Linux sandbox; written now for
+    /// the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_advertises_macos_display_sleep() {
+        let caps = capabilities();
+        assert_eq!(
+            caps.get("macos-display-sleep"),
+            Some(&vec![BlankMode::PowerOff]),
+            "macos-display-sleep capabilities must be exactly [PowerOff]"
+        );
+    }
+
+    /// Task 10 RED-first: `build_controllers` wires a bare
+    /// `controllers = ["macos-display-sleep"]` display with NO `output`
+    /// (the common case — this controller is global, see the module docs)
+    /// into a working chain, and threads `cfg.command_timeout` through
+    /// (indirectly verified via `supported_modes` staying `[PowerOff]` and
+    /// the controller not panicking to build). DEFERRED: PR CI — cannot run
+    /// in this Linux sandbox; written now for the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn build_macos_display_sleep_requires_no_output() {
+        let mut cfg = command_cfg();
+        cfg.controllers = vec!["macos-display-sleep".into()];
+        cfg.blank_mode = Some(BlankMode::PowerOff);
+        cfg.output = None; // global fallback — no selector required
+
+        let creds = Credentials::default();
+        let chain = build_controllers("main", &cfg, &creds, &test_ctx()).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name(), "macos-display-sleep");
+        assert_eq!(chain[0].supported_modes(), vec![BlankMode::PowerOff]);
     }
 
     /// Task 7 RED-first: the registry wires `cfg.output` (the Task 4

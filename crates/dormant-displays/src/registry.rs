@@ -147,7 +147,61 @@ impl ControllerBuildContext {
 /// Produce the identity used to retain blank ownership across a rebuild.
 #[must_use]
 pub fn controller_chain_fingerprint(cfg: &DisplayConfig) -> String {
-    format!("{cfg:?}")
+    // Keep this field classification in sync with
+    // `dormantd::reload::dispatch_relevant_eq`: owner retention is safe only
+    // while blank/wake dispatch is unchanged.
+    let DisplayConfig {
+        controllers,
+        blank_mode,
+        degraded_mode,
+        ladder,
+        screensaver: _,
+        output,
+        ddc_display,
+        host,
+        wol_mac,
+        blank_command,
+        wake_command,
+        modes,
+        ha_url,
+        blank_service,
+        blank_data,
+        wake_service,
+        wake_data,
+        command_timeout,
+        restore_brightness: _,
+        samsung_restore_backlight: _,
+        treat_unreachable_as_blanked,
+        panel_type: _,
+    } = cfg;
+
+    format!(
+        "{:?}",
+        (
+            (
+                controllers,
+                blank_mode,
+                degraded_mode,
+                ladder,
+                output,
+                ddc_display,
+                host,
+                wol_mac,
+                blank_command,
+                wake_command,
+            ),
+            (
+                modes,
+                ha_url,
+                blank_service,
+                blank_data,
+                wake_service,
+                wake_data,
+                command_timeout,
+                treat_unreachable_as_blanked,
+            ),
+        )
+    )
 }
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.

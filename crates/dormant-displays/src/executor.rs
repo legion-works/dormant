@@ -658,6 +658,9 @@ impl CommandSink for DisplayExecutor {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+    use dormant_core::config::defaults::{COMMAND_TIMEOUT, SAMSUNG_RESTORE_BACKLIGHT};
+    use dormant_core::config::schema::DisplayConfig;
+    use dormant_core::wear::PanelType;
     use std::collections::VecDeque;
     use std::sync::Arc;
 
@@ -742,6 +745,33 @@ mod tests {
                 .iter()
                 .filter(|(_, o)| *o == op)
                 .count()
+        }
+    }
+
+    fn chain_config() -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["command".into()],
+            blank_mode: Some(BlankMode::PowerOff),
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            output: None,
+            ddc_display: Some("1-1".into()),
+            host: None,
+            wol_mac: None,
+            blank_command: Some("blank".into()),
+            wake_command: Some("wake".into()),
+            modes: Some(vec![BlankMode::PowerOff]),
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: COMMAND_TIMEOUT,
+            restore_brightness: 80,
+            samsung_restore_backlight: SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: PanelType::Unknown,
         }
     }
 
@@ -1603,6 +1633,62 @@ mod tests {
         a.set_available(true);
         let rebuilt =
             executor_with_shared_owners(vec![a.clone(), b.clone()], owners, "changed-chain");
+        rebuilt.wake().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 1);
+        assert_eq!(b.count_op("wake"), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_cosmetic_edit_wakes_the_recorded_owner_first() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let owners = Arc::new(BlankOwnerRegistry::new());
+        let original_config = chain_config();
+        a.set_available(false);
+        let original = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            Arc::clone(&owners),
+            &crate::registry::controller_chain_fingerprint(&original_config),
+        );
+        original.blank(BlankMode::PowerOff).await.unwrap();
+
+        let mut cosmetic_edit = original_config;
+        cosmetic_edit.panel_type = PanelType::QdOled;
+        a.set_available(true);
+        let rebuilt = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            owners,
+            &crate::registry::controller_chain_fingerprint(&cosmetic_edit),
+        );
+        rebuilt.wake().await.unwrap();
+
+        assert_eq!(b.count_op("wake"), 1);
+        assert_eq!(a.count_op("wake"), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_changed_ddc_target_drops_the_recorded_owner() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let owners = Arc::new(BlankOwnerRegistry::new());
+        let original_config = chain_config();
+        a.set_available(false);
+        let original = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            Arc::clone(&owners),
+            &crate::registry::controller_chain_fingerprint(&original_config),
+        );
+        original.blank(BlankMode::PowerOff).await.unwrap();
+
+        let mut dispatch_edit = original_config;
+        dispatch_edit.ddc_display = Some("2-1".into());
+        a.set_available(true);
+        let rebuilt = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            owners,
+            &crate::registry::controller_chain_fingerprint(&dispatch_edit),
+        );
         rebuilt.wake().await.unwrap();
 
         assert_eq!(a.count_op("wake"), 1);

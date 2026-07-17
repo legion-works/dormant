@@ -120,6 +120,9 @@ pub fn config_watcher(config_path: &Path) -> Result<ConfigWatcher> {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn dispatch_relevant_eq(a: &DisplayConfig, b: &DisplayConfig) -> bool {
+    // Keep this field classification in sync with
+    // `dormant_displays::registry::controller_chain_fingerprint`: both reload
+    // carry-over and blank-owner retention must agree on dispatch changes.
     let DisplayConfig {
         controllers: a_controllers,
         blank_mode: a_blank_mode,

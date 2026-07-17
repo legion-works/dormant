@@ -40,7 +40,11 @@ dormantctl doctor --draft-feature
 dormantctl doctor --report-issue /tmp/my-bug.md
 ```
 
-Both flags mirror the field order and headings of `.github/ISSUE_TEMPLATE/{bug,feature}.yml`, so pasting the draft into a new GitHub issue lines up with the template. Machine-collectable fields (dormant version, OS/kernel, session type, compositor, the display inventory, config load status, and the probe table) are pre-filled; everything else is left as an `<!-- fill in -->` placeholder. Never overwrites an existing file — a name collision gets a `-2`, `-3`, … suffix. Display entries only ever carry `id`, panel type, controller list, and blank mode — hosts, tokens, and MAC addresses never enter the draft. The two flags are mutually exclusive with each other and with any doctor subcommand (`ddcci`, `mqtt`, …) — the draft always runs the full offline set.
+Both flags mirror the field order and headings of `.github/ISSUE_TEMPLATE/{bug,feature}.yml`, so pasting the draft into a new GitHub issue lines up with the template. Machine-collectable fields (dormant version, OS/kernel, session type, compositor, the display inventory, config load status, and the probe table) are pre-filled; everything else is left as an `<!-- fill in -->` placeholder. Never overwrites an existing file — a name collision gets a `-2`, `-3`, … suffix.
+
+Redaction is layered, not just allowlisting: display entries only ever carry `id`, panel type, controller list, and blank mode (never a host, token, or MAC address). On top of that, every literal secret value the loaded config and credentials actually hold — broker URLs, hosts, MAC addresses, HA/Samsung/MQTT credentials — is substituted with `[redacted]` across the **entire draft, including probe result text**, since a probe's own diagnostic detail can otherwise echo a host or broker URL verbatim (e.g. an mqtt auth-failure message). A second, cheaper pass scrubs any leftover bare IPv4 literal as defense-in-depth. Still, glance at the file before posting it publicly — redaction only catches values dormant itself knows about, not anything you type into a `<!-- fill in -->` section by hand.
+
+The two flags are mutually exclusive with each other and with any doctor subcommand (`ddcci`, `mqtt`, …) — the draft always runs the full offline set. Pass the path with `=` (`--report-issue=./ddcci`) if you want a file genuinely named after a subcommand; the space form (`--report-issue ddcci`) is rejected because clap can't tell "PATH" from "subcommand" there.
 
 ## Common errors
 

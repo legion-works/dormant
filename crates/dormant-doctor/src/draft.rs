@@ -19,6 +19,7 @@ use std::fmt::Write as _;
 use std::time::SystemTime;
 
 use dormant_core::config::Config;
+use dormant_core::config::schema::{Credentials, SensorConfig};
 
 use crate::types::ProbeResult;
 
@@ -129,8 +130,9 @@ pub fn build_display_inventory(cfg: &Config) -> Vec<DisplayInventoryEntry> {
 // ── DraftContext ─────────────────────────────────────────────────────────────────
 
 /// Everything a draft needs to render: version, environment, config status,
-/// the redacted display inventory, and the probe results from the just-run
-/// offline doctor pass.
+/// the redacted display inventory, the probe results from the just-run
+/// offline doctor pass, and the [`SecretSet`] every render function must
+/// apply to its free text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DraftContext {
     /// `dormant` crate version (`env!("CARGO_PKG_VERSION")`).
@@ -143,8 +145,165 @@ pub struct DraftContext {
     pub config_ok: bool,
     /// Allowlisted per-display inventory.
     pub displays: Vec<DisplayInventoryEntry>,
-    /// The full offline probe result set, in run order.
+    /// The full offline probe result set, in run order — rendered through
+    /// `redact` against `secrets`, never verbatim.
     pub probes: Vec<ProbeResult>,
+    /// Every literal secret value from the loaded config + credentials,
+    /// applied to every free-text field a draft renders (probe name,
+    /// probe detail, the config-status line).
+    pub secrets: SecretSet,
+}
+
+// ── Value-based redaction ─────────────────────────────────────────────────────────
+//
+// Display-inventory redaction (above) is allowlist-style: only known-safe
+// fields are ever copied in. That doesn't cover free text a probe writes
+// itself — `dormant-doctor`'s own probes embed broker URLs, hosts, and
+// usernames straight into `ProbeResult::detail` for operator-facing
+// diagnosis (e.g. "no credentials entry matches '<broker_url>'"). A draft
+// renders that text verbatim, so pattern-stripping after the fact is a
+// losing game — instead, every literal secret VALUE the loaded config and
+// credentials actually hold is collected once into a [`SecretSet`] and
+// substituted out of every free-text field a draft renders, centrally, so
+// no render function can bypass it by construction.
+
+/// Every literal string that must never appear in a draft, collected from
+/// the loaded [`Config`] and [`Credentials`] at draft time.
+///
+/// Values shorter than `MIN_SECRET_LEN` are skipped — a 1-3 character
+/// secret (or an empty one) would redact common substrings across the
+/// entire draft, which is worse than not redacting it at all.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SecretSet {
+    secrets: Vec<String>,
+}
+
+/// Secrets shorter than this are not redacted — see [`SecretSet`] docs.
+const MIN_SECRET_LEN: usize = 4;
+
+const REDACTED: &str = "[redacted]";
+
+impl SecretSet {
+    /// Collect every secret-shaped value out of `cfg` and `creds`: display
+    /// hosts, `wol_mac`, HA sensor/display URLs, MQTT broker URLs, and every
+    /// credential (HA token, per-host Samsung tokens, per-broker MQTT
+    /// username + password).
+    #[must_use]
+    pub fn collect(cfg: &Config, creds: &Credentials) -> Self {
+        let mut secrets = Vec::new();
+
+        for display in cfg.displays.values() {
+            if let Some(host) = &display.host {
+                secrets.push(host.clone());
+            }
+            if let Some(mac) = &display.wol_mac {
+                secrets.push(mac.clone());
+            }
+            if let Some(url) = &display.ha_url {
+                secrets.push(url.clone());
+            }
+        }
+        for sensor in cfg.sensors.values() {
+            match sensor {
+                SensorConfig::Mqtt(m) => secrets.push(m.broker_url.clone()),
+                SensorConfig::Ha(h) => secrets.push(h.url.clone()),
+                SensorConfig::UsbLd2410(_) => {}
+            }
+        }
+
+        if let Some(token) = &creds.ha_token {
+            secrets.push(token.clone());
+        }
+        for (host, token) in &creds.samsung {
+            secrets.push(host.clone());
+            secrets.push(token.clone());
+        }
+        for cred in creds.mqtt.values() {
+            secrets.push(cred.username.clone());
+            secrets.push(cred.password.clone());
+        }
+
+        secrets.retain(|s| s.len() >= MIN_SECRET_LEN);
+        // Longest-first so a secret that is a prefix/substring of another
+        // (e.g. a broker URL containing a bare host also in the set) is
+        // replaced by its longest match rather than leaving a fragment of
+        // the shorter one exposed after the longer one is cut.
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.dedup();
+
+        Self { secrets }
+    }
+}
+
+/// Replace every known secret value in `text` with `[redacted]`, then scrub
+/// any remaining IPv4-literal-shaped token as defense-in-depth against a
+/// host that wasn't captured in `set` (e.g. one embedded in a nested error
+/// string one layer deeper than the config schema tracks).
+#[must_use]
+fn redact(set: &SecretSet, text: &str) -> String {
+    let mut out = text.to_string();
+    for secret in &set.secrets {
+        out = out.replace(secret.as_str(), REDACTED);
+    }
+    scrub_ipv4_literals(&out)
+}
+
+/// Replace every `\d+\.\d+\.\d+\.\d+` token with `[redacted-ip]` — a cheap,
+/// dependency-free second layer that catches a host address even when it
+/// wasn't (or couldn't be) captured in the [`SecretSet`]. No regex crate:
+/// hand-rolled scan over ASCII-digit/dot runs.
+fn scrub_ipv4_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = ipv4_literal_end(bytes, i) {
+            out.push_str("[redacted-ip]");
+            i = end;
+        } else {
+            // Safe: `text` is `&str`, so re-slicing one byte at a time
+            // still lands on valid UTF-8 boundaries because ASCII digits
+            // and '.' are single-byte and any non-match falls through to
+            // this branch one byte at a time only within an ASCII run;
+            // for a multi-byte char this pushes its first byte's char
+            // boundary correctly since `char_indices` isn't needed here —
+            // we only ever short-circuit at ASCII digits.
+            let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&text[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+/// If an IPv4-literal-shaped token (`\d+\.\d+\.\d+\.\d+`, each octet
+/// 1-3 digits) starts at `start`, return the index just past it.
+fn ipv4_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    for octet in 0..4 {
+        if octet > 0 {
+            if bytes.get(i) != Some(&b'.') {
+                return None;
+            }
+            i += 1;
+        }
+        let digit_start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        let len = i - digit_start;
+        if len == 0 || len > 3 {
+            return None;
+        }
+    }
+    // Require a non-digit boundary after the match so "1.2.3.4567" isn't
+    // truncated mid-token, and "10.0.0.1.2.3.4" only ever consumes the
+    // first four octets (the trailing ".2.3.4" is left for the next scan
+    // pass, which will itself fail to match a leading '.').
+    if bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(i)
 }
 
 // ── Date formatting (no new date/time dependency) ───────────────────────────────
@@ -155,11 +314,18 @@ pub struct DraftContext {
 /// epoch seconds rather than pulling in a date/time crate — the workspace
 /// already has no `chrono`/`time` dependency and this needs nothing more
 /// than a calendar date.
+///
+/// Precondition: `now` is expected to be at or after the Unix epoch (true
+/// for every real call site — `SystemTime::now()`). A pre-epoch `now`
+/// (clock set before 1970, never observed in practice) falls back to
+/// epoch-seconds `0` — i.e. renders `1970-01-01` — rather than panicking,
+/// since this only ever feeds a best-effort default filename.
 #[must_use]
 pub fn format_date_ymd(now: SystemTime) -> String {
-    let epoch_s = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let epoch_s = match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => 0, // pre-epoch clock — see precondition above
+    };
     let days = i64::try_from(epoch_s / 86400).unwrap_or(0);
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
@@ -191,14 +357,19 @@ fn render_environment_section(ctx: &DraftContext) -> String {
          - OS: {os}\n\
          - Kernel: {kernel}\n\
          - Session type: {session}\n\
-         - Desktop/compositor: {desktop}\n\
-         - dormant version: {version}\n",
+         - Desktop/compositor: {desktop}\n",
         os = ctx.env.os_pretty_name,
         kernel = ctx.env.kernel_release,
         session = ctx.env.session_type,
         desktop = ctx.env.desktop,
-        version = ctx.version,
     )
+}
+
+/// `bug.yml` declares `id: version` as its own top-level field (not nested
+/// under Environment) — mirror that exactly so pasting a draft into the
+/// template lines up field-for-field.
+fn render_version_section(ctx: &DraftContext) -> String {
+    format!("## dormant version\n\n{version}\n", version = ctx.version)
 }
 
 fn render_config_section(ctx: &DraftContext) -> String {
@@ -207,12 +378,12 @@ fn render_config_section(ctx: &DraftContext) -> String {
     } else {
         "FAILED to load or validate — see the doctor output below"
     };
+    let path = redact(&ctx.secrets, &ctx.config_path);
     format!(
         "## Configuration\n\n\
          Config path: `{path}` ({status})\n\n\
          <!-- Paste your sanitized TOML config here if it helps. Do not paste \
          tokens, passwords, or credentials.toml contents. -->\n",
-        path = ctx.config_path,
     )
 }
 
@@ -253,9 +424,15 @@ fn render_doctor_section(ctx: &DraftContext) -> String {
             crate::types::ProbeStatus::Skip => "SKIP",
             crate::types::ProbeStatus::NotSupported => "N/A",
         };
+        // Probe name/detail are operator-facing diagnostic text and may
+        // embed a broker URL, host, or username verbatim (see the
+        // module-level redaction docs) — redact BEFORE the markdown-escape
+        // step below, not after, so a secret containing '|' still matches.
+        let name = redact(&ctx.secrets, &r.name);
+        let detail = redact(&ctx.secrets, &r.detail);
         // Markdown table cells can't contain literal newlines or bare pipes.
-        let detail = r.detail.replace('|', "\\|").replace('\n', "<br>");
-        let _ = writeln!(out, "| {} | {status} | {detail} |", r.name);
+        let detail = detail.replace('|', "\\|").replace('\n', "<br>");
+        let _ = writeln!(out, "| {name} | {status} | {detail} |");
     }
     out
 }
@@ -288,6 +465,8 @@ pub fn render_bug_draft(ctx: &DraftContext) -> String {
     out.push_str(&render_displays_section(ctx));
     out.push('\n');
     out.push_str(&render_environment_section(ctx));
+    out.push('\n');
+    out.push_str(&render_version_section(ctx));
     out.push('\n');
 
     out.push_str("## `dormantctl status` output\n\n");
@@ -512,6 +691,7 @@ mod tests {
                 ProbeResult::pass("config", "configuration OK"),
                 ProbeResult::fail("ddcci", "no DDC/CI displays detected"),
             ],
+            secrets: SecretSet::default(),
         }
     }
 
@@ -524,6 +704,7 @@ mod tests {
             "## Configuration",
             "## Displays involved",
             "## Environment",
+            "## dormant version",
             "## `dormantctl status` output",
             "## `dormantctl doctor` output",
             "## Relevant daemon logs",
@@ -537,6 +718,10 @@ mod tests {
         assert!(
             out.contains("no DDC/CI displays detected"),
             "should list the probe detail"
+        );
+        assert!(
+            out.contains("PowerOff"),
+            "should render the blank-mode column"
         );
     }
 
@@ -583,9 +768,13 @@ mod tests {
     }
 
     /// Decisive redaction test: a config with a Samsung host and a
-    /// credentials token must not leak either string into either draft —
-    /// [`build_display_inventory`] only copies the allowlisted fields, so
-    /// this fails loudly if that allowlist is ever widened by mistake.
+    /// credentials token must not leak either string into either draft.
+    /// Covers BOTH mechanisms: [`build_display_inventory`]'s allowlist
+    /// (host never copied into the inventory struct) AND [`SecretSet`]
+    /// value-based redaction (host/token collected from the real config +
+    /// credentials and substituted out of every free-text field —
+    /// including the config-status line, which carries the config path
+    /// and could theoretically embed a host in a pathological setup).
     #[test]
     fn drafts_never_leak_host_or_credentials() {
         let secret_host = "192.168.77.42";
@@ -604,6 +793,7 @@ mod tests {
 
         let ctx = DraftContext {
             displays: build_display_inventory(&cfg),
+            secrets: SecretSet::collect(&cfg, &creds),
             ..sample_ctx()
         };
 
@@ -624,5 +814,134 @@ mod tests {
             creds.samsung.get(secret_host).map(String::as_str),
             Some(secret_token)
         );
+    }
+
+    /// Reviewer-reproduced leak (Must 1): a secret injected into a
+    /// `ProbeResult`'s name/detail — the shape real probes actually use
+    /// (mqtt.rs embeds the broker URL in its auth-failure detail;
+    /// validate.rs embeds the samsung host in its missing-token error) —
+    /// bypassed the display-inventory allowlist entirely, because
+    /// `render_doctor_section` wrote `r.name`/`r.detail` verbatim.
+    ///
+    /// The config/credentials below are built so `SecretSet::collect`
+    /// actually captures `secret_host` (a display host), `secret_broker`
+    /// (an mqtt sensor's `broker_url`), and `secret_user` (an mqtt
+    /// credential username) — this exercises the real collection path,
+    /// not a hand-built `SecretSet`.
+    #[test]
+    fn drafts_never_leak_secrets_from_probe_result_text() {
+        let secret_host = "192.168.55.10";
+        let secret_broker = "tcp://192.168.55.20:1883";
+        let secret_user = "mqtt-admin-user";
+        let secret_password = "hunter2-password";
+
+        let mut displays = IndexMap::new();
+        displays.insert(
+            "tv".to_string(),
+            sample_display(vec!["samsung-tizen"], Some(secret_host)),
+        );
+        let mut sensors = IndexMap::new();
+        sensors.insert(
+            "desk".to_string(),
+            SensorConfig::Mqtt(dormant_core::config::schema::MqttSensorCfg {
+                broker_url: secret_broker.to_string(),
+                topic: "dormant/desk".to_string(),
+                field: "/occupancy".to_string(),
+                payload_on: None,
+                payload_off: None,
+                availability_topic: None,
+                availability_payload_online: "online".to_string(),
+                availability_payload_offline: "offline".to_string(),
+                kind: dormant_core::config::schema::SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        let cfg = Config {
+            sensors,
+            ..config_with_displays(displays)
+        };
+        let mut creds = Credentials::default();
+        creds.mqtt.insert(
+            secret_broker.to_string(),
+            dormant_core::config::schema::MqttCredential {
+                username: secret_user.to_string(),
+                password: secret_password.to_string(),
+            },
+        );
+
+        let mut ctx = sample_ctx();
+        ctx.secrets = SecretSet::collect(&cfg, &creds);
+        ctx.probes = vec![
+            ProbeResult::fail(
+                format!("mqtt {secret_broker}"),
+                format!("broker requires auth and no credentials entry matches '{secret_broker}'"),
+            ),
+            ProbeResult::fail(
+                format!("samsung {secret_host} token"),
+                format!("display 'tv' (host '{secret_host}') needs a samsung token"),
+            ),
+            ProbeResult::fail(
+                format!("mqtt {secret_broker} auth"),
+                format!("rejected credentials for user '{secret_user}'"),
+            ),
+        ];
+
+        let bug = render_bug_draft(&ctx);
+        let feature = render_feature_draft(&ctx);
+
+        for secret in [secret_host, secret_broker, secret_user] {
+            assert!(
+                !bug.contains(secret),
+                "bug draft leaked probe-result secret: {secret}"
+            );
+            assert!(
+                !feature.contains(secret),
+                "feature draft leaked probe-result secret: {secret}"
+            );
+        }
+    }
+
+    // ── SecretSet / redact / scrub_ipv4_literals ────────────────────────────
+
+    #[test]
+    fn secret_set_skips_short_values() {
+        let mut creds = Credentials::default();
+        creds.samsung.insert("abc".to_string(), "xy".to_string());
+        let cfg = config_with_displays(IndexMap::new());
+        let set = SecretSet::collect(&cfg, &creds);
+        assert!(
+            set.secrets.is_empty(),
+            "values under MIN_SECRET_LEN must not be collected: {:?}",
+            set.secrets
+        );
+    }
+
+    #[test]
+    fn redact_replaces_known_secret() {
+        let set = SecretSet {
+            secrets: vec!["supersecrettoken".to_string()],
+        };
+        let out = redact(&set, "token is supersecrettoken here");
+        assert_eq!(out, "token is [redacted] here");
+    }
+
+    #[test]
+    fn scrub_ipv4_literals_replaces_bare_ip() {
+        let out = scrub_ipv4_literals("connect to 192.168.1.99 on port 8002");
+        assert_eq!(out, "connect to [redacted-ip] on port 8002");
+    }
+
+    #[test]
+    fn scrub_ipv4_literals_ignores_non_ip_numbers() {
+        // Not IPv4-shaped (three dot-separated groups, one 4-digit group).
+        let out = scrub_ipv4_literals("version 1.88.2024 released");
+        assert_eq!(out, "version 1.88.2024 released");
+    }
+
+    #[test]
+    fn scrub_ipv4_literals_handles_multiple_occurrences() {
+        let out = scrub_ipv4_literals("10.0.0.1 and 10.0.0.2");
+        assert_eq!(out, "[redacted-ip] and [redacted-ip]");
     }
 }

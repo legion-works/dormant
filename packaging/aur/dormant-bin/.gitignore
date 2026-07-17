@@ -1,0 +1,6 @@
+# makepkg build artifacts — only PKGBUILD, .SRCINFO, and README.md are committed
+src/
+pkg/
+*.pkg.tar.*
+*.tar.xz
+*.service

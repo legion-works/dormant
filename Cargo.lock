@@ -915,6 +915,7 @@ dependencies = [
  "dormant-sensors",
  "futures-util",
  "indexmap",
+ "libc",
  "rumqttc",
  "serde_json",
  "tempfile",

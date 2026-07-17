@@ -18,9 +18,15 @@ pub use types::{ProbeResult, ProbeStatus};
 
 // Re-export probe functions the CLI dispatches per-subcommand.
 pub use probes::config::probe_config_inner;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use probes::ddcci::probe_ddcci;
 pub use probes::ha::probe_ha_all;
+#[cfg(target_os = "macos")]
+pub use probes::macos_display_sleep::probe_macos_display_sleep;
+#[cfg(target_os = "macos")]
+pub use probes::macos_idle::probe_macos_idle;
+#[cfg(target_os = "macos")]
+pub use probes::macos_power::probe_macos_power;
 pub use probes::mqtt::probe_mqtt_all;
 pub use probes::samsung::probe_samsung;
 pub use probes::usb::probe_usb;
@@ -129,18 +135,31 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
             .values()
             .any(|d| d.controllers.iter().any(|c| c == "ddcci"));
         if has_ddcci {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 results.push(probes::ddcci::probe_ddcci().await);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 results.push(ProbeResult::not_supported(
                     "ddcci",
-                    "DDC/CI is only supported on Linux in this release",
+                    "DDC/CI is only supported on Linux and macOS in this release",
                 ));
             }
         }
+    }
+
+    // macOS-only read-only platform probes — always run on a macOS host
+    // (not gated by any per-display/per-sensor config, unlike DDC/CI
+    // above): idle-clock health, display-sleep API availability + current
+    // per-display state, and active power assertions. All three are
+    // read-only diagnostics; none of them ever blanks or wakes a display —
+    // that stays exclusively under `doctor exercise <display>`.
+    #[cfg(target_os = "macos")]
+    {
+        results.push(probes::macos_idle::probe_macos_idle().await);
+        results.push(probes::macos_display_sleep::probe_macos_display_sleep().await);
+        results.push(probes::macos_power::probe_macos_power().await);
     }
 
     results

@@ -1,27 +1,14 @@
 //! USB LD2410 radar sensor probe — opens a serial port and decodes frames.
 //!
-//! ## macOS cfg-broadening decision (Task 11)
+//! ## Platform coverage
 //!
-//! `tokio-serial` (the `[target.'cfg(...)'.dependencies]` entry in this
-//! crate's `Cargo.toml`) supports macOS as well as Linux, so the real
-//! implementation below is broadened from `#[cfg(target_os = "linux")]` to
-//! `#[cfg(any(target_os = "linux", target_os = "macos"))]` in THIS commit —
-//! not deferred to a follow-up after the macOS CI lane proves the PTY test
-//! below. The reasoning: the plan text says "broaden only after CI proof",
-//! and the PTY test IS that proof for everything this probe's logic
-//! actually depends on (`tokio_serial::SerialStream::open` +
-//! `dormant_sensors::usb_ld2410::FrameParser`, both platform-neutral code
-//! paths already exercised end-to-end against a real Unix PTY by
-//! `usb_probe_decodes_a_frame_over_a_unix_pty`, below, which runs on Linux
-//! today). The macOS *build* of this exact function has never compiled in
-//! this Linux sandbox and is DEFERRED: PR CI in the sense that nobody has
-//! watched `cargo test -p dormant-doctor` go green on the macOS lane yet —
-//! but the code is not gated behind that lane's approval because the gate
-//! IS the PR: this PR cannot merge with a red macOS CI lane (Task 2 wired
-//! `cargo test`+MSRV checks into that lane), so leaving the cfg narrowed to
-//! Linux here would just mean writing the identical one-line broadening
-//! commit later, with strictly less test coverage in front of it than this
-//! commit already has.
+//! The production probe supports Linux and macOS. Its PTY integration test
+//! is Linux-only: serialport-rs applies macOS's `IOSSIOSPEED` ioctl for every
+//! baud rate, while macOS PTYs reject that ioctl with `ENOTTY` (serialport-rs
+//! issue #22). On macOS 26.5 this was observed with both 256000 and 115200;
+//! the resulting early slave close then makes the master writer report EIO.
+//! Real serial devices support `IOSSIOSPEED`, so macOS coverage of the open
+//! path belongs to on-target doctor acceptance rather than this PTY fake.
 
 use crate::types::ProbeResult;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
@@ -115,6 +102,7 @@ pub async fn probe_usb(_port: &str, _baud: u32) -> ProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::types::ProbeStatus;
 
     #[test]
@@ -163,7 +151,7 @@ mod tests {
     /// cannot be imported from here — this reproduces the documented frame
     /// format table at the top of `dormant_sensors::usb_ld2410` instead of
     /// hand-rolling an unrelated byte layout).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn ld2410_present_frame() -> Vec<u8> {
         let mut buf = vec![0xF4, 0xF3, 0xF2, 0xF1];
         let data_len: u16 = 9;
@@ -178,24 +166,20 @@ mod tests {
         buf
     }
 
-    // ── TestPty — a real Unix PTY pair, proving `probe_usb`'s serial I/O
+    // ── TestPty — a real Linux PTY pair, proving `probe_usb`'s serial I/O
     // path end to end (this is NOT a fake: `tokio_serial::SerialStream`
     // opens the slave path exactly as it would open a real
-    // `/dev/ttyUSB0`). `libc::openpty` is available on both `linux-gnu`
-    // and macOS's `libc` bindings (see `libc::unix::bsd::apple` /
-    // `libc::unix::linux_like`), hence `cfg(unix)` rather than a
-    // platform-specific cfg — this test genuinely runs on Linux today,
-    // which is the whole point: it is the one piece of this task's macOS
-    // cfg-broadening (see the module doc's "cfg-broadening decision") that
-    // is NOT deferred to the macOS CI lane.
+    // `/dev/ttyUSB0`). This harness is intentionally Linux-only: macOS PTYs
+    // reject serialport-rs's unconditional IOSSIOSPEED ioctl with ENOTTY
+    // (serialport-rs#22), unlike real macOS serial devices.
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     struct TestPty {
         master: std::fs::File,
         slave_path: std::path::PathBuf,
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     impl TestPty {
         fn open() -> std::io::Result<Self> {
             use std::os::unix::io::FromRawFd;
@@ -223,11 +207,8 @@ mod tests {
             }
 
             // Safety: `slave_fd` is a valid, open fd `openpty` just
-            // returned. We only need the slave's PATH (already captured
-            // into `name_buf`) — `probe_usb` opens that path independently
-            // via `tokio_serial`, and closing our own copy of the slave fd
-            // here does not invalidate the device node as long as
-            // `master_fd` (below) stays open for the lifetime of `Self`.
+            // returned. The probe opens this path independently via
+            // `tokio_serial`, so the test's setup copy is no longer needed.
             unsafe { libc::close(slave_fd) };
 
             // Safety: `openpty` NUL-terminates `name_buf` on success.
@@ -277,10 +258,10 @@ mod tests {
     /// "present" frame to the master from a background thread, and asserts
     /// `probe_usb` — reading the SLAVE path through the exact same
     /// `tokio_serial::SerialStream::open` + `FrameParser` code path
-    /// production uses — decodes it correctly. Runs on Linux today (see
-    /// the `TestPty` docs above for why `cfg(unix)` rather than
-    /// `cfg(target_os = "macos")`).
-    #[cfg(unix)]
+    /// production uses — decodes it correctly. macOS PTYs are deliberately
+    /// excluded because serialport-rs always applies IOSSIOSPEED there and
+    /// PTYs reject it with ENOTTY; real-device validation covers that path.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn usb_probe_decodes_a_frame_over_a_unix_pty() {
         let pty = TestPty::open().expect("openpty");

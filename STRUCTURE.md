@@ -94,11 +94,7 @@ oled-proximity/
 **Per-panel DDC/CI bus lock:** `crates/dormant-displays/src/ddc_lock.rs` (`PanelLocks` registry + `PanelLock` with `VcpPriority::Command` vs `Sampler` discipline + poison recovery).
 **Sensor source registry:** `crates/dormant-sensors/src/registry.rs`.
 **Display controller registry:** `crates/dormant-displays/src/registry.rs`.
-<<<<<<< Updated upstream
-**Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,samsung,usb,macos_idle,macos_power,macos_display_sleep}.rs`.
-=======
 **Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,samsung,usb,macos_idle,macos_display_sleep,macos_power}.rs`. The three macOS probes are read-only and `cfg(target_os = "macos")`-gated; `macos_display_sleep` reuses `dormant_displays::macos_power::RealDisplaySleepTransport::online_sleep_states` for its per-display `CGDisplayIsAsleep` readback; `macos_power` shells out to `pmset -g assertions` directly and never reaches for the transport's mutating `declare_user_activity`.
->>>>>>> Stashed changes
 **Web routes:** `crates/dormant-web/src/routes/{command,config,config_apply,doctor,events,wear,pair}.rs`. `wear.rs` reads the shared `WearHandle` directly (no engine round-trip; mirrors the `doctor` route's read-only-diagnostics ethos). `pair.rs` is the Samsung pairing wizard — non-blocking (`202` + poll) and single-flight, calling `dormant_displays::samsung_tizen::pair_with_connect` + `dormant_core::config::upsert_samsung_token` in-process (no daemon IPC round-trip).
 **Web config-patch module:** `crates/dormant-web/src/config_patch.rs` — pure patch hygiene / allowlist / `toml_edit` application; the `config_apply.rs` route is the only consumer. Also owns the entity-CRUD gate (`CreateEntity`/`DeleteEntity`, `CREATABLE_FIELDS`, `RESERVED_ENTITY_IDS`) — `entity_crud_enabled` itself is enforced one level up, in `config_apply.rs`, ahead of the shared 5-stage `Set`/`Remove` pipeline.
 **Wear tracker:** `crates/dormantd/src/wear_tracker.rs` — pure `tick(snapshot, samples, config, now)` advances ledgers; async shell owns file I/O, `load_or_create_ledger`, and `DaemonEvent::WearSnapshot`/`CompensationAdvisory` publication.

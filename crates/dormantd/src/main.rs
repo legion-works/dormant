@@ -118,7 +118,7 @@ fn main() -> ExitCode {
                 state_dir,
                 &gamma_recovery::RealGammaSystemRestore,
                 "startup",
-            );
+            )
         },
         peek_boot_options,
         |inputs, boot_options| {
@@ -130,7 +130,7 @@ fn main() -> ExitCode {
                 boot_options.lkg_rollback_enabled,
             )
         },
-        |inputs, boot_options, plan| {
+        |inputs, boot_options, plan, startup_gamma_event| {
             // The common and immediate-rollback paths already peeked the chosen
             // config. Only a prepare-time rollback changes the chosen path.
             let level = if plan.chosen_config == inputs.config_path {
@@ -144,6 +144,9 @@ fn main() -> ExitCode {
             }
 
             emit_deferred_events(&plan.deferred_events);
+            if let Some(event) = startup_gamma_event.as_ref() {
+                gamma_recovery::emit_deferred_event(event);
+            }
 
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(WORKER_THREADS)
@@ -224,11 +227,14 @@ async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
             }
         }),
         || {
-            gamma_recovery::restore_stale_breadcrumb(
+            let event = gamma_recovery::restore_stale_breadcrumb(
                 &state_dir,
                 &gamma_recovery::RealGammaSystemRestore,
                 "shutdown",
             );
+            if let Some(event) = event.as_ref() {
+                gamma_recovery::emit_deferred_event(event);
+            }
         },
     )
     .await

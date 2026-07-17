@@ -34,9 +34,9 @@
 //!
 //! ## Failure handling
 //!
-//! Restoration failure is LOGGED, never propagated as an error — this
-//! module must never convert a self-restoring crash-recovery path into a
-//! startup abort or a shutdown hang. Every function here returns `()`.
+//! Restoration failure is recorded as a deferred log event, never propagated
+//! as an error — this module must never convert a self-restoring
+//! crash-recovery path into a startup abort or a shutdown hang.
 
 use std::path::Path;
 
@@ -110,38 +110,83 @@ impl GammaSystemRestore for RealGammaSystemRestore {
     }
 }
 
+/// A breadcrumb recovery outcome to emit once logging is available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GammaRecoveryEvent {
+    /// The system gamma state was restored and its stale breadcrumb removed.
+    StaleBreadcrumbRestored {
+        /// Whether the startup or shutdown recovery path ran.
+        caller: String,
+    },
+    /// The system state was restored but the breadcrumb could not be removed.
+    BreadcrumbClearFailed {
+        /// Whether the startup or shutdown recovery path ran.
+        caller: String,
+        /// Filesystem error from removing the breadcrumb.
+        error: String,
+    },
+    /// Restoring the system gamma state failed, so the breadcrumb remains.
+    StaleBreadcrumbRestoreFailed {
+        /// Whether the startup or shutdown recovery path ran.
+        caller: String,
+        /// Error reported by the system restore backend.
+        error: String,
+    },
+}
+
 /// Startup/shutdown breadcrumb check (see module docs): if `state_dir`'s
 /// breadcrumb exists, call `restore.restore_all()` and clear the marker on
-/// success. Always logs its outcome; never returns an error — this must
-/// never abort startup or hang shutdown. A no-op (no log at all) when no
-/// breadcrumb exists.
+/// success. Returns its outcome for emission after logging is initialised;
+/// never returns an error — this must never abort startup or hang shutdown.
+/// A no-op (no event at all) when no breadcrumb exists.
 ///
-/// `caller` is a short label (`"startup"` / `"shutdown"`) folded into the
-/// log event names so the two call sites remain distinguishable in
-/// operator logs despite sharing this one implementation.
-pub fn restore_stale_breadcrumb(state_dir: &Path, restore: &dyn GammaSystemRestore, caller: &str) {
+/// `caller` is a short label (`"startup"` / `"shutdown"`) carried into the
+/// emitted event so the two call sites remain distinguishable in operator
+/// logs despite sharing this one implementation.
+pub fn restore_stale_breadcrumb(
+    state_dir: &Path,
+    restore: &dyn GammaSystemRestore,
+    caller: &str,
+) -> Option<GammaRecoveryEvent> {
     let breadcrumb = GammaBreadcrumb::new(state_dir);
     if !breadcrumb.exists() {
-        return;
+        return None;
     }
     match restore.restore_all() {
         Ok(()) => match breadcrumb.delete() {
-            Ok(()) => {
-                tracing::info!(event = "gamma_stale_breadcrumb_restored", caller = %caller);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event = "gamma_breadcrumb_clear_failed",
-                    caller = %caller,
-                    error = %e,
-                );
-            }
+            Ok(()) => Some(GammaRecoveryEvent::StaleBreadcrumbRestored {
+                caller: caller.to_string(),
+            }),
+            Err(error) => Some(GammaRecoveryEvent::BreadcrumbClearFailed {
+                caller: caller.to_string(),
+                error: error.to_string(),
+            }),
         },
-        Err(e) => {
+        Err(error) => Some(GammaRecoveryEvent::StaleBreadcrumbRestoreFailed {
+            caller: caller.to_string(),
+            error,
+        }),
+    }
+}
+
+/// Emit a breadcrumb recovery event after logging has been initialised.
+pub fn emit_deferred_event(event: &GammaRecoveryEvent) {
+    match event {
+        GammaRecoveryEvent::StaleBreadcrumbRestored { caller } => {
+            tracing::info!(event = "gamma_stale_breadcrumb_restored", caller = %caller);
+        }
+        GammaRecoveryEvent::BreadcrumbClearFailed { caller, error } => {
+            tracing::warn!(
+                event = "gamma_breadcrumb_clear_failed",
+                caller = %caller,
+                error = %error,
+            );
+        }
+        GammaRecoveryEvent::StaleBreadcrumbRestoreFailed { caller, error } => {
             tracing::warn!(
                 event = "gamma_stale_breadcrumb_restore_failed",
                 caller = %caller,
-                error = %e,
+                error = %error,
             );
         }
     }
@@ -209,9 +254,15 @@ mod tests {
         assert!(breadcrumb.exists());
 
         let restore = FakeRestore::default();
-        restore_stale_breadcrumb(dir.path(), &restore, "startup");
+        let event = restore_stale_breadcrumb(dir.path(), &restore, "startup");
 
         assert_eq!(restore.calls(), 1);
+        assert_eq!(
+            event,
+            Some(GammaRecoveryEvent::StaleBreadcrumbRestored {
+                caller: "startup".to_string(),
+            })
+        );
         assert!(
             !breadcrumb.exists(),
             "breadcrumb must be cleared after a successful restore"

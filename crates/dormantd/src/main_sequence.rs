@@ -20,17 +20,17 @@ pub(super) struct StartupInputs {
 /// `boot` owns the remaining logging/runtime/boot stage. Its early returns
 /// therefore cannot bypass the stale-gamma restore, config peek, or
 /// `boot_guard::prepare` calls that precede it here.
-pub(super) fn run_startup_sequence<Config, Prepared, Output>(
+pub(super) fn run_startup_sequence<Config, Prepared, Deferred, Output>(
     inputs: StartupInputs,
-    restore_stale_gamma: impl FnOnce(&Path),
+    restore_stale_gamma: impl FnOnce(&Path) -> Deferred,
     load_config: impl FnOnce(&Path, Strictness) -> Config,
     prepare: impl FnOnce(&StartupInputs, &Config) -> Prepared,
-    boot: impl FnOnce(StartupInputs, Config, Prepared) -> Output,
+    boot: impl FnOnce(StartupInputs, Config, Prepared, Deferred) -> Output,
 ) -> Output {
-    restore_stale_gamma(&inputs.state_dir);
+    let deferred = restore_stale_gamma(&inputs.state_dir);
     let config = load_config(&inputs.config_path, inputs.strictness);
     let prepared = prepare(&inputs, &config);
-    boot(inputs, config, prepared)
+    boot(inputs, config, prepared, deferred)
 }
 
 /// Await the complete boot verdict dispatch before running shutdown restore.
@@ -138,7 +138,7 @@ mod tests {
                 },
                 {
                     let trace = trace.clone();
-                    move |_, (), ()| {
+                    move |_, (), (), ()| {
                         if reaches_boot {
                             trace.push("boot");
                         }

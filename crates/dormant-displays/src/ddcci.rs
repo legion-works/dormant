@@ -1994,8 +1994,13 @@ mod tests {
             .expect("sampler's delayed read must have measured its own elapsed time");
 
         let read_timeout = Duration::from_secs(5);
+        // Slack sized for shared CI runners (macos-latest showed 203ms of
+        // pure scheduler noise on an 80ms sampler read — PR #78 round 9).
+        // The pin still distinguishes the bug class: waiting behind a full
+        // sampler QUEUE or the 2s VCP read-timeout lands seconds away from
+        // one-transaction + 1s.
         assert!(
-            wake_elapsed < sampler_read_elapsed + Duration::from_millis(200),
+            wake_elapsed < sampler_read_elapsed + Duration::from_secs(1),
             "wake_elapsed {wake_elapsed:?} must be bounded by the single \
              in-flight sampler transaction {sampler_read_elapsed:?} + slack \
              — not by any additional unrelated wait"

@@ -4015,6 +4015,12 @@ async fn watchdog_reload_mid_window_resets_candidate() {
     );
 }
 
+// Linux-only: pins WATCHDOG=1 datagram CADENCE by wall-clock timing.
+// The watchdog probe-arm only ever runs under systemd (WATCHDOG_USEC —
+// launchd sets no equivalent), and macos-latest scheduler noise breaks
+// sub-second cadence windows (PR #78 round-9 rerun: 0 datagrams by
+// ~900ms). LKG file-write tests above stay cross-platform.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -4154,6 +4160,9 @@ wake_retry_interval = "1s"
     )
 }
 
+// Linux-only: datagram-count assertion on the systemd-only ping arm —
+// see the cadence test's note above.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -4301,6 +4310,9 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
     );
 }
 
+// Linux-only: datagram-count assertion on the systemd-only ping arm —
+// see the cadence test's note above.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -4406,6 +4418,9 @@ async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
 /// arm in `Runner::reload` to run, with a synthetic cause — everything
 /// downstream of that point (the ping, `rebuild_old`, the `Rejected`
 /// outcome) is production code, unmodified.
+// Linux-only: datagram-count assertion on the systemd-only ping arm —
+// see the cadence test's note above.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -4648,6 +4663,12 @@ inhibitors = ["audio-playback"]
 
 // ── (a) grace-freeze then blank on idle ─────────────────────────────────────────
 
+// Linux-only: full-daemon audio integration over a fake pw-dump script —
+// PipeWire is a Linux subsystem (macOS audio-aware blanking is out of
+// scope by design; production there fail-safes via the spawn-failure
+// breaker), and the test's grace/timing windows break under macos-latest
+// spawn latency (PR #78 round-9 rerun).
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
     let dir = TempDir::new().unwrap();
@@ -4709,6 +4730,8 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
 
 // ── (b) reload-mid-movie (F2/R2-M1, anti-tautology per P4) ──────────────────────
 
+// Linux-only: see the audio integration note above.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     let dir = TempDir::new().unwrap();

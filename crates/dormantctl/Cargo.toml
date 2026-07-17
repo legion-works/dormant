@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 humantime = "2"
 comfy-table = "7"
 rumqttc = { workspace = true }
@@ -37,5 +38,5 @@ render = ["dormant-core/render"]
 dist = true
 
 [dev-dependencies]
-async-trait = { workspace = true }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -15,6 +15,7 @@ pub mod command;
 pub mod ddc_lock;
 pub mod ddcci;
 pub mod executor;
+pub mod gamma_breadcrumb;
 pub mod ha_passthrough;
 pub mod kwin_dpms;
 // `macos_display_catalog` is the thin macOS-only FFI backend (raw Quartz

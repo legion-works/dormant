@@ -20,6 +20,7 @@ use dormant_core::paths;
 use dormantd::app;
 use dormantd::boot::{self, BootOutcome};
 use dormantd::boot_guard::{self, BootInputs, BootPlan, DeferredEvent};
+use dormantd::gamma_recovery;
 use dormantd::logging;
 use dormantd::sd_notify::SdNotify;
 
@@ -99,6 +100,21 @@ fn main() -> ExitCode {
         return ExitCode::from(u8::try_from(report.exit_code()).unwrap_or(1));
     }
 
+    // Task 8 (gamma continuity): resolve `state_dir` and check for a stale
+    // `gamma-blank.json` breadcrumb from an unclean prior exit BEFORE any
+    // config load, `boot_guard::prepare`, `App::build`, or assembly — this
+    // call takes no config dependency at all (see
+    // `gamma_recovery::restore_stale_breadcrumb`'s signature and module
+    // docs), so an invalid/unloadable config can never suppress it.
+    // Restoration failure is logged, never fatal — it must never convert
+    // this self-restoring crash-recovery path into a startup abort.
+    let state_dir = paths::state_dir();
+    gamma_recovery::restore_stale_breadcrumb(
+        &state_dir,
+        &gamma_recovery::RealGammaSystemRestore,
+        "startup",
+    );
+
     // Cheap pre-`prepare` peek (spec §5.1, confirm-round row): the
     // crash-loop rollback gate must be known BEFORE `prepare` runs, but
     // logging doesn't exist yet either. Defaults the gate true if the
@@ -106,7 +122,6 @@ fn main() -> ExitCode {
     // this machinery must still work for.
     let boot_options = peek_boot_options(&config_path, strictness);
 
-    let state_dir = paths::state_dir();
     let lock_path = paths::default_lock_path();
 
     let plan = boot_guard::prepare(
@@ -164,13 +179,15 @@ fn main() -> ExitCode {
 /// split out of `main` purely to keep `main` under the line-count gate; no
 /// behavioral seam.
 async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
-    // Captured before `plan` moves into `boot::boot` below (rollback-
-    // recovery plan, Task 1 §6): the REAL operator path, for the
+    // Captured before `plan`/`inputs` move into `boot::boot` below
+    // (rollback-recovery plan, Task 1 §6 for `operator_config`; Task 8 for
+    // `state_dir`): `operator_config` is the REAL operator path, for the
     // `reload_config` log field — distinct from `used_config`, which keeps
     // reporting whichever source actually booted generation 0 (unchanged
-    // meaning).
+    // meaning). `state_dir` is needed again below, after `inputs` is gone.
     let operator_config = plan.operator_config.clone();
-    match boot::boot(plan, inputs).await {
+    let state_dir = inputs.state_dir.clone();
+    let exit_code = match boot::boot(plan, inputs).await {
         Ok(BootOutcome::LockFailed) => ExitCode::from(1),
         Ok(BootOutcome::BuildFailed(msg)) => {
             tracing::error!(event = "startup_failed", error = %msg);
@@ -203,7 +220,24 @@ async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
             tracing::error!(event = "daemon_failed", error = %e);
             ExitCode::FAILURE
         }
-    }
+    };
+
+    // Task 8 (gamma continuity): best-effort restore around
+    // `run_to_completion`'s return — a genuine process exit (normal
+    // shutdown, SIGTERM, SIGINT, or any of the early-return failure arms
+    // above, all of which end the process) with a still-present breadcrumb
+    // means at least one gamma selector's hold was never cleared by a
+    // confirmed wake. SIGHUP (reload) never reaches this function at all —
+    // it is handled entirely inside `run_loop`/`Runner::reload`, which
+    // returns control to `join.await` above only on an actual shutdown
+    // signal (see `gamma_recovery`'s module docs).
+    gamma_recovery::restore_stale_breadcrumb(
+        &state_dir,
+        &gamma_recovery::RealGammaSystemRestore,
+        "shutdown",
+    );
+
+    exit_code
 }
 
 /// Emit `prepare`'s deferred log events (spec §5.1: recorded/decided before

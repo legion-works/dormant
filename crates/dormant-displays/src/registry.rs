@@ -15,6 +15,7 @@
 //! - the per-display chain assembly (via [`build_controllers`]).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dormant_core::config::schema::{Credentials, DisplayConfig};
@@ -26,6 +27,8 @@ use crate::command::CommandController;
 use crate::ddc_lock::PanelLocks;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::ddcci::DdcciController;
+#[cfg(target_os = "macos")]
+use crate::gamma_breadcrumb::GammaBreadcrumb;
 use crate::ha_passthrough::HaPassthroughController;
 #[cfg(target_os = "linux")]
 use crate::kwin_dpms::KwinDpmsController;
@@ -33,27 +36,101 @@ use crate::kwin_dpms::KwinDpmsController;
 use crate::macos_gamma_black::{GammaHoldRegistry, MacosGammaBlackController};
 use crate::samsung_tizen::SamsungTizenController;
 
-/// Process-wide, daemon-lifetime [`GammaHoldRegistry`] for every
-/// `macos-gamma-black` controller this process builds.
-///
-/// A `static OnceLock` — rather than a parameter threaded through
-/// [`build_controllers`] — is a deliberate interim choice for Task 7: the
-/// hold registry MUST survive a config reload (a fresh `build_controllers`
-/// call per generation) exactly like [`PanelLocks`] does, but widening
-/// `build_controllers`'s signature to accept a second shared registry is
-/// Task 8's job (it introduces a `ControllerBuildContext` bundling both,
-/// after auditing every call site — see the Task 8 plan section). A process
-/// static gives the SAME daemon-lifetime persistence property without that
-/// wider refactor now; Task 8 replaces this static with the injected
-/// context.
-#[cfg(target_os = "macos")]
-static GAMMA_HOLDS: std::sync::OnceLock<std::sync::Arc<GammaHoldRegistry>> =
-    std::sync::OnceLock::new();
+// ── ControllerBuildContext (Task 8) ─────────────────────────────────────
 
-/// Accessor for the process-wide gamma hold registry (see [`GAMMA_HOLDS`]).
-#[cfg(target_os = "macos")]
-fn gamma_holds() -> std::sync::Arc<GammaHoldRegistry> {
-    std::sync::Arc::clone(GAMMA_HOLDS.get_or_init(|| std::sync::Arc::new(GammaHoldRegistry::new())))
+/// Everything [`build_controllers`] needs that must survive a config reload
+/// unchanged, bundled into one value so every call site threads exactly one
+/// thing instead of an ever-growing parameter list.
+///
+/// Carries:
+/// - [`PanelLocks`] (spec §4.3) — the daemon's process-wide DDC/CI
+///   per-panel lock registry (Task 3/6).
+/// - `state_dir` — the daemon's resolved state directory (Task 5's
+///   `dormant_core::paths::state_dir()`, or a caller-supplied override),
+///   used by the `macos-gamma-black` arm to construct the Task 8
+///   `GammaBreadcrumb` breadcrumb.
+/// - `gamma_holds` (macOS-only, `#[cfg(target_os = "macos")]`) — the
+///   daemon's process-wide `crate::macos_gamma_black::GammaHoldRegistry`
+///   (Task 7; not an intra-doc link — that item is itself only `use`d on
+///   macOS in this module, so a Linux doc build can't resolve it even by
+///   full path). The FIELD is `cfg`-gated (there is nothing to hold on a
+///   platform with no Quartz gamma API), but the STRUCT itself is
+///   deliberately platform-neutral — [`Self::new`] and every other public
+///   method compile and run unchanged on Linux — so callers never need
+///   their own `cfg` gating just to construct or thread a context.
+///
+/// Constructed exactly ONCE per daemon process, in `App::start` (alongside
+/// `PanelLocks::new()`, which it wraps), and reused, unchanged, across
+/// every reload/rollback generation's `assemble_static` call — the same
+/// survives-a-reload contract [`PanelLocks`] already had, now extended to
+/// the gamma hold registry and the breadcrumb (both must resolve to the
+/// SAME instance before and after a config reload; see
+/// `crate::macos_gamma_black`'s "First-blank-wins saved state" docs and
+/// `crate::gamma_breadcrumb`'s module docs).
+pub struct ControllerBuildContext {
+    locks: Arc<PanelLocks>,
+    state_dir: PathBuf,
+    #[cfg(target_os = "macos")]
+    gamma_holds: Arc<GammaHoldRegistry>,
+    /// ONE shared breadcrumb instance for every `macos-gamma-black`
+    /// controller this context builds — MUST be the same `Arc` (not a
+    /// fresh `GammaBreadcrumb` per controller), because `GammaBreadcrumb`'s
+    /// "process-wide marker mutex" (see its module docs' "Concurrency"
+    /// section) is an in-process `std::sync::Mutex`, not a file lock: two
+    /// independently-constructed instances pointed at the same directory
+    /// would each guard only their OWN read-modify-write, not each
+    /// other's, reopening exactly the lost-update race the marker mutex
+    /// exists to close.
+    #[cfg(target_os = "macos")]
+    gamma_breadcrumb: Arc<GammaBreadcrumb>,
+}
+
+impl ControllerBuildContext {
+    /// Build a context wrapping `locks` and `state_dir`. On macOS this also
+    /// constructs a fresh `GammaHoldRegistry` and a single
+    /// `GammaBreadcrumb` rooted at `state_dir` — callers MUST call this
+    /// exactly once per daemon process and reuse the same
+    /// `ControllerBuildContext` for every subsequent
+    /// `build_controllers`/`assemble_static` call (see the struct docs).
+    #[must_use]
+    pub fn new(locks: Arc<PanelLocks>, state_dir: impl Into<PathBuf>) -> Self {
+        let state_dir = state_dir.into();
+        Self {
+            locks,
+            #[cfg(target_os = "macos")]
+            gamma_holds: Arc::new(GammaHoldRegistry::new()),
+            #[cfg(target_os = "macos")]
+            gamma_breadcrumb: Arc::new(GammaBreadcrumb::new(state_dir.clone())),
+            state_dir,
+        }
+    }
+
+    /// The shared [`PanelLocks`] registry.
+    #[must_use]
+    pub fn locks(&self) -> &Arc<PanelLocks> {
+        &self.locks
+    }
+
+    /// The resolved state directory this context was built with.
+    #[must_use]
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// The shared [`GammaHoldRegistry`] (macOS only).
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn gamma_holds(&self) -> &Arc<GammaHoldRegistry> {
+        &self.gamma_holds
+    }
+
+    /// The shared [`GammaBreadcrumb`] (macOS only) — the SAME instance for
+    /// every controller this context builds (see the struct field's docs).
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn gamma_breadcrumb(&self) -> &Arc<GammaBreadcrumb> {
+        &self.gamma_breadcrumb
+    }
 }
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
@@ -144,21 +221,24 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
 ///   `modes = []` is treated the same as a missing `modes` — an empty
 ///   capability set can never blank any mode.
 ///
-/// `locks` is the shared per-panel DDC/CI lock registry (spec §4.3) — the
-/// caller constructs exactly ONE `Arc<PanelLocks>` for its whole lifetime
-/// (the daemon in `App::start`; each direct-hardware CLI invocation gets
-/// its own fresh one, being a separate process) and passes it to every
-/// `build_controllers` call, so that a panel's lock resolves to the same
-/// `Arc<PanelLock>` no matter which config-reload generation or call site
-/// derived its controller. Only the `ddcci` arm consumes it; every other
-/// controller type ignores the parameter (no shared physical bus to
-/// serialize).
+/// `ctx` is the [`ControllerBuildContext`] bundling every piece of shared,
+/// reload-surviving state a controller may need (spec §4.3 for the
+/// `PanelLocks` half; Task 8 for the macOS gamma-hold-registry/breadcrumb
+/// half) — the caller constructs exactly ONE `ControllerBuildContext` for
+/// its whole lifetime (the daemon in `App::start`; each direct-hardware CLI
+/// invocation gets its own fresh one, being a separate process) and passes
+/// it to every `build_controllers` call, so that a panel's lock — and, on
+/// macOS, a selector's gamma hold/breadcrumb — resolves to the same shared
+/// instance no matter which config-reload generation or call site derived
+/// its controller. Only the `ddcci` and `macos-gamma-black` arms consume
+/// it; every other controller type ignores it (no shared physical bus or
+/// daemon-lifetime state to serialize).
 #[allow(clippy::too_many_lines)]
 pub fn build_controllers(
     display_name: &str,
     cfg: &DisplayConfig,
     creds: &Credentials,
-    locks: &Arc<PanelLocks>,
+    ctx: &ControllerBuildContext,
 ) -> Result<Vec<Box<dyn DisplayController>>, DormantError> {
     let mut chain: Vec<Box<dyn DisplayController>> = Vec::with_capacity(cfg.controllers.len());
 
@@ -173,7 +253,7 @@ pub fn build_controllers(
                     matcher,
                     cfg.restore_brightness,
                     cfg.primary_blank_mode(),
-                    locks,
+                    ctx.locks(),
                 )));
             }
             #[cfg(target_os = "linux")]
@@ -197,7 +277,8 @@ pub fn build_controllers(
                 })?;
                 chain.push(Box::new(MacosGammaBlackController::new(
                     selector,
-                    gamma_holds(),
+                    Arc::clone(ctx.gamma_holds()),
+                    Arc::clone(ctx.gamma_breadcrumb()),
                 )));
             }
             "command" => {
@@ -319,6 +400,19 @@ mod tests {
     use super::*;
     use dormant_core::config::defaults::{COMMAND_TIMEOUT, SAMSUNG_RESTORE_BACKLIGHT};
     use std::time::Duration;
+
+    /// A fresh [`ControllerBuildContext`] for tests that don't care about
+    /// state-dir persistence (most of this module's tests) — every test
+    /// gets its own throwaway `/tmp`-rooted path; nothing in this module's
+    /// tests exercises Task 8 breadcrumb file I/O, so the path is never
+    /// actually written to on Linux (the `macos-gamma-black` arm that would
+    /// touch it is `#[cfg(target_os = "macos")]`-gated).
+    fn test_ctx() -> ControllerBuildContext {
+        ControllerBuildContext::new(
+            PanelLocks::new(),
+            std::env::temp_dir().join("dormant-registry-test"),
+        )
+    }
 
     /// Minimal valid `command` display config — used by the happy-path test
     /// and as a base for "missing fields" variants.
@@ -512,7 +606,7 @@ mod tests {
         cfg.output = Some("cg:deadbeef-0000-0000-0000-000000000000".into());
 
         let creds = Credentials::default();
-        let chain = build_controllers("main", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("main", &cfg, &creds, &test_ctx()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "macos-gamma-black");
 
@@ -543,7 +637,7 @@ mod tests {
         cfg.output = None;
 
         let creds = Credentials::default();
-        match build_controllers("main", &cfg, &creds, &PanelLocks::new()) {
+        match build_controllers("main", &cfg, &creds, &test_ctx()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("display 'main'"));
                 assert!(detail.contains("missing 'output'"));
@@ -556,7 +650,7 @@ mod tests {
     fn build_command_happy() {
         let cfg = command_cfg();
         let creds = Credentials::default();
-        let chain = build_controllers("main", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("main", &cfg, &creds, &test_ctx()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "command");
         assert_eq!(chain[0].supported_modes(), vec![BlankMode::PowerOff]);
@@ -609,7 +703,7 @@ mod tests {
             .samsung
             .insert("192.0.2.7".into(), "test-token".into());
 
-        let chain = build_controllers("tv", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("tv", &cfg, &creds, &test_ctx()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "samsung-tizen");
 
@@ -662,7 +756,7 @@ mod tests {
         cfg.ddc_display = Some("DELL".into());
 
         let creds = Credentials::default();
-        let chain = build_controllers("main", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("main", &cfg, &creds, &test_ctx()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name(), "ddcci");
 
@@ -684,7 +778,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.controllers = vec!["lg-webos".into()]; // not yet registered (M3)
         let creds = Credentials::default();
-        let res = build_controllers("main", &cfg, &creds, &PanelLocks::new());
+        let res = build_controllers("main", &cfg, &creds, &test_ctx());
         match res {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("unknown controller 'lg-webos'"));
@@ -700,7 +794,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.blank_command = None;
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
+        match build_controllers("tv-corner", &cfg, &creds, &test_ctx()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(
                     detail.contains("display 'tv-corner'"),
@@ -718,7 +812,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.wake_command = None;
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
+        match build_controllers("tv-corner", &cfg, &creds, &test_ctx()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("missing 'wake_command'"));
                 assert!(detail.contains("display 'tv-corner'"));
@@ -733,7 +827,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.modes = None;
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
+        match build_controllers("tv-corner", &cfg, &creds, &test_ctx()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(detail.contains("missing or empty 'modes'"));
                 assert!(detail.contains("display 'tv-corner'"));
@@ -750,7 +844,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.modes = Some(vec![]);
         let creds = Credentials::default();
-        match build_controllers("tv-corner", &cfg, &creds, &PanelLocks::new()) {
+        match build_controllers("tv-corner", &cfg, &creds, &test_ctx()) {
             Err(DormantError::ConfigInvalid { detail }) => {
                 assert!(
                     detail.contains("missing or empty 'modes'"),
@@ -768,7 +862,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.controllers = vec![];
         let creds = Credentials::default();
-        let chain = build_controllers("no-display", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("no-display", &cfg, &creds, &test_ctx()).unwrap();
         assert!(chain.is_empty());
     }
 
@@ -780,7 +874,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.controllers = vec!["command".into(), "command".into()];
         let creds = Credentials::default();
-        let chain = build_controllers("multi", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("multi", &cfg, &creds, &test_ctx()).unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].name(), "command");
         assert_eq!(chain[1].name(), "command");
@@ -791,7 +885,7 @@ mod tests {
         let mut cfg = command_cfg();
         cfg.command_timeout = Duration::from_secs(42);
         let creds = Credentials::default();
-        let chain = build_controllers("with-timeout", &cfg, &creds, &PanelLocks::new()).unwrap();
+        let chain = build_controllers("with-timeout", &cfg, &creds, &test_ctx()).unwrap();
         // We can't observe the timeout directly through the trait, but the
         // controller built with a non-default timeout must at least not panic
         // and expose the configured mode set.

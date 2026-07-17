@@ -8,6 +8,7 @@ pub mod app;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;
+pub mod gamma_recovery;
 pub mod idle_source;
 pub mod inhibit_activity;
 pub mod inhibit_audio;

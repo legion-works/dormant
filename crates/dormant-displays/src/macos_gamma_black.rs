@@ -69,6 +69,8 @@ use dormant_core::error::{DormantError, E_DISPLAY_IO};
 use dormant_core::traits::{DisplayController, PanelState};
 use dormant_core::types::{BlankMode, CmdFailure};
 
+use crate::gamma_breadcrumb::GammaBreadcrumb;
+
 /// Numeric Core Graphics display identifier (`CGDirectDisplayID` in Apple's
 /// headers). Defined platform-neutrally — not behind
 /// `#[cfg(target_os = "macos")]` — so [`GammaApi`], [`GammaTable`], and
@@ -359,6 +361,13 @@ pub struct MacosGammaBlackController {
     selector: String,
     api: Arc<dyn GammaApi>,
     holds: Arc<GammaHoldRegistry>,
+    /// Task 8 crash-insurance breadcrumb (`crate::gamma_breadcrumb`).
+    /// `None` in the plain [`Self::with_api`] constructor (most of this
+    /// module's own tests don't exercise breadcrumb persistence and would
+    /// otherwise need a throwaway temp dir each); ALWAYS `Some` in
+    /// production (see [`Self::new`], which always threads one in from the
+    /// daemon's [`crate::registry::ControllerBuildContext`]).
+    breadcrumb: Option<Arc<GammaBreadcrumb>>,
 }
 
 impl MacosGammaBlackController {
@@ -369,19 +378,29 @@ impl MacosGammaBlackController {
     /// constructed once and reused across every reload generation so a
     /// panel's saved wake table survives a config reload (mirrors
     /// [`crate::ddc_lock::PanelLocks`]'s contract for `DdcciController`).
+    /// `breadcrumb` is the daemon's single process-wide
+    /// [`GammaBreadcrumb`] — same one-instance-per-daemon-lifetime contract
+    /// as `holds` (both come from the same
+    /// [`crate::registry::ControllerBuildContext`]).
     #[cfg(target_os = "macos")]
     #[must_use]
-    pub fn new(selector: String, holds: Arc<GammaHoldRegistry>) -> Self {
-        Self::with_api(
+    pub fn new(
+        selector: String,
+        holds: Arc<GammaHoldRegistry>,
+        breadcrumb: Arc<GammaBreadcrumb>,
+    ) -> Self {
+        Self::with_api_and_breadcrumb(
             selector,
             Arc::new(crate::macos_display_catalog::RealGammaApi),
             holds,
+            breadcrumb,
         )
     }
 
     /// Build a `MacosGammaBlackController` with a custom [`GammaApi`]
-    /// implementation (used by tests to inject the test `FakeGammaApi`, and
-    /// by the macOS-only `Self::new` to inject the real backend).
+    /// implementation and NO breadcrumb persistence (used by this module's
+    /// own tests that aren't exercising the breadcrumb contract — see
+    /// [`Self::with_api_and_breadcrumb`] for tests that are).
     #[must_use]
     pub fn with_api(
         selector: String,
@@ -392,6 +411,26 @@ impl MacosGammaBlackController {
             selector,
             api,
             holds,
+            breadcrumb: None,
+        }
+    }
+
+    /// Build a `MacosGammaBlackController` with a custom [`GammaApi`]
+    /// implementation AND breadcrumb persistence wired in (used by
+    /// production `Self::new` — macOS-only, so not linkable from a doc
+    /// build on this target — and by breadcrumb-focused tests).
+    #[must_use]
+    pub fn with_api_and_breadcrumb(
+        selector: String,
+        api: Arc<dyn GammaApi>,
+        holds: Arc<GammaHoldRegistry>,
+        breadcrumb: Arc<GammaBreadcrumb>,
+    ) -> Self {
+        Self {
+            selector,
+            api,
+            holds,
+            breadcrumb: Some(breadcrumb),
         }
     }
 
@@ -486,6 +525,20 @@ impl DisplayController for MacosGammaBlackController {
             )));
         }
 
+        // Task 8 crash insurance: persist the breadcrumb BEFORE the first
+        // LUT write below — a crash between this call and the write still
+        // leaves a breadcrumb naming the selector about to go dark, never a
+        // write with no breadcrumb behind it. A breadcrumb write failure
+        // aborts the blank entirely (fail-safe: better to refuse a blank
+        // than to gamma-black a panel with no crash-recovery marker).
+        if let Some(bc) = &self.breadcrumb {
+            bc.add_selector(&self.selector).map_err(|e| {
+                Self::io_err(format!(
+                    "failed to persist gamma-blank breadcrumb before write: {e}"
+                ))
+            })?;
+        }
+
         let black = GammaTable::black(current.len());
         self.api
             .write_table(id, &black)
@@ -545,6 +598,24 @@ impl DisplayController for MacosGammaBlackController {
         match self.api.read_table(id) {
             Ok(confirm) if confirm == saved => {
                 self.holds.clear(&self.selector);
+                // Task 8 crash insurance: remove this selector from the
+                // breadcrumb only AFTER a confirmed, successful wake replay
+                // (mirrors the hold-registry clear immediately above).
+                // Best-effort: a removal failure does not un-succeed a wake
+                // that has already physically landed — logged, not
+                // propagated (mirrors the startup/shutdown restore paths'
+                // "log, never abort" contract in `dormantd::gamma_recovery`).
+                if let Some(Err(e)) = self
+                    .breadcrumb
+                    .as_ref()
+                    .map(|bc| bc.remove_selector(&self.selector))
+                {
+                    tracing::warn!(
+                        event = "gamma_breadcrumb_clear_failed",
+                        selector = %self.selector,
+                        error = %e,
+                    );
+                }
                 Ok(())
             }
             Ok(_) => Err(Self::io_err(format!(
@@ -579,6 +650,15 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A fresh, temp-dir-backed [`GammaBreadcrumb`] for breadcrumb-focused
+    /// tests. Returns the owning [`tempfile::TempDir`] too — it must stay
+    /// alive for the breadcrumb's directory to keep existing.
+    fn test_breadcrumb() -> (tempfile::TempDir, Arc<GammaBreadcrumb>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bc = Arc::new(GammaBreadcrumb::new(dir.path()));
+        (dir, bc)
+    }
 
     // ── FakeGammaApi ───────────────────────────────────────────────────────
 
@@ -682,6 +762,16 @@ mod tests {
 
         fn saved_table_replay_calls(&self) -> u32 {
             self.inner.lock().unwrap().saved_table_replay_calls
+        }
+
+        /// Count of `write_table` calls that wrote a BLACK table — i.e. the
+        /// blank-path LUT write itself (as opposed to
+        /// [`Self::saved_table_replay_calls`]'s non-black saved-table
+        /// replays). Used to prove a failed breadcrumb persist aborts
+        /// `blank()` before touching the LUT at all — see
+        /// `blank_aborts_before_any_lut_write_when_breadcrumb_persist_fails`.
+        fn blank_write_calls(&self) -> u32 {
+            self.inner.lock().unwrap().blank_write_calls
         }
 
         fn restore_all_calls(&self) -> u32 {
@@ -861,6 +951,157 @@ mod tests {
 
         assert!(!api.current("cg:panel").is_black());
         assert_eq!(api.saved_table_replay_calls(), 1);
+    }
+
+    // ── Task 8: breadcrumb persistence wiring ─────────────────────────────
+
+    #[tokio::test]
+    async fn blank_persists_breadcrumb_before_the_lut_write() {
+        let api = Arc::new(FakeGammaApi::with_table(
+            "cg:panel",
+            GammaTable::linear(256),
+        ));
+        let holds = Arc::new(GammaHoldRegistry::default());
+        let (_dir, breadcrumb) = test_breadcrumb();
+        let controller = MacosGammaBlackController::with_api_and_breadcrumb(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            holds,
+            Arc::clone(&breadcrumb),
+        );
+
+        assert!(!breadcrumb.exists(), "no breadcrumb before any blank");
+        controller.blank(BlankMode::BrightnessZero).await.unwrap();
+
+        let state = breadcrumb.read().expect("breadcrumb persisted by blank()");
+        assert!(state.held_selectors.contains("cg:panel"));
+        assert!(api.current("cg:panel").is_black());
+    }
+
+    #[tokio::test]
+    async fn blank_aborts_before_any_lut_write_when_breadcrumb_persist_fails() {
+        // Proves the breadcrumb-persist-before-LUT-write ordering invariant
+        // (module docs, "Task 8 crash insurance" comment in `blank()`): make
+        // the breadcrumb path un-writable by pre-creating
+        // `gamma-blank.json` as a DIRECTORY, so `add_selector`'s atomic
+        // temp-file-then-rename fails (rename onto an existing directory is
+        // rejected by the OS). If `blank()` ever wrote the LUT before (or
+        // without regard to) a successful breadcrumb persist, this test
+        // would see a black table / nonzero write count despite the
+        // breadcrumb failure — exactly what reviewer Mutation A (swapping
+        // the write/persist order) would cause.
+        let api = Arc::new(FakeGammaApi::with_table(
+            "cg:panel",
+            GammaTable::linear(256),
+        ));
+        let holds = Arc::new(GammaHoldRegistry::default());
+        let (dir, breadcrumb) = test_breadcrumb();
+        std::fs::create_dir(
+            dir.path()
+                .join(crate::gamma_breadcrumb::BREADCRUMB_FILENAME),
+        )
+        .expect("pre-create breadcrumb path as a directory");
+        let controller = MacosGammaBlackController::with_api_and_breadcrumb(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            holds,
+            Arc::clone(&breadcrumb),
+        );
+
+        let err = controller
+            .blank(BlankMode::BrightnessZero)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.error
+                .contains("failed to persist gamma-blank breadcrumb before write"),
+            "error must name the breadcrumb persist failure: {err}"
+        );
+        assert_eq!(
+            api.blank_write_calls(),
+            0,
+            "a failed breadcrumb persist must abort blank() before ANY LUT \
+             write lands — Mutation A (swapping write/persist order) makes \
+             this assertion fail"
+        );
+        assert!(
+            !api.current("cg:panel").is_black(),
+            "the display's table must be untouched when breadcrumb persist \
+             fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_clears_breadcrumb_after_confirmed_replay() {
+        let api = Arc::new(FakeGammaApi::with_table(
+            "cg:panel",
+            GammaTable::linear(256),
+        ));
+        let holds = Arc::new(GammaHoldRegistry::default());
+        let (_dir, breadcrumb) = test_breadcrumb();
+        let controller = MacosGammaBlackController::with_api_and_breadcrumb(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            holds,
+            Arc::clone(&breadcrumb),
+        );
+
+        controller.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert!(breadcrumb.exists(), "breadcrumb held after blank");
+
+        controller.wake().await.unwrap();
+        assert!(
+            !breadcrumb.exists(),
+            "breadcrumb must be cleared after a confirmed wake replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn breadcrumb_survives_repeated_idempotent_blank() {
+        // First-blank-wins: the second blank() call is a no-op short-circuit
+        // (see `first_blank_wins_and_repeated_blank_never_saves_black`) and
+        // must not re-add (or otherwise disturb) the already-held selector.
+        let api = Arc::new(FakeGammaApi::with_table(
+            "cg:panel",
+            GammaTable::linear(256),
+        ));
+        let holds = Arc::new(GammaHoldRegistry::default());
+        let (_dir, breadcrumb) = test_breadcrumb();
+        let controller = MacosGammaBlackController::with_api_and_breadcrumb(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            holds,
+            Arc::clone(&breadcrumb),
+        );
+
+        controller.blank(BlankMode::BrightnessZero).await.unwrap();
+        controller.blank(BlankMode::BrightnessZero).await.unwrap();
+
+        let state = breadcrumb.read().expect("breadcrumb still present");
+        assert_eq!(state.held_selectors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_api_without_breadcrumb_still_blanks_and_wakes() {
+        // Most of this module's tests use `with_api` (no breadcrumb) — this
+        // pins that the breadcrumb wiring is genuinely optional and never
+        // required for the core blank/wake contract to keep working.
+        let api = Arc::new(FakeGammaApi::with_table(
+            "cg:panel",
+            GammaTable::linear(256),
+        ));
+        let holds = Arc::new(GammaHoldRegistry::default());
+        let controller = MacosGammaBlackController::with_api(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            holds,
+        );
+
+        controller.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert!(api.current("cg:panel").is_black());
+        controller.wake().await.unwrap();
+        assert!(!api.current("cg:panel").is_black());
     }
 
     // ── Additional coverage (not in the plan's RED list, cheap + honest) ──

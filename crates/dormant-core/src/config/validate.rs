@@ -1336,7 +1336,7 @@ fn validate_display(
     }
 
     // Per-controller required field checks (still per-controller).
-    for controller in &dc.controllers {
+    for (controller_index, controller) in dc.controllers.iter().enumerate() {
         match controller.as_str() {
             "samsung-tizen" => {
                 if dc.host.is_none() {
@@ -1482,17 +1482,11 @@ fn validate_display(
                 }
             }
             "macos-display-sleep" => {
-                // Task 10 ratified contract (the explicit exception named in
-                // `docs/research/2026-07-16-macos-display-selector.md`):
-                // this controller is GLOBAL — it puts every display on the
-                // Mac to sleep via `pmset displaysleepnow`, with no
-                // per-display targeting surface at all. `output` must
-                // therefore be either absent, or the literal string `"all"`
-                // (an explicit "yes, I mean every display" opt-in) — any
-                // *named* selector (`"cg:<uuid>"`, a connector name like
-                // `"DP-1"`, anything else) is a hard error, because this
-                // controller could never honor it.
-                if let Some(output) = &dc.output
+                // Display sleep is global, so a leading instance must reject
+                // named selectors. In a fallback position, `output` belongs
+                // to an earlier controller and is ignored here.
+                if controller_index == 0
+                    && let Some(output) = &dc.output
                     && output != "all"
                 {
                     errors.push(ValidationError {
@@ -2672,6 +2666,33 @@ gracee_period = "60s"
     }
 
     #[test]
+    fn macos_display_sleep_fallback_accepts_a_preceding_controller_selector() {
+        let dc = DisplayConfig {
+            controllers: vec![
+                "ddcci".into(),
+                "macos-gamma-black".into(),
+                "macos-display-sleep".into(),
+            ],
+            blank_mode: Some(BlankMode::PowerOff),
+            output: Some("cg:aabd49bb-0000-0000-0000-000000000000".into()),
+            ddc_display: Some("1".into()),
+            ..base_display_cfg()
+        };
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "the documented macOS fallback chain must accept its shared selector: {errors:?}"
+        );
+    }
+
+    #[test]
     fn macos_display_sleep_output_absent_is_accepted() {
         let dc = macos_display_sleep_cfg(None);
         let mut errors = Vec::new();
@@ -2722,6 +2743,30 @@ gracee_period = "60s"
                 .any(|e| e.detail.contains("must be absent or the literal \"all\"")),
             "a named cg: selector must be rejected — this controller has no \
              per-display targeting surface: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_display_sleep_first_in_chain_rejects_named_cg_selector() {
+        let dc = DisplayConfig {
+            controllers: vec!["macos-display-sleep".into(), "ddcci".into()],
+            blank_mode: Some(BlankMode::PowerOff),
+            output: Some("cg:panel".into()),
+            ..base_display_cfg()
+        };
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("must be absent or the literal \"all\"")),
+            "a leading global controller must reject a named selector: {errors:?}"
         );
     }
 

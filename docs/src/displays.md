@@ -106,13 +106,15 @@ macOS-only, last-resort fallback controller. `blank()` runs
 display sleep — every attached display sleeps together, not just one
 panel. `wake()` asserts a temporary IOPM user-activity assertion and polls
 CoreGraphics until every online display reports itself awake again. Only
-supports `power_off`; there is no per-display selector — omit `output` or
-set it to the literal `"all"`.
+supports `power_off`; when it is the first controller, there is no
+per-display selector — omit `output` or set it to the literal `"all"`.
 
 ```toml
 [displays.mac]
 controllers = ["ddcci", "macos-gamma-black", "macos-display-sleep"]
 blank_mode = "power_off"
+output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230"
+ddc_display = "1"
 ```
 
 Use this as the tail of a fallback chain, after `ddcci` and
@@ -163,7 +165,11 @@ For an OLED panel on macOS reachable over DDC/CI, the plan-recommended
 fallback order is:
 
 ```toml
+[displays.oled_mac]
 controllers = ["ddcci", "macos-gamma-black", "macos-display-sleep"]
+blank_mode = "power_off"
+output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230"
+ddc_display = "1"
 ```
 
 `ddcci` first (audio-safe, panel-internal, per-monitor); `macos-gamma-black`
@@ -171,6 +177,8 @@ next when DDC/CI is unavailable or unsupported (also audio-safe, but only a
 color-LUT black, not a real power-off, and with the restart caveats above);
 `macos-display-sleep` last (a real hardware sleep, but whole-machine and
 with no audio-safety guarantee — treat it as the fallback of last resort).
+As a fallback member, `macos-display-sleep` ignores the per-display `output`
+selector; the `cg:` selector above targets `macos-gamma-black`.
 
 ### `samsung-tizen` — Samsung Tizen TV
 

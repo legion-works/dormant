@@ -910,6 +910,7 @@ name = "dormant-doctor"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "core-foundation-sys",
  "dormant-core",
  "dormant-displays",
  "dormant-sensors",

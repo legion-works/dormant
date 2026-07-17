@@ -214,8 +214,8 @@ mod tests {
                     &raw mut master_fd,
                     &raw mut slave_fd,
                     name_buf.as_mut_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             };
             if rc != 0 {

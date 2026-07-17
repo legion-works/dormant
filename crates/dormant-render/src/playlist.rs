@@ -273,7 +273,6 @@ fn scan_dir(
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::ffi::OsStrExt;
 
     /// Build a tempdir tree with the given structure.
     ///
@@ -423,7 +422,11 @@ mod tests {
 
     #[test]
     fn case_insensitive_extensions() {
-        let tmp = make_tree(&["img.JPG", "img.JpG", "vid.MP4", "vid.Mp4"]);
+        // Distinct basenames: macOS APFS is case-insensitive, so names
+        // differing only in extension case (img.JPG / img.JpG) collapse
+        // into ONE file there — the extension-matching logic under test
+        // is exercised by the case-varied extensions alone.
+        let tmp = make_tree(&["a.JPG", "b.JpG", "c.MP4", "d.Mp4"]);
 
         let source = ScreensaverSource {
             path: Some(tmp.path().to_string_lossy().into_owned()),
@@ -810,8 +813,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // Linux-only: macOS APFS rejects non-UTF-8 filenames at the syscall
+    // level (EILSEQ, errno 92 "Illegal byte sequence"), so the fixture
+    // this test needs cannot exist there — the skip path is unreachable
+    // on macOS by construction. On Linux (ext4 et al.) arbitrary bytes
+    // are legal filenames and the skip path is real.
+    #[cfg(target_os = "linux")]
     fn non_utf8_paths_are_skipped() {
+        use std::os::unix::ffi::OsStrExt;
+
         let tmp = tempfile::tempdir().expect("tempdir");
         // Create a valid UTF-8 media file (should be included).
         fs::write(tmp.path().join("good.jpg"), b"").expect("write good.jpg");

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use ddc_hi::Ddc;
 
 use crate::ddc_lock::PanelLock;
@@ -172,11 +172,23 @@ fn acquire(lock: &PanelLock, prio: VcpPriority) -> Result<crate::ddc_lock::Panel
 /// Real DDC/CI operations backed by ddc-hi, with every call wrapped in
 /// [`tokio::task::spawn_blocking`].
 ///
-/// Only available on Linux — DDC/CI I²C access requires platform support.
-#[cfg(target_os = "linux")]
+/// Available on Linux (I²C-dev) and macOS (the vendored, path-patched
+/// `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md`). On both
+/// platforms `ddc_hi::Display` hides the backend behind one enum `Handle`,
+/// so every method below is identical code for both — there is no
+/// macOS-specific branch here. A macOS host with the private `CoreDisplay`
+/// symbols unavailable (`ddc-macos`'s `Error::MissingCoreDisplaySymbol` /
+/// `CoreDisplayFrameworkUnavailable`) never surfaces as a panic or a build
+/// failure: `ddc_macos::Monitor::enumerate()` treats a display it can't
+/// resolve a service for as absent rather than erroring the whole
+/// enumeration (upstream `ddc-hi` only trusts an `Ok` enumeration result
+/// too), so it simply drops out of `list_displays()` — the existing empty/
+/// no-match handling in `DdcciController::probe`/`is_available` already
+/// turns that into an ordinary "unavailable" outcome.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct RealVcp;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl RealVcp {
     /// Enumerate synchronously (called inside `spawn_blocking`).
     fn enumerate_displays() -> Vec<(String, ddc_hi::Display)> {
@@ -199,7 +211,7 @@ impl RealVcp {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait]
 impl VcpOps for RealVcp {
     async fn list_displays(&self) -> Vec<VcpDisplayInfo> {
@@ -758,6 +770,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, 7);
+    }
+
+    /// Task 6 test 4: sampler yields to a waiting command through the
+    /// `vcp_ops` acquisition layer (`acquire()` + `PanelLock`), combining
+    /// the existing delayed-transaction pattern
+    /// (`command_priority_serializes_two_concurrent_transactions`) with the
+    /// existing skip-on-contention pattern (`sampler_priority_skips_when_lock_is_held`)
+    /// into one three-party scenario neither covers alone: an in-flight
+    /// sampler read, a command that arrives and announces itself while that
+    /// read is still running, and a SECOND sampler read that arrives after
+    /// the command has announced.
+    ///
+    /// `FakeVcp::call_log` records each call the instant its (synchronous)
+    /// prelude runs — before the spawned closure ever touches the panel
+    /// lock — so, given the staggered spawn order below, the log order IS
+    /// invocation order: `["sample-1", "command", "sample-2"]`. That both
+    /// proves the plain ordering AND, combined with the return-value
+    /// assertions, proves `sample-2` never blocked behind `sample-1`'s
+    /// in-flight transaction — it yielded (`VCP_SKIPPED`) the instant it
+    /// observed the command's announcement, never touching the panel.
+    #[tokio::test]
+    async fn sampler_yields_to_a_waiting_command_through_real_vcp_ops() {
+        let fake = Arc::new(single_display_fake());
+        let panel_locks = PanelLocks::new();
+        let panel_lock = panel_locks.get(IDENT);
+
+        // sample-1: holds the panel for 80ms via a sampler-priority read on
+        // 0x10 — the "in-flight sampler transaction" a command must wait
+        // behind (mirrors `command_priority_serializes_two_concurrent_transactions`).
+        fake.expect_get_delay(IDENT, 0x10, Duration::from_millis(80));
+        fake.expect_get(IDENT, 0x10, Ok(1));
+        // command: a command-priority read on a distinct code (0x11) so its
+        // call-log entry is unambiguous; it must wait for sample-1 to
+        // release before it can even attempt acquisition.
+        fake.expect_get(IDENT, 0x11, Ok(2));
+        // sample-2 (0x12) is deliberately left unscripted: it must yield
+        // via VCP_SKIPPED before ever consuming a script entry — if it
+        // instead blocked and eventually ran, it would surface FakeVcp's
+        // "no scripted response" error instead, failing the assertion below
+        // for the right reason.
+
+        let fake1 = Arc::clone(&fake);
+        let sample1_lock = Arc::clone(&panel_lock);
+        let sample1 = tokio::spawn(async move {
+            fake1
+                .get_vcp(IDENT, 0x10, &sample1_lock, VcpPriority::Sampler)
+                .await
+        });
+
+        // Let sample-1 acquire the lock and enter its 80ms delay.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let fake2 = Arc::clone(&fake);
+        let command_lock = Arc::clone(&panel_lock);
+        let command = tokio::spawn(async move {
+            fake2
+                .get_vcp(IDENT, 0x11, &command_lock, VcpPriority::Command)
+                .await
+        });
+
+        // Let command's spawn_blocking closure actually reach
+        // `command_guard()` (announcing itself) before sample-2 arrives.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let sample2_result = fake
+            .get_vcp(IDENT, 0x12, &panel_lock, VcpPriority::Sampler)
+            .await;
+
+        let sample1_result = sample1.await.unwrap();
+        let command_result = command.await.unwrap();
+
+        assert_eq!(
+            sample1_result,
+            Ok(1),
+            "in-flight sampler read completes normally"
+        );
+        assert_eq!(
+            command_result,
+            Ok(2),
+            "command waits for sample-1, then succeeds"
+        );
+        assert_eq!(
+            sample2_result,
+            Err(VCP_SKIPPED.to_string()),
+            "sample-2 must yield to the waiting command, not queue behind it"
+        );
+
+        let log = fake.take_call_log();
+        let order: Vec<&str> = log
+            .iter()
+            .map(|l| {
+                if l.contains("0x10") {
+                    "sample-1"
+                } else if l.contains("0x11") {
+                    "command"
+                } else if l.contains("0x12") {
+                    "sample-2"
+                } else {
+                    "?"
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["sample-1", "command", "sample-2"],
+            "invocation order must match the staggered spawn order: {log:?}"
+        );
     }
 
     /// `set_vcp`'s panic path mirrors `get_vcp`'s (same `acquire` +

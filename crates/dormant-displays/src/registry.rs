@@ -24,7 +24,7 @@ use dormant_core::types::BlankMode;
 
 use crate::command::CommandController;
 use crate::ddc_lock::PanelLocks;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::ddcci::DdcciController;
 use crate::ha_passthrough::HaPassthroughController;
 #[cfg(target_os = "linux")]
@@ -33,13 +33,20 @@ use crate::samsung_tizen::SamsungTizenController;
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
 ///
-/// Entries are platform-gated: `ddcci` (DDC/CI over I²C) is Linux-only.
+/// Entries are platform-gated:
+/// - `ddcci` (DDC/CI, controller-name-stable across backends — see
+///   `crate::ddcci` module docs) is available on Linux (I²C-dev) and macOS
+///   (the vendored `ddc-macos` fork).
+/// - `kwin-dpms` is Linux-only (a KDE Plasma / `KWin` compositor feature).
 ///
 /// Tasks 12-15 append additional entries (`KWin` DPMS, Samsung Tizen,
 /// LG webOS, HA passthrough, …) as their modules land.
 ///
-/// Tests: on Linux, `ddcci` must be present (test: `controller_types_contains_ddcci_on_linux`).
-/// Off-Linux, it must be absent so config validation rejects it deterministically.
+/// Tests: `controller_types_contains_ddcci_on_linux` /
+/// `controller_types_contains_ddcci_on_macos` pin presence on their
+/// respective targets; `controller_types_excludes_ddcci_elsewhere` pins
+/// absence everywhere else, so config validation rejects `ddcci`
+/// deterministically on a platform that can never build `RealVcp`.
 #[cfg(target_os = "linux")]
 pub const CONTROLLER_TYPES: &[&str] = &[
     "command",
@@ -48,7 +55,9 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "kwin-dpms",
     "samsung-tizen",
 ];
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough", "samsung-tizen"];
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-tizen"];
 
 /// Static candidate modes per controller type.
@@ -62,12 +71,13 @@ pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-ti
 /// layer-1 checks (does the user's `blank_mode` / `degraded_mode` make sense
 /// for the controllers it asks for?).
 ///
-/// `ddcci` is only listed on Linux (DDC/CI requires platform I²C support).
+/// `ddcci` is listed on Linux and macOS (see [`CONTROLLER_TYPES`] for the
+/// platform rationale); `kwin-dpms` remains Linux-only.
 #[must_use]
 pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
     let mut m: HashMap<String, Vec<BlankMode>> = HashMap::new();
     m.insert("command".to_string(), Vec::new());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     m.insert(
         "ddcci".to_string(),
         vec![BlankMode::BrightnessZero, BlankMode::PowerOff],
@@ -118,7 +128,7 @@ pub fn build_controllers(
 
     for name in &cfg.controllers {
         match name.as_str() {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             "ddcci" => {
                 // Normalize empty matcher to None so the controller auto-selects
                 // the single detected display instead of trying to match "".
@@ -309,16 +319,81 @@ mod tests {
         );
     }
 
-    // Off-Linux: ddcci is deliberately absent from CONTROLLER_TYPES so that
-    // config validation rejects `controllers = ["ddcci"]` deterministically
-    // with "unknown controller" rather than silently accepting it and failing
-    // later at controller build time.
+    /// Task 6: `ddcci` broadens to macOS (the vendored `ddc-macos` fork
+    /// backs `RealVcp` there — see `vendor/ddc-macos/README.dormant.md`).
+    /// DEFERRED: PR CI — `#[cfg(target_os = "macos")]` code never compiles
+    /// in this Linux sandbox, so this cannot run here; it is written now so
+    /// the macOS CI lane (Task 2) exercises it.
     #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn controller_types_excludes_ddcci_off_linux() {
+    #[cfg(target_os = "macos")]
+    fn controller_types_contains_ddcci_on_macos() {
+        assert!(
+            CONTROLLER_TYPES.contains(&"ddcci"),
+            "ddcci must be registered on macOS"
+        );
+    }
+
+    // Everywhere else (e.g. Windows): ddcci is deliberately absent from
+    // CONTROLLER_TYPES so that config validation rejects
+    // `controllers = ["ddcci"]` deterministically with "unknown controller"
+    // rather than silently accepting it and failing later at controller
+    // build time — there is no `RealVcp` backend for these targets.
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn controller_types_excludes_ddcci_elsewhere() {
         assert!(
             !CONTROLLER_TYPES.contains(&"ddcci"),
-            "ddcci must NOT be registered on non-Linux platforms"
+            "ddcci must NOT be registered on platforms with no RealVcp backend"
+        );
+    }
+
+    /// Task 6 RED-first test 1: `CONTROLLER_TYPES` and `capabilities()`
+    /// must advertise EXACTLY the same set of controller type names for
+    /// whichever target this crate is compiled for — a drift here means
+    /// config validation (`CONTROLLER_TYPES`) and the layer-1 blank-mode
+    /// check (`capabilities()`) disagree about what a controller name
+    /// means. Runs unconditionally (no target cfg) since the property must
+    /// hold on every platform, not just Linux; on Linux specifically it was
+    /// already true before this task's changes — see the report for the
+    /// "already green" note.
+    #[test]
+    fn advertised_types_exactly_match_capabilities() {
+        use std::collections::BTreeSet;
+
+        let types: BTreeSet<String> = CONTROLLER_TYPES.iter().map(|s| (*s).to_string()).collect();
+        let caps: BTreeSet<String> = capabilities().into_keys().collect();
+        assert_eq!(
+            types, caps,
+            "CONTROLLER_TYPES and capabilities() must advertise exactly the \
+             same controller-type names for this compiled target: \
+             CONTROLLER_TYPES={types:?} capabilities()={caps:?}"
+        );
+    }
+
+    /// Task 6 RED-first test 2: macOS advertises `ddcci` with EXACTLY
+    /// `[PowerOff, BrightnessZero]` — the same static capability set as
+    /// Linux, since it is the same controller (not a parallel macOS-only
+    /// controller) backed by the same `ddc-hi`/`RealVcp` code path.
+    /// DEFERRED: PR CI — cannot run in this Linux sandbox; written now for
+    /// the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_advertises_ddcci() {
+        use std::collections::HashSet;
+
+        let caps = capabilities();
+        let ddcci_modes: HashSet<BlankMode> = caps
+            .get("ddcci")
+            .expect("ddcci must be present in capabilities() on macOS")
+            .iter()
+            .copied()
+            .collect();
+        let expected: HashSet<BlankMode> = [BlankMode::PowerOff, BlankMode::BrightnessZero]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            ddcci_modes, expected,
+            "macOS ddcci capabilities must be exactly [PowerOff, BrightnessZero]"
         );
     }
 

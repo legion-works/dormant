@@ -28,7 +28,12 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rcgen = { version = "0.14", features = ["pem", "ring"], optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# ddc-hi is cross-platform by construction (its own Cargo.toml gates the
+# ddc-i2c backend to Linux/Windows and the ddc-macos backend to macOS via
+# target-cfg'd optional deps) -- Linux uses I2C-dev, macOS resolves through
+# the vendored, path-patched `ddc-macos` fork pinned in the workspace root
+# `[patch.crates-io]` (see vendor/ddc-macos/README.dormant.md).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ddc-hi = { workspace = true }
 
 [features]

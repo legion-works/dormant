@@ -1653,4 +1653,69 @@ mod tests {
              raced past it: {elapsed:?}"
         );
     }
+
+    // ── Task 6 test 6: one executor blank attempt == one DDC transaction ────
+
+    /// Regression guard for the Task 6 post-write verification/rollback
+    /// change (`DdcciController::verify_brightness_zero_write`): a single
+    /// `DisplayExecutor::blank()` call against a chain of one `DdcciController`
+    /// must start exactly ONE `set_vcp(0x10, 0)` transaction on the happy
+    /// path (verification succeeds) — the executor's retry machinery (built
+    /// for the wake burst; `blank()` has no retry loop at all) must never
+    /// wrap or duplicate a blank write, and the new verification step must
+    /// not either.
+    ///
+    /// "fork-internal write repeat is ONE transaction, not a controller
+    /// retry" (Task 6 plan): the vendored `ddc-macos` fork's ARM write path
+    /// performs two low-level I2C writes *inside* a single `execute_raw`
+    /// call (see `vendor/ddc-macos/README.dormant.md`) — invisible above
+    /// the `VcpOps::set_vcp` boundary this test observes. This test proves
+    /// the layers ABOVE that boundary (executor, controller) never turn one
+    /// logical write into more than one `set_vcp` call; it does not and
+    /// cannot exercise the fork's internal write shape (macOS-only code,
+    /// covered by the fork's own co-located tests, DEFERRED: PR CI).
+    #[tokio::test]
+    async fn one_executor_blank_attempt_starts_one_ddc_transaction() {
+        let ident = "i2c-dev:99 TST TEST";
+        let fake = Arc::new({
+            let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
+                ident_string: ident.into(),
+            }]);
+            f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
+            f
+        });
+        let locks = crate::ddc_lock::PanelLocks::new();
+        let mut ddc = crate::ddcci::DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn crate::vcp_ops::VcpOps>,
+            &locks,
+        );
+        ddc.probe().await.unwrap();
+
+        let sink: Arc<dyn CommandSink> = Arc::new(DisplayExecutor::new(
+            DisplayId("t6-panel".into()),
+            vec![Box::new(ddc) as Box<dyn DisplayController>],
+            BlankMode::BrightnessZero,
+            default_retry(),
+        ));
+
+        fake.expect_get(ident, 0x10, Ok(73)); // pre-write read
+        fake.expect_set(ident, 0x10, 0, Ok(())); // the write
+        fake.expect_get(ident, 0x10, Ok(0)); // post-write verification
+
+        sink.blank(BlankMode::BrightnessZero).await.unwrap();
+
+        let log = fake.take_call_log();
+        let transaction_count = log
+            .iter()
+            .filter(|l| l.starts_with("set_vcp") && l.contains("0x10"))
+            .count();
+        assert_eq!(
+            transaction_count, 1,
+            "one executor blank attempt must start exactly one DDC \
+             set_vcp(0x10, 0) transaction: {log:?}"
+        );
+    }
 }

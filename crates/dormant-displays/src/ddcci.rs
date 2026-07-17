@@ -1,9 +1,20 @@
 //! `ddcci` display controller — blanks monitors via DDC/CI VCP commands.
 //!
+//! Platform-neutral by design (Task 6): this is the ONE `ddcci` controller,
+//! not a parallel Linux/macOS pair. It talks to displays exclusively
+//! through [`crate::vcp_ops::VcpOps`]; only that trait's `RealVcp`
+//! implementation is platform-gated (Linux I²C-dev vs. macOS's vendored
+//! `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md`). Every
+//! byte this module sends or interprets (VCP 0x10, 0xD6, 0xC0, the
+//! saved-brightness/rollback state machine below) is identical on both.
+//!
 //! The controller exposes two blank modes:
 //!
-//! - `BrightnessZero` — set VCP code 0x10 (brightness) to 0. Always
-//!   available. This is the audio-preserving fallback for monitors.
+//! - `BrightnessZero` — set VCP code 0x10 (brightness) to 0, then verify
+//!   the write landed via a readback; a failed verification rolls back to
+//!   the saved operator level before returning the original error (see
+//!   `DdcciController::verify_brightness_zero_write`). Always available.
+//!   This is the audio-preserving fallback for monitors.
 //! - `PowerOff` — set VCP code 0xD6 (power) to 0x05 (off). Only available
 //!   after `probe` confirms the display supports 0xD6.
 //!
@@ -23,7 +34,7 @@ use dormant_core::traits::DisplayController;
 use dormant_core::types::{BlankMode, CmdFailure};
 
 use crate::ddc_lock::{PanelLock, PanelLocks};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::vcp_ops::RealVcp;
 use crate::vcp_ops::{VcpOps, VcpPriority};
 
@@ -127,8 +138,9 @@ impl DdcciController {
     /// generation so the same physical panel always resolves to the same
     /// `Arc<PanelLock>`.
     ///
-    /// Only available on Linux — DDC/CI requires platform I²C support.
-    #[cfg(target_os = "linux")]
+    /// Available on Linux (I²C-dev) and macOS (the vendored `ddc-macos`
+    /// fork backing `RealVcp` — see `vendor/ddc-macos/README.dormant.md`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[must_use]
     pub fn new(
         matcher: Option<String>,
@@ -348,6 +360,16 @@ impl DisplayController for DdcciController {
                         controller: Self::NAME.to_string(),
                         error: format!("{E_DISPLAY_IO}: failed to set brightness to 0: {e}"),
                     })?;
+
+                // Post-write verification + rollback (Task 6 invariant): a
+                // DDC write can silently fail to land (flaky I²C bus, loose
+                // cable) — reading it back is the only way to know before
+                // trusting the panel is actually dark. On verification
+                // failure, roll back to the saved operator level in the
+                // SAME transaction before returning the ORIGINAL error; see
+                // `verify_brightness_zero_write` for the full contract.
+                self.verify_brightness_zero_write(&ident, &lock, current)
+                    .await?;
 
                 // Only save on the FIRST blank — a second blank while already
                 // blanked reads current=0 and would clobber the real saved
@@ -580,6 +602,73 @@ impl DisplayController for DdcciController {
 }
 
 impl DdcciController {
+    /// Post-write verification for a `BrightnessZero` blank's
+    /// `set_vcp(0x10, 0)` write, plus the rollback invariant (Task 6): a
+    /// DDC write can silently fail to land (flaky I²C bus, loose cable,
+    /// a monitor that ACKs but ignores the command) — reading it back
+    /// immediately after is the only way to know before the caller trusts
+    /// the panel is actually dark.
+    ///
+    /// On verification failure (the readback errors, or succeeds but
+    /// disagrees with the just-written `0`) this makes exactly ONE
+    /// best-effort attempt to write the panel back to its saved operator
+    /// level — first-blank-wins: the EXISTING `saved_brightness` if an
+    /// earlier blank in this session already established one, else
+    /// `pre_write` (this blank's own pre-write reading, the value that
+    /// would have become `saved_brightness` had verification succeeded) —
+    /// before returning the ORIGINAL verification error. A rollback
+    /// failure is appended to that error's detail, never swallowed and
+    /// never substituted for the original error. This is a single
+    /// same-transaction attempt, not a loop: retry policy belongs to the
+    /// executor above this controller (`crate::executor::DisplayExecutor`),
+    /// which already treats one `blank()` call as one attempt.
+    async fn verify_brightness_zero_write(
+        &self,
+        ident: &str,
+        lock: &Arc<PanelLock>,
+        pre_write: u16,
+    ) -> Result<(), CmdFailure> {
+        let verify_err = match self
+            .ops
+            .get_vcp(ident, VCP_BRIGHTNESS, lock, VcpPriority::Command)
+            .await
+        {
+            Ok(0) => return Ok(()),
+            Ok(v) => format!("post-write verification mismatch: wrote 0, read back {v}"),
+            Err(e) => format!("post-write verification read failed: {e}"),
+        };
+
+        let rollback_value = {
+            let state = self.state.lock().unwrap();
+            state.saved_brightness.unwrap_or(pre_write)
+        };
+
+        let mut detail = format!(
+            "{E_DISPLAY_IO}: failed to verify brightness-zero write on {ident}: {verify_err}"
+        );
+        if let Err(rollback_e) = self
+            .ops
+            .set_vcp(
+                ident,
+                VCP_BRIGHTNESS,
+                rollback_value,
+                lock,
+                VcpPriority::Command,
+            )
+            .await
+        {
+            use std::fmt::Write;
+            let _ = write!(
+                detail,
+                " (rollback to saved brightness {rollback_value} also failed: {rollback_e})"
+            );
+        }
+        Err(CmdFailure {
+            controller: Self::NAME.to_string(),
+            error: detail,
+        })
+    }
+
     /// Shared implementation of [`DisplayController::read_state`] and
     /// [`DisplayController::read_state_sampled`] — identical decode logic,
     /// differing only in the panel-lock acquisition strategy `prio`
@@ -821,8 +910,10 @@ mod tests {
         ctrl.probe().await.unwrap();
 
         // Now blank with BrightnessZero — needs get(0x10) then set(0x10, 0)
+        // then a post-write verification get(0x10) confirming it landed.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
 
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
 
@@ -866,6 +957,7 @@ mod tests {
         // First blank at 75 → saves 75, sets to 0.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(
             ctrl.state.lock().unwrap().saved_brightness,
@@ -876,6 +968,7 @@ mod tests {
         // Second blank reads current=0, sets to 0 again — must NOT clobber.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(
             ctrl.state.lock().unwrap().saved_brightness,
@@ -907,6 +1000,7 @@ mod tests {
         // Blank to save brightness
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(42));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
 
         // Wake — should restore saved 42
@@ -941,6 +1035,7 @@ mod tests {
         // First blank at 75.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
 
@@ -955,6 +1050,7 @@ mod tests {
         // Second blank at 90 → re-saves 90 (not stale 75).
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(90));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(
             ctrl.state.lock().unwrap().saved_brightness,
@@ -989,6 +1085,7 @@ mod tests {
         // First BrightnessZero blank at 75 -> saves 75.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
 
@@ -1006,6 +1103,7 @@ mod tests {
         // not skip saving because a stale saved_brightness was still Some.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(60));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(60));
 
@@ -1047,6 +1145,7 @@ mod tests {
         // BrightnessZero blank at 75 -> saves 75.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
 
@@ -1113,6 +1212,232 @@ mod tests {
             log.iter()
                 .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("55")),
             "should restore config default 55: {log:?}"
+        );
+    }
+
+    // ── Task 6 test 5: post-write verification + rollback (NEW behavior) ────
+
+    /// RED-first (Task 6): before `verify_brightness_zero_write` existed,
+    /// `blank()` never read back its own write — this test is exactly what
+    /// fails without it (see the report for the pasted RED output from
+    /// before the production change: `blank()` returned `Ok(())` and only
+    /// one `set_vcp` call was logged instead of two).
+    ///
+    /// Script: initial read 73 (first blank -> would-be saved value), write
+    /// 0 succeeds, the post-write verification readback FAILS, so the
+    /// controller rolls back to 73 (first-blank-wins: no prior
+    /// `saved_brightness` exists yet, so the rollback target is this
+    /// blank's own pre-write reading) — that rollback write succeeds, but
+    /// `blank()` still returns the ORIGINAL verification error, never `Ok`.
+    #[tokio::test]
+    async fn failed_post_write_verification_rolls_back_before_returning_error() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(73));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_BRIGHTNESS,
+            Err("readback failed".into()),
+        );
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 73, Ok(()));
+
+        let err = ctrl.blank(BlankMode::BrightnessZero).await.unwrap_err();
+        assert!(
+            err.error.contains("failed to verify brightness-zero write"),
+            "blank must surface the ORIGINAL verification error: {err}"
+        );
+        assert!(
+            err.error.contains("readback failed"),
+            "the original readback error must be present, not swallowed by \
+             the (successful) rollback: {err}"
+        );
+
+        // Rollback must not silently succeed into an Ok blank — the panel
+        // write is unverified, so the caller must be told it failed even
+        // though the panel is now safely back at 73.
+        assert!(
+            !err.error.to_lowercase().contains("rollback") || !err.error.contains("also failed"),
+            "a SUCCESSFUL rollback must not be reported as a rollback \
+             failure: {err}"
+        );
+
+        // Exact set_vcp sequence (write then rollback restore) is pinned
+        // separately by `failed_post_write_verification_rollback_set_call_sequence`.
+        let log = fake.take_call_log();
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("set_vcp")).count(),
+            2,
+            "exactly the write and the rollback restore, no retry loop: {log:?}"
+        );
+    }
+
+    /// Same scenario as the readback-failure test above, but asserting the
+    /// exact `set_vcp` call sequence via a single call-log drain: the
+    /// write (`0x10` -> 0) followed by the rollback (`0x10` -> 73, the
+    /// saved/pre-write value) — exactly two set calls, no controller-level
+    /// retry loop duplicating either one.
+    #[tokio::test]
+    async fn failed_post_write_verification_rollback_set_call_sequence() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(73));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_BRIGHTNESS,
+            Err("readback failed".into()),
+        );
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 73, Ok(()));
+
+        let err = ctrl.blank(BlankMode::BrightnessZero).await.unwrap_err();
+        assert!(err.error.contains("readback failed"));
+
+        let log = fake.take_call_log();
+        let set_calls: Vec<&String> = log.iter().filter(|l| l.starts_with("set_vcp")).collect();
+        assert_eq!(
+            set_calls,
+            vec![
+                "set_vcp(i2c-dev:56 DEL DELL U2723QE, 0x10, 0)",
+                "set_vcp(i2c-dev:56 DEL DELL U2723QE, 0x10, 73)",
+            ],
+            "exactly the write then the rollback restore, in order: {log:?}"
+        );
+
+        // saved_brightness must remain unset — verification never
+        // succeeded, so this was never established as the operator level
+        // (fail-toward-visible: a later successful blank still gets to
+        // save its OWN pre-write reading fresh).
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            None,
+            "a failed (unverified) blank must not establish saved_brightness"
+        );
+    }
+
+    /// Rollback-target sibling: when a PRIOR blank already established
+    /// `saved_brightness`, a later blank's failed verification must roll
+    /// back to that EXISTING saved value (first-blank-wins), not to this
+    /// blank's own (already-blanked, uninteresting) pre-write reading.
+    #[tokio::test]
+    async fn failed_post_write_verification_rolls_back_to_first_blank_wins_value() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // First blank establishes saved_brightness = 75 (verifies clean).
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(ctrl.state.lock().unwrap().saved_brightness, Some(75));
+
+        // Second blank: pre-write reading is 0 (already blanked), write
+        // succeeds, verification fails -- rollback must target the
+        // EXISTING saved 75, not this blank's own pre-write reading (0).
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_BRIGHTNESS,
+            Err("readback failed".into()),
+        );
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 75, Ok(()));
+
+        let err = ctrl.blank(BlankMode::BrightnessZero).await.unwrap_err();
+        assert!(err.error.contains("readback failed"));
+
+        let log = fake.take_call_log();
+        assert!(
+            log.iter()
+                .any(|l| l == "set_vcp(i2c-dev:56 DEL DELL U2723QE, 0x10, 75)"),
+            "rollback must restore the first-blank-wins saved value 75, \
+             not the second blank's own pre-write reading of 0: {log:?}"
+        );
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            Some(75),
+            "the existing saved_brightness must survive a failed second blank"
+        );
+    }
+
+    /// Rollback FAILURE sibling: if the rollback write itself also fails,
+    /// that failure is appended as detail to the ORIGINAL verification
+    /// error — never substituted for it, never swallowed.
+    #[tokio::test]
+    async fn failed_post_write_verification_rollback_failure_attaches_as_detail() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Err("no".into()));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(73));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_BRIGHTNESS,
+            Err("readback failed".into()),
+        );
+        fake.expect_set(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_BRIGHTNESS,
+            73,
+            Err("rollback write failed".into()),
+        );
+
+        let err = ctrl.blank(BlankMode::BrightnessZero).await.unwrap_err();
+        assert!(
+            err.error.contains("readback failed"),
+            "original verification error must still be present: {err}"
+        );
+        assert!(
+            err.error.contains("rollback")
+                && err.error.contains("also failed")
+                && err.error.contains("rollback write failed"),
+            "rollback failure must be attached as detail on the SAME error: {err}"
         );
     }
 
@@ -1377,6 +1702,48 @@ mod tests {
             Ok([0x00, 0x00, 0x03, 0xC6]),
         );
         assert_eq!(ctrl.read_usage_hours().await, Some(966));
+    }
+
+    /// Task 6 test 3: this is deliberately the SAME shape as
+    /// `read_usage_hours_decodes_scripted_c0_via_controller` above (which
+    /// already pins the real-hardware-captured 0x03C6 -> 966 decode) —
+    /// checked first and found already covered, so this extends rather
+    /// than duplicates it: a different raw encoding (0x1234, exercising the
+    /// `sh`/`sl` bytes with a non-hardware-derived round value) plus an
+    /// explicit assertion on the call log, proving VCP 0xC0 flows through
+    /// `get_vcp_raw` with the exact opcode (not `get_vcp`, which cannot
+    /// represent values > u16, and not some other code).
+    #[tokio::test]
+    async fn usage_hours_reads_raw_c0_opcode() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log(); // drain probe's own D6 read before scripting
+
+        // 0x1234 = 4660 = (ml=0x00 << 16) | (sh=0x12 << 8) | sl=0x34.
+        fake.expect_get_raw(ident, VCP_USAGE_HOURS, Ok([0x00, 0x00, 0x12, 0x34]));
+
+        assert_eq!(ctrl.read_usage_hours().await, Some(0x1234));
+
+        let log = fake.take_call_log();
+        assert_eq!(
+            log,
+            vec![format!("get_vcp_raw({ident}, 0x{VCP_USAGE_HOURS:02X})")],
+            "read_usage_hours must flow through exactly one get_vcp_raw(0xC0) \
+             call, not get_vcp or any other opcode: {log:?}"
+        );
     }
 
     #[tokio::test]
@@ -1665,6 +2032,7 @@ mod tests {
         // Blank reads 0 → saves nothing, sets to 0.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
 
         // Wake — restores config default 77, not 0.
@@ -1716,6 +2084,7 @@ mod tests {
         // Blank reads 55 → saves 55, sets to 0.
         fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(55));
         fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
         ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
         assert_eq!(
             ctrl.state.lock().unwrap().saved_brightness,

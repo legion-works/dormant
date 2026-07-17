@@ -7,15 +7,15 @@ use core_foundation::base::{CFType, TCFType};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
 use core_foundation_sys::base::{
-    CFAllocatorRef, CFRelease, CFTypeRef, OSStatus, kCFAllocatorDefault,
+    kCFAllocatorDefault, CFAllocatorRef, CFRelease, CFTypeRef, OSStatus,
 };
 use core_graphics::display::CGDisplay;
 use ddc::{I2C_ADDRESS_DDC_CI, SUB_ADDRESS_DDC_CI};
 use io_kit_sys::keys::kIOServicePlane;
 use io_kit_sys::types::{io_object_t, io_registry_entry_t};
 use io_kit_sys::{
-    IORegistryEntryCreateCFProperty, IORegistryEntryGetName, IORegistryEntryGetParentEntry,
-    IORegistryEntryGetPath, kIORegistryIterateRecursively,
+    kIORegistryIterateRecursively, IORegistryEntryCreateCFProperty, IORegistryEntryGetName,
+    IORegistryEntryGetParentEntry, IORegistryEntryGetPath,
 };
 use mach2::kern_return::KERN_SUCCESS;
 use std::ffi::{CStr, CString};
@@ -23,33 +23,44 @@ use std::os::raw::{c_uint, c_void};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Retained `IOAVServiceCreateWithService` result.
-#[derive(Debug)]
+/// Opaque CoreDisplay `IOAVService` handle used by the private FFI symbols.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
 pub struct IOAVService(CFTypeRef);
 
 impl IOAVService {
-    fn from_create_rule(raw: CFTypeRef) -> Self {
-        Self(raw)
+    fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+}
+
+/// Retained `IOAVServiceCreateWithService` result.
+#[derive(Debug)]
+pub struct AvService(IOAVService);
+
+impl AvService {
+    fn from_create_rule(handle: IOAVService) -> Self {
+        Self(handle)
     }
 
-    fn raw(&self) -> CFTypeRef {
+    fn handle(&self) -> IOAVService {
         self.0
     }
 }
 
-impl Drop for IOAVService {
+impl Drop for AvService {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            unsafe { CFRelease(self.0) };
+            unsafe { CFRelease(self.0 .0) };
         }
     }
 }
 
 // SAFETY: CoreFoundation services are retained handles; the native calls use
 // the handle value and do not require thread-affine Rust access.
-unsafe impl Send for IOAVService {}
+unsafe impl Send for AvService {}
 // SAFETY: shared access only passes the retained handle to CoreDisplay.
-unsafe impl Sync for IOAVService {}
+unsafe impl Sync for AvService {}
 
 /// Delay the m1ddc-proven transaction shape inserts before each write attempt.
 const ARM_WRITE_DELAY: Duration = Duration::from_millis(10);
@@ -63,17 +74,12 @@ trait ArmI2c {
     fn sleep(&mut self, duration: Duration);
     fn write(
         &mut self,
-        service: &IOAVService,
+        service: &AvService,
         i2c_address: u16,
         data_address: u8,
         data: &[u8],
     ) -> Result<(), Error>;
-    fn read(
-        &mut self,
-        service: &IOAVService,
-        i2c_address: u16,
-        out: &mut [u8],
-    ) -> Result<(), Error>;
+    fn read(&mut self, service: &AvService, i2c_address: u16, out: &mut [u8]) -> Result<(), Error>;
 }
 
 /// Production [`ArmI2c`] backed by the real, runtime-resolved CoreDisplay symbols.
@@ -86,7 +92,7 @@ impl ArmI2c for CoreDisplayIo {
 
     fn write(
         &mut self,
-        service: &IOAVService,
+        service: &AvService,
         i2c_address: u16,
         data_address: u8,
         data: &[u8],
@@ -94,7 +100,7 @@ impl ArmI2c for CoreDisplayIo {
         let symbols = core_display_symbols()?;
         unsafe {
             verify_io((symbols.write_i2c)(
-                service.raw(),
+                service.handle(),
                 i2c_address as _,
                 data_address as _,
                 data.as_ptr() as _,
@@ -103,12 +109,7 @@ impl ArmI2c for CoreDisplayIo {
         }
     }
 
-    fn read(
-        &mut self,
-        service: &IOAVService,
-        i2c_address: u16,
-        out: &mut [u8],
-    ) -> Result<(), Error> {
+    fn read(&mut self, service: &AvService, i2c_address: u16, out: &mut [u8]) -> Result<(), Error> {
         let symbols = core_display_symbols()?;
         call_read_i2c(symbols.read_i2c, service, i2c_address, out)
     }
@@ -116,13 +117,13 @@ impl ArmI2c for CoreDisplayIo {
 
 fn call_read_i2c(
     read_i2c: ReadI2CFn,
-    service: &IOAVService,
+    service: &AvService,
     i2c_address: u16,
     out: &mut [u8],
 ) -> Result<(), Error> {
     unsafe {
         verify_io(read_i2c(
-            service.raw(),
+            service.handle(),
             i2c_address as _,
             0,
             out.as_mut_ptr().cast(),
@@ -132,7 +133,7 @@ fn call_read_i2c(
 }
 
 pub(crate) fn execute<'a>(
-    service: &IOAVService,
+    service: &AvService,
     i2c_address: u16,
     request_data: &[u8],
     out: &'a mut [u8],
@@ -157,7 +158,7 @@ pub(crate) fn execute<'a>(
 /// policy beyond this transaction belongs to the executor above this crate.
 fn execute_with<'a, IO: ArmI2c>(
     io: &mut IO,
-    service: &IOAVService,
+    service: &AvService,
     i2c_address: u16,
     request_data: &[u8],
     out: &'a mut [u8],
@@ -178,7 +179,7 @@ fn execute_with<'a, IO: ArmI2c>(
 }
 
 /// Returns an AVService and its DDC I2C address for a given display
-pub(crate) fn get_display_av_service(display: CGDisplay) -> Result<(IOAVService, u16), Error> {
+pub(crate) fn get_display_av_service(display: CGDisplay) -> Result<(AvService, u16), Error> {
     if display.is_builtin() {
         return Err(ServiceNotFound);
     }
@@ -215,7 +216,7 @@ pub(crate) fn get_display_av_service(display: CGDisplay) -> Result<(IOAVService,
                             let loc_ref = unsafe { CFType::wrap_under_create_rule(loc_ref) };
                             if !av_service.is_null() && (loc_ref == external_location) {
                                 return Ok((
-                                    IOAVService::from_create_rule(av_service),
+                                    AvService::from_create_rule(av_service),
                                     i2c_address(service),
                                 ));
                             }
@@ -370,7 +371,11 @@ impl SymbolLoader for DlopenSymbolLoader {
         // SAFETY: `self.handle` is a valid handle from a successful `dlopen`, and `name` is a
         // valid NUL-terminated string that outlives this call.
         let ptr = unsafe { libc::dlsym(self.handle, name.as_ptr()) };
-        if ptr.is_null() { None } else { Some(ptr) }
+        if ptr.is_null() {
+            None
+        } else {
+            Some(ptr)
+        }
     }
 }
 
@@ -417,7 +422,7 @@ mod tests {
 
         fn write(
             &mut self,
-            _service: &IOAVService,
+            _service: &AvService,
             i2c_address: u16,
             data_address: u8,
             data: &[u8],
@@ -435,7 +440,7 @@ mod tests {
 
         fn read(
             &mut self,
-            _service: &IOAVService,
+            _service: &AvService,
             _i2c_address: u16,
             out: &mut [u8],
         ) -> Result<(), Error> {
@@ -450,8 +455,8 @@ mod tests {
         }
     }
 
-    fn fake_service() -> IOAVService {
-        IOAVService::from_create_rule(std::ptr::null())
+    fn fake_service() -> AvService {
+        AvService::from_create_rule(IOAVService(std::ptr::null()))
     }
 
     thread_local! {

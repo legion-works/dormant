@@ -67,7 +67,11 @@ impl IoIterator {
     fn matching_services(dict: CFMutableDictionaryRef) -> Result<Self, std::io::Error> {
         let mut iter: io_iterator_t = 0;
         unsafe {
-            kern_try!(IOServiceGetMatchingServices(kIOMasterPortDefault, dict as _, &mut iter));
+            kern_try!(IOServiceGetMatchingServices(
+                kIOMasterPortDefault,
+                dict as _,
+                &mut iter
+            ));
         }
         Ok(Self(iter))
     }

@@ -1,10 +1,10 @@
-use crate::error::{Error, verify_io};
+use crate::error::{verify_io, Error};
 use crate::iokit::{
-    IODisplayCreateInfoDictionary, kIODisplayOnlyPreferredName, kIOI2CNoTransactionType,
+    kIODisplayOnlyPreferredName, kIOI2CNoTransactionType, IODisplayCreateInfoDictionary,
 };
 use crate::iokit::{
-    IOFBCopyI2CInterfaceForBus, IOFBGetI2CInterfaceCount, IOI2CRequest, IoI2CInterfaceConnection,
-    kIOI2CDDCciReplyTransactionType, kIOI2CSimpleTransactionType,
+    kIOI2CDDCciReplyTransactionType, kIOI2CSimpleTransactionType, IOFBCopyI2CInterfaceForBus,
+    IOFBGetI2CInterfaceCount, IOI2CRequest, IoI2CInterfaceConnection,
 };
 use crate::iokit::{IoIterator, IoObject};
 use core_foundation::base::{CFType, TCFType};
@@ -14,9 +14,9 @@ use core_foundation::string::CFString;
 use core_foundation_sys::base::kCFAllocatorDefault;
 use core_graphics::display::CGDisplay;
 use ddc::SUB_ADDRESS_DDC_CI;
-use io_kit_sys::IORegistryEntryCreateCFProperties;
 use io_kit_sys::ret::kIOReturnSuccess;
-use io_kit_sys::types::{IOItemCount, io_service_t};
+use io_kit_sys::types::{io_service_t, IOItemCount};
+use io_kit_sys::IORegistryEntryCreateCFProperties;
 use mach2::kern_return::KERN_FAILURE;
 use std::time::Duration;
 

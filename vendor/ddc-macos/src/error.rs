@@ -1,7 +1,7 @@
 use core_graphics::base::CGError;
 use ddc::ErrorCode;
 use io_kit_sys::ret::kIOReturnSuccess;
-use mach2::kern_return::{KERN_FAILURE, kern_return_t};
+use mach2::kern_return::{kern_return_t, KERN_FAILURE};
 use thiserror::Error;
 
 /// An error that can occur during DDC/CI communication with a monitor

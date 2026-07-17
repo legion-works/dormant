@@ -17,7 +17,8 @@ pub const kIOI2CDDCciReplyTransactionType: c_uint = 2;
 pub const kIOI2CCombinedTransactionType: c_uint = 3;
 pub const kIOI2CDisplayPortNativeTransactionType: c_uint = 4;
 
-pub type IOI2CRequestCompletion = ::std::option::Option<unsafe extern "C" fn(request: *mut IOI2CRequest)>;
+pub type IOI2CRequestCompletion =
+    ::std::option::Option<unsafe extern "C" fn(request: *mut IOI2CRequest)>;
 
 #[repr(C, packed(4))]
 #[derive(Debug, Copy, Clone)]
@@ -55,7 +56,8 @@ extern "C" {
     #[link(name = "IOKit", kind = "framework")]
 
     /// Returns a count of I2C interfaces available associated with an IOFramebuffer instance
-    pub fn IOFBGetI2CInterfaceCount(framebuffer: io_service_t, count: *mut IOItemCount) -> IOReturn;
+    pub fn IOFBGetI2CInterfaceCount(framebuffer: io_service_t, count: *mut IOItemCount)
+        -> IOReturn;
 
     /// Returns an instance of an I2C bus interface, associated with an IOFramebuffer instance / bus index pair
     pub fn IOFBCopyI2CInterfaceForBus(
@@ -75,7 +77,11 @@ extern "C" {
     pub fn IOI2CInterfaceClose(connect: IOI2CConnectRef, options: IOOptionBits) -> IOReturn;
 
     /// Carries out the I2C transaction specified by an IOI2CRequest structure
-    pub fn IOI2CSendRequest(connect: IOI2CConnectRef, options: IOOptionBits, request: *mut IOI2CRequest) -> IOReturn;
+    pub fn IOI2CSendRequest(
+        connect: IOI2CConnectRef,
+        options: IOOptionBits,
+        request: *mut IOI2CRequest,
+    ) -> IOReturn;
 }
 
 pub(crate) struct IoI2CInterfaceConnection(IOI2CConnectRef);

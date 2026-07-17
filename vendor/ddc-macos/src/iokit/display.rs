@@ -14,9 +14,14 @@ extern "C" {
     // For some reason, this is missing from io_kit_sys
     pub static kIOMainPortDefault: mach_port_t;
     #[link(name = "IOKit", kind = "framework")]
-    pub fn IODisplayCreateInfoDictionary(framebuffer: io_service_t, options: IOOptionBits) -> CFDictionaryRef;
+    pub fn IODisplayCreateInfoDictionary(
+        framebuffer: io_service_t,
+        options: IOOptionBits,
+    ) -> CFDictionaryRef;
 
     #[link(name = "CoreDisplay", kind = "framework")]
     // Creates a display info dictionary for a specified display ID
-    pub fn CoreDisplay_DisplayCreateInfoDictionary(display_id: CGDirectDisplayID) -> CFDictionaryRef;
+    pub fn CoreDisplay_DisplayCreateInfoDictionary(
+        display_id: CGDirectDisplayID,
+    ) -> CFDictionaryRef;
 }

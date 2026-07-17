@@ -10,8 +10,8 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::display::CGDisplay;
 use ddc::{
-    DdcCommand, DdcCommandMarker, DdcCommandRaw, DdcCommandRawMarker, DdcHost, Delay, ErrorCode, I2C_ADDRESS_DDC_CI,
-    SUB_ADDRESS_DDC_CI,
+    DdcCommand, DdcCommandMarker, DdcCommandRaw, DdcCommandRawMarker, DdcHost, Delay, ErrorCode,
+    I2C_ADDRESS_DDC_CI, SUB_ADDRESS_DDC_CI,
 };
 use std::time::Duration;
 use std::{fmt, iter};
@@ -20,7 +20,7 @@ use std::{fmt, iter};
 #[derive(Debug)]
 enum MonitorService {
     Intel(IoObject),
-    Arm(arm::IOAVService),
+    Arm(arm::AvService),
 }
 
 /// A handle to an attached monitor that allows the use of DDC/CI operations.
@@ -57,9 +57,17 @@ impl Monitor {
             .filter_map(|display_id| {
                 let display = CGDisplay::new(display_id);
                 return if let Some(service) = intel::get_io_framebuffer_port(display) {
-                    Some(Self::new(display, MonitorService::Intel(service), I2C_ADDRESS_DDC_CI))
+                    Some(Self::new(
+                        display,
+                        MonitorService::Intel(service),
+                        I2C_ADDRESS_DDC_CI,
+                    ))
                 } else if let Ok((service, i2c_address)) = arm::get_display_av_service(display) {
-                    Some(Self::new(display, MonitorService::Arm(service), i2c_address))
+                    Some(Self::new(
+                        display,
+                        MonitorService::Arm(service),
+                        i2c_address,
+                    ))
                 } else {
                     None
                 };
@@ -89,11 +97,16 @@ impl Monitor {
 
     /// Product name for this [Monitor], if available
     pub fn product_name(&self) -> Option<String> {
-        let info: CFDictionary<CFString, CFType> =
-            unsafe { CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(self.monitor.id)) };
+        let info: CFDictionary<CFString, CFType> = unsafe {
+            CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(
+                self.monitor.id,
+            ))
+        };
 
         let display_product_name_key = CFString::from_static_string("DisplayProductName");
-        let display_product_names_dict = info.find(&display_product_name_key)?.downcast::<CFDictionary>()?;
+        let display_product_names_dict = info
+            .find(&display_product_name_key)?
+            .downcast::<CFDictionary>()?;
         let (_, localized_product_names) = display_product_names_dict.get_keys_and_values();
         localized_product_names
             .first()
@@ -102,8 +115,11 @@ impl Monitor {
 
     /// Returns Extended display identification data (EDID) for this [Monitor] as raw bytes data
     pub fn edid(&self) -> Option<Vec<u8>> {
-        let info: CFDictionary<CFString, CFType> =
-            unsafe { CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(self.monitor.id)) };
+        let info: CFDictionary<CFString, CFType> = unsafe {
+            CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(
+                self.monitor.id,
+            ))
+        };
         let display_product_name_key = CFString::from_static_string("IODisplayEDIDOriginal");
         let edid_data = info.find(&display_product_name_key)?.downcast::<CFData>()?;
         Some(edid_data.bytes().into())
@@ -123,20 +139,32 @@ impl Monitor {
     /// real hardware; this lets fork tests exercise the byte-transparent encoding (including
     /// arbitrary VCP opcodes, e.g. 0xC0 usage hours) without one. Not part of the public API.
     #[cfg(test)]
-    pub(crate) fn encode_command_for_test<'a>(i2c_address: u16, data: &[u8], packet: &'a mut [u8]) -> &'a [u8] {
+    pub(crate) fn encode_command_for_test<'a>(
+        i2c_address: u16,
+        data: &[u8],
+        packet: &'a mut [u8],
+    ) -> &'a [u8] {
         Self::encode_command_with_address(i2c_address, data, packet)
     }
 
-    fn encode_command_with_address<'a>(i2c_address: u16, data: &[u8], packet: &'a mut [u8]) -> &'a [u8] {
+    fn encode_command_with_address<'a>(
+        i2c_address: u16,
+        data: &[u8],
+        packet: &'a mut [u8],
+    ) -> &'a [u8] {
         packet[0] = SUB_ADDRESS_DDC_CI;
         packet[1] = 0x80 | data.len() as u8;
         packet[2..2 + data.len()].copy_from_slice(data);
-        packet[2 + data.len()] =
-            Self::checksum(iter::once((i2c_address as u8) << 1).chain(packet[..2 + data.len()].iter().cloned()));
+        packet[2 + data.len()] = Self::checksum(
+            iter::once((i2c_address as u8) << 1).chain(packet[..2 + data.len()].iter().cloned()),
+        );
         &packet[..3 + data.len()]
     }
 
-    fn decode_response<'a>(&self, response: &'a mut [u8]) -> Result<&'a mut [u8], crate::error::Error> {
+    fn decode_response<'a>(
+        &self,
+        response: &'a mut [u8],
+    ) -> Result<&'a mut [u8], crate::error::Error> {
         if response.is_empty() {
             return Ok(response);
         };
@@ -175,8 +203,12 @@ impl DdcCommandRaw for Monitor {
         let mut packet = [0u8; 36 + 3];
         let packet = self.encode_command(data, &mut packet);
         let response = match &self.service {
-            MonitorService::Intel(service) => intel::execute(service, self.i2c_address, packet, out, response_delay),
-            MonitorService::Arm(service) => arm::execute(service, self.i2c_address, packet, out, response_delay),
+            MonitorService::Intel(service) => {
+                intel::execute(service, self.i2c_address, packet, out, response_delay)
+            }
+            MonitorService::Arm(service) => {
+                arm::execute(service, self.i2c_address, packet, out, response_delay)
+            }
         }?;
         self.decode_response(response)
     }

@@ -52,3 +52,4 @@ tokio = { workspace = true, features = [
 
 [package.metadata.dist]
 dist = true
+include = ["systemd/dormant-tray.service"]

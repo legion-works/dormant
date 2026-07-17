@@ -129,6 +129,49 @@ stage_binary() {
     install -m 755 "$extracted_exe" "$PREFIX/bin/$app"
 }
 
+# Resolve a co-packaged FILE asset (e.g. the launchd plist) that ships in
+# the same "<app>-<triple>/" archive as an already-staged executable
+# (`stage_binary` must have already been called for $app). Only two exact,
+# manifest-informed candidate locations are tried, in this fixed order —
+# never a `find | head`-style guess across the whole extract tree:
+#   1. next to the executable, inside the "<app>-<triple>/" prefix
+#      directory cargo-dist nests binaries under (see `stage_binary`'s
+#      comment above) — root `include`s are documented to land "side-by-
+#      side" with the binary, i.e. likely inside that same prefix;
+#   2. at the tar's true top level, in case root `include`s are NOT nested
+#      under the per-target prefix after all.
+stage_file() {
+    app="$1"          # the app whose already-extracted archive to search
+    asset_name="$2"   # the manifest asset .name, e.g. com.legionworks.dormant.plist
+    dest_path="$3"    # where to copy the resolved file to
+
+    archive_name="$(resolve_archive_name "$app")"
+    [ -n "$archive_name" ] || die "missing packaged file: $asset_name"
+
+    asset_in_archive="$(jq -r --arg archive "$archive_name" --arg asset "$asset_name" '
+        .artifacts[$archive].assets // []
+        | map(select(.name == $asset))
+        | .[0].path // empty
+    ' "$MANIFEST")"
+    [ -n "$asset_in_archive" ] || die "missing packaged file: $asset_name"
+
+    extract_dir="$WORKDIR/extract/$app"
+    [ -d "$extract_dir" ] || die "missing packaged file: $asset_name"
+
+    exe_in_archive="$(resolve_archive_exe_path "$archive_name" "$app")"
+    resolved=""
+    if [ -n "$exe_in_archive" ]; then
+        candidate="$(dirname "$extract_dir/$exe_in_archive")/$(basename "$asset_in_archive")"
+        [ -f "$candidate" ] && resolved="$candidate"
+    fi
+    if [ -z "$resolved" ] && [ -f "$extract_dir/$asset_in_archive" ]; then
+        resolved="$extract_dir/$asset_in_archive"
+    fi
+    [ -n "$resolved" ] || die "missing packaged file: $asset_name"
+
+    cp "$resolved" "$dest_path"
+}
+
 # Order matters: dormantd is checked first so an empty fixture's first
 # failure is deterministically "missing packaged binary: dormantd".
 #
@@ -141,6 +184,23 @@ stage_binary() {
 # packaged BINARIES extract and run before `host` publishes.
 stage_binary "dormantd"
 stage_binary "dormantctl"
+
+# The launchd agent plist ships only in dormantd's archive (Task 12's
+# package-local `[package.metadata.dist] include` in
+# crates/dormantd/Cargo.toml). Assert it is present in every target's
+# archive, and additionally lint it with `plutil` — the macOS system tool
+# that validates plist syntax/structure — on the two *-apple-darwin legs
+# where that tool actually exists.
+PLIST_NAME="com.legionworks.dormant.plist"
+STAGED_PLIST="$WORKDIR/$PLIST_NAME"
+stage_file "dormantd" "$PLIST_NAME" "$STAGED_PLIST"
+
+case "$TARGET_TRIPLE" in
+    *-apple-darwin)
+        command -v plutil >/dev/null 2>&1 || die "plutil not found on $TARGET_TRIPLE runner"
+        plutil -lint "$STAGED_PLIST" >/dev/null || die "plist failed plutil -lint: $STAGED_PLIST"
+        ;;
+esac
 
 CONFIG_FILE="$WORKDIR/config.toml"
 CREDENTIALS_FILE="$WORKDIR/credentials.toml" # intentionally never created:
@@ -170,4 +230,4 @@ assert_version "dormantctl"
     --credentials "$CREDENTIALS_FILE" \
     --validate-only
 
-echo "release-artifact-smoke: dormantd and dormantctl ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+echo "release-artifact-smoke: dormantd, dormantctl, and $PLIST_NAME ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"

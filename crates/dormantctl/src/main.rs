@@ -9,6 +9,7 @@
 mod cmd_blank;
 mod cmd_doctor;
 mod cmd_emergency_wake;
+mod cmd_launchd;
 mod cmd_pair;
 mod cmd_pause;
 mod cmd_status;
@@ -150,6 +151,14 @@ enum Command {
         #[arg(long)]
         lenient_keys: bool,
     },
+    /// Install or remove the macOS launchd `LaunchAgent`. macOS only — parses
+    /// on every platform (so `--help` is always accurate) but the handler
+    /// reports "not yet supported" (exit 3) off macOS, matching the
+    /// `doctor macos-*` arms.
+    Launchd {
+        #[command(subcommand)]
+        subcommand: cmd_launchd::LaunchdSubcommand,
+    },
 }
 
 #[allow(clippy::too_many_lines)]
@@ -283,6 +292,25 @@ fn main() -> ExitCode {
                 Err(e) => Err(e),
             }
         }
+        Command::Launchd { subcommand } => match cmd_launchd::run(&subcommand) {
+            Ok(cmd_launchd::LaunchdOutcome::Installed(path)) => {
+                println!("installed {}", path.display());
+                Ok(())
+            }
+            Ok(cmd_launchd::LaunchdOutcome::Uninstalled { path, removed }) => {
+                if removed {
+                    println!("removed {}", path.display());
+                } else {
+                    println!("not installed: {}", path.display());
+                }
+                Ok(())
+            }
+            Ok(cmd_launchd::LaunchdOutcome::NotSupported) => {
+                eprintln!("not yet supported: launchd is macOS-only");
+                return ExitCode::from(3);
+            }
+            Err(e) => Err(e),
+        },
     };
 
     match result {
@@ -315,5 +343,34 @@ mod tests {
             } => assert_eq!(host, "192.0.2.7"),
             _ => panic!("expected Pair command"),
         }
+    }
+
+    // ── Task 12: `launchd install` / `launchd uninstall` parsing ──────────
+    //
+    // Parsing is unconditional on every platform (mirrors the
+    // `doctor macos-*` arms in cmd_doctor.rs) — only the handler behind it
+    // is macOS-gated (cmd_launchd::run), so `--help` stays accurate
+    // everywhere and these tests run on Linux CI too.
+
+    #[test]
+    fn parse_launchd_install() {
+        let cli = Cli::try_parse_from(["dormantctl", "launchd", "install"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Launchd {
+                subcommand: cmd_launchd::LaunchdSubcommand::Install
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_launchd_uninstall() {
+        let cli = Cli::try_parse_from(["dormantctl", "launchd", "uninstall"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Launchd {
+                subcommand: cmd_launchd::LaunchdSubcommand::Uninstall
+            }
+        ));
     }
 }

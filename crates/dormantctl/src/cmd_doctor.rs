@@ -72,6 +72,16 @@ pub enum DoctorSubcommand {
     Config,
     /// Probe `KWin` DPMS (not yet supported).
     Kwin,
+    /// Probe the macOS idle clock (two bounded raw readings, `Fail` when
+    /// they are identical). macOS only.
+    MacosIdle,
+    /// Probe macOS display-sleep API availability and current per-display
+    /// asleep/awake state. Read-only — never blanks or wakes a display.
+    /// macOS only.
+    MacosDisplaySleep,
+    /// Probe active macOS power assertions preventing display sleep.
+    /// `Fail` when a dormant-owned assertion is still active. macOS only.
+    MacosPower,
     /// Probe Samsung Tizen displays (reachability, power state, token).
     Samsung,
     /// Control-path verification: blank → read → wake → read → restore a
@@ -106,13 +116,13 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let results = vec![dormant_doctor::probe_ddcci().await];
                 print_table(&results);
                 Ok(outcome(&results))
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 Ok(DoctorOutcome::NotSupported("ddcci".into()))
             }
@@ -149,6 +159,9 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             Ok(outcome(&results))
         }
         Some(DoctorSubcommand::Kwin) => Ok(DoctorOutcome::NotSupported("kwin-dpms".into())),
+        Some(DoctorSubcommand::MacosIdle) => run_macos_idle().await,
+        Some(DoctorSubcommand::MacosDisplaySleep) => run_macos_display_sleep().await,
+        Some(DoctorSubcommand::MacosPower) => run_macos_power().await,
         Some(DoctorSubcommand::Samsung) => {
             let (cfg, creds, note) = load_config_and_creds(args)?;
             if let Some(n) = &note {
@@ -176,6 +189,66 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             print_table(&results);
             Ok(outcome(&results))
         }
+    }
+}
+
+// ── macOS read-only doctor arms (Task 11) ─────────────────────────────────────────
+//
+// Extracted out of `run_async` (each one inlined there would push it over
+// `clippy::too_many_lines`) — mirrors the `Ddcci`/`Kwin` NotSupported-off-
+// platform pattern already used above, just as its own named function per
+// arm since there are three of them.
+
+/// `doctor macos-idle` — two bounded raw readings of the idle clock.
+///
+/// `async` only actually awaits anything on macOS (`#[cfg(not(target_os =
+/// "macos"))]`'s body is a bare `Ok(..)`) — the `unused_async` lint fires on
+/// every non-macOS build, so it is suppressed there specifically rather
+/// than dropping `async` (which would require a matching, more invasive
+/// signature change at the `Some(DoctorSubcommand::MacosIdle) => ...await`
+/// call site above, needed on macOS).
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+async fn run_macos_idle() -> Result<DoctorOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        let results = vec![dormant_doctor::probe_macos_idle().await];
+        print_table(&results);
+        Ok(outcome(&results))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(DoctorOutcome::NotSupported("macos-idle".into()))
+    }
+}
+
+/// `doctor macos-display-sleep` — API availability + current per-display
+/// asleep/awake state. Read-only.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+async fn run_macos_display_sleep() -> Result<DoctorOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        let results = vec![dormant_doctor::probe_macos_display_sleep().await];
+        print_table(&results);
+        Ok(outcome(&results))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(DoctorOutcome::NotSupported("macos-display-sleep".into()))
+    }
+}
+
+/// `doctor macos-power` — active display-sleep-preventing power assertions.
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+async fn run_macos_power() -> Result<DoctorOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        let results = vec![dormant_doctor::probe_macos_power().await];
+        print_table(&results);
+        Ok(outcome(&results))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(DoctorOutcome::NotSupported("macos-power".into()))
     }
 }
 
@@ -708,5 +781,45 @@ mod tests {
             DoctorSubcommand::Exercise { display } => assert_eq!(display, "mon"),
             other => panic!("expected Exercise, got {other:?}"),
         }
+    }
+
+    /// Task 11: the three new macOS read-only doctor arms must parse as
+    /// their own subcommand variants under the EXACT kebab-case names the
+    /// plan pins (`macos-idle`, `macos-display-sleep`, `macos-power`) — on
+    /// every platform (parsing is unconditional; only the handler behind
+    /// each variant is macOS-gated, mirroring the pre-existing `Ddcci`/
+    /// `Kwin` pattern above).
+    #[test]
+    fn doctor_parses_all_macos_read_only_arms() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            sub: DoctorSubcommand,
+        }
+
+        let idle = Wrapper::try_parse_from(["dormantctl", "macos-idle"])
+            .expect("macos-idle should parse")
+            .sub;
+        assert!(
+            matches!(idle, DoctorSubcommand::MacosIdle),
+            "expected MacosIdle, got {idle:?}"
+        );
+
+        let display_sleep = Wrapper::try_parse_from(["dormantctl", "macos-display-sleep"])
+            .expect("macos-display-sleep should parse")
+            .sub;
+        assert!(
+            matches!(display_sleep, DoctorSubcommand::MacosDisplaySleep),
+            "expected MacosDisplaySleep, got {display_sleep:?}"
+        );
+
+        let power = Wrapper::try_parse_from(["dormantctl", "macos-power"])
+            .expect("macos-power should parse")
+            .sub;
+        assert!(
+            matches!(power, DoctorSubcommand::MacosPower),
+            "expected MacosPower, got {power:?}"
+        );
     }
 }

@@ -9,20 +9,69 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// Compile-time target routing for platform-specific default-path derivation.
+///
+/// The `_with` functions below take this as an explicit parameter (rather
+/// than reading `cfg!(target_os = ...)` internally) so that BOTH the Linux
+/// and macOS routes are exercised by tests on any host — including this
+/// Linux CI/dev sandbox, which can never compile/run macOS-target code but
+/// CAN exercise the macOS path-derivation *logic* via `TargetOs::Macos`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetOs {
+    /// XDG-style paths: `$XDG_RUNTIME_DIR`, `$HOME/.config`, `/run/dormant`.
+    Linux,
+    /// Apple-style paths: `~/Library/Application Support`, state-dir-derived
+    /// socket/lock. Deliberately never reads `$XDG_RUNTIME_DIR` or `$TMPDIR`.
+    Macos,
+}
+
+impl TargetOs {
+    /// The target this binary was actually compiled for.
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::Linux
+        }
+    }
+}
+
 /// Return the list of candidate config paths, in priority order.
 ///
+/// Linux:
 /// 1. `$XDG_CONFIG_HOME/dormant/config.toml` (if `XDG_CONFIG_HOME` is set)
 /// 2. `$HOME/.config/dormant/config.toml` (if `HOME` is set)
 /// 3. `/etc/dormant/config.toml`
+///
+/// macOS:
+/// 1. `$XDG_CONFIG_HOME/dormant/config.toml` (if `XDG_CONFIG_HOME` is set —
+///    explicit XDG overrides keep working even on macOS)
+/// 2. `$HOME/Library/Application Support/dormant/config.toml` (if `HOME` is set)
+/// 3. `/etc/dormant/config.toml`
 #[must_use]
 pub fn default_config_candidates() -> Vec<PathBuf> {
-    config_candidates_from(
+    default_config_candidates_with(
+        TargetOs::current(),
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME"),
     )
 }
 
-/// Internal: build candidate list from explicit env values (test seam).
+/// Target-routed, env-injected config-candidate derivation (test seam).
+#[must_use]
+pub fn default_config_candidates_with(
+    target: TargetOs,
+    xdg: Option<OsString>,
+    home: Option<OsString>,
+) -> Vec<PathBuf> {
+    match target {
+        TargetOs::Linux => config_candidates_from(xdg, home),
+        TargetOs::Macos => macos_config_candidates_from(xdg, home),
+    }
+}
+
+/// Internal: build the Linux candidate list from explicit env values (test seam).
 #[must_use]
 fn config_candidates_from(xdg: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -33,6 +82,29 @@ fn config_candidates_from(xdg: Option<OsString>, home: Option<OsString>) -> Vec<
         candidates.push(
             PathBuf::from(home)
                 .join(".config")
+                .join("dormant")
+                .join("config.toml"),
+        );
+    }
+    candidates.push(PathBuf::from("/etc/dormant/config.toml"));
+    candidates
+}
+
+/// Internal: build the macOS candidate list from explicit env values (test
+/// seam). `$TMPDIR` is never consulted — Apple apps commonly get a
+/// per-session-unique `$TMPDIR`, which would silently fragment config
+/// discovery across sessions if it leaked in here.
+#[must_use]
+fn macos_config_candidates_from(xdg: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(xdg) = xdg {
+        candidates.push(PathBuf::from(xdg).join("dormant").join("config.toml"));
+    }
+    if let Some(home) = home {
+        candidates.push(
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
                 .join("dormant")
                 .join("config.toml"),
         );
@@ -62,14 +134,40 @@ pub fn resolve_config_path(explicit: Option<&std::path::Path>) -> Result<PathBuf
 
 /// Return the default socket path.
 ///
+/// Linux:
 /// 1. `$XDG_RUNTIME_DIR/dormant.sock`
 /// 2. `/run/dormant/dormant.sock`
+///
+/// macOS: derived from [`state_dir`] (`$XDG_STATE_HOME/dormant`, falling
+/// back to `~/.local/state/dormant`) — `$XDG_RUNTIME_DIR` is deliberately
+/// IGNORED on this route (session-scoped on Linux via systemd/logind; macOS
+/// has no equivalent per-login-session runtime dir with the same lifetime
+/// guarantees), and `$TMPDIR` is never read at all.
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
-    socket_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
+    default_socket_path_with(
+        TargetOs::current(),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
 }
 
-/// Internal: build socket path from explicit env value (test seam).
+/// Target-routed, env-injected socket-path derivation (test seam).
+#[must_use]
+pub fn default_socket_path_with(
+    target: TargetOs,
+    xdg_runtime_dir: Option<OsString>,
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> PathBuf {
+    match target {
+        TargetOs::Linux => socket_path_from(xdg_runtime_dir),
+        TargetOs::Macos => state_dir_from(xdg_state_home, home).join("dormant.sock"),
+    }
+}
+
+/// Internal: build the Linux socket path from explicit env value (test seam).
 #[must_use]
 fn socket_path_from(runtime_dir: Option<OsString>) -> PathBuf {
     if let Some(dir) = runtime_dir {
@@ -87,14 +185,38 @@ fn socket_path_from(runtime_dir: Option<OsString>) -> PathBuf {
 /// daemon with a different lock path would still start and fight the physical
 /// displays.
 ///
+/// Linux:
 /// 1. `$XDG_RUNTIME_DIR/dormant.lock`
 /// 2. `/run/dormant/dormant.lock`
+///
+/// macOS: derived from [`state_dir`], same routing rationale as
+/// [`default_socket_path`] — `$XDG_RUNTIME_DIR` and `$TMPDIR` are ignored.
 #[must_use]
 pub fn default_lock_path() -> PathBuf {
-    lock_path_from(std::env::var_os("XDG_RUNTIME_DIR"))
+    default_lock_path_with(
+        TargetOs::current(),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
 }
 
-/// Internal: build lock path from explicit env value (test seam).
+/// Target-routed, env-injected lock-path derivation (test seam).
+#[must_use]
+pub fn default_lock_path_with(
+    target: TargetOs,
+    xdg_runtime_dir: Option<OsString>,
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> PathBuf {
+    match target {
+        TargetOs::Linux => lock_path_from(xdg_runtime_dir),
+        // Same filename as Linux (`dormant.lock`): one lock identity across platforms.
+        TargetOs::Macos => state_dir_from(xdg_state_home, home).join("dormant.lock"),
+    }
+}
+
+/// Internal: build the Linux lock path from explicit env value (test seam).
 #[must_use]
 fn lock_path_from(runtime_dir: Option<OsString>) -> PathBuf {
     if let Some(dir) = runtime_dir {
@@ -257,5 +379,77 @@ mod tests {
     #[test]
     fn wear_state_dir_is_wear_subdir() {
         assert!(wear_state_dir().ends_with("dormant/wear"));
+    }
+
+    // ── Task 5: macOS path routing ──────────────────────────────────────────
+
+    #[test]
+    fn macos_defaults_keep_socket_and_lock_out_of_tmpdir() {
+        // TMPDIR is deliberately never a parameter anywhere in this module —
+        // it structurally cannot leak into any of these derivations. We still
+        // name it here to document the scenario the test guards against.
+        let home = Some(OsString::from("/Users/alice"));
+        let xdg_runtime_dir = Some(OsString::from("/var/run/session-a"));
+
+        let candidates = default_config_candidates_with(TargetOs::Macos, None, home.clone());
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/Users/alice/Library/Application Support/dormant/config.toml")
+        );
+
+        let state = state_dir_from(None, home.clone());
+        assert_eq!(state, PathBuf::from("/Users/alice/.local/state/dormant"));
+
+        let socket =
+            default_socket_path_with(TargetOs::Macos, xdg_runtime_dir.clone(), None, home.clone());
+        assert_eq!(
+            socket,
+            PathBuf::from("/Users/alice/.local/state/dormant/dormant.sock")
+        );
+
+        let lock = default_lock_path_with(TargetOs::Macos, xdg_runtime_dir, None, home);
+        assert_eq!(
+            lock,
+            PathBuf::from("/Users/alice/.local/state/dormant/dormant.lock")
+        );
+    }
+
+    #[test]
+    fn linux_socket_and_lock_remain_on_xdg_runtime_dir() {
+        // Regression guard: the macOS routing addition must not perturb the
+        // Linux route at all — same byte-for-byte output as before Task 5.
+        let xdg_runtime_dir = Some(OsString::from("/run/user/1000"));
+        let xdg_state_home = Some(OsString::from("/home/alice/.state"));
+        let home = Some(OsString::from("/home/alice"));
+
+        let socket = default_socket_path_with(
+            TargetOs::Linux,
+            xdg_runtime_dir.clone(),
+            xdg_state_home.clone(),
+            home.clone(),
+        );
+        assert_eq!(socket, PathBuf::from("/run/user/1000/dormant.sock"));
+
+        let lock = default_lock_path_with(TargetOs::Linux, xdg_runtime_dir, xdg_state_home, home);
+        assert_eq!(lock, PathBuf::from("/run/user/1000/dormant.lock"));
+    }
+
+    #[test]
+    fn tmpdir_does_not_change_the_resolved_socket() {
+        // Two "envs" that would differ only in $TMPDIR collapse to the same
+        // call because none of the `_with` signatures accept a TMPDIR
+        // parameter at all — TMPDIR cannot reach path derivation by
+        // construction, not merely by convention.
+        let home = Some(OsString::from("/Users/alice"));
+        let xdg_runtime_dir = Some(OsString::from("/var/run/session-a"));
+
+        let a =
+            default_socket_path_with(TargetOs::Macos, xdg_runtime_dir.clone(), None, home.clone());
+        let b = default_socket_path_with(TargetOs::Macos, xdg_runtime_dir, None, home);
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            PathBuf::from("/Users/alice/.local/state/dormant/dormant.sock")
+        );
     }
 }

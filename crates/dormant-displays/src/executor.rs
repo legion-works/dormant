@@ -73,6 +73,7 @@ use dormant_core::traits::{CommandSink, DisplayController, PanelState};
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
 use tokio_util::sync::CancellationToken;
 
+use crate::blank_owner::BlankOwnerRegistry;
 // ── RetrySettings ──────────────────────────────────────────────────────────────
 
 /// Bounded retry parameters for the executor's wake burst.
@@ -115,6 +116,33 @@ pub struct DisplayExecutor {
     /// so [`CommandSink::controller_health`] (sync, `&self`) can return a
     /// snapshot even when spawned tasks are writing this field.
     health: std::sync::Arc<std::sync::Mutex<Vec<ControllerHealth>>>,
+    /// Chain index of the controller that performed the *last successful*
+    /// `blank()`. `None` before any successful blank, or once a wake
+    /// attempted by this owner has itself succeeded.
+    ///
+    /// In-memory only — never serialized (no IPC/config/serde surface).
+    /// `wake()`/`wake_once()` consult this so a display that was blanked by
+    /// controller B (because A was unavailable or A doesn't support the
+    /// blank mode) is *woken* by B first too, even if A has since become
+    /// available and would otherwise win the normal chain-order race.
+    /// Ownership is stronger than probe availability: the owner is always
+    /// attempted first, `is_available()` or not (see `wake`/`wake_once`).
+    ///
+    /// Concurrency note: in production, `blank()` can be entered concurrently
+    /// on the same executor — the rules dispatch fires `blank`/`wake` off a
+    /// fire-and-forget `tokio::spawn`, and the emergency-wake / doctor
+    /// `--exercise` paths share the same `CommandSink` handle. Two in-flight
+    /// `blank()` calls can therefore complete out of logical order, and this
+    /// field is a plain last-write-wins `Mutex<Option<usize>>` with no
+    /// generation/ordering check — the same accepted model already used for
+    /// the `health` field above. A stale write here just means `blank_owner`
+    /// can momentarily point at a controller that isn't the *logically*
+    /// latest blank's controller. That is not a correctness failure: the
+    /// worst case is one wasted owner-first attempt on the wrong controller
+    /// before the wake falls through the rest of the chain in normal order,
+    /// exactly as if there had been no owner at all.
+    blank_owners: std::sync::Arc<BlankOwnerRegistry>,
+    chain_fingerprint: String,
 }
 
 impl DisplayExecutor {
@@ -126,6 +154,31 @@ impl DisplayExecutor {
         effective_mode: BlankMode,
         retry: RetrySettings,
     ) -> Self {
+        let chain_fingerprint = controllers
+            .iter()
+            .map(|controller| controller.name())
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::with_blank_owners(
+            display,
+            controllers,
+            effective_mode,
+            retry,
+            std::sync::Arc::new(BlankOwnerRegistry::new()),
+            chain_fingerprint,
+        )
+    }
+
+    /// Construct an executor backed by process-shared blank-owner state.
+    #[must_use]
+    pub fn with_blank_owners(
+        display: DisplayId,
+        controllers: Vec<Box<dyn DisplayController>>,
+        effective_mode: BlankMode,
+        retry: RetrySettings,
+        blank_owners: std::sync::Arc<BlankOwnerRegistry>,
+        chain_fingerprint: String,
+    ) -> Self {
         Self {
             display,
             chain: controllers,
@@ -133,6 +186,8 @@ impl DisplayExecutor {
             retry,
             supersede: Mutex::new(None),
             health: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            blank_owners,
+            chain_fingerprint,
         }
     }
 
@@ -197,6 +252,34 @@ impl DisplayExecutor {
         }
         new_token
     }
+
+    /// Build the attempt order for a wake pass: the recorded blank `owner`
+    /// (if any and still in range) first, then every other chain index in
+    /// original configured order. Used by both `wake_once` and every round
+    /// of `wake`'s retry burst so the two paths cannot drift apart.
+    ///
+    /// A stale owner index (chain shrank — not possible today, but kept
+    /// defensive) is simply dropped rather than panicking.
+    fn owner_first_order(owner: Option<usize>, len: usize) -> Vec<usize> {
+        let owner = owner.filter(|&o| o < len);
+        let mut order = Vec::with_capacity(len);
+        if let Some(o) = owner {
+            order.push(o);
+        }
+        for i in 0..len {
+            if Some(i) != owner {
+                order.push(i);
+            }
+        }
+        order
+    }
+
+    /// Snapshot of the current blank owner — test-only introspection.
+    #[cfg(test)]
+    fn blank_owner_for_test(&self) -> Option<usize> {
+        self.blank_owners
+            .owner(&self.display, &self.chain_fingerprint)
+    }
 }
 
 #[async_trait]
@@ -244,6 +327,12 @@ impl CommandSink for DisplayExecutor {
                         .health
                         .lock()
                         .expect("DisplayExecutor health lock poisoned") = health;
+                    // Record the owner only now, after the result that
+                    // licenses it (this Ok) is final — a later successful
+                    // blank replaces the owner; an all-failed blank (below)
+                    // never reaches this line, so the prior owner survives.
+                    self.blank_owners
+                        .record(&self.display, &self.chain_fingerprint, i);
                     return Ok(());
                 }
                 Err(e) => {
@@ -281,7 +370,7 @@ impl CommandSink for DisplayExecutor {
     async fn wake_once(&self) -> Result<(), CmdFailure> {
         // Single round through the chain — no retries, no backoff. Used by
         // the emergency-wake path so a panic-recovery command returns fast.
-        let _supersede_token = self.rotate_supersede();
+        let supersede_token = self.rotate_supersede();
 
         if self.chain.is_empty() {
             return Err(CmdFailure {
@@ -290,11 +379,37 @@ impl CommandSink for DisplayExecutor {
             });
         }
 
-        for controller in &self.chain {
-            if !controller.is_available().await {
+        let owner = self
+            .blank_owners
+            .owner(&self.display, &self.chain_fingerprint);
+        let order = Self::owner_first_order(owner, self.chain.len());
+
+        for i in order {
+            let controller = &self.chain[i];
+            let is_owner_attempt = owner == Some(i);
+            if supersede_token.is_cancelled() {
+                return Err(CmdFailure {
+                    controller: "superseded".to_string(),
+                    error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                });
+            }
+            // Ownership is stronger than probe availability: the owner is
+            // attempted regardless of `is_available()`. Non-owner
+            // candidates are still gated as before.
+            if !is_owner_attempt && !controller.is_available().await {
                 continue;
             }
             if controller.wake().await.is_ok() {
+                if supersede_token.is_cancelled() {
+                    return Err(CmdFailure {
+                        controller: "superseded".to_string(),
+                        error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                    });
+                }
+                if is_owner_attempt {
+                    self.blank_owners
+                        .clear_if_owner(&self.display, &self.chain_fingerprint, i);
+                }
                 return Ok(());
             }
         }
@@ -305,6 +420,7 @@ impl CommandSink for DisplayExecutor {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // owner-first ordering + per-round retry/backoff/supersede bookkeeping form one sequential protocol; extracting helpers would scatter the invariants
     async fn wake(&self) -> Result<(), CmdFailure> {
         let supersede_token = self.rotate_supersede();
 
@@ -343,8 +459,20 @@ impl CommandSink for DisplayExecutor {
             })
             .collect();
 
+        // Read the blank owner once, before the burst starts: any blank
+        // arriving mid-burst supersedes this wake via `rotate_supersede()`
+        // (checked below), so the owner cannot change out from under a
+        // wake that is still running. The same order is reused for every
+        // round — one helper, so `wake_once` and `wake` cannot drift.
+        let owner = self
+            .blank_owners
+            .owner(&self.display, &self.chain_fingerprint);
+        let order = Self::owner_first_order(owner, self.chain.len());
+
         for round in 0..total_rounds {
-            for (i, controller) in self.chain.iter().enumerate() {
+            for &i in &order {
+                let controller = &self.chain[i];
+                let is_owner_attempt = owner == Some(i);
                 // Mid-round supersede: a blank arriving between controller
                 // calls aborts the rest of the chain (and the burst) without
                 // waiting for the next inter-round sleep. The token was
@@ -357,7 +485,10 @@ impl CommandSink for DisplayExecutor {
                         error: format!("{E_WAKE_FAILED}: superseded by blank"),
                     });
                 }
-                if !controller.is_available().await {
+                // Ownership is stronger than probe availability: the owner
+                // is attempted regardless of `is_available()`. Non-owner
+                // candidates are still gated as before.
+                if !is_owner_attempt && !controller.is_available().await {
                     health[i].healthy = false;
                     health[i].detail = Some("controller unavailable".to_string());
                     continue;
@@ -382,6 +513,17 @@ impl CommandSink for DisplayExecutor {
                             .health
                             .lock()
                             .expect("DisplayExecutor health lock poisoned") = health;
+                        if is_owner_attempt {
+                            // The owner's wake succeeded: clear it. A
+                            // non-owner fallback success (below, implicitly
+                            // — `is_owner_attempt` is false there) leaves
+                            // the owner in place, per invariant.
+                            self.blank_owners.clear_if_owner(
+                                &self.display,
+                                &self.chain_fingerprint,
+                                i,
+                            );
+                        }
                         return Ok(());
                     }
                     Err(e) => {
@@ -516,6 +658,9 @@ impl CommandSink for DisplayExecutor {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+    use dormant_core::config::defaults::{COMMAND_TIMEOUT, SAMSUNG_RESTORE_BACKLIGHT};
+    use dormant_core::config::schema::DisplayConfig;
+    use dormant_core::wear::PanelType;
     use std::collections::VecDeque;
     use std::sync::Arc;
 
@@ -603,6 +748,33 @@ mod tests {
         }
     }
 
+    fn chain_config() -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["command".into()],
+            blank_mode: Some(BlankMode::PowerOff),
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            output: None,
+            ddc_display: Some("1-1".into()),
+            host: None,
+            wol_mac: None,
+            blank_command: Some("blank".into()),
+            wake_command: Some("wake".into()),
+            modes: Some(vec![BlankMode::PowerOff]),
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: COMMAND_TIMEOUT,
+            restore_brightness: 80,
+            samsung_restore_backlight: SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: PanelType::Unknown,
+        }
+    }
+
     #[async_trait]
     impl DisplayController for FakeController {
         fn name(&self) -> &'static str {
@@ -683,6 +855,27 @@ mod tests {
             retry,
         ));
         (exec, controllers)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn executor_with_shared_owners(
+        controllers: Vec<FakeController>,
+        owners: Arc<BlankOwnerRegistry>,
+        fingerprint: &str,
+    ) -> Arc<DisplayExecutor> {
+        let boxed: Vec<Box<dyn DisplayController>> = controllers
+            .iter()
+            .cloned()
+            .map(|controller| Box::new(controller) as Box<dyn DisplayController>)
+            .collect();
+        Arc::new(DisplayExecutor::with_blank_owners(
+            DisplayId("test-display".into()),
+            boxed,
+            BlankMode::PowerOff,
+            default_retry(),
+            owners,
+            fingerprint.to_string(),
+        ))
     }
 
     fn default_retry() -> RetrySettings {
@@ -1207,6 +1400,364 @@ mod tests {
         assert_eq!(exec.panel_identity(), None);
     }
 
+    // ── Task 3: owner-first wake (RED-first probe; assertions extended post-impl) ──
+
+    #[tokio::test]
+    async fn wake_prefers_the_controller_that_successfully_blanked() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        b.push_blank_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(1),
+            "B (chain index 1) becomes owner after the successful blank"
+        );
+
+        a.set_available(true);
+        exec.wake().await.unwrap();
+
+        assert_eq!(b.count_op("wake"), 1, "B (owner) tried first");
+        assert_eq!(a.count_op("wake"), 0, "A not tried since owner B succeeded");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared once its own wake succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_wake_once_uses_the_same_owner_first_order() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        b.push_blank_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(1),
+            "B (chain index 1) becomes owner after the successful blank"
+        );
+
+        a.set_available(true);
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(b.count_op("wake"), 1, "B (owner) tried first");
+        assert_eq!(a.count_op("wake"), 0, "A not tried since owner B succeeded");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared once its own wake succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_new_blank_does_not_erase_the_previous_owner() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "sole controller becomes owner after a successful blank"
+        );
+
+        a.push_blank_result(Err(err("A")));
+        let res = exec.blank(BlankMode::PowerOff).await;
+        assert!(res.is_err(), "second blank fails (all controllers erred)");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "an all-failed blank must not erase the prior owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_controller_chain_keeps_one_attempt_per_round() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        exec.wake().await.unwrap();
+
+        assert_eq!(
+            a.count_op("blank"),
+            1,
+            "blank calls unchanged by owner-first logic"
+        );
+        assert_eq!(
+            a.count_op("wake"),
+            1,
+            "wake calls unchanged by owner-first logic"
+        );
+    }
+
+    // ── Task 3 fix-round Must 1: owner bypasses is_available() ──────────────
+
+    #[tokio::test]
+    async fn wake_attempts_unavailable_owner_first() {
+        // a: available, blank ok, wake ok. b: available, blank ok, wake ok.
+        // a's blank fails (one-shot script) so b becomes the blank owner.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        a.push_blank_result(Err(err("A")));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(1),
+            "B (chain index 1) becomes owner after the successful blank"
+        );
+
+        // Owner goes unavailable before wake — ownership must still win
+        // over the `is_available()` gate.
+        b.set_available(false);
+
+        exec.wake().await.unwrap();
+
+        assert_eq!(
+            b.count_op("wake"),
+            1,
+            "owner B tried despite being unavailable"
+        );
+        assert_eq!(a.count_op("wake"), 0, "A not tried since owner B succeeded");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared once its own wake succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_once_attempts_unavailable_owner_first() {
+        // Same scenario as `wake_attempts_unavailable_owner_first` but
+        // through the single-attempt `wake_once()` path.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        a.push_blank_result(Err(err("A")));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(1),
+            "B (chain index 1) becomes owner after the successful blank"
+        );
+
+        b.set_available(false);
+
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(
+            b.count_op("wake"),
+            1,
+            "owner B tried despite being unavailable"
+        );
+        assert_eq!(a.count_op("wake"), 0, "A not tried since owner B succeeded");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared once its own wake succeeds"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_once_superseded_by_blank_preserves_new_owner() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(exec.blank_owner_for_test(), Some(0));
+
+        a.set_wake_delay(Duration::from_millis(100));
+        let waking = Arc::clone(&exec);
+        let wake_task = tokio::spawn(async move { waking.wake_once().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        a.set_available(false);
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(exec.blank_owner_for_test(), Some(1));
+
+        let err = wake_task.await.unwrap().unwrap_err();
+        assert_eq!(err.controller, "superseded");
+        assert!(err.error.contains("superseded by blank"));
+        assert_eq!(exec.blank_owner_for_test(), Some(1));
+        assert_eq!(b.count_op("wake"), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_unchanged_chain_wakes_the_recorded_owner_first() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let owners = Arc::new(BlankOwnerRegistry::new());
+        a.set_available(false);
+        let original = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            Arc::clone(&owners),
+            "chain-a-b",
+        );
+        original.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(original.blank_owner_for_test(), Some(1));
+
+        a.set_available(true);
+        let rebuilt = executor_with_shared_owners(vec![a.clone(), b.clone()], owners, "chain-a-b");
+        rebuilt.wake().await.unwrap();
+
+        assert_eq!(b.count_op("wake"), 1);
+        assert_eq!(a.count_op("wake"), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_changed_chain_drops_the_recorded_owner() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let owners = Arc::new(BlankOwnerRegistry::new());
+        a.set_available(false);
+        let original = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            Arc::clone(&owners),
+            "chain-a-b",
+        );
+        original.blank(BlankMode::PowerOff).await.unwrap();
+
+        a.set_available(true);
+        let rebuilt =
+            executor_with_shared_owners(vec![a.clone(), b.clone()], owners, "changed-chain");
+        rebuilt.wake().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 1);
+        assert_eq!(b.count_op("wake"), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_cosmetic_edit_wakes_the_recorded_owner_first() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let owners = Arc::new(BlankOwnerRegistry::new());
+        let original_config = chain_config();
+        a.set_available(false);
+        let original = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            Arc::clone(&owners),
+            &crate::registry::controller_chain_fingerprint(&original_config),
+        );
+        original.blank(BlankMode::PowerOff).await.unwrap();
+
+        let mut cosmetic_edit = original_config;
+        cosmetic_edit.panel_type = PanelType::QdOled;
+        a.set_available(true);
+        let rebuilt = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            owners,
+            &crate::registry::controller_chain_fingerprint(&cosmetic_edit),
+        );
+        rebuilt.wake().await.unwrap();
+
+        assert_eq!(b.count_op("wake"), 1);
+        assert_eq!(a.count_op("wake"), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_with_changed_ddc_target_drops_the_recorded_owner() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let owners = Arc::new(BlankOwnerRegistry::new());
+        let original_config = chain_config();
+        a.set_available(false);
+        let original = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            Arc::clone(&owners),
+            &crate::registry::controller_chain_fingerprint(&original_config),
+        );
+        original.blank(BlankMode::PowerOff).await.unwrap();
+
+        let mut dispatch_edit = original_config;
+        dispatch_edit.ddc_display = Some("2-1".into());
+        a.set_available(true);
+        let rebuilt = executor_with_shared_owners(
+            vec![a.clone(), b.clone()],
+            owners,
+            &crate::registry::controller_chain_fingerprint(&dispatch_edit),
+        );
+        rebuilt.wake().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 1);
+        assert_eq!(b.count_op("wake"), 0);
+    }
+
+    // ── Task 3 fix-round Must 2: non-owner fallback success retains owner ───
+
+    #[tokio::test]
+    async fn wake_retains_owner_when_owner_wake_fails_and_fallback_succeeds() {
+        // A is the owner (sole controller when it blanks). A's wake fails;
+        // B (non-owner fallback) succeeds. Per invariant, only the owner's
+        // *own* successful wake clears ownership — a non-owner fallback
+        // success must retain it.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "A (chain index 0) becomes owner after the successful blank"
+        );
+
+        // default_retry has wake_retries: 0, so wake() runs exactly one
+        // round — a single scripted owner-wake Err is enough.
+        a.push_wake_result(Err(err("A")));
+
+        exec.wake().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 1, "owner A tried first and failed");
+        assert_eq!(b.count_op("wake"), 1, "fallback B tried and succeeded");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "non-owner fallback success must NOT clear ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_once_retains_owner_when_owner_wake_fails_and_fallback_succeeds() {
+        // Same scenario as
+        // `wake_retains_owner_when_owner_wake_fails_and_fallback_succeeds`
+        // but through the single-attempt `wake_once()` path.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "A (chain index 0) becomes owner after the successful blank"
+        );
+
+        a.push_wake_result(Err(err("A")));
+
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 1, "owner A tried first and failed");
+        assert_eq!(b.count_op("wake"), 1, "fallback B tried and succeeded");
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "non-owner fallback success must NOT clear ownership"
+        );
+    }
+
     // ── T5 Step 7 (P1, MANDATORY): trait-boundary priority proof ────────────
 
     /// Proves sampler priority is honored through the `CommandSink` trait
@@ -1311,6 +1862,71 @@ mod tests {
             elapsed >= Duration::from_millis(20),
             "read_state must have actually waited for the held lock, not \
              raced past it: {elapsed:?}"
+        );
+    }
+
+    // ── Task 6 test 6: one executor blank attempt == one DDC transaction ────
+
+    /// Regression guard for the Task 6 post-write verification/rollback
+    /// change (`DdcciController::verify_brightness_zero_write`): a single
+    /// `DisplayExecutor::blank()` call against a chain of one `DdcciController`
+    /// must start exactly ONE `set_vcp(0x10, 0)` transaction on the happy
+    /// path (verification succeeds) — the executor's retry machinery (built
+    /// for the wake burst; `blank()` has no retry loop at all) must never
+    /// wrap or duplicate a blank write, and the new verification step must
+    /// not either.
+    ///
+    /// "fork-internal write repeat is ONE transaction, not a controller
+    /// retry" (Task 6 plan): the vendored `ddc-macos` fork's ARM write path
+    /// performs two low-level I2C writes *inside* a single `execute_raw`
+    /// call (see `vendor/ddc-macos/README.dormant.md`) — invisible above
+    /// the `VcpOps::set_vcp` boundary this test observes. This test proves
+    /// the layers ABOVE that boundary (executor, controller) never turn one
+    /// logical write into more than one `set_vcp` call; it does not and
+    /// cannot exercise the fork's internal write shape (macOS-only code,
+    /// covered by the fork's own co-located tests, DEFERRED: PR CI).
+    #[tokio::test]
+    async fn one_executor_blank_attempt_starts_one_ddc_transaction() {
+        let ident = "i2c-dev:99 TST TEST";
+        let fake = Arc::new({
+            let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
+                ident_string: ident.into(),
+            }]);
+            f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
+            f
+        });
+        let locks = crate::ddc_lock::PanelLocks::new();
+        let mut ddc = crate::ddcci::DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn crate::vcp_ops::VcpOps>,
+            &locks,
+        );
+        ddc.probe().await.unwrap();
+
+        let sink: Arc<dyn CommandSink> = Arc::new(DisplayExecutor::new(
+            DisplayId("t6-panel".into()),
+            vec![Box::new(ddc) as Box<dyn DisplayController>],
+            BlankMode::BrightnessZero,
+            default_retry(),
+        ));
+
+        fake.expect_get(ident, 0x10, Ok(73)); // pre-write read
+        fake.expect_set(ident, 0x10, 0, Ok(())); // the write
+        fake.expect_get(ident, 0x10, Ok(0)); // post-write verification
+
+        sink.blank(BlankMode::BrightnessZero).await.unwrap();
+
+        let log = fake.take_call_log();
+        let transaction_count = log
+            .iter()
+            .filter(|l| l.starts_with("set_vcp") && l.contains("0x10"))
+            .count();
+        assert_eq!(
+            transaction_count, 1,
+            "one executor blank attempt must start exactly one DDC \
+             set_vcp(0x10, 0) transaction: {log:?}"
         );
     }
 }

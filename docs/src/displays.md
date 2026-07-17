@@ -99,6 +99,79 @@ output = "DP-1"
 
 See `docs/research/2026-07-05-kwin-dpms-verification.md` for the spike data.
 
+### `macos-display-sleep` — macOS display sleep
+
+macOS-only, last-resort fallback controller. `blank()` runs
+`pmset displaysleepnow`, a real (coarse, whole-machine) hardware/firmware
+display sleep — every attached display sleeps together, not just one
+panel. `wake()` asserts a temporary IOPM user-activity assertion and polls
+CoreGraphics until every online display reports itself awake again. Only
+supports `power_off`; there is no per-display selector — omit `output` or
+set it to the literal `"all"`.
+
+```toml
+[displays.mac]
+controllers = ["ddcci", "macos-gamma-black", "macos-display-sleep"]
+blank_mode = "power_off"
+```
+
+Use this as the tail of a fallback chain, after `ddcci` and
+`macos-gamma-black` — see [Recommended macOS
+chain](#recommended-macos-chain) below.
+
+### `macos-gamma-black` — macOS gamma black (Quartz)
+
+macOS-only. Blanks by writing an all-zero Quartz gamma table to a specific
+display via CoreGraphics — a true black-pixel overlay at the color-LUT
+level, not a power-state change. Only supports `brightness_zero`.
+`output` must be `"cg:<uuid>"` (lowercase CoreGraphics display UUID) — a
+named/absent selector is a config validation error.
+
+```toml
+[displays.oled_mac]
+controllers = ["ddcci", "macos-gamma-black"]
+blank_mode = "brightness_zero"
+output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230"
+```
+
+**Restart/crash behavior — read before relying on this in production.**
+There is no periodic reassertion and no restore-on-drop: the first
+successful `blank()` per display captures the pre-blank gamma table
+in-process, and `wake()` replays exactly that captured table. That capture
+lives only in the running daemon's memory.
+
+- A `dormantd` restart mid-blank does **not** itself flash the desktop —
+  the in-memory captured table is simply gone, and a `wake()` with nothing
+  captured is a no-op.
+- But dormant also writes a breadcrumb file
+  (`$XDG_STATE_HOME/dormant/gamma-blank.json`, falling back to
+  `~/.local/state/dormant/gamma-blank.json`) before every gamma blank,
+  cleared only after a confirmed wake. On the *next* `dormantd` startup,
+  before any config is loaded, a leftover breadcrumb triggers a
+  system-wide `CGDisplayRestoreColorSyncSettings()` restore — so a crash
+  does not permanently strand the panel black, but it does mean the panel
+  visibly un-blacks for a moment at the next daemon start, and the rules
+  engine may then re-blank it immediately if presence still calls for it.
+- A dead daemon does not strand the panel any *more* black than it already
+  is, but it also cannot fix it. Use `dormantctl emergency-wake` for that —
+  it restores from the same breadcrumb independently of daemon health. See
+  [macOS: gamma emergency restore](./troubleshooting.md#macos-gamma-emergency-restore).
+
+#### Recommended macOS chain
+
+For an OLED panel on macOS reachable over DDC/CI, the plan-recommended
+fallback order is:
+
+```toml
+controllers = ["ddcci", "macos-gamma-black", "macos-display-sleep"]
+```
+
+`ddcci` first (audio-safe, panel-internal, per-monitor); `macos-gamma-black`
+next when DDC/CI is unavailable or unsupported (also audio-safe, but only a
+color-LUT black, not a real power-off, and with the restart caveats above);
+`macos-display-sleep` last (a real hardware sleep, but whole-machine and
+with no audio-safety guarantee — treat it as the fallback of last resort).
+
 ### `samsung-tizen` — Samsung Tizen TV
 
 Controls Samsung Tizen (OLED) TVs via `KEY_PICTURE_OFF` remote key over

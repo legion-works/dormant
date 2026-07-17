@@ -200,6 +200,13 @@ async fn run_inner(
         }
     }
 
+    // ── macOS-only read-only platform checks — never re-run owned
+    // display blank/wake (that stays exclusively under the `Exercise`
+    // control path); see `push_macos_platform_checks` (extracted to its own
+    // function to keep this one under clippy::too_many_lines).
+    #[cfg(target_os = "macos")]
+    push_macos_platform_checks(&mut checks).await;
+
     // ── Non-exclusive network sensors (MQTT / HA) — active probe ──
     let mut probe_futs: Vec<std::pin::Pin<Box<dyn Future<Output = Check> + Send>>> = Vec::new();
     for (id, sensor_cfg) in &cfg.sensors {
@@ -244,6 +251,27 @@ async fn run_inner(
     }
 
     DoctorReport { checks }
+}
+
+/// Append the same three read-only macOS platform probes the bare
+/// `dormantctl doctor` runs (see `crate::probe_all_offline`) to the live
+/// daemon-backed doctor's checks — idle-clock health, display-sleep API
+/// availability + current per-display state, and active power assertions.
+/// All three are read-only diagnostics; none of them ever blanks or wakes a
+/// display — that stays exclusively under the `Exercise` control path.
+/// Extracted out of [`run_inner`] to keep that function under
+/// `clippy::too_many_lines`.
+#[cfg(target_os = "macos")]
+async fn push_macos_platform_checks(checks: &mut Vec<Check>) {
+    checks.push(probe_result_to_check(
+        &crate::probes::macos_idle::probe_macos_idle().await,
+    ));
+    checks.push(probe_result_to_check(
+        &crate::probes::macos_display_sleep::probe_macos_display_sleep().await,
+    ));
+    checks.push(probe_result_to_check(
+        &crate::probes::macos_power::probe_macos_power().await,
+    ));
 }
 
 /// Fetch a snapshot from the engine (bounded).  Returns an empty snapshot

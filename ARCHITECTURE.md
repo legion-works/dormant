@@ -8,12 +8,12 @@ Crate map, data flow, and where-to-find-it guide for the dormant codebase.
 |---|---|---|
 | `dormant-core` | Domain types, traits, config schema/validation, zone fusion engine, rules engine, state machine, IPC protocol, reload types, doctor wire types (`DoctorReport`/`Check`/`CheckStatus`), panel-wear ledger model (`wear.rs` — `WearLedger`/`WearIdentity`/`PanelType`/`WearHandle`/identity normalization; `DaemonEvent::WearSnapshot` + `CompensationAdvisory`), ownership gate (`ownership.rs` — `OwnershipGate` trait + `AlwaysOwned` impl, the seam a future multi-instance coordinator would replace without touching the state machine) — pure logic, no I/O | No |
 | `dormant-sensors` | Sensor sources: MQTT (`mqtt.rs`), Home Assistant WebSocket (`ha_ws.rs`), USB-serial LD2410 radar (`usb_ld2410.rs`), plus a shared backoff helper and a static registry | No |
-| `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`), abstract VCP operations (`vcp_ops.rs` — ddc-hi real backend + scripted fake, panic-recovery via `catch_unwind`), per-panel DDC/CI bus lock (`ddc_lock.rs` — `PanelLocks` registry, `VcpPriority::Command` vs `Sampler`, poison recovery), Home Assistant passthrough (`ha_passthrough.rs`), Samsung Tizen (`samsung_tizen.rs` — port 8002 WebSocket + Wake-on-LAN + pairing, with `pair()`'s connect step behind an injectable `PairConnect` trait — `RealPairConnect` for the real WSS handshake, `test_support::FakePairConnect` behind the `test-util` feature for deterministic pairing-route tests in `dormant-web`) plus its audio-safe IP Control G2 JSON-RPC transport (`samsung_ip.rs` — port 1516 `backlightControl` for `brightness_zero`), execution engine with fallback/retry (`executor.rs`), static registry | No |
-| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI, Samsung Tizen (reachability + power state + token presence); live coalesced `DoctorService` for the daemon + web UI; control-path verification — `dormantctl doctor --exercise <display>` routes an `Exercise` IPC request through the daemon, which pauses the target's rules and steps blank→read→wake→read on the live controller chain to confirm each command actually moved the panel. Wire types live in `dormant_core::doctor` to avoid a cycle | No |
+| `dormant-displays` | Display controllers: arbitrary shell command (`command.rs`), DDC/CI (`ddcci.rs`, Linux and macOS — the vendored `ddc-macos` fork backs `RealVcp` on macOS), abstract VCP operations (`vcp_ops.rs` — ddc-hi real backend + scripted fake, panic-recovery via `catch_unwind`), per-panel DDC/CI bus lock (`ddc_lock.rs` — `PanelLocks` registry, `VcpPriority::Command` vs `Sampler`, poison recovery), Home Assistant passthrough (`ha_passthrough.rs`), Samsung Tizen (`samsung_tizen.rs` — port 8002 WebSocket + Wake-on-LAN + pairing, with `pair()`'s connect step behind an injectable `PairConnect` trait — `RealPairConnect` for the real WSS handshake, `test_support::FakePairConnect` behind the `test-util` feature for deterministic pairing-route tests in `dormant-web`) plus its audio-safe IP Control G2 JSON-RPC transport (`samsung_ip.rs` — port 1516 `backlightControl` for `brightness_zero`), execution engine with fallback/retry (`executor.rs`), static registry. macOS-only (`#[cfg(target_os = "macos")]`), Task 7–10: `macos_gamma_black.rs` (audio-safe Quartz gamma-table black, `cg:<uuid>`-selector, first-blank-wins `GammaHoldRegistry`, no periodic reassertion/no `Drop` restore — see [Displays](docs/src/displays.md#macos-gamma-black--macos-gamma-black-quartz)), `gamma_breadcrumb.rs` (daemon-lifetime + on-disk breadcrumb backing the emergency/startup restore path), `macos_display_sleep.rs` (global `pmset displaysleepnow` fallback + IOPM-assertion wake, no per-display selector) | No |
+| `dormant-doctor` | Hardware/connectivity health checks: probes for config, MQTT, HA WebSocket, USB LD2410, DDC/CI, Samsung Tizen (reachability + power state + token presence); live coalesced `DoctorService` for the daemon + web UI; control-path verification — `dormantctl doctor --exercise <display>` routes an `Exercise` IPC request through the daemon, which pauses the target's rules and steps blank→read→wake→read on the live controller chain to confirm each command actually moved the panel. Wire types live in `dormant_core::doctor` to avoid a cycle. macOS-only, read-only probes (Task 11): `macos-idle` (bounded raw idle-clock readings), `macos-display-sleep` (API availability + per-display asleep/awake state), `macos-power` (active display-sleep-preventing power assertions) — never blank or wake a display | No |
 | `dormant-web` | Loopback-only web dashboard: axum HTTP/WS bridge that reads live engine state and serves a SPA (`crates/dormant-web/webui/`). Optional dependency of `dormantd`, gated behind the `web-ui` Cargo feature — when off, zero web code is compiled. `config_patch.rs` also gates entity create/delete (`CreateEntity`/`DeleteEntity` patch ops, a per-collection closed creatable-field allowlist, and a reserved-entity-id ban); `routes/pair.rs` is the Samsung pairing wizard (`POST`/`GET /api/pair/samsung[/<id>]`, non-blocking + single-flight over `PairConnect`) | No |
 | `dormant-render` | Local Wayland layer-shell `RenderSink`: software-blank black overlay (final ladder fallback when every display controller failed) and libmpv-driven screensaver overlay (last-resort idle surface) with pixel-shift (`shift_px`/`shift_interval` keys on `[displays.<id>.screensaver]`, `ShiftSettings` re-exported alongside `ScreensaverSettings`; pure raster-walk math in `shift.rs` — U5: the black overlay never shifts). Wayland I/O is `target_os = "linux"`-gated; non-Linux builds expose a no-op stub with the same `LayerShellRenderSink` surface so callers compile unconditionally | No |
-| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher + the PipeWire `pw-dump`-polling audio/call inhibitor (`audio_source.rs`/`inhibit_audio.rs` — poll/classify/debounce/circuit-breaker, mirrors `idle_source.rs`'s publish/dedup discipline), single-instance flock, reload handling, panel-wear tracker (`wear_tracker.rs` — periodic panel-state sampling through `CommandSink::read_state_sampled`, ledger persistence to `wear_state_dir()`, advisory event emission), desktop failure notifier (`notifier.rs` — pure `decide`/`reconcile` policy over a daemon-lifetime `NotifyState`, `ZbusSink` session-bus I/O boundary), dispatch-relevant reload voiding (`reload.rs::zero_changed_displays`/`dispatch_relevant_eq`), boot-time crash-loop verdict + LKG state I/O (`boot_guard.rs` — pure `decide`/`should_promote` + sync `prepare` shell), the split boot sequence (`boot.rs::boot`), best-effort `sd_notify` (`sd_notify.rs`), optional web UI spawn, logging | **Yes** — `dormantd` |
-| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `emergency-wake` (IPC fast path with a direct-hardware fallback when the daemon is unresponsive), `doctor` (per-target subcommands including `samsung`, plus `--exercise <display>` for control-path verification), `pair samsung <host>` subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
+| `dormantd` | Daemon binary: config loading, event loop, IPC server, inhibit-activity watcher + the PipeWire `pw-dump`-polling audio/call inhibitor (`audio_source.rs`/`inhibit_audio.rs` — poll/classify/debounce/circuit-breaker, mirrors `idle_source.rs`'s publish/dedup discipline), single-instance flock, reload handling, panel-wear tracker (`wear_tracker.rs` — periodic panel-state sampling through `CommandSink::read_state_sampled`, ledger persistence to `wear_state_dir()`, advisory event emission), desktop failure notifier (`notifier.rs` — pure `decide`/`reconcile` policy over a daemon-lifetime `NotifyState`, `ZbusSink` session-bus I/O boundary), dispatch-relevant reload voiding (`reload.rs::zero_changed_displays`/`dispatch_relevant_eq`), boot-time crash-loop verdict + LKG state I/O (`boot_guard.rs` — pure `decide`/`should_promote` + sync `prepare` shell, supervisor-agnostic — composes with systemd's `RestartSec` and launchd's `ThrottleInterval` identically), the split boot sequence (`boot.rs::boot`), best-effort `sd_notify` (`sd_notify.rs`, Linux/systemd only — no macOS watchdog-ping equivalent), optional web UI spawn, logging, macOS-only (Task 9) CoreGraphics idle source + startup gamma-breadcrumb restore (`macos_idle.rs`, `gamma_recovery.rs`) | **Yes** — `dormantd` |
+| `dormantctl` | CLI binary: `status`, `pause`, `resume`, `blank`, `wake`, `reload`, `validate`, `watch`, `emergency-wake` (IPC fast path with a direct-hardware fallback when the daemon is unresponsive — also runs the macOS gamma breadcrumb restore independently of daemon health), `doctor` (per-target subcommands including `samsung` and the macOS-only read-only arms, plus `--exercise <display>` for control-path verification), `pair samsung <host>`, `launchd install`/`launchd uninstall` (Task 12, macOS-only handler — installs/removes the checked-in `LaunchAgent` plist at the canonical `~/Library/LaunchAgents/com.legionworks.dormant.plist`, `cmd_launchd.rs`) subcommands. Also re-exports its IPC `client` module as a library entry (`crates/dormantctl/src/lib.rs`) so `dormant-tray` can drive the same protocol without forking the socket glue | **Yes** — `dormantctl` |
 | `dormant-tray` | KDE `StatusNotifierItem` tray applet (`ksni`): live icon (Normal / Attention / Paused / Unreachable), pause/resume/blank/wake menu items, tooltip, reconnecting IPC event-stream reader. Linux-only — non-Linux bin prints a notice and exits 1 so cross-platform `cargo check` stays green | **Yes** — `dormant-tray` |
 
 Each crate follows the convention: one module per concept, one file per sensor/controller, explicit static registry with no proc-macro magic.
@@ -231,6 +231,17 @@ are deliberately not config; they come from systemd's own
 full mechanism writeup, the `WatchdogSec=150` derivation, and the
 binary-before-unit upgrade order warning.
 
+**No macOS watchdog parity.** `sd_notify.rs` and the engine-liveness
+`WATCHDOG=1` ping are systemd-only — launchd has no equivalent mechanism
+to detect a *running but wedged* (hung, not exited) `dormantd`. The
+crash-loop / LKG-rollback logic above is otherwise fully
+supervisor-agnostic (it counts process starts from its own state files,
+not from systemd or launchd), so launchd's `ThrottleInterval=10` paces
+restarts the same way systemd's `RestartSec=2` does, and a
+config-caused crash loop still rolls back to last-known-good on macOS —
+only the *wedged-but-alive* detection is Linux/systemd-only. See
+[Installation: LaunchAgent (macOS)](docs/src/installation.md#launchagent-macos).
+
 ## Audio-safe blanking
 
 DPMS-based blanking (including `kwin-dpms`) disables the DRM/KMS output,
@@ -243,15 +254,28 @@ preserving audio:
 - **`ddcci`** — VCP `0xD6` sends a "display power off" command over I2C.
   The monitor blanks its panel internally; the OS output and ALSA device
   remain active. Only works on DDC/CI-capable monitors that support D6.
+  Cross-platform: same VCP semantics on Linux and macOS.
 - **`samsung-tizen`** — `KEY_PICTURE_OFF` blanks the TV panel over WebSocket.
   The TV continues rendering audio; the HDMI output remains active.
 - **`samsung-tizen`** (`brightness_zero`) — Samsung IP Control G2 JSON-RPC on
   port 1516 calls `backlightControl` to dim the panel to 0 via `samsung_ip`.
   Source and audio keep running; the HDMI output stays active. Used when
   `KEY_PICTURE_OFF` would cut the source or pause media.
+- **`macos-gamma-black`** (macOS only) — writes an all-zero Quartz gamma
+  table via CoreGraphics. A color-LUT black, not a power-state or output
+  change, so it never touches audio. Trades that safety for a restart
+  caveat: no periodic reassertion, restore depends on an in-process
+  captured table or the on-disk breadcrumb — see [Displays: macOS gamma
+  black](docs/src/displays.md#macos-gamma-black--macos-gamma-black-quartz).
+
+`macos-display-sleep` (macOS's last-resort fallback, `pmset
+displaysleepnow`) is deliberately **not** in the audio-safe list above —
+unlike the LUT-level and DDC/CI-internal modes, it is a real, whole-machine
+hardware/firmware display sleep with no audio-safety guarantee.
 
 Per-display strategy:
-- DDC/CI monitor → `ddcci` power_off (audio-safe, verified on AOC AG326UZD)
+- DDC/CI monitor → `ddcci` power_off (audio-safe, verified on AOC AG326UZD;
+  same controller on Linux and macOS)
 - Samsung Tizen TV → `samsung-tizen` picture-off (audio-safe, verified on S90D)
 - Samsung Tizen TV where the source must keep running → `samsung-tizen`
   `brightness_zero` via port 1516 IP Control G2 (audio-safe, softer panel
@@ -259,6 +283,11 @@ Per-display strategy:
 - Outputs with no DDC/CI and no audio → `kwin-dpms` is acceptable (no audio to kill)
 - Outputs with audio but no DDC/CI → Tizen passthrough or `command` with an
   audio-safe external command; otherwise live with the audio loss
+- macOS display with no DDC/CI support → `macos-gamma-black` (audio-safe),
+  falling back to `macos-display-sleep` (not audio-safe, last resort) —
+  the plan-recommended chain is `["ddcci", "macos-gamma-black",
+  "macos-display-sleep"]`, see [Displays: recommended macOS
+  chain](docs/src/displays.md#recommended-macos-chain)
 
 See `docs/research/2026-07-05-kwin-dpms-verification.md` and
 `docs/research/2026-07-05-s90d-verification.md` for the hardware spike data.

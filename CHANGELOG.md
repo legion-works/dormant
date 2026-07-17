@@ -9,6 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Added
 
 - Web UI v2 parity and polish: persistent boot-rollback/failure banners, global emergency wake, browser-launched control-path exercise, per-display wear heat maps and exposure summaries, guarded quick controls, exact event badges, and shared confirmation dialogs.
+- macOS (M1) support, arm64 and x86_64: DDC/CI display control shared with Linux (vendored `ddc-macos` fork), the `macos-gamma-black` audio-safe Quartz gamma-table blank controller (with a daemon-independent breadcrumb-based emergency-restore path, `dormantctl emergency-wake`), the `macos-display-sleep` whole-machine `pmset` fallback controller, a CoreGraphics idle source, and read-only `dormantctl doctor macos-idle` / `macos-display-sleep` / `macos-power` diagnostics.
+- `dormantctl launchd install` / `launchd uninstall` (macOS only): installs/removes the checked-in per-user `LaunchAgent` plist (`RunAtLoad`, `KeepAlive.SuccessfulExit=false`, `ThrottleInterval=10`) at the canonical `~/Library/LaunchAgents/com.legionworks.dormant.plist`, idempotently and without root.
+- cargo-dist release artifacts for `aarch64-apple-darwin` and `x86_64-apple-darwin`, each bundling the checked-in `LaunchAgent` plist (`share/com.legionworks.dormant.plist`) at the same bytes `launchd install` embeds; the release-artifact smoke test now runs across all four targets (adding a `plutil -lint` check on the plist for the two macOS targets).
+- `dormant-tray` is packaged for macOS but is **not functional there** — a KDE `StatusNotifierItem` applet has no macOS equivalent yet.
 
 ## [0.2.0] - 2026-07-14
 

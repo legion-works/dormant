@@ -183,7 +183,7 @@ impl SdNotify {
         Self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn from_socket_for_test(_addr: &std::os::unix::net::SocketAddr) -> Self {
         Self

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  dormant per-user LaunchAgent (macOS).
+
+  Canonical path story (kept in sync with dormantctl's `launchd install`,
+  which embeds this EXACT file at build time — see
+  crates/dormantctl/src/cmd_launchd.rs):
+
+    - This file is staged into every macOS release archive at
+      `share/com.legionworks.dormant.plist` (crates/dormantd/Cargo.toml's
+      `package.metadata.dist.include`).
+    - `dormantctl launchd install` copies these exact bytes to
+      `~/Library/LaunchAgents/com.legionworks.dormant.plist`, mode 0644.
+    - `launchctl bootstrap gui/$UID
+      "$HOME/Library/LaunchAgents/com.legionworks.dormant.plist"` always
+      loads that one canonical path — never a path under $TMPDIR, and never
+      a path launchd is asked to expand itself: launchd does NOT expand
+      $HOME (or any other shell variable) inside plist string values, so
+      ProgramArguments below stays a literal, non-expanding path
+      ("/bin/sh") and defers all $HOME expansion to the shell it invokes.
+
+  Lifecycle semantics:
+    - RunAtLoad: start immediately on `launchctl bootstrap`/login, without
+      waiting for a KeepAlive-triggered restart first.
+    - KeepAlive.SuccessfulExit=false: relaunch dormantd after an unsuccessful
+      exit, but leave a clean `exit 0` down. There is deliberately no other
+      KeepAlive condition (no
+      NetworkState, no PathState): dormant does not need one to be alive.
+    - ThrottleInterval=10: launchd will not restart more than once every 10
+      seconds, bounding a crash loop's restart rate. This is the ONLY
+      restart-rate control in play — there is no macOS equivalent of
+      systemd's WatchdogSec engine-liveness ping wired up here. A dormantd
+      that is running but wedged (hung, not exited) is NOT detected or
+      restarted by launchd; see docs/src/installation.md's "no watchdog
+      parity" note.
+
+  Program invocation:
+    ProgramArguments runs `/bin/sh -lc <script>` rather than dormantd
+    directly so the script can create the log directory and redirect
+    stdout/stderr before dormantd starts, using $HOME (which only a shell,
+    not launchd's plist parser, expands). The script's LAST action is
+    `exec "$HOME/.local/bin/dormantd"`: exec REPLACES the shell process
+    with dormantd in place, so dormantd itself becomes the direct child
+    launchd supervises — the shell does not linger as a supervisor
+    intermediary between launchd and dormantd.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.legionworks.dormant</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-lc</string>
+		<string>mkdir -p "$HOME/Library/Logs/dormant" &amp;&amp; exec "$HOME/.local/bin/dormantd" &gt;&gt;"$HOME/Library/Logs/dormant/dormantd.log" 2&gt;&gt;"$HOME/Library/Logs/dormant/dormantd.err.log"</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

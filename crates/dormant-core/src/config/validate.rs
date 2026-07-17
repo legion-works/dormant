@@ -117,6 +117,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "pairing_enabled",
             "pair_timeout",
             "doctor_wake_settle",
+            "macos_idle_frozen_polls",
+            "macos_idle_sanity_cap",
+            "macos_idle_startup_grace",
         ],
     ),
     // ── sensors.<id> ───────────────────────────────────────────────────────
@@ -638,8 +641,12 @@ fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
     }
 }
 
-/// Validate the `[daemon]` section: `pair_timeout` and
-/// `doctor_wake_settle` bounds.
+/// Validate the `[daemon]` section: `pair_timeout`, `doctor_wake_settle`,
+/// and the macOS idle-source (`macos_idle_*`) bounds. The macOS fields are
+/// validated unconditionally (not gated on `idle_source == "macos"`) — a
+/// bogus value sitting dormant in the config until the operator flips
+/// `idle_source` would surface as a startup failure at the worst possible
+/// time; validating always catches it at `config-validate` time instead.
 fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let daemon = &cfg.daemon;
 
@@ -664,6 +671,30 @@ fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 "daemon.doctor_wake_settle {:?} is out of range — allowed: 100ms..=30s",
                 daemon.doctor_wake_settle
             ),
+        });
+    }
+
+    if daemon.macos_idle_frozen_polls < 2 {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: format!(
+                "daemon.macos_idle_frozen_polls {} is below the minimum of 2",
+                daemon.macos_idle_frozen_polls
+            ),
+        });
+    }
+
+    if daemon.macos_idle_sanity_cap.is_zero() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "daemon.macos_idle_sanity_cap must be > 0".into(),
+        });
+    }
+
+    if daemon.macos_idle_startup_grace.is_zero() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "daemon.macos_idle_startup_grace must be > 0".into(),
         });
     }
 }
@@ -1399,6 +1430,82 @@ fn validate_display(
                     });
                 }
             }
+            "macos-gamma-black" => {
+                // Task 4 ratified selector contract: this controller is
+                // addressed by a stable `cg:<lowercase-cfuuid>` selector,
+                // sourced from `output`, and NEVER a main-display fallback —
+                // missing `output` is a hard validation error, not a
+                // silently-degraded default.
+                match &dc.output {
+                    None => {
+                        errors.push(ValidationError {
+                            what: "missing field".into(),
+                            detail: format!(
+                                "display '{display_id}' uses macos-gamma-black but has no \
+                                 'output' field (expected \"cg:<uuid>\", e.g. \
+                                 output = \"cg:e33e5bf7-...\") — there is no main-display \
+                                 fallback for this controller"
+                            ),
+                        });
+                    }
+                    Some(output) => {
+                        if let Some(uuid) = output.strip_prefix("cg:") {
+                            if uuid.is_empty() {
+                                errors.push(ValidationError {
+                                    what: "invalid selector".into(),
+                                    detail: format!(
+                                        "display '{display_id}' macos-gamma-black 'output' \
+                                         \"{output}\" has an empty UUID after the 'cg:' prefix"
+                                    ),
+                                });
+                            } else if uuid.chars().any(|c| c.is_ascii_uppercase()) {
+                                errors.push(ValidationError {
+                                    what: "invalid selector".into(),
+                                    detail: format!(
+                                        "display '{display_id}' macos-gamma-black 'output' \
+                                         \"{output}\" must be lowercase (got an uppercase \
+                                         character in the UUID)"
+                                    ),
+                                });
+                            }
+                        } else {
+                            errors.push(ValidationError {
+                                what: "invalid selector".into(),
+                                detail: format!(
+                                    "display '{display_id}' macos-gamma-black 'output' \
+                                     \"{output}\" must start with \"cg:\" (the Task 4 ratified \
+                                     stable-UUID selector contract)"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            "macos-display-sleep" => {
+                // Task 10 ratified contract (the explicit exception named in
+                // `docs/research/2026-07-16-macos-display-selector.md`):
+                // this controller is GLOBAL — it puts every display on the
+                // Mac to sleep via `pmset displaysleepnow`, with no
+                // per-display targeting surface at all. `output` must
+                // therefore be either absent, or the literal string `"all"`
+                // (an explicit "yes, I mean every display" opt-in) — any
+                // *named* selector (`"cg:<uuid>"`, a connector name like
+                // `"DP-1"`, anything else) is a hard error, because this
+                // controller could never honor it.
+                if let Some(output) = &dc.output
+                    && output != "all"
+                {
+                    errors.push(ValidationError {
+                        what: "invalid selector".into(),
+                        detail: format!(
+                            "display '{display_id}' macos-display-sleep 'output' \"{output}\" \
+                             must be absent or the literal \"all\" — this controller is a \
+                             GLOBAL fallback with no per-display targeting surface (it puts \
+                             every display to sleep via pmset displaysleepnow)"
+                        ),
+                    });
+                }
+            }
             // kwin-dpms and ddcci have no required fields beyond the defaults.
             _ => {}
         }
@@ -1803,6 +1910,8 @@ gracee_period = "60s"
             ),
             ("ha-passthrough".into(), vec![]),
             ("command".into(), vec![]),
+            ("macos-gamma-black".into(), vec![BlankMode::BrightnessZero]),
+            ("macos-display-sleep".into(), vec![BlankMode::PowerOff]),
         ])
     }
 
@@ -2432,6 +2541,207 @@ gracee_period = "60s"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
         }
+    }
+
+    // ── Task 7: macos-gamma-black selector validation ──────────────────────
+    //
+    // Platform-neutral: this validation logic runs on every host regardless
+    // of whether `macos-gamma-black` is actually registered on that target
+    // (see `dormant_displays::registry::CONTROLLER_TYPES`) — a Linux
+    // sandbox can fully exercise these RED-first tests without ever
+    // building the macOS FFI layer.
+
+    fn macos_gamma_black_cfg(output: Option<&str>) -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["macos-gamma-black".into()],
+            blank_mode: Some(BlankMode::BrightnessZero),
+            output: output.map(String::from),
+            ..base_display_cfg()
+        }
+    }
+
+    #[test]
+    fn macos_gamma_black_missing_output_is_hard_error() {
+        let dc = macos_gamma_black_cfg(None);
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("no 'output' field")),
+            "missing output must be a hard error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_without_cg_prefix_is_rejected() {
+        let dc = macos_gamma_black_cfg(Some("DP-1"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.detail.contains("must start with")),
+            "an output not shaped as 'cg:<uuid>' must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_empty_uuid_is_rejected() {
+        let dc = macos_gamma_black_cfg(Some("cg:"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.detail.contains("empty UUID")),
+            "a 'cg:' prefix with no UUID must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_uppercase_uuid_is_rejected() {
+        let dc = macos_gamma_black_cfg(Some("cg:E33E5BF7-0000-0000-0000-000000000000"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.detail.contains("lowercase")),
+            "an uppercase UUID must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_lowercase_uuid_is_accepted() {
+        let dc = macos_gamma_black_cfg(Some("cg:e33e5bf7-0000-0000-0000-000000000000"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "a well-formed lowercase cg: selector must not error: {errors:?}"
+        );
+    }
+
+    // ── Task 10: macos-display-sleep global-output validation ─────────────
+    //
+    // Platform-neutral, same reasoning as the macos-gamma-black block above:
+    // this validation logic runs on every host regardless of whether
+    // `macos-display-sleep` is actually registered on that target (see
+    // `dormant_displays::registry::CONTROLLER_TYPES`).
+    //
+    // Exact predicate (ratified in
+    // `docs/research/2026-07-16-macos-display-selector.md`): `output` must
+    // be absent OR the literal string `"all"` — any named selector is a
+    // hard error, because this controller is GLOBAL and has no per-display
+    // targeting surface at all (unlike macos-gamma-black, which REQUIRES a
+    // named `cg:<uuid>` selector — the two controllers are deliberately
+    // opposite here, per the plan's "Trap 6").
+
+    fn macos_display_sleep_cfg(output: Option<&str>) -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["macos-display-sleep".into()],
+            blank_mode: Some(BlankMode::PowerOff),
+            output: output.map(String::from),
+            ..base_display_cfg()
+        }
+    }
+
+    #[test]
+    fn macos_display_sleep_output_absent_is_accepted() {
+        let dc = macos_display_sleep_cfg(None);
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "absent output must be accepted for the global fallback: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_display_sleep_output_all_is_accepted() {
+        let dc = macos_display_sleep_cfg(Some("all"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "the literal \"all\" must be accepted: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_display_sleep_output_named_cg_selector_is_rejected() {
+        let dc = macos_display_sleep_cfg(Some("cg:panel"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("must be absent or the literal \"all\"")),
+            "a named cg: selector must be rejected — this controller has no \
+             per-display targeting surface: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_display_sleep_output_connector_name_is_rejected() {
+        let dc = macos_display_sleep_cfg(Some("DP-1"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("must be absent or the literal \"all\"")),
+            "a connector-name output must be rejected: {errors:?}"
+        );
     }
 
     fn config_with_scale_mode(scale_mode: Option<&str>) -> super::super::schema::Config {
@@ -5234,5 +5544,122 @@ availability_payload_offline = "down"
         );
         let (cfg, _warnings) = result.unwrap();
         assert_eq!(cfg.daemon.doctor_wake_settle, Duration::from_secs(5));
+    }
+
+    // ── Task 5: daemon.macos_idle_frozen_polls / macos_idle_sanity_cap /
+    //    macos_idle_startup_grace ──────────────────────────────────────────
+
+    #[test]
+    fn macos_idle_frozen_polls_floor_1_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_frozen_polls = 1\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("macos_idle_frozen_polls")),
+            "macos_idle_frozen_polls below the floor of 2 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_frozen_polls_floor_2_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_frozen_polls = 2\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("macos_idle_frozen_polls")),
+            "macos_idle_frozen_polls = 2 (the floor) must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_sanity_cap_zero_rejected() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_sanity_cap = \"0s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("macos_idle_sanity_cap")),
+            "macos_idle_sanity_cap = 0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_sanity_cap_positive_accepted() {
+        let errors = validate_str("config_version = 1\n[daemon]\nmacos_idle_sanity_cap = \"1s\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("macos_idle_sanity_cap")),
+            "macos_idle_sanity_cap > 0 must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_startup_grace_zero_rejected() {
+        let errors =
+            validate_str("config_version = 1\n[daemon]\nmacos_idle_startup_grace = \"0s\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == "E_CONFIG_INVALID"
+                    && e.detail.contains("macos_idle_startup_grace")),
+            "macos_idle_startup_grace = 0 must be rejected, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_startup_grace_positive_accepted() {
+        let errors =
+            validate_str("config_version = 1\n[daemon]\nmacos_idle_startup_grace = \"1s\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("macos_idle_startup_grace")),
+            "macos_idle_startup_grace > 0 must be accepted, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn macos_idle_keys_accepted_in_strict_mode_and_known_keys() {
+        let result = load_str_strict(
+            "config_version = 1\n\
+             [daemon]\n\
+             idle_source = \"macos\"\n\
+             macos_idle_frozen_polls = 4\n\
+             macos_idle_sanity_cap = \"12h\"\n\
+             macos_idle_startup_grace = \"5s\"\n",
+        );
+        assert!(
+            result.is_ok(),
+            "the three macos_idle_* keys must be in KNOWN_KEYS, got: {:?}",
+            result.err()
+        );
+        let (cfg, _warnings) = result.unwrap();
+        assert_eq!(cfg.daemon.macos_idle_frozen_polls, 4);
+        assert_eq!(
+            cfg.daemon.macos_idle_sanity_cap,
+            Duration::from_secs(12 * 60 * 60)
+        );
+        assert_eq!(cfg.daemon.macos_idle_startup_grace, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn macos_idle_defaults_pass_validation() {
+        // The shipped defaults (3 polls / 24h / 15s) must themselves be
+        // valid — a default that fails its own validator would brick every
+        // config that doesn't touch these keys.
+        let errors = validate_str("config_version = 1\n");
+        assert!(
+            !errors.iter().any(|e| e.detail.contains("macos_idle")),
+            "the macos_idle_* defaults must pass validation, got: {:?}",
+            errors
+        );
     }
 }

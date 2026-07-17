@@ -1418,6 +1418,13 @@ async fn lock_failure_discounts_the_losers_nonce() {
 /// pinned is ORDER and COUNT: the very first datagram must be `READY=1`,
 /// and a second datagram (if any lands in the short follow-up window) must
 /// never be a second `READY=1`.
+/// Linux-only: this test exercises the ENV-constructed production path
+/// (`NOTIFY_SOCKET` → real datagram send), and `SdNotify`'s non-Linux
+/// build is a deliberate no-op stub that ignores the environment —
+/// systemd does not exist there, so on macOS no datagram can ever
+/// arrive and the bounded recv times out (PR #78 round 8, `WouldBlock`).
+/// The `from_socket_for_test`-seam watchdog tests stay cross-platform.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boot_sends_ready_before_any_watchdog_ping() {
     let h = Harness::new();

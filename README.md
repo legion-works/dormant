@@ -10,7 +10,7 @@
   <a href="https://github.com/legion-works/dormant/actions/workflows/ci.yml"><img src="https://github.com/legion-works/dormant/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="MSRV 1.88">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
-  <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational" alt="Linux and macOS">
   <a href="https://github.com/legion-works/dormant/releases/latest"><img src="https://img.shields.io/github/v/release/legion-works/dormant" alt="Latest release"></a>
 </p>
 
@@ -64,11 +64,13 @@ Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A 
 
 | Controller | |
 |---|---|
-| `ddcci` — DDC/CI power-off and brightness (audio-safe) | Ready |
+| `ddcci` — DDC/CI power-off and brightness (audio-safe, Linux and macOS) | Ready |
 | `samsung-tizen` — Samsung Tizen TVs over WebSocket | Ready |
-| `kwin-dpms` — KDE Wayland DPMS (audio-unsafe fallback) | Ready |
+| `kwin-dpms` — KDE Wayland DPMS (audio-unsafe fallback, Linux only) | Ready |
 | `ha-passthrough` — any Home Assistant service call | Ready |
 | `command` — arbitrary blank/wake shell commands | Ready |
+| `macos-gamma-black` — Quartz gamma-table black (audio-safe, macOS only) | Ready |
+| `macos-display-sleep` — `pmset` display sleep (whole-machine fallback, macOS only) | Ready |
 
 Each display gets an ordered controller chain with automatic fallback and bounded wake retry. A wake that fails on one controller escalates to the next. Repeated failures surface through desktop notifications, the tray, and the web dashboard.
 
@@ -88,14 +90,27 @@ The `dormant-tray` applet puts per-display status and blank/wake/pause controls 
 
 ## Quickstart
 
-### Install from release (Linux x86_64 / aarch64)
+### Install from release (Linux x86_64 / aarch64, macOS arm64 / x86_64)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
 ```
 
-`dormant-tray-installer.sh` is also available in the same directory. Checksums are published alongside every artifact; verify with `sha256sum -c <artifact>.sha256`.
+`dormant-tray-installer.sh` is also available in the same directory — on
+macOS it installs but is **not yet functional** (a KDE `StatusNotifierItem`
+applet has no macOS equivalent until M2; see [Installation: macOS
+(M1)](./docs/src/installation.md#macos-m1)). Checksums are published
+alongside every artifact; verify with `sha256sum -c <artifact>.sha256`.
+
+On macOS, install the per-user `LaunchAgent` and start it — see
+[Installation: LaunchAgent
+(macOS)](./docs/src/installation.md#launchagent-macos):
+
+```bash
+dormantctl launchd install
+launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant.plist"
+```
 
 ### Build from source (Linux, Rust 1.88+)
 
@@ -157,7 +172,7 @@ Configuration reference, sensor and controller guides, and the `doctor` command 
 
 ## Status
 
-Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows. The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit. The shipped watchdog restarts a wedged engine; last-known-good rollback can recover a bad boot config.
+Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows; macOS (M1) is a genuinely supported target as of this milestone — DDC/CI, Quartz-gamma black, and `pmset` display-sleep controllers, a CoreGraphics idle source, and a launchd `LaunchAgent` — while Windows remains portability-only (no native display control). The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit (Linux). The shipped watchdog restarts a wedged engine on Linux via systemd's `WatchdogSec`; macOS has no equivalent wedged-daemon detection (see [Installation: LaunchAgent (macOS)](./docs/src/installation.md#launchagent-macos)). Last-known-good rollback can recover a bad boot config on both platforms — it is supervisor-agnostic. `dormant-tray` (the KDE tray applet) is Linux-only in function; it is packaged for macOS but nonfunctional there until M2.
 
 It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
 

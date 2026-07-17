@@ -7,8 +7,8 @@ oled-proximity/
 ├── crates/
 │   ├── dormant-core/         # Pure domain logic: types, traits, config, rules, state machine, IPC, reload, doctor wire types
 │   ├── dormant-sensors/      # Sensor sources: MQTT, HA WebSocket, USB LD2410 + registry
-│   ├── dormant-displays/     # Display controllers: command, ddcci, kwin-dpms, samsung-tizen (+ samsung_ip IP-Control-G2 transport), ha-passthrough + executor/registry
-│   ├── dormant-doctor/       # Offline + live coalesced hardware/connectivity probes (config, mqtt, ha, usb, ddcci, samsung)
+│   ├── dormant-displays/     # Display controllers: command, ddcci, kwin-dpms, macOS gamma/sleep, samsung-tizen (+ samsung_ip IP-Control-G2 transport), ha-passthrough + executor/registry
+│   ├── dormant-doctor/       # Offline + live coalesced hardware/connectivity probes (config, mqtt, ha, usb, ddcci, samsung, macOS)
 │   ├── dormant-web/          # Loopback-only axum HTTP/WS bridge + SPA (webui/)
 │   ├── dormant-render/       # Local Wayland layer-shell render sink (black overlay + libmpv screensaver); Linux-only I/O
 │   ├── dormantd/             # Daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, logging
@@ -35,7 +35,7 @@ oled-proximity/
 - Key files: `crates/dormant-sensors/src/registry.rs` (explicit static registry — add new sources here).
 
 **`crates/dormant-displays/`**
-- Purpose: Display controllers that turn rules-engine `CommandSink` calls into real blank/wake operations, plus the per-panel DDC/CI bus lock that serializes command-vs-sampler transactions on a single I²C bus.
+- Purpose: Display controllers that turn rules-engine `CommandSink` calls into real blank/wake operations, plus per-panel DDC locks, reload-safe blank-owner state, and serialized gamma holds.
 - Contains: `command.rs`, `ddcci.rs` (Linux-only), `kwin_dpms.rs` (Linux-only), `samsung_tizen.rs` (port 8002 WebSocket remote control + Wake-on-LAN + network pairing — `pair`/`pair_with_connect` behind an injectable `PairConnect` trait, `RealPairConnect` the production impl), `samsung_ip.rs` (port 1516 IP Control G2 JSON-RPC — `backlightControl` for the audio-safe `brightness_zero` blank path; uses `dormant_core::paths::state_dir_from_env` for token-store path derivation), `ha_passthrough.rs`, `vcp_ops.rs` (abstract `VcpOps` trait + ddc-hi real backend + scripted fake; every physical transaction runs under `spawn_blocking` with `catch_unwind` for panic recovery), `ddc_lock.rs` (`PanelLocks` registry, `PanelLock` with command-priority + poison recovery), `executor.rs` (per-display fallback chain + retry; chain-walks `read_state`/`read_state_sampled`/`read_usage_hours`/`panel_identity`), `registry.rs`, `test_support.rs` (`FakePairConnect` — a scripted `PairConnect` fake for the pairing-route tests in `dormant-web`; gated behind the `test-util` Cargo feature so it's reachable from another crate's dev-dependencies, not `#[cfg(test)]`-only).
 - Key files: `crates/dormant-displays/src/registry.rs` (`CONTROLLER_TYPES`, `capabilities()`, `build_controllers()` — the new controllers accept an `Arc<PanelLocks>` argument for the same bus lock to be shared across an `App` generation).
 
@@ -85,7 +85,7 @@ oled-proximity/
 - `crates/dormant-core/src/config/defaults.rs` — single source of truth for every timing knob.
 - `crates/dormant-core/src/config/validate.rs` — cross-reference validation rules AND the known-key tree for unknown-key detection (`KNOWN_KEYS`, `validate.rs:42`) — **not** `config/mod.rs` (F5 correction: an earlier revision of this file misattributed the tree to `mod.rs`).
 - `crates/dormant-core/src/config/mod.rs` — loader; calls `validate::collect_unknown_keys` but does not itself hold the known-key tree.
-- `crates/dormant-core/src/paths.rs` — XDG path resolution (`config_path`, `socket_path`, `sibling_credentials`, plus the daemon-owned `state_dir()` / `wear_state_dir()` and the `state_dir_from_env` test seam).
+- `crates/dormant-core/src/paths.rs` — XDG path resolution plus macOS Application Support state paths (`config_path`, `socket_path`, `sibling_credentials`, `state_dir()` / `wear_state_dir()`, and `state_dir_from_env`).
 - `examples/config.toml`, `examples/credentials.toml` — working reference configs.
 
 **Domain logic:** `crates/dormant-core/src/{types,traits,rules,state_machine,zone,reload,ipc_proto,error,doctor,wear}.rs`. `wear.rs` owns the per-panel `WearLedger` model (no I/O) — the tracker in `dormantd` owns sampling/persistence.
@@ -94,7 +94,7 @@ oled-proximity/
 **Per-panel DDC/CI bus lock:** `crates/dormant-displays/src/ddc_lock.rs` (`PanelLocks` registry + `PanelLock` with `VcpPriority::Command` vs `Sampler` discipline + poison recovery).
 **Sensor source registry:** `crates/dormant-sensors/src/registry.rs`.
 **Display controller registry:** `crates/dormant-displays/src/registry.rs`.
-**Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,samsung,usb}.rs`.
+**Doctor probes:** `crates/dormant-doctor/src/probes/{config,ddcci,ha,mqtt,samsung,usb,macos_idle,macos_power,macos_display_sleep}.rs`.
 **Web routes:** `crates/dormant-web/src/routes/{command,config,config_apply,doctor,events,wear,pair}.rs`. `wear.rs` reads the shared `WearHandle` directly (no engine round-trip; mirrors the `doctor` route's read-only-diagnostics ethos). `pair.rs` is the Samsung pairing wizard — non-blocking (`202` + poll) and single-flight, calling `dormant_displays::samsung_tizen::pair_with_connect` + `dormant_core::config::upsert_samsung_token` in-process (no daemon IPC round-trip).
 **Web config-patch module:** `crates/dormant-web/src/config_patch.rs` — pure patch hygiene / allowlist / `toml_edit` application; the `config_apply.rs` route is the only consumer. Also owns the entity-CRUD gate (`CreateEntity`/`DeleteEntity`, `CREATABLE_FIELDS`, `RESERVED_ENTITY_IDS`) — `entity_crud_enabled` itself is enforced one level up, in `config_apply.rs`, ahead of the shared 5-stage `Set`/`Remove` pipeline.
 **Wear tracker:** `crates/dormantd/src/wear_tracker.rs` — pure `tick(snapshot, samples, config, now)` advances ledgers; async shell owns file I/O, `load_or_create_ledger`, and `DaemonEvent::WearSnapshot`/`CompensationAdvisory` publication.

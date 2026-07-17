@@ -17,6 +17,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio-tungstenite = { workspace = true }
@@ -28,8 +29,22 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rcgen = { version = "0.14", features = ["pem", "ring"], optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# ddc-hi is cross-platform by construction (its own Cargo.toml gates the
+# ddc-i2c backend to Linux/Windows and the ddc-macos backend to macOS via
+# target-cfg'd optional deps) -- Linux uses I2C-dev, macOS resolves through
+# the vendored, path-patched `ddc-macos` fork pinned in the workspace root
+# `[patch.crates-io]` (see vendor/ddc-macos/README.dormant.md).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ddc-hi = { workspace = true }
+
+# Thin macOS-only FFI surface for `macos_display_catalog` (stable-UUID
+# display resolution via CFUUID + the raw Quartz gamma-table calls).
+# `core-foundation-sys` is the minimal, no-abstraction binding crate — this
+# module hand-declares its own CoreGraphics `extern "C"` functions rather
+# than pulling in a heavier `core-graphics`/`objc` dependency, per Task 7's
+# "keep the FFI layer thin" instruction.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8.7"
 
 [features]
 # Enables the rcgen-based TLS handshake integration test.

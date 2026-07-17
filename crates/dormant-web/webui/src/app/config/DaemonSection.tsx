@@ -28,6 +28,9 @@ const KNOWN_FIELDS: Record<string, { kind: "enum" | "number" | "duration" | "tex
   idle_source: { kind: "enum", options: IDLE_SOURCES },
   stale_sensor_timeout: { kind: "duration" },
   doctor_wake_settle: { kind: "duration" },
+  macos_idle_frozen_polls: { kind: "number" },
+  macos_idle_sanity_cap: { kind: "duration" },
+  macos_idle_startup_grace: { kind: "duration" },
 };
 
 /** Per-field help text — accurate to the real config semantics. */
@@ -41,6 +44,9 @@ const FIELD_HELP: Record<string, string> = {
   stale_sensor_timeout: "A sensor silent this long becomes unavailable.",
   doctor_wake_settle:
     "Doctor exercise: settle time before retrying the post-wake panel readback (100ms\u201330s).",
+  macos_idle_frozen_polls: "Consecutive unchanged macOS idle readings before treating the source as frozen (minimum 2).",
+  macos_idle_sanity_cap: "Maximum plausible macOS idle reading; larger values are rejected as bogus.",
+  macos_idle_startup_grace: "Startup window before macOS idle readings are trusted.",
 };
 
 /** Placeholder text for empty inputs — the real default value. */
@@ -49,6 +55,9 @@ const FIELD_PLACEHOLDER: Record<string, string> = {
   reload_debounce: "500ms",
   stale_sensor_timeout: "300s",
   doctor_wake_settle: "3s",
+  macos_idle_frozen_polls: "3",
+  macos_idle_sanity_cap: "24h",
+  macos_idle_startup_grace: "30s",
 };
 
 export default function DaemonSection({ daemon, store, redactedPaths, onDirty, fieldErrors }: DaemonSectionProps) {

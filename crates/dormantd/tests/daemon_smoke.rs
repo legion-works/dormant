@@ -1175,7 +1175,17 @@ async fn web_bind_change_ignored_on_reload() {
 
 // ── 12: render sink wiring (feature-gated) ────────────────────────────────────
 
-#[cfg(feature = "render")]
+// Linux-only on top of the feature gate: the render backend off-Linux is
+// dormant-render's no-op stub (`show` always fails E_RENDER_UNAVAILABLE),
+// so these daemon-level tests would pin real-Wayland machinery — layer
+// surfaces, input-wake drains, overlay/rollback interplay — against a stub
+// that has none of it. They only pass there via timing-fragile stub
+// fall-through (PR #78 round 10: rollback_input_wake_routes_through_drain
+// flaked "expected Rejected, got Reloaded" on macos-latest after four
+// green runs). The stub's own contract is unit-pinned in
+// dormant-render/src/stub.rs; macOS overlay work is M2 and gets its own
+// tests when a real backend exists.
+#[cfg(all(feature = "render", target_os = "linux"))]
 mod render_smoke {
     use super::*;
     use dormant_core::fakes::RecordingRenderSink;

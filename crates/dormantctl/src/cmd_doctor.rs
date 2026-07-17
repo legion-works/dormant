@@ -6,9 +6,9 @@
 //! module handles CLI argument parsing, config loading, table rendering, and
 //! exit-code mapping.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use comfy_table::Color;
 use comfy_table::ContentArrangement;
@@ -18,7 +18,7 @@ use dormant_core::config::{Strictness, load_config, load_credentials};
 use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::paths;
 use dormant_core::rules::{ExerciseReport, ExerciseStep, ExerciseVerdict};
-use dormant_doctor::{ProbeResult, ProbeStatus};
+use dormant_doctor::{DraftContext, ProbeResult, ProbeStatus};
 
 use dormantctl::client;
 
@@ -47,6 +47,33 @@ pub struct DoctorArgs {
     /// Path to the credentials file.
     #[arg(long)]
     pub credentials: Option<PathBuf>,
+
+    /// After running the full offline probe set, write a ready-to-file bug
+    /// report draft to PATH (default `./dormant-issue-<YYYY-MM-DD>.md`).
+    /// Mutually exclusive with `--draft-feature` and any subcommand — the
+    /// draft always runs the full offline probe set (checked at runtime,
+    /// not by clap, since a subcommand can't be a `conflicts_with` target
+    /// in derive).
+    ///
+    /// `String`, not `PathBuf`: clap v4's `PathBuf` value parser rejects an
+    /// empty string outright (even via `default_missing_value`), so an
+    /// empty marker for "use the default filename" has to travel as a
+    /// plain string and get converted at the call site.
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "draft_feature"
+    )]
+    pub report_issue: Option<String>,
+
+    /// After running the full offline probe set, write a ready-to-file
+    /// feature request draft to PATH (default
+    /// `./dormant-feature-<YYYY-MM-DD>.md`). Mutually exclusive with
+    /// `--report-issue` and any subcommand.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub draft_feature: Option<String>,
 
     #[command(subcommand)]
     pub subcommand: Option<DoctorSubcommand>,
@@ -114,6 +141,37 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
 }
 
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
+    if args.report_issue.is_some() || args.draft_feature.is_some() {
+        if args.subcommand.is_some() {
+            anyhow::bail!(
+                "--report-issue / --draft-feature run the full offline probe set and \
+                 cannot be combined with a doctor subcommand"
+            );
+        }
+        // The space form (`--report-issue ddcci`) is syntactically
+        // ambiguous to clap — an optional-value flag greedily consumes the
+        // next bare token as its PATH, so `ddcci` never reaches
+        // `args.subcommand` and the check above can't catch it. Reject it
+        // explicitly here by name, built from the actual subcommand list
+        // (not a hand-maintained parallel list that can drift).
+        for (flag, requested) in [
+            ("--report-issue", args.report_issue.as_deref()),
+            ("--draft-feature", args.draft_feature.as_deref()),
+        ] {
+            if let Some(value) = requested
+                && is_known_subcommand_name(value)
+            {
+                anyhow::bail!(
+                    "'{value}' looks like a doctor subcommand name, not a file path — \
+                     {flag} runs the full offline probe set and cannot take a \
+                     subcommand as its argument. Use `{flag}=./{value}` if you really \
+                     want a file named '{value}'."
+                );
+            }
+        }
+        return run_draft(args).await;
+    }
+
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -190,6 +248,130 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             Ok(outcome(&results))
         }
     }
+}
+
+// ── Doctor-assisted issue drafting ────────────────────────────────────────────────
+
+/// Which draft shape to render — replaces a `"issue"`/`"feature"` string
+/// tag so the two paths can't silently drift out of sync (a mistyped
+/// literal used to be a one-character bug with no compiler catch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftKind {
+    Issue,
+    Feature,
+}
+
+impl DraftKind {
+    fn default_filename(self, today: &str) -> String {
+        match self {
+            Self::Issue => format!("dormant-issue-{today}.md"),
+            Self::Feature => format!("dormant-feature-{today}.md"),
+        }
+    }
+}
+
+/// `doctor --report-issue [PATH]` / `--draft-feature [PATH]`: run the full
+/// offline probe set, print the normal table, then write a ready-to-file
+/// issue draft. The two flags are mutually exclusive (enforced by clap's
+/// `conflicts_with` plus the subcommand check in [`run_async`]).
+async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
+    let (cfg, creds, note) = load_config_and_creds(args)?;
+    if let Some(n) = &note {
+        println!("{n}");
+    }
+    let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
+    print_table(&results);
+
+    let config_path =
+        paths::resolve_config_path(args.config.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_ok = results.iter().all(|r| r.status != ProbeStatus::Fail);
+
+    // Collected from the SAME cfg + creds the probes just ran against —
+    // every host/token/URL a draft could otherwise echo verbatim through a
+    // probe's free-text detail (see `dormant_doctor::draft`'s module docs).
+    let secrets = dormant_doctor::SecretSet::collect(&cfg, &creds);
+
+    let ctx = DraftContext {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        env: dormant_doctor::collect_env(),
+        config_path: config_path.display().to_string(),
+        config_ok,
+        displays: dormant_doctor::build_display_inventory(&cfg),
+        probes: results.clone(),
+        secrets,
+    };
+
+    let (requested_path, body, kind) = if let Some(p) = &args.report_issue {
+        (p, dormant_doctor::render_bug_draft(&ctx), DraftKind::Issue)
+    } else if let Some(p) = &args.draft_feature {
+        (
+            p,
+            dormant_doctor::render_feature_draft(&ctx),
+            DraftKind::Feature,
+        )
+    } else {
+        unreachable!("run_draft is only called when report_issue or draft_feature is set")
+    };
+
+    let today = dormant_doctor::format_date_ymd(std::time::SystemTime::now());
+    let base_path = if requested_path.is_empty() {
+        PathBuf::from(kind.default_filename(&today))
+    } else {
+        PathBuf::from(requested_path)
+    };
+    let write_path = next_available_path(&base_path);
+
+    tokio::fs::write(&write_path, body)
+        .await
+        .with_context(|| format!("write draft to '{}'", write_path.display()))?;
+    println!("draft written to {}", write_path.display());
+
+    Ok(outcome(&results))
+}
+
+/// True when `name` matches a doctor subcommand's clap-registered name
+/// (`ddcci`, `mqtt`, `macos-idle`, …). Built from
+/// [`clap::Subcommand::has_subcommand`] against the real
+/// [`DoctorSubcommand`] enum — never a hand-maintained parallel list that
+/// could silently drift when a subcommand is renamed or added.
+fn is_known_subcommand_name(name: &str) -> bool {
+    <DoctorSubcommand as clap::Subcommand>::has_subcommand(name)
+}
+
+/// Return the first available path among `base`, `base-2`, `base-3`, … —
+/// never silently overwrite an existing draft.
+///
+/// Suffix is inserted before the file's extension (`dormant-issue-2026-07-18.md`
+/// → `dormant-issue-2026-07-18-2.md`) when the path has one, otherwise
+/// appended directly.
+fn next_available_path(base: &Path) -> PathBuf {
+    if !base.exists() {
+        return base.to_path_buf();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = suffixed_path(base, n);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Build `<stem>-<n>.<ext>` (or `<name>-<n>` when there is no extension)
+/// from `base`. Pure so [`next_available_path`]'s suffix logic is testable
+/// without touching the filesystem.
+fn suffixed_path(base: &Path, n: u32) -> PathBuf {
+    let parent = base.parent().unwrap_or_else(|| Path::new(""));
+    let stem = base
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().to_string());
+    let ext = base.extension().map(|e| e.to_string_lossy().to_string());
+    let file_name = match ext {
+        Some(ext) => format!("{stem}-{n}.{ext}"),
+        None => format!("{stem}-{n}"),
+    };
+    parent.join(file_name)
 }
 
 // ── macOS read-only doctor arms (Task 11) ─────────────────────────────────────────
@@ -820,6 +1002,182 @@ mod tests {
         assert!(
             matches!(power, DoctorSubcommand::MacosPower),
             "expected MacosPower, got {power:?}"
+        );
+    }
+
+    // ── Issue drafting: collision-suffix ────────────────────────────────────
+
+    #[test]
+    fn suffixed_path_inserts_before_extension() {
+        let base = Path::new("dormant-issue-2026-07-18.md");
+        assert_eq!(
+            suffixed_path(base, 2),
+            PathBuf::from("dormant-issue-2026-07-18-2.md")
+        );
+        assert_eq!(
+            suffixed_path(base, 3),
+            PathBuf::from("dormant-issue-2026-07-18-3.md")
+        );
+    }
+
+    #[test]
+    fn suffixed_path_no_extension_appends_directly() {
+        let base = Path::new("draft-no-ext");
+        assert_eq!(suffixed_path(base, 2), PathBuf::from("draft-no-ext-2"));
+    }
+
+    #[test]
+    fn suffixed_path_preserves_parent_directory() {
+        let base = Path::new("/tmp/some/dir/draft.md");
+        assert_eq!(
+            suffixed_path(base, 2),
+            PathBuf::from("/tmp/some/dir/draft-2.md")
+        );
+    }
+
+    #[test]
+    fn next_available_path_returns_base_when_free() {
+        let dir =
+            std::env::temp_dir().join(format!("dormantctl-draft-test-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("draft.md");
+
+        assert_eq!(next_available_path(&base), base);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_available_path_skips_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dormantctl-draft-test-collision-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("draft.md");
+        std::fs::write(&base, b"existing").unwrap();
+        std::fs::write(dir.join("draft-2.md"), b"existing").unwrap();
+
+        let next = next_available_path(&base);
+        assert_eq!(next, dir.join("draft-3.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Issue drafting: flag conflicts ──────────────────────────────────────
+
+    #[test]
+    fn report_issue_and_draft_feature_are_mutually_exclusive() {
+        // `=` binds the (empty, "use default filename") value explicitly so
+        // clap doesn't try to consume `--draft-feature` itself as
+        // `--report-issue`'s optional value.
+        let err = DoctorArgs::try_parse_from(["doctor", "--report-issue=", "--draft-feature"])
+            .expect_err("--report-issue and --draft-feature must conflict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("report-issue") && msg.contains("draft-feature"),
+            "error should name both conflicting flags; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn report_issue_combined_with_subcommand_is_rejected_at_runtime() {
+        // clap can't express "flag conflicts with any subcommand" via
+        // `conflicts_with` (subcommands aren't arg ids), so this is
+        // enforced in `run_async` — parsing itself succeeds. `=` binds the
+        // value explicitly so `ddcci` is left for the subcommand slot
+        // instead of being greedily consumed as `--report-issue`'s PATH.
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue=/tmp/x.md", "ddcci"])
+            .expect("parses: the runtime check, not clap, rejects this combination");
+        assert!(args.report_issue.is_some());
+        assert!(matches!(args.subcommand, Some(DoctorSubcommand::Ddcci)));
+    }
+
+    #[test]
+    fn report_issue_default_missing_value_is_none_path_marker() {
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue="]).unwrap();
+        assert_eq!(args.report_issue, Some(String::new()));
+    }
+
+    #[test]
+    fn report_issue_explicit_path_is_captured() {
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue", "/tmp/x.md"]).unwrap();
+        assert_eq!(args.report_issue, Some("/tmp/x.md".to_string()));
+    }
+
+    // ── Issue drafting: subcommand-name-as-path guard ───────────────────────
+
+    #[test]
+    fn is_known_subcommand_name_matches_real_variants() {
+        for name in ["ddcci", "mqtt", "ha", "config", "kwin", "samsung"] {
+            assert!(
+                is_known_subcommand_name(name),
+                "{name} should be recognised as a doctor subcommand"
+            );
+        }
+        assert!(
+            !is_known_subcommand_name("not-a-subcommand"),
+            "an arbitrary string must not be misclassified as a subcommand"
+        );
+        assert!(
+            !is_known_subcommand_name("ddcci.md"),
+            "a genuine filename that merely starts with a subcommand name \
+             must not be misclassified"
+        );
+    }
+
+    /// The space form (`--report-issue ddcci`) parses successfully — clap's
+    /// optional-value flag greedily consumes `ddcci` as PATH, leaving
+    /// `args.subcommand` at `None` — so the subcommand-conflict check in
+    /// `run_async` can't catch it. This drives the actual runtime rejection
+    /// path end to end (not just `is_known_subcommand_name` in isolation).
+    #[tokio::test]
+    async fn report_issue_space_form_with_subcommand_name_is_rejected() {
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue", "ddcci"]).unwrap();
+        assert_eq!(
+            args.report_issue,
+            Some("ddcci".to_string()),
+            "sanity: clap must have captured 'ddcci' as the flag's value, \
+             not classified it as a subcommand — this is the ambiguity \
+             the runtime guard exists for"
+        );
+        assert!(args.subcommand.is_none());
+
+        let result = run_async(&args).await;
+        let err = result.expect_err("space-form subcommand-name PATH must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ddcci") && msg.contains("--report-issue="),
+            "error should name the ambiguous value and the `=` escape hatch; got: {msg}"
+        );
+    }
+
+    /// Counterpart: the `=` form binds the value explicitly, so a file
+    /// genuinely named after a subcommand is accepted — the escape hatch
+    /// the error message points to actually works. Uses a config path that
+    /// doesn't exist so this fails at config-load (an `Err` from a
+    /// different cause), confirming the subcommand-name guard itself did
+    /// NOT fire — the guard-specific error text is absent.
+    #[tokio::test]
+    async fn report_issue_explicit_form_with_subcommand_name_is_accepted_by_the_guard() {
+        let args = DoctorArgs::try_parse_from([
+            "doctor",
+            "--report-issue=./ddcci",
+            "--config",
+            "/nonexistent-config-for-test.toml",
+        ])
+        .unwrap();
+        assert_eq!(args.report_issue, Some("./ddcci".to_string()));
+
+        let result = run_async(&args).await;
+        let err =
+            result.expect_err("nonexistent config path should still fail, just not via the guard");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("looks like a doctor subcommand name"),
+            "the `=` form must not trip the subcommand-name guard; got: {msg}"
         );
     }
 }

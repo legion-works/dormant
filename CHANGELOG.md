@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Allowed selector-bearing macOS controller chains to use `macos-display-sleep` as a fallback after per-display controllers.
+
 ## [0.3.0] - 2026-07-17
 
 ### Added

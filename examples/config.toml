@@ -187,6 +187,23 @@ wake_service = "media_player.turn_on"
 wake_data = { entity_id = "media_player.living_room_tv" }
 modes = ["power_off"]
 
+# macOS example: DDC/CI first, falling back to the audio-safe Quartz
+# gamma-black controller, falling back to the whole-machine `pmset`
+# display-sleep controller as the last resort. This is the plan-recommended
+# chain order for a macOS host — see docs/src/displays.md#recommended-macos-chain.
+# `ddcci` and `macos-gamma-black` read DIFFERENT selector fields: `ddcci`
+# uses `ddc_display` (a matcher; unset auto-selects the single detected
+# DDC/CI display), `macos-gamma-black` requires `output = "cg:<uuid>"` (the
+# CoreGraphics display UUID — read one from `dormantctl doctor
+# macos-display-sleep`'s output). The trailing `macos-display-sleep`
+# controller is global and ignores `output` entirely (must be absent or the
+# literal "all" — it has no per-display selector).
+# [displays.oled_mac]
+# controllers = ["ddcci", "macos-gamma-black", "macos-display-sleep"]
+# blank_mode = "brightness_zero"
+# output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230"
+# modes = ["brightness_zero", "power_off"]
+
 # Desktop monitor with a render ladder: blank the panel via DDC/CI, then
 # switch to a black software overlay, and finally show a screensaver of
 # local images if the room stays vacant.  Requires `--features render`.

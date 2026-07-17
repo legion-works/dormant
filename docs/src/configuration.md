@@ -19,7 +19,10 @@ Required. Must be `1`. This gates backward compatibility — bump when making br
 | `log_level` | string | `"info"` | Tracing log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `socket_path` | path | auto | Unix-domain socket for `dormantctl` IPC (defaults to XDG_RUNTIME_DIR) |
 | `idle_time_unit` | string | `"auto"` | How to interpret screensaver idle values: `"auto"`, `"ms"`, `"s"`. KDE returns ms despite the spec saying seconds — auto detects the unit at runtime |
-| `idle_source` | string | `"auto"` | User-activity source: `"auto"`, `"wayland"`, or `"dbus"` |
+| `idle_source` | string | `"auto"` | User-activity source: `"auto"`, `"wayland"`, `"dbus"`, or `"macos"` (CoreGraphics idle time, macOS builds only) |
+| `macos_idle_frozen_polls` | integer | `3` | macOS only: consecutive identical-looking idle-clock polls before a reading is treated as frozen (defensive against a stuck clock) |
+| `macos_idle_sanity_cap` | duration | `"24h"` | macOS only: idle readings above this are treated as bogus, not real idle time (must be `> 0`) |
+| `macos_idle_startup_grace` | duration | `"15s"` | macOS only: idle readings are untrusted for this long after daemon startup (must be `> 0`) |
 | `reload_debounce` | duration | `"500ms"` | Coalesces rapid config-file changes into a single reload |
 | `web_port` | integer | unset | Web UI port; unset disables the server even in a `web-ui` build |
 | `web_bind` | IP address | `"127.0.0.1"` | Web UI bind address |
@@ -149,7 +152,7 @@ Each display has a user-chosen `id`. The `controllers` list is an ordered fallba
 | `controllers` | []string | yes | Ordered list of controller names to try |
 | `blank_mode` | string | yes | Primary blank mode: `"screen_off_audio_on"`, `"power_off"`, `"brightness_zero"` |
 | `degraded_mode` | string | no | Fallback mode if primary is unsupported |
-| `output` | string | conditional | KWin output name (e.g., `"DP-1"`) |
+| `output` | string | conditional | Output selector: KWin output name (e.g., `"DP-1"`, Linux `kwin-dpms`); `"cg:<uuid>"` CoreGraphics display UUID (macOS `macos-gamma-black`, required — see [Displays](./displays.md#macos-gamma-black--macos-gamma-black-quartz)); absent or `"all"` for `macos-display-sleep` (no per-display selector) |
 | `ddc_display` | string | conditional | DDC/CI display identifier |
 | `host` | string | conditional | Hostname/IP for network-controllable displays |
 | `wol_mac` | string | conditional | MAC address for Wake-on-LAN |

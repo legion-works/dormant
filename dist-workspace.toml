@@ -11,9 +11,20 @@ ci = "github"
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax).
 # GNU, not musl: zbus (DBus) and libudev make static musl builds painful.
-# Darwin/Windows targets excluded — dormant uses Linux-specific facilities
-# (KWin DBus, DDC/CI via /dev/i2c, udev, Wayland/X11 DPMS).
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# macOS (M1) targets ship the DDC/CI, macos-gamma-black, macos-display-sleep,
+# and CoreGraphics-idle controllers plus the read-only macOS doctor arms
+# built in earlier M1 milestones. `dormant-tray` is still packaged for macOS
+# (a StatusNotifierItem applet has no macOS equivalent), but it is
+# NONFUNCTIONAL there until M2 — see docs/src/installation.md.
+# Windows remains excluded — dormant still uses facilities with no Windows
+# port (KWin DBus, DDC/CI via /dev/i2c or IOKit, udev, Wayland/X11 DPMS,
+# CoreGraphics gamma/idle).
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
 # Path that installers should place binaries in
 install-path = "~/.local/bin"
 # Where to host releases
@@ -30,13 +41,36 @@ global-artifacts-jobs = ["./release-artifact-smoke"]
 features = ["web-ui"]
 all-features = false
 github-build-setup = "../dist-build-setup.yml"
-# Release builds need system libraries:
+
+# Pin the Apple runners explicitly instead of trusting dist's defaults to
+# stay put: arm64 (M1/M2/M3) builds on the standard Apple Silicon runner,
+# x86_64 builds on the dedicated Intel runner (Apple Silicon runners cross
+# x86_64 only via Rosetta, which dist does not use for real builds).
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-latest"
+x86_64-apple-darwin = "macos-15-intel"
+
+# Release builds need system libraries. Apt itself only runs on the Linux
+# runners, but `targets` is kept explicit below anyway so the Linux-only
+# scope is obvious from this file alone now that Apple targets are present:
 # - libudev-dev: tokio-serial → libudev-sys
 # - libwayland-dev: dormant-render → wayland-sys (wayland-client.pc)
 # - libmpv-dev: dormant-render screensaver → libmpv2
 # - pkg-config: build-script probes for the above
 [dist.dependencies.apt]
-libudev-dev = '*'
-libwayland-dev = '*'
-libmpv-dev = '*'
-pkg-config = '*'
+libudev-dev = { targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+] }
+libwayland-dev = { targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+] }
+libmpv-dev = { targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+] }
+pkg-config = { targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+] }

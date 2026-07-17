@@ -12,11 +12,16 @@ dormantctl doctor
 dormantctl doctor mqtt      # probe MQTT sensors
 dormantctl doctor ha        # probe HA WebSocket sensors
 dormantctl doctor usb /dev/ttyUSB0  # probe USB LD2410
-dormantctl doctor ddcci     # probe DDC/CI displays
+dormantctl doctor ddcci     # probe DDC/CI displays (Linux and macOS)
 dormantctl doctor config    # validate configuration
+
+# macOS-only, read-only checks
+dormantctl doctor macos-idle            # two bounded raw idle-clock readings
+dormantctl doctor macos-display-sleep   # display-sleep API availability + per-display state
+dormantctl doctor macos-power           # active power assertions blocking display sleep
 ```
 
-Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a controller reports its last known state is stale). Failures indicate something needs fixing.
+Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a controller reports its last known state is stale). Failures indicate something needs fixing. The three `macos-*` checks exit 3 ("not yet supported") on Linux — they are read-only probes, never blanking or waking a display.
 
 ## Common errors
 
@@ -110,6 +115,34 @@ For a one-keystroke recovery, bind the command to a global shortcut:
 - **Sway / wlroots**: bind in `~/.config/sway/config`: `bindsym $mod+grave exec dormantctl emergency-wake`.
 
 First-class daemon-registered shortcuts (no compositor setup) are a separate roadmap item.
+
+### macOS: gamma emergency restore
+
+`macos-gamma-black` (see [Displays](./displays.md#macos-gamma-black--macos-gamma-black-quartz)) blanks
+by writing an all-black Quartz gamma table — there is no periodic
+reassertion and no restore-on-drop, so a dead daemon does not strand the
+panel any *more* black than it already is, but it also does nothing to fix
+it. `dormantctl emergency-wake` restores gamma through a dedicated,
+daemon-independent path:
+
+- Before writing a black table, dormant records a breadcrumb file
+  (`$XDG_STATE_HOME/dormant/gamma-blank.json` or the `~/.local/state`
+  fallback) listing every display currently gamma-blanked, cleared again
+  after a confirmed wake.
+- `emergency-wake` restores from that breadcrumb via
+  `CGDisplayRestoreColorSyncSettings()` — a **system-wide** restore, not a
+  per-panel replay of the exact pre-blank table — and does this
+  independently of whether the daemon's IPC call succeeds, fails, or times
+  out. It also runs on the *next* dormantd startup if a stale breadcrumb is
+  found, so a crash never leaves gamma permanently black either.
+- **Wedged-daemon caveat**: if `emergency-wake`'s IPC call times out
+  (daemon alive but hung, not merely unreachable) rather than being
+  refused, the command prints a warning that the daemon may still complete
+  a queued blank write *after* the fallback restore already fixed the
+  display — re-blanking it. If you see the display go black again shortly
+  after an emergency wake, stop `dormantd` (or `launchctl kickstart -k` /
+  `systemctl --user restart dormant` it) before rerunning
+  `emergency-wake`.
 
 ## Control-path verification — `dormantctl doctor exercise <display>`
 

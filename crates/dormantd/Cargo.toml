@@ -72,3 +72,13 @@ tempfile = { workspace = true }
 
 [package.metadata.dist]
 dist = true
+# Stage the checked-in launchd agent plist into every archive at
+# share/com.legionworks.dormant.plist — the SAME bytes `dormantctl launchd
+# install` embeds via include_bytes! (crates/dormantctl/src/cmd_launchd.rs),
+# so the archived file and the installed file are provably identical.
+include = ["share/com.legionworks.dormant.plist"]
+# Printed by the shell installer on success. Tells operators the next step
+# without running anything on their behalf: neither `dormantctl launchd
+# install` nor `launchctl bootstrap` is safe to run unattended (it would
+# silently start a background daemon the operator hasn't configured yet).
+install-success-msg = "dormantd installed. On macOS, run `dormantctl launchd install` and then `launchctl bootstrap gui/$UID \"$HOME/Library/LaunchAgents/com.legionworks.dormant.plist\"` to start it at login."

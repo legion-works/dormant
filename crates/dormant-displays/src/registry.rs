@@ -29,7 +29,32 @@ use crate::ddcci::DdcciController;
 use crate::ha_passthrough::HaPassthroughController;
 #[cfg(target_os = "linux")]
 use crate::kwin_dpms::KwinDpmsController;
+#[cfg(target_os = "macos")]
+use crate::macos_gamma_black::{GammaHoldRegistry, MacosGammaBlackController};
 use crate::samsung_tizen::SamsungTizenController;
+
+/// Process-wide, daemon-lifetime [`GammaHoldRegistry`] for every
+/// `macos-gamma-black` controller this process builds.
+///
+/// A `static OnceLock` — rather than a parameter threaded through
+/// [`build_controllers`] — is a deliberate interim choice for Task 7: the
+/// hold registry MUST survive a config reload (a fresh `build_controllers`
+/// call per generation) exactly like [`PanelLocks`] does, but widening
+/// `build_controllers`'s signature to accept a second shared registry is
+/// Task 8's job (it introduces a `ControllerBuildContext` bundling both,
+/// after auditing every call site — see the Task 8 plan section). A process
+/// static gives the SAME daemon-lifetime persistence property without that
+/// wider refactor now; Task 8 replaces this static with the injected
+/// context.
+#[cfg(target_os = "macos")]
+static GAMMA_HOLDS: std::sync::OnceLock<std::sync::Arc<GammaHoldRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Accessor for the process-wide gamma hold registry (see [`GAMMA_HOLDS`]).
+#[cfg(target_os = "macos")]
+fn gamma_holds() -> std::sync::Arc<GammaHoldRegistry> {
+    std::sync::Arc::clone(GAMMA_HOLDS.get_or_init(|| std::sync::Arc::new(GammaHoldRegistry::new())))
+}
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
 ///
@@ -56,7 +81,13 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "samsung-tizen",
 ];
 #[cfg(target_os = "macos")]
-pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough", "samsung-tizen"];
+pub const CONTROLLER_TYPES: &[&str] = &[
+    "command",
+    "ddcci",
+    "ha-passthrough",
+    "macos-gamma-black",
+    "samsung-tizen",
+];
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-tizen"];
 
@@ -84,6 +115,11 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
     );
     #[cfg(target_os = "linux")]
     m.insert("kwin-dpms".to_string(), vec![BlankMode::PowerOff]);
+    #[cfg(target_os = "macos")]
+    m.insert(
+        "macos-gamma-black".to_string(),
+        vec![BlankMode::BrightnessZero],
+    );
     m.insert("ha-passthrough".to_string(), Vec::new());
     m.insert(
         "samsung-tizen".to_string(),
@@ -145,6 +181,23 @@ pub fn build_controllers(
                 chain.push(Box::new(KwinDpmsController::new(
                     cfg.output.clone(),
                     cfg.command_timeout,
+                )));
+            }
+            #[cfg(target_os = "macos")]
+            "macos-gamma-black" => {
+                // `output` is required by config validation (Task 4's
+                // ratified `cg:<uuid>` selector contract, enforced in
+                // `dormant_core::config::validate`) — this `expect` documents
+                // that invariant rather than re-deriving a second error
+                // message here; a config that reached `build_controllers`
+                // without a valid `output` for this controller already
+                // failed validation and never gets here in production.
+                let selector = cfg.output.clone().ok_or_else(|| {
+                    config_invalid_cmd(display_name, "missing 'output' (expected \"cg:<uuid>\")")
+                })?;
+                chain.push(Box::new(MacosGammaBlackController::new(
+                    selector,
+                    gamma_holds(),
                 )));
             }
             "command" => {
@@ -347,6 +400,34 @@ mod tests {
         );
     }
 
+    /// Task 7: `macos-gamma-black` is macOS-only (no Quartz gamma API
+    /// anywhere else). DEFERRED: PR CI — cannot run in this Linux sandbox;
+    /// written now for the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn controller_types_contains_macos_gamma_black_on_macos() {
+        assert!(
+            CONTROLLER_TYPES.contains(&"macos-gamma-black"),
+            "macos-gamma-black must be registered on macOS"
+        );
+    }
+
+    /// Task 7 RED-first (Linux-runnable half of the registry-drift pin):
+    /// `macos-gamma-black` must be absent from `CONTROLLER_TYPES` on every
+    /// platform except macOS, so config validation rejects
+    /// `controllers = ["macos-gamma-black"]` deterministically with
+    /// "unknown controller" rather than reaching `build_controllers` and
+    /// hitting a controller type that only exists behind a
+    /// `#[cfg(target_os = "macos")]` match arm.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn controller_types_excludes_macos_gamma_black_elsewhere() {
+        assert!(
+            !CONTROLLER_TYPES.contains(&"macos-gamma-black"),
+            "macos-gamma-black must NOT be registered off macOS"
+        );
+    }
+
     /// Task 6 RED-first test 1: `CONTROLLER_TYPES` and `capabilities()`
     /// must advertise EXACTLY the same set of controller type names for
     /// whichever target this crate is compiled for — a drift here means
@@ -395,6 +476,80 @@ mod tests {
             ddcci_modes, expected,
             "macOS ddcci capabilities must be exactly [PowerOff, BrightnessZero]"
         );
+    }
+
+    /// Task 7 RED-first: macOS advertises `macos-gamma-black` with EXACTLY
+    /// `[BrightnessZero]` — no `PowerOff`, no `ScreenOffAudioOn`: this
+    /// controller has exactly one capability (see the module docs on why
+    /// gamma-zeroing is the only mode it can express). DEFERRED: PR CI —
+    /// cannot run in this Linux sandbox; written now for the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_advertises_macos_gamma_black() {
+        let caps = capabilities();
+        assert_eq!(
+            caps.get("macos-gamma-black"),
+            Some(&vec![BlankMode::BrightnessZero]),
+            "macos-gamma-black capabilities must be exactly [BrightnessZero]"
+        );
+    }
+
+    /// Task 7 RED-first: the registry wires `cfg.output` (the Task 4
+    /// ratified `cg:<uuid>` selector) into the controller's selector, and
+    /// two controller instances built against the SAME process (i.e. the
+    /// same `GAMMA_HOLDS` static) share one `GammaHoldRegistry` — mirrors
+    /// `build_ddcci_ladder_primary_power_off_wires_configured_primary_mode`'s
+    /// registry-path pinning for ddcci. DEFERRED: PR CI — cannot run in
+    /// this Linux sandbox; written now for the macOS CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn build_macos_gamma_black_wires_output_as_selector() {
+        use crate::macos_gamma_black::MacosGammaBlackController;
+
+        let mut cfg = command_cfg();
+        cfg.controllers = vec!["macos-gamma-black".into()];
+        cfg.blank_mode = Some(BlankMode::BrightnessZero);
+        cfg.output = Some("cg:deadbeef-0000-0000-0000-000000000000".into());
+
+        let creds = Credentials::default();
+        let chain = build_controllers("main", &cfg, &creds, &PanelLocks::new()).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name(), "macos-gamma-black");
+
+        let boxed = chain.into_iter().next().expect("one controller");
+        let ctrl: Box<MacosGammaBlackController> = (boxed as Box<dyn std::any::Any>)
+            .downcast()
+            .expect("macos-gamma-black controller downcast");
+        assert_eq!(
+            ctrl.panel_identity(),
+            Some("cg:deadbeef-0000-0000-0000-000000000000".to_string()),
+            "registry must thread cfg.output into the controller's selector"
+        );
+    }
+
+    /// Task 7: `build_controllers` refuses a `macos-gamma-black` display
+    /// with no `output` set — the same hard requirement config validation
+    /// enforces (see `dormant_core::config::validate`), pinned here too as
+    /// a belt-and-braces guard since `build_controllers` is the last line
+    /// of defense before a controller is actually constructed. DEFERRED:
+    /// PR CI — cannot run in this Linux sandbox; written now for the macOS
+    /// CI lane.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn build_macos_gamma_black_missing_output_fails_naming_display() {
+        let mut cfg = command_cfg();
+        cfg.controllers = vec!["macos-gamma-black".into()];
+        cfg.blank_mode = Some(BlankMode::BrightnessZero);
+        cfg.output = None;
+
+        let creds = Credentials::default();
+        match build_controllers("main", &cfg, &creds, &PanelLocks::new()) {
+            Err(DormantError::ConfigInvalid { detail }) => {
+                assert!(detail.contains("display 'main'"));
+                assert!(detail.contains("missing 'output'"));
+            }
+            other => panic!("expected ConfigInvalid for missing output, got {other:?}"),
+        }
     }
 
     #[test]

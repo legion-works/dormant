@@ -36,6 +36,15 @@ rcgen = { version = "0.14", features = ["pem", "ring"], optional = true }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ddc-hi = { workspace = true }
 
+# Thin macOS-only FFI surface for `macos_display_catalog` (stable-UUID
+# display resolution via CFUUID + the raw Quartz gamma-table calls).
+# `core-foundation-sys` is the minimal, no-abstraction binding crate — this
+# module hand-declares its own CoreGraphics `extern "C"` functions rather
+# than pulling in a heavier `core-graphics`/`objc` dependency, per Task 7's
+# "keep the FFI layer thin" instruction.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8.7"
+
 [features]
 # Enables the rcgen-based TLS handshake integration test.
 # Off by default so CI keeps the dep footprint lean.

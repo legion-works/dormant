@@ -4704,3 +4704,104 @@ mod restore_tests {
         let _ = handle.await;
     }
 }
+
+/// Task 7: chain-degradation / assembly coverage for `macos-gamma-black`.
+///
+/// The plan's RED-first list names two `AssemblyHarness`-based scenarios
+/// here (`missing_core_display_symbols_degrade_to_gamma_without_rejecting_assembly`
+/// and `all_controllers_unavailable_is_honest_mode_unsupported`). Building a
+/// full `AssemblyHarness` (fake `CoreDisplay`/gamma/display-sleep backends
+/// wired through a real `assemble_static` call) is disproportionate for
+/// Task 7 alone — `macos-gamma-black` only registers in
+/// `dormant_displays::registry::CONTROLLER_TYPES` on macOS, so a config
+/// naming it can never reach `assemble_static` on this Linux sandbox in the
+/// first place, and the richer harness (breadcrumb-aware reload/rollback
+/// fakes) is explicitly Task 8 scope per the plan's own file list.
+///
+/// What Task 7 CAN and does pin here, platform-neutrally:
+///
+/// - `unavailable_ddcci_degrades_to_gamma_black_in_the_chain` in
+///   `dormant_displays::macos_gamma_black`'s own test module exercises the
+///   real load-bearing mechanism (`DisplayExecutor` skipping an unavailable
+///   controller and falling through to a working `MacosGammaBlackController`
+///   later in the chain) directly — the same mechanism `assemble_static`
+///   relies on for every display, on every platform.
+/// - The test below pins `assemble_static`'s EXISTING `E_MODE_UNSUPPORTED`
+///   startup bail (see this module's "Post-probe display validation (layer
+///   2)" doc comment) against a chain whose only controller cannot express
+///   the display's configured mode — the controller-agnostic mechanism a
+///   macOS gamma-only chain would ALSO hit if gamma (or every controller in
+///   its chain) failed to advertise the configured mode. No production code
+///   changed for this test: it is a regression pin confirming the bail is
+///   controller-agnostic, which is exactly the property a gamma-only chain
+///   needs.
+#[cfg(test)]
+mod macos_gamma_black_assembly_tests {
+    use super::*;
+    use dormant_core::config::schema::{
+        AudioConfig, DaemonConfig, DisplayConfig, NotificationsConfig, WatchdogConfig, WearConfig,
+    };
+    use dormant_core::types::BlankMode;
+    use indexmap::IndexMap;
+
+    #[tokio::test]
+    async fn chain_with_no_effective_mode_fails_assembly_as_mode_unsupported() {
+        let display = DisplayConfig {
+            controllers: vec!["command".into()],
+            blank_mode: Some(BlankMode::PowerOff),
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: Some("/bin/true".into()),
+            wake_command: Some("/bin/true".into()),
+            // Deliberately mismatched against `blank_mode` above, and with
+            // no `degraded_mode` fallback — the chain's only controller
+            // cannot express the configured primary mode at all.
+            modes: Some(vec![BlankMode::ScreenOffAudioOn]),
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 80,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
+        };
+        let mut displays = IndexMap::new();
+        displays.insert("panel".to_string(), display);
+
+        let cfg = Config {
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays,
+            rules: IndexMap::new(),
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            watchdog: WatchdogConfig::default(),
+            audio: AudioConfig::default(),
+        };
+        let creds = Credentials::default();
+        let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
+        let locks = Arc::new(PanelLocks::new());
+
+        #[cfg(feature = "render")]
+        let result = assemble_static(cfg, creds, &source_builder, None, &locks).await;
+        #[cfg(not(feature = "render"))]
+        let result = assemble_static(cfg, creds, &source_builder, &locks).await;
+        match result {
+            Ok(_) => panic!("expected assemble_static to fail with E_MODE_UNSUPPORTED"),
+            Err(e) => assert!(
+                e.to_string().contains("E_MODE_UNSUPPORTED"),
+                "expected E_MODE_UNSUPPORTED, got: {e}"
+            ),
+        }
+    }
+}

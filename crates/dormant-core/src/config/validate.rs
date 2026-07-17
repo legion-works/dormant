@@ -1430,6 +1430,57 @@ fn validate_display(
                     });
                 }
             }
+            "macos-gamma-black" => {
+                // Task 4 ratified selector contract: this controller is
+                // addressed by a stable `cg:<lowercase-cfuuid>` selector,
+                // sourced from `output`, and NEVER a main-display fallback —
+                // missing `output` is a hard validation error, not a
+                // silently-degraded default.
+                match &dc.output {
+                    None => {
+                        errors.push(ValidationError {
+                            what: "missing field".into(),
+                            detail: format!(
+                                "display '{display_id}' uses macos-gamma-black but has no \
+                                 'output' field (expected \"cg:<uuid>\", e.g. \
+                                 output = \"cg:e33e5bf7-...\") — there is no main-display \
+                                 fallback for this controller"
+                            ),
+                        });
+                    }
+                    Some(output) => {
+                        if let Some(uuid) = output.strip_prefix("cg:") {
+                            if uuid.is_empty() {
+                                errors.push(ValidationError {
+                                    what: "invalid selector".into(),
+                                    detail: format!(
+                                        "display '{display_id}' macos-gamma-black 'output' \
+                                         \"{output}\" has an empty UUID after the 'cg:' prefix"
+                                    ),
+                                });
+                            } else if uuid.chars().any(|c| c.is_ascii_uppercase()) {
+                                errors.push(ValidationError {
+                                    what: "invalid selector".into(),
+                                    detail: format!(
+                                        "display '{display_id}' macos-gamma-black 'output' \
+                                         \"{output}\" must be lowercase (got an uppercase \
+                                         character in the UUID)"
+                                    ),
+                                });
+                            }
+                        } else {
+                            errors.push(ValidationError {
+                                what: "invalid selector".into(),
+                                detail: format!(
+                                    "display '{display_id}' macos-gamma-black 'output' \
+                                     \"{output}\" must start with \"cg:\" (the Task 4 ratified \
+                                     stable-UUID selector contract)"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
             // kwin-dpms and ddcci have no required fields beyond the defaults.
             _ => {}
         }
@@ -1834,6 +1885,7 @@ gracee_period = "60s"
             ),
             ("ha-passthrough".into(), vec![]),
             ("command".into(), vec![]),
+            ("macos-gamma-black".into(), vec![BlankMode::BrightnessZero]),
         ])
     }
 
@@ -2463,6 +2515,132 @@ gracee_period = "60s"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
         }
+    }
+
+    // ── Task 7: macos-gamma-black selector validation ──────────────────────
+    //
+    // Platform-neutral: this validation logic runs on every host regardless
+    // of whether `macos-gamma-black` is actually registered on that target
+    // (see `dormant_displays::registry::CONTROLLER_TYPES`) — a Linux
+    // sandbox can fully exercise these RED-first tests without ever
+    // building the macOS FFI layer.
+
+    fn macos_gamma_black_cfg(output: Option<&str>) -> DisplayConfig {
+        DisplayConfig {
+            controllers: vec!["macos-gamma-black".into()],
+            blank_mode: Some(BlankMode::BrightnessZero),
+            output: output.map(String::from),
+            ..base_display_cfg()
+        }
+    }
+
+    #[test]
+    fn macos_gamma_black_missing_output_is_hard_error() {
+        let dc = macos_gamma_black_cfg(None);
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("no 'output' field")),
+            "missing output must be a hard error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_without_cg_prefix_is_rejected() {
+        let dc = macos_gamma_black_cfg(Some("DP-1"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.detail.contains("must start with")),
+            "an output not shaped as 'cg:<uuid>' must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_empty_uuid_is_rejected() {
+        let dc = macos_gamma_black_cfg(Some("cg:"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.detail.contains("empty UUID")),
+            "a 'cg:' prefix with no UUID must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_uppercase_uuid_is_rejected() {
+        let dc = macos_gamma_black_cfg(Some("cg:E33E5BF7-0000-0000-0000-000000000000"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.iter().any(|e| e.detail.contains("lowercase")),
+            "an uppercase UUID must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn macos_gamma_black_output_lowercase_uuid_is_accepted() {
+        let dc = macos_gamma_black_cfg(Some("cg:e33e5bf7-0000-0000-0000-000000000000"));
+        let mut errors = Vec::new();
+        validate_display(
+            "panel",
+            &dc,
+            &test_capabilities(),
+            &test_creds(),
+            &mut errors,
+        );
+        assert!(
+            errors.is_empty(),
+            "a well-formed lowercase cg: selector must not error: {errors:?}"
+        );
+    }
+
+    /// `macos-display-sleep` (Task 10) is explicitly out of scope here —
+    /// this pins that the per-controller field-check loop does not
+    /// accidentally already handle it (a future implementer adding Task 10
+    /// must add its own arm, not assume this one covers it).
+    #[test]
+    fn macos_display_sleep_is_not_handled_by_this_arm() {
+        let dc = DisplayConfig {
+            controllers: vec!["macos-display-sleep".into()],
+            blank_mode: Some(BlankMode::PowerOff),
+            output: None,
+            ..base_display_cfg()
+        };
+        let mut errors = Vec::new();
+        let mut caps = test_capabilities();
+        caps.insert("macos-display-sleep".into(), vec![BlankMode::PowerOff]);
+        validate_display("panel", &dc, &caps, &test_creds(), &mut errors);
+        assert!(
+            errors.is_empty(),
+            "macos-display-sleep has no field checks yet (Task 10 scope): {errors:?}"
+        );
     }
 
     fn config_with_scale_mode(scale_mode: Option<&str>) -> super::super::schema::Config {

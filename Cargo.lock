@@ -886,6 +886,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "core-foundation-sys",
  "ddc-hi",
  "dormant-core",
  "futures-util",

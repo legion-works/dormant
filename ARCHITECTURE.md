@@ -37,11 +37,13 @@ Each crate follows the convention: one module per concept, one file per sensor/c
                                                     ▼
                   ┌──────────────┐
                   │  Executor    │──▶ Controller chain (fallback)
-                  │  (retry,     │      ├── kwin-dpms (fallback, audio-unsafe)
-                  │   escalation)│      ├── ddcci
+                  │  (retry,     │      ├── kwin-dpms (Linux fallback, audio-unsafe)
+                  │   escalation)│      ├── ddcci (Linux + macOS, audio-safe via VCP 0xD6)
                   └──────────────┘      ├── command
                                         ├── ha-passthrough
-                                        └── samsung-tizen
+                                        ├── samsung-tizen (audio-safe)
+                                        ├── macos-gamma-black (macOS, Quartz LUT, audio-safe)
+                                        └── macos-display-sleep (macOS last resort, audio-unsafe)
 ```
 
 1. **Sensors** produce `PresenceEvent` values (occupied / vacant) and push them to the zone engine.

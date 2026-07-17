@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Dashboard from "./views/Dashboard";
 import Displays from "./views/Displays";
 import Events from "./views/Events";
@@ -6,7 +6,8 @@ import Config from "./views/Config";
 import Doctor from "./views/Doctor";
 import { LiveStateProvider } from "./state";
 import { useLiveState } from "./hooks/useLiveState";
-import { postReload } from "../api/client";
+import { getDaemon, postReload } from "../api/client";
+import type { DaemonIdentity } from "../api/types";
 import { navItems, navBadgeText, type ViewId } from "./nav";
 import RollbackBanner from "./components/RollbackBanner";
 import FailureBanner from "./components/FailureBanner";
@@ -65,6 +66,8 @@ export default function Shell() {
 function ShellInner() {
   const [activeView, setActiveView] = useState<ViewId>(getViewFromHash);
   const [clock, setClock] = useState(formatClock);
+  const [daemon, setDaemon] = useState<DaemonIdentity | null>(null);
+  const initialDaemonFetch = useRef(true);
   const { connected, snapshot, config, pollWarning, doctorReport, selectDisplay, selectedDisplay } = useLiveState();
 
   useEffect(() => {
@@ -77,6 +80,14 @@ function ShellInner() {
     const id = setInterval(() => setClock(formatClock()), 1_000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (!initialDaemonFetch.current && !connected) return;
+    initialDaemonFetch.current = false;
+    void getDaemon()
+      .then(setDaemon)
+      .catch(() => undefined);
+  }, [connected]);
 
   const navigate = useCallback((key: ViewId) => {
     setActiveView(key);
@@ -133,7 +144,7 @@ function ShellInner() {
           <img src="/mark.svg" alt="" aria-hidden="true" className="brand-mark" />
           <div>
             <div className="brand-wordmark">dormant</div>
-            <div className="brand-sub">{`v${__DORMANT_VERSION__}`}</div>
+            <div className="brand-sub">{daemon ? `v${daemon.version}` : "connecting…"}</div>
           </div>
         </div>
 
@@ -162,7 +173,7 @@ function ShellInner() {
           ))}
         </nav>
 
-        <SidebarFooter connected={connected} />
+        <SidebarFooter connected={connected} daemon={daemon} />
       </aside>
 
       <main className="main">

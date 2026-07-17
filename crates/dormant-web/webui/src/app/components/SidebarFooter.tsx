@@ -3,18 +3,16 @@
  * a mono `pid <pid> · up <duration>` / socket line, a hairline divider,
  * then the "Legion fleet daemon" label row and the GitHub link.
  *
- * Fetches `GET /api/daemon` once on mount and again whenever the event
- * stream reconnects (`connected` flips false → true) — cheap, no polling
- * loop; pid/version/socket are static for the daemon's lifetime and
- * uptime only needs to resync after a connectivity gap.
+ * Receives daemon identity from the shell so the brand and footer share
+ * one `GET /api/daemon` request at startup and after reconnects.
  */
-import { useEffect, useRef, useState } from "react";
-import { getDaemon } from "../../api/client";
+import { useEffect, useState } from "react";
 import type { DaemonIdentity } from "../../api/types";
 import "./SidebarFooter.css";
 
 export interface SidebarFooterProps {
   connected: boolean;
+  daemon: DaemonIdentity | null;
 }
 
 /** Format seconds elapsed as `6h 12m` style — hours are always shown
@@ -28,25 +26,8 @@ function formatUptime(elapsedSeconds: number): string {
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
-export default function SidebarFooter({ connected }: SidebarFooterProps) {
-  const [daemon, setDaemon] = useState<DaemonIdentity | null>(null);
+export default function SidebarFooter({ connected, daemon }: SidebarFooterProps) {
   const [now, setNow] = useState(() => Date.now());
-  const wasConnected = useRef(connected);
-
-  useEffect(() => {
-    void getDaemon()
-      .then(setDaemon)
-      .catch(() => undefined);
-  }, []);
-
-  useEffect(() => {
-    if (connected && !wasConnected.current) {
-      void getDaemon()
-        .then(setDaemon)
-        .catch(() => undefined);
-    }
-    wasConnected.current = connected;
-  }, [connected]);
 
   // Tick the displayed uptime once a minute — cheap, and daemon uptime
   // never needs sub-minute precision.

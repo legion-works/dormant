@@ -39,19 +39,18 @@ pub struct LayerShellRenderSink {
 }
 
 impl LayerShellRenderSink {
-    /// Construct a stub.  Never fails on non-Linux — the absence of a
-    /// real backend is reported on the first [`RenderSink::show`] call.
-    #[must_use]
+    /// Construct a stub. Never fails on non-Linux — the absence of a real
+    /// backend is reported on the first [`RenderSink::show`] call.
     pub fn new(
         display_id: DisplayId,
         output_name: String,
         input_wake_tx: Option<&UnboundedSender<DisplayId>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CmdFailure> {
+        Ok(Self {
             display_id,
             output_name,
             input_wake_tx: input_wake_tx.cloned(),
-        }
+        })
     }
 
     /// Identifier of the display this sink was built for.  Exposed for
@@ -107,7 +106,8 @@ mod tests {
 
     #[tokio::test]
     async fn show_render_black_returns_unavailable() {
-        let sink = LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None);
+        let sink =
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
         let result = sink.show(1, 0, StageKind::RenderBlack).await;
         let err = result.expect_err("stub show must error");
         assert_eq!(err.controller, "render-black");
@@ -120,14 +120,16 @@ mod tests {
 
     #[tokio::test]
     async fn show_render_screensaver_returns_unavailable() {
-        let sink = LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None);
+        let sink =
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
         let result = sink.show(1, 0, StageKind::RenderScreensaver).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn show_controller_stage_returns_unavailable() {
-        let sink = LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None);
+        let sink =
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
         let result = sink
             .show(
                 1,
@@ -140,14 +142,16 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_is_infallible_and_noop() {
-        let sink = LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None);
+        let sink =
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
         sink.teardown(99).await;
     }
 
     #[test]
     fn accessors_return_constructor_args() {
         let sink =
-            LayerShellRenderSink::new(DisplayId("display-B".into()), "HDMI-A-1".into(), None);
+            LayerShellRenderSink::new(DisplayId("display-B".into()), "HDMI-A-1".into(), None)
+                .unwrap();
         assert_eq!(sink.display_id().to_string(), "display-B");
         assert_eq!(sink.output_name(), "HDMI-A-1");
     }

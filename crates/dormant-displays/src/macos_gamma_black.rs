@@ -272,14 +272,17 @@ pub trait GammaApi: Send + Sync {
 /// **stable selector string** (`cg:<uuid>`) — never the transient numeric
 /// `CGDirectDisplayID`, which is not guaranteed to survive a reconnect.
 ///
-/// Each selector's hold is an independently-locked slot
-/// (`Arc<Mutex<Option<GammaTable>>>`) so that blanking/waking one display
-/// never blocks a concurrent blank/wake on a different display sharing the
-/// same registry — the same independence property
-/// [`crate::ddc_lock::PanelLocks`] gives DDC/CI panels.
+/// Each selector has an independently-locked hold and operation lock so that
+/// blanking/waking one display never blocks another selector while one
+/// selector's full save/restore protocol remains atomic.
 #[derive(Default)]
 pub struct GammaHoldRegistry {
-    holds: StdMutex<HashMap<String, Arc<StdMutex<Option<GammaTable>>>>>,
+    holds: StdMutex<HashMap<String, Arc<GammaSlot>>>,
+}
+
+struct GammaSlot {
+    saved: StdMutex<Option<GammaTable>>,
+    operation: StdMutex<()>,
 }
 
 impl GammaHoldRegistry {
@@ -290,16 +293,17 @@ impl GammaHoldRegistry {
     }
 
     /// Get-or-create this selector's independently-locked slot.
-    fn slot(&self, selector: &str) -> Arc<StdMutex<Option<GammaTable>>> {
+    fn slot(&self, selector: &str) -> Arc<GammaSlot> {
         let mut holds = self
             .holds
             .lock()
             .expect("GammaHoldRegistry holds lock poisoned");
-        Arc::clone(
-            holds
-                .entry(selector.to_string())
-                .or_insert_with(|| Arc::new(StdMutex::new(None))),
-        )
+        Arc::clone(holds.entry(selector.to_string()).or_insert_with(|| {
+            Arc::new(GammaSlot {
+                saved: StdMutex::new(None),
+                operation: StdMutex::new(()),
+            })
+        }))
     }
 
     /// The currently-held wake-target table for `selector`, if any.
@@ -314,6 +318,7 @@ impl GammaHoldRegistry {
     #[must_use]
     pub fn saved(&self, selector: &str) -> Option<GammaTable> {
         self.slot(selector)
+            .saved
             .lock()
             .expect("gamma hold slot lock poisoned")
             .clone()
@@ -326,6 +331,7 @@ impl GammaHoldRegistry {
     fn set(&self, selector: &str, table: GammaTable) {
         *self
             .slot(selector)
+            .saved
             .lock()
             .expect("gamma hold slot lock poisoned") = Some(table);
     }
@@ -336,6 +342,7 @@ impl GammaHoldRegistry {
     fn clear(&self, selector: &str) {
         *self
             .slot(selector)
+            .saved
             .lock()
             .expect("gamma hold slot lock poisoned") = None;
     }
@@ -490,6 +497,12 @@ impl DisplayController for MacosGammaBlackController {
             return Err(Self::io_err(format!("unsupported blank mode {mode:?}")));
         }
 
+        let slot = self.holds.slot(&self.selector);
+        let _operation = slot
+            .operation
+            .lock()
+            .expect("gamma operation lock poisoned");
+
         let id = self.resolve()?;
 
         // First-blank-wins idempotency: a hold already occupied for this
@@ -581,6 +594,11 @@ impl DisplayController for MacosGammaBlackController {
     }
 
     async fn wake(&self) -> Result<(), CmdFailure> {
+        let slot = self.holds.slot(&self.selector);
+        let _operation = slot
+            .operation
+            .lock()
+            .expect("gamma operation lock poisoned");
         let id = self.resolve()?;
 
         let Some(saved) = self.holds.saved(&self.selector) else {
@@ -649,6 +667,7 @@ impl DisplayController for MacosGammaBlackController {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A fresh, temp-dir-backed [`GammaBreadcrumb`] for breadcrumb-focused
@@ -686,6 +705,8 @@ mod tests {
         /// that reference it document "wake never calls a system-wide
         /// restore" structurally, not just empirically.
         restore_all_calls: u32,
+        blank_write_started: Option<Arc<Barrier>>,
+        blank_write_release: Option<Arc<Barrier>>,
     }
 
     #[derive(Clone)]
@@ -707,6 +728,8 @@ mod tests {
                     blank_write_calls: 0,
                     saved_table_replay_calls: 0,
                     restore_all_calls: 0,
+                    blank_write_started: None,
+                    blank_write_release: None,
                 })),
                 next_id: Arc::new(AtomicU32::new(1)),
             }
@@ -754,6 +777,12 @@ mod tests {
         /// irrelevant, only that it isn't already black.
         fn working(selector: &str) -> Self {
             Self::with_table(selector, GammaTable::linear(256))
+        }
+
+        fn pause_black_write(&self, started: Arc<Barrier>, release: Arc<Barrier>) {
+            let mut inner = self.inner.lock().unwrap();
+            inner.blank_write_started = Some(started);
+            inner.blank_write_release = Some(release);
         }
 
         fn read_calls(&self) -> u32 {
@@ -819,6 +848,23 @@ mod tests {
             display: CGDirectDisplayID,
             table: &GammaTable,
         ) -> Result<(), GammaError> {
+            let (started, release) = {
+                let inner = self.inner.lock().unwrap();
+                if table.is_black() {
+                    (
+                        inner.blank_write_started.clone(),
+                        inner.blank_write_release.clone(),
+                    )
+                } else {
+                    (None, None)
+                }
+            };
+            if let Some(started) = started {
+                started.wait();
+                release
+                    .expect("black-write pause needs release barrier")
+                    .wait();
+            }
             let mut inner = self.inner.lock().unwrap();
             if !inner.tables.contains_key(&display) {
                 return Err(GammaError::from(format!(
@@ -862,6 +908,45 @@ mod tests {
         assert_eq!(api.read_calls(), 2);
         assert_eq!(holds.saved("cg:panel"), Some(GammaTable::linear(256)));
         assert!(api.current("cg:panel").is_black());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_wake_cannot_be_overwritten_by_blank() {
+        let api = Arc::new(FakeGammaApi::with_table(
+            "cg:panel",
+            GammaTable::linear(256),
+        ));
+        let holds = Arc::new(GammaHoldRegistry::new());
+        let blank = Arc::new(MacosGammaBlackController::with_api(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            Arc::clone(&holds),
+        ));
+        let wake = Arc::new(MacosGammaBlackController::with_api(
+            "cg:panel".into(),
+            Arc::clone(&api) as Arc<dyn GammaApi>,
+            holds,
+        ));
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        api.pause_black_write(Arc::clone(&started), Arc::clone(&release));
+
+        let blank_task = tokio::spawn(async move { blank.blank(BlankMode::BrightnessZero).await });
+        started.wait();
+
+        let wake_task = tokio::spawn(async move { wake.wake().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        release.wait();
+
+        blank_task.await.unwrap().unwrap();
+        wake_task.await.unwrap().unwrap();
+        assert!(
+            !api.current("cg:panel").is_black(),
+            "a wake that completed after blank began must leave the display active"
+        );
+        assert_eq!(api.current("cg:panel"), GammaTable::linear(256));
     }
 
     #[tokio::test]
@@ -1209,12 +1294,10 @@ mod tests {
 
     #[test]
     fn unrelated_selector_holds_use_independent_locks() {
-        // Each selector's slot is its own `Arc<Mutex<..>>` — holding "cg:a"'s
-        // lock (simulated here by taking the slot directly) must not block
-        // a concurrent access to "cg:b"'s slot.
+        // Holding one selector's operation lock must not block another selector.
         let holds = GammaHoldRegistry::default();
         let slot_a = holds.slot("cg:a");
-        let _guard = slot_a.lock().unwrap();
+        let _guard = slot_a.operation.lock().unwrap();
 
         // "cg:b" must still be freely accessible while "cg:a" is locked.
         assert_eq!(holds.saved("cg:b"), None);

@@ -65,7 +65,9 @@ use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, Zone
 use dormant_core::zone::{ZoneEngine, ZoneSpec, absent_mqtt_hazards};
 use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
-use dormant_displays::registry::{ControllerBuildContext, build_controllers, capabilities};
+use dormant_displays::registry::{
+    ControllerBuildContext, build_controllers, capabilities, controller_chain_fingerprint,
+};
 use dormant_doctor::DoctorService;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -2272,8 +2274,14 @@ async fn assemble_static(
 
         let controllers = build_controllers(name, dc, &creds, ctx)
             .with_context(|| format!("build controllers for display '{name}'"))?;
-        let mut executor =
-            DisplayExecutor::new(did.clone(), controllers, dc.primary_blank_mode(), retry);
+        let mut executor = DisplayExecutor::with_blank_owners(
+            did.clone(),
+            controllers,
+            dc.primary_blank_mode(),
+            retry,
+            Arc::clone(ctx.blank_owners()),
+            controller_chain_fingerprint(dc),
+        );
 
         for (controller, result) in executor.probe_all().await {
             tracing::info!(

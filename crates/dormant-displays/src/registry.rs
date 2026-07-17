@@ -23,6 +23,7 @@ use dormant_core::error::DormantError;
 use dormant_core::traits::DisplayController;
 use dormant_core::types::BlankMode;
 
+use crate::blank_owner::BlankOwnerRegistry;
 use crate::command::CommandController;
 use crate::ddc_lock::PanelLocks;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -71,6 +72,7 @@ use crate::samsung_tizen::SamsungTizenController;
 /// `crate::gamma_breadcrumb`'s module docs).
 pub struct ControllerBuildContext {
     locks: Arc<PanelLocks>,
+    blank_owners: Arc<BlankOwnerRegistry>,
     state_dir: PathBuf,
     #[cfg(target_os = "macos")]
     gamma_holds: Arc<GammaHoldRegistry>,
@@ -99,6 +101,7 @@ impl ControllerBuildContext {
         let state_dir = state_dir.into();
         Self {
             locks,
+            blank_owners: Arc::new(BlankOwnerRegistry::new()),
             #[cfg(target_os = "macos")]
             gamma_holds: Arc::new(GammaHoldRegistry::new()),
             #[cfg(target_os = "macos")]
@@ -111,6 +114,12 @@ impl ControllerBuildContext {
     #[must_use]
     pub fn locks(&self) -> &Arc<PanelLocks> {
         &self.locks
+    }
+
+    /// The shared blank-owner registry for generation-safe executor rebuilds.
+    #[must_use]
+    pub fn blank_owners(&self) -> &Arc<BlankOwnerRegistry> {
+        &self.blank_owners
     }
 
     /// The resolved state directory this context was built with.
@@ -133,6 +142,12 @@ impl ControllerBuildContext {
     pub fn gamma_breadcrumb(&self) -> &Arc<GammaBreadcrumb> {
         &self.gamma_breadcrumb
     }
+}
+
+/// Produce the identity used to retain blank ownership across a rebuild.
+#[must_use]
+pub fn controller_chain_fingerprint(cfg: &DisplayConfig) -> String {
+    format!("{cfg:?}")
 }
 
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.

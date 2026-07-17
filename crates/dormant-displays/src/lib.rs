@@ -11,6 +11,7 @@
 
 #![warn(missing_docs)]
 
+pub mod blank_owner;
 pub mod command;
 pub mod ddc_lock;
 pub mod ddcci;

@@ -6,9 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-17
+
 ### Fixed
 
-- Allowed selector-bearing macOS controller chains to use `macos-display-sleep` as a fallback after per-display controllers.
+- Allowed selector-bearing macOS controller chains to use `macos-display-sleep` as a fallback after per-display controllers — the documented recommended macOS chain `["ddcci", "macos-gamma-black", "macos-display-sleep"]` now passes validation.
+- The web UI version label now shows the running daemon's actual version (from `GET /api/daemon`) instead of a hardcoded "pre-alpha" literal.
+- macOS startup gamma-restore events (`gamma_stale_breadcrumb_restored` and siblings) are deferred until logging is initialised instead of being lost — the crash-recovery restore is now visible in the log.
+- Two macOS CI-lane test flakes retired: the wear shutdown-persist test now awaits the daemon join instead of racing it, and the LKG sidecar test tolerates a reload-armed first candidate under scheduler pressure.
 
 ## [0.3.0] - 2026-07-17
 

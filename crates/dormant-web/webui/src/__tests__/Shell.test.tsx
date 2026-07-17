@@ -61,7 +61,7 @@ vi.mock("../api/client", () => ({
   getDaemon: vi.fn().mockResolvedValue({
     pid: 48213,
     started_epoch_s: Math.floor(Date.now() / 1000) - 6 * 3600,
-    version: "0.2.0",
+    version: "9.8.7",
     socket: "/tmp/dormant.sock",
   }),
 }));
@@ -72,13 +72,17 @@ afterEach(() => {
 });
 
 describe("Shell", () => {
-  it("renders the sidebar navigation with all five views", () => {
+  it("renders the daemon version in the sidebar navigation", async () => {
     render(<Shell />);
 
     expect(document.querySelector(".brand-wordmark")?.textContent).toBe("dormant");
-    const brandSub = document.querySelector(".brand-sub")?.textContent;
-    expect(brandSub).toBe(`v${__DORMANT_VERSION__}`);
-    expect(brandSub).not.toContain("pre-alpha");
+    await waitFor(() => {
+      expect(document.querySelector(".brand-sub")?.textContent).toBe("v9.8.7");
+    });
+  });
+
+  it("renders the sidebar navigation with all five views", () => {
+    render(<Shell />);
 
     const navEl = document.querySelector(".sidebar-nav")!;
     const navLabels = ["Dashboard", "Displays", "Events", "Config", "Doctor"];

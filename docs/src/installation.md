@@ -161,6 +161,16 @@ starts after `dormant.service` and restarts on failure. A plain XDG
 resolves a relative `Exec=` against a minimal boot `PATH` that excludes
 `~/.local/bin`, so no unit gets generated.
 
+## Homebrew (macOS)
+
+Formulae publish per-app to the [legion-works/homebrew-tap](https://github.com/legion-works/homebrew-tap) tap. Install with:
+
+```bash
+brew install legion-works/tap/dormantd legion-works/tap/dormantctl
+```
+
+Formulae land with the next release (not v0.3.1). Each binary gets its own formula — `dormantd`, `dormantctl`, and `dormant-tray` are published independently.
+
 ## macOS (M1)
 
 dormant runs natively on macOS (arm64 and x86_64), no root required. This

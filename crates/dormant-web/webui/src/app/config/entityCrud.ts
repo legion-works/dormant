@@ -102,7 +102,7 @@ export const SAMSUNG_TIZEN_CONTROLLER = "samsung-tizen";
 /**
  * rust: crates/dormant-displays/src/registry.rs CONTROLLER_TYPES (:44-52)
  *
- * The Linux superset (`ddcci` is Linux-only server-side); listed here
+ * The platform superset (`ddcci` is available on Linux and macOS); listed here
  * regardless since the web UI has no way to know the daemon's platform
  * and the server's `capabilities()`/collection check is the real gate —
  * an unsupported controller on a non-Linux daemon fails the
@@ -114,6 +114,8 @@ export const DISPLAY_CONTROLLER_OPTIONS = [
   "ddcci",
   "ha-passthrough",
   "kwin-dpms",
+  "macos-display-sleep",
+  "macos-gamma-black",
   "samsung-tizen",
 ] as const;
 

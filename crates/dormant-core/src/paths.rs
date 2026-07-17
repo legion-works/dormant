@@ -211,10 +211,7 @@ pub fn default_lock_path_with(
 ) -> PathBuf {
     match target {
         TargetOs::Linux => lock_path_from(xdg_runtime_dir),
-        // Same filename as Linux (`dormant.lock`): one conceptual file, one name.
-        // The 2026-07-16 plan's RED test named it `dormantd.lock`, but that test
-        // also contradicted the tree's pre-existing Linux name — ruled a plan
-        // defect during run-5 review; see the run ledger.
+        // Same filename as Linux (`dormant.lock`): one lock identity across platforms.
         TargetOs::Macos => state_dir_from(xdg_state_home, home).join("dormant.lock"),
     }
 }

@@ -63,7 +63,9 @@ The CI jobs in `.github/workflows/ci.yml` are:
 - `clippy` — workspace/all-targets/all-features with warnings and Clippy pedantic denied
 - `test` — `cargo test --workspace --all-features`
 - `render` — render-feature builds and tests for `dormant-core`, `dormantd`, and `dormant-render`
-- `portability` — `cargo check --workspace` on Windows and macOS
+- `windows-portability` — `cargo check --workspace` on Windows
+- `macos-test` — workspace tests plus the vendored DDC transport tests on macOS
+- `macos-msrv` — Rust 1.88 workspace and vendored DDC transport checks on macOS
 - `deny` and `audit` — dependency policy and RustSec advisories
 - `msrv` — `cargo check --workspace` on Rust 1.88
 - `mqtt-integration` — live Mosquitto tests, including retained state and availability

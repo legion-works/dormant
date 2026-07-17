@@ -23,10 +23,9 @@
   Lifecycle semantics:
     - RunAtLoad: start immediately on `launchctl bootstrap`/login, without
       waiting for a KeepAlive-triggered restart first.
-    - KeepAlive.SuccessfulExit=false: relaunch dormantd whenever it exits,
-      REGARDLESS of exit code, but never treat a clean `exit 0` (e.g. an
-      explicit operator stop via a signal that lets it exit 0) as "stay
-      down". There is deliberately no other KeepAlive condition (no
+    - KeepAlive.SuccessfulExit=false: relaunch dormantd after an unsuccessful
+      exit, but leave a clean `exit 0` down. There is deliberately no other
+      KeepAlive condition (no
       NetworkState, no PathState): dormant does not need one to be alive.
     - ThrottleInterval=10: launchd will not restart more than once every 10
       seconds, bounding a crash loop's restart rate. This is the ONLY

@@ -205,7 +205,7 @@ shell never lingers as a supervisor between launchd and the daemon.
 To stop and remove:
 
 ```bash
-launchctl bootout gui/$UID com.legionworks.dormant
+launchctl bootout gui/$(id -u)/com.legionworks.dormant
 dormantctl launchd uninstall
 ```
 

@@ -116,6 +116,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
+      - run: cargo test --manifest-path vendor/ddc-macos/Cargo.toml
       - run: cargo test --workspace --all-features --doc
 
   macos-msrv:
@@ -125,6 +126,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
+      - run: cargo check --manifest-path vendor/ddc-macos/Cargo.toml --all-targets
 
   deny:
     runs-on: ubuntu-latest

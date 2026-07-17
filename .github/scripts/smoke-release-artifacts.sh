@@ -224,17 +224,13 @@ case "$TARGET_TRIPLE" in
         STAGED_TRAY_SERVICE="$WORKDIR/dormant-tray.service"
         stage_file "dormant-tray" "dormant-tray.service" "$STAGED_TRAY_SERVICE"
 
-        if command -v systemd-analyze >/dev/null 2>&1; then
-            systemd-analyze verify "$STAGED_SERVICE" >/dev/null 2>&1 \
-                || die "dormant.service failed systemd-analyze verify"
-            systemd-analyze verify "$STAGED_TRAY_SERVICE" >/dev/null 2>&1 \
-                || die "dormant-tray.service failed systemd-analyze verify"
-        else
-            grep -q 'ExecStart=' "$STAGED_SERVICE" \
-                || die "dormant.service missing ExecStart="
-            grep -q 'ExecStart=' "$STAGED_TRAY_SERVICE" \
-                || die "dormant-tray.service missing ExecStart="
-        fi
+        # Sanity-check unit file shape only — ExecStart binary-path validity
+        # is meaningless on the release runner (the target binary does not
+        # exist there), and systemd-analyze verify requires the binary on disk.
+        grep -q 'ExecStart=' "$STAGED_SERVICE" \
+            || die "dormant.service missing ExecStart="
+        grep -q 'ExecStart=' "$STAGED_TRAY_SERVICE" \
+            || die "dormant-tray.service missing ExecStart="
         ;;
 esac
 

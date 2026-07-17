@@ -298,8 +298,11 @@ async fn dbus_run(
 }
 
 /// Publish `inhibited = false` for every rule (fail-toward-blanking).
-#[cfg(target_os = "linux")]
-fn set_all_inactive(
+///
+/// Platform-neutral: shared by the Linux `DBus`/Wayland sources and the
+/// macOS `CoreGraphics` source (`crate::macos_idle::macos_run`) — not
+/// `cfg`-gated so it stays testable wherever those callers are.
+pub(crate) fn set_all_inactive(
     ctl: &mpsc::Sender<ControlMsg>,
     last_sent: &mut HashMap<RuleId, bool>,
     rules: &[ActivityRule],
@@ -312,8 +315,9 @@ fn set_all_inactive(
 /// Send a `SetInhibited` only when the value changed for this rule, and record
 /// the new value **only on a successful send** so a dropped edge is retried on
 /// the next poll rather than silently lost.
-#[cfg(target_os = "linux")]
-fn publish(
+///
+/// Platform-neutral for the same reason as [`set_all_inactive`].
+pub(crate) fn publish(
     ctl: &mpsc::Sender<ControlMsg>,
     last_sent: &mut HashMap<RuleId, bool>,
     rule: &RuleId,
@@ -351,8 +355,11 @@ async fn get_idle_raw(conn: &zbus::Connection) -> zbus::Result<u64> {
 }
 
 /// Sleep for `dur` or return `true` if cancellation fired first.
-#[cfg(target_os = "linux")]
-async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
+///
+/// Platform-neutral for the same reason as [`set_all_inactive`] — also used
+/// by `crate::macos_idle::macos_run` to make cancellation interrupt the
+/// poll sleep there too.
+pub(crate) async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         () = cancel.cancelled() => true,
         () = tokio::time::sleep(dur) => false,
@@ -749,6 +756,12 @@ async fn wayland_run(
 /// Select and create the appropriate idle source based on the configured mode
 /// and environment.
 ///
+/// `macos_guard_cfg` carries the `daemon.macos_idle_*` knobs through to the
+/// macOS source's [`crate::macos_idle::MacosIdleGuard`]; it's plain data on
+/// every platform (not `cfg`-gated) so callers don't need their own `cfg` to
+/// build one, even though it's only consulted when `effective` resolves to
+/// `Macos` on an actual macOS build.
+///
 /// Returns `None` when there are no rules.
 #[must_use]
 pub fn create_source(
@@ -756,10 +769,16 @@ pub fn create_source(
     rules: Vec<ActivityRule>,
     poll_interval: Duration,
     idle_unit: IdleTimeUnit,
+    macos_guard_cfg: crate::macos_idle::MacosIdleGuardConfig,
 ) -> Option<Box<dyn IdleSource>> {
     if rules.is_empty() {
         return None;
     }
+    // `MacosIdleGuardConfig` is `Copy`; this "use" only silences the
+    // unused-variable warning on non-macOS builds, where the match arm
+    // below that actually consumes it is `cfg`-gated out — it doesn't
+    // consume the value the `Macos` arm still needs on macOS.
+    let _ = macos_guard_cfg;
 
     let effective = match mode {
         #[cfg(target_os = "linux")]
@@ -794,21 +813,44 @@ pub fn create_source(
                 dormant_core::config::IdleSource::Dbus
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        // Auto selects Macos ON MACOS ONLY — Linux Auto (above) stays
+        // Wayland→DBus byte-identically, and this arm never fires there.
+        #[cfg(target_os = "macos")]
+        dormant_core::config::IdleSource::Auto => {
+            tracing::info!(event = "idle_source_selected", source = "macos");
+            dormant_core::config::IdleSource::Macos
+        }
+        // Windows (or any other non-Linux, non-macOS target): keep the
+        // existing unsupported/fail-toward-inactive behavior — fall back to
+        // the DBus source, whose non-Linux stub (`dbus_run` below) never
+        // publishes anything, so rules simply stay at their inactive
+        // default rather than wedging displays awake.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         dormant_core::config::IdleSource::Auto => {
             tracing::info!(event = "idle_source_selected", source = "dbus");
             dormant_core::config::IdleSource::Dbus
         }
         dormant_core::config::IdleSource::Dbus => dormant_core::config::IdleSource::Dbus,
-        // The CoreGraphics-backed macOS idle source itself lands in a later
-        // task (see Task 9 in the M1 macOS port plan); for now the config
-        // key is accepted (additive schema) but degrades to Dbus at
-        // selection time rather than failing to compile or panicking.
+        // Explicitly configured on macOS: use the real CoreGraphics source.
+        #[cfg(target_os = "macos")]
+        dormant_core::config::IdleSource::Macos => {
+            tracing::info!(event = "idle_source_selected", source = "macos");
+            dormant_core::config::IdleSource::Macos
+        }
+        // Explicitly configured on a foreign (non-macOS) target: this is
+        // the same "explicit unsupported" pattern the Wayland arm above
+        // uses for non-Linux targets (`wayland_idle_unsupported` → warn +
+        // fall back to DBus rather than fail to start) — mirrored here so
+        // an operator who forces `idle_source = "macos"` on Linux/Windows
+        // gets a clear warning instead of a silent no-op or a startup
+        // failure. Replaces Task 5's interim `macos_idle_not_yet_wired`
+        // warn+DBus-fallback arm now that the real backend exists.
+        #[cfg(not(target_os = "macos"))]
         dormant_core::config::IdleSource::Macos => {
             tracing::warn!(
-                event = "macos_idle_not_yet_wired",
-                "macos idle source selected but the CoreGraphics backend is not yet \
-                 implemented; falling back to dbus",
+                event = "macos_idle_unsupported",
+                "macos idle source requested but this platform is not macOS; \
+                 treating user as inactive via dbus fallback",
             );
             dormant_core::config::IdleSource::Dbus
         }
@@ -836,7 +878,12 @@ pub fn create_source(
             poll_interval,
             idle_unit,
         ))),
-        // Auto resolved to one of the above — unreachable.
+        #[cfg(target_os = "macos")]
+        dormant_core::config::IdleSource::Macos => Some(Box::new(
+            crate::macos_idle::MacosIdleSource::new(rules, poll_interval, macos_guard_cfg),
+        )),
+        // Auto/Macos resolved to one of the above on this platform, or
+        // Macos degraded to Dbus above — unreachable in practice.
         _ => None,
     }
 }
@@ -979,6 +1026,7 @@ mod tests {
             vec![],
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
         );
         assert!(result.is_none());
     }
@@ -994,6 +1042,7 @@ mod tests {
             rules,
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
         );
         assert!(result.is_some());
     }
@@ -1010,6 +1059,7 @@ mod tests {
             rules,
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
         );
         // Auto resolves — always returns Some when rules are non-empty.
         assert!(result.is_some());
@@ -1026,8 +1076,54 @@ mod tests {
             rules,
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
         );
         // Wayland mode either succeeds or falls back to DBus — always Some.
+        assert!(result.is_some());
+    }
+
+    // ── macOS selection tests ────────────────────────────────────────────────
+
+    /// Explicitly-configured `idle_source = "macos"` on a foreign (non-macOS)
+    /// target must not silently no-op or fail to start — it degrades to
+    /// `DBus` the same way `Wayland` does on non-Linux (see
+    /// `create_source`'s `macos_idle_unsupported` arm). Linux-runnable;
+    /// the macOS-target counterpart (selects the real `MacosIdleSource`) is
+    /// exercised on the macOS CI lane.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn create_source_macos_explicit_on_foreign_target_falls_back_to_dbus() {
+        let rules = vec![ActivityRule {
+            rule: RuleId("r".into()),
+            idle_threshold: Duration::from_secs(120),
+        }];
+        let result = create_source(
+            dormant_core::config::IdleSource::Macos,
+            rules,
+            Duration::from_secs(5),
+            IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
+        );
+        // Falls back to DBus rather than returning None or panicking.
+        assert!(result.is_some());
+    }
+
+    /// `Auto` on a foreign target must never resolve to `Macos` — it stays
+    /// on the existing Linux Wayland→DBus (or non-Linux `DBus`) path.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn create_source_auto_on_foreign_target_never_selects_macos() {
+        let rules = vec![ActivityRule {
+            rule: RuleId("r".into()),
+            idle_threshold: Duration::from_secs(120),
+        }];
+        let result = create_source(
+            dormant_core::config::IdleSource::Auto,
+            rules,
+            Duration::from_secs(5),
+            IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
+        );
         assert!(result.is_some());
     }
 

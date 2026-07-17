@@ -77,6 +77,7 @@ use dormant_render::LayerShellRenderSink;
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
+use crate::macos_idle;
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
 use crate::sd_notify::{self, SdNotify};
@@ -2801,11 +2802,17 @@ fn spawn_generation(
         .unwrap_or_else(|| Duration::from_secs(5));
     let idle_unit = assembly.cfg.daemon.idle_time_unit;
     let idle_source = assembly.cfg.daemon.idle_source;
+    let macos_guard_cfg = macos_idle::MacosIdleGuardConfig {
+        frozen_polls: assembly.cfg.daemon.macos_idle_frozen_polls,
+        sanity_cap: assembly.cfg.daemon.macos_idle_sanity_cap,
+        startup_grace: assembly.cfg.daemon.macos_idle_startup_grace,
+    };
     let _inhibitor = inhibit_activity::spawn(
         assembly.activity_rules,
         poll,
         idle_source,
         idle_unit,
+        macos_guard_cfg,
         ctl_tx.clone(),
         token.clone(),
     );

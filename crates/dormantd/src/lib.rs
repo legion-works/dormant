@@ -15,6 +15,7 @@ pub mod inhibit_audio;
 #[cfg(unix)]
 pub mod ipc;
 pub mod logging;
+pub mod macos_idle;
 pub mod notifier;
 pub mod reload;
 pub mod sd_notify;

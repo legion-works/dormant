@@ -31,9 +31,11 @@ pub fn spawn(
     poll_interval: Duration,
     idlesrc: dormant_core::config::IdleSource,
     unit: IdleTimeUnit,
+    macos_guard_cfg: crate::macos_idle::MacosIdleGuardConfig,
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let source = crate::idle_source::create_source(idlesrc, rules, poll_interval, unit)?;
+    let source =
+        crate::idle_source::create_source(idlesrc, rules, poll_interval, unit, macos_guard_cfg)?;
     Some(tokio::spawn(async move { source.run(ctl, cancel).await }))
 }

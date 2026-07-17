@@ -234,17 +234,24 @@ pub enum IdleTimeUnit {
 
 /// Which idle source the activity inhibitor should use.
 ///
-/// * `Auto` (default) — prefer Wayland's `ext_idle_notifier_v1` when
+/// * `Auto` (default) — on macOS, always use the `CoreGraphics` idle-time
+///   source; on Linux, prefer Wayland's `ext_idle_notifier_v1` when
 ///   `WAYLAND_DISPLAY` is set and the compositor advertises the protocol,
-///   fall back to `DBus` `GetSessionIdleTime` otherwise.
+///   falling back to `DBus` `GetSessionIdleTime` otherwise; elsewhere
+///   (Windows), `DBus` (whose non-Linux implementation is an inert stub —
+///   see `dormantd::idle_source`'s `dbus_run`).
 /// * `Wayland` — force the Wayland idle notifier; the daemon will error at
 ///   startup if the compositor does not expose the protocol.
 /// * `Dbus` — always use the `DBus` screensaver poll.
 /// * `Macos` — use the macOS `CoreGraphics` idle-time source (see
 ///   [`super::defaults::MACOS_IDLE_FROZEN_POLLS`] and friends for the
-///   accompanying `[daemon]` tunables). Additive: selecting this on a
-///   non-macOS build is a config error at the wiring layer, not here — this
-///   enum only describes what the TOML key accepts.
+///   accompanying `[daemon]` tunables). Additive: this enum only describes
+///   what the TOML key accepts — selecting `macos` on a non-macOS build is
+///   *not* rejected here or at startup. The wiring layer
+///   (`dormantd::idle_source::create_source`) treats it the same way it
+///   treats `wayland` requested on non-Linux: warn once
+///   (`macos_idle_unsupported`) and fail toward inactive by falling back to
+///   `DBus`, rather than refusing to start.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleSource {

@@ -23,6 +23,25 @@ dormantctl doctor macos-power           # active power assertions blocking displ
 
 Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a controller reports its last known state is stale). Failures indicate something needs fixing. The three `macos-*` checks exit 3 ("not yet supported") on Linux — they are read-only probes, never blanking or waking a display.
 
+### Doctor-assisted issue drafting
+
+When something fails and you want to file it later without hand-reconstructing the context, `--report-issue` and `--draft-feature` run the full offline probe set (same as bare `dormantctl doctor`) and write a ready-to-paste draft:
+
+```bash
+# Bug report — pre-filled with version, environment, display inventory, and
+# the probe table. Default path: ./dormant-issue-<YYYY-MM-DD>.md
+dormantctl doctor --report-issue
+
+# Feature request — same environment capture, no probe-failure framing.
+# Default path: ./dormant-feature-<YYYY-MM-DD>.md
+dormantctl doctor --draft-feature
+
+# Explicit path
+dormantctl doctor --report-issue /tmp/my-bug.md
+```
+
+Both flags mirror the field order and headings of `.github/ISSUE_TEMPLATE/{bug,feature}.yml`, so pasting the draft into a new GitHub issue lines up with the template. Machine-collectable fields (dormant version, OS/kernel, session type, compositor, the display inventory, config load status, and the probe table) are pre-filled; everything else is left as an `<!-- fill in -->` placeholder. Never overwrites an existing file — a name collision gets a `-2`, `-3`, … suffix. Display entries only ever carry `id`, panel type, controller list, and blank mode — hosts, tokens, and MAC addresses never enter the draft. The two flags are mutually exclusive with each other and with any doctor subcommand (`ddcci`, `mqtt`, …) — the draft always runs the full offline set.
+
 ## Common errors
 
 | Code | Meaning | Fix |

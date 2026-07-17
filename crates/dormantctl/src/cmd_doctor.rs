@@ -6,9 +6,9 @@
 //! module handles CLI argument parsing, config loading, table rendering, and
 //! exit-code mapping.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use comfy_table::Color;
 use comfy_table::ContentArrangement;
@@ -18,7 +18,7 @@ use dormant_core::config::{Strictness, load_config, load_credentials};
 use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::paths;
 use dormant_core::rules::{ExerciseReport, ExerciseStep, ExerciseVerdict};
-use dormant_doctor::{ProbeResult, ProbeStatus};
+use dormant_doctor::{DraftContext, ProbeResult, ProbeStatus};
 
 use dormantctl::client;
 
@@ -47,6 +47,33 @@ pub struct DoctorArgs {
     /// Path to the credentials file.
     #[arg(long)]
     pub credentials: Option<PathBuf>,
+
+    /// After running the full offline probe set, write a ready-to-file bug
+    /// report draft to PATH (default `./dormant-issue-<YYYY-MM-DD>.md`).
+    /// Mutually exclusive with `--draft-feature` and any subcommand — the
+    /// draft always runs the full offline probe set (checked at runtime,
+    /// not by clap, since a subcommand can't be a `conflicts_with` target
+    /// in derive).
+    ///
+    /// `String`, not `PathBuf`: clap v4's `PathBuf` value parser rejects an
+    /// empty string outright (even via `default_missing_value`), so an
+    /// empty marker for "use the default filename" has to travel as a
+    /// plain string and get converted at the call site.
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "draft_feature"
+    )]
+    pub report_issue: Option<String>,
+
+    /// After running the full offline probe set, write a ready-to-file
+    /// feature request draft to PATH (default
+    /// `./dormant-feature-<YYYY-MM-DD>.md`). Mutually exclusive with
+    /// `--report-issue` and any subcommand.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub draft_feature: Option<String>,
 
     #[command(subcommand)]
     pub subcommand: Option<DoctorSubcommand>,
@@ -114,6 +141,16 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
 }
 
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
+    if args.report_issue.is_some() || args.draft_feature.is_some() {
+        if args.subcommand.is_some() {
+            anyhow::bail!(
+                "--report-issue / --draft-feature run the full offline probe set and \
+                 cannot be combined with a doctor subcommand"
+            );
+        }
+        return run_draft(args).await;
+    }
+
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -190,6 +227,97 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             Ok(outcome(&results))
         }
     }
+}
+
+// ── Doctor-assisted issue drafting ────────────────────────────────────────────────
+
+/// `doctor --report-issue [PATH]` / `--draft-feature [PATH]`: run the full
+/// offline probe set, print the normal table, then write a ready-to-file
+/// issue draft. The two flags are mutually exclusive (enforced by clap's
+/// `conflicts_with` plus the subcommand check in [`run_async`]).
+async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
+    let (cfg, creds, note) = load_config_and_creds(args)?;
+    if let Some(n) = &note {
+        println!("{n}");
+    }
+    let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
+    print_table(&results);
+
+    let config_path =
+        paths::resolve_config_path(args.config.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config_ok = results.iter().all(|r| r.status != ProbeStatus::Fail);
+
+    let ctx = DraftContext {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        env: dormant_doctor::collect_env(),
+        config_path: config_path.display().to_string(),
+        config_ok,
+        displays: dormant_doctor::build_display_inventory(&cfg),
+        probes: results.clone(),
+    };
+
+    let (requested_path, body, kind) = if let Some(p) = &args.report_issue {
+        (p, dormant_doctor::render_bug_draft(&ctx), "issue")
+    } else if let Some(p) = &args.draft_feature {
+        (p, dormant_doctor::render_feature_draft(&ctx), "feature")
+    } else {
+        unreachable!("run_draft is only called when report_issue or draft_feature is set")
+    };
+
+    let today = dormant_doctor::format_date_ymd(std::time::SystemTime::now());
+    let default_stem = if kind == "issue" {
+        format!("dormant-issue-{today}.md")
+    } else {
+        format!("dormant-feature-{today}.md")
+    };
+    let base_path = if requested_path.is_empty() {
+        PathBuf::from(default_stem)
+    } else {
+        PathBuf::from(requested_path)
+    };
+    let write_path = next_available_path(&base_path);
+
+    std::fs::write(&write_path, body)
+        .with_context(|| format!("write draft to '{}'", write_path.display()))?;
+    println!("draft written to {}", write_path.display());
+
+    Ok(outcome(&results))
+}
+
+/// Return the first available path among `base`, `base-2`, `base-3`, … —
+/// never silently overwrite an existing draft.
+///
+/// Suffix is inserted before the file's extension (`dormant-issue-2026-07-18.md`
+/// → `dormant-issue-2026-07-18-2.md`) when the path has one, otherwise
+/// appended directly.
+fn next_available_path(base: &Path) -> PathBuf {
+    if !base.exists() {
+        return base.to_path_buf();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = suffixed_path(base, n);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Build `<stem>-<n>.<ext>` (or `<name>-<n>` when there is no extension)
+/// from `base`. Pure so [`next_available_path`]'s suffix logic is testable
+/// without touching the filesystem.
+fn suffixed_path(base: &Path, n: u32) -> PathBuf {
+    let parent = base.parent().unwrap_or_else(|| Path::new(""));
+    let stem = base
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().to_string());
+    let ext = base.extension().map(|e| e.to_string_lossy().to_string());
+    let file_name = match ext {
+        Some(ext) => format!("{stem}-{n}.{ext}"),
+        None => format!("{stem}-{n}"),
+    };
+    parent.join(file_name)
 }
 
 // ── macOS read-only doctor arms (Task 11) ─────────────────────────────────────────
@@ -821,5 +949,107 @@ mod tests {
             matches!(power, DoctorSubcommand::MacosPower),
             "expected MacosPower, got {power:?}"
         );
+    }
+
+    // ── Issue drafting: collision-suffix ────────────────────────────────────
+
+    #[test]
+    fn suffixed_path_inserts_before_extension() {
+        let base = Path::new("dormant-issue-2026-07-18.md");
+        assert_eq!(
+            suffixed_path(base, 2),
+            PathBuf::from("dormant-issue-2026-07-18-2.md")
+        );
+        assert_eq!(
+            suffixed_path(base, 3),
+            PathBuf::from("dormant-issue-2026-07-18-3.md")
+        );
+    }
+
+    #[test]
+    fn suffixed_path_no_extension_appends_directly() {
+        let base = Path::new("draft-no-ext");
+        assert_eq!(suffixed_path(base, 2), PathBuf::from("draft-no-ext-2"));
+    }
+
+    #[test]
+    fn suffixed_path_preserves_parent_directory() {
+        let base = Path::new("/tmp/some/dir/draft.md");
+        assert_eq!(
+            suffixed_path(base, 2),
+            PathBuf::from("/tmp/some/dir/draft-2.md")
+        );
+    }
+
+    #[test]
+    fn next_available_path_returns_base_when_free() {
+        let dir =
+            std::env::temp_dir().join(format!("dormantctl-draft-test-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("draft.md");
+
+        assert_eq!(next_available_path(&base), base);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_available_path_skips_existing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dormantctl-draft-test-collision-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("draft.md");
+        std::fs::write(&base, b"existing").unwrap();
+        std::fs::write(dir.join("draft-2.md"), b"existing").unwrap();
+
+        let next = next_available_path(&base);
+        assert_eq!(next, dir.join("draft-3.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Issue drafting: flag conflicts ──────────────────────────────────────
+
+    #[test]
+    fn report_issue_and_draft_feature_are_mutually_exclusive() {
+        // `=` binds the (empty, "use default filename") value explicitly so
+        // clap doesn't try to consume `--draft-feature` itself as
+        // `--report-issue`'s optional value.
+        let err = DoctorArgs::try_parse_from(["doctor", "--report-issue=", "--draft-feature"])
+            .expect_err("--report-issue and --draft-feature must conflict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("report-issue") && msg.contains("draft-feature"),
+            "error should name both conflicting flags; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn report_issue_combined_with_subcommand_is_rejected_at_runtime() {
+        // clap can't express "flag conflicts with any subcommand" via
+        // `conflicts_with` (subcommands aren't arg ids), so this is
+        // enforced in `run_async` — parsing itself succeeds. `=` binds the
+        // value explicitly so `ddcci` is left for the subcommand slot
+        // instead of being greedily consumed as `--report-issue`'s PATH.
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue=/tmp/x.md", "ddcci"])
+            .expect("parses: the runtime check, not clap, rejects this combination");
+        assert!(args.report_issue.is_some());
+        assert!(matches!(args.subcommand, Some(DoctorSubcommand::Ddcci)));
+    }
+
+    #[test]
+    fn report_issue_default_missing_value_is_none_path_marker() {
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue="]).unwrap();
+        assert_eq!(args.report_issue, Some(String::new()));
+    }
+
+    #[test]
+    fn report_issue_explicit_path_is_captured() {
+        let args = DoctorArgs::try_parse_from(["doctor", "--report-issue", "/tmp/x.md"]).unwrap();
+        assert_eq!(args.report_issue, Some("/tmp/x.md".to_string()));
     }
 }

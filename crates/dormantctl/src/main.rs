@@ -126,6 +126,22 @@ enum Command {
         #[arg(long)]
         credentials: Option<PathBuf>,
 
+        /// Write a ready-to-file bug report draft after the offline probe
+        /// set. See `cmd_doctor::DoctorArgs::report_issue`.
+        #[arg(
+            long,
+            value_name = "PATH",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with = "draft_feature"
+        )]
+        report_issue: Option<String>,
+
+        /// Write a ready-to-file feature request draft after the offline
+        /// probe set. See `cmd_doctor::DoctorArgs::draft_feature`.
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+        draft_feature: Option<String>,
+
         #[command(subcommand)]
         subcommand: Option<cmd_doctor::DoctorSubcommand>,
     },
@@ -215,6 +231,8 @@ fn main() -> ExitCode {
         Command::Doctor {
             config,
             credentials,
+            report_issue,
+            draft_feature,
             subcommand,
         } => {
             // The Exercise subcommand needs the resolved socket path (the
@@ -256,6 +274,8 @@ fn main() -> ExitCode {
             let args = cmd_doctor::DoctorArgs {
                 config,
                 credentials,
+                report_issue,
+                draft_feature,
                 subcommand,
             };
             match cmd_doctor::run(&args) {

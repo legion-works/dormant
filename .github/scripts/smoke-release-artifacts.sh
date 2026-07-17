@@ -134,12 +134,16 @@ stage_binary() {
 # (`stage_binary` must have already been called for $app). Only two exact,
 # manifest-informed candidate locations are tried, in this fixed order —
 # never a `find | head`-style guess across the whole extract tree:
-#   1. next to the executable, inside the "<app>-<triple>/" prefix
-#      directory cargo-dist nests binaries under (see `stage_binary`'s
-#      comment above) — root `include`s are documented to land "side-by-
-#      side" with the binary, i.e. likely inside that same prefix;
-#   2. at the tar's true top level, in case root `include`s are NOT nested
-#      under the per-target prefix after all.
+#   1. next to the executable at the manifest-reported path (future-proof
+#      against a flat layout — the manifest reports bare basenames);
+#   2. at the tar's true top level, same flat-layout hedge;
+#   3. inside the "<archive-stem>/" prefix directory cargo-dist actually
+#      nests archive contents under (v0.3.0 round-1 evidence: the manifest
+#      says `com.legionworks.dormant.plist` while the tarball holds
+#      `dormantd-x86_64-unknown-linux-gnu/com.legionworks.dormant.plist` —
+#      the same manifest-vs-layout divergence stage_binary handles above).
+#      The stem is derived from the archive NAME, deterministically — still
+#      never a `find | head`-style guess across the whole extract tree.
 stage_file() {
     app="$1"          # the app whose already-extracted archive to search
     asset_name="$2"   # the manifest asset .name, e.g. com.legionworks.dormant.plist
@@ -166,6 +170,15 @@ stage_file() {
     fi
     if [ -z "$resolved" ] && [ -f "$extract_dir/$asset_in_archive" ]; then
         resolved="$extract_dir/$asset_in_archive"
+    fi
+    if [ -z "$resolved" ]; then
+        # cargo-dist nests archive contents under a directory named after
+        # the archive stem ("dormantd-<triple>", the archive filename minus
+        # .tar.xz/.zip) — the layout the real v0.3.0 tarballs shipped.
+        archive_stem="${archive_name%.tar.xz}"
+        archive_stem="${archive_stem%.zip}"
+        candidate="$extract_dir/$archive_stem/$(basename "$asset_in_archive")"
+        [ -f "$candidate" ] && resolved="$candidate"
     fi
     [ -n "$resolved" ] || die "missing packaged file: $asset_name"
 

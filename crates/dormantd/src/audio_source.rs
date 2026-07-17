@@ -861,7 +861,14 @@ mod tests {
 /// `PermissionsExt` precedent, `daemon_smoke.rs:146-153` — same mechanism,
 /// 0o755 not 0o600, because the script must be executable). Phase swaps use
 /// write-temp + chmod + atomic rename (F13).
-#[cfg(test)]
+// Linux-only: these are spawn-timing-window tests around the PipeWire
+// poller — pw-dump exists only on Linux, macOS audio-aware blanking is
+// out of scope by design (production there: spawn failure → circuit
+// breaker → fail-safe inactive, covered by the platform-neutral unit
+// tests above), and macOS CI-runner process-spawn latency invalidates
+// the tests' ~100ms assertion windows wholesale (PR #78 round 7: 9/9
+// failed on macos-latest while all pure-logic audio tests passed).
+#[cfg(all(test, target_os = "linux"))]
 mod poller_tests {
     use super::{AudioDeps, AudioRule, ReapOutcome, production_reap_probe, run_loop};
     use dormant_core::config::schema::AudioConfig;

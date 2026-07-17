@@ -3373,7 +3373,14 @@ mod watchdog_tests {
     /// need a full `Runner`/`App`. This is also the re-kill test for
     /// reviewer mutation m6 ("ping unconditionally, ignoring the probe
     /// result") — see the report for the mutation re-application evidence.
+    // Linux-only (both datagram tests): sd_notify is systemd-only by
+    // architecture — NOTIFY_SOCKET is never set on macOS and the send
+    // path is best-effort/swallowed there, so on macos-latest the healthy
+    // test times out (recv WouldBlock, PR #78 round 7) and the failure-side
+    // test would pass vacuously. The pure-logic watchdog tests below stay
+    // cross-platform.
     #[test]
+    #[cfg(target_os = "linux")]
     fn ping_if_healthy_sends_nothing_on_failed_probe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify.sock");
@@ -3401,6 +3408,7 @@ mod watchdog_tests {
     /// still ping (guards against an overcorrection that silences the
     /// healthy path too).
     #[test]
+    #[cfg(target_os = "linux")] // see the failure-side pin's Linux-only note
     fn ping_if_healthy_sends_watchdog_on_healthy_probe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notify.sock");

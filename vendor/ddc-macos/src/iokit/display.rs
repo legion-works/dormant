@@ -19,9 +19,4 @@ extern "C" {
         options: IOOptionBits,
     ) -> CFDictionaryRef;
 
-    #[link(name = "CoreDisplay", kind = "framework")]
-    // Creates a display info dictionary for a specified display ID
-    pub fn CoreDisplay_DisplayCreateInfoDictionary(
-        display_id: CGDirectDisplayID,
-    ) -> CFDictionaryRef;
 }

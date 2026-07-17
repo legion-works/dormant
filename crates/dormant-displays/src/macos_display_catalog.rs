@@ -36,6 +36,14 @@ type CGError = i32;
 const MAX_ONLINE_DISPLAYS: usize = 32;
 
 #[allow(non_snake_case)]
+// `CGDisplayCreateUUIDFromDisplayID` is declared by ColorSyncDevice.h and
+// exported by ColorSync.framework.
+#[link(name = "ColorSync", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayCreateUUIDFromDisplayID(display: CGDirectDisplayID) -> CFUUIDRef;
+}
+
+#[allow(non_snake_case)]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGGetOnlineDisplayList(
@@ -43,8 +51,6 @@ unsafe extern "C" {
         onlineDisplays: *mut CGDirectDisplayID,
         displayCount: *mut u32,
     ) -> CGError;
-
-    fn CGDisplayCreateUUIDFromDisplayID(display: CGDirectDisplayID) -> CFUUIDRef;
 
     fn CGDisplayGammaTableCapacity(display: CGDirectDisplayID) -> u32;
 

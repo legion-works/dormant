@@ -1,15 +1,15 @@
 use crate::error::Error;
 use crate::error::Error::{DisplayLocationNotFound, ServiceNotFound};
 use crate::iokit::IoIterator;
-use crate::iokit::{CoreDisplay_DisplayCreateInfoDictionary, IoObject};
+use crate::iokit::IoObject;
 use crate::{kern_try, verify_io};
 use core_foundation::base::{CFType, TCFType};
-use core_foundation::dictionary::CFDictionary;
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 use core_foundation::string::CFString;
 use core_foundation_sys::base::{
     kCFAllocatorDefault, CFAllocatorRef, CFRelease, CFTypeRef, OSStatus,
 };
-use core_graphics::display::CGDisplay;
+use core_graphics::display::{CGDirectDisplayID, CGDisplay};
 use ddc::{I2C_ADDRESS_DDC_CI, SUB_ADDRESS_DDC_CI};
 use io_kit_sys::keys::kIOServicePlane;
 use io_kit_sys::types::{io_object_t, io_registry_entry_t};
@@ -185,7 +185,7 @@ pub(crate) fn get_display_av_service(display: CGDisplay) -> Result<(AvService, u
     }
     let symbols = core_display_symbols()?;
     let display_infos: CFDictionary<CFString, CFType> = unsafe {
-        CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(display.id))
+        CFDictionary::wrap_under_create_rule(display_create_info_dictionary(display.id)?)
     };
     let location = display_infos
         .find(CFString::from_static_string("IODisplayLocation"))
@@ -300,6 +300,7 @@ fn get_service_registry_entry_name(entry: io_registry_entry_t) -> Result<String,
 // never a process abort or link failure.
 
 const SYMBOL_CREATE_WITH_SERVICE: &str = "IOAVServiceCreateWithService";
+const SYMBOL_DISPLAY_CREATE_INFO_DICTIONARY: &str = "CoreDisplay_DisplayCreateInfoDictionary";
 const SYMBOL_READ_I2C: &str = "IOAVServiceReadI2C";
 const SYMBOL_WRITE_I2C: &str = "IOAVServiceWriteI2C";
 
@@ -307,13 +308,16 @@ const CORE_DISPLAY_FRAMEWORK_PATH: &str =
     "/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay";
 
 type CreateWithServiceFn = unsafe extern "C" fn(CFAllocatorRef, io_object_t) -> IOAVService;
+type DisplayCreateInfoDictionaryFn = unsafe extern "C" fn(CGDirectDisplayID) -> CFDictionaryRef;
 type ReadI2CFn = unsafe extern "C" fn(IOAVService, c_uint, c_uint, *mut c_void, c_uint) -> OSStatus;
 type WriteI2CFn =
     unsafe extern "C" fn(IOAVService, c_uint, c_uint, *const c_void, c_uint) -> OSStatus;
 
 /// Runtime-resolved table of CoreDisplay's private `IOAVService*` symbols.
+#[derive(Debug)]
 struct CoreDisplaySymbols {
     create_with_service: CreateWithServiceFn,
+    display_create_info_dictionary: DisplayCreateInfoDictionaryFn,
     read_i2c: ReadI2CFn,
     write_i2c: WriteI2CFn,
 }
@@ -322,6 +326,10 @@ impl CoreDisplaySymbols {
     fn resolve<L: SymbolLoader>(loader: &L) -> Result<Self, Error> {
         Ok(CoreDisplaySymbols {
             create_with_service: Self::resolve_one(loader, SYMBOL_CREATE_WITH_SERVICE)?,
+            display_create_info_dictionary: Self::resolve_one(
+                loader,
+                SYMBOL_DISPLAY_CREATE_INFO_DICTIONARY,
+            )?,
             read_i2c: Self::resolve_one(loader, SYMBOL_READ_I2C)?,
             write_i2c: Self::resolve_one(loader, SYMBOL_WRITE_I2C)?,
         })
@@ -336,6 +344,16 @@ impl CoreDisplaySymbols {
         // data pointer, so a pointer-for-pointer copy is a valid reinterpretation.
         Ok(unsafe { std::mem::transmute_copy::<*mut c_void, F>(&ptr) })
     }
+}
+
+/// Load CoreDisplay's private display-info dictionary symbol on demand.
+pub(crate) fn display_create_info_dictionary(
+    display: CGDirectDisplayID,
+) -> Result<CFDictionaryRef, Error> {
+    // SAFETY: the runtime-resolved symbol has the ABI declared by
+    // `DisplayCreateInfoDictionaryFn`; CoreDisplay returns a +1 dictionary
+    // under the Create naming rule, owned by the caller on success.
+    Ok(unsafe { (core_display_symbols()?.display_create_info_dictionary)(display) })
 }
 
 /// A source of dynamically-resolved native symbols, abstracted so tests can simulate a
@@ -557,6 +575,28 @@ mod tests {
         let err = CoreDisplaySymbols::resolve(&FakeSymbolLoader).unwrap_err();
         assert!(
             err.to_string().contains("IOAVServiceWriteI2C"),
+            "expected error to name the missing symbol, got: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_display_info_symbol_is_a_typed_error() {
+        struct FakeSymbolLoader;
+        impl SymbolLoader for FakeSymbolLoader {
+            fn resolve(&self, symbol: &str) -> Option<*mut c_void> {
+                if symbol == SYMBOL_DISPLAY_CREATE_INFO_DICTIONARY {
+                    None
+                } else {
+                    // Never dereferenced by this test; any non-null value resolves.
+                    Some(0x1 as *mut c_void)
+                }
+            }
+        }
+
+        let err = CoreDisplaySymbols::resolve(&FakeSymbolLoader).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(SYMBOL_DISPLAY_CREATE_INFO_DICTIONARY),
             "expected error to name the missing symbol, got: {err}"
         );
     }

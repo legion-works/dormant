@@ -217,8 +217,10 @@ mod tests {
             Duration::ZERO,
             kIOI2CDDCciReplyTransactionType,
             |request| {
-                assert_eq!(request.sendBuffer, packet_ptr);
-                assert_eq!(request.replyBuffer, out_ptr);
+                let send_buffer = request.sendBuffer;
+                let reply_buffer = request.replyBuffer;
+                assert_eq!(send_buffer, packet_ptr);
+                assert_eq!(reply_buffer, out_ptr);
                 unsafe { std::slice::from_raw_parts_mut(request.replyBuffer as *mut u8, 2) }
                     .copy_from_slice(&[0x51, 0x82]);
                 request.replyBytes = 2;

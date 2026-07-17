@@ -1,7 +1,6 @@
 #![deny(missing_docs)]
 
 use crate::error::Error;
-use crate::iokit::CoreDisplay_DisplayCreateInfoDictionary;
 use crate::iokit::IoObject;
 use crate::{arm, intel};
 use core_foundation::base::{CFType, TCFType};
@@ -98,9 +97,9 @@ impl Monitor {
     /// Product name for this [Monitor], if available
     pub fn product_name(&self) -> Option<String> {
         let info: CFDictionary<CFString, CFType> = unsafe {
-            CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(
-                self.monitor.id,
-            ))
+            CFDictionary::wrap_under_create_rule(
+                arm::display_create_info_dictionary(self.monitor.id).ok()?,
+            )
         };
 
         let display_product_name_key = CFString::from_static_string("DisplayProductName");
@@ -116,9 +115,9 @@ impl Monitor {
     /// Returns Extended display identification data (EDID) for this [Monitor] as raw bytes data
     pub fn edid(&self) -> Option<Vec<u8>> {
         let info: CFDictionary<CFString, CFType> = unsafe {
-            CFDictionary::wrap_under_create_rule(CoreDisplay_DisplayCreateInfoDictionary(
-                self.monitor.id,
-            ))
+            CFDictionary::wrap_under_create_rule(
+                arm::display_create_info_dictionary(self.monitor.id).ok()?,
+            )
         };
         let display_product_name_key = CFString::from_static_string("IODisplayEDIDOriginal");
         let edid_data = info.find(&display_product_name_key)?.downcast::<CFData>()?;

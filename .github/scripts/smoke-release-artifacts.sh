@@ -208,10 +208,33 @@ PLIST_NAME="com.legionworks.dormant.plist"
 STAGED_PLIST="$WORKDIR/$PLIST_NAME"
 stage_file "dormantd" "$PLIST_NAME" "$STAGED_PLIST"
 
+# Systemd user unit — dormant.service ships in dormantd's archive on every target
+# (it's a harmless 2 KB text file on macOS).
+STAGED_SERVICE="$WORKDIR/dormant.service"
+stage_file "dormantd" "dormant.service" "$STAGED_SERVICE"
+
 case "$TARGET_TRIPLE" in
     *-apple-darwin)
         command -v plutil >/dev/null 2>&1 || die "plutil not found on $TARGET_TRIPLE runner"
         plutil -lint "$STAGED_PLIST" >/dev/null || die "plist failed plutil -lint: $STAGED_PLIST"
+        ;;
+    *-linux*)
+        # dormant-tray ships only on Linux
+        stage_binary "dormant-tray"
+        STAGED_TRAY_SERVICE="$WORKDIR/dormant-tray.service"
+        stage_file "dormant-tray" "dormant-tray.service" "$STAGED_TRAY_SERVICE"
+
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze verify "$STAGED_SERVICE" >/dev/null 2>&1 \
+                || die "dormant.service failed systemd-analyze verify"
+            systemd-analyze verify "$STAGED_TRAY_SERVICE" >/dev/null 2>&1 \
+                || die "dormant-tray.service failed systemd-analyze verify"
+        else
+            grep -q 'ExecStart=' "$STAGED_SERVICE" \
+                || die "dormant.service missing ExecStart="
+            grep -q 'ExecStart=' "$STAGED_TRAY_SERVICE" \
+                || die "dormant-tray.service missing ExecStart="
+        fi
         ;;
 esac
 
@@ -243,4 +266,14 @@ assert_version "dormantctl"
     --credentials "$CREDENTIALS_FILE" \
     --validate-only
 
-echo "release-artifact-smoke: dormantd, dormantctl, and $PLIST_NAME ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+case "$TARGET_TRIPLE" in
+    *-apple-darwin)
+        echo "release-artifact-smoke: dormantd, dormantctl, $PLIST_NAME ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+        ;;
+    *-linux*)
+        echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, systemd units ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+        ;;
+    *)
+        echo "release-artifact-smoke: dormantd, dormantctl ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+        ;;
+esac

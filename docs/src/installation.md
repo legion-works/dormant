@@ -67,11 +67,26 @@ sha256sum -c dormantctl-x86_64-unknown-linux-gnu.tar.xz.sha256
 
 ## Systemd user unit
 
-dormant runs as a user service — it does not need root. Install the provided unit:
+dormant runs as a user service — it does not need root. The unit file
+(`dormant.service`) is in the release tarball (under
+`dormantd-<triple>/systemd/dormant.service`) and in the source tree at
+`crates/dormantd/systemd/dormant.service`.
+
+Install it:
 
 ```bash
 mkdir -p ~/.config/systemd/user
+
+# From source:
 cp crates/dormantd/systemd/dormant.service ~/.config/systemd/user/
+
+# From a release tarball:
+tar -xf dormantd-x86_64-unknown-linux-gnu.tar.xz \
+    dormantd-x86_64-unknown-linux-gnu/systemd/dormant.service
+mv dormantd-x86_64-unknown-linux-gnu/systemd/dormant.service \
+    ~/.config/systemd/user/dormant.service
+
+# Then enable and start:
 systemctl --user daemon-reload
 systemctl --user enable --now dormant
 ```
@@ -117,11 +132,24 @@ chmod 600 ~/.config/dormant/credentials.toml
 ## Tray autostart
 
 Run `dormant-tray` on every graphical session with the provided user
-unit — the same mechanism as the daemon:
+unit — the same mechanism as the daemon. The unit file
+(`dormant-tray.service`) ships in the release tarball under
+`dormant-tray-<triple>/systemd/dormant-tray.service` and in the source
+tree at `crates/dormant-tray/systemd/dormant-tray.service`.
 
 ```bash
 mkdir -p ~/.config/systemd/user
+
+# From source:
 cp crates/dormant-tray/systemd/dormant-tray.service ~/.config/systemd/user/
+
+# From a release tarball:
+tar -xf dormant-tray-x86_64-unknown-linux-gnu.tar.xz \
+    dormant-tray-x86_64-unknown-linux-gnu/systemd/dormant-tray.service
+mv dormant-tray-x86_64-unknown-linux-gnu/systemd/dormant-tray.service \
+    ~/.config/systemd/user/dormant-tray.service
+
+# Then enable and start:
 systemctl --user daemon-reload
 systemctl --user enable --now dormant-tray
 ```

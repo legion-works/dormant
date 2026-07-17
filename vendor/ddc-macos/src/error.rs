@@ -1,7 +1,7 @@
 use core_graphics::base::CGError;
 use ddc::ErrorCode;
 use io_kit_sys::ret::kIOReturnSuccess;
-use mach2::kern_return::{kern_return_t, KERN_FAILURE};
+use mach2::kern_return::{KERN_FAILURE, kern_return_t};
 use thiserror::Error;
 
 /// An error that can occur during DDC/CI communication with a monitor
@@ -30,6 +30,14 @@ pub enum Error {
     /// The private `CoreDisplay.framework` could not be opened via `dlopen`.
     #[error("CoreDisplay framework unavailable")]
     CoreDisplayFrameworkUnavailable,
+    /// Native IOKit reported a reply longer than the caller-provided buffer.
+    #[error("I2C reply length {reported} exceeds output buffer capacity {capacity}")]
+    ReplyLengthOutOfBounds {
+        /// Length returned by the native transport.
+        reported: usize,
+        /// Capacity supplied by the caller.
+        capacity: usize,
+    },
 }
 
 pub fn verify_io(result: kern_return_t) -> Result<(), Error> {

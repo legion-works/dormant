@@ -1,8 +1,10 @@
-use crate::error::{verify_io, Error};
-use crate::iokit::{kIODisplayOnlyPreferredName, kIOI2CNoTransactionType, IODisplayCreateInfoDictionary};
+use crate::error::{Error, verify_io};
 use crate::iokit::{
-    kIOI2CDDCciReplyTransactionType, kIOI2CSimpleTransactionType, IOFBCopyI2CInterfaceForBus, IOFBGetI2CInterfaceCount,
-    IOI2CRequest, IoI2CInterfaceConnection,
+    IODisplayCreateInfoDictionary, kIODisplayOnlyPreferredName, kIOI2CNoTransactionType,
+};
+use crate::iokit::{
+    IOFBCopyI2CInterfaceForBus, IOFBGetI2CInterfaceCount, IOI2CRequest, IoI2CInterfaceConnection,
+    kIOI2CDDCciReplyTransactionType, kIOI2CSimpleTransactionType,
 };
 use crate::iokit::{IoIterator, IoObject};
 use core_foundation::base::{CFType, TCFType};
@@ -12,9 +14,9 @@ use core_foundation::string::CFString;
 use core_foundation_sys::base::kCFAllocatorDefault;
 use core_graphics::display::CGDisplay;
 use ddc::SUB_ADDRESS_DDC_CI;
-use io_kit_sys::ret::kIOReturnSuccess;
-use io_kit_sys::types::{io_service_t, IOItemCount};
 use io_kit_sys::IORegistryEntryCreateCFProperties;
+use io_kit_sys::ret::kIOReturnSuccess;
+use io_kit_sys::types::{IOItemCount, io_service_t};
 use mach2::kern_return::KERN_FAILURE;
 use std::time::Duration;
 
@@ -25,41 +27,70 @@ pub(crate) fn execute<'a>(
     out: &'a mut [u8],
     response_delay: Duration,
 ) -> Result<&'a mut [u8], crate::error::Error> {
+    let reply_transaction_type = if out.is_empty() {
+        kIOI2CNoTransactionType
+    } else {
+        unsafe { get_supported_transaction_type().unwrap_or(kIOI2CNoTransactionType) }
+    };
+    execute_with(
+        i2c_address,
+        request_data,
+        out,
+        response_delay,
+        reply_transaction_type,
+        |request| unsafe { send_request(service, request) },
+    )
+}
+
+fn execute_with<'a, F>(
+    i2c_address: u16,
+    request_data: &[u8],
+    out: &'a mut [u8],
+    response_delay: Duration,
+    reply_transaction_type: u32,
+    send: F,
+) -> Result<&'a mut [u8], Error>
+where
+    F: FnOnce(&mut IOI2CRequest) -> Result<(), Error>,
+{
     let mut request: IOI2CRequest = unsafe { std::mem::zeroed() };
 
     request.commFlags = 0;
     request.sendAddress = (i2c_address << 1) as u32;
     request.sendTransactionType = kIOI2CSimpleTransactionType;
-    request.sendBuffer = &request_data as *const _ as usize;
+    request.sendBuffer = request_data.as_ptr() as usize;
     request.sendBytes = request_data.len() as u32;
     request.minReplyDelay = response_delay.as_nanos() as u64;
     request.result = -1;
 
-    request.replyTransactionType = if out.is_empty() {
-        kIOI2CNoTransactionType
-    } else {
-        unsafe { get_supported_transaction_type().unwrap_or(kIOI2CNoTransactionType) }
-    };
+    request.replyTransactionType = reply_transaction_type;
     request.replyAddress = ((i2c_address << 1) | 1) as u32;
     request.replySubAddress = SUB_ADDRESS_DDC_CI;
 
-    request.replyBuffer = &out as *const _ as usize;
+    request.replyBuffer = out.as_mut_ptr() as usize;
     request.replyBytes = out.len() as u32;
 
-    unsafe {
-        send_request(service, &mut request)?;
+    send(&mut request)?;
+    if request.replyTransactionType == kIOI2CNoTransactionType {
+        return Ok(&mut []);
     }
-    if request.replyTransactionType != kIOI2CNoTransactionType {
-        Ok(&mut [0u8; 0])
-    } else {
-        Ok(out)
+    let reply_len = request.replyBytes as usize;
+    if reply_len > out.len() {
+        return Err(Error::ReplyLengthOutOfBounds {
+            reported: reply_len,
+            capacity: out.len(),
+        });
     }
+    Ok(&mut out[..reply_len])
 }
 
 fn display_info_dict(frame_buffer: &IoObject) -> Option<CFDictionary<CFString, CFType>> {
     unsafe {
-        let info = IODisplayCreateInfoDictionary(frame_buffer.into(), kIODisplayOnlyPreferredName).as_ref()?;
-        Some(CFDictionary::<CFString, CFType>::wrap_under_create_rule(info))
+        let info = IODisplayCreateInfoDictionary(frame_buffer.into(), kIODisplayOnlyPreferredName)
+            .as_ref()?;
+        Some(CFDictionary::<CFString, CFType>::wrap_under_create_rule(
+            info,
+        ))
     }
 }
 
@@ -77,8 +108,12 @@ unsafe fn get_supported_transaction_type() -> Option<u32> {
             0,
         ) == kIOReturnSuccess
         {
-            let info = CFDictionary::<CFString, CFType>::wrap_under_create_rule(service_properties as _);
-            let transaction_types = info.find(&transaction_types_key)?.downcast::<CFNumber>()?.to_i64()?;
+            let info =
+                CFDictionary::<CFString, CFType>::wrap_under_create_rule(service_properties as _);
+            let transaction_types = info
+                .find(&transaction_types_key)?
+                .downcast::<CFNumber>()?
+                .to_i64()?;
             if ((1 << kIOI2CDDCciReplyTransactionType) & transaction_types) != 0 {
                 return Some(kIOI2CDDCciReplyTransactionType);
             } else if ((1 << kIOI2CSimpleTransactionType) & transaction_types) != 0 {
@@ -105,8 +140,14 @@ fn framebuffer_port_matches_display(port: &IoObject, display: CGDisplay) -> Opti
     let display_product_key = CFString::from_static_string("DisplayProductID");
     let display_serial_key = CFString::from_static_string("DisplaySerialNumber");
 
-    let display_vendor = info.find(&display_vendor_key)?.downcast::<CFNumber>()?.to_i64()? as u32;
-    let display_product = info.find(&display_product_key)?.downcast::<CFNumber>()?.to_i64()? as u32;
+    let display_vendor = info
+        .find(&display_vendor_key)?
+        .downcast::<CFNumber>()?
+        .to_i64()? as u32;
+    let display_product = info
+        .find(&display_product_key)?
+        .downcast::<CFNumber>()?
+        .to_i64()? as u32;
     // Display serial number is not always present. If it's not there, default to zero
     // (to match what CGDisplay.serial_number() returns
     let display_serial = info
@@ -156,4 +197,77 @@ unsafe fn send_request(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_transaction_uses_packet_and_writable_output_buffers() {
+        let packet = [0x6e, 0x82, 0x01, 0x10, 0x00];
+        let mut out = [0_u8; 4];
+        let packet_ptr = packet.as_ptr() as usize;
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        let reply = execute_with(
+            0x37,
+            &packet,
+            &mut out,
+            Duration::ZERO,
+            kIOI2CDDCciReplyTransactionType,
+            |request| {
+                assert_eq!(request.sendBuffer, packet_ptr);
+                assert_eq!(request.replyBuffer, out_ptr);
+                unsafe { std::slice::from_raw_parts_mut(request.replyBuffer as *mut u8, 2) }
+                    .copy_from_slice(&[0x51, 0x82]);
+                request.replyBytes = 2;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reply, &[0x51, 0x82]);
+    }
+
+    #[test]
+    fn no_reply_transaction_returns_an_empty_slice() {
+        let mut out = [];
+        let reply = execute_with(
+            0x37,
+            &[0x6e],
+            &mut out,
+            Duration::ZERO,
+            kIOI2CNoTransactionType,
+            |_request| Ok(()),
+        )
+        .unwrap();
+
+        assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn reply_length_larger_than_buffer_is_rejected() {
+        let mut out = [0_u8; 2];
+        let error = execute_with(
+            0x37,
+            &[0x6e],
+            &mut out,
+            Duration::ZERO,
+            kIOI2CDDCciReplyTransactionType,
+            |request| {
+                request.replyBytes = 3;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ReplyLengthOutOfBounds {
+                reported: 3,
+                capacity: 2
+            }
+        ));
+    }
 }

@@ -3,12 +3,14 @@
 //! Wires configuration → sensors → zones → rules → displays, with post-probe
 //! display validation, hot config reload, and a user-activity inhibitor.
 //!
-//! Boot sequence (spec §5.1): `peek_boot_options` (cheap, pre-runtime) →
-//! `boot_guard::prepare` (records this start, decides the crash-loop
-//! verdict, chooses which config to attempt) → peek the CHOSEN path's log
-//! level → `logging::init` → emit `prepare`'s deferred log events →
+//! Boot sequence (spec §5.1): stale-gamma restore → `peek_boot_options`
+//! (cheap, pre-runtime) → `boot_guard::prepare` (records this start, decides
+//! the crash-loop verdict, chooses which config to attempt) → peek the CHOSEN
+//! path's log level → `logging::init` → emit `prepare`'s deferred log events →
 //! `runtime.block_on(boot::boot(plan, inputs))`, which owns the actual
 //! build/lock/start/rollback machinery (`dormantd::boot`).
+
+mod main_sequence;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,6 +25,7 @@ use dormantd::boot_guard::{self, BootInputs, BootPlan, DeferredEvent};
 use dormantd::gamma_recovery;
 use dormantd::logging;
 use dormantd::sd_notify::SdNotify;
+use main_sequence::{StartupInputs, run_boot_with_shutdown_restore, run_startup_sequence};
 
 /// dormant daemon — proximity-driven display blanking.
 #[derive(Parser, Debug)]
@@ -100,84 +103,78 @@ fn main() -> ExitCode {
         return ExitCode::from(u8::try_from(report.exit_code()).unwrap_or(1));
     }
 
-    // Task 8 (gamma continuity): resolve `state_dir` and check for a stale
-    // `gamma-blank.json` breadcrumb from an unclean prior exit BEFORE any
-    // config load, `boot_guard::prepare`, `App::build`, or assembly — this
-    // call takes no config dependency at all (see
-    // `gamma_recovery::restore_stale_breadcrumb`'s signature and module
-    // docs), so an invalid/unloadable config can never suppress it.
-    // Restoration failure is logged, never fatal — it must never convert
-    // this self-restoring crash-recovery path into a startup abort.
     let state_dir = paths::state_dir();
-    gamma_recovery::restore_stale_breadcrumb(
-        &state_dir,
-        &gamma_recovery::RealGammaSystemRestore,
-        "startup",
-    );
-
-    // Cheap pre-`prepare` peek (spec §5.1, confirm-round row): the
-    // crash-loop rollback gate must be known BEFORE `prepare` runs, but
-    // logging doesn't exist yet either. Defaults the gate true if the
-    // config cannot load at all — an unloadable config is exactly the case
-    // this machinery must still work for.
-    let boot_options = peek_boot_options(&config_path, strictness);
-
     let lock_path = paths::default_lock_path();
 
-    let plan = boot_guard::prepare(
-        &config_path,
-        &creds_path,
-        &state_dir,
-        strictness,
-        boot_options.lkg_rollback_enabled,
-    );
+    run_startup_sequence(
+        StartupInputs {
+            config_path,
+            creds_path,
+            state_dir,
+            strictness,
+        },
+        |state_dir| {
+            gamma_recovery::restore_stale_breadcrumb(
+                state_dir,
+                &gamma_recovery::RealGammaSystemRestore,
+                "startup",
+            );
+        },
+        peek_boot_options,
+        |inputs, boot_options| {
+            boot_guard::prepare(
+                &inputs.config_path,
+                &inputs.creds_path,
+                &inputs.state_dir,
+                inputs.strictness,
+                boot_options.lkg_rollback_enabled,
+            )
+        },
+        |inputs, boot_options, plan| {
+            // The common and immediate-rollback paths already peeked the chosen
+            // config. Only a prepare-time rollback changes the chosen path.
+            let level = if plan.chosen_config == inputs.config_path {
+                boot_options.log_level
+            } else {
+                peek_log_level(&plan.chosen_config, inputs.strictness)
+            };
+            if let Err(e) = logging::init(&level, cli.log_json) {
+                eprintln!("failed to initialise logging: {e}");
+                return ExitCode::FAILURE;
+            }
 
-    // Peek the log level of the CHOSEN path (spec §5.1: "against the CHOSEN
-    // path"). When `prepare` chose the original config (the common case,
-    // and also the immediate-rollback case — that failure is only
-    // discovered later, inside `boot()`, so the chosen path IS still the
-    // original config here), `boot_options.log_level` already IS that
-    // peek — reuse it rather than reading the file twice. Only a
-    // `RollBack`/`ContinueRollback` verdict (chosen = the LKG file) needs a
-    // fresh peek against a DIFFERENT path.
-    let level = if plan.chosen_config == config_path {
-        boot_options.log_level.clone()
-    } else {
-        peek_log_level(&plan.chosen_config, strictness)
-    };
-    if let Err(e) = logging::init(&level, cli.log_json) {
-        eprintln!("failed to initialise logging: {e}");
-        return ExitCode::FAILURE;
-    }
+            emit_deferred_events(&plan.deferred_events);
 
-    emit_deferred_events(&plan.deferred_events);
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(WORKER_THREADS)
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(event = "runtime_init_failed", error = %e);
+                    return ExitCode::FAILURE;
+                }
+            };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(WORKER_THREADS)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(event = "runtime_init_failed", error = %e);
-            return ExitCode::FAILURE;
-        }
-    };
+            let boot_inputs = BootInputs {
+                creds_path: inputs.creds_path,
+                strictness: inputs.strictness,
+                state_dir: inputs.state_dir,
+                lock_path,
+                sd_notify: SdNotify::from_env(),
+            };
 
-    let inputs = BootInputs {
-        creds_path,
-        strictness,
-        state_dir,
-        lock_path,
-        sd_notify: SdNotify::from_env(),
-    };
-
-    runtime.block_on(run_to_completion(plan, inputs))
+            runtime.block_on(run_to_completion(plan, boot_inputs))
+        },
+    )
 }
 
-/// `block_on(boot(plan, inputs))` plus the outcome dispatch (spec §5.1) —
-/// split out of `main` purely to keep `main` under the line-count gate; no
-/// behavioral seam.
+/// `block_on(boot(plan, inputs))` plus the outcome dispatch (spec §5.1).
+///
+/// The ordering seam wraps the whole verdict dispatch so lock/build failures,
+/// boot errors, clean shutdown, and a failed run-loop join all converge on the
+/// same shutdown restore.
 async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
     // Captured before `plan`/`inputs` move into `boot::boot` below
     // (rollback-recovery plan, Task 1 §6 for `operator_config`; Task 8 for
@@ -187,57 +184,54 @@ async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
     // meaning). `state_dir` is needed again below, after `inputs` is gone.
     let operator_config = plan.operator_config.clone();
     let state_dir = inputs.state_dir.clone();
-    let exit_code = match boot::boot(plan, inputs).await {
-        Ok(BootOutcome::LockFailed) => ExitCode::from(1),
-        Ok(BootOutcome::BuildFailed(msg)) => {
-            tracing::error!(event = "startup_failed", error = %msg);
-            eprintln!("{msg}");
-            ExitCode::FAILURE
-        }
-        Ok(BootOutcome::Started {
-            handle,
-            join,
-            used_config,
-            rolled_back,
-        }) => {
-            tracing::info!(
-                event = "daemon_starting",
-                config = %used_config.display(),
-                reload_config = %operator_config.display(),
-                rolled_back,
-            );
-            let result = join.await.context("run loop panicked");
-            drop(handle);
-            match result {
-                Ok(()) => ExitCode::SUCCESS,
+    run_boot_with_shutdown_restore(
+        // `boot()` owns the full assembly state across awaits; boxing keeps the
+        // top-level shutdown wrapper future small without changing ownership.
+        Box::pin(async move {
+            match boot::boot(plan, inputs).await {
+                Ok(BootOutcome::LockFailed) => ExitCode::from(1),
+                Ok(BootOutcome::BuildFailed(msg)) => {
+                    tracing::error!(event = "startup_failed", error = %msg);
+                    eprintln!("{msg}");
+                    ExitCode::FAILURE
+                }
+                Ok(BootOutcome::Started {
+                    handle,
+                    join,
+                    used_config,
+                    rolled_back,
+                }) => {
+                    tracing::info!(
+                        event = "daemon_starting",
+                        config = %used_config.display(),
+                        reload_config = %operator_config.display(),
+                        rolled_back,
+                    );
+                    let result = join.await.context("run loop panicked");
+                    drop(handle);
+                    match result {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            tracing::error!(event = "daemon_failed", error = %e);
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::error!(event = "daemon_failed", error = %e);
                     ExitCode::FAILURE
                 }
             }
-        }
-        Err(e) => {
-            tracing::error!(event = "daemon_failed", error = %e);
-            ExitCode::FAILURE
-        }
-    };
-
-    // Task 8 (gamma continuity): best-effort restore around
-    // `run_to_completion`'s return — a genuine process exit (normal
-    // shutdown, SIGTERM, SIGINT, or any of the early-return failure arms
-    // above, all of which end the process) with a still-present breadcrumb
-    // means at least one gamma selector's hold was never cleared by a
-    // confirmed wake. SIGHUP (reload) never reaches this function at all —
-    // it is handled entirely inside `run_loop`/`Runner::reload`, which
-    // returns control to `join.await` above only on an actual shutdown
-    // signal (see `gamma_recovery`'s module docs).
-    gamma_recovery::restore_stale_breadcrumb(
-        &state_dir,
-        &gamma_recovery::RealGammaSystemRestore,
-        "shutdown",
-    );
-
-    exit_code
+        }),
+        || {
+            gamma_recovery::restore_stale_breadcrumb(
+                &state_dir,
+                &gamma_recovery::RealGammaSystemRestore,
+                "shutdown",
+            );
+        },
+    )
+    .await
 }
 
 /// Emit `prepare`'s deferred log events (spec §5.1: recorded/decided before

@@ -5088,6 +5088,64 @@ async fn rollback_double_spawn_failure_cancels_root() {
         .expect("run loop must not panic");
 }
 
+/// Pausing the front-door routers must not close the old engine before its
+/// drain barrier arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_barrier_survives_router_pause() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let gate = GenerationBarrierGate::new();
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_generation_barrier_gate(gate.clone())
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    let (snapshot_tx, snapshot_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Snapshot(snapshot_tx))
+        .await
+        .expect("old generation control route stays open");
+    tokio::time::timeout(Duration::from_secs(1), snapshot_rx)
+        .await
+        .expect("old generation responds before the forced barrier timeout")
+        .expect("old generation snapshot reply");
+
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before reaching the old-generation barrier"),
+            result = tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered()) => {
+                assert!(result.is_ok(), "reload did not reach the old-generation barrier");
+            }
+        }
+        gate.release();
+        let (request_id, receipt) = tokio::time::timeout(Duration::from_secs(3), reload)
+            .await
+            .expect("reload completes after the barrier")
+            .expect("reload requester remains available");
+        assert!(receipt.request_ids.contains(&request_id));
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+        assert!(!handle.root_is_cancelled_for_test());
+    }
+    shutdown(handle, join).await;
+}
+
 /// Rollback-recovery plan Task 1 §8: `rebuild_old` must carry
 /// Runner-OWNED rollback status (`self.rollback_status.clone()`) even when
 /// the preliminary snapshot request timed out — `rebuild_old` never derives

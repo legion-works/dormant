@@ -2754,6 +2754,11 @@ impl<T: Send + 'static> GenerationRouter<T> {
 struct Generation {
     engine_token: CancellationToken,
     engine_handle: Option<JoinHandle<()>>,
+    // Engine shutdown is token-driven; retained senders keep channel closure
+    // from racing the generation barrier while front-door routers are paused.
+    // Teardown drops them only after cancelling and joining the engine.
+    engine_ctl_tx: Option<mpsc::Sender<ControlMsg>>,
+    engine_events_tx: Option<mpsc::Sender<PresenceEvent>>,
     producer_token: CancellationToken,
     producer_handles: Vec<JoinHandle<()>>,
     cfg: Config,
@@ -2792,6 +2797,8 @@ async fn teardown(generation: &mut Generation) {
             tracing::warn!(event = "engine_abort_forced");
         }
     }
+    generation.engine_ctl_tx.take();
+    generation.engine_events_tx.take();
 }
 
 /// Stop generation-local producers while leaving the engine available to drain.
@@ -3523,6 +3530,8 @@ fn spawn_generation(
     let generation = Generation {
         engine_token,
         engine_handle: Some(engine_handle),
+        engine_ctl_tx: Some(ctl_tx.clone()),
+        engine_events_tx: Some(events_tx.clone()),
         producer_token,
         producer_handles,
         cfg: assembly.cfg,

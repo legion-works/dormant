@@ -136,4 +136,13 @@ override prevents profile retries from multiplying the count.
 
 ## macos-14 availability
 
-PENDING — remote probe (T2 operator leg)
+Probed 2026-07-18 via disposable draft PR #103 (workflow `macos-14-probe.yml`,
+closed unmerged): `runs-on: macos-14` resolved and ran green.
+
+- macos-14 availability: CONFIRMED — job completed successfully
+- `sw_vers` ProductVersion: 14.8.7 (arm64)
+- Runner image: `macos-14-arm64/20260629.0180`
+- Image readme: https://github.com/actions/runner-images/blob/macos-14-arm64/20260629.0180/images/macos/macos-14-arm64-Readme.md
+
+T8/T18 may pin `macos-14`. Caveat recorded: macos-14 runners are Apple Silicon
+(arm64) — same as the current `macos-latest` lanes, so no target-triple change.

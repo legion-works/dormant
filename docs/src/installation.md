@@ -22,6 +22,26 @@ is off by default. The full build below enables it. For a smaller build, omit
   `E_RENDER_UNAVAILABLE`; the daemon, CLI, and non-render sensors/displays still
   build and run normally.
 
+## Homebrew
+
+The Legion Works tap publishes one formula per binary for macOS and Linuxbrew.
+Formulas are versioned with each release.
+
+```bash
+brew install legion-works/tap/dormantd
+brew install legion-works/tap/dormantctl
+brew install legion-works/tap/dormant-tray
+```
+
+## Arch Linux (AUR)
+
+`dormant-bin` installs pre-built x86_64 release binaries and the systemd user
+units under `/usr/lib/systemd/user/`.
+
+```bash
+yay -S dormant-bin
+```
+
 ## From source
 
 ```bash
@@ -51,11 +71,11 @@ See [Tray autostart](#tray-autostart) below to run it on every login.
 
 ## From release
 
-The cargo-dist pipeline publishes shell installers and tarballs for each binary on every release. Install the latest release (Linux x86_64 / aarch64):
+The cargo-dist pipeline publishes shell installers and tarballs for each binary on every release. Install v0.4.0 (Linux x86_64 / aarch64):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantctl-installer.sh | sh
 ```
 
 `dormant-tray-installer.sh` is also available in the same directory. Checksums are published alongside every artifact; verify with:
@@ -71,6 +91,9 @@ dormant runs as a user service — it does not need root. The unit file
 (`dormant.service`) is in the release tarball (under
 `dormantd-<triple>/systemd/dormant.service`) and in the source tree at
 `crates/dormantd/systemd/dormant.service`.
+
+The AUR package installs the unit under `/usr/lib/systemd/user/` already. Use
+the manual paths below for source builds and release tarballs.
 
 Install it:
 
@@ -161,16 +184,6 @@ starts after `dormant.service` and restarts on failure. A plain XDG
 resolves a relative `Exec=` against a minimal boot `PATH` that excludes
 `~/.local/bin`, so no unit gets generated.
 
-## Homebrew (macOS)
-
-Formulae publish per-app to the [legion-works/homebrew-tap](https://github.com/legion-works/homebrew-tap) tap. Install with:
-
-```bash
-brew install legion-works/tap/dormantd legion-works/tap/dormantctl
-```
-
-Formulae land with the next release (not v0.3.1). Each binary gets its own formula — `dormantd`, `dormantctl`, and `dormant-tray` are published independently.
-
 ## macOS (M1)
 
 dormant runs natively on macOS (arm64 and x86_64), no root required. This
@@ -190,8 +203,8 @@ from a menu) until M2; install and run `dormantd`/`dormantctl` only.
 ### From release (macOS)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantctl-installer.sh | sh
 ```
 
 Binaries land in `~/.local/bin/`, same as Linux. The installer also prints

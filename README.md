@@ -60,6 +60,10 @@ Three binaries: **`dormantd`** (the daemon), **`dormantctl`** (the CLI), and **`
 
 Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A sensor that goes quiet — broker down, USB unplugged, a stale reading — resolves as *present*, never absent. dormant will not blank a room it can't see.
 
+`dormantctl doctor` checks the configured sensors and displays. `--report-issue`
+and `--draft-feature` turn the full offline probe run into a ready-to-file
+GitHub issue draft, with known config and credential values redacted.
+
 ### Display controllers
 
 | Controller | |
@@ -90,18 +94,37 @@ The `dormant-tray` applet puts per-display status and blank/wake/pause controls 
 
 ## Quickstart
 
-### Install from release (Linux x86_64 / aarch64, macOS arm64 / x86_64)
+Install through the channel that matches your platform:
+
+**Homebrew** (macOS or Linuxbrew):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.1.0/dormantctl-installer.sh | sh
+brew install legion-works/tap/dormantd
+brew install legion-works/tap/dormantctl
+brew install legion-works/tap/dormant-tray
 ```
 
-`dormant-tray-installer.sh` is also available in the same directory — on
-macOS it installs but is **not yet functional** (a KDE `StatusNotifierItem`
-applet has no macOS equivalent until M2; see [Installation: macOS
-(M1)](./docs/src/installation.md#macos-m1)). Checksums are published
-alongside every artifact; verify with `sha256sum -c <artifact>.sha256`.
+**Arch Linux (AUR):**
+
+```bash
+yay -S dormant-bin
+```
+
+The AUR package includes the pre-built binaries and systemd user units.
+
+**Installer scripts** (Linux x86_64 / aarch64, macOS arm64 / x86_64):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantctl-installer.sh | sh
+```
+
+The `dormant-tray-installer.sh` script is in the same release directory.
+Checksums are published alongside every artifact; verify with
+`sha256sum -c <artifact>.sha256`.
+
+Release tarballs include the matching systemd user units on Linux. Manual
+installation and source builds are covered in the [installation guide](./docs/src/installation.md).
 
 On macOS, install the per-user `LaunchAgent` and start it — see
 [Installation: LaunchAgent

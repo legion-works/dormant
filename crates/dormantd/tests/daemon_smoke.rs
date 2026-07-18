@@ -1149,20 +1149,19 @@ async fn config_watch_updates_on_successful_reload_only() {
 
     // Now trigger a rejected reload — the watch must NOT change.
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
-    let rejected = handle
-        .request_reload(ReloadSource::Control)
+    let (rejected_request_id, rejected) = handle
+        .request_reload_with_id(ReloadSource::Control)
         .await
         .expect("rejected control reload receipt");
+    assert!(rejected.request_ids.contains(&rejected_request_id));
     assert!(matches!(rejected.outcome, ReloadOutcome::Rejected(_)));
 
-    // The watch should NOT have changed after a rejected reload. The prior
-    // `borrow_and_update()` poll above already marked the successful-reload
-    // value seen, so `changed()` here can only resolve on a NEW send — a
-    // short timeout confirming none arrives is the correct (not stale-prone)
-    // check for this negative assertion.
-    let no_change = tokio::time::timeout(Duration::from_millis(300), config_watch.changed()).await;
+    // The receipt resolves only after this request has completed, so the
+    // watch's change bit is a deterministic post-reload assertion.
     assert!(
-        no_change.is_err(),
+        !config_watch
+            .has_changed()
+            .expect("config watch sender stays open"),
         "config watch must NOT update after a rejected reload"
     );
 
@@ -1256,17 +1255,19 @@ async fn creds_watch_updates_on_successful_reload_only() {
 
     // Trigger a rejected reload — creds watch must NOT change.
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
-    assert!(handle.trigger_reload().await);
+    let (rejected_request_id, rejected) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("rejected control reload receipt");
+    assert!(rejected.request_ids.contains(&rejected_request_id));
+    assert!(matches!(rejected.outcome, ReloadOutcome::Rejected(_)));
 
-    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(3)).await;
-    match outcome {
-        ReloadOutcome::Rejected(_) => {}
-        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
-    }
-
-    let no_change = tokio::time::timeout(Duration::from_millis(300), creds_watch.changed()).await;
+    // The receipt resolves only after this request has completed, so the
+    // watch's change bit is a deterministic post-reload assertion.
     assert!(
-        no_change.is_err(),
+        !creds_watch
+            .has_changed()
+            .expect("credentials watch sender stays open"),
         "creds watch must NOT update after a rejected reload"
     );
 

@@ -145,6 +145,12 @@ async fn run(mut deps: WearTrackerDeps) {
     // synchronously by the caller before this task was ever spawned.
     let dir = deps.dir.clone();
 
+    // Issue #94 follow-up: sweep orphaned persist tmp files once at startup,
+    // before any ledger in this run is ever loaded/persisted — see
+    // `prune_stale_wear_temps`'s doc comment for why this is needed now that
+    // `persist_ledger` writes a unique tmp name per call.
+    prune_stale_wear_temps(&dir);
+
     let mut interval = new_interval(deps.config_rx.borrow().wear.sample_interval);
 
     loop {
@@ -867,6 +873,54 @@ fn persist_ledger(dir: &Path, key: &str, ledger: &WearLedger) -> std::io::Result
     }
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(())
+}
+
+/// `true` for a filename produced by [`tmp_filename`] — `wear-<key>.json.tmp.<pid>.<seq>`
+/// — and `false` for a final ledger (`wear-<key>.json`) or any unrelated file.
+/// Pure — the sweep's matching logic, unit-testable without touching a
+/// filesystem or racing threads.
+fn is_wear_persist_tmp(name: &str) -> bool {
+    name.starts_with("wear-") && name.contains(".json.tmp.")
+}
+
+/// Remove orphaned `wear-*.json.tmp.*` files (issue #94 follow-up — the
+/// per-call unique tmp name in [`tmp_filename`] means a persist that crashed
+/// between `write` and `rename` leaves a tmp file with no `rename` ever
+/// coming to claim it; the OLD fixed-name scheme self-cleaned by
+/// overwriting on the next persist, so this sweep replaces that accidental
+/// property). Only removes files older than 1 hour — the age guard means a
+/// concurrently-running second daemon process's in-flight tmp write (which
+/// this process cannot distinguish from a truly orphaned one by name alone)
+/// is never deleted out from under it. Mirrors the identical precedent at
+/// `dormant-web::prune_stale_temps`.
+fn prune_stale_wear_temps(dir: &Path) {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(Duration::from_secs(3600)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut pruned: u64 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !is_wear_persist_tmp(&name_str) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_file(entry.path()).is_ok() {
+            pruned += 1;
+        }
+    }
+    if pruned > 0 {
+        tracing::debug!(event = "wear_tmp_pruned", count = pruned);
+    }
 }
 
 #[cfg(test)]
@@ -1735,6 +1789,19 @@ mod tests {
             a, b,
             "two persists for the same key must use distinct tmp paths"
         );
+    }
+
+    /// Issue #94 follow-up: `is_wear_persist_tmp` must recognize a real
+    /// `tmp_filename` output, and must NOT match a final ledger or any
+    /// unrelated file — a false positive here would delete a live ledger.
+    #[test]
+    fn is_wear_persist_tmp_matches_only_persist_tmp_files() {
+        assert!(is_wear_persist_tmp("wear-x.json.tmp.123.0"));
+        assert!(is_wear_persist_tmp(&tmp_filename("mon")));
+        assert!(!is_wear_persist_tmp("wear-x.json"));
+        assert!(!is_wear_persist_tmp("wear-x.json.corrupt.100"));
+        assert!(!is_wear_persist_tmp("config.toml.tmp.fresh"));
+        assert!(!is_wear_persist_tmp("unrelated.txt"));
     }
 
     #[test]

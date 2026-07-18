@@ -851,6 +851,18 @@ async fn ruleless_display_preserves_phase_on_reload() {
         .await,
         "both displays should blank before reload"
     );
+    // Ensure mon2's phase has actually landed at "blanked" before the
+    // reload below — the B-marker byte (waited for above) is written by the
+    // command executor before the engine finishes processing the blank
+    // RESULT (same hazard as the manual-only-display tests, issue #94
+    // sweep). Without this, the reload could race a still-"blanking" mon2
+    // and the post-reload "preserved" assertion below would only be
+    // preserving the wrong phase.
+    let ctl = handle.control_sender();
+    assert!(
+        wait_for_phase(&ctl, "mon2", "blanked", Duration::from_secs(3)).await,
+        "mon2's phase must settle to blanked before reload"
+    );
     let m2_wake_before = count(&m2, 'W');
     let m2_blank_before = count(&m2, 'B');
 

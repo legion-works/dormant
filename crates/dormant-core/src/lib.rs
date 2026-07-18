@@ -5,6 +5,7 @@ pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod ipc_proto;
+pub mod observation;
 pub mod ownership;
 pub mod paths;
 pub mod reload;

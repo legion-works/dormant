@@ -309,6 +309,8 @@ pub struct App {
     force_reload_snapshot_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
+    #[cfg(any(test, feature = "test-util"))]
+    reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
 /// Test-only rendezvous immediately before the old engine drain barrier.
@@ -318,6 +320,36 @@ pub struct GenerationBarrierGate {
     entered_tx: watch::Sender<bool>,
     entered_rx: watch::Receiver<bool>,
     release: Arc<tokio::sync::Notify>,
+}
+
+/// Test-only record of the forced snapshot-timeout reload's lifecycle stages.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone, Default)]
+pub struct ReloadLifecycleCapture(Arc<Mutex<Vec<&'static str>>>);
+
+#[cfg(any(test, feature = "test-util"))]
+impl ReloadLifecycleCapture {
+    /// Create an empty lifecycle capture.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the stages reached by the forced reload so far.
+    #[must_use]
+    pub fn stages(&self) -> Vec<&'static str> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record(&self, stage: &'static str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(stage);
+    }
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -409,6 +441,8 @@ impl App {
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
+            #[cfg(any(test, feature = "test-util"))]
+            reload_lifecycle_capture: None,
         })
     }
 
@@ -452,6 +486,8 @@ impl App {
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
+            #[cfg(any(test, feature = "test-util"))]
+            reload_lifecycle_capture: None,
         })
     }
 
@@ -581,6 +617,14 @@ impl App {
     #[must_use]
     pub fn with_test_generation_barrier_gate(mut self, gate: GenerationBarrierGate) -> Self {
         self.generation_barrier_gate = Some(gate);
+        self
+    }
+
+    /// Record stages reached by a forced snapshot-timeout reload.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_reload_lifecycle_capture(mut self, capture: ReloadLifecycleCapture) -> Self {
+        self.reload_lifecycle_capture = Some(capture);
         self
     }
 
@@ -981,6 +1025,8 @@ impl App {
             force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: self.generation_barrier_gate,
+            #[cfg(any(test, feature = "test-util"))]
+            reload_lifecycle_capture: self.reload_lifecycle_capture,
         };
 
         let join = tokio::spawn(run_loop(
@@ -1316,6 +1362,8 @@ struct Runner {
     force_reload_snapshot_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
+    #[cfg(any(test, feature = "test-util"))]
+    reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
@@ -1444,6 +1492,7 @@ impl Runner {
             .expect("current engine control route exists before reload");
         #[cfg(any(test, feature = "test-util"))]
         let preliminary = if self.force_reload_snapshot_timeout {
+            self.record_reload_lifecycle_stage("snapshot_bypassed");
             None
         } else {
             request_snapshot(&old_ctl).await
@@ -1616,17 +1665,21 @@ impl Runner {
 
         self.ctl_router.pause().await;
         self.events_router.pause().await;
+        self.record_reload_lifecycle_stage("routers_paused");
         quiesce_inputs(&mut self.generation).await;
+        self.record_reload_lifecycle_stage("inputs_quiesced");
         #[cfg(any(test, feature = "test-util"))]
         if let Some(gate) = &self.generation_barrier_gate {
             gate.reach().await;
         }
         await_generation_barrier(&old_ctl).await;
+        self.record_reload_lifecycle_stage("barrier_acknowledged");
         self.observations
             .emit(DaemonObservation::GenerationDrained {
                 generation: self.generation_id,
             });
         teardown(&mut self.generation).await;
+        self.record_reload_lifecycle_stage("engine_torn_down");
 
         // Verified physical wake of REMOVED displays (no executor in the new
         // generation) that were dark — via their OLD executor, after teardown
@@ -1858,10 +1911,13 @@ impl Runner {
                 // `rebuild_old` call site (the accepted-config
                 // `spawn_generation` failure path).
                 self.ping("before_rebuild_old_spawn_failure");
+                self.record_reload_lifecycle_stage("rebuild_old_started");
                 self.rebuild_old(Some(detail.clone()), snapshot.as_ref())
                     .await;
+                self.record_reload_lifecycle_stage("rebuild_old_finished");
                 let outcome = ReloadOutcome::Rejected(detail);
                 let _ = self.reload_tx.send(outcome.clone());
+                self.record_reload_lifecycle_stage("outcome_broadcast");
                 self.reload_receipt(request_ids, sources, requested_revision, outcome, false)
             }
         }
@@ -1885,6 +1941,18 @@ impl Runner {
             coalesced,
         }
     }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn record_reload_lifecycle_stage(&self, stage: &'static str) {
+        if self.force_reload_snapshot_timeout
+            && let Some(capture) = &self.reload_lifecycle_capture
+        {
+            capture.record(stage);
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-util")))]
+    fn record_reload_lifecycle_stage(&self, _stage: &'static str) {}
 
     /// Issue a defensive physical wake to RETAINED displays that were dark
     /// before the reload. The rebuilt state machines start `Active`, so a

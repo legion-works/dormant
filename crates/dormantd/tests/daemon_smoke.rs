@@ -19,7 +19,9 @@ use dormant_core::observation::{DaemonObservation, GenerationId, ObservationHub,
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
-use dormantd::app::{App, GenerationBarrierGate, ReloadOutcome, validate_only};
+use dormantd::app::{
+    App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
+};
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
@@ -5109,6 +5111,7 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
         lkg_fp: "11:cafebabe".to_string(),
         detail: "running last-known-good".to_string(),
     };
+    let lifecycle = ReloadLifecycleCapture::new();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -5120,6 +5123,7 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
     .with_test_rollback_status(status.clone(), dir.path().to_path_buf())
     .with_test_force_reload_snapshot_timeout()
     .with_test_force_reload_spawn_failure()
+    .with_test_reload_lifecycle_capture(lifecycle.clone())
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     handle
@@ -5131,16 +5135,67 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
 
     std::fs::write(&cfg_path, one_display_config(&marker, "100ms")).unwrap();
     assert!(handle.trigger_reload().await);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(3), reloads.recv())
-            .await
-            .expect("reload outcome")
-            .expect("reload bus"),
-        ReloadOutcome::Rejected(_)
-    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .unwrap_or_else(|elapsed| {
+            panic!(
+                "reload outcome: {elapsed:?}; lifecycle stages: {:?}",
+                lifecycle.stages()
+            )
+        })
+        .expect("reload bus");
+    assert!(matches!(outcome, ReloadOutcome::Rejected(_)));
 
     let snapshot = snapshot_with_retry(&handle.control_sender()).await;
     assert_eq!(snapshot.rollback, Some(status));
+    shutdown(handle, join).await;
+}
+
+/// A watcher request can arrive after a rejected reload has restored the old
+/// generation but before the operator changes the still-rejected revision.
+/// Each execution must drain and rebuild independently rather than leaving
+/// the routers paused behind the first rollback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_reload_can_repeat_after_rollback_restore() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_force_reload_snapshot_timeout()
+    .with_test_force_reload_spawn_failure()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    fs::write(&cfg_path, one_display_config(&marker, "100ms")).unwrap();
+
+    for source in [ReloadSource::Watcher, ReloadSource::Control] {
+        let (request_id, receipt) = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.request_reload_with_id(source),
+        )
+        .await
+        .expect("rejected reload receipt in time")
+        .expect("reload requester remains available");
+        assert!(receipt.request_ids.contains(&request_id));
+        assert!(matches!(receipt.outcome, ReloadOutcome::Rejected(_)));
+    }
+
+    assert!(
+        !handle.root_is_cancelled_for_test(),
+        "a successful rollback keeps the daemon serving a later rejected revision"
+    );
     shutdown(handle, join).await;
 }
 

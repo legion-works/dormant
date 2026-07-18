@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-18
+
+### Added
+
+- `dormantctl doctor --report-issue [PATH]` and `--draft-feature [PATH]` now generate prefilled GitHub issue drafts from doctor probe results, with value-based redaction of config and credential secrets and IPv4 scrubbing in the draft text (#93).
+- The release pipeline now publishes Homebrew formulas to `legion-works/homebrew-tap`; install binaries with `brew install legion-works/tap/<binary>` (#91).
+- The `dormant-bin` AUR package is now published automatically after each release announcement (#90, #97).
+- Linux release tarballs now include the systemd user units (#90).
+
+### Fixed
+
+- Wear-ledger persistence no longer collides between processes: temporary files use unique PID-and-sequence names, and stale temporary files are pruned at startup (#95).
+- Retired three macOS timing races in the daemon smoke tests (#95).
+
 ## [0.3.1] - 2026-07-17
 
 ### Fixed
@@ -96,6 +110,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/legion-works/dormant/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/legion-works/dormant/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/legion-works/dormant/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/legion-works/dormant/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/legion-works/dormant/releases/tag/v0.1.0

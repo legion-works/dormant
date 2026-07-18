@@ -310,6 +310,8 @@ pub struct App {
     #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
     #[cfg(any(test, feature = "test-util"))]
+    force_generation_barrier_timeout: bool,
+    #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
@@ -442,6 +444,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
+            force_generation_barrier_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
         })
     }
@@ -486,6 +490,8 @@ impl App {
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
+            #[cfg(any(test, feature = "test-util"))]
+            force_generation_barrier_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
         })
@@ -617,6 +623,14 @@ impl App {
     #[must_use]
     pub fn with_test_generation_barrier_gate(mut self, gate: GenerationBarrierGate) -> Self {
         self.generation_barrier_gate = Some(gate);
+        self
+    }
+
+    /// Simulate an old engine that never acknowledges its generation drain.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_force_generation_barrier_timeout(mut self) -> Self {
+        self.force_generation_barrier_timeout = true;
         self
     }
 
@@ -1026,6 +1040,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: self.generation_barrier_gate,
             #[cfg(any(test, feature = "test-util"))]
+            force_generation_barrier_timeout: self.force_generation_barrier_timeout,
+            #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: self.reload_lifecycle_capture,
         };
 
@@ -1363,6 +1379,8 @@ struct Runner {
     #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
     #[cfg(any(test, feature = "test-util"))]
+    force_generation_barrier_timeout: bool,
+    #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
@@ -1672,7 +1690,16 @@ impl Runner {
         if let Some(gate) = &self.generation_barrier_gate {
             gate.reach().await;
         }
-        await_generation_barrier(&old_ctl).await;
+        if let Err(detail) =
+            await_generation_barrier(&old_ctl, self.force_generation_barrier_timeout_for_test())
+                .await
+        {
+            tracing::error!(event = "generation_barrier_invariant_failed", detail);
+            self.root.cancel();
+            let outcome = ReloadOutcome::Rejected(detail.to_string());
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
+        }
         self.record_reload_lifecycle_stage("barrier_acknowledged");
         self.observations
             .emit(DaemonObservation::GenerationDrained {
@@ -1953,6 +1980,16 @@ impl Runner {
 
     #[cfg(not(any(test, feature = "test-util")))]
     fn record_reload_lifecycle_stage(&self, _stage: &'static str) {}
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn force_generation_barrier_timeout_for_test(&self) -> bool {
+        self.force_generation_barrier_timeout
+    }
+
+    #[cfg(not(any(test, feature = "test-util")))]
+    fn force_generation_barrier_timeout_for_test(&self) -> bool {
+        false
+    }
 
     /// Issue a defensive physical wake to RETAINED displays that were dark
     /// before the reload. The rebuilt state machines start `Active`, so a
@@ -2816,24 +2853,31 @@ async fn quiesce_inputs(generation: &mut Generation) {
     }
 }
 
-async fn await_generation_barrier(ctl: &mpsc::Sender<ControlMsg>) {
+const GENERATION_BARRIER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn await_generation_barrier(
+    ctl: &mpsc::Sender<ControlMsg>,
+    force_timeout_for_test: bool,
+) -> Result<(), &'static str> {
     let (ack_tx, ack_rx) = oneshot::channel();
     if ctl
         .send(ControlMsg::GenerationBarrier(ack_tx))
         .await
         .is_err()
     {
-        tracing::error!(
-            event = "generation_barrier_send_failed",
-            "old engine closed before acknowledging its generation barrier"
-        );
-        return;
+        return Err("old engine closed before accepting its generation barrier");
     }
-    if ack_rx.await.is_err() {
-        tracing::error!(
-            event = "generation_barrier_ack_failed",
-            "old engine exited before acknowledging its generation barrier"
-        );
+    let acknowledged = async move {
+        if force_timeout_for_test {
+            std::future::pending::<Result<(), oneshot::error::RecvError>>().await
+        } else {
+            ack_rx.await
+        }
+    };
+    match tokio::time::timeout(GENERATION_BARRIER_ACK_TIMEOUT, acknowledged).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err("old engine exited before acknowledging its generation barrier"),
+        Err(_) => Err("old engine did not acknowledge its generation barrier before timeout"),
     }
 }
 

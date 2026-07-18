@@ -5146,6 +5146,59 @@ async fn generation_barrier_survives_router_pause() {
     shutdown(handle, join).await;
 }
 
+/// An engine that fails to acknowledge its drain barrier must hand recovery to
+/// the supervisor rather than leave paused routers and a reload request wedged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_barrier_timeout_cancels_root() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_force_generation_barrier_timeout()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    let reload_started = Instant::now();
+    let (request_id, receipt) = tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.request_reload_with_id(ReloadSource::Control),
+    )
+    .await
+    .expect("barrier failure produces a receipt")
+    .expect("reload requester remains available");
+    assert!(receipt.request_ids.contains(&request_id));
+    assert!(
+        matches!(&receipt.outcome, ReloadOutcome::Rejected(detail) if detail.contains("timeout")),
+        "barrier failure must report an acknowledgement timeout: {:?}",
+        receipt.outcome
+    );
+    assert!(
+        reload_started.elapsed() >= Duration::from_secs(2),
+        "forced missing acknowledgement must exercise the bounded wait"
+    );
+    assert!(
+        handle.root_is_cancelled_for_test(),
+        "missing generation-barrier acknowledgement must cancel the daemon root"
+    );
+    tokio::time::timeout(Duration::from_secs(3), join)
+        .await
+        .expect("cancelled root stops the run loop")
+        .expect("run loop must not panic");
+}
+
 /// Rollback-recovery plan Task 1 §8: `rebuild_old` must carry
 /// Runner-OWNED rollback status (`self.rollback_status.clone()`) even when
 /// the preliminary snapshot request timed out — `rebuild_old` never derives

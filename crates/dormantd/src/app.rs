@@ -297,6 +297,10 @@ pub struct App {
     /// black-box config edit provably cannot reach.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_spawn_failure: bool,
+    /// Test seam: independently fails `rebuild_old`'s spawn after the
+    /// accepted-config spawn failure has exercised the rollback path.
+    #[cfg(any(test, feature = "test-util"))]
+    force_rebuild_old_spawn_failure: bool,
     /// Test seam (rollback-recovery plan, Task 1 §8): forces `Runner::reload`
     /// to treat the preliminary snapshot request as timed out (`None`),
     /// proving `rebuild_old` still carries Runner-owned rollback status even
@@ -400,6 +404,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: false,
             #[cfg(any(test, feature = "test-util"))]
+            force_rebuild_old_spawn_failure: false,
+            #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
@@ -440,6 +446,8 @@ impl App {
             watchdog_interval: None,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: false,
+            #[cfg(any(test, feature = "test-util"))]
+            force_rebuild_old_spawn_failure: false,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
@@ -548,6 +556,14 @@ impl App {
     #[must_use]
     pub fn with_test_force_reload_spawn_failure(mut self) -> Self {
         self.force_reload_spawn_failure = true;
+        self
+    }
+
+    /// Force `rebuild_old`'s generation spawn to fail after a rejected reload.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_force_rebuild_old_spawn_failure(mut self) -> Self {
+        self.force_rebuild_old_spawn_failure = true;
         self
     }
 
@@ -960,6 +976,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_reload_spawn_failure: self.force_reload_spawn_failure,
             #[cfg(any(test, feature = "test-util"))]
+            force_rebuild_old_spawn_failure: self.force_rebuild_old_spawn_failure,
+            #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: self.generation_barrier_gate,
@@ -1112,6 +1130,13 @@ impl AppHandle {
     /// Signal shutdown; the run loop tears down the current generation.
     pub fn shutdown(&self) {
         self.root.cancel();
+    }
+
+    /// Whether the daemon's root cancellation has been requested.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn root_is_cancelled_for_test(&self) -> bool {
+        self.root.is_cancelled()
     }
 
     /// Subscribe to live config updates (M2 web UI config view seam).
@@ -1283,6 +1308,9 @@ struct Runner {
     /// Test seam (F1) — see `App::force_reload_spawn_failure`.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_spawn_failure: bool,
+    /// Test seam — see `App::force_rebuild_old_spawn_failure`.
+    #[cfg(any(test, feature = "test-util"))]
+    force_rebuild_old_spawn_failure: bool,
     /// Test seam — see `App::force_reload_snapshot_timeout`.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
@@ -1944,7 +1972,7 @@ impl Runner {
             #[cfg(feature = "render")]
             input_wake_rx: Some(input_wake_rx),
         };
-        match spawn_generation_for_reload(
+        let spawn_result = spawn_generation_for_reload(
             &self.state_dir,
             &self.root,
             assembly,
@@ -1955,7 +1983,18 @@ impl Runner {
             self.notify_sink.clone(),
             self.generation_id,
             Some(self.observations.clone()),
-        ) {
+        );
+        #[cfg(any(test, feature = "test-util"))]
+        let spawn_result = if self.force_rebuild_old_spawn_failure {
+            spawn_result.and_then(|_| {
+                Err(anyhow::anyhow!(
+                    "test-injected rebuild_old spawn_generation failure"
+                ))
+            })
+        } else {
+            spawn_result
+        };
+        match spawn_result {
             Ok(spawn) => {
                 self.install_generation(spawn).await;
                 self.observations
@@ -1963,7 +2002,12 @@ impl Runner {
                         generation: self.generation_id,
                     });
             }
-            Err(e) => tracing::error!(event = "reload_rebuild_old_failed", error = %e),
+            Err(e) => {
+                tracing::error!(event = "reload_rebuild_old_failed", error = %e);
+                // Routers remain paused without a replacement generation; exit so the
+                // supervisor can restart into the boot-guard/LKG recovery path.
+                self.root.cancel();
+            }
         }
     }
 

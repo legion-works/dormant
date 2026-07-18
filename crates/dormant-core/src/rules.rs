@@ -1612,6 +1612,9 @@ impl RulesEngine {
         let Some((generation, hub)) = &self.observations else {
             return;
         };
+        // A multi-rule display reports its lexicographically-smallest rule id:
+        // deterministic single-owner reporting keeps this diagnostic shape simple,
+        // and multi-rule displays are rare.
         let rule_id = self
             .rule_displays
             .iter()

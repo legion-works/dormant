@@ -5042,6 +5042,50 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
     );
 }
 
+/// A failed accepted-config spawn leaves both front-door routers paused while
+/// `rebuild_old` attempts to restore service. If that second spawn fails too,
+/// the daemon must exit rather than remain alive without an engine that can
+/// process a wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_double_spawn_failure_cancels_root() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_force_reload_spawn_failure()
+    .with_test_force_rebuild_old_spawn_failure()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("rejected reload receipt");
+    assert!(receipt.request_ids.contains(&request_id));
+    assert!(matches!(receipt.outcome, ReloadOutcome::Rejected(_)));
+    assert!(
+        handle.root_is_cancelled_for_test(),
+        "double spawn failure must cancel the daemon root token"
+    );
+    tokio::time::timeout(Duration::from_secs(3), join)
+        .await
+        .expect("cancelled root must stop the run loop")
+        .expect("run loop must not panic");
+}
+
 /// Rollback-recovery plan Task 1 §8: `rebuild_old` must carry
 /// Runner-OWNED rollback status (`self.rollback_status.clone()`) even when
 /// the preliminary snapshot request timed out — `rebuild_old` never derives

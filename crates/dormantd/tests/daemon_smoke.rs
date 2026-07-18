@@ -20,10 +20,63 @@ use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{App, ReloadOutcome, validate_only};
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recv_terminal_outcome_skips_stale_reloaded_receipts() {
+    let (tx, mut reloads) = broadcast::channel(2);
+    tx.send(ReloadOutcome::Reloaded)
+        .expect("send stale reloaded receipt");
+    tx.send(ReloadOutcome::Rejected("invalid config".into()))
+        .expect("send rejected receipt");
+
+    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(1)).await;
+
+    assert_eq!(outcome, ReloadOutcome::Rejected("invalid config".into()));
+}
+
+// INTERIM (#92): superseded by correlated reload receipts (attempt ids) — see .opencode/ci-hardening/2026-07-18-direction.md PR 1.
+/// Receives a rejected reload outcome while ignoring stale successful receipts.
+///
+/// After an invalid-config write, [`ReloadOutcome::Reloaded`] can only be a
+/// stale receipt from the preceding valid reload's duplicate watcher/trigger
+/// execution: invalid content cannot validate. A genuinely accepted invalid
+/// reload would also update the config or credentials watch, which the callers
+/// assert separately.
+async fn recv_terminal_outcome(
+    reloads: &mut broadcast::Receiver<ReloadOutcome>,
+    timeout: Duration,
+) -> ReloadOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut observed = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for Rejected reload outcome; observed: {observed:?}"
+        );
+
+        match tokio::time::timeout(remaining, reloads.recv()).await {
+            Ok(Ok(ReloadOutcome::Rejected(detail))) => return ReloadOutcome::Rejected(detail),
+            Ok(Ok(outcome)) => observed.push(outcome),
+            Ok(Err(error)) => {
+                // RecvError covers both Closed and Lagged — keep the message neutral.
+                panic!(
+                    "reload bus error while waiting for Rejected; observed: {observed:?}; error: {error}"
+                );
+            }
+            Err(error) => {
+                panic!(
+                    "timed out waiting for Rejected reload outcome; observed: {observed:?}; error: {error}"
+                );
+            }
+        }
+    }
+}
 
 /// Resilient snapshot: retries across the reload generation-switch window.
 ///
@@ -999,10 +1052,7 @@ async fn config_watch_updates_on_successful_reload_only() {
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
     assert!(handle.trigger_reload().await);
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
-        .await
-        .expect("reload outcome in time")
-        .expect("reload bus open");
+    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(3)).await;
     match outcome {
         ReloadOutcome::Rejected(_) => {}
         ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
@@ -1106,10 +1156,7 @@ async fn creds_watch_updates_on_successful_reload_only() {
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
     assert!(handle.trigger_reload().await);
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
-        .await
-        .expect("reload outcome in time")
-        .expect("reload bus open");
+    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(3)).await;
     match outcome {
         ReloadOutcome::Rejected(_) => {}
         ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),

@@ -37,6 +37,8 @@ install-updater = false
 tap = "legion-works/homebrew-tap"
 # Publish jobs to run after a release
 publish-jobs = ["homebrew"]
+# AUR sources only resolve after GitHub release assets are public.
+post-announce-jobs = ["./publish-aur"]
 # Generate checksums for release artifacts
 checksums = true
 # Verify packaged Linux binaries actually run before publishing (#38)

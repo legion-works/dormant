@@ -145,6 +145,12 @@ async fn run(mut deps: WearTrackerDeps) {
     // synchronously by the caller before this task was ever spawned.
     let dir = deps.dir.clone();
 
+    // Issue #94 follow-up: sweep orphaned persist tmp files once at startup,
+    // before any ledger in this run is ever loaded/persisted — see
+    // `prune_stale_wear_temps`'s doc comment for why this is needed now that
+    // `persist_ledger` writes a unique tmp name per call.
+    prune_stale_wear_temps(&dir);
+
     let mut interval = new_interval(deps.config_rx.borrow().wear.sample_interval);
 
     loop {
@@ -833,12 +839,30 @@ fn load_or_create_ledger(
     }
 }
 
+/// Process-wide counter disambiguating concurrent `persist_ledger` calls for
+/// the SAME key within this process (issue #94 — a shared `wear-<key>.json.tmp`
+/// let two in-flight persists for one display interleave their write/rename
+/// and rename a blend into place, e.g. shutdown's `persist_all_dirty` racing
+/// a periodic `Persist` action for the same display).
+static PERSIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Derive this write's tmp filename: unique per call (pid + a process-global
+/// sequence number) so concurrent persists for the same `key` never share a
+/// tmp path. Pure — split out so the uniqueness property is unit-testable
+/// without racing real threads.
+fn tmp_filename(key: &str) -> String {
+    let seq = PERSIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("wear-{key}.json.tmp.{}.{seq}", std::process::id())
+}
+
 /// Atomically persist `ledger` to `<dir>/wear-<key>.json` (tmp+rename, same
-/// dir, mode 0644 on Unix). Creates `dir` if missing.
+/// dir, mode 0644 on Unix). Creates `dir` if missing. Each call writes to its
+/// own uniquely-named tmp file (see [`tmp_filename`]) so two concurrent
+/// persists for the same `key` can never interleave a write/rename pair.
 fn persist_ledger(dir: &Path, key: &str, ledger: &WearLedger) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let final_path = dir.join(format!("wear-{key}.json"));
-    let tmp_path = dir.join(format!("wear-{key}.json.tmp"));
+    let tmp_path = dir.join(tmp_filename(key));
     let json = serde_json::to_string(ledger)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&tmp_path, json)?;
@@ -849,6 +873,54 @@ fn persist_ledger(dir: &Path, key: &str, ledger: &WearLedger) -> std::io::Result
     }
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(())
+}
+
+/// `true` for a filename produced by [`tmp_filename`] — `wear-<key>.json.tmp.<pid>.<seq>`
+/// — and `false` for a final ledger (`wear-<key>.json`) or any unrelated file.
+/// Pure — the sweep's matching logic, unit-testable without touching a
+/// filesystem or racing threads.
+fn is_wear_persist_tmp(name: &str) -> bool {
+    name.starts_with("wear-") && name.contains(".json.tmp.")
+}
+
+/// Remove orphaned `wear-*.json.tmp.*` files (issue #94 follow-up — the
+/// per-call unique tmp name in [`tmp_filename`] means a persist that crashed
+/// between `write` and `rename` leaves a tmp file with no `rename` ever
+/// coming to claim it; the OLD fixed-name scheme self-cleaned by
+/// overwriting on the next persist, so this sweep replaces that accidental
+/// property). Only removes files older than 1 hour — the age guard means a
+/// concurrently-running second daemon process's in-flight tmp write (which
+/// this process cannot distinguish from a truly orphaned one by name alone)
+/// is never deleted out from under it. Mirrors the identical precedent at
+/// `dormant-web::prune_stale_temps`.
+fn prune_stale_wear_temps(dir: &Path) {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(Duration::from_secs(3600)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut pruned: u64 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !is_wear_persist_tmp(&name_str) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < cutoff && std::fs::remove_file(entry.path()).is_ok() {
+            pruned += 1;
+        }
+    }
+    if pruned > 0 {
+        tracing::debug!(event = "wear_tmp_pruned", count = pruned);
+    }
 }
 
 #[cfg(test)]
@@ -1700,6 +1772,36 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o644);
         }
+    }
+
+    /// Issue #94: two `persist_ledger` calls for the SAME key must never
+    /// derive the same tmp filename — the old fixed `wear-<key>.json.tmp`
+    /// let a shutdown persist race a periodic Persist for the same display
+    /// and interleave their write/rename, corrupting the final file (CI:
+    /// `wear_shutdown_persists_final_ledger` saw a JSON blend). RED against
+    /// the pre-fix derivation: a fixed-name `tmp_filename` would return the
+    /// same string both calls and this assertion would fail.
+    #[test]
+    fn tmp_filename_is_unique_per_call_for_the_same_key() {
+        let a = tmp_filename("mon");
+        let b = tmp_filename("mon");
+        assert_ne!(
+            a, b,
+            "two persists for the same key must use distinct tmp paths"
+        );
+    }
+
+    /// Issue #94 follow-up: `is_wear_persist_tmp` must recognize a real
+    /// `tmp_filename` output, and must NOT match a final ledger or any
+    /// unrelated file — a false positive here would delete a live ledger.
+    #[test]
+    fn is_wear_persist_tmp_matches_only_persist_tmp_files() {
+        assert!(is_wear_persist_tmp("wear-x.json.tmp.123.0"));
+        assert!(is_wear_persist_tmp(&tmp_filename("mon")));
+        assert!(!is_wear_persist_tmp("wear-x.json"));
+        assert!(!is_wear_persist_tmp("wear-x.json.corrupt.100"));
+        assert!(!is_wear_persist_tmp("config.toml.tmp.fresh"));
+        assert!(!is_wear_persist_tmp("unrelated.txt"));
     }
 
     #[test]

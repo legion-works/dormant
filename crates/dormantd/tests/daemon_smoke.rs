@@ -104,6 +104,34 @@ async fn wait_for_sensor_reported(
     }
 }
 
+/// Poll `Status` snapshots (via [`snapshot_with_retry`]) until `display`'s
+/// `phase` equals `want` or `timeout` elapses. A command sent over the
+/// control channel (`ForceBlank`, a reload's defensive wake, ...) writes its
+/// marker byte before the engine has finished processing the command's
+/// RESULT and landing the phase transition — a point-in-time snapshot taken
+/// right after the marker appears can still observe the PRIOR phase (e.g.
+/// "blanking" instead of "blanked"). Bounded-poll instead of asserting once.
+async fn wait_for_phase(
+    ctl: &mpsc::Sender<ControlMsg>,
+    display: &str,
+    want: &str,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let snap = snapshot_with_retry(ctl).await;
+        if let Some((_, d)) = snap.displays.iter().find(|(id, _)| id == display)
+            && d.phase == want
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, contents).expect("write file");
@@ -823,6 +851,18 @@ async fn ruleless_display_preserves_phase_on_reload() {
         .await,
         "both displays should blank before reload"
     );
+    // Ensure mon2's phase has actually landed at "blanked" before the
+    // reload below — the B-marker byte (waited for above) is written by the
+    // command executor before the engine finishes processing the blank
+    // RESULT (same hazard as the manual-only-display tests, issue #94
+    // sweep). Without this, the reload could race a still-"blanking" mon2
+    // and the post-reload "preserved" assertion below would only be
+    // preserving the wrong phase.
+    let ctl = handle.control_sender();
+    assert!(
+        wait_for_phase(&ctl, "mon2", "blanked", Duration::from_secs(3)).await,
+        "mon2's phase must settle to blanked before reload"
+    );
     let m2_wake_before = count(&m2, 'W');
     let m2_blank_before = count(&m2, 'B');
 
@@ -909,7 +949,7 @@ async fn config_watch_updates_on_successful_reload_only() {
     let mut reloads = handle.subscribe_reload();
 
     let mut config_watch = handle.config_watch();
-    let initial_holdoff = config_watch.borrow().daemon.startup_holdoff;
+    let initial_holdoff = config_watch.borrow_and_update().daemon.startup_holdoff;
     assert_eq!(initial_holdoff, Duration::from_secs(0));
 
     // Wait for the initial blank so the run loop has fully settled.
@@ -930,17 +970,29 @@ async fn config_watch_updates_on_successful_reload_only() {
         .expect("reload bus open");
     assert_eq!(outcome, ReloadOutcome::Reloaded);
 
-    // The watch should deliver the updated config.
-    let changed = tokio::time::timeout(Duration::from_secs(2), config_watch.changed())
-        .await
-        .expect("watch changed in time");
+    // Poll (not a single `changed()`) for the updated value: `changed()`
+    // marks the CURRENT value seen and resolves on ANY send since the last
+    // `borrow_and_update()`/subscribe — under CI scheduler jitter a prior,
+    // now-superseded notification can still be pending and `changed()` can
+    // return before the reload's own send_replace has landed, so the very
+    // next `borrow()` reads a stale pre-reload value (issue #92). A bounded
+    // poll on the actual target value is immune to which notification
+    // `changed()` happened to resolve against. Manual loop (not the
+    // `wait_for` helper) because `borrow_and_update()` needs `&mut`.
+    let poll_start = Instant::now();
+    let reflected = loop {
+        if config_watch.borrow_and_update().daemon.startup_holdoff == Duration::from_secs(5) {
+            break true;
+        }
+        if poll_start.elapsed() >= Duration::from_secs(2) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(
-        changed.is_ok(),
-        "config watch must reflect successful reload"
-    );
-    assert_eq!(
-        config_watch.borrow().daemon.startup_holdoff,
-        Duration::from_secs(5)
+        reflected,
+        "config watch must reflect successful reload, got startup_holdoff={:?}",
+        config_watch.borrow().daemon.startup_holdoff
     );
 
     // Now trigger a rejected reload — the watch must NOT change.
@@ -956,9 +1008,11 @@ async fn config_watch_updates_on_successful_reload_only() {
         ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
     }
 
-    // The watch should NOT have changed after a rejected reload.
-    // Because watch::changed() would hang if no update is sent, we use
-    // a short timeout to confirm no update arrives.
+    // The watch should NOT have changed after a rejected reload. The prior
+    // `borrow_and_update()` poll above already marked the successful-reload
+    // value seen, so `changed()` here can only resolve on a NEW send — a
+    // short timeout confirming none arrives is the correct (not stale-prone)
+    // check for this negative assertion.
     let no_change = tokio::time::timeout(Duration::from_millis(300), config_watch.changed()).await;
     assert!(
         no_change.is_err(),
@@ -1004,7 +1058,10 @@ async fn creds_watch_updates_on_successful_reload_only() {
     let mut reloads = handle.subscribe_reload();
 
     let mut creds_watch = handle.creds_watch();
-    assert_eq!(creds_watch.borrow().ha_token, Some("initial".to_string()));
+    assert_eq!(
+        creds_watch.borrow_and_update().ha_token,
+        Some("initial".to_string())
+    );
 
     // Wait for the initial blank so the run loop has fully settled.
     assert!(
@@ -1022,14 +1079,28 @@ async fn creds_watch_updates_on_successful_reload_only() {
         .expect("reload bus open");
     assert_eq!(outcome, ReloadOutcome::Reloaded);
 
-    let changed = tokio::time::timeout(Duration::from_secs(2), creds_watch.changed())
-        .await
-        .expect("creds watch changed in time");
+    // Bounded poll, not a single `changed()` — same stale-notification hazard
+    // as `config_watch_updates_on_successful_reload_only` (issue #92/#94):
+    // `changed()` resolves on ANY send since the last
+    // `borrow_and_update()`/subscribe, so a prior pending notification can
+    // resolve it before this reload's own `send_replace` has landed. Manual
+    // loop (not the `wait_for` helper) because `borrow_and_update()` needs
+    // `&mut`.
+    let poll_start = Instant::now();
+    let reflected = loop {
+        if creds_watch.borrow_and_update().ha_token == Some("updated".to_string()) {
+            break true;
+        }
+        if poll_start.elapsed() >= Duration::from_secs(2) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(
-        changed.is_ok(),
-        "creds watch must reflect successful reload"
+        reflected,
+        "creds watch must reflect successful reload, got ha_token={:?}",
+        creds_watch.borrow().ha_token
     );
-    assert_eq!(creds_watch.borrow().ha_token, Some("updated".to_string()));
 
     // Trigger a rejected reload — creds watch must NOT change.
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
@@ -1946,6 +2017,17 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         "manual display should blank after ForceBlank, manual={:?}",
         read(&manual_marker)
     );
+    // Ensure the phase has actually landed at "blanked" before triggering
+    // the reload below — the marker byte (waited for above) is written by
+    // the command executor before the engine finishes processing the blank
+    // RESULT (same hazard as `manual_only_display_full_lifecycle_across_reload`,
+    // issue #94 sweep). Without this, the reload could race a still-
+    // "blanking" manual display and the post-reload "preserved" assertion
+    // would only be preserving the wrong phase.
+    assert!(
+        wait_for_phase(&ctl, "manual", "blanked", Duration::from_secs(3)).await,
+        "manual display's phase must settle to blanked before reload"
+    );
 
     // Clear any W that may have been written (defensive wake at initial
     // holdoff expiry, etc.) and track the exact counts before reload.
@@ -2139,26 +2221,15 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         read(&manual_marker)
     );
 
-    // Verify phase is "blanked" in the snapshot.
-    {
-        let (tx, rx) = oneshot::channel();
-        ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
-        let snap: StateSnapshot = tokio::time::timeout(Duration::from_secs(2), rx)
-            .await
-            .expect("snapshot in time")
-            .expect("snapshot reply");
-        let manual_snap = snap
-            .displays
-            .iter()
-            .find(|(id, _)| id == "manual")
-            .map(|(_, ds)| ds)
-            .unwrap();
-        assert_eq!(
-            manual_snap.phase, "blanked",
-            "phase must be blanked after ForceBlank, got {:?}",
-            manual_snap.phase
-        );
-    }
+    // Verify phase reaches "blanked" in the snapshot. The blank marker byte
+    // (waited for above) is written by the command executor before the
+    // engine has finished processing the blank RESULT and landing the
+    // Blanking→Blanked transition — a single point-in-time snapshot here can
+    // still observe "blanking" (CI-observed). Bounded poll instead.
+    assert!(
+        wait_for_phase(&ctl, "manual", "blanked", Duration::from_secs(3)).await,
+        "phase must reach blanked after ForceBlank"
+    );
 
     let manual_wake_before = count(&manual_marker, 'W');
 
@@ -2228,24 +2299,9 @@ async fn manual_only_display_full_lifecycle_across_reload() {
 
     // Poll until the snapshot reflects the phase transition (the wake
     // command writes the marker before the engine processes WakeResult).
-    let mut final_phase = String::new();
-    for _ in 0..100 {
-        // ~5s bounded
-        let (tx, rx) = oneshot::channel();
-        if ctl.send(ControlMsg::Snapshot(tx)).await.is_ok()
-            && let Ok(Ok(snap)) = tokio::time::timeout(Duration::from_millis(200), rx).await
-            && let Some((_, d)) = snap.displays.iter().find(|(id, _)| id == "manual")
-        {
-            final_phase = d.phase.clone();
-            if final_phase == "active" {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        final_phase, "active",
-        "manual-only display must be active after ForceWake, got {final_phase:?}"
+    assert!(
+        wait_for_phase(&ctl, "manual", "active", Duration::from_secs(5)).await,
+        "manual-only display must be active after ForceWake"
     );
 
     shutdown(handle, join).await;

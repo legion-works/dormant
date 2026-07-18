@@ -1,0 +1,24 @@
+# DISPOSABLE probe workflow — T2 of the CI-hardening plan. Never lands on dev.
+# Proves: a rerun of a failed job increments github.run_attempt, a guard step
+# can fail on run_attempt > 1, and the PR check stays red across reruns.
+name: run-attempt-probe
+on:
+  pull_request:
+    branches: [dev]
+
+jobs:
+  run-attempt-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print attempt
+        run: echo "run_attempt=${{ github.run_attempt }}"
+      - name: Guard - fail on rerun
+        if: ${{ github.run_attempt != '1' }}
+        run: |
+          echo "rerun detected (attempt ${{ github.run_attempt }}) - failing per no-rerun-roulette guard"
+          exit 1
+      - name: Intentional first-attempt failure
+        if: ${{ github.run_attempt == '1' }}
+        run: |
+          echo "intentional failure on attempt 1 to enable the rerun probe"
+          exit 1

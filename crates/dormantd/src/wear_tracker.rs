@@ -833,12 +833,30 @@ fn load_or_create_ledger(
     }
 }
 
+/// Process-wide counter disambiguating concurrent `persist_ledger` calls for
+/// the SAME key within this process (issue #94 — a shared `wear-<key>.json.tmp`
+/// let two in-flight persists for one display interleave their write/rename
+/// and rename a blend into place, e.g. shutdown's `persist_all_dirty` racing
+/// a periodic `Persist` action for the same display).
+static PERSIST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Derive this write's tmp filename: unique per call (pid + a process-global
+/// sequence number) so concurrent persists for the same `key` never share a
+/// tmp path. Pure — split out so the uniqueness property is unit-testable
+/// without racing real threads.
+fn tmp_filename(key: &str) -> String {
+    let seq = PERSIST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("wear-{key}.json.tmp.{}.{seq}", std::process::id())
+}
+
 /// Atomically persist `ledger` to `<dir>/wear-<key>.json` (tmp+rename, same
-/// dir, mode 0644 on Unix). Creates `dir` if missing.
+/// dir, mode 0644 on Unix). Creates `dir` if missing. Each call writes to its
+/// own uniquely-named tmp file (see [`tmp_filename`]) so two concurrent
+/// persists for the same `key` can never interleave a write/rename pair.
 fn persist_ledger(dir: &Path, key: &str, ledger: &WearLedger) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let final_path = dir.join(format!("wear-{key}.json"));
-    let tmp_path = dir.join(format!("wear-{key}.json.tmp"));
+    let tmp_path = dir.join(tmp_filename(key));
     let json = serde_json::to_string(ledger)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&tmp_path, json)?;
@@ -1700,6 +1718,23 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o644);
         }
+    }
+
+    /// Issue #94: two `persist_ledger` calls for the SAME key must never
+    /// derive the same tmp filename — the old fixed `wear-<key>.json.tmp`
+    /// let a shutdown persist race a periodic Persist for the same display
+    /// and interleave their write/rename, corrupting the final file (CI:
+    /// `wear_shutdown_persists_final_ledger` saw a JSON blend). RED against
+    /// the pre-fix derivation: a fixed-name `tmp_filename` would return the
+    /// same string both calls and this assertion would fail.
+    #[test]
+    fn tmp_filename_is_unique_per_call_for_the_same_key() {
+        let a = tmp_filename("mon");
+        let b = tmp_filename("mon");
+        assert_ne!(
+            a, b,
+            "two persists for the same key must use distinct tmp paths"
+        );
     }
 
     #[test]

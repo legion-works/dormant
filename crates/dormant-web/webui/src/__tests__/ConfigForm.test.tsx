@@ -892,6 +892,30 @@ describe("Config tab-switch guard", () => {
     expect(s.isLocked(["daemon", "doctor_wake_settle"], noRedacted)).toBe(false);
   });
 
+  it("renders generation_barrier_ack_timeout as a duration input", async () => {
+    const cfg: ConfigResponse = {
+      ...SAMPLE_CONFIG,
+      fingerprint: "fe02aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44ee55ff66aa11bb22cc",
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        daemon: {
+          ...SAMPLE_CONFIG.inventory.daemon,
+          generation_barrier_ack_timeout: "2s",
+        },
+      },
+    };
+
+    render(<SettingsForm config={cfg} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    const timeoutInput = screen.getByLabelText("generation_barrier_ack_timeout") as HTMLInputElement;
+    expect(timeoutInput.type).toBe("text");
+    expect(timeoutInput.value).toBe("2s");
+  });
+
   // ── DurationField placeholder ──
 
   it("DurationField shows persistent placeholder when placeholder prop given", async () => {

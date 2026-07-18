@@ -21,6 +21,10 @@ pub const STALE_SENSOR_TIMEOUT: Duration = Duration::from_secs(300);
 /// reload (editors often write-then-rename, producing several events).
 pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Maximum time a generation swap waits for its old engine to drain queued
+/// inputs before acknowledging the barrier.
+pub const GENERATION_BARRIER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long a zone must stay present or absent before a rule acts (debounce).
 pub const GRACE_PERIOD: Duration = Duration::from_secs(60);
 

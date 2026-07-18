@@ -24,6 +24,7 @@ const KNOWN_FIELDS: Record<string, { kind: "enum" | "number" | "duration" | "tex
   web_port: { kind: "number" },
   startup_holdoff: { kind: "duration" },
   reload_debounce: { kind: "duration" },
+  generation_barrier_ack_timeout: { kind: "duration" },
   idle_time_unit: { kind: "enum", options: IDLE_TIME_UNITS },
   idle_source: { kind: "enum", options: IDLE_SOURCES },
   stale_sensor_timeout: { kind: "duration" },
@@ -39,6 +40,7 @@ const FIELD_HELP: Record<string, string> = {
   web_port: "1024–65535; empty disables the web UI.",
   startup_holdoff: "Delay before any blank/wake actions after startup, allowing sensors to stabilise.",
   reload_debounce: "Coalesce rapid config reloads.",
+  generation_barrier_ack_timeout: "Maximum wait for the old generation to drain during a reload.",
   idle_time_unit: "How to read the compositor's idle-time reply. auto detects the unit; override only if detection is wrong.",
   idle_source: "Idle-detection backend for the user-activity inhibitor.",
   stale_sensor_timeout: "A sensor silent this long becomes unavailable.",
@@ -53,6 +55,7 @@ const FIELD_HELP: Record<string, string> = {
 const FIELD_PLACEHOLDER: Record<string, string> = {
   startup_holdoff: "30s",
   reload_debounce: "500ms",
+  generation_barrier_ack_timeout: "2s",
   stale_sensor_timeout: "300s",
   doctor_wake_settle: "3s",
   macos_idle_frozen_polls: "3",

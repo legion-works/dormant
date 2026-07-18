@@ -5134,7 +5134,17 @@ async fn generation_barrier_survives_router_pause() {
                 assert!(result.is_ok(), "reload did not reach the old-generation barrier");
             }
         }
+        let probe = gate.request_post_release_snapshot();
         gate.release();
+        let old_snapshot = tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .expect("old engine accepted the post-release barrier probe")
+            .expect("reload kept the barrier probe alive")
+            .expect("old engine control route remained open after pause");
+        tokio::time::timeout(Duration::from_secs(1), old_snapshot)
+            .await
+            .expect("old engine answered the post-release barrier probe")
+            .expect("old engine snapshot reply");
         let (request_id, receipt) = tokio::time::timeout(Duration::from_secs(3), reload)
             .await
             .expect("reload completes after the barrier")
@@ -5170,7 +5180,14 @@ async fn generation_barrier_timeout_cancels_root() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    fs::write(
+        &cfg_path,
+        one_display_config(&marker, "50ms").replace(
+            "startup_holdoff = \"0s\"",
+            "startup_holdoff = \"0s\"\nreload_debounce = \"0s\"\ngeneration_barrier_ack_timeout = \"50ms\"",
+        ),
+    )
+    .unwrap();
     let reload_started = Instant::now();
     let (request_id, receipt) = tokio::time::timeout(
         Duration::from_secs(3),
@@ -5186,7 +5203,7 @@ async fn generation_barrier_timeout_cancels_root() {
         receipt.outcome
     );
     assert!(
-        reload_started.elapsed() >= Duration::from_secs(2),
+        reload_started.elapsed() >= Duration::from_millis(50),
         "forced missing acknowledgement must exercise the bounded wait"
     );
     assert!(

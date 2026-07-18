@@ -315,6 +315,10 @@ pub struct App {
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
+/// Result of a post-release old-engine snapshot probe.
+#[cfg(any(test, feature = "test-util"))]
+type BarrierSnapshotProbe = Result<oneshot::Receiver<StateSnapshot>, &'static str>;
+
 /// Test-only rendezvous immediately before the old engine drain barrier.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Clone)]
@@ -322,6 +326,7 @@ pub struct GenerationBarrierGate {
     entered_tx: watch::Sender<bool>,
     entered_rx: watch::Receiver<bool>,
     release: Arc<tokio::sync::Notify>,
+    post_release_snapshot: Arc<Mutex<Option<oneshot::Sender<BarrierSnapshotProbe>>>>,
 }
 
 /// Test-only record of the forced snapshot-timeout reload's lifecycle stages.
@@ -364,6 +369,7 @@ impl GenerationBarrierGate {
             entered_tx,
             entered_rx,
             release: Arc::new(tokio::sync::Notify::new()),
+            post_release_snapshot: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -382,9 +388,39 @@ impl GenerationBarrierGate {
         self.release.notify_one();
     }
 
-    async fn reach(&self) {
+    /// Request a snapshot probe sent after release and before the drain barrier.
+    /// The returned channel reports whether the old engine accepted the probe.
+    pub fn request_post_release_snapshot(&self) -> oneshot::Receiver<BarrierSnapshotProbe> {
+        let (tx, rx) = oneshot::channel();
+        let mut probe = self
+            .post_release_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probe.is_some() {
+            let _ = tx.send(Err("barrier snapshot probe already registered"));
+        } else {
+            *probe = Some(tx);
+        }
+        rx
+    }
+
+    async fn reach(&self, old_ctl: mpsc::Sender<ControlMsg>) {
         self.entered_tx.send_replace(true);
         self.release.notified().await;
+        let probe = self
+            .post_release_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(probe) = probe {
+            let (snapshot_tx, snapshot_rx) = oneshot::channel();
+            let result = old_ctl
+                .send(ControlMsg::Snapshot(snapshot_tx))
+                .await
+                .map(|()| snapshot_rx)
+                .map_err(|_| "old engine closed before the barrier probe");
+            let _ = probe.send(result);
+        }
     }
 }
 
@@ -993,6 +1029,8 @@ impl App {
         // docs, which reference this comment).
         self.sd_notify.ready();
 
+        let generation_barrier_ack_timeout =
+            spawn.generation.cfg.daemon.generation_barrier_ack_timeout;
         let runner = Runner {
             config_path: self.operator_config_path.clone(),
             creds_path: self.creds_path.clone(),
@@ -1021,6 +1059,7 @@ impl App {
             notify_sink,
             sd: self.sd_notify,
             watchdog_interval,
+            generation_barrier_ack_timeout,
             lkg_candidate,
             lkg_defer_count: 0,
             probe_failed_warned: false,
@@ -1308,6 +1347,8 @@ struct Runner {
     /// The probe arm's tick period (spec §6.3), captured once at
     /// construction — see [`App::with_watchdog_interval`].
     watchdog_interval: Duration,
+    /// Bounded wait for the old engine's drain acknowledgement during reload.
+    generation_barrier_ack_timeout: Duration,
     /// The in-flight LKG promotion candidate (spec §4), or `None` when
     /// `watchdog.lkg_enabled` is false (no candidate tracking at all) or no
     /// candidate has been armed yet. Set at startup and at every successful
@@ -1488,6 +1529,8 @@ impl Runner {
             .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
             .collect();
         self.executors_tx.send_replace(Arc::new(executors));
+        self.generation_barrier_ack_timeout =
+            spawn.generation.cfg.daemon.generation_barrier_ack_timeout;
         self.generation = spawn.generation;
         self.ctl_router.install(spawn.ctl_tx).await;
         self.events_router.install(spawn.events_tx).await;
@@ -1658,6 +1701,7 @@ impl Runner {
         // BEFORE new_assembly is consumed by spawn_generation.
         let new_cfg = new_assembly.cfg.clone();
         let new_creds = new_assembly.creds.clone();
+        self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
 
         // Reload does not rebind a web listener — flag port/bind changes.
         if new_cfg.daemon.web_port != self.started_web_port
@@ -1688,11 +1732,14 @@ impl Runner {
         self.record_reload_lifecycle_stage("inputs_quiesced");
         #[cfg(any(test, feature = "test-util"))]
         if let Some(gate) = &self.generation_barrier_gate {
-            gate.reach().await;
+            gate.reach(old_ctl.clone()).await;
         }
-        if let Err(detail) =
-            await_generation_barrier(&old_ctl, self.force_generation_barrier_timeout_for_test())
-                .await
+        if let Err(detail) = await_generation_barrier(
+            &old_ctl,
+            self.generation_barrier_ack_timeout,
+            self.force_generation_barrier_timeout_for_test(),
+        )
+        .await
         {
             tracing::error!(event = "generation_barrier_invariant_failed", detail);
             self.root.cancel();
@@ -2853,10 +2900,9 @@ async fn quiesce_inputs(generation: &mut Generation) {
     }
 }
 
-const GENERATION_BARRIER_ACK_TIMEOUT: Duration = Duration::from_secs(2);
-
 async fn await_generation_barrier(
     ctl: &mpsc::Sender<ControlMsg>,
+    timeout: Duration,
     force_timeout_for_test: bool,
 ) -> Result<(), &'static str> {
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -2874,7 +2920,7 @@ async fn await_generation_barrier(
             ack_rx.await
         }
     };
-    match tokio::time::timeout(GENERATION_BARRIER_ACK_TIMEOUT, acknowledged).await {
+    match tokio::time::timeout(timeout, acknowledged).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err("old engine exited before acknowledging its generation barrier"),
         Err(_) => Err("old engine did not acknowledge its generation barrier before timeout"),

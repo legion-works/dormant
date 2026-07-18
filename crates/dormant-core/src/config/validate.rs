@@ -110,6 +110,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "idle_time_unit",
             "idle_source",
             "reload_debounce",
+            "generation_barrier_ack_timeout",
             "web_port",
             "web_bind",
             "web_allow_nonloopback",
@@ -641,8 +642,8 @@ fn validate_sensors(cfg: &Config, errors: &mut Vec<ValidationError>) {
     }
 }
 
-/// Validate the `[daemon]` section: `pair_timeout`, `doctor_wake_settle`,
-/// and the macOS idle-source (`macos_idle_*`) bounds. The macOS fields are
+/// Validate the `[daemon]` section: timeout bounds and the macOS idle-source
+/// (`macos_idle_*`) bounds. The macOS fields are
 /// validated unconditionally (not gated on `idle_source == "macos"`) — a
 /// bogus value sitting dormant in the config until the operator flips
 /// `idle_source` would surface as a startup failure at the worst possible
@@ -671,6 +672,13 @@ fn validate_daemon(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 "daemon.doctor_wake_settle {:?} is out of range — allowed: 100ms..=30s",
                 daemon.doctor_wake_settle
             ),
+        });
+    }
+
+    if daemon.generation_barrier_ack_timeout.is_zero() {
+        errors.push(ValidationError {
+            what: "E_CONFIG_INVALID".into(),
+            detail: "daemon.generation_barrier_ack_timeout must be > 0".into(),
         });
     }
 
@@ -5434,6 +5442,10 @@ availability_payload_offline = "down"
         assert!(cfg.daemon.entity_crud_enabled);
         assert!(cfg.daemon.pairing_enabled);
         assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(120));
+        assert_eq!(
+            cfg.daemon.generation_barrier_ack_timeout,
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -5513,6 +5525,33 @@ availability_payload_offline = "down"
         assert!(!cfg.daemon.entity_crud_enabled);
         assert!(!cfg.daemon.pairing_enabled);
         assert_eq!(cfg.daemon.pair_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn generation_barrier_ack_timeout_is_accepted_in_strict_mode() {
+        let (cfg, _warnings) = load_str_strict(
+            "config_version = 1\n\
+             [daemon]\n\
+             generation_barrier_ack_timeout = \"50ms\"\n",
+        )
+        .expect("generation barrier timeout is a known daemon key");
+        assert_eq!(
+            cfg.daemon.generation_barrier_ack_timeout,
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn generation_barrier_ack_timeout_zero_is_rejected() {
+        let errors =
+            validate_str("config_version = 1\n[daemon]\ngeneration_barrier_ack_timeout = \"0s\"\n");
+        assert!(
+            errors.iter().any(|error| {
+                error.what == "E_CONFIG_INVALID"
+                    && error.detail.contains("generation_barrier_ack_timeout")
+            }),
+            "zero generation barrier acknowledgement timeout must be rejected, got: {errors:?}"
+        );
     }
 
     // ── Task 4: daemon.doctor_wake_settle (#34) ─────────────────────────────

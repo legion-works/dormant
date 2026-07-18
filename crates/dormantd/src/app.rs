@@ -739,8 +739,8 @@ impl App {
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
 
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
-        // over the front ctl channel (rides `forward_ctl`'s
-        // `deliver_or_drop` across generation swaps), sees the current
+        // over the front ctl channel (rides the `GenerationRouter`'s
+        // pause/queue/release across generation swaps), sees the current
         // generation's executors via the watch seeded above.
         let wear_tracker_handle =
             crate::wear_tracker::spawn(crate::wear_tracker::WearTrackerDeps {
@@ -2580,7 +2580,7 @@ impl<T: Send + 'static> GenerationRouter<T> {
         let Some(target) = state.target.clone() else {
             tracing::error!(
                 event = "generation_route_missing",
-                "front-door route missing outside intentional shutdown"
+                "invariant violation: no installed generation target while not shutting down — input dropped"
             );
             return false;
         };

@@ -1,0 +1,96 @@
+name: CI Stress
+
+on:
+  pull_request:
+    types: [opened, labeled, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  reload-stress-ubuntu:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Mirror the ordinary test lane's reliable runner-image-drift workaround.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      # T1 evidence: docs/research/2026-07-18-nextest-ci-spike.md.
+      - run: cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Configure nextest
+        run: |
+          cat > "$RUNNER_TEMP/nextest-reload-stress.toml" <<'EOF'
+          [profile.default]
+          retries = 0
+          flaky-result = "fail"
+          fail-fast = false
+
+          [profile.default.junit]
+          path = "../reload-stress/junit.xml"
+          EOF
+      - name: Stress config-watch reload
+        run: |
+          filter='test(config_watch_updates_on_successful_reload_only)'
+          selected="$(cargo nextest list -p dormantd --test daemon_smoke -E "$filter")"
+          printf '%s\n' "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -eq 1
+          cargo nextest run --config-file "$RUNNER_TEMP/nextest-reload-stress.toml" -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(config_watch_updates_on_successful_reload_only)'
+      - name: Stress manual-only reload
+        run: |
+          filter='test(manual_only_display_full_lifecycle_across_reload)'
+          selected="$(cargo nextest list -p dormantd --test daemon_smoke -E "$filter")"
+          printf '%s\n' "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -eq 1
+          cargo nextest run --config-file "$RUNNER_TEMP/nextest-reload-stress.toml" -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_full_lifecycle_across_reload)'
+      - name: Upload reload-stress artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reload-stress-ubuntu
+          path: target/nextest
+          if-no-files-found: warn
+
+  reload-stress-macos:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    # T1 evidence: docs/research/2026-07-18-nextest-ci-spike.md confirms this pin.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # T1 evidence: docs/research/2026-07-18-nextest-ci-spike.md.
+      - run: cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Configure nextest
+        run: |
+          cat > "$RUNNER_TEMP/nextest-reload-stress.toml" <<'EOF'
+          [profile.default]
+          retries = 0
+          flaky-result = "fail"
+          fail-fast = false
+
+          [profile.default.junit]
+          path = "../reload-stress/junit.xml"
+          EOF
+      - name: Stress config-watch reload
+        run: |
+          filter='test(config_watch_updates_on_successful_reload_only)'
+          selected="$(cargo nextest list -p dormantd --test daemon_smoke -E "$filter")"
+          printf '%s\n' "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -eq 1
+          cargo nextest run --config-file "$RUNNER_TEMP/nextest-reload-stress.toml" -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(config_watch_updates_on_successful_reload_only)'
+      - name: Stress manual-only reload
+        run: |
+          filter='test(manual_only_display_full_lifecycle_across_reload)'
+          selected="$(cargo nextest list -p dormantd --test daemon_smoke -E "$filter")"
+          printf '%s\n' "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -eq 1
+          cargo nextest run --config-file "$RUNNER_TEMP/nextest-reload-stress.toml" -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_full_lifecycle_across_reload)'
+      - name: Upload reload-stress artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reload-stress-macos
+          path: target/nextest
+          if-no-files-found: warn

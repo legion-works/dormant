@@ -15,7 +15,7 @@ use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
-use dormant_core::observation::ReloadSource;
+use dormant_core::observation::{DaemonObservation, GenerationId, ObservationHub, ReloadSource};
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
@@ -228,6 +228,35 @@ async fn wait_for<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     pred()
+}
+
+/// Receive the next observation matching `predicate`, retaining unrelated
+/// diagnostics so a test awaits a transition instead of a scheduler delay.
+async fn recv_observation(
+    observations: &mut broadcast::Receiver<DaemonObservation>,
+    timeout: Duration,
+    label: &str,
+    predicate: impl Fn(&DaemonObservation) -> bool,
+) -> DaemonObservation {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {label}; saw {seen:?}"
+        );
+
+        match tokio::time::timeout(remaining, observations.recv()).await {
+            Ok(Ok(observation)) if predicate(&observation) => return observation,
+            Ok(Ok(observation)) => seen.push(observation),
+            Ok(Err(error)) => {
+                panic!("observation stream failed waiting for {label}: {error}; saw {seen:?}")
+            }
+            Err(error) => panic!("timed out waiting for {label}: {error}; saw {seen:?}"),
+        }
+    }
 }
 
 /// One-display `command`-controller config with tunable grace and marker path.
@@ -1003,15 +1032,10 @@ async fn ruleless_display_preserves_phase_on_reload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
-    clippy::await_holding_lock,
-    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
-              count step-boundary tests it would otherwise contaminate — test-local, always \
-              released promptly at test end"
+    clippy::too_many_lines,
+    reason = "the test keeps the complete reload observation sequence adjacent to its config mutation"
 )]
 async fn config_watch_updates_on_successful_reload_only() {
-    let _capture_guard = capture_count_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -1022,6 +1046,8 @@ async fn config_watch_updates_on_successful_reload_only() {
     let creds_path = dir.path().join("credentials.toml");
 
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let observations = ObservationHub::new(64);
+    let mut observation_rx = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -1030,19 +1056,38 @@ async fn config_watch_updates_on_successful_reload_only() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
-    let mut reloads = handle.subscribe_reload();
 
     let mut config_watch = handle.config_watch();
     let initial_holdoff = config_watch.borrow_and_update().daemon.startup_holdoff;
     assert_eq!(initial_holdoff, Duration::from_secs(0));
 
-    // Wait for the initial blank so the run loop has fully settled.
+    // The marker proves controller execution; the observation below proves
+    // the owning state-machine transition.
     assert!(
         wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
         "first blank should occur"
     );
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "rule display blanking to blanked",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanking,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
 
     // Write a valid config with a different startup_holdoff and reload.
     let modified = one_display_config(&marker, "400ms")
@@ -1054,47 +1099,61 @@ async fn config_watch_updates_on_successful_reload_only() {
         .expect("control reload receipt");
     assert!(receipt.request_ids.contains(&request_id));
     assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
-
-    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
-        .await
-        .expect("reload outcome in time")
-        .expect("reload bus open");
-    assert_eq!(outcome, ReloadOutcome::Reloaded);
-
-    // Poll (not a single `changed()`) for the updated value: `changed()`
-    // marks the CURRENT value seen and resolves on ANY send since the last
-    // `borrow_and_update()`/subscribe — under CI scheduler jitter a prior,
-    // now-superseded notification can still be pending and `changed()` can
-    // return before the reload's own send_replace has landed, so the very
-    // next `borrow()` reads a stale pre-reload value (issue #92). A bounded
-    // poll on the actual target value is immune to which notification
-    // `changed()` happened to resolve against. Manual loop (not the
-    // `wait_for` helper) because `borrow_and_update()` needs `&mut`.
-    let poll_start = Instant::now();
-    let reflected = loop {
-        if config_watch.borrow_and_update().daemon.startup_holdoff == Duration::from_secs(5) {
-            break true;
-        }
-        if poll_start.elapsed() >= Duration::from_secs(2) {
-            break false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert!(
-        reflected,
-        "config watch must reflect successful reload, got startup_holdoff={:?}",
-        config_watch.borrow().daemon.startup_holdoff
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero drained",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationDrained {
+                    generation: GenerationId(0)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one started",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationStarted {
+                    generation: GenerationId(1)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "reload completed for generation one",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::ReloadCompleted(receipt)
+                    if receipt.generation == GenerationId(1)
+                        && receipt.outcome == ReloadOutcome::Reloaded
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        config_watch.borrow_and_update().daemon.startup_holdoff,
+        Duration::from_secs(5),
+        "config watch must reflect successful reload"
     );
 
     // Now trigger a rejected reload — the watch must NOT change.
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
-    assert!(handle.trigger_reload().await);
-
-    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(3)).await;
-    match outcome {
-        ReloadOutcome::Rejected(_) => {}
-        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
-    }
+    let rejected = handle
+        .request_reload(ReloadSource::Control)
+        .await
+        .expect("rejected control reload receipt");
+    assert!(matches!(rejected.outcome, ReloadOutcome::Rejected(_)));
 
     // The watch should NOT have changed after a rejected reload. The prior
     // `borrow_and_update()` poll above already marked the successful-reload
@@ -2508,16 +2567,7 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
 /// manual command (tracked in issue #9).
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
-              count step-boundary tests it would otherwise contaminate — test-local, always \
-              released promptly at test end"
-)]
 async fn manual_only_display_full_lifecycle_across_reload() {
-    let _capture_guard = capture_count_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
@@ -2531,6 +2581,8 @@ async fn manual_only_display_full_lifecycle_across_reload() {
     // No sensor events — the manual display starts active (no rule drives
     // it).  The rule-driven "mon" will blank after its 300ms grace, but
     // that is irrelevant to the manual-only lifecycle under test.
+    let observations = ObservationHub::new(64);
+    let mut observation_rx = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -2539,9 +2591,9 @@ async fn manual_only_display_full_lifecycle_across_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
-    let mut reloads = handle.subscribe_reload();
     let ctl = handle.control_sender();
 
     // ── 1. ForceBlank the manual-only display ──────────────────────────
@@ -2553,16 +2605,50 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         "manual display must blank after ForceBlank, marker={:?}",
         read(&manual_marker)
     );
-
-    // Verify phase reaches "blanked" in the snapshot. The blank marker byte
-    // (waited for above) is written by the command executor before the
-    // engine has finished processing the blank RESULT and landing the
-    // Blanking→Blanked transition — a single point-in-time snapshot here can
-    // still observe "blanking" (CI-observed). Bounded poll instead.
-    assert!(
-        wait_for_phase(&ctl, "manual", "blanked", Duration::from_secs(3)).await,
-        "phase must reach blanked after ForceBlank"
-    );
+    let blanking = recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual active to blanking",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Blanking,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    assert!(matches!(
+        blanking,
+        DaemonObservation::DisplayPhaseChanged { .. }
+    ));
+    let blanked = recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual blanking to blanked",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanking,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    assert!(matches!(
+        blanked,
+        DaemonObservation::DisplayPhaseChanged { .. }
+    ));
 
     let manual_wake_before = count(&manual_marker, 'W');
 
@@ -2576,19 +2662,66 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         manual_and_ruled_config(&mon_marker, &manual_marker, "150ms"),
     )
     .unwrap();
-    // Drain reload outcomes until the bus is quiet, then assert the last
-    // one was Reloaded.  The watcher debounce is 500ms; a 1s settle window
-    // is tight but sufficient for a single deterministic reload.
-    let settle = Duration::from_secs(1);
-    let mut last_outcome = None;
-    while let Ok(Ok(o)) = tokio::time::timeout(settle, reloads.recv()).await {
-        last_outcome = Some(o);
-    }
-    assert_eq!(
-        last_outcome,
-        Some(ReloadOutcome::Reloaded),
-        "reload must settle as Reloaded"
-    );
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero drained",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationDrained {
+                    generation: GenerationId(0)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual phase restored into generation one",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one started",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationStarted {
+                    generation: GenerationId(1)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "reload completed for generation one",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::ReloadCompleted(receipt)
+                    if receipt.generation == GenerationId(1)
+                        && receipt.outcome == ReloadOutcome::Reloaded
+            )
+        },
+    )
+    .await;
 
     // ── 4. Assert across reload: NO wake, phase preserved ──────────────
     let manual_w_after = count(&manual_marker, 'W');
@@ -2599,22 +2732,6 @@ async fn manual_only_display_full_lifecycle_across_reload() {
          got {manual_w_after} W (was {manual_wake_before} W before), marker={:?}",
         read(&manual_marker)
     );
-
-    {
-        // Retry across the reload generation-switch window (issue #9).
-        let snap = snapshot_with_retry(&handle.control_sender()).await;
-        let manual_snap = snap
-            .displays
-            .iter()
-            .find(|(id, _)| id == "manual")
-            .map(|(_, ds)| ds)
-            .unwrap();
-        assert_eq!(
-            manual_snap.phase, "blanked",
-            "manual-only display must preserve blanked phase after reload, got {:?}",
-            manual_snap.phase
-        );
-    }
 
     // ── 5. ForceWake the manual-only display ───────────────────────────
     ctl.send(ControlMsg::ForceWake(DisplayId("manual".into())))
@@ -2629,13 +2746,42 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         "manual display must wake after ForceWake, marker={:?}",
         read(&manual_marker)
     );
-
-    // Poll until the snapshot reflects the phase transition (the wake
-    // command writes the marker before the engine processes WakeResult).
-    assert!(
-        wait_for_phase(&ctl, "manual", "active", Duration::from_secs(5)).await,
-        "manual-only display must be active after ForceWake"
-    );
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual blanked to waking",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanked,
+                    new_phase: dormant_core::state_machine::Phase::Waking,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual waking to active",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Waking,
+                    new_phase: dormant_core::state_machine::Phase::Active,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
 
     shutdown(handle, join).await;
 }

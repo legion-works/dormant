@@ -42,10 +42,19 @@ impl ReloadRequester {
     /// Create producers that feed `tx` and share one request-id sequence.
     #[must_use]
     pub fn new(tx: mpsc::Sender<ReloadRequest>) -> Self {
+        Self::new_with_observations(tx, ObservationHub::new(64))
+    }
+
+    /// Create producers that share an app-owned observation hub.
+    #[must_use]
+    pub fn new_with_observations(
+        tx: mpsc::Sender<ReloadRequest>,
+        observations: ObservationHub,
+    ) -> Self {
         Self {
             tx,
             next_request_id: Arc::new(AtomicU64::new(1)),
-            observations: ObservationHub::new(64),
+            observations,
         }
     }
 

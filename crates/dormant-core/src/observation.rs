@@ -88,12 +88,22 @@ pub enum DaemonObservation {
     },
     /// A correlated reload batch completed.
     ReloadCompleted(ReloadReceipt),
+    /// A generation finished draining its queued inputs before teardown.
+    GenerationDrained {
+        /// Generation that reached its drain barrier.
+        generation: GenerationId,
+    },
+    /// A generation was installed and can receive routed inputs.
+    GenerationStarted {
+        /// Generation that was installed.
+        generation: GenerationId,
+    },
     /// A display changed lifecycle phase.
     DisplayPhaseChanged {
         /// Generation that owns the rules engine.
         generation: GenerationId,
-        /// Rule whose display transitioned.
-        rule_id: RuleId,
+        /// Rule whose display transitioned; `None` for a manual/rule-less command path.
+        rule_id: Option<RuleId>,
         /// Display that transitioned.
         display_id: DisplayId,
         /// Phase before the transition.
@@ -192,6 +202,22 @@ mod tests {
         };
 
         assert_eq!(receipt.generation, GenerationId(7));
+    }
+
+    #[test]
+    fn manual_phase_observations_have_no_rule_identity() {
+        let observation = DaemonObservation::DisplayPhaseChanged {
+            generation: GenerationId(7),
+            rule_id: None,
+            display_id: DisplayId("manual".into()),
+            old_phase: Phase::Active,
+            new_phase: Phase::Blanking,
+        };
+
+        assert!(matches!(
+            observation,
+            DaemonObservation::DisplayPhaseChanged { rule_id: None, .. }
+        ));
     }
 
     #[tokio::test]

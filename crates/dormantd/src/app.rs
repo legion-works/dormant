@@ -270,6 +270,9 @@ pub struct App {
     #[cfg(feature = "render")]
     render_sink_builder: Option<RenderSinkBuilder>,
     notify_sink_builder: NotifySinkBuilder,
+    /// Daemon-local diagnostic hub, injected before start when startup
+    /// transitions must be observed by a test.
+    observations: ObservationHub,
     disable_ipc: bool,
     sd_notify: SdNotify,
     /// Test seam (T4): overrides the watchdog probe-arm's tick period,
@@ -390,6 +393,7 @@ impl App {
             #[cfg(feature = "render")]
             render_sink_builder: None,
             notify_sink_builder: default_notify_sink_builder(),
+            observations: ObservationHub::new(64),
             disable_ipc: false,
             sd_notify: SdNotify::from_env(),
             watchdog_interval: None,
@@ -430,6 +434,7 @@ impl App {
             #[cfg(feature = "render")]
             render_sink_builder: None,
             notify_sink_builder: default_notify_sink_builder(),
+            observations: ObservationHub::new(64),
             disable_ipc: false,
             sd_notify: SdNotify::from_env(),
             watchdog_interval: None,
@@ -591,6 +596,13 @@ impl App {
         self
     }
 
+    /// Replace the daemon-local observation hub before startup.
+    #[must_use]
+    pub fn with_observation_hub(mut self, observations: ObservationHub) -> Self {
+        self.observations = observations;
+        self
+    }
+
     fn validate_or_bail(
         config_path: &std::path::Path,
         creds_path: &std::path::Path,
@@ -694,7 +706,13 @@ impl App {
             None,
             notify_state.clone(),
             notify_sink.clone(),
+            GenerationId(0),
+            Some(self.observations.clone()),
         )?;
+        self.observations
+            .emit(DaemonObservation::GenerationStarted {
+                generation: GenerationId(0),
+            });
 
         // Executor-map watch channel for the wear tracker (spec §4.3):
         // seeded here from the first generation, republished by
@@ -732,7 +750,8 @@ impl App {
 
         let (reload_tx, _) = broadcast::channel(16);
         let (reload_request_tx, reload_request_rx) = mpsc::channel::<ReloadRequest>(32);
-        let reload_requester = ReloadRequester::new(reload_request_tx);
+        let reload_requester =
+            ReloadRequester::new_with_observations(reload_request_tx, self.observations.clone());
         let observations = reload_requester.observations();
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
@@ -1575,6 +1594,10 @@ impl Runner {
             gate.reach().await;
         }
         await_generation_barrier(&old_ctl).await;
+        self.observations
+            .emit(DaemonObservation::GenerationDrained {
+                generation: self.generation_id,
+            });
         teardown(&mut self.generation).await;
 
         // Verified physical wake of REMOVED displays (no executor in the new
@@ -1639,6 +1662,7 @@ impl Runner {
             reload::zero_changed_sensor_reported(&displays_filtered, &self.generation.cfg, &new_cfg)
         });
 
+        let next_generation = GenerationId(self.generation_id.0.saturating_add(1));
         let spawn_result = spawn_generation_for_reload(
             &self.state_dir,
             &self.root,
@@ -1648,6 +1672,8 @@ impl Runner {
             None,
             self.notify_state.clone(),
             self.notify_sink.clone(),
+            next_generation,
+            Some(self.observations.clone()),
         );
         // Test seam (F1): see `App::force_reload_spawn_failure` doc — no
         // config-only path reaches an `Err` here, so a test that needs to
@@ -1668,7 +1694,11 @@ impl Runner {
             Ok(spawn) => {
                 self.install_generation(spawn).await;
                 self.applied_revision = requested_revision.clone();
-                self.generation_id = GenerationId(self.generation_id.0.saturating_add(1));
+                self.generation_id = next_generation;
+                self.observations
+                    .emit(DaemonObservation::GenerationStarted {
+                        generation: self.generation_id,
+                    });
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a
                 // successful reload from the operator path while a
@@ -1923,8 +1953,16 @@ impl Runner {
             self.rollback_status.clone(),
             self.notify_state.clone(),
             self.notify_sink.clone(),
+            self.generation_id,
+            Some(self.observations.clone()),
         ) {
-            Ok(spawn) => self.install_generation(spawn).await,
+            Ok(spawn) => {
+                self.install_generation(spawn).await;
+                self.observations
+                    .emit(DaemonObservation::GenerationStarted {
+                        generation: self.generation_id,
+                    });
+            }
             Err(e) => tracing::error!(event = "reload_rebuild_old_failed", error = %e),
         }
     }
@@ -3237,7 +3275,8 @@ fn build_render_sinks(
 /// config reload.
 #[allow(
     clippy::too_many_lines,
-    reason = "generation construction keeps every producer handle visible at its spawn site"
+    clippy::too_many_arguments,
+    reason = "generation construction keeps every producer and daemon-lifetime handle visible at its spawn site"
 )]
 fn spawn_generation(
     root: &CancellationToken,
@@ -3247,6 +3286,8 @@ fn spawn_generation(
     rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
+    generation_id: GenerationId,
+    observations: Option<ObservationHub>,
 ) -> Result<GenSpawn> {
     let engine_token = root.child_token();
     let engine_cancel = engine_token.clone();
@@ -3271,6 +3312,9 @@ fn spawn_generation(
         Arc::new(AlwaysOwned),
     )
     .context("build engine")?;
+    if let Some(observations) = observations {
+        engine = engine.with_observation_hub(generation_id, observations);
+    }
 
     if let Some(detail) = pending {
         engine.set_pending_reload(Some(detail));
@@ -3465,6 +3509,8 @@ fn spawn_generation_for_reload(
     rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
+    generation_id: GenerationId,
+    observations: Option<ObservationHub>,
 ) -> Result<GenSpawn> {
     #[cfg(any(test, feature = "test-util"))]
     record_reload_spawn_rollback_for_test(state_dir, rollback.as_ref());
@@ -3477,6 +3523,8 @@ fn spawn_generation_for_reload(
         rollback,
         notify_state,
         notify_sink,
+        generation_id,
+        observations,
     )
 }
 

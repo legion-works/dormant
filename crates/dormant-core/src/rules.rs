@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::SensorKind;
 use crate::error::DormantError;
+use crate::observation::{DaemonObservation, GenerationId, ObservationHub};
 use crate::ownership::OwnershipGate;
 use crate::state_machine::{DisplayStateMachine, Effect, Input, SmTimings};
 use crate::traits::{CommandSink, PanelState, PowerState, RenderSink};
@@ -766,6 +767,8 @@ pub struct RulesEngine {
     results_tx: mpsc::UnboundedSender<InternalResult>,
     /// Broadcast bus for [`DaemonEvent`]s.
     event_tx: broadcast::Sender<DaemonEvent>,
+    /// Optional daemon-level diagnostic sink for lifecycle transitions.
+    observations: Option<(GenerationId, ObservationHub)>,
     /// Pending reload detail (operator feedback in snapshots).
     pending_reload: Option<String>,
     /// Boot-time rollback metadata (operator feedback in snapshots).
@@ -875,10 +878,18 @@ impl RulesEngine {
             results_rx,
             results_tx,
             event_tx,
+            observations: None,
             pending_reload: None,
             rollback: None,
             pending_restore: Vec::new(),
         })
+    }
+
+    /// Attach the daemon observation hub for this engine generation.
+    #[must_use]
+    pub fn with_observation_hub(mut self, generation: GenerationId, hub: ObservationHub) -> Self {
+        self.observations = Some((generation, hub));
+        self
     }
 
     /// Set or clear the pending-reload indicator (operator feedback in
@@ -914,10 +925,20 @@ impl RulesEngine {
         effects: Vec<Effect>,
         now: Tick,
     ) {
+        let mut phase_changes = Vec::new();
         if let Some(slot) = self.machines.get_mut(display) {
+            let old_phase = slot.phase().clone();
             *slot = machine;
+            let restored_phase = slot.phase().clone();
+            if old_phase != restored_phase {
+                phase_changes.push((old_phase, restored_phase));
+            }
             let owns = self.ownership.owns(display);
-            let refeed = slot.step(Input::OwnershipChanged(owns), now);
+            let (refeed, transition) =
+                slot.step_with_transition(Input::OwnershipChanged(owns), now);
+            if let Some(transition) = transition {
+                phase_changes.push(transition);
+            }
             self.last_owned.insert(display.clone(), owns);
             // Queue restore-phase-entry effects first, then the
             // ownership-edge effects — both drain via process_effect at
@@ -928,6 +949,9 @@ impl RulesEngine {
             let mut queued = effects;
             queued.extend(refeed);
             self.pending_restore.push((display.clone(), queued));
+        }
+        for (old_phase, new_phase) in phase_changes {
+            self.emit_phase_transition(display, old_phase, new_phase);
         }
     }
 
@@ -1161,17 +1185,8 @@ impl RulesEngine {
             for display_id in displays {
                 // Feed ownership so the gate verdict is current before
                 // processing the presence edge.
-                let own_effects = self.feed_ownership(&display_id, now);
-                for effect in own_effects {
-                    self.process_effect(&display_id, effect);
-                }
-                let Some(machine) = self.machines.get_mut(&display_id) else {
-                    continue;
-                };
-                let effects = machine.step(Input::ZonePresent(present), now);
-                for effect in effects {
-                    self.process_effect(&display_id, effect);
-                }
+                self.feed_ownership(&display_id, now);
+                self.step_machine(&display_id, Input::ZonePresent(present), now);
             }
         }
     }
@@ -1569,36 +1584,63 @@ impl RulesEngine {
     /// machine's `owned` flag always reflects the gate's current verdict.
     fn step_one(&mut self, display: &DisplayId, input: Input) {
         let now = Tick::now();
-        let own_effects = self.feed_ownership(display, now);
-        for effect in own_effects {
-            self.process_effect(display, effect);
-        }
+        self.feed_ownership(display, now);
+        self.step_machine(display, input, now);
+    }
+
+    /// Step a machine, forward a real phase change to diagnostics, then run
+    /// the resulting effects. Observations deliberately remain non-blocking.
+    fn step_machine(&mut self, display: &DisplayId, input: Input, now: Tick) {
         let Some(machine) = self.machines.get_mut(display) else {
             return;
         };
-        let effects = machine.step(input, now);
+        let (effects, transition) = machine.step_with_transition(input, now);
+        if let Some((old_phase, new_phase)) = transition {
+            self.emit_phase_transition(display, old_phase, new_phase);
+        }
         for effect in effects {
             self.process_effect(display, effect);
         }
+    }
+
+    fn emit_phase_transition(
+        &self,
+        display_id: &DisplayId,
+        old_phase: crate::state_machine::Phase,
+        new_phase: crate::state_machine::Phase,
+    ) {
+        let Some((generation, hub)) = &self.observations else {
+            return;
+        };
+        let rule_id = self
+            .rule_displays
+            .iter()
+            .filter(|(_, displays)| displays.contains(display_id))
+            .map(|(rule_id, _)| rule_id.clone())
+            .min();
+        hub.emit(DaemonObservation::DisplayPhaseChanged {
+            generation: *generation,
+            rule_id,
+            display_id: display_id.clone(),
+            old_phase,
+            new_phase,
+        });
     }
 
     /// Consult the [`OwnershipGate`] for `display` and, if the verdict
     /// differs from the last-fed value, feed
     /// [`Input::OwnershipChanged`] to the state machine.
     ///
-    /// Returns any effects the machine produced (e.g. teardown-render on
-    /// ownership-yield).  When the gate returns the same value as last
-    /// time this is a no-op (returns `vec![]`).
-    fn feed_ownership(&mut self, display: &DisplayId, now: Tick) -> Vec<Effect> {
+    /// Processes any effects the machine produced (e.g. teardown-render on
+    /// ownership-yield). When the gate returns the same value as last time,
+    /// this is a no-op.
+    fn feed_ownership(&mut self, display: &DisplayId, now: Tick) {
         let owns = self.ownership.owns(display);
         if self.last_owned.get(display) == Some(&owns) {
-            return vec![];
+            return;
         }
         self.last_owned.insert(display.clone(), owns);
-        let Some(machine) = self.machines.get_mut(display) else {
-            return vec![];
-        };
-        machine.step(Input::OwnershipChanged(owns), now)
+        self.step_machine(display, Input::OwnershipChanged(owns), now);
     }
 
     fn send_snapshot(&self, tx: oneshot::Sender<StateSnapshot>) {
@@ -1679,12 +1721,7 @@ impl RulesEngine {
                 // BEFORE `result` is moved into `machine.step` below —
                 // precedent: `let ok = result.is_ok();` in the Wake arm.
                 let failure: Option<CmdFailure> = result.as_ref().err().cloned();
-                if let Some(machine) = self.machines.get_mut(&display) {
-                    let effects = machine.step(Input::BlankResult { r#gen, result }, now);
-                    for effect in effects {
-                        self.process_effect(&display, effect);
-                    }
-                }
+                self.step_machine(&display, Input::BlankResult { r#gen, result }, now);
                 match failure {
                     Some(f) => {
                         self.last_blank_failed.insert(display.clone());
@@ -1707,12 +1744,7 @@ impl RulesEngine {
                 result,
             } => {
                 let ok = result.is_ok();
-                if let Some(machine) = self.machines.get_mut(&display) {
-                    let effects = machine.step(Input::WakeResult { r#gen, result }, now);
-                    for effect in effects {
-                        self.process_effect(&display, effect);
-                    }
-                }
+                self.step_machine(&display, Input::WakeResult { r#gen, result }, now);
                 if ok {
                     if let Some(n) = self.wake_attempts.remove(&display)
                         && n > 0
@@ -1736,12 +1768,7 @@ impl RulesEngine {
                 r#gen,
                 result,
             } => {
-                if let Some(machine) = self.machines.get_mut(&display) {
-                    let effects = machine.step(Input::RenderResult { r#gen, result }, now);
-                    for effect in effects {
-                        self.process_effect(&display, effect);
-                    }
-                }
+                self.step_machine(&display, Input::RenderResult { r#gen, result }, now);
             }
             InternalResult::ExerciseResume { rules } => {
                 // Off-run-loop exercise sequence completed (possibly
@@ -1781,29 +1808,16 @@ impl RulesEngine {
                 let Reverse((deadline, timer_entry)) = self.timers.pop().expect("peeked");
                 match timer_entry {
                     TimerEntry::DisplayTick(display) => {
-                        let own_effects = self.feed_ownership(&display, deadline);
-                        for effect in own_effects {
-                            self.process_effect(&display, effect);
-                        }
-                        if let Some(machine) = self.machines.get_mut(&display) {
-                            let effects = machine.step(Input::Tick, deadline);
-                            for effect in effects {
-                                self.process_effect(&display, effect);
-                            }
-                        }
+                        self.feed_ownership(&display, deadline);
+                        self.step_machine(&display, Input::Tick, deadline);
                     }
                     TimerEntry::DisplayStageTick(display, stage_gen) => {
-                        let own_effects = self.feed_ownership(&display, deadline);
-                        for effect in own_effects {
-                            self.process_effect(&display, effect);
-                        }
-                        if let Some(machine) = self.machines.get_mut(&display) {
-                            let effects =
-                                machine.step(Input::StageTick { r#gen: stage_gen }, deadline);
-                            for effect in effects {
-                                self.process_effect(&display, effect);
-                            }
-                        }
+                        self.feed_ownership(&display, deadline);
+                        self.step_machine(
+                            &display,
+                            Input::StageTick { r#gen: stage_gen },
+                            deadline,
+                        );
                     }
                     TimerEntry::HoldExpiry(sensor_id) => {
                         self.fire_hold_expiry(&sensor_id, deadline);
@@ -3406,6 +3420,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         results_rx,
         results_tx,
         event_tx,
+        observations: None,
         pending_reload: None,
         rollback: None,
         pending_restore: Vec::new(),
@@ -3506,6 +3521,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         results_rx,
         results_tx,
         event_tx,
+        observations: None,
         pending_reload: None,
         rollback: None,
         pending_restore: Vec::new(),

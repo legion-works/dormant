@@ -983,8 +983,21 @@ impl AppHandle {
 
     /// Request a reload and await the receipt registered before enqueueing it.
     pub async fn request_reload(&self, source: ReloadSource) -> Option<ReloadReceipt> {
-        let (_, receipt) = self.reload_requester.request(source).await?;
-        receipt.await.ok()
+        self.request_reload_with_id(source)
+            .await
+            .map(|(_, receipt)| receipt)
+    }
+
+    /// Request a reload and return the allocated request identity with its receipt.
+    ///
+    /// This additive API lets in-process callers prove that a returned receipt
+    /// belongs to their request rather than merely to a nearby reload attempt.
+    pub async fn request_reload_with_id(
+        &self,
+        source: ReloadSource,
+    ) -> Option<(u64, ReloadReceipt)> {
+        let (request_id, receipt) = self.reload_requester.request(source).await?;
+        receipt.await.ok().map(|receipt| (request_id, receipt))
     }
 
     /// Request a control-plane reload and await its correlated receipt.
@@ -2274,6 +2287,7 @@ async fn execute_reload_batch(
 
     let receipt = if requested_revision == runner.applied_revision {
         let outcome = ReloadOutcome::Reloaded;
+        // Keep the legacy terminal broadcast observable for out-of-process consumers.
         let _ = runner.reload_tx.send(outcome.clone());
         runner.reload_receipt(
             batch.request_ids,

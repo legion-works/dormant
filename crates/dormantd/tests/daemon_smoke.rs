@@ -15,6 +15,7 @@ use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::observation::ReloadSource;
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
@@ -269,6 +270,31 @@ wake_retry_interval = "1s"
 async fn shutdown(handle: dormantd::app::AppHandle, join: tokio::task::JoinHandle<()>) {
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
+
+async fn start_coordinator_app(
+    config_path: PathBuf,
+    creds_path: PathBuf,
+) -> (dormantd::app::AppHandle, tokio::task::JoinHandle<()>) {
+    App::build_with_sources(
+        config_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build coordinator app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .start()
+    .await
+    .expect("start coordinator app")
+}
+
+fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {
+    one_display_config(marker, "1s").replace(
+        "startup_holdoff = \"0s\"",
+        &format!("startup_holdoff = \"{startup_holdoff}\"\nreload_debounce = \"100ms\""),
+    )
 }
 
 /// Write a credentials file with correct 0o600 permissions (Unix).
@@ -1022,11 +1048,11 @@ async fn config_watch_updates_on_successful_reload_only() {
     let modified = one_display_config(&marker, "400ms")
         .replace("startup_holdoff = \"0s\"", "startup_holdoff = \"5s\"");
     fs::write(&cfg_path, &modified).unwrap();
-    let receipt = handle
-        .request_control_reload()
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
         .await
         .expect("control reload receipt");
-    assert!(receipt.request_ids.contains(&receipt.request_ids[0]));
+    assert!(receipt.request_ids.contains(&request_id));
     assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -1133,11 +1159,11 @@ async fn creds_watch_updates_on_successful_reload_only() {
 
     // Update the credentials and reload — watch must see the new value.
     let _creds_path = write_credentials(dir.path(), "ha_token = \"updated\"");
-    let receipt = handle
-        .request_control_reload()
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
         .await
         .expect("control reload receipt");
-    assert!(receipt.request_ids.contains(&receipt.request_ids[0]));
+    assert!(receipt.request_ids.contains(&request_id));
     assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -1184,6 +1210,180 @@ async fn creds_watch_updates_on_successful_reload_only() {
         no_change.is_err(),
         "creds watch must NOT update after a rejected reload"
     );
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_batches_watcher_and_control_for_one_revision() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    let (_, before) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("baseline receipt");
+    fs::write(&cfg_path, coordinator_config(&marker, "1s")).unwrap();
+    let (watcher, control) = tokio::join!(
+        handle.request_reload_with_id(ReloadSource::Watcher),
+        handle.request_reload_with_id(ReloadSource::Control),
+    );
+    let (watcher_id, watcher_receipt) = watcher.expect("watcher receipt");
+    let (control_id, control_receipt) = control.expect("control receipt");
+
+    assert_eq!(
+        watcher_receipt, control_receipt,
+        "one batch has one receipt"
+    );
+    assert!(watcher_receipt.request_ids.contains(&watcher_id));
+    assert!(watcher_receipt.request_ids.contains(&control_id));
+    assert!(watcher_receipt.sources.contains(&ReloadSource::Watcher));
+    assert!(watcher_receipt.sources.contains(&ReloadSource::Control));
+    assert!(!watcher_receipt.coalesced);
+    assert_eq!(watcher_receipt.generation.0, before.generation.0 + 1);
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_batches_watcher_and_web_apply_for_one_revision() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    fs::write(&cfg_path, coordinator_config(&marker, "2s")).unwrap();
+    let (watcher, web_apply) = tokio::join!(
+        handle.request_reload_with_id(ReloadSource::Watcher),
+        handle.request_reload_with_id(ReloadSource::WebApply),
+    );
+    let (watcher_id, watcher_receipt) = watcher.expect("watcher receipt");
+    let (web_id, web_receipt) = web_apply.expect("web-apply receipt");
+
+    assert_eq!(
+        watcher_receipt, web_receipt,
+        "web apply joins the watcher batch"
+    );
+    assert!(web_receipt.request_ids.contains(&watcher_id));
+    assert!(web_receipt.request_ids.contains(&web_id));
+    assert!(web_receipt.sources.contains(&ReloadSource::Watcher));
+    assert!(web_receipt.sources.contains(&ReloadSource::WebApply));
+    assert!(!web_receipt.coalesced);
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_late_watcher_for_unchanged_revision_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path, creds_path).await;
+
+    let (_, first) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("first receipt");
+    let (watcher_id, late) = handle
+        .request_reload_with_id(ReloadSource::Watcher)
+        .await
+        .expect("late watcher receipt");
+
+    assert!(late.request_ids.contains(&watcher_id));
+    assert!(late.coalesced);
+    assert_eq!(late.outcome, ReloadOutcome::Reloaded);
+    assert_eq!(
+        late.generation, first.generation,
+        "no generation was installed"
+    );
+    assert_eq!(late.applied_revision, first.applied_revision);
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_credentials_only_reload_changes_credentials_revision() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path, creds_path.clone()).await;
+
+    let (_, before) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("baseline receipt");
+    write_credentials(dir.path(), "# credentials-only change\n");
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("credentials receipt");
+
+    assert!(receipt.request_ids.contains(&request_id));
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    assert!(!receipt.coalesced);
+    assert_eq!(
+        receipt.requested_revision.config,
+        before.applied_revision.config
+    );
+    assert_ne!(
+        receipt.requested_revision.credentials,
+        before.applied_revision.credentials
+    );
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_rejects_invalid_request_with_its_own_receipt() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    fs::write(&cfg_path, coordinator_config(&marker, "1s")).unwrap();
+    let (_, valid) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("valid receipt");
+    assert_eq!(valid.outcome, ReloadOutcome::Reloaded);
+
+    fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
+    let (invalid_id, invalid) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("invalid receipt");
+
+    // Replacing the private one-shot with a shared broadcast receive lets this
+    // waiter observe `valid` above; its own ID makes that regression falsifiable.
+    assert!(invalid.request_ids.contains(&invalid_id));
+    assert!(matches!(invalid.outcome, ReloadOutcome::Rejected(_)));
 
     shutdown(handle, join).await;
 }

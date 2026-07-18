@@ -7,7 +7,7 @@ use std::sync::{
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::observation::{ReloadReceipt, ReloadSource};
+use crate::observation::{DaemonObservation, ObservationHub, ReloadReceipt, ReloadSource};
 
 /// Outcome of a reload attempt, published on the daemon-level reload bus.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,7 @@ pub struct ReloadRequest {
 pub struct ReloadRequester {
     tx: mpsc::Sender<ReloadRequest>,
     next_request_id: Arc<AtomicU64>,
+    observations: ObservationHub,
 }
 
 impl ReloadRequester {
@@ -44,6 +45,7 @@ impl ReloadRequester {
         Self {
             tx,
             next_request_id: Arc::new(AtomicU64::new(1)),
+            observations: ObservationHub::new(64),
         }
     }
 
@@ -75,6 +77,18 @@ impl ReloadRequester {
             })
             .await
             .is_ok()
+    }
+
+    /// Subscribe to daemon-owned causal observations for these requests.
+    #[must_use]
+    pub fn subscribe_observations(&self) -> tokio::sync::broadcast::Receiver<DaemonObservation> {
+        self.observations.subscribe()
+    }
+
+    /// Return the causal observation hub shared with the coordinator.
+    #[must_use]
+    pub fn observations(&self) -> ObservationHub {
+        self.observations.clone()
     }
 
     fn allocate_id(&self) -> u64 {

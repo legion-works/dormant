@@ -665,9 +665,9 @@ impl App {
         ));
 
         let (reload_tx, _) = broadcast::channel(16);
-        let observations = ObservationHub::new(64);
         let (reload_request_tx, reload_request_rx) = mpsc::channel::<ReloadRequest>(32);
         let reload_requester = ReloadRequester::new(reload_request_tx);
+        let observations = reload_requester.observations();
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));

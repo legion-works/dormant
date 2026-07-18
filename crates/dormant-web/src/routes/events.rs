@@ -3,7 +3,7 @@
 //! On WebSocket upgrade, subscribes to the engine event broadcast via
 //! [`ControlMsg::SubscribeEvents`] and streams each [`DaemonEvent`] as
 //! a JSON text frame.  The handler `select!`s over four sources:
-//! inbound client close, event receiver, reload outcomes, and a cancel
+//! inbound client close, event receiver, causal reload receipts, and a cancel
 //! token so an idle disconnect is observed immediately.
 //!
 //! ## Reload re-subscription (spec §3.2)
@@ -23,7 +23,7 @@
 //! The handler has exactly two stable states — `events = Some(ev_rx)`
 //! (streaming) and `events = None` (resubscribe failed; waiting for
 //! shutdown).  There is no flag tracking prior reload outcomes because
-//! every interleaving of `ReloadOutcome` and `ev_rx.recv()` resolves the
+//! every interleaving of [`DaemonObservation::ReloadCompleted`] and `ev_rx.recv()` resolves the
 //! same way:
 //!
 //! - A normal validation [`ReloadOutcome::Rejected`] NEVER closes
@@ -82,7 +82,7 @@ pub(crate) async fn ws_events(
 async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error> {
     let ctl_tx = state.inner.ctl_tx.clone();
     let cancel = state.inner.cancel.clone();
-    let mut reload_rx = state.inner.reload_rx.resubscribe();
+    let mut reload_rx = state.inner.reload_requester.subscribe_observations();
 
     let (mut tx, mut rx) = socket.split();
 
@@ -133,9 +133,10 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                     }
                 }
 
-                outcome = reload_rx.recv() => {
-                    match outcome {
-                        Ok(ReloadOutcome::Reloaded) => {
+                observation = reload_rx.recv() => {
+                    match observation {
+                        Ok(dormant_core::observation::DaemonObservation::ReloadCompleted(receipt)) => match receipt.outcome {
+                        ReloadOutcome::Reloaded => {
                             // Only job is announcing the reload to the
                             // frontend.  Resubscription is driven by
                             // the `Closed` branch above so the handler
@@ -146,7 +147,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                                 .unwrap_or_default();
                             let _ = tx.send(Message::Text(frame)).await;
                         }
-                        Ok(ReloadOutcome::Rejected(detail)) => {
+                        ReloadOutcome::Rejected(detail) => {
                             // Emit a rejected frame so the frontend can
                             // show the validation failure.  The events
                             // receiver is still valid (normal reject
@@ -160,8 +161,10 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                                 serde_json::to_string(&frame).unwrap_or_default();
                             let _ = tx.send(Message::Text(text)).await;
                         }
+                        },
+                        Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            reload_rx = state.inner.reload_rx.resubscribe();
+                            reload_rx = state.inner.reload_requester.subscribe_observations();
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             return Ok(());
@@ -180,15 +183,16 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
 
                 () = cancel.cancelled() => return Ok(()),
 
-                outcome = reload_rx.recv() => {
-                    match outcome {
-                        Ok(ReloadOutcome::Reloaded) => {
+                observation = reload_rx.recv() => {
+                    match observation {
+                        Ok(dormant_core::observation::DaemonObservation::ReloadCompleted(receipt)) => match receipt.outcome {
+                        ReloadOutcome::Reloaded => {
                             let frame = serde_json::to_string(&DaemonEvent::ConfigReloaded)
                                 .unwrap_or_default();
                             let _ = tx.send(Message::Text(frame)).await;
                             events = resubscribe_events(&ctl_tx).await.ok();
                         }
-                        Ok(ReloadOutcome::Rejected(detail)) => {
+                        ReloadOutcome::Rejected(detail) => {
                             // Emit the reject frame even when the
                             // events channel lagged — the frontend
                             // must see the validation failure.
@@ -204,8 +208,10 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                             // currently running.
                             events = resubscribe_events(&ctl_tx).await.ok();
                         }
+                        },
+                        Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            reload_rx = state.inner.reload_rx.resubscribe();
+                            reload_rx = state.inner.reload_requester.subscribe_observations();
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             return Ok(());
@@ -250,6 +256,7 @@ mod tests {
     use axum::routing::get;
 
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
+    use dormant_core::observation::DaemonObservation;
     use dormant_core::types::SensorState;
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -260,15 +267,30 @@ mod tests {
 
     use futures_util::StreamExt;
 
+    fn emit_reload(
+        observations: &dormant_core::observation::ObservationHub,
+        outcome: ReloadOutcome,
+    ) {
+        let revision = dormant_core::observation::RuntimeRevision {
+            config: dormant_core::observation::ContentRevision::from_bytes(b"test"),
+            credentials: dormant_core::observation::ContentRevision::missing(),
+        };
+        observations.emit(DaemonObservation::ReloadCompleted(
+            dormant_core::observation::ReloadReceipt {
+                request_ids: vec![1],
+                sources: vec![dormant_core::observation::ReloadSource::Control],
+                requested_revision: revision.clone(),
+                applied_revision: revision,
+                generation: dormant_core::observation::GenerationId(1),
+                outcome,
+                coalesced: false,
+            },
+        ));
+    }
+
     struct TestHarness {
         event_tx: broadcast::Sender<DaemonEvent>,
-        // Held to keep the reload broadcast's Sender alive for the
-        // whole test: `stream_events` calls `state.inner.reload_rx
-        // .resubscribe()` per WS connection, which requires the channel
-        // to still have a Sender.  Dropping it earlier closes the
-        // channel and forces every handler out via `Closed`.
-        #[allow(dead_code)]
-        reload_tx: broadcast::Sender<ReloadOutcome>,
+        observations: dormant_core::observation::ObservationHub,
         cancel: CancellationToken,
         addr: SocketAddr,
     }
@@ -276,7 +298,7 @@ mod tests {
     async fn harness() -> TestHarness {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
-        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (_reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
         let (event_tx, _event_rx) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
@@ -300,6 +322,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -308,7 +333,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -350,7 +375,7 @@ mod tests {
 
         TestHarness {
             event_tx,
-            reload_tx,
+            observations,
             cancel,
             addr,
         }
@@ -443,6 +468,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -451,7 +479,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -558,6 +586,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -566,7 +597,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -645,7 +676,7 @@ mod tests {
     async fn reload_resubscribe_keeps_streaming_and_emits_config_reloaded() {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
-        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (_reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
         let (gen1_tx, _gen1_rx) = broadcast::channel::<DaemonEvent>(64);
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
@@ -670,6 +701,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -678,7 +712,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -777,7 +811,7 @@ mod tests {
         let _ = drop_gen1_tx.send(());
         drop(gen1_tx);
         let _ = phase_tx.send(2).await;
-        let _ = reload_tx.send(ReloadOutcome::Reloaded);
+        emit_reload(&observations, ReloadOutcome::Reloaded);
 
         // The next frame MUST be config_reloaded (MUST 3).
         let reload_frame = recv_json(&mut ws).await;
@@ -808,7 +842,7 @@ mod tests {
     async fn rejected_resubscribes_when_events_closed() {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
-        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (_reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
         let (gen1_tx, _gen1_rx) = broadcast::channel::<DaemonEvent>(64);
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
@@ -833,6 +867,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -841,7 +878,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -927,7 +964,10 @@ mod tests {
         // deferred-close flag is meant to recover.
         let _ = drop_gen1_tx.send(());
         drop(gen1_tx);
-        let _ = reload_tx.send(ReloadOutcome::Rejected("rebuild rejected".into()));
+        emit_reload(
+            &observations,
+            ReloadOutcome::Rejected("rebuild rejected".into()),
+        );
 
         // Wait until the engine has handed the handler a fresh gen2
         // subscription BEFORE we publish the post-teardown event —
@@ -975,7 +1015,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
-        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (_reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
         let (event_tx, _) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
@@ -999,6 +1039,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -1007,7 +1050,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -1069,7 +1112,7 @@ mod tests {
         // deferred-close fix, the handler arms the flag and keeps streaming
         // on ev_rx. With the buggy drain-then-resubscribe, it replaces
         // ev_rx during the 50ms engine delay, dropping anything buffered.
-        let _ = reload_tx.send(ReloadOutcome::Rejected("bad config".into()));
+        emit_reload(&observations, ReloadOutcome::Rejected("bad config".into()));
 
         // Three events sent back-to-back on the SAME broadcast. With the
         // buggy handler, all three land in the OLD receiver's buffer and
@@ -1134,7 +1177,7 @@ mod tests {
     async fn stale_reject_flag_does_not_drop_new_gen_event() {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
-        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (_reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
         let (gen1_tx, _gen1_rx) = broadcast::channel::<DaemonEvent>(64);
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
@@ -1159,6 +1202,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -1167,7 +1213,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -1250,7 +1296,7 @@ mod tests {
         // Step 1: normal validation Reject — gen1 stays alive.  On the
         // OLD sticky-flag code this would set `resubscribe_on_close =
         // true`; on the new design it does nothing to the receiver.
-        let _ = reload_tx.send(ReloadOutcome::Rejected("validation".into()));
+        emit_reload(&observations, ReloadOutcome::Rejected("validation".into()));
 
         // Drain the config_reload_rejected frame emitted by the Rejected
         // arm before continuing — it arrives before the Closed/Reloaded
@@ -1262,7 +1308,7 @@ mod tests {
         // Step 2: daemon tears down gen1 BEFORE publishing Reloaded.
         let _ = drop_gen1_tx.send(());
         drop(gen1_tx);
-        let _ = reload_tx.send(ReloadOutcome::Reloaded);
+        emit_reload(&observations, ReloadOutcome::Reloaded);
 
         // Step 3: wait for the FIRST post-initial resubscribe to
         // complete.  On the new design this is the only resubscribe
@@ -1332,9 +1378,10 @@ mod tests {
         assert_eq!(f1["sensor"], "flowing-pre");
 
         // Normal reject — flowing arm should emit the reject frame.
-        let _ = harness
-            .reload_tx
-            .send(ReloadOutcome::Rejected("bad sensor config".into()));
+        emit_reload(
+            &harness.observations,
+            ReloadOutcome::Rejected("bad sensor config".into()),
+        );
 
         let reject_frame = recv_json(&mut ws).await;
         assert_eq!(reject_frame["event"], "config_reload_rejected");
@@ -1361,7 +1408,7 @@ mod tests {
     async fn rejected_recovery_emits_config_reload_rejected_frame() {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
-        let (reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
+        let (_reload_tx, reload_rx) = broadcast::channel::<ReloadOutcome>(16);
         let (gen1_tx, _gen1_rx) = broadcast::channel::<DaemonEvent>(64);
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
@@ -1386,6 +1433,9 @@ mod tests {
         let (reload_trigger_tx, reload_trigger_rx) =
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
+        let reload_requester = dormant_core::reload::ReloadRequester::new(reload_trigger_tx);
+        let observations = reload_requester.observations();
+        let _ = &observations;
 
         let doctor =
             dormant_doctor::DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
@@ -1394,7 +1444,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
+                reload_requester,
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -1483,7 +1533,10 @@ mod tests {
 
         // Send Rejected NOW, while the handler is genuinely in
         // events=None.  The frame can only come from the recovery arm.
-        let _ = reload_tx.send(ReloadOutcome::Rejected("rebuild rejected".into()));
+        emit_reload(
+            &observations,
+            ReloadOutcome::Rejected("rebuild rejected".into()),
+        );
 
         // The handler must emit config_reload_rejected BEFORE resubscribing.
         let reject_frame = recv_json(&mut ws).await;

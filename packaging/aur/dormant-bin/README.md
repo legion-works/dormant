@@ -9,11 +9,15 @@ from the upstream GitHub releases. No compilation needed.
 
 ## Publishing to AUR
 
-Publishing requires the maintainer's AUR SSH key, which is out of scope for
-this repository. The package lives here so the PKGBUILD can be versioned
-alongside the source.
+`.github/workflows/publish-aur.yml` publishes `dormant-bin` automatically on
+each release, after the GitHub release assets are public. It updates `pkgver`,
+resets `pkgrel`, recomputes checksums, regenerates `.SRCINFO`, and pushes the
+result to AUR.
 
-## Updating for a new release
+The in-repository PKGBUILD is a template. Its `pkgver` and `sha256sums` can lag
+the AUR-published package between releases.
+
+## Manual fallback for a new release
 
 ```bash
 # Bump pkgver in PKGBUILD

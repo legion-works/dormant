@@ -1,0 +1,45 @@
+name: Publish dormant-bin to AUR
+#
+# Updates dormant-bin after GitHub release assets are public, so PKGBUILD source
+# URLs resolve when updpkgsums runs. Re-running an already-published version
+# produces an empty commit and fails harmlessly without affecting the release.
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-aur:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Derive release version
+        id: version
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Update PKGBUILD version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i -E \
+            -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+            -e 's/^pkgrel=.*/pkgrel=1/' \
+            packaging/aur/dormant-bin/PKGBUILD
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: dormant-bin
+          pkgbuild: packaging/aur/dormant-bin/PKGBUILD
+          updpkgsums: true
+          test: true
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_username: LegionWorks
+          commit_email: aur@legionworks.dev
+          commit_message: "dormant-bin: bump to ${{ steps.version.outputs.version }}"
+          allow_empty_commits: false

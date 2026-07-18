@@ -145,7 +145,8 @@ mod tests {
     fn test_web_state(ctl_tx: mpsc::Sender<ControlMsg>) -> (WebState, CancellationToken) {
         let cancel = CancellationToken::new();
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = broadcast::channel(16);
 
         let config = Arc::new(Config {
@@ -175,7 +176,7 @@ mod tests {
 
         let state = WebState::new(WebStateInner::new_for_test(WebStateInnerParams {
             ctl_tx,
-            reload_trigger: reload_trigger_tx,
+            reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
             reload_rx,
             config_rx,
             creds_rx,

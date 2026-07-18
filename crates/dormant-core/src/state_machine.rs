@@ -1099,6 +1099,24 @@ impl DisplayStateMachine {
         result
     }
 
+    /// Feed an input and report the lifecycle transition it caused, if any.
+    ///
+    /// The effect list remains available through [`Self::step`] for callers
+    /// that do not need diagnostics; rules-engine observation forwarding uses
+    /// this form so transitions are reported at their owning state machine.
+    #[must_use]
+    pub fn step_with_transition(
+        &mut self,
+        input: Input,
+        now: Tick,
+    ) -> (Vec<Effect>, Option<(Phase, Phase)>) {
+        let old_phase = self.phase.clone();
+        let effects = self.step(input, now);
+        let new_phase = self.phase.clone();
+        let transition = (old_phase != new_phase).then_some((old_phase, new_phase));
+        (effects, transition)
+    }
+
     /// Return the current phase.
     #[must_use]
     pub fn phase(&self) -> &Phase {

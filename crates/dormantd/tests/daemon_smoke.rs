@@ -15,10 +15,13 @@ use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::observation::{DaemonObservation, GenerationId, ObservationHub, ReloadSource};
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
-use dormantd::app::{App, ReloadOutcome, validate_only};
+use dormantd::app::{
+    App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
+};
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
@@ -229,6 +232,35 @@ async fn wait_for<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
     pred()
 }
 
+/// Receive the next observation matching `predicate`, retaining unrelated
+/// diagnostics so a test awaits a transition instead of a scheduler delay.
+async fn recv_observation(
+    observations: &mut broadcast::Receiver<DaemonObservation>,
+    timeout: Duration,
+    label: &str,
+    predicate: impl Fn(&DaemonObservation) -> bool,
+) -> DaemonObservation {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {label}; saw {seen:?}"
+        );
+
+        match tokio::time::timeout(remaining, observations.recv()).await {
+            Ok(Ok(observation)) if predicate(&observation) => return observation,
+            Ok(Ok(observation)) => seen.push(observation),
+            Ok(Err(error)) => {
+                panic!("observation stream failed waiting for {label}: {error}; saw {seen:?}")
+            }
+            Err(error) => panic!("timed out waiting for {label}: {error}; saw {seen:?}"),
+        }
+    }
+}
+
 /// One-display `command`-controller config with tunable grace and marker path.
 fn one_display_config(marker: &Path, grace: &str) -> String {
     format!(
@@ -269,6 +301,31 @@ wake_retry_interval = "1s"
 async fn shutdown(handle: dormantd::app::AppHandle, join: tokio::task::JoinHandle<()>) {
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+}
+
+async fn start_coordinator_app(
+    config_path: PathBuf,
+    creds_path: PathBuf,
+) -> (dormantd::app::AppHandle, tokio::task::JoinHandle<()>) {
+    App::build_with_sources(
+        config_path,
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build coordinator app")
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc()
+    .start()
+    .await
+    .expect("start coordinator app")
+}
+
+fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {
+    one_display_config(marker, "1s").replace(
+        "startup_holdoff = \"0s\"",
+        &format!("startup_holdoff = \"{startup_holdoff}\"\nreload_debounce = \"100ms\""),
+    )
 }
 
 /// Write a credentials file with correct 0o600 permissions (Unix).
@@ -840,7 +897,14 @@ async fn reload_defensive_wake_retained() {
 
     // Reload while the display stays rule-controlled: the rebuilt machine
     // restarts Active, so the still-dark panel must get a defensive wake.
-    fs::write(&cfg_path, one_display_config(&marker, "150ms")).unwrap();
+    fs::write(
+        &cfg_path,
+        format!(
+            "{}\n# retain a distinct content revision",
+            one_display_config(&marker, "150ms")
+        ),
+    )
+    .unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -970,15 +1034,10 @@ async fn ruleless_display_preserves_phase_on_reload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
-    clippy::await_holding_lock,
-    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
-              count step-boundary tests it would otherwise contaminate — test-local, always \
-              released promptly at test end"
+    clippy::too_many_lines,
+    reason = "the test keeps the complete reload observation sequence adjacent to its config mutation"
 )]
 async fn config_watch_updates_on_successful_reload_only() {
-    let _capture_guard = capture_count_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -989,6 +1048,8 @@ async fn config_watch_updates_on_successful_reload_only() {
     let creds_path = dir.path().join("credentials.toml");
 
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let observations = ObservationHub::new(64);
+    let mut observation_rx = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -997,75 +1058,112 @@ async fn config_watch_updates_on_successful_reload_only() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
-    let mut reloads = handle.subscribe_reload();
 
     let mut config_watch = handle.config_watch();
     let initial_holdoff = config_watch.borrow_and_update().daemon.startup_holdoff;
     assert_eq!(initial_holdoff, Duration::from_secs(0));
 
-    // Wait for the initial blank so the run loop has fully settled.
+    // The marker proves controller execution; the observation below proves
+    // the owning state-machine transition.
     assert!(
         wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
         "first blank should occur"
     );
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "rule display blanking to blanked",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanking,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
 
     // Write a valid config with a different startup_holdoff and reload.
     let modified = one_display_config(&marker, "400ms")
         .replace("startup_holdoff = \"0s\"", "startup_holdoff = \"5s\"");
     fs::write(&cfg_path, &modified).unwrap();
-    assert!(handle.trigger_reload().await);
-
-    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
         .await
-        .expect("reload outcome in time")
-        .expect("reload bus open");
-    assert_eq!(outcome, ReloadOutcome::Reloaded);
-
-    // Poll (not a single `changed()`) for the updated value: `changed()`
-    // marks the CURRENT value seen and resolves on ANY send since the last
-    // `borrow_and_update()`/subscribe — under CI scheduler jitter a prior,
-    // now-superseded notification can still be pending and `changed()` can
-    // return before the reload's own send_replace has landed, so the very
-    // next `borrow()` reads a stale pre-reload value (issue #92). A bounded
-    // poll on the actual target value is immune to which notification
-    // `changed()` happened to resolve against. Manual loop (not the
-    // `wait_for` helper) because `borrow_and_update()` needs `&mut`.
-    let poll_start = Instant::now();
-    let reflected = loop {
-        if config_watch.borrow_and_update().daemon.startup_holdoff == Duration::from_secs(5) {
-            break true;
-        }
-        if poll_start.elapsed() >= Duration::from_secs(2) {
-            break false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert!(
-        reflected,
-        "config watch must reflect successful reload, got startup_holdoff={:?}",
-        config_watch.borrow().daemon.startup_holdoff
+        .expect("control reload receipt");
+    assert!(receipt.request_ids.contains(&request_id));
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero drained",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationDrained {
+                    generation: GenerationId(0)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one started",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationStarted {
+                    generation: GenerationId(1)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "reload completed for generation one",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::ReloadCompleted(receipt)
+                    if receipt.generation == GenerationId(1)
+                        && receipt.outcome == ReloadOutcome::Reloaded
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        config_watch.borrow_and_update().daemon.startup_holdoff,
+        Duration::from_secs(5),
+        "config watch must reflect successful reload"
     );
 
     // Now trigger a rejected reload — the watch must NOT change.
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
-    assert!(handle.trigger_reload().await);
+    let (rejected_request_id, rejected) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("rejected control reload receipt");
+    assert!(rejected.request_ids.contains(&rejected_request_id));
+    assert!(matches!(rejected.outcome, ReloadOutcome::Rejected(_)));
 
-    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(3)).await;
-    match outcome {
-        ReloadOutcome::Rejected(_) => {}
-        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
-    }
-
-    // The watch should NOT have changed after a rejected reload. The prior
-    // `borrow_and_update()` poll above already marked the successful-reload
-    // value seen, so `changed()` here can only resolve on a NEW send — a
-    // short timeout confirming none arrives is the correct (not stale-prone)
-    // check for this negative assertion.
-    let no_change = tokio::time::timeout(Duration::from_millis(300), config_watch.changed()).await;
+    // The receipt resolves only after this request has completed, so the
+    // watch's change bit is a deterministic post-reload assertion.
     assert!(
-        no_change.is_err(),
+        !config_watch
+            .has_changed()
+            .expect("config watch sender stays open"),
         "config watch must NOT update after a rejected reload"
     );
 
@@ -1121,7 +1219,12 @@ async fn creds_watch_updates_on_successful_reload_only() {
 
     // Update the credentials and reload — watch must see the new value.
     let _creds_path = write_credentials(dir.path(), "ha_token = \"updated\"");
-    assert!(handle.trigger_reload().await);
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("control reload receipt");
+    assert!(receipt.request_ids.contains(&request_id));
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
         .await
@@ -1154,19 +1257,288 @@ async fn creds_watch_updates_on_successful_reload_only() {
 
     // Trigger a rejected reload — creds watch must NOT change.
     fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
-    assert!(handle.trigger_reload().await);
+    let (rejected_request_id, rejected) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("rejected control reload receipt");
+    assert!(rejected.request_ids.contains(&rejected_request_id));
+    assert!(matches!(rejected.outcome, ReloadOutcome::Rejected(_)));
 
-    let outcome = recv_terminal_outcome(&mut reloads, Duration::from_secs(3)).await;
-    match outcome {
-        ReloadOutcome::Rejected(_) => {}
-        ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
-    }
-
-    let no_change = tokio::time::timeout(Duration::from_millis(300), creds_watch.changed()).await;
+    // The receipt resolves only after this request has completed, so the
+    // watch's change bit is a deterministic post-reload assertion.
     assert!(
-        no_change.is_err(),
+        !creds_watch
+            .has_changed()
+            .expect("credentials watch sender stays open"),
         "creds watch must NOT update after a rejected reload"
     );
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_batches_watcher_and_control_for_one_revision() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    let (_, before) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("baseline receipt");
+    fs::write(&cfg_path, coordinator_config(&marker, "1s")).unwrap();
+    let (watcher, control) = tokio::join!(
+        handle.request_reload_with_id(ReloadSource::Watcher),
+        handle.request_reload_with_id(ReloadSource::Control),
+    );
+    let (watcher_id, watcher_receipt) = watcher.expect("watcher receipt");
+    let (control_id, control_receipt) = control.expect("control receipt");
+
+    assert_eq!(
+        watcher_receipt, control_receipt,
+        "one batch has one receipt"
+    );
+    assert!(watcher_receipt.request_ids.contains(&watcher_id));
+    assert!(watcher_receipt.request_ids.contains(&control_id));
+    assert!(watcher_receipt.sources.contains(&ReloadSource::Watcher));
+    assert!(watcher_receipt.sources.contains(&ReloadSource::Control));
+    assert!(!watcher_receipt.coalesced);
+    assert_eq!(watcher_receipt.generation.0, before.generation.0 + 1);
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_batches_watcher_and_web_apply_for_one_revision() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    fs::write(&cfg_path, coordinator_config(&marker, "2s")).unwrap();
+    let (watcher, web_apply) = tokio::join!(
+        handle.request_reload_with_id(ReloadSource::Watcher),
+        handle.request_reload_with_id(ReloadSource::WebApply),
+    );
+    let (watcher_id, watcher_receipt) = watcher.expect("watcher receipt");
+    let (web_id, web_receipt) = web_apply.expect("web-apply receipt");
+
+    assert_eq!(
+        watcher_receipt, web_receipt,
+        "web apply joins the watcher batch"
+    );
+    assert!(web_receipt.request_ids.contains(&watcher_id));
+    assert!(web_receipt.request_ids.contains(&web_id));
+    assert!(web_receipt.sources.contains(&ReloadSource::Watcher));
+    assert!(web_receipt.sources.contains(&ReloadSource::WebApply));
+    assert!(!web_receipt.coalesced);
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_late_watcher_for_unchanged_revision_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path, creds_path).await;
+
+    let (_, first) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("first receipt");
+    let (watcher_id, late) = handle
+        .request_reload_with_id(ReloadSource::Watcher)
+        .await
+        .expect("late watcher receipt");
+
+    assert!(late.request_ids.contains(&watcher_id));
+    assert!(late.coalesced);
+    assert_eq!(late.outcome, ReloadOutcome::Reloaded);
+    assert_eq!(
+        late.generation, first.generation,
+        "no generation was installed"
+    );
+    assert_eq!(late.applied_revision, first.applied_revision);
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_credentials_only_reload_changes_credentials_revision() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path, creds_path.clone()).await;
+
+    let (_, before) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("baseline receipt");
+    write_credentials(dir.path(), "# credentials-only change\n");
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("credentials receipt");
+
+    assert!(receipt.request_ids.contains(&request_id));
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    assert!(!receipt.coalesced);
+    assert_eq!(
+        receipt.requested_revision.config,
+        before.applied_revision.config
+    );
+    assert_ne!(
+        receipt.requested_revision.credentials,
+        before.applied_revision.credentials
+    );
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_rejects_invalid_request_with_its_own_receipt() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    fs::write(&cfg_path, coordinator_config(&marker, "1s")).unwrap();
+    let (_, valid) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("valid receipt");
+    assert_eq!(valid.outcome, ReloadOutcome::Reloaded);
+
+    fs::write(&cfg_path, "config_version = 1\nbogus = true\n").unwrap();
+    let (invalid_id, invalid) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("invalid receipt");
+
+    // Replacing the private one-shot with a shared broadcast receive lets this
+    // waiter observe `valid` above; its own ID makes that regression falsifiable.
+    assert!(invalid.request_ids.contains(&invalid_id));
+    assert!(matches!(invalid.outcome, ReloadOutcome::Rejected(_)));
+
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_reload_inputs_are_delivered_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    let old_event_marker = dir.path().join("old-event-marker");
+    let old_control_marker = dir.path().join("old-control-marker");
+    let new_event_marker = dir.path().join("new-event-marker");
+    let new_control_marker = dir.path().join("new-control-marker");
+    let generation_swap_config = |event_marker: &Path, control_marker: &Path| {
+        format!(
+            "{}\n[displays.manual]\ncontrollers = [\"command\"]\nblank_mode = \"power_off\"\nblank_command = \"printf B >> '{}'\"\nwake_command = \"printf W >> '{}'\"\nmodes = [\"power_off\"]\n",
+            one_display_config(event_marker, "0s"),
+            control_marker.display(),
+            control_marker.display(),
+        )
+    };
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &generation_swap_config(&old_event_marker, &old_control_marker),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let gate = GenerationBarrierGate::new();
+    let (handle, join) = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_test_generation_barrier_gate(gate.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+
+    fs::write(
+        &cfg_path,
+        generation_swap_config(&new_event_marker, &new_control_marker).replace(
+            "startup_holdoff = \"0s\"",
+            "startup_holdoff = \"0s\"\nreload_debounce = \"1ms\"",
+        ),
+    )
+    .unwrap();
+
+    let events = handle.events_sender();
+    let controls = handle.control_sender();
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before reaching the old-generation drain"),
+            result = tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered()) => {
+                assert!(result.is_ok(), "reload did not pause at the old-generation drain");
+            }
+        }
+
+        events.send(ev("desk", SensorState::Absent)).await.unwrap();
+        controls
+            .send(ControlMsg::ForceBlank(DisplayId("manual".into())))
+            .await
+            .unwrap();
+        gate.release();
+
+        let (_, receipt) = tokio::time::timeout(Duration::from_secs(5), reload)
+            .await
+            .expect("reload completes")
+            .expect("reload receipt");
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    }
+    assert!(
+        wait_for(
+            || count(&new_event_marker, 'B') == 1 && count(&new_control_marker, 'B') == 1,
+            Duration::from_secs(2),
+        )
+        .await
+    );
+    assert_eq!(
+        count(&old_event_marker, 'B'),
+        0,
+        "event reached old generation"
+    );
+    assert_eq!(
+        count(&old_control_marker, 'B'),
+        0,
+        "control reached old generation"
+    );
+    assert_eq!(count(&new_event_marker, 'B'), 1, "event handled once");
+    assert_eq!(count(&new_control_marker, 'B'), 1, "control handled once");
 
     shutdown(handle, join).await;
 }
@@ -1586,22 +1958,8 @@ wake_retry_interval = "1s"
     /// Uses a two-display config where mon2 has `wake_command = "false"`
     /// so its verified wake fails on removal, triggering `rebuild_old`.
     ///
-    /// **Determinism — identity-based, no counts.** The test factory pairs
-    /// each render sink it builds with the `InputWake` sender it was handed,
-    /// in build order.  Selection never counts invocations (that total is
-    /// environment-dependent — a single `fs::write` can wake both
-    /// `trigger_reload` and the config watcher, and CPU load shifts timing).
-    /// Instead, after draining the reload bus until quiet (so the installed
-    /// generation is FINAL) and re-driving the engine to a render stage, the
-    /// test selects the sink pinned by three identity marks: index >= 2 (only
-    /// a rollback generation lands here — indices 0..2 are the initial
-    /// assembly, and a rejected new-assembly's sink is dropped before its
-    /// generation is ever spawned, so it never renders), a LIVE sender (only
-    /// the CURRENT generation's `InputWake` receiver is still held by a drain
-    /// — superseded rollbacks are closed), and an actual `RenderBlack` (so a
-    /// teardown is observable).  Among matches it takes the highest index
-    /// (build order → newest generation).  No control-channel bypass, no
-    /// count gate.
+    /// The exact rejected receipt and its matching completion observation make
+    /// the restored generation observable without timing a quiet reload bus.
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(
@@ -1708,7 +2066,7 @@ wake_retry_interval = "1s"
         .disable_ipc();
 
         let (handle, join) = app.start().await.expect("start app");
-        let mut reloads = handle.subscribe_reload();
+        let mut observations = handle.subscribe_observations();
 
         // Both displays blank + render — some initial sink shows RenderBlack.
         let show_ok = wait_for(
@@ -1762,13 +2120,12 @@ wake_retry_interval = "1s"
             m1 = m1.display(),
         );
         fs::write(&cfg_path, &cfg_single).unwrap();
-        assert!(handle.trigger_reload().await);
-
-        let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        let (request_id, receipt) = handle
+            .request_reload_with_id(ReloadSource::Control)
             .await
-            .expect("reload outcome")
-            .expect("reload bus open");
-        match outcome {
+            .expect("rejected reload receipt");
+        assert!(receipt.request_ids.contains(&request_id));
+        match &receipt.outcome {
             ReloadOutcome::Rejected(detail) => {
                 assert!(
                     detail.contains("mon2"),
@@ -1779,44 +2136,35 @@ wake_retry_interval = "1s"
                 panic!("expected Rejected on mon2 wake failure, got Reloaded")
             }
         }
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match observations.recv().await.expect("observation bus open") {
+                    dormant_core::observation::DaemonObservation::ReloadCompleted(observed)
+                        if observed.request_ids.contains(&request_id) =>
+                    {
+                        break observed;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("matching reload completion observation");
+        assert_eq!(
+            observed, receipt,
+            "completion observes the restored generation"
+        );
 
-        // A single `fs::write` wakes BOTH the explicit `trigger_reload` AND
-        // the config file watcher, and `run_loop` services reload triggers
-        // serially — so a SECOND (watcher-driven) reload can follow the
-        // first, replacing its rollback generation (a `tokio::select!` race).
-        // Drain the reload bus until it goes quiet for longer than
-        // `reload_debounce` (500ms default): once no further outcome arrives
-        // and the test issues no more config writes, no new reload cycle can
-        // start, so the generation now installed is FINAL.
-        while (tokio::time::timeout(Duration::from_millis(900), reloads.recv()).await).is_ok() {
-            // Keep draining until the bus is quiet.
-        }
-
-        // Drive the final restored generation back to a render stage so its
-        // rollback sink renders and a teardown becomes observable.
-        let events = handle.events_sender();
-        let _ = events.send(ev("desk", SensorState::Present)).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = events.send(ev("desk", SensorState::Absent)).await;
-
-        // Identity selection (NO counts): find the render sink of the CURRENT
-        // (final) generation and use ITS own channel.  Three identity marks
-        // pin it exactly:
-        //   * index >= 2 — indices 0..2 are the initial assembly; a rejected
-        //     new-assembly's sink is dropped before its generation is ever
-        //     spawned, so only a rollback generation's sink lands here;
-        //   * a LIVE sender (`!is_closed()`) — a generation's `InputWake`
-        //     receiver is held by its spawned drain and dropped when the
-        //     generation is torn down, so only the CURRENT generation's sink
-        //     still has an open sender (superseded rollbacks are closed);
-        //   * that has rendered `RenderBlack` — so a teardown is observable.
-        // Take the highest-index match (build order → the newest generation).
         let live_pair = |sinks: &[WakePair]| -> Option<WakePair> {
-            sinks
+            let mut rendered = sinks
                 .iter()
-                .enumerate()
-                .rfind(|(i, (sink, tx))| *i >= 2 && !tx.is_closed() && sink_rendered(sink))
-                .map(|(_, pair)| pair.clone())
+                .filter(|(sink, tx)| !tx.is_closed() && sink_rendered(sink));
+            let pair = rendered.next()?.clone();
+            assert!(
+                rendered.next().is_none(),
+                "one restored render sink is active"
+            );
+            Some(pair)
         };
         let selected = wait_for(
             || live_pair(&pairs.lock().unwrap()[..]).is_some(),
@@ -1825,7 +2173,7 @@ wake_retry_interval = "1s"
         .await;
         assert!(
             selected,
-            "no live post-initial render sink ever rendered — rebuild_old did not \
+            "no live restored render sink ever rendered — rebuild_old did not \
              rebuild render sinks with a live InputWake channel"
         );
         let (live_sink, live_sender) = live_pair(&pairs.lock().unwrap()[..])
@@ -2222,16 +2570,7 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
 /// manual command (tracked in issue #9).
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
-              count step-boundary tests it would otherwise contaminate — test-local, always \
-              released promptly at test end"
-)]
 async fn manual_only_display_full_lifecycle_across_reload() {
-    let _capture_guard = capture_count_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
@@ -2245,6 +2584,8 @@ async fn manual_only_display_full_lifecycle_across_reload() {
     // No sensor events — the manual display starts active (no rule drives
     // it).  The rule-driven "mon" will blank after its 300ms grace, but
     // that is irrelevant to the manual-only lifecycle under test.
+    let observations = ObservationHub::new(64);
+    let mut observation_rx = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -2253,9 +2594,9 @@ async fn manual_only_display_full_lifecycle_across_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
-    let mut reloads = handle.subscribe_reload();
     let ctl = handle.control_sender();
 
     // ── 1. ForceBlank the manual-only display ──────────────────────────
@@ -2267,16 +2608,50 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         "manual display must blank after ForceBlank, marker={:?}",
         read(&manual_marker)
     );
-
-    // Verify phase reaches "blanked" in the snapshot. The blank marker byte
-    // (waited for above) is written by the command executor before the
-    // engine has finished processing the blank RESULT and landing the
-    // Blanking→Blanked transition — a single point-in-time snapshot here can
-    // still observe "blanking" (CI-observed). Bounded poll instead.
-    assert!(
-        wait_for_phase(&ctl, "manual", "blanked", Duration::from_secs(3)).await,
-        "phase must reach blanked after ForceBlank"
-    );
+    let blanking = recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual active to blanking",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Blanking,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    assert!(matches!(
+        blanking,
+        DaemonObservation::DisplayPhaseChanged { .. }
+    ));
+    let blanked = recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual blanking to blanked",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanking,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    assert!(matches!(
+        blanked,
+        DaemonObservation::DisplayPhaseChanged { .. }
+    ));
 
     let manual_wake_before = count(&manual_marker, 'W');
 
@@ -2290,19 +2665,66 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         manual_and_ruled_config(&mon_marker, &manual_marker, "150ms"),
     )
     .unwrap();
-    // Drain reload outcomes until the bus is quiet, then assert the last
-    // one was Reloaded.  The watcher debounce is 500ms; a 1s settle window
-    // is tight but sufficient for a single deterministic reload.
-    let settle = Duration::from_secs(1);
-    let mut last_outcome = None;
-    while let Ok(Ok(o)) = tokio::time::timeout(settle, reloads.recv()).await {
-        last_outcome = Some(o);
-    }
-    assert_eq!(
-        last_outcome,
-        Some(ReloadOutcome::Reloaded),
-        "reload must settle as Reloaded"
-    );
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero drained",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationDrained {
+                    generation: GenerationId(0)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual phase restored into generation one",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one started",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationStarted {
+                    generation: GenerationId(1)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "reload completed for generation one",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::ReloadCompleted(receipt)
+                    if receipt.generation == GenerationId(1)
+                        && receipt.outcome == ReloadOutcome::Reloaded
+            )
+        },
+    )
+    .await;
 
     // ── 4. Assert across reload: NO wake, phase preserved ──────────────
     let manual_w_after = count(&manual_marker, 'W');
@@ -2313,22 +2735,6 @@ async fn manual_only_display_full_lifecycle_across_reload() {
          got {manual_w_after} W (was {manual_wake_before} W before), marker={:?}",
         read(&manual_marker)
     );
-
-    {
-        // Retry across the reload generation-switch window (issue #9).
-        let snap = snapshot_with_retry(&handle.control_sender()).await;
-        let manual_snap = snap
-            .displays
-            .iter()
-            .find(|(id, _)| id == "manual")
-            .map(|(_, ds)| ds)
-            .unwrap();
-        assert_eq!(
-            manual_snap.phase, "blanked",
-            "manual-only display must preserve blanked phase after reload, got {:?}",
-            manual_snap.phase
-        );
-    }
 
     // ── 5. ForceWake the manual-only display ───────────────────────────
     ctl.send(ControlMsg::ForceWake(DisplayId("manual".into())))
@@ -2343,13 +2749,42 @@ async fn manual_only_display_full_lifecycle_across_reload() {
         "manual display must wake after ForceWake, marker={:?}",
         read(&manual_marker)
     );
-
-    // Poll until the snapshot reflects the phase transition (the wake
-    // command writes the marker before the engine processes WakeResult).
-    assert!(
-        wait_for_phase(&ctl, "manual", "active", Duration::from_secs(5)).await,
-        "manual-only display must be active after ForceWake"
-    );
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual blanked to waking",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanked,
+                    new_phase: dormant_core::state_machine::Phase::Waking,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "manual waking to active",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: None,
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Waking,
+                    new_phase: dormant_core::state_machine::Phase::Active,
+                } if display_id.0 == "manual"
+            )
+        },
+    )
+    .await;
 
     shutdown(handle, join).await;
 }
@@ -4609,6 +5044,178 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
     );
 }
 
+/// A failed accepted-config spawn leaves both front-door routers paused while
+/// `rebuild_old` attempts to restore service. If that second spawn fails too,
+/// the daemon must exit rather than remain alive without an engine that can
+/// process a wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_double_spawn_failure_cancels_root() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_force_reload_spawn_failure()
+    .with_test_force_rebuild_old_spawn_failure()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("rejected reload receipt");
+    assert!(receipt.request_ids.contains(&request_id));
+    assert!(matches!(receipt.outcome, ReloadOutcome::Rejected(_)));
+    assert!(
+        handle.root_is_cancelled_for_test(),
+        "double spawn failure must cancel the daemon root token"
+    );
+    tokio::time::timeout(Duration::from_secs(3), join)
+        .await
+        .expect("cancelled root must stop the run loop")
+        .expect("run loop must not panic");
+}
+
+/// Pausing the front-door routers must not close the old engine before its
+/// drain barrier arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_barrier_survives_router_pause() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let gate = GenerationBarrierGate::new();
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_generation_barrier_gate(gate.clone())
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    let (snapshot_tx, snapshot_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Snapshot(snapshot_tx))
+        .await
+        .expect("old generation control route stays open");
+    tokio::time::timeout(Duration::from_secs(1), snapshot_rx)
+        .await
+        .expect("old generation responds before the forced barrier timeout")
+        .expect("old generation snapshot reply");
+
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before reaching the old-generation barrier"),
+            result = tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered()) => {
+                assert!(result.is_ok(), "reload did not reach the old-generation barrier");
+            }
+        }
+        let probe = gate.request_post_release_snapshot();
+        gate.release();
+        let old_snapshot = tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .expect("old engine accepted the post-release barrier probe")
+            .expect("reload kept the barrier probe alive")
+            .expect("old engine control route remained open after pause");
+        tokio::time::timeout(Duration::from_secs(1), old_snapshot)
+            .await
+            .expect("old engine answered the post-release barrier probe")
+            .expect("old engine snapshot reply");
+        let (request_id, receipt) = tokio::time::timeout(Duration::from_secs(3), reload)
+            .await
+            .expect("reload completes after the barrier")
+            .expect("reload requester remains available");
+        assert!(receipt.request_ids.contains(&request_id));
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+        assert!(!handle.root_is_cancelled_for_test());
+    }
+    shutdown(handle, join).await;
+}
+
+/// An engine that fails to acknowledge its drain barrier must hand recovery to
+/// the supervisor rather than leave paused routers and a reload request wedged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_barrier_timeout_cancels_root() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_force_generation_barrier_timeout()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    fs::write(
+        &cfg_path,
+        one_display_config(&marker, "50ms").replace(
+            "startup_holdoff = \"0s\"",
+            "startup_holdoff = \"0s\"\nreload_debounce = \"0s\"\ngeneration_barrier_ack_timeout = \"50ms\"",
+        ),
+    )
+    .unwrap();
+    let reload_started = Instant::now();
+    let (request_id, receipt) = tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.request_reload_with_id(ReloadSource::Control),
+    )
+    .await
+    .expect("barrier failure produces a receipt")
+    .expect("reload requester remains available");
+    assert!(receipt.request_ids.contains(&request_id));
+    assert!(
+        matches!(&receipt.outcome, ReloadOutcome::Rejected(detail) if detail.contains("timeout")),
+        "barrier failure must report an acknowledgement timeout: {:?}",
+        receipt.outcome
+    );
+    assert!(
+        reload_started.elapsed() >= Duration::from_millis(50),
+        "forced missing acknowledgement must exercise the bounded wait"
+    );
+    assert!(
+        handle.root_is_cancelled_for_test(),
+        "missing generation-barrier acknowledgement must cancel the daemon root"
+    );
+    tokio::time::timeout(Duration::from_secs(3), join)
+        .await
+        .expect("cancelled root stops the run loop")
+        .expect("run loop must not panic");
+}
+
 /// Rollback-recovery plan Task 1 §8: `rebuild_old` must carry
 /// Runner-OWNED rollback status (`self.rollback_status.clone()`) even when
 /// the preliminary snapshot request timed out — `rebuild_old` never derives
@@ -4632,6 +5239,7 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
         lkg_fp: "11:cafebabe".to_string(),
         detail: "running last-known-good".to_string(),
     };
+    let lifecycle = ReloadLifecycleCapture::new();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -4643,6 +5251,7 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
     .with_test_rollback_status(status.clone(), dir.path().to_path_buf())
     .with_test_force_reload_snapshot_timeout()
     .with_test_force_reload_spawn_failure()
+    .with_test_reload_lifecycle_capture(lifecycle.clone())
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     handle
@@ -4654,16 +5263,67 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
 
     std::fs::write(&cfg_path, one_display_config(&marker, "100ms")).unwrap();
     assert!(handle.trigger_reload().await);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(3), reloads.recv())
-            .await
-            .expect("reload outcome")
-            .expect("reload bus"),
-        ReloadOutcome::Rejected(_)
-    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+        .await
+        .unwrap_or_else(|elapsed| {
+            panic!(
+                "reload outcome: {elapsed:?}; lifecycle stages: {:?}",
+                lifecycle.stages()
+            )
+        })
+        .expect("reload bus");
+    assert!(matches!(outcome, ReloadOutcome::Rejected(_)));
 
     let snapshot = snapshot_with_retry(&handle.control_sender()).await;
     assert_eq!(snapshot.rollback, Some(status));
+    shutdown(handle, join).await;
+}
+
+/// A watcher request can arrive after a rejected reload has restored the old
+/// generation but before the operator changes the still-rejected revision.
+/// Each execution must drain and rebuild independently rather than leaving
+/// the routers paused behind the first rollback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_reload_can_repeat_after_rollback_restore() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "400ms"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_test_force_reload_snapshot_timeout()
+    .with_test_force_reload_spawn_failure()
+    .disable_ipc();
+    let (handle, join) = app.start().await.expect("start app");
+
+    fs::write(&cfg_path, one_display_config(&marker, "100ms")).unwrap();
+
+    for source in [ReloadSource::Watcher, ReloadSource::Control] {
+        let (request_id, receipt) = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.request_reload_with_id(source),
+        )
+        .await
+        .expect("rejected reload receipt in time")
+        .expect("reload requester remains available");
+        assert!(receipt.request_ids.contains(&request_id));
+        assert!(matches!(receipt.outcome, ReloadOutcome::Rejected(_)));
+    }
+
+    assert!(
+        !handle.root_is_cancelled_for_test(),
+        "a successful rollback keeps the daemon serving a later rejected revision"
+    );
     shutdown(handle, join).await;
 }
 

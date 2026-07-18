@@ -47,7 +47,39 @@ pub fn load_config(
         detail: format!("cannot read config file '{}': {e}", path.display()),
     })?;
 
-    let value: toml::Value = toml::from_str(&raw).map_err(|e| DormantError::ConfigInvalid {
+    load_config_from_str(&raw, strict)
+}
+
+/// Parse configuration bytes, applying strict or lenient unknown-key handling.
+///
+/// # Errors
+///
+/// Returns [`DormantError::ConfigInvalid`] when the bytes are not valid UTF-8,
+/// contain invalid TOML, or specify an unsupported configuration version.
+pub fn load_config_from_bytes(
+    raw: &[u8],
+    strict: Strictness,
+) -> Result<(Config, Vec<Warning>), DormantError> {
+    let raw = std::str::from_utf8(raw).map_err(|e| DormantError::ConfigInvalid {
+        detail: format!("configuration is not valid UTF-8: {e}"),
+    })?;
+
+    load_config_from_str(raw, strict)
+}
+
+/// Parse a configuration document, applying strict or lenient unknown-key handling.
+///
+/// # Errors
+///
+/// - TOML syntax errors.
+/// - [`DormantError::ConfigInvalid`] if `config_version` ≠ 1.
+/// - [`DormantError::ConfigUnknownKey`] in [`Strictness::Strict`] mode when an
+///   unrecognized key is found.
+pub fn load_config_from_str(
+    raw: &str,
+    strict: Strictness,
+) -> Result<(Config, Vec<Warning>), DormantError> {
+    let value: toml::Value = toml::from_str(raw).map_err(|e| DormantError::ConfigInvalid {
         detail: format!("TOML syntax error: {e}"),
     })?;
 
@@ -73,7 +105,7 @@ pub fn load_config(
     };
 
     // Deserialize WITHOUT deny_unknown_fields — we already handled that above.
-    let cfg: Config = toml::from_str(&raw).map_err(|e| DormantError::ConfigInvalid {
+    let cfg: Config = toml::from_str(raw).map_err(|e| DormantError::ConfigInvalid {
         detail: format!("configuration error: {e}"),
     })?;
 
@@ -154,7 +186,30 @@ pub fn load_credentials(path: &Path) -> Result<Credentials, DormantError> {
         detail: format!("cannot read credentials file '{}': {e}", path.display()),
     })?;
 
-    let creds: Credentials = toml::from_str(&raw).map_err(|e| DormantError::ConfigInvalid {
+    load_credentials_from_str(&raw)
+}
+
+/// Parse credentials bytes from an already-read document.
+///
+/// # Errors
+///
+/// Returns [`DormantError::ConfigInvalid`] when the bytes are not valid UTF-8
+/// or contain invalid credentials TOML.
+pub fn load_credentials_from_bytes(raw: &[u8]) -> Result<Credentials, DormantError> {
+    let raw = std::str::from_utf8(raw).map_err(|e| DormantError::ConfigInvalid {
+        detail: format!("credentials are not valid UTF-8: {e}"),
+    })?;
+
+    load_credentials_from_str(raw)
+}
+
+/// Parse credentials from an already-read TOML document.
+///
+/// # Errors
+///
+/// Returns [`DormantError::ConfigInvalid`] for invalid credentials TOML.
+pub fn load_credentials_from_str(raw: &str) -> Result<Credentials, DormantError> {
+    let creds: Credentials = toml::from_str(raw).map_err(|e| DormantError::ConfigInvalid {
         detail: format!("credentials TOML error: {e}"),
     })?;
 
@@ -355,5 +410,17 @@ password = "secret"
             let mode = std::fs::metadata(&creds_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "file mode is not 0600");
         }
+    }
+
+    #[test]
+    fn byte_parsers_accept_the_same_minimal_documents_as_path_loaders() {
+        let (config, warnings) =
+            load_config_from_bytes(b"config_version = 1\n", Strictness::Strict).unwrap();
+        assert_eq!(config.config_version, 1);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            load_credentials_from_bytes(b"").unwrap(),
+            Credentials::default()
+        );
     }
 }

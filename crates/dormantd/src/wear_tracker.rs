@@ -92,8 +92,8 @@ pub struct WearTrackerDeps {
     /// Live config, so the tracker reacts to `[wear]` edits (enable/disable,
     /// interval changes, grid resize) across reloads without a restart.
     pub config_rx: watch::Receiver<Arc<Config>>,
-    /// Front ctl channel — rides `forward_ctl`'s `deliver_or_drop` across
-    /// generation swaps, exactly like `AppHandle`'s sender.
+    /// Front ctl channel — rides the `GenerationRouter`'s pause/queue/release
+    /// across generation swaps, exactly like `AppHandle`'s sender.
     pub ctl_tx: mpsc::Sender<ControlMsg>,
     /// Current generation's executor map, republished by `app.rs` on every
     /// install/rollback and emptied immediately before teardown so the

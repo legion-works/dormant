@@ -144,10 +144,11 @@ pub(crate) async fn post_reload(
 ) -> Result<Json<serde_json::Value>, WebError> {
     state
         .inner
-        .reload_trigger
-        .send(())
+        .reload_requester
+        .notify(dormant_core::observation::ReloadSource::Control)
         .await
-        .map_err(|_| WebError::ReloadUnavailable)?;
+        .then_some(())
+        .ok_or(WebError::ReloadUnavailable)?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -238,7 +239,8 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     use tokio::sync::watch;
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let (reload_trigger_tx, mut reload_trigger_rx) = mpsc::channel::<()>(8);
+    let (reload_trigger_tx, mut reload_trigger_rx) =
+        mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
     let config = Arc::new(Config {
         config_version: 1,
@@ -265,7 +267,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
 
     let state = WebState::new(WebStateInner::new_for_test(WebStateInnerParams {
         ctl_tx,
-        reload_trigger: reload_trigger_tx,
+        reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
         reload_rx,
         config_rx,
         creds_rx,
@@ -341,7 +343,8 @@ mod tests {
 
     fn test_web_state(ctl_tx: mpsc::Sender<ControlMsg>) -> WebState {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (reload_trigger_tx, _reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, _reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
         let config = Arc::new(Config {
             config_version: 1,
@@ -369,7 +372,7 @@ mod tests {
         WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -625,7 +628,8 @@ mod tests {
 
         // Build a custom state with a reload_trigger that can be observed.
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (reload_trigger_tx, mut reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, mut reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
         let config = Arc::new(Config {
             config_version: 1,
@@ -653,7 +657,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx: ctl_tx.clone(),
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,

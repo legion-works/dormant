@@ -136,6 +136,14 @@ pub struct DaemonConfig {
     #[serde(default = "default_reload_debounce", with = "humantime_serde")]
     pub reload_debounce: Duration,
 
+    /// Maximum time a generation swap waits for its old engine to acknowledge
+    /// the drained-input barrier. Validated to `> 0`.
+    #[serde(
+        default = "default_generation_barrier_ack_timeout",
+        with = "humantime_serde"
+    )]
+    pub generation_barrier_ack_timeout: Duration,
+
     /// TCP port for the M2 web UI. `None` disables the web UI even when
     /// compiled with `--features web-ui`.
     #[serde(default)]
@@ -200,6 +208,7 @@ impl Default for DaemonConfig {
             idle_time_unit: IdleTimeUnit::default(),
             idle_source: IdleSource::default(),
             reload_debounce: defaults::RELOAD_DEBOUNCE,
+            generation_barrier_ack_timeout: defaults::GENERATION_BARRIER_ACK_TIMEOUT,
             web_port: None,
             web_bind: defaults::WEB_BIND_DEFAULT,
             web_allow_nonloopback: false,
@@ -1138,6 +1147,10 @@ fn default_stale_sensor_timeout() -> Duration {
 }
 fn default_reload_debounce() -> Duration {
     defaults::RELOAD_DEBOUNCE
+}
+
+fn default_generation_barrier_ack_timeout() -> Duration {
+    defaults::GENERATION_BARRIER_ACK_TIMEOUT
 }
 fn default_log_level() -> String {
     defaults::LOG_LEVEL.into()

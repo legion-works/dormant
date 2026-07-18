@@ -27,9 +27,9 @@ use axum::Json;
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
 
 use dormant_core::config::{Strictness, load_config, load_credentials, validate};
+use dormant_core::observation::{ContentRevision, ReloadSource};
 use dormant_core::reload::ReloadOutcome;
 use dormant_displays::registry::capabilities;
 
@@ -210,34 +210,28 @@ pub(crate) async fn post_apply(
     // invariant 8, §14; see `log_entity_audit_events`'s doc comment).
     log_entity_audit_events(&body.patches);
 
-    // ── Step 9: subscribe to reload outcome, wait for it ─────────────────
-    // Subscribe AFTER the rename but INSIDE the apply_lock so concurrent
-    // applies cannot interleave their reload-outcome waits.  The reload
-    // bus carries the last outcome from the daemon's config watcher; if
-    // our write triggered a reload, the outcome arrives here.
-    let written_fingerprint = format!("{:x}", Sha256::digest(patched_toml.as_bytes()));
-    let mut rx = state.inner.reload_rx.resubscribe();
+    // ── Step 9: register the receipt waiter before enqueueing the reload ──
+    let written_revision = ContentRevision::from_bytes(patched_toml.as_bytes());
+    let (_, receipt_rx) = state
+        .inner
+        .reload_requester
+        .request(ReloadSource::WebApply)
+        .await
+        .ok_or(WebError::ReloadUnavailable)?;
     let timeout = state.inner.reload_timeout;
 
-    let (reload, detail) = match tokio::time::timeout(timeout, rx.recv()).await {
-        Ok(Ok(outcome)) => {
-            let disk_bytes = std::fs::read(&state.inner.config_path)
-                .map_err(|e| WebError::ConfigReadError(format!("cannot read config: {e}")))?;
-            let disk_fingerprint = format!("{:x}", Sha256::digest(&disk_bytes));
-
-            if disk_fingerprint == written_fingerprint {
-                match outcome {
+    let (reload, detail) = match tokio::time::timeout(timeout, receipt_rx).await {
+        Ok(Ok(receipt)) => {
+            if receipt.requested_revision.config == written_revision {
+                match receipt.outcome {
                     ReloadOutcome::Reloaded => (String::from("reloaded"), None),
                     ReloadOutcome::Rejected(detail) => (String::from("rejected"), Some(detail)),
                 }
             } else {
-                // Another writer landed after us — outcome belongs to them.
                 (String::from("superseded"), None)
             }
         }
-        Ok(Err(broadcast::error::RecvError::Lagged(_) | broadcast::error::RecvError::Closed)) => {
-            (String::from("pending"), None)
-        }
+        Ok(Err(_closed)) => (String::from("pending"), None),
         Err(_elapsed) => {
             // Timeout — daemon hasn't responded yet or reload is stalled.
             (String::from("pending"), None)
@@ -442,7 +436,8 @@ mod tests {
     /// Build a [`WebState`] suitable for testing the apply handler.
     fn test_state(config_dir: &std::path::Path, config: Config, bind_port: u16) -> WebState {
         let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<dormant_core::rules::ControlMsg>(8);
-        let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (reload_trigger_tx, mut reload_trigger_rx) =
+            tokio::sync::mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
         let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(config));
         let creds = Arc::new(dormant_core::config::schema::Credentials::default());
@@ -458,11 +453,37 @@ mod tests {
 
         let config_path = config_dir.join("config.toml");
         let creds_path = config_dir.join("config.creds.toml");
+        let receipt_config_path = config_path.clone();
+        let receipt_creds_path = creds_path.clone();
+        tokio::spawn(async move {
+            while let Some(request) = reload_trigger_rx.recv().await {
+                let config = std::fs::read(&receipt_config_path).unwrap_or_default();
+                let credentials = std::fs::read(&receipt_creds_path).map_or_else(
+                    |_| dormant_core::observation::ContentRevision::missing(),
+                    |bytes| dormant_core::observation::ContentRevision::from_bytes(&bytes),
+                );
+                let revision = dormant_core::observation::RuntimeRevision {
+                    config: dormant_core::observation::ContentRevision::from_bytes(&config),
+                    credentials,
+                };
+                if let Some(waiter) = request.receipt_tx {
+                    let _ = waiter.send(dormant_core::observation::ReloadReceipt {
+                        request_ids: vec![request.request_id],
+                        sources: vec![request.source],
+                        requested_revision: revision.clone(),
+                        applied_revision: revision,
+                        generation: dormant_core::observation::GenerationId(0),
+                        outcome: ReloadOutcome::Reloaded,
+                        coalesced: false,
+                    });
+                }
+            }
+        });
 
         WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -486,7 +507,8 @@ mod tests {
         reload_timeout: Duration,
     ) -> (WebState, broadcast::Sender<ReloadOutcome>) {
         let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<dormant_core::rules::ControlMsg>(8);
-        let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (reload_trigger_tx, mut reload_trigger_rx) =
+            tokio::sync::mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
         let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(config));
         let creds = Arc::new(dormant_core::config::schema::Credentials::default());
@@ -502,11 +524,39 @@ mod tests {
 
         let config_path = config_dir.join("config.toml");
         let creds_path = config_dir.join("config.creds.toml");
+        let receipt_config_path = config_path.clone();
+        let receipt_creds_path = creds_path.clone();
+        let mut outcomes = reload_tx.subscribe();
+        tokio::spawn(async move {
+            while let Some(request) = reload_trigger_rx.recv().await {
+                let outcome = outcomes.recv().await.unwrap_or(ReloadOutcome::Reloaded);
+                let config = std::fs::read(&receipt_config_path).unwrap_or_default();
+                let credentials = std::fs::read(&receipt_creds_path).map_or_else(
+                    |_| dormant_core::observation::ContentRevision::missing(),
+                    |bytes| dormant_core::observation::ContentRevision::from_bytes(&bytes),
+                );
+                let revision = dormant_core::observation::RuntimeRevision {
+                    config: dormant_core::observation::ContentRevision::from_bytes(&config),
+                    credentials,
+                };
+                if let Some(waiter) = request.receipt_tx {
+                    let _ = waiter.send(dormant_core::observation::ReloadReceipt {
+                        request_ids: vec![request.request_id],
+                        sources: vec![request.source],
+                        requested_revision: revision.clone(),
+                        applied_revision: revision,
+                        generation: dormant_core::observation::GenerationId(0),
+                        outcome,
+                        coalesced: false,
+                    });
+                }
+            }
+        });
 
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -1400,8 +1450,7 @@ field = "/val"
         assert_eq!(result.reload, "pending");
     }
 
-    /// Lagged on the reload bus (17+ outcomes before the handler reads) →
-    /// `"pending"`.
+    /// Receipt delivery survives unrelated reload-bus overflow.
     #[tokio::test]
     async fn reload_sync_lagged() {
         let dir = tempfile::tempdir().unwrap();
@@ -1424,7 +1473,7 @@ field = "/val"
             }],
         };
 
-        // Overflow the 16-capacity broadcast channel BEFORE the handler reads.
+        // Overflow the compatibility broadcast before the request is enqueued.
         for i in 0..17 {
             let _ = reload_tx.send(ReloadOutcome::Reloaded);
             // The first 16 fill the ring buffer; the 17th evicts the oldest.
@@ -1434,13 +1483,12 @@ field = "/val"
 
         let handle = tokio::spawn(async move { post_apply(State(state), axum::Json(req)).await });
 
-        // Let the handler subscribe — it sees Lagged because the channel
-        // overflowed before it arrived.
+        // The request's one-shot receipt is independent of the overflowed bus.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let result = handle.await.unwrap().unwrap();
         assert!(result.applied);
-        assert_eq!(result.reload, "pending");
+        assert_eq!(result.reload, "reloaded");
     }
 
     // ── Task 2 Step 5: CreateEntity/DeleteEntity apply integration ──────────

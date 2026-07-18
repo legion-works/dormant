@@ -146,14 +146,14 @@ async fn setup_server() -> (
     let socket_path = dir.path().join("dormant.sock");
 
     let (ctl_tx, event_tx, record_rx) = spawn_fake_engine();
-    let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+    let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let cancel = CancellationToken::new();
     let doctor = fake_doctor(ctl_tx.clone());
 
     let _handle = dormantd::ipc::spawn(
         &socket_path,
         ctl_tx.clone(),
-        reload_tx,
+        dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         cancel.clone(),
     )
@@ -438,12 +438,18 @@ async fn socket_file_permissions_0600() {
     let socket_path = dir.path().join("dormant.sock");
 
     let (ctl_tx, _event_tx, _record_rx) = spawn_fake_engine();
-    let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+    let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let cancel = CancellationToken::new();
     let doctor = fake_doctor(ctl_tx.clone());
 
-    let _handle =
-        dormantd::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel.clone()).unwrap();
+    let _handle = dormantd::ipc::spawn(
+        &socket_path,
+        ctl_tx,
+        dormant_core::reload::ReloadRequester::new(reload_tx),
+        doctor,
+        cancel.clone(),
+    )
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -468,12 +474,18 @@ async fn stale_socket_replacement() {
     std::fs::write(&socket_path, "stale").unwrap();
 
     let (ctl_tx, _event_tx, _record_rx) = spawn_fake_engine();
-    let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+    let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let cancel = CancellationToken::new();
     let doctor = fake_doctor(ctl_tx.clone());
 
     // Should succeed — replaces the stale socket
-    let result = dormantd::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel.clone());
+    let result = dormantd::ipc::spawn(
+        &socket_path,
+        ctl_tx,
+        dormant_core::reload::ReloadRequester::new(reload_tx),
+        doctor,
+        cancel.clone(),
+    );
     assert!(result.is_ok(), "should replace stale socket: {result:?}");
 
     // Verify the socket file exists and is connectable

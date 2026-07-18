@@ -363,7 +363,8 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<dormant_core::rules::ControlMsg>(8);
-        let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (reload_trigger_tx, _reload_trigger_rx) =
+            tokio::sync::mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
         let (config_tx, config_rx) = tokio::sync::watch::channel(Arc::new(config));
         let creds = Arc::new(dormant_core::config::schema::Credentials::default());
@@ -382,7 +383,7 @@ mod tests {
         WebState::new(super::super::super::state::WebStateInner::new_for_test(
             super::super::super::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,

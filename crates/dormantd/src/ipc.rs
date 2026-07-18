@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+use dormant_core::observation::ReloadSource;
+use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, StateSnapshot};
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -44,7 +46,7 @@ const MAX_LINE_BYTES: usize = 1_048_576;
 pub fn spawn(
     socket_path: &Path,
     ctl_tx: mpsc::Sender<ControlMsg>,
-    reload_trigger_tx: mpsc::Sender<()>,
+    reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
@@ -125,7 +127,7 @@ pub fn spawn(
         run(
             listener,
             ctl_tx,
-            reload_trigger_tx,
+            reload_requester,
             doctor_service,
             cancel,
             &socket_owned,
@@ -140,7 +142,7 @@ pub fn spawn(
 async fn run(
     listener: UnixListener,
     ctl_tx: mpsc::Sender<ControlMsg>,
-    reload_trigger_tx: mpsc::Sender<()>,
+    reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
@@ -157,7 +159,7 @@ async fn run(
                 match accept {
                     Ok((stream, addr)) => {
                         let ctl = ctl_tx.clone();
-                        let reload = reload_trigger_tx.clone();
+                        let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
                         tokio::spawn(handle_connection(stream, ctl, reload, doctor));
                         let _ = addr; // Unix socket peer address (debug).
@@ -177,7 +179,7 @@ async fn run(
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     ctl_tx: mpsc::Sender<ControlMsg>,
-    reload_trigger_tx: mpsc::Sender<()>,
+    reload_requester: ReloadRequester,
     doctor_service: DoctorService,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -233,7 +235,7 @@ async fn handle_connection(
                 return; // events stream owns the connection until disconnect
             }
             IpcRequest::Reload => {
-                let _ = reload_trigger_tx.send(()).await;
+                let _ = reload_requester.notify(ReloadSource::Ipc).await;
                 let resp = IpcResponse::ok(None);
                 let _ = write_json(&mut writer, &resp).await;
             }
@@ -585,10 +587,16 @@ mod tests {
         std::fs::set_permissions(dir.path(), perms).unwrap();
 
         let (ctl_tx, cancel) = fake_engine();
-        let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+        let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let doctor = fake_doctor(ctl_tx.clone());
 
-        let result = crate::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel);
+        let result = crate::ipc::spawn(
+            &socket_path,
+            ctl_tx,
+            dormant_core::reload::ReloadRequester::new(reload_tx),
+            doctor,
+            cancel,
+        );
         assert!(result.is_err(), "group-writable parent should be rejected");
         let err = format!("{}", result.unwrap_err());
         assert!(
@@ -603,10 +611,16 @@ mod tests {
         let socket_path = dir.path().join("dormant.sock");
 
         let (ctl_tx, cancel) = fake_engine();
-        let (reload_tx, _reload_rx) = mpsc::channel::<()>(8);
+        let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let doctor = fake_doctor(ctl_tx.clone());
 
-        let result = crate::ipc::spawn(&socket_path, ctl_tx, reload_tx, doctor, cancel.clone());
+        let result = crate::ipc::spawn(
+            &socket_path,
+            ctl_tx,
+            dormant_core::reload::ReloadRequester::new(reload_tx),
+            doctor,
+            cancel.clone(),
+        );
         assert!(
             result.is_ok(),
             "plain tempdir should be accepted: {result:?}"

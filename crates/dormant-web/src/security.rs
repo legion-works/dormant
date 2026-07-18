@@ -319,7 +319,8 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let (ctl_tx, _ctl_rx) = tokio::sync::mpsc::channel::<ControlMsg>(8);
-        let (reload_trigger_tx, _reload_trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
+        let (reload_trigger_tx, _reload_trigger_rx) =
+            tokio::sync::mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
 
         let config = Arc::new(Config {
@@ -348,7 +349,7 @@ mod tests {
         let state = WebState::new(super::super::state::WebStateInner::new_for_test(
             super::super::state::WebStateInnerParams {
                 ctl_tx: ctl_tx.clone(),
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,

@@ -25,7 +25,7 @@ Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a co
 
 ### Doctor-assisted issue drafting
 
-When something fails and you want to file it later without hand-reconstructing the context, `--report-issue` and `--draft-feature` run the full offline probe set (same as bare `dormantctl doctor`) and write a ready-to-paste draft:
+When something fails and you want to file it later without hand-reconstructing the context, `--report-issue` and `--draft-feature` run the full offline probe set (same as bare `dormantctl doctor`) and write a ready-to-paste draft to a file. The probe table and the final `draft written to ...` message still go to stdout:
 
 ```bash
 # Bug report — pre-filled with version, environment, display inventory, and

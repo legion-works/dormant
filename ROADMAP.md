@@ -6,6 +6,13 @@ Direction for `dormant` — the OLED-preserving presence daemon. Grouped by stat
 
 ## Shipped
 
+### v0.4.0 shipped 2026-07-18
+
+- **Homebrew tap** — `legion-works/homebrew-tap` publishes versioned `dormantd`, `dormantctl`, and `dormant-tray` formulae on every release.
+- **Arch Linux package** — the `dormant-bin` AUR package ships pre-built x86_64 binaries and installs the systemd user units under `/usr/lib/systemd/user/`.
+- **Release systemd units** — Linux release tarballs include `dormant.service` and `dormant-tray.service`.
+- **Doctor-assisted issue drafting** — `dormantctl doctor --report-issue` / `--draft-feature` runs the full offline probe set and writes a ready-to-file bug report or feature request draft, with known config and credential values redacted.
+
 - **Daemon core** — config schema + strict validation (unknown-key rejection, cross-reference checks), zone fusion engine (`any`/`all`/`quorum`/`weighted`), rules engine, per-display state machine, hot reload with phase carry-over, single-instance `flock` guard. Fail-safe presence throughout: data loss makes a sensor `unavailable`, never `absent` — a room you can't see is never blanked blind.
 - **Sensors** — MQTT (with native per-broker auth), Home Assistant WebSocket, USB-serial LD2410 mmWave. One module per backend; ESPHome sensors drop in over the existing MQTT path with no new code.
 - **Retained values and availability** — MQTT retained values flow through on subscribe and reconnect. `sensors.<id>.availability_topic`, `availability_payload_online`, and `availability_payload_offline` support non-Zigbee2MQTT LWT conventions. The `reported` diagnostic distinguishes "no data since start" from a sensor that later went offline. A startup/reload warning flags MQTT zones using `zones.<id>.unavailable_policy = "absent"`.
@@ -19,7 +26,6 @@ Direction for `dormant` — the OLED-preserving presence daemon. Grouped by stat
 - **Control-path verification** — `dormantctl doctor exercise <display>` blanks and wakes the panel, then reads state back where the controller supports it. The exercise runs through the daemon, pauses the display's rule for the window, and always restores wake state.
 - **Manual-only displays** — a display in `[displays]` referenced by no rule is hand-controllable and never auto-blanked. This is how a TV joins dormant without a keep-awake dummy zone.
 - **Doctor** — hardware/connectivity probes for config, MQTT, HA, USB, DDC/CI, and Samsung (reachability, power state, token), plus the exercise mode above.
-- **Doctor-assisted issue drafting** — `dormantctl doctor --report-issue` / `--draft-feature` runs the full offline probe set and writes a ready-to-file bug report or feature request draft, pre-filled with the dormant version, OS/kernel/session/compositor, the allowlisted display inventory (id, panel type, controllers, blank mode), config load status, and the probe table, mirroring `.github/ISSUE_TEMPLATE/{bug,feature}.yml`'s field order. Every known config/credential value (hosts, MAC addresses, broker URLs, tokens) is redacted from the entire draft — including probe result text, not just the display inventory — plus a bare-IPv4 scrub as a second layer; still worth a glance before posting. Never overwrites an existing draft.
 - **Flat footprint** — the Tokio worker pool is capped to two threads, `malloc_trim` runs after every screensaver teardown, and the systemd unit sets `MALLOC_ARENA_MAX=2`. Together these drop the post-screensaver RSS floor from ~265 MB to ~90 MB; idle RSS stays flat across blank/wake/screensaver/reload cycles.
 - **Reload-window integrity** — control messages and presence events forwarded during a config-reload generation swap are retried across the swap instead of being dropped into the torn-down generation. Closes the narrow lost-command window on both the control and presence paths ([#9](https://github.com/legion-works/dormant/issues/9)).
 - **Failure notifications** — repeated wake failures and exhausted blank controller chains appear as critical desktop notifications, a tray `Failure` state, and a web-dashboard banner. `notifications.*` controls the desktop notices; tray and web failure state remain active when they are disabled.

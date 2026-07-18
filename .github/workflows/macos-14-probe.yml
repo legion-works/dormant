@@ -1,0 +1,16 @@
+# DISPOSABLE probe workflow — T1 step 7 of the CI-hardening plan. Never lands on dev.
+# Proves the `macos-14` runner label is available and records its image identity.
+name: macos-14-probe
+on:
+  pull_request:
+    branches: [dev]
+
+jobs:
+  macos-14-probe:
+    runs-on: macos-14
+    steps:
+      - name: Record runner identity
+        run: |
+          sw_vers
+          uname -m
+          echo "IMAGE=$ImageOS $ImageVersion"

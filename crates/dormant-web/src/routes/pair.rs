@@ -584,7 +584,8 @@ mod tests {
     ) -> (WebState, CancellationToken, UpsertLog) {
         let cancel = CancellationToken::new();
         let (ctl_tx, _ctl_rx) = mpsc::channel::<ControlMsg>(8);
-        let (reload_trigger_tx, _reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, _reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = broadcast::channel(16);
         let config = Arc::new(Config {
             config_version: 1,
@@ -621,7 +622,7 @@ mod tests {
         let state = WebState::new(WebStateInner::new_for_test_with_pairing(
             WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,

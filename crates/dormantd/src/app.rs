@@ -52,7 +52,12 @@ use serde::Serialize;
 
 use dormant_core::config::schema::{Config, Credentials, RuleConfig};
 use dormant_core::config::{
-    Strictness, ValidationError, Warning, load_config, load_credentials, validate,
+    Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
+    load_credentials_from_bytes, validate,
+};
+use dormant_core::observation::{
+    ContentRevision, DaemonObservation, GenerationId, ObservationHub, ReloadReceipt, ReloadSource,
+    RuntimeRevision,
 };
 use dormant_core::ownership::AlwaysOwned;
 use dormant_core::rules::{
@@ -127,6 +132,7 @@ type RenderSinkBuilder = Arc<
 >;
 
 pub use dormant_core::reload::ReloadOutcome;
+use dormant_core::reload::{ReloadRequest, ReloadRequester};
 
 // ── ValidationReport (for --validate-only) ─────────────────────────────────────
 
@@ -572,6 +578,7 @@ impl App {
         let wear_dir = dormant_core::paths::wear_state_dir();
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
+        let applied_revision = runtime_revision_from_paths(&self.config_path, &self.creds_path)?;
         let socket_path =
             dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
 
@@ -658,7 +665,9 @@ impl App {
         ));
 
         let (reload_tx, _) = broadcast::channel(16);
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let observations = ObservationHub::new(64);
+        let (reload_request_tx, reload_request_rx) = mpsc::channel::<ReloadRequest>(32);
+        let reload_requester = ReloadRequester::new(reload_request_tx);
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
@@ -721,7 +730,7 @@ impl App {
                 crate::ipc::spawn(
                     &socket_path,
                     front_ctl_tx.clone(),
-                    reload_trigger_tx.clone(),
+                    reload_requester.clone(),
                     doctor_service.clone(),
                     root.clone(),
                 )
@@ -742,7 +751,7 @@ impl App {
                 let web_state = dormant_web::WebState::new(dormant_web::WebStateInner::new(
                     dormant_web::WebStateInnerParams {
                         ctl_tx: front_ctl_tx.clone(),
-                        reload_trigger: reload_trigger_tx.clone(),
+                        reload_requester: reload_requester.clone(),
                         reload_rx: reload_tx.subscribe(),
                         config_rx: config_rx.clone(),
                         creds_rx: creds_rx.clone(),
@@ -837,9 +846,12 @@ impl App {
             engine_events: engine_events_tx,
             executors_tx,
             reload_tx: reload_tx.clone(),
+            observations: observations.clone(),
             config_tx,
             creds_tx,
             generation: spawn.generation,
+            applied_revision,
+            generation_id: GenerationId(0),
             wear_tracker_handle,
             started_web_port,
             started_web_bind,
@@ -864,13 +876,19 @@ impl App {
             force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
         };
 
-        let join = tokio::spawn(run_loop(runner, watcher, reload_trigger_rx));
+        let join = tokio::spawn(run_loop(
+            runner,
+            watcher,
+            reload_requester.clone(),
+            reload_request_rx,
+        ));
 
         let handle = AppHandle {
             ctl_tx: front_ctl_tx,
             events_tx: front_events_tx,
             reload_tx,
-            reload_trigger: reload_trigger_tx,
+            reload_requester,
+            observations,
             root,
             config_rx,
             creds_rx,
@@ -917,7 +935,8 @@ pub struct AppHandle {
     ctl_tx: mpsc::Sender<ControlMsg>,
     events_tx: mpsc::Sender<PresenceEvent>,
     reload_tx: broadcast::Sender<ReloadOutcome>,
-    reload_trigger: mpsc::Sender<()>,
+    reload_requester: ReloadRequester,
+    observations: ObservationHub,
     root: CancellationToken,
     config_rx: watch::Receiver<Arc<Config>>,
     creds_rx: watch::Receiver<Arc<Credentials>>,
@@ -956,9 +975,36 @@ impl AppHandle {
         self.reload_tx.subscribe()
     }
 
+    /// Subscribe to correlated daemon observations.
+    #[must_use]
+    pub fn subscribe_observations(&self) -> broadcast::Receiver<DaemonObservation> {
+        self.observations.subscribe()
+    }
+
+    /// Request a reload and await the receipt registered before enqueueing it.
+    pub async fn request_reload(&self, source: ReloadSource) -> Option<ReloadReceipt> {
+        let (_, receipt) = self.reload_requester.request(source).await?;
+        receipt.await.ok()
+    }
+
+    /// Request a control-plane reload and await its correlated receipt.
+    pub async fn request_control_reload(&self) -> Option<ReloadReceipt> {
+        self.request_reload(ReloadSource::Control).await
+    }
+
+    /// Request an IPC reload and await its correlated receipt.
+    pub async fn request_ipc_reload(&self) -> Option<ReloadReceipt> {
+        self.request_reload(ReloadSource::Ipc).await
+    }
+
+    /// Request a web-apply reload and await its correlated receipt.
+    pub async fn request_web_apply_reload(&self) -> Option<ReloadReceipt> {
+        self.request_reload(ReloadSource::WebApply).await
+    }
+
     /// Request an immediate reload (as if the config file changed).
     pub async fn trigger_reload(&self) -> bool {
-        self.reload_trigger.send(()).await.is_ok()
+        self.reload_requester.notify(ReloadSource::Control).await
     }
 
     /// Signal shutdown; the run loop tears down the current generation.
@@ -1034,9 +1080,12 @@ struct Runner {
     /// emptied immediately before teardown in [`Runner::reload`].
     executors_tx: watch::Sender<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     reload_tx: broadcast::Sender<ReloadOutcome>,
+    observations: ObservationHub,
     config_tx: watch::Sender<Arc<Config>>,
     creds_tx: watch::Sender<Arc<Credentials>>,
     generation: Generation,
+    applied_revision: RuntimeRevision,
+    generation_id: GenerationId,
     /// The wear tracker's `JoinHandle` (#47 fix, secondary hardening):
     /// retained (no longer fire-and-forget) so `run_loop` can bound-await
     /// its cancellation-triggered final persist during shutdown, mirroring
@@ -1247,7 +1296,13 @@ impl Runner {
     /// Reload the config, restarting the runtime in place. See the module
     /// docs for the full state machine.
     #[allow(clippy::too_many_lines)]
-    async fn reload(&mut self) {
+    async fn reload(
+        &mut self,
+        new_assembly: Result<StaticAssembly, String>,
+        requested_revision: RuntimeRevision,
+        request_ids: Vec<u64>,
+        sources: Vec<ReloadSource>,
+    ) -> ReloadReceipt {
         let old_ctl = self.engine_ctl.borrow().clone();
         #[cfg(any(test, feature = "test-util"))]
         let preliminary = if self.force_reload_snapshot_timeout {
@@ -1262,15 +1317,22 @@ impl Runner {
         // generation. An invalid or un-assemblable config only flags
         // pending_reload on the live engine and leaves it running — no
         // teardown, no phase loss, no churn on a bad edit.
-        let new_assembly = match self.load_and_assemble().await {
+        let new_assembly = match new_assembly {
             Ok(assembly) => assembly,
             Err(detail) => {
                 tracing::error!(event = "config_reload_rejected", detail = %detail);
                 let _ = old_ctl
                     .send(ControlMsg::SetPendingReload(Some(detail.clone())))
                     .await;
-                let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
-                return;
+                let outcome = ReloadOutcome::Rejected(detail);
+                let _ = self.reload_tx.send(outcome.clone());
+                return self.reload_receipt(
+                    request_ids,
+                    sources,
+                    requested_revision,
+                    outcome,
+                    false,
+                );
             }
         };
 
@@ -1437,8 +1499,15 @@ impl Runner {
                     // controller reprobe, but still non-trivial work).
                     self.ping("before_rebuild_old_wake_failure");
                     self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
-                    let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
-                    return;
+                    let outcome = ReloadOutcome::Rejected(detail);
+                    let _ = self.reload_tx.send(outcome.clone());
+                    return self.reload_receipt(
+                        request_ids,
+                        sources,
+                        requested_revision,
+                        outcome,
+                        false,
+                    );
                 }
                 tracing::info!(event = "reload_removed_display_woken", display = %display_id);
                 // Step-boundary ping 4/7 (spec §6.3 F5/R2-M5): one ping PER
@@ -1498,6 +1567,8 @@ impl Runner {
         match spawn_result {
             Ok(spawn) => {
                 self.install_generation(spawn);
+                self.applied_revision = requested_revision.clone();
+                self.generation_id = GenerationId(self.generation_id.0.saturating_add(1));
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a
                 // successful reload from the operator path while a
@@ -1614,7 +1685,9 @@ impl Runner {
                 // reacts to the outcome — the ping must be fully visible
                 // BEFORE the outcome is, not after.
                 self.ping("reload_end");
-                let _ = self.reload_tx.send(ReloadOutcome::Reloaded);
+                let outcome = ReloadOutcome::Reloaded;
+                let _ = self.reload_tx.send(outcome.clone());
+                self.reload_receipt(request_ids, sources, requested_revision, outcome, false)
             }
             Err(e) => {
                 let detail = format!("rebuild from new config failed: {e}");
@@ -1624,8 +1697,29 @@ impl Runner {
                 // `spawn_generation` failure path).
                 self.ping("before_rebuild_old_spawn_failure");
                 self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
-                let _ = self.reload_tx.send(ReloadOutcome::Rejected(detail));
+                let outcome = ReloadOutcome::Rejected(detail);
+                let _ = self.reload_tx.send(outcome.clone());
+                self.reload_receipt(request_ids, sources, requested_revision, outcome, false)
             }
+        }
+    }
+
+    fn reload_receipt(
+        &self,
+        request_ids: Vec<u64>,
+        sources: Vec<ReloadSource>,
+        requested_revision: RuntimeRevision,
+        outcome: ReloadOutcome,
+        coalesced: bool,
+    ) -> ReloadReceipt {
+        ReloadReceipt {
+            request_ids,
+            sources,
+            requested_revision,
+            applied_revision: self.applied_revision.clone(),
+            generation: self.generation_id,
+            outcome,
+            coalesced,
         }
     }
 
@@ -1652,11 +1746,12 @@ impl Runner {
         }
     }
 
-    /// Load + validate + assemble the new config. Returns a human-readable
-    /// detail string on any failure.
-    async fn load_and_assemble(&self) -> Result<StaticAssembly, String> {
-        let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)
-            .map_err(|e| e.to_string())?;
+    /// Validate and assemble bytes already loaded by the reload coordinator.
+    async fn assemble_loaded(
+        &self,
+        cfg: Config,
+        creds: Credentials,
+    ) -> Result<StaticAssembly, String> {
         let errors = validate(&cfg, &capabilities(), &creds);
         if !errors.is_empty() {
             return Err(errors
@@ -1998,7 +2093,8 @@ fn reset_candidate_on_probe_failure(candidate: &mut Option<LkgCandidate>, now: I
 async fn run_loop(
     mut runner: Runner,
     mut watcher: reload::ConfigWatcher,
-    mut reload_trigger: mpsc::Receiver<()>,
+    reload_requester: ReloadRequester,
+    mut reload_requests: mpsc::Receiver<ReloadRequest>,
 ) {
     // The watchdog probe arm (spec §6.3): a plain interval, period captured
     // once at `Runner` construction (`App::start`/`with_watchdog_interval`).
@@ -2031,21 +2127,20 @@ async fn run_loop(
                 }
                 () = wait_unix_signal(sighup.as_mut()) => {
                     tracing::info!(event = "reload_signal", signal = "SIGHUP");
-                    let window = runner.generation.cfg.daemon.reload_debounce;
-                    debounce(&mut watcher, window).await;
-                    runner.reload().await;
+                    let _ = reload_requester.notify(ReloadSource::Signal).await;
                 }
                 Some(()) = watcher.rx.recv() => {
                     tracing::info!(event = "reload_trigger", source = "watcher");
-                    let window = runner.generation.cfg.daemon.reload_debounce;
-                    debounce(&mut watcher, window).await;
-                    runner.reload().await;
+                    let _ = reload_requester.notify(ReloadSource::Watcher).await;
                 }
-                Some(()) = reload_trigger.recv() => {
-                    tracing::info!(event = "reload_trigger", source = "ipc");
-                    let window = runner.generation.cfg.daemon.reload_debounce;
-                    debounce(&mut watcher, window).await;
-                    runner.reload().await;
+                Some(first) = reload_requests.recv() => {
+                    execute_reload_batch(
+                        &mut runner,
+                        &mut watcher,
+                        &reload_requester,
+                        &mut reload_requests,
+                        first,
+                    ).await;
                 }
                 _ = watchdog_ticker.tick() => {
                     runner.watchdog_tick().await;
@@ -2068,15 +2163,16 @@ async fn run_loop(
                 }
                 Some(()) = watcher.rx.recv() => {
                     tracing::info!(event = "reload_trigger", source = "watcher");
-                    let window = runner.generation.cfg.daemon.reload_debounce;
-                    debounce(&mut watcher, window).await;
-                    runner.reload().await;
+                    let _ = reload_requester.notify(ReloadSource::Watcher).await;
                 }
-                Some(()) = reload_trigger.recv() => {
-                    tracing::info!(event = "reload_trigger", source = "ipc");
-                    let window = runner.generation.cfg.daemon.reload_debounce;
-                    debounce(&mut watcher, window).await;
-                    runner.reload().await;
+                Some(first) = reload_requests.recv() => {
+                    execute_reload_batch(
+                        &mut runner,
+                        &mut watcher,
+                        &reload_requester,
+                        &mut reload_requests,
+                        first,
+                    ).await;
                 }
                 _ = watchdog_ticker.tick() => {
                     runner.watchdog_tick().await;
@@ -2119,23 +2215,177 @@ async fn wait_unix_signal(sig: Option<&mut tokio::signal::unix::Signal>) {
     }
 }
 
-/// Drain further watcher events for `window` before acting, coalescing the
-/// write-then-rename bursts editors produce into one reload.
-async fn debounce(watcher: &mut reload::ConfigWatcher, window: Duration) {
-    if window.is_zero() {
-        return;
+struct ReloadBatch {
+    request_ids: Vec<u64>,
+    sources: Vec<ReloadSource>,
+    waiters: Vec<oneshot::Sender<ReloadReceipt>>,
+}
+
+impl ReloadBatch {
+    fn new(request: ReloadRequest) -> Self {
+        let mut batch = Self {
+            request_ids: Vec::new(),
+            sources: Vec::new(),
+            waiters: Vec::new(),
+        };
+        batch.push(request);
+        batch
     }
-    let deadline = tokio::time::Instant::now() + window;
-    loop {
-        tokio::select! {
-            () = tokio::time::sleep_until(deadline) => break,
-            msg = watcher.rx.recv() => {
-                if msg.is_none() {
-                    break;
+
+    fn push(&mut self, request: ReloadRequest) {
+        self.request_ids.push(request.request_id);
+        if !self.sources.contains(&request.source) {
+            self.sources.push(request.source);
+        }
+        if let Some(waiter) = request.receipt_tx {
+            self.waiters.push(waiter);
+        }
+    }
+}
+
+async fn execute_reload_batch(
+    runner: &mut Runner,
+    watcher: &mut reload::ConfigWatcher,
+    requester: &ReloadRequester,
+    requests: &mut mpsc::Receiver<ReloadRequest>,
+    first: ReloadRequest,
+) {
+    let mut batch = ReloadBatch::new(first);
+    let window = runner.generation.cfg.daemon.reload_debounce;
+    if !window.is_zero() {
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                Some(request) = requests.recv() => batch.push(request),
+                Some(()) = watcher.rx.recv() => {
+                    let _ = requester.notify(ReloadSource::Watcher).await;
                 }
             }
         }
     }
+
+    let (requested_revision, loaded) =
+        load_runtime_from_paths(&runner.config_path, &runner.creds_path, runner.strictness);
+    runner.observations.emit(DaemonObservation::ReloadStarted {
+        request_ids: batch.request_ids.clone(),
+        requested_revision: requested_revision.clone(),
+    });
+
+    let receipt = if requested_revision == runner.applied_revision {
+        let outcome = ReloadOutcome::Reloaded;
+        let _ = runner.reload_tx.send(outcome.clone());
+        runner.reload_receipt(
+            batch.request_ids,
+            batch.sources,
+            requested_revision,
+            outcome,
+            true,
+        )
+    } else {
+        let assembly = match loaded {
+            Ok((cfg, creds)) => runner.assemble_loaded(cfg, creds).await,
+            Err(detail) => Err(detail),
+        };
+        runner
+            .reload(
+                assembly,
+                requested_revision,
+                batch.request_ids,
+                batch.sources,
+            )
+            .await
+    };
+
+    runner
+        .observations
+        .emit(DaemonObservation::ReloadCompleted(receipt.clone()));
+    for waiter in batch.waiters {
+        let _ = waiter.send(receipt.clone());
+    }
+}
+
+fn load_runtime_from_paths(
+    config_path: &Path,
+    creds_path: &Path,
+    strictness: Strictness,
+) -> (RuntimeRevision, Result<(Config, Credentials), String>) {
+    let config_bytes = match std::fs::read(config_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                RuntimeRevision {
+                    config: ContentRevision::from_bytes(&[]),
+                    credentials: ContentRevision::missing(),
+                },
+                Err(format!("load config '{}': {error}", config_path.display())),
+            );
+        }
+    };
+    let config_revision = ContentRevision::from_bytes(&config_bytes);
+    let (credentials_revision, creds) = if creds_path.exists() {
+        #[cfg(unix)]
+        let permissions = std::fs::metadata(creds_path)
+            .map_err(|error| format!("stat credentials '{}': {error}", creds_path.display()))
+            .and_then(|metadata| {
+                use std::os::unix::fs::PermissionsExt;
+                (metadata.permissions().mode() & 0o777 == 0o600)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        format!(
+                            "credentials permissions are not 0600: '{}'",
+                            creds_path.display()
+                        )
+                    })
+            });
+        #[cfg(not(unix))]
+        let permissions: Result<(), String> = Ok(());
+        let bytes = permissions.and_then(|()| {
+            std::fs::read(creds_path)
+                .map_err(|error| format!("read credentials '{}': {error}", creds_path.display()))
+        });
+        match bytes {
+            Ok(bytes) => (
+                ContentRevision::from_bytes(&bytes),
+                load_credentials_from_bytes(&bytes).map_err(|error| error.to_string()),
+            ),
+            Err(detail) => (ContentRevision::from_bytes(&[]), Err(detail)),
+        }
+    } else {
+        (ContentRevision::missing(), Ok(Credentials::default()))
+    };
+    let revision = RuntimeRevision {
+        config: config_revision,
+        credentials: credentials_revision,
+    };
+    let cfg = load_config_from_bytes(&config_bytes, strictness).map_err(|error| error.to_string());
+    let loaded = match (cfg, creds) {
+        (Ok((cfg, warnings)), Ok(creds)) => {
+            for warning in warnings {
+                tracing::warn!(event = "config_warning", key = %warning.key_path, message = %warning.message);
+            }
+            Ok((cfg, creds))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    };
+    (revision, loaded)
+}
+
+fn runtime_revision_from_paths(config_path: &Path, creds_path: &Path) -> Result<RuntimeRevision> {
+    let config = std::fs::read(config_path)
+        .with_context(|| format!("read config '{}'", config_path.display()))?;
+    let credentials = if creds_path.exists() {
+        ContentRevision::from_bytes(
+            &std::fs::read(creds_path)
+                .with_context(|| format!("read credentials '{}'", creds_path.display()))?,
+        )
+    } else {
+        ContentRevision::missing()
+    };
+    Ok(RuntimeRevision {
+        config: ContentRevision::from_bytes(&config),
+        credentials,
+    })
 }
 
 // ── Generation ─────────────────────────────────────────────────────────────────

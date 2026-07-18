@@ -840,7 +840,14 @@ async fn reload_defensive_wake_retained() {
 
     // Reload while the display stays rule-controlled: the rebuilt machine
     // restarts Active, so the still-dark panel must get a defensive wake.
-    fs::write(&cfg_path, one_display_config(&marker, "150ms")).unwrap();
+    fs::write(
+        &cfg_path,
+        format!(
+            "{}\n# retain a distinct content revision",
+            one_display_config(&marker, "150ms")
+        ),
+    )
+    .unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -1015,7 +1022,12 @@ async fn config_watch_updates_on_successful_reload_only() {
     let modified = one_display_config(&marker, "400ms")
         .replace("startup_holdoff = \"0s\"", "startup_holdoff = \"5s\"");
     fs::write(&cfg_path, &modified).unwrap();
-    assert!(handle.trigger_reload().await);
+    let receipt = handle
+        .request_control_reload()
+        .await
+        .expect("control reload receipt");
+    assert!(receipt.request_ids.contains(&receipt.request_ids[0]));
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
         .await
@@ -1121,7 +1133,12 @@ async fn creds_watch_updates_on_successful_reload_only() {
 
     // Update the credentials and reload — watch must see the new value.
     let _creds_path = write_credentials(dir.path(), "ha_token = \"updated\"");
-    assert!(handle.trigger_reload().await);
+    let receipt = handle
+        .request_control_reload()
+        .await
+        .expect("control reload receipt");
+    assert!(receipt.request_ids.contains(&receipt.request_ids[0]));
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
         .await

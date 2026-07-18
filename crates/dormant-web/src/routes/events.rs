@@ -297,7 +297,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -307,7 +308,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -439,7 +440,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -449,7 +451,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -553,7 +555,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -563,7 +566,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -664,7 +667,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -674,7 +678,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -826,7 +830,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -836,7 +841,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -991,7 +996,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -1001,7 +1007,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -1150,7 +1156,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -1160,7 +1167,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,
@@ -1376,7 +1383,8 @@ mod tests {
         std::mem::forget(config_tx);
         std::mem::forget(creds_tx);
 
-        let (reload_trigger_tx, reload_trigger_rx) = mpsc::channel::<()>(8);
+        let (reload_trigger_tx, reload_trigger_rx) =
+            mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         std::mem::forget(reload_trigger_rx);
 
         let doctor =
@@ -1386,7 +1394,7 @@ mod tests {
         let state = WebState::new(crate::state::WebStateInner::new_for_test(
             crate::state::WebStateInnerParams {
                 ctl_tx,
-                reload_trigger: reload_trigger_tx,
+                reload_requester: dormant_core::reload::ReloadRequester::new(reload_trigger_tx),
                 reload_rx,
                 config_rx,
                 creds_rx,

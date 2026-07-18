@@ -15,6 +15,7 @@ use std::time::Duration;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::error::DormantError;
 use dormant_core::reload::ReloadOutcome;
+use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::ControlMsg;
 use dormant_core::types::DisplayId;
 use dormant_core::wear::WearHandle;
@@ -58,11 +59,10 @@ pub struct WebStateInner {
     /// (`/api/state`) or a control action (`/api/blank`, etc.).
     pub ctl_tx: mpsc::Sender<ControlMsg>,
 
-    /// Trigger a config reload (fire-and-forget — sent to the daemon's run
-    /// loop, not the engine).
-    pub reload_trigger: mpsc::Sender<()>,
+    /// Submit causally-correlated requests to the daemon's reload coordinator.
+    pub reload_requester: ReloadRequester,
 
-    /// Subscribe to reload outcomes (for the events WS re-subscribe dance).
+    /// Subscribe to reload outcomes for the events WS re-subscribe dance.
     pub reload_rx: broadcast::Receiver<ReloadOutcome>,
 
     /// Live config watch (read-only receiver, used by `/api/config`).
@@ -169,7 +169,7 @@ pub struct WebStateInner {
 /// how many seam fields `WebStateInner` grows over time.
 pub struct WebStateInnerParams {
     pub ctl_tx: mpsc::Sender<ControlMsg>,
-    pub reload_trigger: mpsc::Sender<()>,
+    pub reload_requester: ReloadRequester,
     pub reload_rx: broadcast::Receiver<ReloadOutcome>,
     pub config_rx: watch::Receiver<Arc<Config>>,
     pub creds_rx: watch::Receiver<Arc<Credentials>>,
@@ -246,7 +246,7 @@ impl WebStateInner {
     ) -> Self {
         Self {
             ctl_tx: params.ctl_tx,
-            reload_trigger: params.reload_trigger,
+            reload_requester: params.reload_requester,
             reload_rx: params.reload_rx,
             config_rx: params.config_rx,
             creds_rx: params.creds_rx,

@@ -187,6 +187,10 @@ pub enum ControlMsg {
         /// One-shot reply channel for the exercise report.
         reply: oneshot::Sender<ExerciseReport>,
     },
+    /// Internal generation-swap fence. The daemon sends this only after all
+    /// generation-local producers have stopped, so acknowledgement proves the
+    /// old engine consumed every input queued before the swap.
+    GenerationBarrier(oneshot::Sender<()>),
 }
 
 /// Per-display outcome of an [`ControlMsg::EmergencyWake`].
@@ -1008,6 +1012,10 @@ impl RulesEngine {
                 }
                 c = ctl.recv() => {
                     match c {
+                        Some(ControlMsg::GenerationBarrier(ack)) => {
+                            self.drain_generation_inputs(&mut events, &mut ctl);
+                            let _ = ack.send(());
+                        }
                         Some(c) => self.handle_control(c),
                         None => break,
                     }
@@ -1199,6 +1207,23 @@ impl RulesEngine {
             ControlMsg::SetRollback(status) => self.set_rollback(status),
             ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
             ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply),
+            ControlMsg::GenerationBarrier(ack) => {
+                let _ = ack.send(());
+            }
+        }
+    }
+
+    /// Consume inputs already buffered when a generation barrier is received.
+    fn drain_generation_inputs(
+        &mut self,
+        events: &mut mpsc::Receiver<PresenceEvent>,
+        ctl: &mut mpsc::Receiver<ControlMsg>,
+    ) {
+        while let Ok(event) = events.try_recv() {
+            self.handle_presence_event(event);
+        }
+        while let Ok(control) = ctl.try_recv() {
+            self.handle_control(control);
         }
     }
 
@@ -3002,6 +3027,49 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         engine.handle_control(ControlMsg::Snapshot(tx));
         rx.try_recv().expect("snapshot reply sent inline")
+    }
+
+    #[tokio::test]
+    async fn generation_barrier_drains_before_ack() {
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (ctl_tx, ctl_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let engine = engine_with_sensor("desk");
+        let task = tokio::spawn(engine.run(events_rx, ctl_rx, cancel.clone()));
+
+        events_tx
+            .send(PresenceEvent::new(
+                SensorId("desk".into()),
+                SensorState::Present,
+                Timestamp::now(),
+            ))
+            .await
+            .unwrap();
+        ctl_tx
+            .send(ControlMsg::SetPendingReload(Some("queued".into())))
+            .await
+            .unwrap();
+        let (barrier_tx, barrier_rx) = oneshot::channel();
+        ctl_tx
+            .send(ControlMsg::GenerationBarrier(barrier_tx))
+            .await
+            .unwrap();
+        barrier_rx.await.expect("barrier acknowledgement");
+
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        ctl_tx
+            .send(ControlMsg::Snapshot(snapshot_tx))
+            .await
+            .unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), snapshot_rx)
+            .await
+            .expect("snapshot reply arrives")
+            .expect("engine remains live");
+        assert!(snapshot.sensors.iter().any(|sensor| sensor.reported));
+        assert_eq!(snapshot.pending_reload.as_deref(), Some("queued"));
+
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[test]

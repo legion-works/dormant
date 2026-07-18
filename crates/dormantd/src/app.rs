@@ -40,7 +40,7 @@
 //! (above) covers the physically-dark-but-Active gap. Removed-display verified
 //! wake is fully implemented.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::OnceLock;
@@ -300,6 +300,58 @@ pub struct App {
     /// when `snapshot.and_then(...)` would have been `None` anyway.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
+    #[cfg(any(test, feature = "test-util"))]
+    generation_barrier_gate: Option<GenerationBarrierGate>,
+}
+
+/// Test-only rendezvous immediately before the old engine drain barrier.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Clone)]
+pub struct GenerationBarrierGate {
+    entered_tx: watch::Sender<bool>,
+    entered_rx: watch::Receiver<bool>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl GenerationBarrierGate {
+    /// Create a gate that remains closed until [`Self::release`] is called.
+    #[must_use]
+    pub fn new() -> Self {
+        let (entered_tx, entered_rx) = watch::channel(false);
+        Self {
+            entered_tx,
+            entered_rx,
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Wait until reload has paused front-door routing before the old drain.
+    pub async fn wait_until_entered(&self) {
+        let mut entered = self.entered_rx.clone();
+        while !*entered.borrow_and_update() {
+            if entered.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Permit the reload to send the old-generation drain barrier.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn reach(&self) {
+        self.entered_tx.send_replace(true);
+        self.release.notified().await;
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Default for GenerationBarrierGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The default production [`NotifySinkBuilder`]: a fresh [`notifier::ZbusSink`]
@@ -345,6 +397,8 @@ impl App {
             force_reload_spawn_failure: false,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
+            generation_barrier_gate: None,
         })
     }
 
@@ -383,6 +437,8 @@ impl App {
             force_reload_spawn_failure: false,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
+            generation_barrier_gate: None,
         })
     }
 
@@ -496,6 +552,14 @@ impl App {
     #[must_use]
     pub fn with_test_force_reload_snapshot_timeout(mut self) -> Self {
         self.force_reload_snapshot_timeout = true;
+        self
+    }
+
+    /// Pause a reload immediately before its old-generation drain barrier.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_generation_barrier_gate(mut self, gate: GenerationBarrierGate) -> Self {
+        self.generation_barrier_gate = Some(gate);
         self
     }
 
@@ -651,16 +715,18 @@ impl App {
         let wear_handle: dormant_core::wear::WearHandle =
             Arc::new(std::sync::RwLock::new(HashMap::new()));
 
-        // Stable front channels forwarded to the *current* generation.
-        let (engine_ctl_tx, engine_ctl_rx) = watch::channel(spawn.ctl_tx.clone());
-        let (engine_events_tx, engine_events_rx) = watch::channel(spawn.events_tx.clone());
+        // Stable front channels are paused before an old engine is drained, so
+        // no delivery can race behind the generation barrier.
+        let ctl_router = Arc::new(GenerationRouter::new(spawn.ctl_tx.clone()));
+        let events_router = Arc::new(GenerationRouter::new(spawn.events_tx.clone()));
         let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
         let (front_events_tx, front_events_rx) = mpsc::channel::<PresenceEvent>(256);
 
-        tokio::spawn(forward_ctl(front_ctl_rx, engine_ctl_rx, root.clone()));
-        tokio::spawn(forward_events(
+        let front_ctl_handle =
+            tokio::spawn(forward_ctl(front_ctl_rx, ctl_router.clone(), root.clone()));
+        let front_events_handle = tokio::spawn(forward_events(
             front_events_rx,
-            engine_events_rx,
+            events_router.clone(),
             root.clone(),
         ));
 
@@ -842,8 +908,10 @@ impl App {
             #[cfg(feature = "render")]
             render_sink_builder: self.render_sink_builder,
             root: root.clone(),
-            engine_ctl: engine_ctl_tx,
-            engine_events: engine_events_tx,
+            ctl_router,
+            events_router,
+            front_ctl_handle,
+            front_events_handle,
             executors_tx,
             reload_tx: reload_tx.clone(),
             observations: observations.clone(),
@@ -874,6 +942,8 @@ impl App {
             force_reload_spawn_failure: self.force_reload_spawn_failure,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
+            #[cfg(any(test, feature = "test-util"))]
+            generation_barrier_gate: self.generation_barrier_gate,
         };
 
         let join = tokio::spawn(run_loop(
@@ -1086,8 +1156,10 @@ struct Runner {
     #[cfg(feature = "render")]
     render_sink_builder: Option<RenderSinkBuilder>,
     root: CancellationToken,
-    engine_ctl: watch::Sender<mpsc::Sender<ControlMsg>>,
-    engine_events: watch::Sender<mpsc::Sender<PresenceEvent>>,
+    ctl_router: Arc<GenerationRouter<ControlMsg>>,
+    events_router: Arc<GenerationRouter<PresenceEvent>>,
+    front_ctl_handle: JoinHandle<()>,
+    front_events_handle: JoinHandle<()>,
     /// Current generation's executor map for the wear tracker (spec §4.3).
     /// Republished on every install/rollback via [`Runner::install_generation`];
     /// emptied immediately before teardown in [`Runner::reload`].
@@ -1195,6 +1267,8 @@ struct Runner {
     /// Test seam — see `App::force_reload_snapshot_timeout`.
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
+    #[cfg(any(test, feature = "test-util"))]
+    generation_barrier_gate: Option<GenerationBarrierGate>,
 }
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
@@ -1293,9 +1367,7 @@ struct LkgMeta {
 }
 
 impl Runner {
-    fn install_generation(&mut self, spawn: GenSpawn) {
-        let _ = self.engine_ctl.send(spawn.ctl_tx);
-        let _ = self.engine_events.send(spawn.events_tx);
+    async fn install_generation(&mut self, spawn: GenSpawn) {
         let executors: HashMap<DisplayId, Arc<dyn CommandSink>> = spawn
             .generation
             .display_executors
@@ -1304,6 +1376,8 @@ impl Runner {
             .collect();
         self.executors_tx.send_replace(Arc::new(executors));
         self.generation = spawn.generation;
+        self.ctl_router.install(spawn.ctl_tx).await;
+        self.events_router.install(spawn.events_tx).await;
     }
 
     /// Reload the config, restarting the runtime in place. See the module
@@ -1316,7 +1390,11 @@ impl Runner {
         request_ids: Vec<u64>,
         sources: Vec<ReloadSource>,
     ) -> ReloadReceipt {
-        let old_ctl = self.engine_ctl.borrow().clone();
+        let old_ctl = self
+            .ctl_router
+            .current()
+            .await
+            .expect("current engine control route exists before reload");
         #[cfg(any(test, feature = "test-util"))]
         let preliminary = if self.force_reload_snapshot_timeout {
             None
@@ -1489,6 +1567,14 @@ impl Runner {
         // above covering the two stretches that precede this point).
         self.ping("before_teardown");
 
+        self.ctl_router.pause().await;
+        self.events_router.pause().await;
+        quiesce_inputs(&mut self.generation).await;
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(gate) = &self.generation_barrier_gate {
+            gate.reach().await;
+        }
+        await_generation_barrier(&old_ctl).await;
         teardown(&mut self.generation).await;
 
         // Verified physical wake of REMOVED displays (no executor in the new
@@ -1511,7 +1597,8 @@ impl Runner {
                     // engine construction, controllers reused — not a
                     // controller reprobe, but still non-trivial work).
                     self.ping("before_rebuild_old_wake_failure");
-                    self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
+                    self.rebuild_old(Some(detail.clone()), snapshot.as_ref())
+                        .await;
                     let outcome = ReloadOutcome::Rejected(detail);
                     let _ = self.reload_tx.send(outcome.clone());
                     return self.reload_receipt(
@@ -1579,7 +1666,7 @@ impl Runner {
         };
         match spawn_result {
             Ok(spawn) => {
-                self.install_generation(spawn);
+                self.install_generation(spawn).await;
                 self.applied_revision = requested_revision.clone();
                 self.generation_id = GenerationId(self.generation_id.0.saturating_add(1));
 
@@ -1600,7 +1687,11 @@ impl Runner {
                     // — it makes the transition's specified shape explicit
                     // rather than relying on `spawn_generation`'s literal
                     // staying `None` forever.
-                    let new_ctl = self.engine_ctl.borrow().clone();
+                    let new_ctl = self
+                        .ctl_router
+                        .current()
+                        .await
+                        .expect("new engine control route exists after install");
                     let _ = new_ctl.send(ControlMsg::SetPendingReload(None)).await;
 
                     // Persist the crash-loop-state clear (Task 2 §4: a
@@ -1709,7 +1800,8 @@ impl Runner {
                 // `rebuild_old` call site (the accepted-config
                 // `spawn_generation` failure path).
                 self.ping("before_rebuild_old_spawn_failure");
-                self.rebuild_old(Some(detail.clone()), snapshot.as_ref());
+                self.rebuild_old(Some(detail.clone()), snapshot.as_ref())
+                    .await;
                 let outcome = ReloadOutcome::Rejected(detail);
                 let _ = self.reload_tx.send(outcome.clone());
                 self.reload_receipt(request_ids, sources, requested_revision, outcome, false)
@@ -1795,7 +1887,7 @@ impl Runner {
 
     /// Restart the *old* config in place with `pending` populated. Reuses the
     /// current generation's live controllers (no re-probe); rebuilds sources.
-    fn rebuild_old(&mut self, pending: Option<String>, snapshot: Option<&StateSnapshot>) {
+    async fn rebuild_old(&mut self, pending: Option<String>, snapshot: Option<&StateSnapshot>) {
         let sources = (self.source_builder)(&self.generation.cfg, &self.generation.creds)
             .unwrap_or_else(|e| {
                 tracing::error!(event = "reload_source_rebuild_failed", error = %e);
@@ -1832,7 +1924,7 @@ impl Runner {
             self.notify_state.clone(),
             self.notify_sink.clone(),
         ) {
-            Ok(spawn) => self.install_generation(spawn),
+            Ok(spawn) => self.install_generation(spawn).await,
             Err(e) => tracing::error!(event = "reload_rebuild_old_failed", error = %e),
         }
     }
@@ -1861,7 +1953,13 @@ impl Runner {
         // starves the retry too.
         self.retry_rollback_state_clear();
 
-        let ctl = self.engine_ctl.borrow().clone();
+        let Some(ctl) = self.ctl_router.current().await else {
+            tracing::error!(
+                event = "generation_route_missing",
+                "watchdog found no active engine route"
+            );
+            return;
+        };
         let probe_result = watchdog_probe(&ctl).await;
         if ping_if_healthy(&mut self.sd, probe_result.as_ref()) {
             self.probe_failed_warned = false;
@@ -2103,6 +2201,10 @@ fn reset_candidate_on_probe_failure(candidate: &mut Option<LkgCandidate>, now: I
 /// Uses platform-specific signals:
 /// - Unix: SIGHUP (reload), SIGTERM (shutdown), SIGINT (shutdown)
 /// - Non-Unix: Ctrl+C only (reload via watcher/IPC)
+#[allow(
+    clippy::too_many_lines,
+    reason = "platform-specific signal loops and bounded shutdown ownership stay together"
+)]
 async fn run_loop(
     mut runner: Runner,
     mut watcher: reload::ConfigWatcher,
@@ -2213,7 +2315,25 @@ async fn run_loop(
             tracing::warn!(event = "wear_tracker_abort_forced");
         }
     };
-    tokio::join!(teardown(&mut runner.generation), wear_teardown);
+    let front_ctl_handle = runner.front_ctl_handle;
+    let front_events_handle = runner.front_events_handle;
+    let front_teardown = async {
+        for handle in [front_ctl_handle, front_events_handle] {
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+                tracing::warn!(event = "front_router_abort_forced");
+            }
+        }
+    };
+    let generation_teardown = async {
+        quiesce_inputs(&mut runner.generation).await;
+        teardown(&mut runner.generation).await;
+    };
+    tokio::join!(generation_teardown, wear_teardown, front_teardown);
     tracing::info!(event = "daemon_stopped");
 }
 
@@ -2404,11 +2524,88 @@ fn runtime_revision_from_paths(config_path: &Path, creds_path: &Path) -> Result<
 
 // ── Generation ─────────────────────────────────────────────────────────────────
 
+/// Stable front-door route for one generation-scoped message type.
+struct GenerationRouter<T> {
+    state: tokio::sync::Mutex<GenerationRouterState<T>>,
+}
+
+struct GenerationRouterState<T> {
+    paused: bool,
+    target: Option<mpsc::Sender<T>>,
+    queued: VecDeque<T>,
+}
+
+impl<T: Send + 'static> GenerationRouter<T> {
+    fn new(target: mpsc::Sender<T>) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(GenerationRouterState {
+                paused: false,
+                target: Some(target),
+                queued: VecDeque::new(),
+            }),
+        }
+    }
+
+    async fn current(&self) -> Option<mpsc::Sender<T>> {
+        self.state.lock().await.target.clone()
+    }
+
+    async fn pause(&self) {
+        let mut state = self.state.lock().await;
+        state.paused = true;
+        state.target = None;
+    }
+
+    async fn install(&self, target: mpsc::Sender<T>) {
+        let mut state = self.state.lock().await;
+        state.target = Some(target.clone());
+        while let Some(message) = state.queued.pop_front() {
+            if target.send(message).await.is_err() {
+                tracing::error!(
+                    event = "generation_route_install_failed",
+                    "new generation closed while queued inputs were being released"
+                );
+                break;
+            }
+        }
+        state.paused = false;
+    }
+
+    async fn route(&self, message: T, root: &CancellationToken) -> bool {
+        let mut state = self.state.lock().await;
+        if state.paused {
+            state.queued.push_back(message);
+            return true;
+        }
+        let Some(target) = state.target.clone() else {
+            tracing::error!(
+                event = "generation_route_missing",
+                "front-door route missing outside intentional shutdown"
+            );
+            return false;
+        };
+        tokio::select! {
+            () = root.cancelled() => false,
+            result = target.send(message) => {
+                if result.is_err() && !root.is_cancelled() {
+                    tracing::error!(
+                        event = "generation_route_send_failed",
+                        "active generation closed its inbound route"
+                    );
+                }
+                result.is_ok()
+            }
+        }
+    }
+}
+
 /// One live runtime generation: the spawned engine plus everything needed to
 /// cheaply rebuild it on a rejected reload.
 struct Generation {
-    token: CancellationToken,
+    engine_token: CancellationToken,
     engine_handle: Option<JoinHandle<()>>,
+    producer_token: CancellationToken,
+    producer_handles: Vec<JoinHandle<()>>,
     cfg: Config,
     creds: Credentials,
     engine_cfg: RulesEngineConfig,
@@ -2434,7 +2631,7 @@ struct GenSpawn {
 /// Cancel a generation and await its engine (bounded), force-aborting the
 /// engine task if it overruns the grace window.
 async fn teardown(generation: &mut Generation) {
-    generation.token.cancel();
+    generation.engine_token.cancel();
     if let Some(handle) = generation.engine_handle.take() {
         let abort = handle.abort_handle();
         if tokio::time::timeout(Duration::from_secs(5), handle)
@@ -2444,6 +2641,42 @@ async fn teardown(generation: &mut Generation) {
             abort.abort();
             tracing::warn!(event = "engine_abort_forced");
         }
+    }
+}
+
+/// Stop generation-local producers while leaving the engine available to drain.
+async fn quiesce_inputs(generation: &mut Generation) {
+    generation.producer_token.cancel();
+    for handle in generation.producer_handles.drain(..) {
+        let abort = handle.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .is_err()
+        {
+            abort.abort();
+            tracing::warn!(event = "generation_producer_abort_forced");
+        }
+    }
+}
+
+async fn await_generation_barrier(ctl: &mpsc::Sender<ControlMsg>) {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if ctl
+        .send(ControlMsg::GenerationBarrier(ack_tx))
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            event = "generation_barrier_send_failed",
+            "old engine closed before acknowledging its generation barrier"
+        );
+        return;
+    }
+    if ack_rx.await.is_err() {
+        tracing::error!(
+            event = "generation_barrier_ack_failed",
+            "old engine exited before acknowledging its generation barrier"
+        );
     }
 }
 
@@ -3002,6 +3235,10 @@ fn build_render_sinks(
 /// [`App::start`]) — every call site threads the SAME `Arc`s through so the
 /// notifier's open episodes (and the sink's cached connection) survive a
 /// config reload.
+#[allow(
+    clippy::too_many_lines,
+    reason = "generation construction keeps every producer handle visible at its spawn site"
+)]
 fn spawn_generation(
     root: &CancellationToken,
     assembly: StaticAssembly,
@@ -3011,7 +3248,9 @@ fn spawn_generation(
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
 ) -> Result<GenSpawn> {
-    let token = root.child_token();
+    let engine_token = root.child_token();
+    let engine_cancel = engine_token.clone();
+    let producer_token = root.child_token();
     let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(64);
     let (events_tx, events_rx) = mpsc::channel::<PresenceEvent>(256);
 
@@ -3043,30 +3282,36 @@ fn spawn_generation(
         apply_restore(&mut engine, snapshot, &assembly.engine_cfg);
     }
 
-    let engine_token = token.clone();
     let engine_handle = tokio::spawn(async move {
-        engine.run(events_rx, ctl_rx, engine_token).await;
+        engine.run(events_rx, ctl_rx, engine_cancel).await;
     });
+
+    let mut producer_handles = Vec::new();
 
     // ── InputWake drain (feature-gated: render surfaces emit InputWake) ──
     // Each LayerShellRenderSink pushes DisplayId through an unbounded
     // channel on the first pointer/key event.  This task routes those
     // DisplayIds to the engine as ControlMsg::InputWake so the state
-    // machine can react.  Scoped to the generation's cancellation token
-    // so it dies on reload alongside the engine.
+    // machine can react. Its producer token stops it before the old engine
+    // receives the generation barrier, preventing a wake from landing behind
+    // that fence.
     #[cfg(feature = "render")]
     if let Some(input_wake_rx) = assembly.input_wake_rx {
-        spawn_input_wake_drain(input_wake_rx, ctl_tx.clone(), token.clone());
+        producer_handles.push(spawn_input_wake_drain(
+            input_wake_rx,
+            ctl_tx.clone(),
+            producer_token.clone(),
+        ));
     }
 
     for source in assembly.sources {
         let stx = events_tx.clone();
-        let stoken = token.clone();
-        tokio::spawn(async move {
+        let stoken = producer_token.clone();
+        producer_handles.push(tokio::spawn(async move {
             if let Err(e) = source.run(stx, stoken).await {
                 tracing::error!(event = "sensor_source_exited", error = %e);
             }
-        });
+        }));
     }
 
     let poll = assembly
@@ -3079,15 +3324,17 @@ fn spawn_generation(
         sanity_cap: assembly.cfg.daemon.macos_idle_sanity_cap,
         startup_grace: assembly.cfg.daemon.macos_idle_startup_grace,
     };
-    let _inhibitor = inhibit_activity::spawn(
+    if let Some(handle) = inhibit_activity::spawn(
         assembly.activity_rules,
         poll,
         idle_source,
         idle_unit,
         macos_guard_cfg,
         ctl_tx.clone(),
-        token.clone(),
-    );
+        producer_token.clone(),
+    ) {
+        producer_handles.push(handle);
+    }
 
     // Audio/call inhibitor (spec §4.3) — global `[audio]` section, so the
     // rule list is derived straight from `assembly.cfg` here rather than
@@ -3095,27 +3342,33 @@ fn spawn_generation(
     // (there is no per-rule interval to carry). `None` when no rule opts in
     // (`inhibit_activity::spawn`'s own precedent, mirrored by
     // `inhibit_audio::spawn`).
-    let _audio_inhibitor = inhibit_audio::spawn(
+    if let Some(handle) = inhibit_audio::spawn(
         audio_rules(&assembly.cfg),
         assembly.cfg.audio.clone(),
         ctl_tx.clone(),
-        token.clone(),
-    );
+        producer_token.clone(),
+    ) {
+        producer_handles.push(handle);
+    }
 
     // Desktop wake/blank-failure notifier (spec §4.4) — `notifier::spawn`
     // returns `None` (no-op) when `[notifications] enabled = false`,
     // mirroring `inhibit_activity::spawn`'s own None-returning precedent.
-    let _notifier = notifier::spawn(NotifierDeps {
+    if let Some(handle) = notifier::spawn(NotifierDeps {
         ctl: ctl_tx.clone(),
         cfg: assembly.cfg.notifications,
         state: notify_state,
         sink: notify_sink,
-        cancel: token.clone(),
-    });
+        cancel: producer_token.clone(),
+    }) {
+        producer_handles.push(handle);
+    }
 
     let generation = Generation {
-        token,
+        engine_token,
         engine_handle: Some(engine_handle),
+        producer_token,
+        producer_handles,
         cfg: assembly.cfg,
         creds: assembly.creds,
         engine_cfg: assembly.engine_cfg,
@@ -3446,24 +3699,10 @@ async fn request_snapshot(ctl: &mpsc::Sender<ControlMsg>) -> Option<StateSnapsho
         .ok()
 }
 
-/// Forward control messages to the current generation's engine.
-///
-/// During a config reload the engine is torn down and rebuilt; there is a
-/// brief window between dropping the old `ControlMsg` receiver and writing
-/// the new generation's sender into the watch. A message forwarded in that
-/// window hits a dead sender and would be lost without retry — the canonical
-/// failure for a manual-only (rule-less) display is a dropped `ForceWake`
-/// leaving the screen dark with nothing to re-converge it.
-///
-/// On `SendError` we recover the message (`SendError(m)` gives it back),
-/// wait for the next watch write via `target.changed()`, and re-send —
-/// bounded by `MAX_SWAP_WAITS` to cover the pathological case where the
-/// reload stalls and no new generation ever arrives. Single-task sequential
-/// processing preserves ordering: each `rx.recv()` and its full retry loop
-/// complete before the next receive.
+/// Forward control messages through the current generation router.
 async fn forward_ctl(
     mut rx: mpsc::Receiver<ControlMsg>,
-    mut target: watch::Receiver<mpsc::Sender<ControlMsg>>,
+    router: Arc<GenerationRouter<ControlMsg>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -3472,7 +3711,7 @@ async fn forward_ctl(
             msg = rx.recv() => match msg {
                 None => break,
                 Some(m) => {
-                    if !deliver_or_drop(m, &mut target, &cancel, "ctl_forward_dropped").await {
+                    if !router.route(m, &cancel).await {
                         break;
                     }
                 }
@@ -3481,77 +3720,10 @@ async fn forward_ctl(
     }
 }
 
-/// Deliver a single message to the current generation's engine, retrying
-/// across a reload swap on `SendError`. Returns `false` when the forwarder
-/// should exit (cancellation observed, watch sender dropped, or
-/// `MAX_SWAP_WAITS` exceeded — all logged under `drop_event`).
-///
-/// Generic over the message type so the control and presence forwarders
-/// share one implementation. Each call site passes its own `drop_event`
-/// literal (AGENTS.md rule 3 — grep-stable anchors at the definition site):
-/// `"ctl_forward_dropped"` for control messages, `"event_forward_dropped"`
-/// for presence events. `T` carries no explicit bound — the `Send`
-/// requirement comes implicitly from `mpsc::Sender<T>::send(T)` at the
-/// call site.
-async fn deliver_or_drop<T>(
-    msg: T,
-    target: &mut watch::Receiver<mpsc::Sender<T>>,
-    cancel: &CancellationToken,
-    drop_event: &'static str,
-) -> bool {
-    const MAX_SWAP_WAITS: usize = 2;
-    let mut pending = msg;
-    let mut waits: usize = 0;
-    loop {
-        let sender = target.borrow().clone();
-        match sender.send(pending).await {
-            Ok(()) => return true,
-            Err(e) => {
-                pending = e.0;
-                if waits >= MAX_SWAP_WAITS {
-                    tracing::warn!(
-                        event = drop_event,
-                        waits,
-                        "message dropped: no live engine generation within retry bound"
-                    );
-                    return false;
-                }
-                waits += 1;
-                tokio::select! {
-                    () = cancel.cancelled() => {
-                        tracing::warn!(
-                            event = drop_event,
-                            waits,
-                            "message dropped: cancellation observed while awaiting new generation"
-                        );
-                        return false;
-                    }
-                    r = target.changed() => {
-                        if r.is_err() {
-                            tracing::warn!(
-                                event = drop_event,
-                                waits,
-                                "message dropped: watch sender dropped (shutdown)"
-                            );
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Forward injected presence events to the current generation's engine.
-///
-/// Same reload-window drop risk as [`forward_ctl`]: between
-/// `teardown(old)` and `install_generation(new)` the watch still points at
-/// the dead old-generation sender, and a presence event forwarded in that
-/// window would be silently swallowed by `SendError`. Retry the same way
-/// — see [`deliver_or_drop`] — bounded by `MAX_SWAP_WAITS`.
+/// Forward injected presence events through the current generation router.
 async fn forward_events(
     mut rx: mpsc::Receiver<PresenceEvent>,
-    mut target: watch::Receiver<mpsc::Sender<PresenceEvent>>,
+    router: Arc<GenerationRouter<PresenceEvent>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -3560,7 +3732,7 @@ async fn forward_events(
             msg = rx.recv() => match msg {
                 None => break,
                 Some(m) => {
-                    if !deliver_or_drop(m, &mut target, &cancel, "event_forward_dropped").await {
+                    if !router.route(m, &cancel).await {
                         break;
                     }
                 }
@@ -3811,7 +3983,7 @@ fn spawn_input_wake_drain(
     input_wake_rx: tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
     ctl_tx: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
             () = cancel.cancelled() => {}
@@ -3824,7 +3996,7 @@ fn spawn_input_wake_drain(
                 }
             } => {}
         }
-    });
+    })
 }
 
 #[cfg(feature = "render")]
@@ -4542,339 +4714,68 @@ mod render_tests {
     }
 }
 
-// ── forward_ctl reload-window tests (#9) ─────────────────────────────────────
+// ── generation router tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
-mod forward_ctl_tests {
+mod generation_router_tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
+    use dormant_core::types::{SensorState, Timestamp};
 
-    /// Build a watch seeded with a `ControlMsg` sender whose receiver has been
-    /// dropped — exactly the state of the engine watch between
-    /// `teardown(old)` and `install_generation(new)` during a reload.
-    fn dead_watch() -> (
-        watch::Sender<mpsc::Sender<ControlMsg>>,
-        watch::Receiver<mpsc::Sender<ControlMsg>>,
-        mpsc::Sender<ControlMsg>,
-    ) {
-        let (dead_tx, dead_rx) = mpsc::channel::<ControlMsg>(1);
-        drop(dead_rx);
-        let (watch_tx, watch_rx) = watch::channel(dead_tx.clone());
-        (watch_tx, watch_rx, dead_tx)
-    }
-
-    /// RED-FIRST crux (#9): a control message forwarded during the reload
-    /// window — when the watch still points at the dead old-generation sender
-    /// — must arrive on the NEW live receiver once `install_generation`
-    /// writes the replacement sender. With the unfixed
-    /// `let _ = sender.send(m).await` the message is dropped and the
-    /// assertion times out.
     #[tokio::test]
-    async fn forward_ctl_retries_across_generation_swap() {
-        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
+    async fn control_queued_while_paused_releases_once_to_new_generation() {
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let router = Arc::new(GenerationRouter::new(old_tx));
+        router.pause().await;
         let cancel = CancellationToken::new();
-        let (front_tx, front_rx) = mpsc::channel::<ControlMsg>(1);
+        let (front_tx, front_rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_ctl(front_rx, router.clone(), cancel.clone()));
 
-        let handle = tokio::spawn(forward_ctl(front_rx, watch_rx, cancel.clone()));
-
-        // Send a ForceWake into the front channel. forward_ctl will try the
-        // dead sender, get SendError, and start waiting on changed().
         front_tx
             .send(ControlMsg::ForceWake(DisplayId("manual-only".into())))
             .await
-            .expect("front channel send");
-
-        // Force a scheduler hand-off so forward_ctl's task is guaranteed to
-        // run, consume the front-channel message, attempt the dead-sender
-        // send, and park on `changed()` BEFORE we update the watch. Without
-        // this yield the multi-thread test runtime can race the watch write
-        // ahead of forward_ctl's first `borrow()`, letting the unfixed
-        // `let _ = sender.send(m).await` see the new live sender and
-        // deliver the message trivially — a polite test that doesn't guard
-        // the fix.
+            .unwrap();
         tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        // Install the new generation's live sender — simulates install_generation.
-        let (new_tx, mut new_rx) = mpsc::channel::<ControlMsg>(1);
-        watch_tx.send(new_tx).expect("watch send");
-
-        // The fixed forward_ctl must re-deliver the pending message to the
-        // NEW receiver. Timeout-bound so a hang becomes a clean assert.
-        let received = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        router.install(new_tx).await;
+        let received = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
             .await
-            .expect("forward_ctl did not deliver to the new generation within 2s")
-            .expect("new generation channel closed unexpectedly");
-
-        match received {
-            ControlMsg::ForceWake(d) => assert_eq!(d.0, "manual-only"),
-            other => panic!("expected ForceWake(manual-only), got {other:?}"),
-        }
+            .expect("queued control is released")
+            .expect("new generation stays live");
+        assert!(matches!(received, ControlMsg::ForceWake(display) if display.0 == "manual-only"));
 
         cancel.cancel();
-        // Drop the front sender so the spawn can exit.
         drop(front_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        forwarder.await.unwrap();
     }
 
-    /// Bounded-retry path: with no live generation ever arriving (a
-    /// pathological non-shutdown stall), the message is dropped after
-    /// `MAX_SWAP_WAITS` wait cycles and `forward_ctl` exits cleanly. Each
-    /// `changed()` wait is resolved by writing another dead sender to the
-    /// watch, so the retry loop completes and `forward_ctl` logs
-    /// `ctl_forward_dropped` rather than hanging. Crucially, the front
-    /// channel is NOT closed and cancellation is NOT triggered — the exit
-    /// must come from the `MAX_SWAP_WAITS` bound, not from rx recv / cancel.
-    /// Against the unfixed code this test would hang on the next
-    /// `rx.recv()` after the dropped message.
     #[tokio::test]
-    async fn forward_ctl_drops_after_max_swap_waits_when_no_new_generation() {
-        // Mirror the constant bound inside `deliver_or_drop`. Each write
-        // lets one `changed()` resolution complete; without a live sender
-        // every retry fails and the bound is hit.
-        const MAX_SWAP_WAITS: usize = 2;
-        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
+    async fn event_queued_while_paused_releases_once_to_new_generation() {
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let router = Arc::new(GenerationRouter::new(old_tx));
+        router.pause().await;
         let cancel = CancellationToken::new();
-        let (front_tx, front_rx) = mpsc::channel::<ControlMsg>(1);
-
-        let handle = tokio::spawn(forward_ctl(front_rx, watch_rx, cancel.clone()));
-
-        front_tx
-            .send(ControlMsg::ForceWake(DisplayId("doomed".into())))
-            .await
-            .expect("front channel send");
-
-        // Yield so forward_ctl processes the front message and parks on
-        // its first `changed()` await before we start writing to the watch.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        for _ in 0..MAX_SWAP_WAITS {
-            let (extra_dead_tx, extra_dead_rx) = mpsc::channel::<ControlMsg>(1);
-            drop(extra_dead_rx);
-            watch_tx.send(extra_dead_tx).expect("watch send");
-            // Yield so forward_ctl processes the changed() resolution,
-            // re-borrow the dead sender, fail to send, and re-arm the wait.
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-
-        // No cancellation, front_tx still alive — forward_ctl must still
-        // exit because `deliver_or_drop` returns false at the bound and
-        // the outer loop breaks. Bound the wait so an unbounded retry
-        // loop (regression) or the unfixed "swallow then await forever"
-        // path becomes a clean test failure.
-        let join = tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("forward_ctl did not exit within 2s — MAX_SWAP_WAITS bound was not honored");
-        assert!(join.is_ok(), "forward_ctl task panicked: {join:?}");
-    }
-
-    /// Cancel mid-wait: while `forward_ctl` is blocked on `changed()` waiting
-    /// for the next generation, cancelling the token must break the inner
-    /// retry loop and the outer `forward_ctl` cleanly — no hang, no panic.
-    #[tokio::test]
-    async fn forward_ctl_breaks_cleanly_on_cancel_during_swap_wait() {
-        let (_watch_tx, watch_rx, _dead_tx) = dead_watch();
-        let cancel = CancellationToken::new();
-        let (front_tx, front_rx) = mpsc::channel::<ControlMsg>(1);
-
-        let handle = tokio::spawn(forward_ctl(front_rx, watch_rx, cancel.clone()));
-
-        // Trigger the dead-sender path so forward_ctl parks on changed().
-        front_tx
-            .send(ControlMsg::ForceWake(DisplayId("cancelled".into())))
-            .await
-            .expect("front channel send");
-
-        // Yield so forward_ctl reaches its `changed()` await before we cancel.
-        // Without this, on a multi-thread runtime the cancel may race ahead of
-        // the task ever entering the changed() wait.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        // Now cancel — forward_ctl must exit cleanly without ever writing
-        // to the watch.
-        cancel.cancel();
-        drop(front_tx);
-
-        let join = tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("forward_ctl did not exit within 1s after cancel");
-        assert!(join.is_ok(), "forward_ctl task panicked on cancel");
-    }
-}
-
-#[cfg(test)]
-mod forward_events_tests {
-    use super::*;
-    use dormant_core::types::{SensorState, Timestamp};
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    /// Build a watch seeded with a `PresenceEvent` sender whose receiver has
-    /// been dropped — the same state `forward_events` would observe between
-    /// `teardown(old)` and `install_generation(new)` during a reload.
-    fn dead_watch() -> (
-        watch::Sender<mpsc::Sender<PresenceEvent>>,
-        watch::Receiver<mpsc::Sender<PresenceEvent>>,
-        mpsc::Sender<PresenceEvent>,
-    ) {
-        let (dead_tx, dead_rx) = mpsc::channel::<PresenceEvent>(1);
-        drop(dead_rx);
-        let (watch_tx, watch_rx) = watch::channel(dead_tx.clone());
-        (watch_tx, watch_rx, dead_tx)
-    }
-
-    /// RED-FIRST crux: a presence event forwarded during the reload window —
-    /// when the watch still points at the dead old-generation sender — must
-    /// arrive on the NEW live receiver once `install_generation` writes the
-    /// replacement sender. With the unfixed `let _ = sender.send(m).await`
-    /// the message is dropped and the assertion times out.
-    #[tokio::test]
-    async fn forward_events_retries_across_generation_swap() {
-        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
-        let cancel = CancellationToken::new();
-        let (front_tx, front_rx) = mpsc::channel::<PresenceEvent>(1);
-
-        let handle = tokio::spawn(forward_events(front_rx, watch_rx, cancel.clone()));
-
-        // Send a Present event into the front channel. forward_events will try
-        // the dead sender, get SendError, and start waiting on changed().
+        let (front_tx, front_rx) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_events(front_rx, router.clone(), cancel.clone()));
         let event = PresenceEvent::new(
             SensorId("test-sensor".into()),
             SensorState::Present,
             Timestamp::now(),
         );
-        front_tx
-            .send(event.clone())
-            .await
-            .expect("front channel send");
 
-        // Force a scheduler hand-off so forward_events is guaranteed to
-        // consume the front-channel message, attempt the dead-sender send,
-        // and park on `changed()` BEFORE we update the watch. Without this
-        // yield the multi-thread test runtime can race the watch write ahead
-        // of forward_events' first `borrow()`, letting the unfixed
-        // `let _ = sender.send(m).await` see the new live sender and
-        // deliver the message trivially — a polite test that doesn't guard
-        // the fix.
+        front_tx.send(event.clone()).await.unwrap();
         tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        // Install the new generation's live sender — simulates install_generation.
-        let (new_tx, mut new_rx) = mpsc::channel::<PresenceEvent>(1);
-        watch_tx.send(new_tx).expect("watch send");
-
-        // The fixed forward_events must re-deliver the pending event to the
-        // NEW receiver. Timeout-bound so a hang becomes a clean assert.
-        let received = tokio::time::timeout(Duration::from_secs(2), new_rx.recv())
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        router.install(new_tx).await;
+        let received = tokio::time::timeout(Duration::from_secs(1), new_rx.recv())
             .await
-            .expect("forward_events did not deliver to the new generation within 2s")
-            .expect("new generation channel closed unexpectedly");
-
+            .expect("queued event is released")
+            .expect("new generation stays live");
         assert_eq!(received.sensor_id, event.sensor_id);
         assert_eq!(received.state, event.state);
 
         cancel.cancel();
-        // Drop the front sender so the spawn can exit.
         drop(front_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
-    }
-
-    /// Bounded-retry path: with no live generation ever arriving (a
-    /// pathological non-shutdown stall), the message is dropped after
-    /// `MAX_SWAP_WAITS` wait cycles and `forward_events` exits cleanly. Each
-    /// `changed()` wait is resolved by writing another dead sender to the
-    /// watch, so the retry loop completes and `forward_events` logs
-    /// `event_forward_dropped` rather than hanging. Crucially, the front
-    /// channel is NOT closed and cancellation is NOT triggered — the exit
-    /// must come from the `MAX_SWAP_WAITS` bound, not from rx recv / cancel.
-    #[tokio::test]
-    async fn forward_events_drops_after_max_swap_waits_when_no_new_generation() {
-        // Mirror the constant bound inside `deliver_or_drop`. Each write
-        // lets one `changed()` resolution complete; without a live sender
-        // every retry fails and the bound is hit.
-        const MAX_SWAP_WAITS: usize = 2;
-        let (watch_tx, watch_rx, _dead_tx) = dead_watch();
-        let cancel = CancellationToken::new();
-        let (front_tx, front_rx) = mpsc::channel::<PresenceEvent>(1);
-
-        let handle = tokio::spawn(forward_events(front_rx, watch_rx, cancel.clone()));
-
-        let event = PresenceEvent::new(
-            SensorId("doomed".into()),
-            SensorState::Absent,
-            Timestamp::now(),
-        );
-        front_tx.send(event).await.expect("front channel send");
-
-        // Yield so forward_events processes the front message and parks on
-        // its first `changed()` await before we start writing to the watch.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        for _ in 0..MAX_SWAP_WAITS {
-            let (extra_dead_tx, extra_dead_rx) = mpsc::channel::<PresenceEvent>(1);
-            drop(extra_dead_rx);
-            watch_tx.send(extra_dead_tx).expect("watch send");
-            // Yield so forward_events processes the changed() resolution,
-            // re-borrow the dead sender, fail to send, and re-arm the wait.
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
-        }
-
-        // No cancellation, front_tx still alive — forward_events must still
-        // exit because `deliver_or_drop` returns false at the bound and
-        // the outer loop breaks. Bound the wait so an unbounded retry
-        // loop (regression) or the unfixed "swallow then await forever"
-        // path becomes a clean test failure.
-        let join = tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("forward_events did not exit within 2s — MAX_SWAP_WAITS bound was not honored");
-        assert!(join.is_ok(), "forward_events task panicked: {join:?}");
-    }
-
-    /// Cancel mid-wait: while `forward_events` is blocked on `changed()`
-    /// waiting for the next generation, cancelling the token must break the
-    /// inner retry loop and the outer `forward_events` cleanly — no hang, no
-    /// panic.
-    #[tokio::test]
-    async fn forward_events_breaks_cleanly_on_cancel_during_swap_wait() {
-        let (_watch_tx, watch_rx, _dead_tx) = dead_watch();
-        let cancel = CancellationToken::new();
-        let (front_tx, front_rx) = mpsc::channel::<PresenceEvent>(1);
-
-        let handle = tokio::spawn(forward_events(front_rx, watch_rx, cancel.clone()));
-
-        // Trigger the dead-sender path so forward_events parks on changed().
-        let event = PresenceEvent::new(
-            SensorId("cancelled".into()),
-            SensorState::Present,
-            Timestamp::now(),
-        );
-        front_tx.send(event).await.expect("front channel send");
-
-        // Yield so forward_events reaches its `changed()` await before we
-        // cancel. Without this, on a multi-thread runtime the cancel may
-        // race ahead of the task ever entering the changed() wait.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        // Now cancel — forward_events must exit cleanly without ever writing
-        // to the watch.
-        cancel.cancel();
-        drop(front_tx);
-
-        let join = tokio::time::timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("forward_events did not exit within 1s after cancel");
-        assert!(join.is_ok(), "forward_events task panicked on cancel");
+        forwarder.await.unwrap();
     }
 }
 

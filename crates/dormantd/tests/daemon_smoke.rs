@@ -19,7 +19,7 @@ use dormant_core::observation::ReloadSource;
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
-use dormantd::app::{App, ReloadOutcome, validate_only};
+use dormantd::app::{App, GenerationBarrierGate, ReloadOutcome, validate_only};
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
@@ -1388,6 +1388,99 @@ async fn coordinator_rejects_invalid_request_with_its_own_receipt() {
     shutdown(handle, join).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_reload_inputs_are_delivered_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    let old_event_marker = dir.path().join("old-event-marker");
+    let old_control_marker = dir.path().join("old-control-marker");
+    let new_event_marker = dir.path().join("new-event-marker");
+    let new_control_marker = dir.path().join("new-control-marker");
+    let generation_swap_config = |event_marker: &Path, control_marker: &Path| {
+        format!(
+            "{}\n[displays.manual]\ncontrollers = [\"command\"]\nblank_mode = \"power_off\"\nblank_command = \"printf B >> '{}'\"\nwake_command = \"printf W >> '{}'\"\nmodes = [\"power_off\"]\n",
+            one_display_config(event_marker, "0s"),
+            control_marker.display(),
+            control_marker.display(),
+        )
+    };
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &generation_swap_config(&old_event_marker, &old_control_marker),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let gate = GenerationBarrierGate::new();
+    let (handle, join) = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_test_generation_barrier_gate(gate.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+
+    fs::write(
+        &cfg_path,
+        generation_swap_config(&new_event_marker, &new_control_marker).replace(
+            "startup_holdoff = \"0s\"",
+            "startup_holdoff = \"0s\"\nreload_debounce = \"1ms\"",
+        ),
+    )
+    .unwrap();
+
+    let events = handle.events_sender();
+    let controls = handle.control_sender();
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before reaching the old-generation drain"),
+            result = tokio::time::timeout(Duration::from_secs(1), gate.wait_until_entered()) => {
+                assert!(result.is_ok(), "reload did not pause at the old-generation drain");
+            }
+        }
+
+        events.send(ev("desk", SensorState::Absent)).await.unwrap();
+        controls
+            .send(ControlMsg::ForceBlank(DisplayId("manual".into())))
+            .await
+            .unwrap();
+        gate.release();
+
+        let (_, receipt) = tokio::time::timeout(Duration::from_secs(5), reload)
+            .await
+            .expect("reload completes")
+            .expect("reload receipt");
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    }
+    assert!(
+        wait_for(
+            || count(&new_event_marker, 'B') == 1 && count(&new_control_marker, 'B') == 1,
+            Duration::from_secs(2),
+        )
+        .await
+    );
+    assert_eq!(
+        count(&old_event_marker, 'B'),
+        0,
+        "event reached old generation"
+    );
+    assert_eq!(
+        count(&old_control_marker, 'B'),
+        0,
+        "control reached old generation"
+    );
+    assert_eq!(count(&new_event_marker, 'B'), 1, "event handled once");
+    assert_eq!(count(&new_control_marker, 'B'), 1, "control handled once");
+
+    shutdown(handle, join).await;
+}
+
 // ── 10: web_nonloopback_enabled warning fires at startup ───────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1803,22 +1896,8 @@ wake_retry_interval = "1s"
     /// Uses a two-display config where mon2 has `wake_command = "false"`
     /// so its verified wake fails on removal, triggering `rebuild_old`.
     ///
-    /// **Determinism — identity-based, no counts.** The test factory pairs
-    /// each render sink it builds with the `InputWake` sender it was handed,
-    /// in build order.  Selection never counts invocations (that total is
-    /// environment-dependent — a single `fs::write` can wake both
-    /// `trigger_reload` and the config watcher, and CPU load shifts timing).
-    /// Instead, after draining the reload bus until quiet (so the installed
-    /// generation is FINAL) and re-driving the engine to a render stage, the
-    /// test selects the sink pinned by three identity marks: index >= 2 (only
-    /// a rollback generation lands here — indices 0..2 are the initial
-    /// assembly, and a rejected new-assembly's sink is dropped before its
-    /// generation is ever spawned, so it never renders), a LIVE sender (only
-    /// the CURRENT generation's `InputWake` receiver is still held by a drain
-    /// — superseded rollbacks are closed), and an actual `RenderBlack` (so a
-    /// teardown is observable).  Among matches it takes the highest index
-    /// (build order → newest generation).  No control-channel bypass, no
-    /// count gate.
+    /// The exact rejected receipt and its matching completion observation make
+    /// the restored generation observable without timing a quiet reload bus.
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(
@@ -1925,7 +2004,7 @@ wake_retry_interval = "1s"
         .disable_ipc();
 
         let (handle, join) = app.start().await.expect("start app");
-        let mut reloads = handle.subscribe_reload();
+        let mut observations = handle.subscribe_observations();
 
         // Both displays blank + render — some initial sink shows RenderBlack.
         let show_ok = wait_for(
@@ -1979,13 +2058,12 @@ wake_retry_interval = "1s"
             m1 = m1.display(),
         );
         fs::write(&cfg_path, &cfg_single).unwrap();
-        assert!(handle.trigger_reload().await);
-
-        let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        let (request_id, receipt) = handle
+            .request_reload_with_id(ReloadSource::Control)
             .await
-            .expect("reload outcome")
-            .expect("reload bus open");
-        match outcome {
+            .expect("rejected reload receipt");
+        assert!(receipt.request_ids.contains(&request_id));
+        match &receipt.outcome {
             ReloadOutcome::Rejected(detail) => {
                 assert!(
                     detail.contains("mon2"),
@@ -1996,44 +2074,35 @@ wake_retry_interval = "1s"
                 panic!("expected Rejected on mon2 wake failure, got Reloaded")
             }
         }
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match observations.recv().await.expect("observation bus open") {
+                    dormant_core::observation::DaemonObservation::ReloadCompleted(observed)
+                        if observed.request_ids.contains(&request_id) =>
+                    {
+                        break observed;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("matching reload completion observation");
+        assert_eq!(
+            observed, receipt,
+            "completion observes the restored generation"
+        );
 
-        // A single `fs::write` wakes BOTH the explicit `trigger_reload` AND
-        // the config file watcher, and `run_loop` services reload triggers
-        // serially — so a SECOND (watcher-driven) reload can follow the
-        // first, replacing its rollback generation (a `tokio::select!` race).
-        // Drain the reload bus until it goes quiet for longer than
-        // `reload_debounce` (500ms default): once no further outcome arrives
-        // and the test issues no more config writes, no new reload cycle can
-        // start, so the generation now installed is FINAL.
-        while (tokio::time::timeout(Duration::from_millis(900), reloads.recv()).await).is_ok() {
-            // Keep draining until the bus is quiet.
-        }
-
-        // Drive the final restored generation back to a render stage so its
-        // rollback sink renders and a teardown becomes observable.
-        let events = handle.events_sender();
-        let _ = events.send(ev("desk", SensorState::Present)).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let _ = events.send(ev("desk", SensorState::Absent)).await;
-
-        // Identity selection (NO counts): find the render sink of the CURRENT
-        // (final) generation and use ITS own channel.  Three identity marks
-        // pin it exactly:
-        //   * index >= 2 — indices 0..2 are the initial assembly; a rejected
-        //     new-assembly's sink is dropped before its generation is ever
-        //     spawned, so only a rollback generation's sink lands here;
-        //   * a LIVE sender (`!is_closed()`) — a generation's `InputWake`
-        //     receiver is held by its spawned drain and dropped when the
-        //     generation is torn down, so only the CURRENT generation's sink
-        //     still has an open sender (superseded rollbacks are closed);
-        //   * that has rendered `RenderBlack` — so a teardown is observable.
-        // Take the highest-index match (build order → the newest generation).
         let live_pair = |sinks: &[WakePair]| -> Option<WakePair> {
-            sinks
+            let mut rendered = sinks
                 .iter()
-                .enumerate()
-                .rfind(|(i, (sink, tx))| *i >= 2 && !tx.is_closed() && sink_rendered(sink))
-                .map(|(_, pair)| pair.clone())
+                .filter(|(sink, tx)| !tx.is_closed() && sink_rendered(sink));
+            let pair = rendered.next()?.clone();
+            assert!(
+                rendered.next().is_none(),
+                "one restored render sink is active"
+            );
+            Some(pair)
         };
         let selected = wait_for(
             || live_pair(&pairs.lock().unwrap()[..]).is_some(),
@@ -2042,7 +2111,7 @@ wake_retry_interval = "1s"
         .await;
         assert!(
             selected,
-            "no live post-initial render sink ever rendered — rebuild_old did not \
+            "no live restored render sink ever rendered — rebuild_old did not \
              rebuild render sinks with a live InputWake channel"
         );
         let (live_sink, live_sender) = live_pair(&pairs.lock().unwrap()[..])

@@ -275,6 +275,19 @@ mod tests {
     use crate::types::ProbeStatus;
     use dormant_displays::vcp_ops::VcpDisplayInfo;
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn ddcutil_is_on_path() -> bool {
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+
+        std::env::split_paths(&path).any(|directory| {
+            std::fs::metadata(directory.join("ddcutil")).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+    }
 
     // ── FakeVcp — scripted ddc-hi side, local to this probe's tests ────────
 
@@ -416,11 +429,18 @@ mod tests {
         );
     }
 
-    /// The one branch this sandbox exercises naturally: there is no
-    /// `ddcutil` binary (and no I²C bus) here, so the *real* `DdcutilOps`
-    /// implementation genuinely returns `NotInstalled` without any script.
+    /// Asserts the real missing-binary branch only where `ddcutil` is absent
+    /// from `PATH`; developer hosts with the optional package installed skip
+    /// this environment-specific assertion while CI preserves the coverage.
     #[tokio::test]
     async fn real_ddcutil_reports_not_installed_in_this_sandbox() {
+        if ddcutil_is_on_path() {
+            eprintln!(
+                "skipping: ddcutil present on PATH; this test only asserts the not-installed path"
+            );
+            return;
+        }
+
         let outcome = RealDdcutil::new()
             .detect_brief(Duration::from_secs(5))
             .await;

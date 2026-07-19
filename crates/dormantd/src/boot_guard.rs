@@ -313,7 +313,7 @@ pub struct BootPlan {
 }
 
 /// Runtime-only bundle `boot()` (T5, `dormantd/src/boot.rs`) needs (spec
-/// §5.1). Five fields, pinned by `boot_inputs_field_list_is_minimal` below —
+/// §5.1). Six fields, pinned by `boot_inputs_field_list_is_minimal` below —
 /// no socket override field, because T5's tests set `daemon.socket_path`
 /// directly in the seeded config instead (`App::start` binds real IPC; the
 /// tempdir-socket pattern, `ipc_roundtrip.rs:34-50` precedent).
@@ -322,6 +322,8 @@ pub struct BootInputs {
     pub strictness: Strictness,
     pub state_dir: PathBuf,
     pub lock_path: PathBuf,
+    /// Daemon-local diagnostics shared with the App started by `boot()`.
+    pub observations: dormant_core::observation::ObservationHub,
     /// Injected readiness/watchdog seam (spec §6.2). `boot()` threads this
     /// straight into `App::with_sd_notify` on whichever `App` it ends up
     /// starting — production callers build it via `SdNotify::from_env()`;
@@ -1233,8 +1235,8 @@ mod tests {
 
     #[test]
     fn boot_inputs_field_list_is_minimal() {
-        // Pins the T5 field list: creds_path, strictness, state_dir,
-        // lock_path, sd_notify — no socket override (T5 tests set
+        // Pins the T11 field list: creds_path, strictness, state_dir,
+        // lock_path, observations, sd_notify — no socket override (T5 tests set
         // `daemon.socket_path` in the seeded config instead). If this
         // struct literal fails to compile, the field list has drifted from
         // this pin and the test must be amended alongside the code change.
@@ -1243,6 +1245,7 @@ mod tests {
             strictness: Strictness::Strict,
             state_dir: PathBuf::from("/tmp/state"),
             lock_path: PathBuf::from("/tmp/dormant.lock"),
+            observations: dormant_core::observation::ObservationHub::new(1),
             sd_notify: SdNotify::from_env(),
         };
     }

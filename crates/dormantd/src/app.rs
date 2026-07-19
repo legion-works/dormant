@@ -581,6 +581,13 @@ impl App {
         self
     }
 
+    /// Set the root directory for daemon-owned state.
+    #[must_use]
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.state_dir = state_dir;
+        self
+    }
+
     /// Boot-only setter (rollback-recovery plan, Task 1 §3): called by
     /// [`crate::boot::boot`] immediately after it has successfully built
     /// `Self` from whichever source `prepare()`/immediate-rollback chose
@@ -753,16 +760,7 @@ impl App {
     pub async fn start(mut self) -> Result<(AppHandle, JoinHandle<()>)> {
         let root = CancellationToken::new();
 
-        // #47 fix: resolve the wear-tracker state directory ONCE,
-        // synchronously, as the very first thing `start` does — before any
-        // `.await` point in this function and long before the tracker task
-        // is spawned below. Reading `XDG_STATE_HOME`/`HOME` here rather than
-        // inside the later-spawned detached task means a concurrent
-        // process/test that mutates this same process-global env var after
-        // this point can never redirect an in-flight tracker's persistence
-        // (see `wear_tracker::WearTrackerDeps::dir`'s doc comment for the
-        // full mechanism this closes).
-        let wear_dir = dormant_core::paths::wear_state_dir();
+        let wear_dir = self.state_dir.join("wear");
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
         let applied_revision = runtime_revision_from_paths(&self.config_path, &self.creds_path)?;
@@ -880,6 +878,7 @@ impl App {
                 handle: wear_handle.clone(),
                 cancel: root.clone(),
                 dir: wear_dir,
+                observations: self.observations.clone(),
             });
 
         if cfg_clone.daemon.web_allow_nonloopback {
@@ -2344,7 +2343,7 @@ impl Runner {
                     // (retry next tick) rather than panic if it ever isn't.
                     return;
                 };
-                match write_lkg(source, bytes) {
+                match write_lkg(&self.state_dir, source, bytes) {
                     Ok(()) => {
                         tracing::info!(event = "lkg_saved");
                         self.lkg_defer_count = 0;
@@ -2371,12 +2370,11 @@ impl Runner {
 /// Atomically copy `bytes` (the config bytes the caller already read fresh
 /// for this tick's dirty check — F4: no second read here, closing the
 /// TOCTOU window a re-read would otherwise open) to
-/// `state_dir()/last-known-good.toml` + the `.meta.json` sidecar (spec §3).
+/// `state_dir/last-known-good.toml` + the `.meta.json` sidecar (spec §3).
 /// A free function, not a `Runner` method (`clippy::unused_self`): it needs
 /// nothing from `Runner` beyond the two arguments the caller already has.
-fn write_lkg(source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = dormant_core::paths::state_dir();
-    boot_guard::write_atomic_bytes(&dir, "last-known-good.toml", bytes)?;
+fn write_lkg(dir: &std::path::Path, source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
+    boot_guard::write_atomic_bytes(dir, "last-known-good.toml", bytes)?;
     let meta = LkgMeta {
         schema_version: 1,
         fingerprint: boot_guard::fingerprint_bytes(bytes),
@@ -2385,7 +2383,7 @@ fn write_lkg(source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
             .map_or(0, |d| d.as_secs()),
         source,
     };
-    boot_guard::write_atomic_json(&dir, "last-known-good.meta.json", &meta)
+    boot_guard::write_atomic_json(dir, "last-known-good.meta.json", &meta)
 }
 
 /// The watchdog probe (spec §6.3 F8): proves the engine drains its ctl

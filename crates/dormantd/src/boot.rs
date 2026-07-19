@@ -93,6 +93,7 @@ pub enum BootOutcome {
 /// unexpected-at-runtime failures, distinct from the two EXPECTED
 /// [`BootOutcome`] failure shapes above.
 pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
+    let observations = inputs.observations.clone();
     let lkg_path = boot_guard::lkg_path(&inputs.state_dir);
     // `prepare` already chose the LKG path for `RollBack`/`ContinueRollback`
     // verdicts (spec §5.1 points 3-4) — this is the reliable, cheap way to
@@ -131,6 +132,11 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
                         detail = %detail,
                         "config validation failed at boot; rolling back to last-known-good",
                     );
+                    observations.emit(dormant_core::observation::DaemonObservation::BootRollback {
+                        failed_fingerprint: boot_guard::fingerprint_label(current_fp),
+                        lkg_fingerprint: boot_guard::fingerprint_label(lkg_fp),
+                        detail: detail.clone(),
+                    });
                     // Concise stderr mirror (cross-family cold-gate,
                     // deepseek fold): a failed config's own `log_level =
                     // "off"` must not hide this from the operator.
@@ -164,6 +170,7 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
 
     let app = app
         .with_sd_notify(inputs.sd_notify)
+        .with_observation_hub(observations)
         // Rollback-recovery plan, Task 1 §3/§5 (state_dir threading added
         // Task 2 §2): tell `App` the REAL operator path (may differ from
         // `plan.chosen_config`, which this `app` was actually built from —

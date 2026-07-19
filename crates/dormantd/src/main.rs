@@ -166,6 +166,7 @@ fn main() -> ExitCode {
                 state_dir: inputs.state_dir,
                 lock_path,
                 sd_notify: SdNotify::from_env(),
+                observations: dormant_core::observation::ObservationHub::new(64),
             };
 
             runtime.block_on(run_to_completion(plan, boot_inputs))

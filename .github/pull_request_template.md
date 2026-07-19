@@ -4,12 +4,10 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo build --workspace` passes
-- [ ] `cargo doc --workspace --no-deps` passes
-- [ ] `cargo deny check` passes
+- [ ] Relevant `scripts/gates/*.sh` entry points pass (`fmt.sh`, `clippy.sh`, `rust-tests.sh`, and `rustdoc.sh` for Rust changes)
+- [ ] `rust-tests.sh` passed both nextest and doctests
+- [ ] Web UI, mdBook, dependency-policy, and MSRV gate scripts ran when their paths changed
+- [ ] No test was rerun to clear a flake; any flake follows `.github/flake-ledger.toml`
 - [ ] New public items have doc comments
 - [ ] Tests cover the changes
 - [ ] Flake-fix PRs include Ubuntu and macOS reload-stress evidence (100/100 per target)

@@ -13,3 +13,7 @@ Cargo.lock.orig
 .worktrees/
 # Generated mdbook output
 /docs/book/
+
+# Python bytecode caches (scripts/ci/*.py)
+__pycache__/
+*.pyc

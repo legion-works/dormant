@@ -88,6 +88,7 @@ use crate::macos_idle;
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
 use crate::sd_notify::{self, SdNotify};
+use crate::watchdog_schedule::WatchdogSchedule;
 
 /// Builds the daemon-lifetime notification sink. Production defaults to
 /// [`notifier::ZbusSink`]; tests inject a factory returning a shared
@@ -580,6 +581,13 @@ impl App {
         self
     }
 
+    /// Set the root directory for daemon-owned state.
+    #[must_use]
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.state_dir = state_dir;
+        self
+    }
+
     /// Boot-only setter (rollback-recovery plan, Task 1 §3): called by
     /// [`crate::boot::boot`] immediately after it has successfully built
     /// `Self` from whichever source `prepare()`/immediate-rollback chose
@@ -616,9 +624,9 @@ impl App {
 
     /// Override the watchdog probe-arm's tick period (test seam — spec
     /// §6.3). Production leaves this unset and `Runner` falls back to
-    /// `sd_notify::watchdog_interval_from_env().unwrap_or(30s)`; a cadence
-    /// test that needs a short LKG `stability_window` to elapse inside the
-    /// gate's real-time budget calls this instead of touching the
+    /// `sd_notify::watchdog_interval_from_env().unwrap_or(30s)`; an LKG
+    /// promotion test that needs a short `stability_window` to elapse inside
+    /// the gate's real-time budget calls this instead of touching the
     /// process-global `WATCHDOG_USEC` (forbidden in tests).
     #[must_use]
     pub fn with_watchdog_interval(mut self, interval: Duration) -> Self {
@@ -752,16 +760,7 @@ impl App {
     pub async fn start(mut self) -> Result<(AppHandle, JoinHandle<()>)> {
         let root = CancellationToken::new();
 
-        // #47 fix: resolve the wear-tracker state directory ONCE,
-        // synchronously, as the very first thing `start` does — before any
-        // `.await` point in this function and long before the tracker task
-        // is spawned below. Reading `XDG_STATE_HOME`/`HOME` here rather than
-        // inside the later-spawned detached task means a concurrent
-        // process/test that mutates this same process-global env var after
-        // this point can never redirect an in-flight tracker's persistence
-        // (see `wear_tracker::WearTrackerDeps::dir`'s doc comment for the
-        // full mechanism this closes).
-        let wear_dir = dormant_core::paths::wear_state_dir();
+        let wear_dir = self.state_dir.join("wear");
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
         let applied_revision = runtime_revision_from_paths(&self.config_path, &self.creds_path)?;
@@ -879,6 +878,7 @@ impl App {
                 handle: wear_handle.clone(),
                 cancel: root.clone(),
                 dir: wear_dir,
+                observations: self.observations.clone(),
             });
 
         if cfg_clone.daemon.web_allow_nonloopback {
@@ -2178,7 +2178,7 @@ impl Runner {
     /// The watchdog probe-arm tick (spec §6.3): probe the engine via the
     /// SAME `request_snapshot` idiom `reload()` uses, ping only on success,
     /// and run the §4 LKG-promotion check on every healthy tick.
-    async fn watchdog_tick(&mut self) {
+    async fn watchdog_tick_at(&mut self, now: Instant) {
         // Rollback-recovery retry (Task 2 §4): fires on EVERY watchdog
         // tick, independent of probe health — the pending clear is a
         // plain filesystem write, unrelated to whether the engine answers
@@ -2199,16 +2199,17 @@ impl Runner {
             self.probe_failed_warned = false;
             // `ping_if_healthy` returning `true` only on `Some` is the
             // whole point of the extraction below — safe to unwrap.
-            self.lkg_tick(
+            self.lkg_tick_at(
                 probe_result
                     .as_ref()
                     .expect("ping_if_healthy true implies Some"),
+                now,
             );
         } else {
             // A wedged engine starves the watchdog by design (spec
             // invariant #3) — NO ping — and any in-flight LKG candidate
             // loses its unbroken-healthy-window claim (spec F3).
-            reset_candidate_on_probe_failure(&mut self.lkg_candidate, Instant::now());
+            reset_candidate_on_probe_failure(&mut self.lkg_candidate, now);
             if !self.probe_failed_warned {
                 tracing::warn!(
                     event = "watchdog_probe_failed",
@@ -2271,7 +2272,7 @@ impl Runner {
     /// `None` candidate (disabled, or none armed yet) is a no-op — spec
     /// §4 failure semantics: `lkg_enabled = false` means no candidate
     /// tracking, no files, ever.
-    fn lkg_tick(&mut self, snapshot: &StateSnapshot) {
+    fn lkg_tick_at(&mut self, snapshot: &StateSnapshot, now: Instant) {
         let Some(since) = self.lkg_candidate.as_ref().map(|c| c.since) else {
             return;
         };
@@ -2287,7 +2288,7 @@ impl Runner {
 
         let verdict = boot_guard::should_promote(
             since,
-            Instant::now(),
+            now,
             window,
             snapshot,
             self.lkg_defer_count,
@@ -2342,7 +2343,7 @@ impl Runner {
                     // (retry next tick) rather than panic if it ever isn't.
                     return;
                 };
-                match write_lkg(source, bytes) {
+                match write_lkg(&self.state_dir, source, bytes) {
                     Ok(()) => {
                         tracing::info!(event = "lkg_saved");
                         self.lkg_defer_count = 0;
@@ -2369,12 +2370,11 @@ impl Runner {
 /// Atomically copy `bytes` (the config bytes the caller already read fresh
 /// for this tick's dirty check — F4: no second read here, closing the
 /// TOCTOU window a re-read would otherwise open) to
-/// `state_dir()/last-known-good.toml` + the `.meta.json` sidecar (spec §3).
+/// `state_dir/last-known-good.toml` + the `.meta.json` sidecar (spec §3).
 /// A free function, not a `Runner` method (`clippy::unused_self`): it needs
 /// nothing from `Runner` beyond the two arguments the caller already has.
-fn write_lkg(source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = dormant_core::paths::state_dir();
-    boot_guard::write_atomic_bytes(&dir, "last-known-good.toml", bytes)?;
+fn write_lkg(dir: &std::path::Path, source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
+    boot_guard::write_atomic_bytes(dir, "last-known-good.toml", bytes)?;
     let meta = LkgMeta {
         schema_version: 1,
         fingerprint: boot_guard::fingerprint_bytes(bytes),
@@ -2383,7 +2383,7 @@ fn write_lkg(source: &'static str, bytes: &[u8]) -> std::io::Result<()> {
             .map_or(0, |d| d.as_secs()),
         source,
     };
-    boot_guard::write_atomic_json(&dir, "last-known-good.meta.json", &meta)
+    boot_guard::write_atomic_json(dir, "last-known-good.meta.json", &meta)
 }
 
 /// The watchdog probe (spec §6.3 F8): proves the engine drains its ctl
@@ -2420,7 +2420,7 @@ fn ping_if_healthy(sd: &mut SdNotify, probe_result: Option<&StateSnapshot>) -> b
 
 /// Reset an LKG candidate's window start on a failed engine probe (spec §4
 /// F3: "any failed probe RESETS the candidate window"). Factored out of
-/// [`Runner::watchdog_tick`] so the reset rule is unit-testable without a
+/// [`Runner::watchdog_tick_at`] so the reset rule is unit-testable without a
 /// full `Runner`/`App` — the reset is explicitly the CALLER's job, not
 /// `should_promote`'s (spec's pure gate only ever sees an unbroken window).
 fn reset_candidate_on_probe_failure(candidate: &mut Option<LkgCandidate>, now: Instant) {
@@ -2445,13 +2445,13 @@ async fn run_loop(
     reload_requester: ReloadRequester,
     mut reload_requests: mpsc::Receiver<ReloadRequest>,
 ) {
-    // The watchdog probe arm (spec §6.3): a plain interval, period captured
-    // once at `Runner` construction (`App::start`/`with_watchdog_interval`).
+    // The watchdog probe arm (spec §6.3): its period is captured once at
+    // `Runner` construction (`App::start`/`with_watchdog_interval`).
     // Runs on BOTH platform branches below — on non-Unix the tick still
     // drives §4 LKG promotion even though `sd.watchdog()` itself is a
     // permanent no-op there (no `NOTIFY_SOCKET` concept off Linux).
-    let mut watchdog_ticker = tokio::time::interval(runner.watchdog_interval);
-    watchdog_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watchdog_schedule =
+        WatchdogSchedule::new(runner.watchdog_interval, tokio::time::Instant::now());
 
     #[cfg(unix)]
     {
@@ -2491,8 +2491,9 @@ async fn run_loop(
                         first,
                     ).await;
                 }
-                _ = watchdog_ticker.tick() => {
-                    runner.watchdog_tick().await;
+                () = tokio::time::sleep_until(watchdog_schedule.deadline()) => {
+                    watchdog_schedule.record_tick(tokio::time::Instant::now());
+                    runner.watchdog_tick_at(Instant::now()).await;
                 }
             }
         }
@@ -2523,8 +2524,9 @@ async fn run_loop(
                         first,
                     ).await;
                 }
-                _ = watchdog_ticker.tick() => {
-                    runner.watchdog_tick().await;
+                () = tokio::time::sleep_until(watchdog_schedule.deadline()) => {
+                    watchdog_schedule.record_tick(tokio::time::Instant::now());
+                    runner.watchdog_tick_at(Instant::now()).await;
                 }
             }
         }

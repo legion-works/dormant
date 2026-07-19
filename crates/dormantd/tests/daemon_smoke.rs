@@ -26,6 +26,12 @@ use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
 
+mod support {
+    pub mod app_paths;
+}
+
+use support::app_paths::TestAppPaths;
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -307,6 +313,10 @@ async fn start_coordinator_app(
     config_path: PathBuf,
     creds_path: PathBuf,
 ) -> (dormantd::app::AppHandle, tokio::task::JoinHandle<()>) {
+    let state_dir = config_path
+        .parent()
+        .expect("coordinator config has a parent")
+        .join("state");
     App::build_with_sources(
         config_path,
         creds_path,
@@ -315,6 +325,7 @@ async fn start_coordinator_app(
     )
     .expect("build coordinator app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(state_dir)
     .disable_ipc()
     .start()
     .await
@@ -427,6 +438,100 @@ fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
     std::sync::Arc::new(NoopNotifySink)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_apps_keep_wear_paths_and_observations_isolated() {
+    let paths_a = TestAppPaths::new();
+    let paths_b = TestAppPaths::new();
+    let wear_config = "[wear]\nenabled = true\nsample_interval = \"5s\"\npersist_interval = \"5s\"\nread_timeout = \"500ms\"\n";
+    let corrupt_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after Unix epoch")
+        .as_secs();
+
+    for paths in [&paths_a, &paths_b] {
+        fs::write(
+            &paths.config,
+            one_display_config_with_wear(&paths.marker, "50ms", wear_config),
+        )
+        .expect("write config");
+        let wear_dir = paths.state.join("wear");
+        for epoch_s in corrupt_epoch..=corrupt_epoch + 10 {
+            fs::create_dir_all(wear_dir.join(format!("wear-mon.json.corrupt.{epoch_s}")))
+                .expect("block corrupt-ledger rename");
+        }
+        fs::write(wear_dir.join("wear-mon.json"), "{ invalid ledger").expect("seed corrupt ledger");
+    }
+
+    let observations_a = ObservationHub::new(16);
+    let observations_b = ObservationHub::new(16);
+    let mut rx_a = observations_a.subscribe();
+    let mut rx_b = observations_b.subscribe();
+
+    let app_a = App::build_with_sources(
+        paths_a.config.clone(),
+        paths_a.credentials.clone(),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app A")
+    .with_state_dir(paths_a.state.clone())
+    .with_observation_hub(observations_a)
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc();
+    let app_b = App::build_with_sources(
+        paths_b.config.clone(),
+        paths_b.credentials.clone(),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app B")
+    .with_state_dir(paths_b.state.clone())
+    .with_observation_hub(observations_b)
+    .with_notify_sink_builder(noop_factory)
+    .disable_ipc();
+
+    let (started_a, started_b) = tokio::join!(app_a.start(), app_b.start());
+    let (handle_a, join_a) = started_a.expect("start app A");
+    let (handle_b, join_b) = started_b.expect("start app B");
+
+    let expected_a = paths_a.state.join("wear").join("wear-mon.json");
+    let expected_b = paths_b.state.join("wear").join("wear-mon.json");
+    let observed_a = recv_observation(
+        &mut rx_a,
+        Duration::from_secs(8),
+        "app A corrupt wear ledger",
+        |observation| matches!(observation, DaemonObservation::WearLedgerCorrupt { path, .. } if path == &expected_a),
+    )
+    .await;
+    let observed_b = recv_observation(
+        &mut rx_b,
+        Duration::from_secs(8),
+        "app B corrupt wear ledger",
+        |observation| matches!(observation, DaemonObservation::WearLedgerCorrupt { path, .. } if path == &expected_b),
+    )
+    .await;
+    assert!(
+        matches!(observed_a, DaemonObservation::WearLedgerCorrupt { path, .. } if path == expected_a)
+    );
+    assert!(
+        matches!(observed_b, DaemonObservation::WearLedgerCorrupt { path, .. } if path == expected_b)
+    );
+
+    let (_, receipt_a) = handle_a
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("reload app A");
+    let (_, receipt_b) = handle_b
+        .request_reload_with_id(ReloadSource::Control)
+        .await
+        .expect("reload app B");
+    assert_eq!(receipt_a.outcome, ReloadOutcome::Reloaded);
+    assert_eq!(receipt_b.outcome, ReloadOutcome::Reloaded);
+
+    shutdown(handle_a, join_a).await;
+    shutdown(handle_b, join_b).await;
+}
+
 // ── 1: blank then wake ─────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -453,6 +558,7 @@ async fn smoke_blank_and_wake() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -537,6 +643,7 @@ async fn reload_swap() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -591,6 +698,7 @@ async fn reload_rejected_keeps_old() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -739,6 +847,7 @@ async fn removed_display_verified_wake() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -806,7 +915,9 @@ async fn removed_display_wake_failure_aborts() {
         fake_factory("desk", script),
     )
     .expect("build app")
-    .with_notify_sink_builder(noop_factory);
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
 
@@ -885,6 +996,7 @@ async fn reload_defensive_wake_retained() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -956,6 +1068,7 @@ async fn ruleless_display_preserves_phase_on_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -1058,6 +1171,7 @@ async fn config_watch_updates_on_successful_reload_only() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
@@ -1201,6 +1315,7 @@ async fn creds_watch_updates_on_successful_reload_only() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -1480,6 +1595,7 @@ async fn concurrent_reload_inputs_are_delivered_exactly_once() {
     )
     .unwrap()
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_test_generation_barrier_gate(gate.clone())
     .disable_ipc()
     .start()
@@ -1572,6 +1688,7 @@ async fn web_nonloopback_warning_fires_at_startup() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -1616,6 +1733,7 @@ async fn web_bind_change_ignored_on_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -1789,6 +1907,7 @@ wake_retry_interval = "1s"
         )
         .expect("build app")
         .with_notify_sink_builder(noop_factory)
+        .with_state_dir(dir.path().join("state"))
         .with_render_sink_builder(builder)
         .disable_ipc();
 
@@ -1872,6 +1991,7 @@ wake_retry_interval = "1s"
         )
         .expect("build app")
         .with_notify_sink_builder(noop_factory)
+        .with_state_dir(dir.path().join("state"))
         .with_render_sink_builder(builder)
         .disable_ipc();
 
@@ -2062,6 +2182,7 @@ wake_retry_interval = "1s"
         )
         .expect("build app")
         .with_notify_sink_builder(noop_factory)
+        .with_state_dir(dir.path().join("state"))
         .with_render_sink_builder(builder)
         .disable_ipc();
 
@@ -2278,6 +2399,7 @@ async fn manual_only_display_present_in_snapshot() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -2390,6 +2512,7 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -2528,6 +2651,7 @@ async fn rule_driven_dark_display_defensive_woken_on_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -2594,6 +2718,7 @@ async fn manual_only_display_full_lifecycle_across_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
@@ -2791,48 +2916,6 @@ async fn manual_only_display_full_lifecycle_across_reload() {
 
 // ── Wear tracker (T7) ────────────────────────────────────────────────────────
 
-/// `XDG_STATE_HOME` is process-global env; these tests are the only ones in
-/// this binary that touch it, so a dedicated mutex held for the lifetime of
-/// each test (set → run app → read files → restore) is sufficient to keep
-/// them from racing each other under `cargo test`'s default multi-threaded
-/// runner. Mirrors the pattern in `dormant-tray/src/icon.rs`'s
-/// `load_does_not_depend_on_out_dir_at_runtime` test.
-static WEAR_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn wear_env_lock() -> &'static Mutex<()> {
-    WEAR_ENV_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Point `XDG_STATE_HOME` at `dir` for the duration of the guard, restoring
-/// the previous value (or unsetting) on drop.
-struct XdgStateHomeGuard {
-    prev: Option<std::ffi::OsString>,
-}
-
-impl XdgStateHomeGuard {
-    fn set(dir: &Path) -> Self {
-        let prev = std::env::var_os("XDG_STATE_HOME");
-        // SAFETY: caller holds `wear_env_lock()` for the guard's lifetime,
-        // so no other thread in this process observes env::* concurrently.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", dir);
-        }
-        Self { prev }
-    }
-}
-
-impl Drop for XdgStateHomeGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `set` above.
-        unsafe {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-        }
-    }
-}
-
 /// [`one_display_config`] plus a `[wear]` section (appended TOML — later
 /// keys win nothing here since `[wear]` only appears once).
 fn one_display_config_with_wear(marker: &Path, grace: &str, wear_toml: &str) -> String {
@@ -2840,20 +2923,7 @@ fn one_display_config_with_wear(marker: &Path, grace: &str, wear_toml: &str) -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock serializes the 3 wear tests' shared XDG_STATE_HOME env var across \
-              the whole test body (app lifetime included) — the lock is test-local (only these \
-              3 tests touch it) and always released promptly at test end, so holding it across \
-              awaits here cannot deadlock or starve unrelated tests"
-)]
 async fn wear_ledger_file_appears_and_seeds() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg = one_display_config_with_wear(
@@ -2872,17 +2942,14 @@ async fn wear_ledger_file_appears_and_seeds() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
     // `tokio::time::interval`'s FIRST tick fires immediately (not after a
     // full period), so the first sample/persist happens right away despite
     // the 5s-floor `sample_interval` validation requires.
-    let wear_file = state_home
-        .path()
-        .join("dormant")
-        .join("wear")
-        .join("wear-mon.json");
+    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
     let ok = wait_for(|| wear_file.exists(), Duration::from_secs(3)).await;
 
     let ledger_check = ok.then(|| {
@@ -2894,7 +2961,7 @@ async fn wear_ledger_file_appears_and_seeds() {
 
     assert!(
         ok,
-        "wear ledger file for 'mon' must appear under XDG_STATE_HOME/dormant/wear"
+        "wear ledger file for 'mon' must appear under the app-owned state directory"
     );
     let ledger = ledger_check.unwrap().expect("ledger file must parse");
     assert_eq!(
@@ -2904,40 +2971,7 @@ async fn wear_ledger_file_appears_and_seeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock serializes the 3 wear tests' shared XDG_STATE_HOME env var across \
-              the whole test body (app lifetime included) — the lock is test-local (only these \
-              3 tests touch it) and always released promptly at test end, so holding it across \
-              awaits here cannot deadlock or starve unrelated tests"
-)]
 async fn wear_disabled_creates_nothing() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // #47 fix (§1 — test determinism): this test used to prove absence with
-    // a flat `sleep(300ms)` then a directory read. That 300ms had NO
-    // synchronization with the tracker's own lifecycle — it was purely a
-    // best-effort margin against the OLD bug (an unrelated test's tracker,
-    // spawned with `wear.enabled` defaulting `true`, reading
-    // `wear_state_dir()` — i.e. `XDG_STATE_HOME` — from inside its own
-    // detached task and landing inside THIS test's `wear_env_lock`-protected
-    // env mutation window; see `WearTrackerDeps::dir`'s doc comment). Now
-    // that the state directory is resolved synchronously in `App::start`
-    // and threaded through as a plain `PathBuf` — no component under test
-    // ever reads `XDG_STATE_HOME` again — the sleep's only remaining job is
-    // "give the disabled tracker's own first tick time to park", which IS
-    // observable: it logs `event = "wear_tracker_parked"` from the very
-    // tick this test cares about. Block on that event instead of a fixed
-    // wall-clock guess, and name the actual owner (tracker parked or not,
-    // which path leaked) in the failure message rather than a bare
-    // left/right mismatch.
-    install_capture_subscriber();
-    drain_capture(); // discard startup/prior-test noise
-
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg = one_display_config_with_wear(
@@ -2956,31 +2990,11 @@ async fn wear_disabled_creates_nothing() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    // Block on the tracker's own `wear_tracker_parked` event (its first
-    // tick fires immediately regardless of `sample_interval`, so this
-    // resolves almost instantly in the common case) instead of guessing a
-    // fixed sleep duration. Only `wear_disabled_creates_nothing` and
-    // `wear_park_persists_final_ledger` can ever emit this event, and
-    // `wear_env_lock` (held for this test's whole body) already excludes
-    // the latter from running concurrently — so this substring check
-    // cannot be contaminated by a sibling wear test.
-    let mut captured = String::new();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let parked = loop {
-        captured.push_str(&drain_capture());
-        if captured.contains("wear_tracker_parked") {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-
-    let wear_dir = state_home.path().join("dormant").join("wear");
+    let wear_dir = dir.path().join("state").join("wear");
     let entries: Vec<PathBuf> = fs::read_dir(&wear_dir)
         .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
         .unwrap_or_default();
@@ -2988,29 +3002,17 @@ async fn wear_disabled_creates_nothing() {
     shutdown(handle, join).await;
 
     assert!(
-        parked,
-        "disabled tracker never logged wear_tracker_parked within 2s — cannot prove the \
-         directory check below observed a settled tracker; captured trace:\n{captured}"
-    );
-    assert!(
         entries.is_empty(),
-        "wear.enabled = false must create no files under the wear state dir; found {entries:?} \
-         (tracker reported parked={parked})"
+        "wear.enabled = false must create no files under the app-owned wear state dir; found {entries:?}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "wear_env_lock serializes the 3 wear tests' shared XDG_STATE_HOME env var across \
-              the whole test body (app lifetime included) — the lock is test-local (only these \
-              3 tests touch it) and always released promptly at test end, so holding it across \
-              awaits here cannot deadlock or starve unrelated tests"
+    reason = "capture_count_lock serializes reload step-boundary assertions in unrelated watchdog tests"
 )]
 async fn wear_survives_reload_and_fail_closes_during_swap() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // This test drives 3 back-to-back reloads (below) — each is a real
     // Runner::reload() call that emits the same step-boundary markers the
     // exact-count watchdog tests count, so it also serializes on
@@ -3018,9 +3020,6 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
     let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     // sample_interval sits at the 5s validation floor (E_CONFIG_INVALID
@@ -3043,14 +3042,11 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    let wear_file = state_home
-        .path()
-        .join("dormant")
-        .join("wear")
-        .join("wear-mon.json");
+    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
     assert!(
         wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
         "ledger must appear before the reload churn starts"
@@ -3138,20 +3134,7 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
 /// without weakening the assertion itself (still `sample_count >` the
 /// first-persist count).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock serializes the wear tests' shared XDG_STATE_HOME env var across \
-              the whole test body (app lifetime included) — the lock is test-local and always \
-              released promptly at test end, so holding it across awaits here cannot deadlock \
-              or starve unrelated tests"
-)]
 async fn wear_shutdown_persists_final_ledger() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     // persist_interval is deliberately far longer than sample_interval so
@@ -3178,14 +3161,11 @@ async fn wear_shutdown_persists_final_ledger() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    let wear_file = state_home
-        .path()
-        .join("dormant")
-        .join("wear")
-        .join("wear-mon.json");
+    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
     assert!(
         wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
         "ledger must appear from the first (immediate) tick's persist"
@@ -3235,15 +3215,9 @@ async fn wear_shutdown_persists_final_ledger() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "wear_env_lock serializes the wear tests' shared XDG_STATE_HOME env var across \
-              the whole test body (app lifetime included) — the lock is test-local and always \
-              released promptly at test end, so holding it across awaits here cannot deadlock \
-              or starve unrelated tests"
+    reason = "capture_count_lock serializes reload step-boundary assertions in unrelated watchdog tests"
 )]
 async fn wear_park_persists_final_ledger() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // The [wear].enabled = false reload below is a real Runner::reload()
     // call that emits the same step-boundary markers the exact-count
     // watchdog tests count, so it also serializes on capture_count_lock
@@ -3251,9 +3225,6 @@ async fn wear_park_persists_final_ledger() {
     let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = dir.path().join("config.toml");
@@ -3273,14 +3244,11 @@ async fn wear_park_persists_final_ledger() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    let wear_file = state_home
-        .path()
-        .join("dormant")
-        .join("wear")
-        .join("wear-mon.json");
+    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
     assert!(
         wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
         "ledger must appear from the first (immediate) tick's persist"
@@ -3409,7 +3377,8 @@ async fn ipc_event_stream_surfaces_blank_failure_then_recovery() {
         fake_factory("desk", script),
     )
     .expect("build app")
-    .with_notify_sink_builder(noop_factory);
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"));
     // Real IPC — this test needs the actual socket for event subscription.
     let (handle, join) = app.start().await.expect("start app");
 
@@ -3606,6 +3575,7 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -3836,7 +3806,8 @@ async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
     )
     .expect("build app")
     .disable_ipc()
-    .with_notify_sink_builder(move || sink_for_builder.clone() as std::sync::Arc<dyn NotifySink>);
+    .with_notify_sink_builder(move || sink_for_builder.clone() as std::sync::Arc<dyn NotifySink>)
+    .with_state_dir(dir.path().join("state"));
     let (handle, join) = app.start().await.expect("start app");
 
     // ── Generation 1: drive a wake failure past the threshold ──────────────
@@ -3966,7 +3937,8 @@ async fn notifier_disabled_records_zero_sink_calls_after_failure_burst() {
     )
     .expect("build app")
     .disable_ipc()
-    .with_notify_sink_builder(move || sink_for_builder.clone() as std::sync::Arc<dyn NotifySink>);
+    .with_notify_sink_builder(move || sink_for_builder.clone() as std::sync::Arc<dyn NotifySink>)
+    .with_state_dir(dir.path().join("state"));
     let (handle, join) = app.start().await.expect("start app");
 
     // Let several wake-retry cycles elapse — plenty of time for a failure
@@ -4064,6 +4036,7 @@ async fn reload_carries_sensor_reported_until_own_config_edit() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -4207,6 +4180,7 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -4246,11 +4220,8 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
 
 // ── Watchdog probe arm + LKG promotion (T4) ─────────────────────────────────
 //
-// `.disable_ipc()` throughout (Global Constraints). `XDG_STATE_HOME` is
-// process-global, so every test below serializes on `wear_env_lock()` (the
-// SAME lock the wear tests already use for the same env var — a single
-// dedicated lock per env var, not one per feature). `WATCHDOG_USEC` is
-// NEVER touched (Global Constraints); cadence is controlled entirely via
+// `.disable_ipc()` throughout (Global Constraints). `WATCHDOG_USEC` is NEVER
+// touched; cadence is controlled entirely via
 // `App::with_watchdog_interval` + `SdNotify::from_socket_for_test`
 // (`test-util` feature — see `Cargo.toml`/`sd_notify.rs` T4 fix).
 //
@@ -4346,46 +4317,13 @@ fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> 
 fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotify) {
     let path = dir.join("notify.sock");
     let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
-    // Deliberately SHORT: the daemon under test keeps sending on its own
-    // cadence (as fast as every ~150ms in the cadence test below) for as
-    // long as it runs, so a long read-timeout here would never see a real
-    // gap and `drain_datagrams` would block the calling OS thread
-    // indefinitely (this is a blocking std call inside an async test body
-    // — bounding it tightly is load-bearing, not cosmetic).
-    listener
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
     let addr = std::os::unix::net::SocketAddr::from_pathname(&path).unwrap();
     let sd = SdNotify::from_socket_for_test(&addr);
     (listener, sd)
 }
 
-/// Drain every currently-queued datagram off `listener` and return the
-/// count. Blocks the calling OS thread for up to one read-timeout waiting
-/// for the queue to run dry — see the tight timeout note on
-/// [`fake_systemd_socket`].
-fn drain_datagrams(listener: &std::os::unix::net::UnixDatagram) -> usize {
-    let mut buf = [0u8; 64];
-    let mut n = 0;
-    while listener.recv_from(&mut buf).is_ok() {
-        n += 1;
-    }
-    n
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock + capture_count_lock serialize test-local state and are \
-              always released promptly at test end"
-)]
 async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -4404,19 +4342,14 @@ async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc()
     .with_sd_notify(sd)
     .with_watchdog_interval(Duration::from_millis(500));
     let (handle, join) = app.start().await.expect("start app");
 
-    let lkg_path = state_home
-        .path()
-        .join("dormant")
-        .join("last-known-good.toml");
-    let meta_path = state_home
-        .path()
-        .join("dormant")
-        .join("last-known-good.meta.json");
+    let lkg_path = dir.path().join("state").join("last-known-good.toml");
+    let meta_path = dir.path().join("state").join("last-known-good.meta.json");
     let ok = wait_for(
         || lkg_path.exists() && meta_path.exists(),
         Duration::from_secs(35),
@@ -4442,18 +4375,7 @@ async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
-              body (app lifetime included) — test-local, always released promptly at test end"
-)]
 async fn watchdog_lkg_disabled_writes_nothing() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -4472,6 +4394,7 @@ async fn watchdog_lkg_disabled_writes_nothing() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc()
     .with_sd_notify(sd)
     .with_watchdog_interval(Duration::from_millis(100));
@@ -4482,10 +4405,7 @@ async fn watchdog_lkg_disabled_writes_nothing() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     shutdown(handle, join).await;
 
-    let lkg_path = state_home
-        .path()
-        .join("dormant")
-        .join("last-known-good.toml");
+    let lkg_path = dir.path().join("state").join("last-known-good.toml");
     assert!(
         !lkg_path.exists(),
         "watchdog.lkg_enabled = false must never write last-known-good.toml"
@@ -4495,13 +4415,9 @@ async fn watchdog_lkg_disabled_writes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
-    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
-              body (app lifetime included) — test-local, always released promptly at test end"
+    reason = "capture_count_lock serializes reload step-boundary assertions in unrelated watchdog tests"
 )]
 async fn watchdog_reload_mid_window_resets_candidate() {
-    let _wear_guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Serialize against the count-sensitive watchdog tests: this test does
     // a reload which emits the same step-boundary markers
     // (after_assemble/after_quiesce/before_teardown/reload_end) that
@@ -4510,9 +4426,6 @@ async fn watchdog_reload_mid_window_resets_candidate() {
     let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state_home = TempDir::new().unwrap();
-    let _env = XdgStateHomeGuard::set(state_home.path());
-
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let cfg_path = write_file(
@@ -4531,6 +4444,7 @@ async fn watchdog_reload_mid_window_resets_candidate() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc()
     .with_sd_notify(sd)
     .with_watchdog_interval(Duration::from_millis(500));
@@ -4553,10 +4467,7 @@ async fn watchdog_reload_mid_window_resets_candidate() {
     // would already be > 30s old by now and would have promoted.
     tokio::time::sleep(Duration::from_secs(24)).await;
 
-    let lkg_path = state_home
-        .path()
-        .join("dormant")
-        .join("last-known-good.toml");
+    let lkg_path = dir.path().join("state").join("last-known-good.toml");
     let premature = lkg_path.exists();
 
     shutdown(handle, join).await;
@@ -4564,74 +4475,6 @@ async fn watchdog_reload_mid_window_resets_candidate() {
     assert!(
         !premature,
         "a reload mid-window must reset the LKG candidate — no premature promotion"
-    );
-}
-
-// Linux-only: pins WATCHDOG=1 datagram CADENCE by wall-clock timing.
-// The watchdog probe-arm only ever runs under systemd (WATCHDOG_USEC —
-// launchd sets no equivalent), and macos-latest scheduler noise breaks
-// sub-second cadence windows (PR #78 round-9 rerun: 0 datagrams by
-// ~900ms). LKG file-write tests above stay cross-platform.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
-              body (app lifetime included) — test-local, always released promptly at test end. \
-              #47 fix: this test builds an App (default `wear.enabled = true` spawns a real \
-              tracker that reads XDG_STATE_HOME once at startup) but never mutated the env \
-              itself, so it used to run WITHOUT this lock — the section-header comment above \
-              already documented that every test here must hold it, but this one didn't. That \
-              gap let this test's own tracker capture `wear_disabled_creates_nothing`'s \
-              temp directory whenever this test's `App::start` happened to land inside that \
-              test's `wear_env_lock`-protected `XDG_STATE_HOME` mutation window, producing a \
-              real `wear-mon.json` there (both configs use the same `[displays.mon]` key) even \
-              after WearTrackerDeps::dir closed the OTHER half of the race (a later env \
-              mutation redirecting an already-running tracker). Taking the lock here closes \
-              this half: it excludes this test from running concurrently with any test that \
-              mutates XDG_STATE_HOME at all, not just ones sharing a directory with it."
-)]
-async fn watchdog_ping_cadence_grows_on_healthy_ticks() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().unwrap();
-    let marker = dir.path().join("marker");
-    let cfg_path = write_file(
-        dir.path(),
-        "config.toml",
-        &one_display_config(&marker, "0s"),
-    );
-    let creds_path = dir.path().join("credentials.toml");
-    let (listener, sd) = fake_systemd_socket(dir.path());
-
-    let app = App::build_with_sources(
-        cfg_path,
-        creds_path,
-        Strictness::Strict,
-        fake_factory("desk", Vec::new()),
-    )
-    .expect("build app")
-    .with_notify_sink_builder(noop_factory)
-    .disable_ipc()
-    .with_sd_notify(sd)
-    .with_watchdog_interval(Duration::from_millis(150));
-    let (handle, join) = app.start().await.expect("start app");
-
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let n1 = drain_datagrams(&listener);
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let n2 = drain_datagrams(&listener);
-
-    shutdown(handle, join).await;
-
-    assert!(
-        n1 >= 3,
-        "expected several WATCHDOG=1 datagrams by ~900ms, got {n1}"
-    );
-    assert!(
-        n2 >= 3,
-        "datagram count must keep growing on later healthy ticks, got {n2}"
     );
 }
 
@@ -4756,6 +4599,7 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc()
     .with_sd_notify(sd)
     // Long interval — the periodic tick arm must not fire during this
@@ -4902,6 +4746,7 @@ async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc()
     .with_sd_notify(sd)
     .with_watchdog_interval(Duration::from_secs(120));
@@ -5005,6 +4850,7 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc()
     .with_sd_notify(sd)
     .with_watchdog_interval(Duration::from_secs(120))
@@ -5066,6 +4912,7 @@ async fn rollback_double_spawn_failure_cancels_root() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_test_force_reload_spawn_failure()
     .with_test_force_rebuild_old_spawn_failure()
     .disable_ipc();
@@ -5109,6 +4956,7 @@ async fn generation_barrier_survives_router_pause() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_test_generation_barrier_gate(gate.clone())
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
@@ -5176,6 +5024,7 @@ async fn generation_barrier_timeout_cancels_root() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_test_force_generation_barrier_timeout()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
@@ -5248,6 +5097,7 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_test_rollback_status(status.clone(), dir.path().to_path_buf())
     .with_test_force_reload_snapshot_timeout()
     .with_test_force_reload_spawn_failure()
@@ -5301,6 +5151,7 @@ async fn rejected_reload_can_repeat_after_rollback_restore() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .with_test_force_reload_snapshot_timeout()
     .with_test_force_reload_spawn_failure()
     .disable_ipc();
@@ -5464,6 +5315,8 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
     // (`state_machine.rs:1213-1237`) — deterministic regardless of tick
     // jitter, rather than racing a partial freeze.
     let sensor_script = vec![(Duration::from_millis(800), ev("desk", SensorState::Absent))];
+    let observations = ObservationHub::new(64);
+    let mut observation_rx = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path,
         creds_path,
@@ -5472,34 +5325,61 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    // Grace (3s) would expire at ~3.8s if unfrozen (800ms Absent edge + 3s
-    // grace); wait comfortably past that. The movie fixture never changes
-    // in this phase, so the display must still be grace-frozen: no blank.
-    let blanked_early = wait_for(
-        || count(&marker, 'B') >= 1,
-        Duration::from_millis(800 + 3000 + 1500),
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero entering grace",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Grace { .. },
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
     )
     .await;
     assert!(
-        !blanked_early,
-        "movie fixture must keep the display grace-frozen past grace expiry"
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, display)| id == "mon" && display.inhibited),
+        "movie fixture must inhibit the display while grace is active"
     );
 
-    // Swap the fixture to idle — the poller's next tick deasserts
-    // immediately (asymmetric debounce), unfreezing the countdown from its
-    // full stored remaining duration; the blank must now proceed.
     rewrite_pw_dump_script(&script, AUDIO_IDLE_FIXTURE);
-    assert!(
-        wait_for(
-            || count(&marker, 'B') >= 1,
-            // 1s tick delay + 3s grace remaining + 2s margin = 6s.
-            Duration::from_secs(6),
-        )
-        .await,
-        "idle fixture must unfreeze grace and let the blank proceed"
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(6),
+        "generation zero blanking completed after audio deassertion",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanking,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        count(&marker, 'B'),
+        1,
+        "the command controller must blank once"
     );
 
     shutdown(handle, join).await;
@@ -5510,6 +5390,10 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
 // Linux-only: see the audio integration note above.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reload's causal observations and configuration mutation must remain together"
+)]
 async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
@@ -5534,15 +5418,37 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .with_observation_hub(ObservationHub::new(64))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
-    let mut reloads = handle.subscribe_reload();
+    let mut observation_rx = handle.subscribe_observations();
 
-    // Pre-reload sanity: the first generation's own startup_grace exemption
-    // should already have the display grace-frozen on the movie fixture.
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero entering grace",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Grace { .. },
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
     assert!(
-        !wait_for(|| count(&marker, 'B') >= 1, Duration::from_millis(1500)).await,
-        "pre-reload generation must already be grace-frozen on the movie fixture"
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, display)| id == "mon" && display.inhibited),
+        "generation zero must be inhibited before its reload"
     );
 
     // Unrelated-key reload — `log_level` only; same display/rule/audio block.
@@ -5551,35 +5457,57 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
         audio_rule_config(&marker, &script, "3s", "5s", "debug"),
     )
     .unwrap();
-    assert!(handle.trigger_reload().await);
-    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
         .await
-        .expect("reload outcome in time")
-        .expect("reload bus open");
+        .expect("reload receipt");
+    assert!(receipt.request_ids.contains(&request_id));
     assert_eq!(
-        outcome,
+        receipt.outcome,
         ReloadOutcome::Reloaded,
         "the unrelated log_level edit must be accepted"
     );
-
-    // Anti-tautology pin (P4): min_active (5s) is set strictly greater than
-    // the post-reload observation window (grace 3s, zone-absent at 800ms).
-    // A missing startup_grace exemption on the NEW generation's poller
-    // would leave `overlays.inhibited` false when the zone's own fresh
-    // Absent edge arrives, so `enter_grace` starts a LIVE (unfrozen)
-    // countdown expiring at ~3.8s post-reload — long before ordinary
-    // debounce (5s) could ever assert — and the display blanks. The
-    // exemption must instead re-freeze grace before that, so no blank must
-    // appear even comfortably past that deadline.
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one started",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationStarted {
+                    generation: GenerationId(1)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one entering grace",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Grace { .. },
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
     assert!(
-        !wait_for(
-            || count(&marker, 'B') >= 1,
-            Duration::from_millis(800 + 3000 + 2000),
-        )
-        .await,
-        "the new generation's poller must re-freeze grace via its own fresh \
-         startup_grace exemption — grace must never expire"
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, display)| id == "mon" && display.inhibited),
+        "fresh startup grace must inhibit the new generation before grace expires"
     );
+    assert_eq!(count(&marker, 'B'), 0, "an inhibited grace must not blank");
 
     shutdown(handle, join).await;
 }

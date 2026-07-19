@@ -37,13 +37,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use dormant_core::config::schema::{MqttCredential, MqttSensorCfg};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::mqttbytes::v4::SubscribeReasonCode;
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -83,6 +84,16 @@ struct SensorBinding {
 /// every sensor subscribed to that topic (each with its own field pointer).
 type TopicMap = HashMap<String, Vec<SensorBinding>>;
 
+/// Connection observations exposed only to external integration tests.
+#[cfg(feature = "test-util")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MqttLifecycle {
+    /// The broker accepted the MQTT connection.
+    Connected,
+    /// Every queued topic subscription was acknowledged by the broker.
+    Subscribed,
+}
+
 // ── MqttSource ─────────────────────────────────────────────────────────────────
 
 /// An MQTT sensor source that multiplexes multiple sensors on one broker
@@ -100,6 +111,9 @@ pub struct MqttSource {
     topics: Vec<String>,
     /// Optional per-broker MQTT credentials (username + password).
     credential: Option<MqttCredential>,
+    /// Test-only protocol lifecycle observations.
+    #[cfg(feature = "test-util")]
+    lifecycle_tx: Option<mpsc::UnboundedSender<MqttLifecycle>>,
 }
 
 impl MqttSource {
@@ -152,7 +166,20 @@ impl MqttSource {
             availability_topics,
             topics,
             credential,
+            #[cfg(feature = "test-util")]
+            lifecycle_tx: None,
         }
+    }
+
+    /// Attach a test-only receiver for broker protocol observations.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn with_lifecycle_sender(
+        mut self,
+        lifecycle_tx: mpsc::UnboundedSender<MqttLifecycle>,
+    ) -> Self {
+        self.lifecycle_tx = Some(lifecycle_tx);
+        self
     }
 
     /// Test-only access to the optional credential.
@@ -162,11 +189,15 @@ impl MqttSource {
         self.credential.as_ref()
     }
 
-    /// Build a unique MQTT client ID: `dormant-<hostname>-<counter>`.
+    /// Build a unique MQTT client ID for concurrent daemon and test processes.
     fn client_id() -> String {
         let hostname = gethostname::gethostname().to_string_lossy().to_string();
         let n = CLIENT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("dormant-{hostname}-{n}")
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the epoch")
+            .as_nanos();
+        format!("dormant-{hostname}-{}-{n}-{suffix}", std::process::id())
     }
 
     /// Emit [`SensorState::Unavailable`] for every owned sensor.
@@ -185,8 +216,27 @@ impl MqttSource {
         backoff::emit_unavailable_all(&ids, tx).await;
     }
 
-    /// Create a fresh MQTT connection, subscribe to all topics, and return
-    /// the client+eventloop pair.
+    /// Queue subscriptions for every topic and return the number accepted by
+    /// the client request channel.
+    async fn subscribe_topics(client: &AsyncClient, topics: &[String]) -> usize {
+        let mut queued = 0;
+        for topic in topics {
+            match client.subscribe(topic, QoS::AtLeastOnce).await {
+                Ok(()) => queued += 1,
+                Err(e) => warn!("mqtt: initial subscribe failed for '{topic}': {e}"),
+            }
+        }
+        queued
+    }
+
+    fn subscription_ack_succeeded(return_codes: &[SubscribeReasonCode]) -> bool {
+        return_codes
+            .iter()
+            .all(|code| matches!(code, SubscribeReasonCode::Success(_)))
+    }
+
+    /// Create a fresh MQTT connection, queue subscriptions, and return the
+    /// client, event loop, and queued subscription count.
     ///
     /// `broker_url` is expected in the form `host:port` (e.g. `localhost:1883`)
     /// or `tcp://host:port`.
@@ -195,7 +245,7 @@ impl MqttSource {
         client_id: &str,
         topics: &[String],
         credential: Option<&MqttCredential>,
-    ) -> (AsyncClient, EventLoop) {
+    ) -> (AsyncClient, EventLoop, usize) {
         let (host, port) = parse_broker_url(broker_url);
         let mut mqttopts = MqttOptions::new(client_id, host, port);
         mqttopts.set_clean_session(true);
@@ -204,12 +254,8 @@ impl MqttSource {
         }
         let cap = topics.len() + CAP_HEADROOM;
         let (client, eventloop) = AsyncClient::new(mqttopts, cap);
-        for topic in topics {
-            if let Err(e) = client.subscribe(topic, QoS::AtLeastOnce).await {
-                warn!("mqtt: initial subscribe failed for '{topic}': {e}");
-            }
-        }
-        (client, eventloop)
+        let queued_subscriptions = Self::subscribe_topics(&client, topics).await;
+        (client, eventloop, queued_subscriptions)
     }
 
     /// Dispatch a publish on a sensor topic: parse each matching binding's
@@ -312,13 +358,16 @@ impl SensorSource for MqttSource {
 
         // We hold the current client+eventloop pair in these variables.
         // On reconnect we drop both and create a fresh pair.
-        let (mut client, mut eventloop) = Self::connect(
+        let (mut client, mut eventloop, mut queued_subscriptions) = Self::connect(
             &self.broker_url,
             &client_id,
             &topics,
             self.credential.as_ref(),
         )
         .await;
+        let mut pending_subacks: HashMap<u16, String> = HashMap::new();
+        let mut acknowledged_subscriptions = 0;
+        let mut outgoing_subscriptions = 0;
 
         loop {
             tokio::select! {
@@ -346,18 +395,18 @@ impl SensorSource for MqttSource {
                             }
                         }
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                            pending_subacks.clear();
+                            acknowledged_subscriptions = 0;
+                            outgoing_subscriptions = 0;
+                            #[cfg(feature = "test-util")]
+                            if let Some(lifecycle_tx) = &self.lifecycle_tx {
+                                let _ = lifecycle_tx.send(MqttLifecycle::Connected);
+                            }
                             if initial_connack_seen {
                                 // Reconnect after initial connection — re-subscribe
                                 // because clean_session = true.
                                 info!("mqtt: reconnected to '{}', re-subscribing", self.broker_url);
-                                for topic in &topics {
-                                    if let Err(e) = client.subscribe(topic, QoS::AtLeastOnce).await {
-                                        warn!(
-                                            "mqtt: subscribe failed for '{}': {e}",
-                                            topic,
-                                        );
-                                    }
-                                }
+                                queued_subscriptions = Self::subscribe_topics(&client, &topics).await;
                             } else {
                                 initial_connack_seen = true;
                                 debug!("mqtt: initial connection established to '{}'", self.broker_url);
@@ -365,11 +414,35 @@ impl SensorSource for MqttSource {
                             backoff = BACKOFF_MIN;
                             outage_reported = false;
                         }
+                        Ok(Event::Outgoing(Outgoing::Subscribe(pkid))) => {
+                            if let Some(topic) = topics.get(outgoing_subscriptions) {
+                                pending_subacks.insert(pkid, topic.clone());
+                                outgoing_subscriptions += 1;
+                            }
+                        }
+                        Ok(Event::Incoming(Packet::SubAck(suback))) => {
+                            if let Some(topic) = pending_subacks.remove(&suback.pkid) {
+                                if Self::subscription_ack_succeeded(&suback.return_codes) {
+                                    acknowledged_subscriptions += 1;
+                                    if acknowledged_subscriptions == queued_subscriptions {
+                                        #[cfg(feature = "test-util")]
+                                        if let Some(lifecycle_tx) = &self.lifecycle_tx {
+                                            let _ = lifecycle_tx.send(MqttLifecycle::Subscribed);
+                                        }
+                                    }
+                                } else {
+                                    warn!(
+                                        "mqtt: subscription rejected for '{topic}' (pkid {}): {:?}",
+                                        suback.pkid, suback.return_codes,
+                                    );
+                                }
+                            }
+                        }
                         Ok(Event::Incoming(Packet::Disconnect)) => {
                             debug!("mqtt: broker-initiated disconnect from '{}'", self.broker_url);
                         }
                         Ok(_) => {
-                            // Ignore other incoming packets (PingResp, SubAck, etc.).
+                            // Other packets we do not process (PingResp, PubAck, PubRec, PubRel, PubComp).
                         }
                         Err(e) => {
                             warn!(
@@ -400,6 +473,10 @@ impl SensorSource for MqttSource {
                             ).await;
                             client = new_pair.0;
                             eventloop = new_pair.1;
+                            queued_subscriptions = new_pair.2;
+                            pending_subacks.clear();
+                            acknowledged_subscriptions = 0;
+                            outgoing_subscriptions = 0;
                         }
                     }
                 }
@@ -558,6 +635,7 @@ fn parse_broker_url(url: &str) -> (&str, u16) {
 mod tests {
     use super::*;
     use dormant_core::config::schema::SensorKind;
+    use rumqttc::mqttbytes::v4::SubscribeReasonCode;
 
     // ── Fixture helpers ────────────────────────────────────────────────────
 
@@ -1181,5 +1259,17 @@ mod tests {
     fn new_stores_none_when_no_credential() {
         let source = MqttSource::new("tcp://localhost:1883".into(), vec![], None);
         assert!(source.credential().is_none());
+    }
+
+    #[test]
+    fn subscription_ack_succeeds_only_when_all_codes_success() {
+        assert!(MqttSource::subscription_ack_succeeded(&[
+            SubscribeReasonCode::Success(QoS::AtMostOnce),
+            SubscribeReasonCode::Success(QoS::AtLeastOnce),
+        ]));
+        assert!(!MqttSource::subscription_ack_succeeded(&[
+            SubscribeReasonCode::Success(QoS::AtMostOnce),
+            SubscribeReasonCode::Failure,
+        ]));
     }
 }

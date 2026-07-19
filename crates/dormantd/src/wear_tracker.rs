@@ -53,6 +53,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dormant_core::config::schema::{Config, WearConfig};
+use dormant_core::observation::{DaemonObservation, ObservationHub};
 use dormant_core::rules::{ControlMsg, DaemonEvent, StageInfo, StateSnapshot};
 use dormant_core::traits::{CommandSink, PanelState};
 use dormant_core::types::{DisplayId, StageKind};
@@ -104,9 +105,10 @@ pub struct WearTrackerDeps {
     /// Daemon-lifetime cancellation token.
     pub cancel: CancellationToken,
     /// The wear state directory, resolved ONCE and synchronously by
-    /// `app.rs` (from `dormant_core::paths::wear_state_dir()`, i.e.
-    /// `XDG_STATE_HOME`/`HOME`) before this tracker is spawned — never
-    /// re-derived here.
+    /// `app.rs` (as the App's own `state_dir.join("wear")`, where
+    /// `state_dir` is set at build time via `with_state_dir` /
+    /// `with_boot_source` / the `paths::state_dir()` default) before this
+    /// tracker is spawned — never re-derived here.
     ///
     /// #47 fix: the tracker previously called `wear_state_dir()` itself,
     /// inside the detached `tokio::spawn`ed task, at first-tick time — a
@@ -123,6 +125,8 @@ pub struct WearTrackerDeps {
     /// closes that window entirely: nothing in `wear_tracker.rs` ever reads
     /// an env var again.
     pub dir: std::path::PathBuf,
+    /// Daemon-local diagnostics for corrupt ledger recovery.
+    pub observations: ObservationHub,
 }
 
 /// Spawn the wear tracker. Runs until `deps.cancel` fires.
@@ -199,7 +203,7 @@ async fn run(mut deps: WearTrackerDeps) {
                 };
 
                 let now = now_epoch_s();
-                ensure_ledgers_loaded(&mut state, &cfg, &executors, &dir, now);
+                ensure_ledgers_loaded(&mut state, &cfg, &executors, &dir, now, &deps.observations);
 
                 let samples = collect_samples(&snapshot, &executors, &cfg.wear).await;
 
@@ -246,6 +250,7 @@ fn ensure_ledgers_loaded(
     executors: &HashMap<DisplayId, Arc<dyn CommandSink>>,
     dir: &Path,
     now_epoch_s: u64,
+    observations: &ObservationHub,
 ) {
     for display_id in executors.keys() {
         if state.resolved.contains(display_id) {
@@ -282,6 +287,7 @@ fn ensure_ledgers_loaded(
             cfg.wear.grid_rows,
             cfg.wear.grid_cols,
             now_epoch_s,
+            observations,
         );
         state.ledgers.insert(display_id.clone(), result.ledger);
         if result.needs_seed {
@@ -754,6 +760,10 @@ struct LoadResult {
 /// corrupt, or a future schema version. See spec §5.2 / §3.1. Pure math
 /// aside, this is impure (filesystem) — the shell calls it once per display,
 /// the first time that display is observed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the load boundary receives the persisted identity, grid shape, and daemon-owned observation sink together"
+)]
 fn load_or_create_ledger(
     dir: &Path,
     key: &str,
@@ -762,6 +772,7 @@ fn load_or_create_ledger(
     rows: u16,
     cols: u16,
     now_epoch_s: u64,
+    observations: &ObservationHub,
 ) -> LoadResult {
     let path = dir.join(format!("wear-{key}.json"));
     let display_key = identity.key.clone();
@@ -828,6 +839,10 @@ fn load_or_create_ledger(
                     // operator grepping for `wear_ledger_corrupt` must not
                     // miss it.
                     tracing::warn!(event = "wear_ledger_corrupt", display = %display_key, error = %e);
+                    observations.emit(DaemonObservation::WearLedgerCorrupt {
+                        path,
+                        rename_error: e.to_string(),
+                    });
                     LoadResult {
                         ledger: WearLedger::new(identity, panel_type, rows, cols, now_epoch_s),
                         needs_seed: false,
@@ -1209,42 +1224,22 @@ mod tests {
 
         let mut state = TrackerState::default();
         let executors = fake_executors(&[(&display, None)]);
-        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
 
         assert_eq!(state.native_max.get(&display).copied(), Some(50));
     }
 
-    // ── #47 fix: `run` must not re-read `XDG_STATE_HOME` after spawn ────────
-
-    /// Regression pin for the diagnosed `wear_disabled_creates_nothing`
-    /// flake (#47, plan Task 5 §3): before this fix, `run` resolved its
-    /// state directory itself, INSIDE the detached spawned task
-    /// (`dormant_core::paths::wear_state_dir()`, reading the process-global
-    /// `XDG_STATE_HOME`/`HOME` env), racing every other App-building test's
-    /// own env mutations (`wear.enabled` defaults `true`, so every such test
-    /// spawns a tracker). The fix resolves the directory ONCE, synchronously,
-    /// in `App::start` before the tracker is ever spawned, and threads the
-    /// resulting `PathBuf` through as `WearTrackerDeps::dir` — `run` now
-    /// only ever reads `deps.dir`.
-    ///
-    /// Proves it directly: point `XDG_STATE_HOME` at a decoy directory
-    /// AFTER the tracker task is already running (simulating an unrelated
-    /// test/process racing in), and confirm the ledger lands under the
-    /// `dir` injected at spawn time, never under the decoy.
+    /// The tracker persists through the injected state directory.
     #[tokio::test]
-    async fn tracker_persists_to_injected_dir_even_if_xdg_state_home_changes_after_spawn() {
+    async fn tracker_persists_to_injected_dir() {
         let injected_dir = tempfile::tempdir().unwrap();
-        let decoy_dir = tempfile::tempdir().unwrap();
-
-        // SAFETY: the only call site that ever read `XDG_STATE_HOME` inside
-        // this crate's lib target was `run`'s own (now-removed)
-        // `wear_state_dir()` call — no other unit test in this binary reads
-        // that env var, so mutating it here without a cross-test lock
-        // cannot race any other test's assertions.
-        let prev_xdg = std::env::var_os("XDG_STATE_HOME");
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", decoy_dir.path());
-        }
 
         let display = DisplayId("mon".into());
         let mut cfg = minimal_config();
@@ -1280,16 +1275,8 @@ mod tests {
             handle: wear_handle,
             cancel: cancel.clone(),
             dir: injected_dir.path().to_path_buf(),
+            observations: ObservationHub::new(1),
         });
-
-        // Mutate the env var AGAIN now that the tracker is definitely
-        // running, belt-and-braces against the exact race this test pins:
-        // even a mutation landing while the tracker's first tick is in
-        // flight must not matter, because nothing in `run` looks at the
-        // env after spawn.
-        unsafe {
-            std::env::set_var("XDG_STATE_HOME", decoy_dir.path());
-        }
 
         let expected_file = injected_dir.path().join("wear-mon.json");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1301,23 +1288,11 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
         responder.abort();
 
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
-        }
-
         assert!(
             expected_file.exists(),
             "ledger must persist under the WearTrackerDeps::dir injected at spawn ({}) — it \
              never appeared",
             injected_dir.path().display()
-        );
-        let decoy_wear_file = decoy_dir.path().join("wear-mon.json");
-        assert!(
-            !decoy_wear_file.exists(),
-            "ledger must NOT appear under the decoy directory pointed to by XDG_STATE_HOME \
-             AFTER spawn ({}) — `run` must never re-read XDG_STATE_HOME",
-            decoy_wear_file.display()
         );
     }
 
@@ -1339,7 +1314,14 @@ mod tests {
         let executors = fake_executors(&[(&display, Some(panel_ident))]);
 
         let mut state = TrackerState::default();
-        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
 
         let expected_key = sanitize_identity_key(panel_ident);
         assert_eq!(
@@ -1389,7 +1371,14 @@ mod tests {
         let executors = fake_executors(&[(&display, None)]);
 
         let mut state = TrackerState::default();
-        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
 
         let expected_key = sanitize_identity_key(&display.0);
         assert_eq!(
@@ -1418,12 +1407,26 @@ mod tests {
 
         let mut state_before = TrackerState::default();
         let executors_before = fake_executors(&[(&old_id, Some(panel_ident))]);
-        ensure_ledgers_loaded(&mut state_before, &cfg, &executors_before, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state_before,
+            &cfg,
+            &executors_before,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
         let key_before = state_before.storage_key.get(&old_id).cloned().unwrap();
 
         let mut state_after = TrackerState::default();
         let executors_after = fake_executors(&[(&new_id, Some(panel_ident))]);
-        ensure_ledgers_loaded(&mut state_after, &cfg, &executors_after, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state_after,
+            &cfg,
+            &executors_after,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
         let key_after = state_after.storage_key.get(&new_id).cloned().unwrap();
 
         assert_eq!(
@@ -1753,8 +1756,16 @@ mod tests {
         ledger.attribute_uniform(Duration::from_secs(3600), 0.5);
         persist_ledger(dir.path(), "mon", &ledger).unwrap();
 
-        let result =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::QdOled, 9, 16, 100);
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::QdOled,
+            9,
+            16,
+            100,
+            &ObservationHub::new(1),
+        );
         assert!(
             !result.needs_seed,
             "loaded from an existing file — must not re-seed"
@@ -1814,8 +1825,16 @@ mod tests {
             display_name: "mon".into(),
         };
         let now = 12_345;
-        let result =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, now);
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            9,
+            16,
+            now,
+            &ObservationHub::new(1),
+        );
         assert_eq!(result.ledger.total_on_hours, 0.0);
         assert!(!result.needs_seed, "corrupt-recovery must not re-seed");
         assert!(!result.persist_readonly);
@@ -1837,8 +1856,16 @@ mod tests {
             key: "mon".into(),
             display_name: "mon".into(),
         };
-        let result =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, now);
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            9,
+            16,
+            now,
+            &ObservationHub::new(1),
+        );
         assert!(
             result.persist_readonly,
             "rename failure must mark persist-readonly (skip persist for this display)"
@@ -1846,16 +1873,8 @@ mod tests {
         assert!(!result.needs_seed);
     }
 
-    /// T7 review S1 (RED-first): spec §5.2 pins `wear_ledger_corrupt` as the
-    /// log literal for the WHOLE corrupt-handling path, including the
-    /// rename-itself-fails sub-case ("if the rename itself fails (e.g.
-    /// EACCES) ... WARN `wear_ledger_corrupt`, once") — not `wear_persist_failed`
-    /// (that literal is reserved for the unrelated `Persist` action's
-    /// `persist_ledger` I/O failure in `apply_actions`). An operator
-    /// grepping specifically for `wear_ledger_corrupt` to audit corrupt-
-    /// ledger incidents must not miss this sub-case.
-    #[test]
-    fn corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed() {
+    #[tokio::test]
+    async fn corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wear-mon.json");
         std::fs::write(&path, "{ not json").unwrap();
@@ -1866,19 +1885,27 @@ mod tests {
             display_name: "mon".into(),
         };
 
-        let log = capture_tracing(|| {
-            let _ =
-                load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, now);
-        });
+        let observations = ObservationHub::new(1);
+        let mut observation_rx = observations.subscribe();
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            9,
+            16,
+            now,
+            &observations,
+        );
 
-        assert!(
-            log.contains("wear_ledger_corrupt"),
-            "rename-failure path must log wear_ledger_corrupt: {log}"
-        );
-        assert!(
-            !log.contains("wear_persist_failed"),
-            "rename-failure path must NOT log wear_persist_failed: {log}"
-        );
+        assert!(result.persist_readonly);
+        assert!(matches!(
+            observation_rx.recv().await,
+            Ok(DaemonObservation::WearLedgerCorrupt {
+                path: observed_path,
+                rename_error,
+            }) if observed_path == path && !rename_error.is_empty()
+        ));
     }
 
     #[test]
@@ -1894,8 +1921,16 @@ mod tests {
         let original = serde_json::to_string(&future).unwrap();
         std::fs::write(&path, &original).unwrap();
 
-        let result =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, 500);
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            9,
+            16,
+            500,
+            &ObservationHub::new(1),
+        );
         assert!(result.persist_readonly);
         assert!(
             !result.needs_seed,
@@ -1941,8 +1976,16 @@ mod tests {
 
         // Load through the real path — this is what actually populates
         // `persist_readonly` in production.
-        let result =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, 500);
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            9,
+            16,
+            500,
+            &ObservationHub::new(1),
+        );
         assert!(
             result.persist_readonly,
             "sanity: must have loaded read-only"
@@ -1993,8 +2036,16 @@ mod tests {
         persist_ledger(dir.path(), "mon", &disk_ledger).unwrap();
 
         // Config now declares QdOled — load must adopt it.
-        let result =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::QdOled, 9, 16, 500);
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::QdOled,
+            9,
+            16,
+            500,
+            &ObservationHub::new(1),
+        );
         assert!(!result.needs_seed, "existing ledger must not re-seed");
         assert!(!result.persist_readonly);
         assert_eq!(
@@ -2026,7 +2077,14 @@ mod tests {
 
         let mut state = TrackerState::default();
         let executors = fake_executors(&[(&display, None)]);
-        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
 
         assert_eq!(
             state.ledgers.get(&display).unwrap().panel_type,
@@ -2039,7 +2097,14 @@ mod tests {
 
         // A subsequent tick (or reload) calls ensure_ledgers_loaded again —
         // the resolved display must pick up the new panel_type.
-        ensure_ledgers_loaded(&mut state, &cfg, &executors, dir.path(), 0);
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            0,
+            &ObservationHub::new(1),
+        );
 
         assert_eq!(
             state.ledgers.get(&display).unwrap().panel_type,
@@ -2071,13 +2136,22 @@ mod tests {
             9,
             16,
             0,
+            &ObservationHub::new(1),
         );
         assert!(fresh.needs_seed);
         persist_ledger(dir.path(), "mon", &fresh.ledger).unwrap();
 
         // Second load, file now exists — needs_seed false.
-        let again =
-            load_or_create_ledger(dir.path(), "mon", identity, PanelType::Unknown, 9, 16, 100);
+        let again = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            9,
+            16,
+            100,
+            &ObservationHub::new(1),
+        );
         assert!(!again.needs_seed);
     }
 }

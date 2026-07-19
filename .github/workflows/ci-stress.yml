@@ -94,3 +94,233 @@ jobs:
           name: reload-stress-macos
           path: target/nextest
           if-no-files-found: warn
+
+  timer-stress-ubuntu:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Stress audio policy virtual time
+        run: |
+          filter='test(audio_policy::tests::)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+      - name: Stress watchdog virtual time
+        run: |
+          filter='test(watchdog_schedule::tests::) or test(boot_guard::promote_tests)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+      - name: Stress wear corruption virtual time
+        run: |
+          filter='test(wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+      - name: Stress rules virtual time
+        run: |
+          filter='test(clear_grace_blank_then_instant_wake) or test(motion_sensor_hold_time_stretches_pulse) or test(wake_failure_retries_until_success) or test(set_inhibited_freezes_grace_until_released) or test(render_ladder_dwell_advances_to_controller_blank)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-core --test rules_end_to_end -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-core --test rules_end_to_end --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+
+  timer-stress-macos:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Stress audio policy virtual time
+        run: |
+          filter='test(audio_policy::tests::)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+      - name: Stress watchdog virtual time
+        run: |
+          filter='test(watchdog_schedule::tests::) or test(boot_guard::promote_tests)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+      - name: Stress wear corruption virtual time
+        run: |
+          filter='test(wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+      - name: Stress rules virtual time
+        run: |
+          filter='test(clear_grace_blank_then_instant_wake) or test(motion_sensor_hold_time_stretches_pulse) or test(wake_failure_retries_until_success) or test(set_inhibited_freezes_grace_until_released) or test(render_ladder_dwell_advances_to_controller_blank)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-core --test rules_end_to_end -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-core --test rules_end_to_end --stress-count 500 --retries 0 --flaky-result fail -E "$filter"
+
+  io-stress-ubuntu:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Start Mosquitto broker
+        run: |
+          docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+          for _ in $(seq 1 10); do nc -z localhost 1883 && break; sleep 1; done
+          nc -z localhost 1883
+      - name: Stress Linux real-I/O contracts
+        run: |
+          filter='test(rollback_boot_watches_operator_path_and_reload_recovers_without_restart)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --test boot_rollback -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --test boot_rollback --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(command::tests::sleep_past_timeout_errs)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-displays --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-displays --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(sd_notify::tests::temp_path_socket_receives_ready_then_watchdog)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(probes::usb::tests::usb_probe_decodes_a_frame_over_a_unix_pty)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-doctor --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-doctor --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(mqtt_round_trip_publishes_presence_event)'
+          selected="$(DORMANT_TEST_MQTT=1 PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-sensors --test mqtt_integration --run-ignored only -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          DORMANT_TEST_MQTT=1 PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-sensors --test mqtt_integration --run-ignored only --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+  io-stress-macos:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Stress macOS real-I/O contracts
+        run: |
+          filter='test(rollback_boot_watches_operator_path_and_reload_recovers_without_restart)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --test boot_rollback -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --test boot_rollback --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(command::tests::sleep_past_timeout_errs)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-displays --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-displays --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormantd --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+          filter='test(probes::usb::tests::nonexistent_port_returns_structured_failure)'
+          selected="$(PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest list -p dormant-doctor --lib -E "$filter")"
+          printf '%s\n' "$selected"
+          test -n "$selected"
+          test "$(printf '%s\n' "$selected" | wc -l)" -ge 1
+          PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-doctor --lib --stress-count 100 --retries 0 --flaky-result fail -E "$filter"
+
+  hermeticity-stress-ubuntu:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Stress concurrent test binaries
+        run: bash scripts/ci/run-hermeticity-stress.sh --platform Linux --stress-count 100
+      - name: Upload first hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-ubuntu-process-one
+          path: target/hermeticity-stress/process-one
+          if-no-files-found: warn
+      - name: Upload second hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-ubuntu-process-two
+          path: target/hermeticity-stress/process-two
+          if-no-files-found: warn
+
+  hermeticity-stress-macos:
+    if: contains(github.event.pull_request.labels.*.name, 'ci-stress-reload')
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo install cargo-nextest --version 0.9.131 --locked
+      - name: Stress concurrent test binaries
+        run: bash scripts/ci/run-hermeticity-stress.sh --platform Darwin --stress-count 100
+      - name: Upload first hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-macos-process-one
+          path: target/hermeticity-stress/process-one
+          if-no-files-found: warn
+      - name: Upload second hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-macos-process-two
+          path: target/hermeticity-stress/process-two
+          if-no-files-found: warn

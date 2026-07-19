@@ -23,36 +23,14 @@
 //! background task later polls it, so an unreachable `tcp://localhost:1883`
 //! broker never blocks `App::build`/`App::start`.
 //!
-//! **Parallel-execution safety:** `install_capture_subscriber` installs a
-//! process-global subscriber whose buffer is shared by every test in this
-//! binary. Two overlapping reasons put a test under the shared
-//! [`capture_lock`] (the same pattern `daemon_smoke.rs` uses for its
-//! count-sensitive capture tests):
-//!
-//! - it emits or asserts on `config_rollback_boot`/"config validation
-//!   failed at boot" — every test that boots from a bad config with a
-//!   DIFFERING LKG present takes this immediate-rollback branch
-//!   (`bad_config_with_lkg_immediate_rollback`,
-//!   `bad_config_and_bad_lkg_build_failed`,
-//!   `counted_rollback_never_attempts_chosen` — which asserts the literal
-//!   is ABSENT — plus every rollback-recovery test below that boots the
-//!   same way);
-//! - it edits its own OPERATOR config file after boot while the real file
-//!   watcher is installed: a genuine inotify event fires independently of
-//!   whatever triggered the reload under test, logging
-//!   `reload_trigger source="watcher"` into the SAME shared buffer
-//!   (`accepted_reload_recovers_from_rollback_without_restart`,
-//!   `rejected_reload_during_rollback_leaves_rollback_state_untouched`, and
-//!   the Task 3 watcher-drill tests below).
-//!
-//! Every other test in this file emits only event names that do not
-//! collide with any capture-reading assertion.
+//! Each boot receives an app-owned observation hub, so rollback diagnostics
+//! remain attributable when this binary's tests run concurrently.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dormant_core::config::Strictness;
+use dormant_core::observation::{DaemonObservation, ObservationHub, ReloadSource};
 use dormant_core::rules::{ControlMsg, RollbackStatus, StateSnapshot};
 use dormantd::app::AppHandle;
 use dormantd::boot::{self, BootOutcome};
@@ -60,99 +38,13 @@ use dormantd::boot_guard::{
     self, BootInputs, CrashLoopState, DeferredEvent, Fingerprint, StartEntry, fingerprint_bytes,
 };
 use dormantd::sd_notify::SdNotify;
-use tempfile::TempDir;
 use tokio::sync::oneshot;
-use tracing_subscriber::fmt::MakeWriter;
 
-// ── Log capture (mirrors `daemon_smoke.rs`'s `install_capture_subscriber`) ──
-
-static CAPTURE: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
-
-fn install_capture_subscriber() {
-    CAPTURE.get_or_init(|| Mutex::new(Vec::new()));
-    // `with_ansi(false)`: the capture buffer is asserted on via plain
-    // substring `.contains()` checks (Task 3's `source="watcher"` among
-    // them) — ANSI color codes interposed between a field's key, `=`, and
-    // value (tracing-subscriber's default when it can't detect the custom
-    // `CaptureWriter` is a non-tty) would silently break any check that
-    // spans a `key=value` boundary, even though single-token checks like
-    // `contains("config_rollback_boot")` happened to survive it.
-    let _ = tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_writer(CaptureWriter)
-            .with_ansi(false)
-            .finish(),
-    );
+mod support {
+    pub mod app_paths;
 }
 
-#[derive(Clone)]
-struct CaptureWriter;
-
-impl std::io::Write for CaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        CAPTURE
-            .get()
-            .expect("capture subscriber not installed")
-            .lock()
-            .unwrap()
-            .write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for CaptureWriter {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        CaptureWriter
-    }
-}
-
-fn drain_capture() -> String {
-    CAPTURE.get().map_or(String::new(), |buf| {
-        let mut guard = buf.lock().unwrap();
-        let s = String::from_utf8(guard.clone()).unwrap_or_default();
-        guard.clear();
-        s
-    })
-}
-
-/// Serializes the three tests that emit or read the `config_rollback_boot`
-/// event — they share a process-global capture buffer (see
-/// [`install_capture_subscriber`]), and a parallel sibling test that also
-/// calls `boot()` with a bad-config+LKG config can emit the event into the
-/// buffer between a capture-reader's `drain_capture()` and its assertion.
-///
-/// The poison-recovery idiom matches `daemon_smoke.rs`'s
-/// `CAPTURE_COUNT_LOCK` — a panicking test must not wedge the rest of the
-/// binary.
-static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn capture_lock() -> &'static Mutex<()> {
-    CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Bounded-poll [`drain_capture`] (accumulating what's drained across
-/// polls, since each call clears the buffer) until `needle` appears or
-/// `timeout` elapses — Task 3 §3's "bounded polling... never sleep-and-
-/// assume" applied to the tracing capture rather than a `ControlMsg`
-/// snapshot (`daemon_smoke.rs`'s `wait_for` is the same idiom over a
-/// predicate).
-async fn wait_for_capture(needle: &str, timeout: Duration) -> String {
-    let start = Instant::now();
-    let mut acc = String::new();
-    loop {
-        acc.push_str(&drain_capture());
-        if acc.contains(needle) {
-            return acc;
-        }
-        if start.elapsed() >= timeout {
-            return acc;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
+use support::app_paths::TestAppPaths;
 
 // ── Config fixtures ──────────────────────────────────────────────────────
 
@@ -303,23 +195,25 @@ fn replace_watched_file(path: &Path, contents: &str) {
 // ── Harness ──────────────────────────────────────────────────────────────
 
 struct Harness {
-    dir: TempDir,
+    paths: TestAppPaths,
     state_dir: PathBuf,
     lock_path: PathBuf,
     creds_path: PathBuf,
+    observations: ObservationHub,
 }
 
 impl Harness {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
-        let state_dir = dir.path().join("state");
-        let lock_path = dir.path().join("dormant.lock");
-        let creds_path = dir.path().join("credentials.toml");
+        let paths = TestAppPaths::new();
+        let state_dir = paths.state.clone();
+        let lock_path = paths.root().join("dormant.lock");
+        let creds_path = paths.credentials.clone();
         Self {
-            dir,
+            paths,
             state_dir,
             lock_path,
             creds_path,
+            observations: ObservationHub::new(32),
         }
     }
 
@@ -328,7 +222,7 @@ impl Harness {
         // `ipc_roundtrip.rs`/`daemon_smoke.rs`'s "never the default path"
         // isolation note (kept short — abstract/unix socket path length
         // limits).
-        self.dir.path().join("d.sock")
+        self.paths.ipc_socket.clone()
     }
 
     fn inputs(&self) -> BootInputs {
@@ -337,13 +231,14 @@ impl Harness {
             strictness: Strictness::Strict,
             state_dir: self.state_dir.clone(),
             lock_path: self.lock_path.clone(),
+            observations: self.observations.clone(),
             sd_notify: SdNotify::from_env(),
         }
     }
 
     fn write_good(&self) -> PathBuf {
         write_file(
-            self.dir.path(),
+            self.paths.root(),
             "config.toml",
             &good_config(&self.socket_path()),
         )
@@ -351,7 +246,7 @@ impl Harness {
 
     fn write_bad(&self) -> PathBuf {
         write_file(
-            self.dir.path(),
+            self.paths.root(),
             "config.toml",
             &bad_config(&self.socket_path()),
         )
@@ -419,25 +314,37 @@ async fn shutdown(handle: AppHandle, join: tokio::task::JoinHandle<()>) {
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
 }
 
+async fn recv_watcher_reload(
+    observations: &mut tokio::sync::broadcast::Receiver<DaemonObservation>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(remaining, observations.recv()).await {
+            Ok(Ok(DaemonObservation::ReloadCompleted(receipt)))
+                if receipt.sources.contains(&ReloadSource::Watcher) =>
+            {
+                return true;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => return false,
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 /// Bad chosen config, differing LKG present → immediate rollback: LKG used,
-/// pending banner set, `config_rollback_boot` logged directly by `boot()`
-/// (not deferred — this failure is discovered live, after `prepare` already
-/// returned `Proceed`).
+/// pending banner set, and a typed rollback observation emitted directly by
+/// `boot()` (not deferred — this failure is discovered live, after `prepare`
+/// already returned `Proceed`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes the three config_rollback_boot-sensitive tests and is \
-              always released promptly at test end — see the lock's doc comment"
-)]
 async fn bad_config_with_lkg_immediate_rollback() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    install_capture_subscriber();
-    drain_capture();
     let h = Harness::new();
+    let mut observations = h.observations.subscribe();
     let bad = h.write_bad();
     let bad_bytes = std::fs::read(&bad).unwrap();
     let bad_fp = fingerprint_bytes(&bad_bytes);
@@ -512,11 +419,15 @@ async fn bad_config_with_lkg_immediate_rollback() {
         BootOutcome::LockFailed | BootOutcome::BuildFailed(_) => panic!("expected Started"),
     }
 
-    let log = drain_capture();
-    assert!(
-        log.contains("config_rollback_boot"),
-        "boot() must log config_rollback_boot directly, got: {log}"
-    );
+    assert!(matches!(
+        observations.try_recv(),
+        Ok(DaemonObservation::BootRollback {
+            failed_fingerprint,
+            lkg_fingerprint,
+            ..
+        }) if failed_fingerprint == fp_label(bad_fp)
+            && lkg_fingerprint == fp_label(fingerprint_bytes(&std::fs::read(&lkg_path).unwrap()))
+    ));
 
     let state: CrashLoopState = serde_json::from_str(
         &std::fs::read_to_string(h.state_dir.join("crash-loop.json")).unwrap(),
@@ -541,17 +452,7 @@ async fn bad_config_with_lkg_immediate_rollback() {
 /// one fresh LKG candidate is armed from the newly-accepted operator
 /// bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
-              or edits its own watched operator config post-boot against the tests that assert on \
-              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
-              see the module doc comment"
-)]
 async fn accepted_reload_recovers_from_rollback_without_restart() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     let lkg_path = h.write_lkg(&good_config(&h.socket_path()));
@@ -669,17 +570,7 @@ async fn accepted_reload_recovers_from_rollback_without_restart() {
 /// no candidate is armed. Sibling of the accepted-reload recovery test
 /// above; this one edits the operator file with STILL-invalid bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
-              or edits its own watched operator config post-boot against the tests that assert on \
-              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
-              see the module doc comment"
-)]
 async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     let bad_bytes = std::fs::read(&bad).unwrap();
@@ -754,24 +645,12 @@ async fn rejected_reload_during_rollback_leaves_rollback_state_untouched() {
 /// never calls `trigger_reload()` — the fixed operator bytes reach the
 /// daemon only through a real filesystem event on the OPERATOR path (a
 /// sibling-temp + rename, matching `reload::config_watcher`'s own watched-
-/// directory reasoning), and the bounded-polled tracing capture proves the
-/// watcher actually fired before the reload outcome is awaited.
+/// directory reasoning), and the app-owned observation hub proves the watcher
+/// actually fired before the reload outcome is awaited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
-              or edits its own watched operator config post-boot against the tests that assert on \
-              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
-              see the module doc comment"
-)]
 async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    install_capture_subscriber();
-    drain_capture();
-
     let h = Harness::new();
+    let mut observations = h.observations.subscribe();
     let bad = h.write_bad();
     let lkg_contents = watcher_drill_config(&h.socket_path(), "info");
     let lkg_path = h.write_lkg(&lkg_contents);
@@ -826,15 +705,6 @@ async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart
     let mut reloads = handle.subscribe_reload();
     replace_watched_file(&bad, &fixed);
 
-    // Bounded-poll the capture for the real watcher firing — proof this
-    // reload was never manually triggered (no `trigger_reload()` call
-    // anywhere in this test).
-    let log = wait_for_capture(r#"source="watcher""#, Duration::from_secs(5)).await;
-    assert!(
-        log.contains("reload_trigger") && log.contains(r#"source="watcher""#),
-        "expected a real watcher-driven reload_trigger, got: {log}"
-    );
-
     let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
         .await
         .expect("reload outcome within timeout")
@@ -844,6 +714,7 @@ async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart
         dormantd::app::ReloadOutcome::Reloaded,
         "got {outcome:?}"
     );
+    assert!(recv_watcher_reload(&mut observations).await);
 
     assert_eq!(
         handle.config_watch().borrow().daemon.log_level,
@@ -895,17 +766,7 @@ async fn rollback_boot_watches_operator_path_and_reload_recovers_without_restart
 /// stays set, the crash-loop JSON stays active, and no candidate is
 /// armed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes every test in this file that boots an immediate rollback \
-              or edits its own watched operator config post-boot against the tests that assert on \
-              config_rollback_boot / reload_trigger literals in the shared global capture buffer — \
-              see the module doc comment"
-)]
 async fn rollback_boot_watcher_rejects_still_bad_operator_edit() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     let bad_bytes = std::fs::read(&bad).unwrap();
@@ -1024,20 +885,10 @@ async fn counted_rollback_banner_survives_prepare_state_write_failure() {
 /// Bad chosen config AND a bad (unbuildable) LKG → `BuildFailed` (spec
 /// §5.1 point 3's "if THAT also fails" branch).
 ///
-/// This test EMITS `config_rollback_boot` via the immediate-rollback branch
-/// (the first build fails, the LKG also fails) — it is serialized under
-/// [`capture_lock`] against the two capture-reader tests so its event cannot
-/// contaminate a parallel assertion.
+/// This test emits an app-owned rollback observation via the immediate-
+/// rollback branch (the first build fails, then the LKG also fails).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes the three config_rollback_boot-sensitive tests and is \
-              always released promptly at test end — see the lock's doc comment"
-)]
 async fn bad_config_and_bad_lkg_build_failed() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = Harness::new();
     let bad = h.write_bad();
     // An LKG with DIFFERENT, but ALSO invalid, bytes.
@@ -1050,23 +901,12 @@ async fn bad_config_and_bad_lkg_build_failed() {
 
 /// A counted crash-loop verdict (3 same-fingerprint starts, differing LKG)
 /// rolls back BEFORE ever attempting the chosen (bad) config — pinned by
-/// the ABSENCE of `boot()`'s own `config_rollback_boot` log line (that line
-/// only fires on the immediate-rollback branch, which is never entered here
-/// because `App::build(plan.chosen_config)` — the LKG, per `prepare`'s
-/// verdict — succeeds on the first try).
+/// the absence of an immediate-rollback observation because `App::build`
+/// receives the LKG selected by `prepare` on its first attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "capture_lock() serializes the three config_rollback_boot-sensitive tests and is \
-              always released promptly at test end — see the lock's doc comment"
-)]
 async fn counted_rollback_never_attempts_chosen() {
-    let _guard = capture_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    install_capture_subscriber();
-    drain_capture();
     let h = Harness::new();
+    let mut observations = h.observations.subscribe();
     let bad = h.write_bad();
     let bad_bytes = std::fs::read(&bad).unwrap();
     let fp = fingerprint_bytes(&bad_bytes);
@@ -1122,11 +962,12 @@ async fn counted_rollback_never_attempts_chosen() {
         BootOutcome::BuildFailed(msg) => panic!("expected Started, got BuildFailed({msg})"),
     }
 
-    let log = drain_capture();
-    assert!(
-        !log.contains("config validation failed at boot"),
-        "boot()'s own immediate-rollback branch must never fire for a counted verdict, got: {log}"
-    );
+    while let Ok(observation) = observations.try_recv() {
+        assert!(
+            !matches!(observation, DaemonObservation::BootRollback { .. }),
+            "counted rollback must not enter boot()'s immediate rollback branch"
+        );
+    }
 }
 
 /// Sticky `ContinueRollback`: LKG used again, `config_rollback_continued`
@@ -1432,7 +1273,7 @@ async fn boot_sends_ready_before_any_watchdog_ping() {
 
     // Short name, mirroring `Harness::socket_path`'s own "never the default
     // path, keep it short" note (abstract/unix socket path length limits).
-    let notify_path = h.dir.path().join("n.sock");
+    let notify_path = h.paths.notify_socket.clone();
     let listener = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
     listener
         .set_read_timeout(Some(Duration::from_secs(2)))

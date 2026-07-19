@@ -38,6 +38,7 @@ jobs:
           cache: npm
           cache-dependency-path: crates/dormant-web/webui/package-lock.json
       - run: npm ci
+        working-directory: crates/dormant-web/webui
       - run: bash scripts/gates/webui.sh
 
   clippy:

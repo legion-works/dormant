@@ -1,4 +1,5 @@
 # target<TAB>script
+# scripts/ci/wait-for-mqtt.sh is CI-only MQTT readiness, not a shared gate.
 ci	scripts/gates/fmt.sh
 ci	scripts/gates/taplo.sh
 ci	scripts/gates/gitleaks.sh

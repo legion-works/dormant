@@ -112,3 +112,17 @@ fix_pr = ""
 proving_test = ""
 soak_evidence = []
 status = "open"
+
+[[incident]]
+id = "FLAKE-2026-07-18-MPV-FIRSTFRAME"
+test = "screensaver::tests::mpv_render_context_created_with_advanced_control"
+signature = "sha256:6c3c65304df27ffa40bf0088783c56e9adc175e97011ff2bbec3b3f7648ace3b"
+first_run_url = ""
+last_run_url = ""
+mechanism = "real-clock first-frame deadline in the libmpv render-context test; fails intermittently under full-workspace CPU contention, passes when run isolated (3 sightings during M1 T5/T6/T7 full-suite runs; re-observed by the ci profile during M3 T17)"
+reproduction = "cargo nextest run --profile ci --workspace --all-features"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"

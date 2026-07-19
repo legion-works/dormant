@@ -10,7 +10,6 @@ ci	scripts/gates/webui.sh
 ci	scripts/gates/mdbook.sh
 ci	scripts/gates/deny.sh
 ci	scripts/gates/msrv.sh
-ci	scripts/gates/test-timing.sh
 pre-commit	scripts/gates/fmt.sh
 pre-commit	scripts/gates/taplo.sh
 pre-commit	scripts/gates/typos.sh

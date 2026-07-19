@@ -126,3 +126,17 @@ fix_pr = ""
 proving_test = ""
 soak_evidence = []
 status = "open"
+
+[[incident]]
+id = "FLAKE-2026-07-18-RENDER-FRAMES"
+test = "screensaver::tests::renders_non_zero_changing_frames"
+signature = "sha256:5ad1de95466bf0815d42052c0c74653b176e3015c1c0cde9ef884e824b30ef14"
+first_run_url = ""
+last_run_url = ""
+mechanism = "real-clock libmpv frame-production deadline in the screensaver render tests; sibling of FLAKE-2026-07-18-MPV-FIRSTFRAME — same mechanism, different test; retries-to-pass under full-workspace CPU contention, observed by the ci profile during M3 T18"
+reproduction = "cargo nextest run -p dormant-render --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(renders_non_zero_changing_frames)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"

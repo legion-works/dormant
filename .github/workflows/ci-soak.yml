@@ -270,3 +270,60 @@ jobs:
           name: soak-macos-latest-output
           path: target/soak-macos-latest
           if-no-files-found: warn
+
+  soak-hermeticity-ubuntu:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - name: Stress concurrent test binaries
+        run: bash scripts/ci/run-hermeticity-stress.sh --platform Linux --stress-count 100
+      - name: Upload first hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-ubuntu-process-one
+          path: target/hermeticity-stress/process-one
+          if-no-files-found: warn
+      - name: Upload second hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-ubuntu-process-two
+          path: target/hermeticity-stress/process-two
+          if-no-files-found: warn
+
+  soak-hermeticity-macos:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - name: Stress concurrent test binaries
+        run: bash scripts/ci/run-hermeticity-stress.sh --platform Darwin --stress-count 100
+      - name: Upload first hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-macos-process-one
+          path: target/hermeticity-stress/process-one
+          if-no-files-found: warn
+      - name: Upload second hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-macos-process-two
+          path: target/hermeticity-stress/process-two
+          if-no-files-found: warn

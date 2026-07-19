@@ -367,8 +367,29 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Reject same-SHA reruns
         run: bash scripts/ci/reject_required_rerun.sh
+      - name: Check raw test sleep policy
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="${{ github.event.pull_request.base.ref }}"
+            if [[ -z "$base_ref" ]]; then
+              printf 'sleep-policy: pull request base ref unavailable; skipping\n'
+              exit 0
+            fi
+            git fetch origin "$base_ref"
+            revision_range="origin/$base_ref...HEAD"
+          else
+            before="${{ github.event.before }}"
+            if [[ -z "$before" || "$before" =~ ^0+$ ]] || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+              printf 'sleep-policy: push base unavailable; skipping\n'
+              exit 0
+            fi
+            revision_range="$before..HEAD"
+          fi
+          python3 scripts/ci/check_test_timing.py --range "$revision_range"
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
       - uses: taiki-e/install-action@v2

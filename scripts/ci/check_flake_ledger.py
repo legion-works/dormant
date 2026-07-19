@@ -104,7 +104,10 @@ def validate_ledger(path: pathlib.Path) -> list[str]:
             tests.add(test_name)
 
         if not isinstance(incident["signature"], str) or not SIGNATURE.fullmatch(incident["signature"]):
-            errors.append(f"{label}: signature must be sha256: followed by 64 hex characters")
+            errors.append(
+                f"{label}: signature must be sha256: followed by 64 hex characters "
+                "(prefix bare classifier output with sha256:)"
+            )
 
         for field in ("mechanism", "reproduction"):
             if not _is_nonempty_string(incident[field]):

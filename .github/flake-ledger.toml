@@ -1,4 +1,4 @@
-# Open-incident signatures are deterministic placeholders until a classifier records a real failure signature.
+# Open-incident signatures are deterministic placeholders until a classifier records a real failure signature; prefix bare classifier output with sha256:.
 schema_version = 1
 
 [[incident]]

@@ -10,7 +10,7 @@
 - [ ] No test was rerun to clear a flake; any flake follows `.github/flake-ledger.toml`
 - [ ] New public items have doc comments
 - [ ] Tests cover the changes
-- [ ] Flake-fix PRs include Ubuntu and macOS reload-stress evidence (100/100 per target)
+- [ ] Flake-fix PRs include Ubuntu and macOS soak evidence (10 runs per target)
 - [ ] No hard-coded magic numbers — constants from `defaults.rs` or config keys
 - [ ] Fail-safe presence policy preserved (unavailable = present)
 - [ ] No telemetry, no phone-home

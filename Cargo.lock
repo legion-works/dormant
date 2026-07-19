@@ -954,6 +954,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dormant-core",
+ "dormant-sensors",
  "fastrand",
  "futures-util",
  "gethostname",

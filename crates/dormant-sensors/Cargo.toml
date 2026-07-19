@@ -25,3 +25,9 @@ gethostname = "0.5"
 fastrand = "2"
 futures-util = "0.3"
 tokio-serial = { workspace = true }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+dormant-sensors = { path = ".", features = ["test-util"] }

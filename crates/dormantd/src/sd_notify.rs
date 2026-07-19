@@ -347,3 +347,18 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_tests {
+    use super::SdNotify;
+
+    #[test]
+    fn stub_ready_and_watchdog_are_inert() {
+        let mut sd = SdNotify::from_env();
+
+        sd.ready();
+        sd.watchdog();
+
+        assert_eq!(std::mem::size_of::<SdNotify>(), 0);
+    }
+}

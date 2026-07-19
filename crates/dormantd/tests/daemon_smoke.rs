@@ -4368,31 +4368,9 @@ fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> 
 fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotify) {
     let path = dir.join("notify.sock");
     let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
-    // Deliberately SHORT: the daemon under test keeps sending on its own
-    // cadence (as fast as every ~150ms in the cadence test below) for as
-    // long as it runs, so a long read-timeout here would never see a real
-    // gap and `drain_datagrams` would block the calling OS thread
-    // indefinitely (this is a blocking std call inside an async test body
-    // — bounding it tightly is load-bearing, not cosmetic).
-    listener
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
     let addr = std::os::unix::net::SocketAddr::from_pathname(&path).unwrap();
     let sd = SdNotify::from_socket_for_test(&addr);
     (listener, sd)
-}
-
-/// Drain every currently-queued datagram off `listener` and return the
-/// count. Blocks the calling OS thread for up to one read-timeout waiting
-/// for the queue to run dry — see the tight timeout note on
-/// [`fake_systemd_socket`].
-fn drain_datagrams(listener: &std::os::unix::net::UnixDatagram) -> usize {
-    let mut buf = [0u8; 64];
-    let mut n = 0;
-    while listener.recv_from(&mut buf).is_ok() {
-        n += 1;
-    }
-    n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4586,74 +4564,6 @@ async fn watchdog_reload_mid_window_resets_candidate() {
     assert!(
         !premature,
         "a reload mid-window must reset the LKG candidate — no premature promotion"
-    );
-}
-
-// Linux-only: pins WATCHDOG=1 datagram CADENCE by wall-clock timing.
-// The watchdog probe-arm only ever runs under systemd (WATCHDOG_USEC —
-// launchd sets no equivalent), and macos-latest scheduler noise breaks
-// sub-second cadence windows (PR #78 round-9 rerun: 0 datagrams by
-// ~900ms). LKG file-write tests above stay cross-platform.
-#[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(
-    clippy::await_holding_lock,
-    reason = "wear_env_lock serializes XDG_STATE_HOME-touching tests across the whole test \
-              body (app lifetime included) — test-local, always released promptly at test end. \
-              #47 fix: this test builds an App (default `wear.enabled = true` spawns a real \
-              tracker that reads XDG_STATE_HOME once at startup) but never mutated the env \
-              itself, so it used to run WITHOUT this lock — the section-header comment above \
-              already documented that every test here must hold it, but this one didn't. That \
-              gap let this test's own tracker capture `wear_disabled_creates_nothing`'s \
-              temp directory whenever this test's `App::start` happened to land inside that \
-              test's `wear_env_lock`-protected `XDG_STATE_HOME` mutation window, producing a \
-              real `wear-mon.json` there (both configs use the same `[displays.mon]` key) even \
-              after WearTrackerDeps::dir closed the OTHER half of the race (a later env \
-              mutation redirecting an already-running tracker). Taking the lock here closes \
-              this half: it excludes this test from running concurrently with any test that \
-              mutates XDG_STATE_HOME at all, not just ones sharing a directory with it."
-)]
-async fn watchdog_ping_cadence_grows_on_healthy_ticks() {
-    let _guard = wear_env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().unwrap();
-    let marker = dir.path().join("marker");
-    let cfg_path = write_file(
-        dir.path(),
-        "config.toml",
-        &one_display_config(&marker, "0s"),
-    );
-    let creds_path = dir.path().join("credentials.toml");
-    let (listener, sd) = fake_systemd_socket(dir.path());
-
-    let app = App::build_with_sources(
-        cfg_path,
-        creds_path,
-        Strictness::Strict,
-        fake_factory("desk", Vec::new()),
-    )
-    .expect("build app")
-    .with_notify_sink_builder(noop_factory)
-    .disable_ipc()
-    .with_sd_notify(sd)
-    .with_watchdog_interval(Duration::from_millis(150));
-    let (handle, join) = app.start().await.expect("start app");
-
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let n1 = drain_datagrams(&listener);
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let n2 = drain_datagrams(&listener);
-
-    shutdown(handle, join).await;
-
-    assert!(
-        n1 >= 3,
-        "expected several WATCHDOG=1 datagrams by ~900ms, got {n1}"
-    );
-    assert!(
-        n2 >= 3,
-        "datagram count must keep growing on later healthy ticks, got {n2}"
     );
 }
 

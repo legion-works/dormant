@@ -21,4 +21,5 @@ pub mod notifier;
 pub mod reload;
 pub mod sd_notify;
 pub mod single_instance;
+mod watchdog_schedule;
 pub mod wear_tracker;

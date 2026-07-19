@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-19
+
+### Added
+
+- `daemon.generation_barrier_ack_timeout` (default `2s`): bounds how long a config reload waits for the running engine to acknowledge the generation barrier before the daemon force-restarts itself, so a wedged engine can never hang a reload indefinitely (#104).
+
+### Fixed
+
+- Config-reload input handling is now exactly-once and correlated: control/watcher/web reload requests are routed through a single causal coordinator, front-door inputs are paused-and-queued across a generation swap and released after install (no more dropped-or-duplicated commands during a reload), and reload outcomes carry causal receipts so a caller can tell which reload its request completed. Resolves the long-standing reload-race behind the intermittent `config_watch` test failure (#92, #104).
+- MQTT sensor reconnects are more robust: each connection uses a unique client ID (no silent broker-side takeover when a stale session lingers) and subscription acknowledgements are validated, so a rejected subscription surfaces instead of silently dropping presence updates (#107).
+- The `real_ddcutil_reports_not_installed_in_this_sandbox` doctor test no longer false-fails local pre-push on developer machines that have `ddcutil` installed; it skips the not-installed assertion when `ddcutil` is on `PATH` while preserving the assertion in CI (#110).
+
+### Changed
+
+- CI/test infrastructure hardened (workflow-only, no runtime behavior change): nextest `ci`/`stress`/`soak` profiles with `flaky-result = fail` (a retry-pass now fails the run), a tracked flake-incident ledger with a proving-test anchor requirement, shared gate scripts so local Lefthook hooks and CI run identical commands (parity-enforced), per-job timeouts and pinned tool versions, changed-test cross-platform stress jobs, a nightly high-risk soak workflow, and rejection of same-SHA CI reruns so a red required check can't be re-run green (#104, #107, #109).
+
+### Docs
+
+- Reworked the LD2410C example config and sensor guide around a tested ESP32-C6 build, documenting the MQTT-vs-USB wiring choice and the fail-safe availability symmetry between them (#106).
+
 ## [0.4.0] - 2026-07-18
 
 ### Added
@@ -110,7 +130,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/legion-works/dormant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/legion-works/dormant/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/legion-works/dormant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/legion-works/dormant/compare/v0.2.0...v0.3.0

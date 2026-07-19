@@ -61,7 +61,7 @@ bash scripts/gates/gitleaks.sh staged
 
 `rust-tests.sh` uses the `ci` nextest profile and then runs `cargo test --doc`; nextest does not run doctests. Missing optional tools print their install command and fail rather than silently skipping a gate.
 
-Do not rerun a failed test until it turns green. Record flakes in `.github/flake-ledger.toml` with the required evidence, fix the cause, and use the ledger policy instead of rerun roulette.
+Do not rerun a failed test to clear it. Keep the first failing run URL, classify the failure, update `.github/flake-ledger.toml` when it is a flake, fix the root cause, then push a new commit. Same-SHA reruns are diagnostic only.
 
 The CI jobs in `.github/workflows/ci.yml` are:
 

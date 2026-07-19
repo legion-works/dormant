@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -32,6 +34,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -46,6 +50,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -62,6 +68,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Plain apt-get, NOT cache-apt-pkgs-action: the cache action failed two
@@ -92,6 +100,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Plain apt-get — see the test job's note on the cache action's two
@@ -122,6 +132,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
@@ -131,6 +143,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -158,6 +172,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
@@ -182,6 +198,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -201,6 +219,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
@@ -211,6 +231,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # The standalone `audit` job (rustsec/audit-check, ~180s) was dropped: it
@@ -223,6 +245,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
@@ -233,6 +257,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev mosquitto-clients
@@ -264,6 +290,8 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
@@ -274,6 +302,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: taiki-e/install-action@v2
         with:
           tool: mdbook@0.4.52
@@ -284,6 +314,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: taiki-e/install-action@v2
         with:
           tool: taplo-cli@0.10.0
@@ -296,6 +328,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - name: Install gitleaks
         run: |
           curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.2/gitleaks_8.24.2_linux_x64.tar.gz \
@@ -313,6 +347,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: crate-ci/typos@v1
 
   pr-title:
@@ -331,6 +367,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Reject same-SHA reruns
+        run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
       - uses: taiki-e/install-action@v2
@@ -338,5 +376,6 @@ jobs:
           tool: cargo-nextest@0.9.131
       - run: python3 scripts/ci/verify_nextest_policy.py --nextest-version 0.9.131
       - run: python3 scripts/ci/check_flake_ledger.py .github/flake-ledger.toml
+      - run: python3 scripts/ci/check_run_attempt_guards.py .github/workflows/ci.yml
       - run: python3 scripts/ci/check_gate_parity.py --ci .github/workflows/ci.yml --lefthook lefthook.yml --manifest scripts/gates/parity.txt
       - run: python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'

@@ -49,6 +49,22 @@ def metadata_fixture() -> str:
                         }
                     ],
                 },
+                {
+                    "name": "hybrid",
+                    "manifest_path": "/repo/crates/hybrid/Cargo.toml",
+                    "targets": [
+                        {
+                            "name": "hybrid",
+                            "kind": ["lib"],
+                            "src_path": "/repo/crates/hybrid/src/lib.rs",
+                        },
+                        {
+                            "name": "hybrid",
+                            "kind": ["bin"],
+                            "src_path": "/repo/crates/hybrid/src/main.rs",
+                        },
+                    ],
+                },
             ]
         }
     )
@@ -110,6 +126,50 @@ class SelectChangedTestsTests(unittest.TestCase):
         )
 
         self.assert_targets(change, [("example", "lib", "example")])
+
+    def test_ordinary_named_unit_test_body_uses_enclosing_source(self):
+        change = diff(
+            "crates/example/src/lib.rs",
+            "18,1",
+            "18,1",
+            "-    assert_eq!(old(), 1);\n+    assert_eq!(new(), 1);",
+            "fn resolve_socket_path_from_config()",
+        )
+        source = """#[cfg(test)]
+mod tests {
+    #[test]
+    fn resolve_socket_path_from_config() {
+        assert_eq!(new(), 1);
+    }
+}
+"""
+
+        selected = select_changed_tests.select_targets(
+            change,
+            self.metadata,
+            "linux",
+            {"crates/example/src/lib.rs": (source, source)},
+        )
+
+        self.assertEqual([(target.package, target.kind, target.name) for target in selected], [("example", "lib", "example")])
+
+    def test_bin_owned_nested_module_selects_binary_target(self):
+        change = diff(
+            "crates/hybrid/src/cmd_doctor.rs",
+            "18,1",
+            "18,1",
+            "-    assert_eq!(old(), 1);\n+    assert_eq!(new(), 1);",
+            "fn checks_status()",
+        )
+        sources = {
+            "crates/hybrid/src/main.rs": ("mod cmd_doctor;", "mod cmd_doctor;"),
+            "crates/hybrid/src/lib.rs": ("pub fn library() {}", "pub fn library() {}"),
+            "crates/hybrid/src/cmd_doctor.rs": ("#[cfg(test)] mod tests {}", "#[cfg(test)] mod tests {}"),
+        }
+
+        selected = select_changed_tests.select_targets(change, self.metadata, "linux", sources)
+
+        self.assertEqual([(target.package, target.kind, target.name) for target in selected], [("hybrid", "bin", "hybrid")])
 
     def test_cfg_test_range_maps_to_binary_target_when_no_library_exists(self):
         change = diff(
@@ -188,6 +248,25 @@ rename to crates/example/tests/renamed.rs
 
         self.assertEqual(select_changed_tests.select_targets(change, self.metadata, "linux"), [])
 
+    def test_linux_only_integration_target_is_skipped_on_macos(self):
+        change = diff(
+            "crates/example/tests/alpha.rs",
+            "8,1",
+            "8,1",
+            "-assert!(old());\n+assert!(new());",
+            "fn checks_value()",
+        )
+        source = "#![cfg(target_os = \"linux\")]\n#[test]\nfn checks_value() {}\n"
+
+        selected = select_changed_tests.select_targets(
+            change,
+            self.metadata,
+            "macos",
+            {"crates/example/tests/alpha.rs": (source, source)},
+        )
+
+        self.assertEqual(selected, [])
+
     def test_policy_fixture_is_explicitly_skipped(self):
         change = diff(
             ".github/fixtures/nextest-policy/flaky/src/lib.rs",
@@ -206,6 +285,15 @@ rename to crates/example/tests/renamed.rs
 
         with self.assertRaisesRegex(select_changed_tests.SelectionError, "examples/tests/forgotten.rs.*unmappable"):
             select_changed_tests.select_targets(change, self.metadata, "linux")
+
+    def test_junit_destination_includes_target_kind(self):
+        root = pathlib.Path("/repo")
+
+        library = select_changed_tests.junit_destination(root, select_changed_tests.Target("dormantctl", "lib", "dormantctl"))
+        binary = select_changed_tests.junit_destination(root, select_changed_tests.Target("dormantctl", "bin", "dormantctl"))
+
+        self.assertEqual(library, root / "target/nextest/changed/dormantctl-lib-dormantctl.xml")
+        self.assertEqual(binary, root / "target/nextest/changed/dormantctl-bin-dormantctl.xml")
 
 
 if __name__ == "__main__":

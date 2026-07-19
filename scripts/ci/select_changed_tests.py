@@ -10,7 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?P<context>.*)$")
@@ -20,6 +20,9 @@ SUPPORT_MODULE = re.compile(r"^crates/(?P<crate>[^/]+)/tests/support/.+\.rs$")
 TEST_RANGE = re.compile(
     r"#\s*\[\s*(?:[^\]]*::)?test|cfg\s*\(\s*test\s*\)|\bmod\s+tests?\b|\bfn\s+(?:test_[A-Za-z0-9_]*|[A-Za-z0-9_]*_test)\b"
 )
+MODULE = re.compile(r"(?m)^\s*(?:pub\s*(?:\([^)]*\))?\s+)?mod\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;")
+TOP_LEVEL_CFG = re.compile(r"(?m)^\s*#!\s*\[\s*cfg\s*\((?P<expression>.+)\)\s*\]")
+TARGET_OS = re.compile(r'target_os\s*=\s*"(?P<name>[A-Za-z0-9_]+)"')
 
 
 class SelectionError(RuntimeError):
@@ -136,17 +139,59 @@ def _package_for_path(path: str, metadata: Metadata) -> Package | None:
     return metadata.packages.get(f"crates/{match.group('crate')}")
 
 
-def _source_target(path: str, package: Package) -> Target:
+def _source_text(path: str, source_files: Mapping[str, tuple[str | None, str | None]] | None) -> str | None:
+    if source_files is None or path not in source_files:
+        return None
+    old, new = source_files[path]
+    return new if new is not None else old
+
+
+def _module_paths(parent: str, name: str) -> tuple[str, str]:
+    parent_path = pathlib.PurePosixPath(parent)
+    directory = parent_path.parent
+    if parent_path.name not in {"lib.rs", "main.rs", "mod.rs"}:
+        directory /= parent_path.stem
+    return ((directory / f"{name}.rs").as_posix(), (directory / name / "mod.rs").as_posix())
+
+
+def _is_reachable(root: str, target: str, source_files: Mapping[str, tuple[str | None, str | None]]) -> bool:
+    pending = [root]
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        if current == target:
+            return True
+        source = _source_text(current, source_files)
+        if source is None:
+            continue
+        for module in MODULE.finditer(source):
+            for child in _module_paths(current, module.group("name")):
+                if child == target:
+                    return True
+                if child in source_files:
+                    pending.append(child)
+    return False
+
+
+def _source_targets(
+    path: str,
+    package: Package,
+    source_files: Mapping[str, tuple[str | None, str | None]] | None,
+) -> list[Target]:
     if target := package.source_paths.get(path):
         if target.kind in {"lib", "bin"}:
-            return target
-    libraries = [target for target in package.targets if target.kind == "lib"]
-    if libraries:
-        return libraries[0]
-    binaries = [target for target in package.targets if target.kind == "bin"]
-    if len(binaries) == 1:
-        return binaries[0]
-    raise SelectionError(f"{path}: test range has no containing library or unambiguous binary target")
+            return [target]
+    candidates = [target for target in package.targets if target.kind in {"lib", "bin"}]
+    if not candidates:
+        raise SelectionError(f"{path}: test range has no containing library or binary target")
+    if source_files is None or len(candidates) == 1:
+        return candidates
+    roots = {target: root for root, target in package.source_paths.items() if target in candidates}
+    owners = [target for target, root in roots.items() if _is_reachable(root, path, source_files)]
+    return owners or candidates
 
 
 def _integration_target(path: str, metadata: Metadata) -> Target:
@@ -184,7 +229,43 @@ def _looks_like_test_path(path: str) -> bool:
     return path.endswith(".rs") and (path.startswith("tests/") or "/tests/" in path)
 
 
-def select_targets(diff: str, metadata: Metadata, platform: str) -> list[Target]:
+def _source_contains_test_code(change: FileChange, source_files: Mapping[str, tuple[str | None, str | None]] | None) -> bool:
+    if source_files is None:
+        return True
+    return any(
+        source is not None and TEST_RANGE.search(source) is not None
+        for path in change.paths()
+        for source in source_files.get(path, (None, None))
+    )
+
+
+def _platform_compatible(source: str | None, platform: str) -> bool:
+    if source is None:
+        return True
+    expressions = [match.group("expression") for match in TOP_LEVEL_CFG.finditer(source)]
+    operating_systems = {name for expression in expressions for name in TARGET_OS.findall(expression)}
+    if not operating_systems:
+        return True
+    if any("not(" in expression.replace(" ", "") for expression in expressions):
+        return platform not in operating_systems
+    return platform in operating_systems
+
+
+def _new_source_for(change: FileChange, path: str, source_files: Mapping[str, tuple[str | None, str | None]] | None) -> str | None:
+    if source_files is None:
+        return None
+    old, new = source_files.get(path, (None, None))
+    if path == change.new_path:
+        return new
+    return old
+
+
+def select_targets(
+    diff: str,
+    metadata: Metadata,
+    platform: str,
+    source_files: Mapping[str, tuple[str | None, str | None]] | None = None,
+) -> list[Target]:
     """Map changed test ranges and test files to conservative Cargo targets."""
     selected: set[Target] = set()
     for change in parse_diff(diff):
@@ -198,6 +279,9 @@ def select_targets(diff: str, metadata: Metadata, platform: str) -> list[Target]
             for path in (change.new_path, change.old_path):
                 if path not in integration_paths:
                     continue
+                if not _platform_compatible(_new_source_for(change, path, source_files), platform):
+                    mapped = True
+                    break
                 try:
                     selected.add(_integration_target(path, metadata))
                     mapped = True
@@ -222,8 +306,10 @@ def select_targets(diff: str, metadata: Metadata, platform: str) -> list[Target]
                 continue
 
             package = _package_for_path(path, metadata)
-            if package is not None and "/src/" in f"/{path}" and change.is_test_range():
-                selected.add(_source_target(path, package))
+            if package is not None and "/src/" in f"/{path}" and (
+                change.is_test_range() or _source_contains_test_code(change, source_files)
+            ):
+                selected.update(_source_targets(path, package, source_files))
                 continue
             if path.endswith(".rs") and (change.is_test_range() or _looks_like_test_path(path)):
                 raise SelectionError(f"{path}: unmappable Rust test path or test attribute")
@@ -261,15 +347,44 @@ def nextest_commands(target: Target, stress_count: int) -> tuple[list[str], list
     return list_command, run_command
 
 
+def junit_destination(root: pathlib.Path, target: Target) -> pathlib.Path:
+    """Return a per-kind JUnit destination that cannot collide within a package."""
+    return root / "target/nextest/changed" / f"{target.package}-{target.kind}-{target.name}.xml"
+
+
 def _copy_junit(root: pathlib.Path, target: Target) -> pathlib.Path | None:
     source = root / "target/nextest/ci/junit.xml"
-    destination = root / "target/nextest/changed" / f"{target.package}-{target.name}.xml"
+    destination = junit_destination(root, target)
     if not source.is_file():
         print(f"{target.package}/{target.name}: nextest did not produce {source}", file=sys.stderr)
         return None
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     return destination
+
+
+def load_source_files(
+    root: pathlib.Path,
+    base: str,
+    head: str,
+    diff: str,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Load both revisions of changed Rust files for conservative test ownership."""
+    sources: dict[str, tuple[str | None, str | None]] = {}
+
+    def show(revision: str, path: str) -> str | None:
+        completed = subprocess.run(
+            ["git", "show", f"{revision}:{path}"], cwd=root, text=True, capture_output=True
+        )
+        return completed.stdout if completed.returncode == 0 else None
+
+    for change in parse_diff(diff):
+        if change.old_path and change.old_path.endswith(".rs"):
+            sources[change.old_path] = (show(base, change.old_path), None)
+        if change.new_path and change.new_path.endswith(".rs"):
+            old = sources.get(change.new_path, (None, None))[0]
+            sources[change.new_path] = (old, show(head, change.new_path))
+    return sources
 
 
 def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) -> int:
@@ -330,7 +445,12 @@ def main() -> int:
             capture_output=True,
             check=True,
         ).stdout
-        targets = select_targets(diff, parse_metadata(metadata, root), args.platform)
+        targets = select_targets(
+            diff,
+            parse_metadata(metadata, root),
+            args.platform,
+            load_source_files(root, args.base, args.head, diff),
+        )
     except (SelectionError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
         print(f"changed-test selection failed: {error}", file=sys.stderr)
         return 2

@@ -85,6 +85,15 @@ impl AudioPolicy {
     /// Fold one probe outcome into the policy using the caller's clock.
     #[must_use]
     pub(crate) fn step(&mut self, now: Instant, outcome: ProbeOutcome) -> Vec<AudioTransition> {
+        if self.breaker_open
+            && !matches!(outcome, ProbeOutcome::ReapCapReached)
+            && self
+                .cooldown_remaining(now)
+                .is_some_and(|remaining| !remaining.is_zero())
+        {
+            return vec![AudioTransition::NoChange];
+        }
+
         let mut transitions = Vec::with_capacity(3);
         if self.breaker_open && !matches!(outcome, ProbeOutcome::ReapCapReached) {
             self.breaker_open = false;
@@ -477,5 +486,46 @@ mod tests {
                 assert_eq!(policy.cooldown_remaining(now), step.cooldown, "{name}");
             }
         }
+    }
+
+    #[test]
+    fn breaker_cooldown_holds_probes_until_expiry_then_preserves_startup_grace() {
+        let base = Instant::now();
+        let mut policy = AudioPolicy::new(MIN_ACTIVE, BREAKER_COOLDOWN);
+
+        assert_eq!(
+            policy.step(base, ProbeOutcome::ReapCapReached),
+            [
+                AudioTransition::Deassert(InhibitorKind::AudioPlayback),
+                AudioTransition::Deassert(InhibitorKind::Call),
+                AudioTransition::OpenBreaker,
+            ],
+        );
+
+        let during_cooldown = base + BREAKER_COOLDOWN / 2;
+        assert_eq!(
+            policy.step(during_cooldown, ProbeOutcome::classified(true, false),),
+            [AudioTransition::NoChange],
+            "the caller must not resume inhibition while the breaker cooldown is active"
+        );
+        assert!(policy.breaker_is_open());
+        assert_eq!(
+            policy.cooldown_remaining(during_cooldown),
+            Some(BREAKER_COOLDOWN / 2)
+        );
+
+        assert_eq!(
+            policy.step(
+                base + BREAKER_COOLDOWN,
+                ProbeOutcome::classified(true, false),
+            ),
+            [
+                AudioTransition::CloseBreaker,
+                AudioTransition::Assert(InhibitorKind::AudioPlayback),
+                AudioTransition::Deassert(InhibitorKind::Call),
+            ],
+            "the first eligible success must retain its startup-grace assertion"
+        );
+        assert!(!policy.breaker_is_open());
     }
 }

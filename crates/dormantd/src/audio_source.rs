@@ -11,7 +11,7 @@
 //!   `PipeWire` connection.
 //! * The **async** half (`run_loop`): the poll loop, subprocess
 //!   spawn/capture, bounded reap list, and transition publication. Timing,
-//!   debounce, failure, and breaker decisions live in [`crate::audio_policy`].
+//!   debounce, failure, and breaker decisions live in `crate::audio_policy`.
 //!
 //! ## Classification rules (spec §4.2)
 //!
@@ -456,6 +456,17 @@ async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
 /// probe-free public surface that constructs the production probe.
 #[cfg(target_os = "linux")]
 pub(crate) async fn run_loop(deps: AudioDeps, mut probe: ReapProbe, cancel: CancellationToken) {
+    let mut reap_cap = |count| count >= REAP_CAP;
+    run_loop_with_reap_cap(deps, &mut probe, cancel, &mut reap_cap).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn run_loop_with_reap_cap(
+    deps: AudioDeps,
+    probe: &mut ReapProbe,
+    cancel: CancellationToken,
+    reap_cap: &mut (dyn FnMut(usize) -> bool + Send),
+) {
     let AudioDeps { ctl, cfg, rules } = deps;
     let mut reap_list: Vec<tokio::process::Child> = Vec::new();
     let mut last_sent: HashMap<(RuleId, InhibitorKind), bool> = HashMap::new();
@@ -470,7 +481,7 @@ pub(crate) async fn run_loop(deps: AudioDeps, mut probe: ReapProbe, cancel: Canc
         // their own (never zombies — spec §6#5).
         reap_list.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
 
-        if reap_list.len() >= REAP_CAP {
+        if reap_cap(reap_list.len()) {
             let now = Instant::now();
             let transitions = policy.step(now, ProbeOutcome::ReapCapReached);
             if transitions.contains(&AudioTransition::OpenBreaker) {
@@ -492,7 +503,7 @@ pub(crate) async fn run_loop(deps: AudioDeps, mut probe: ReapProbe, cancel: Canc
         match run_tick(
             &cfg.pw_dump_command,
             cfg.poll_interval,
-            &mut probe,
+            probe,
             &mut reap_list,
         )
         .await
@@ -780,12 +791,15 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod poller_tests {
     use super::{
-        AudioDeps, AudioRule, FailureKind, TickOutcome, production_reap_probe, run_loop, run_tick,
+        AudioDeps, AudioRule, FailureKind, TickOutcome, production_reap_probe, run_loop,
+        run_loop_with_reap_cap, run_tick,
     };
     use dormant_core::config::schema::AudioConfig;
-    use dormant_core::rules::InhibitorKind;
+    use dormant_core::rules::{ControlMsg, InhibitorKind};
     use dormant_core::types::RuleId;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -896,6 +910,72 @@ mod poller_tests {
             rules: vec![rule("r1", &[InhibitorKind::AudioPlayback])],
         };
         let handle = tokio::spawn(run_loop(deps, production_reap_probe(), cancel.clone()));
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("cancellation must stop the poller")
+            .expect("poller task must not panic");
+    }
+
+    #[tokio::test]
+    async fn reap_cap_cooldown_blocks_spawn_then_resumes_with_startup_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawned = dir.path().join("spawned");
+        let script = write_script(
+            dir.path(),
+            "pw-dump",
+            &format!(
+                "#!/bin/sh\nprintf S >> '{}'\n{}",
+                spawned.display(),
+                cat_script(MOVIE)
+            ),
+        );
+        let (ctl, mut ctl_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let deps = AudioDeps {
+            ctl,
+            cfg: cfg(&script, Duration::from_secs(1), Duration::from_secs(10)),
+            rules: vec![rule("r1", &[InhibitorKind::AudioPlayback])],
+        };
+        let cap_checks = Arc::new(AtomicUsize::new(0));
+        let cap_checks_for_loop = Arc::clone(&cap_checks);
+        let cancel_for_loop = cancel.clone();
+        let mut probe = production_reap_probe();
+        let handle = tokio::spawn(async move {
+            let mut reap_cap_once =
+                move |_| cap_checks_for_loop.fetch_add(1, Ordering::SeqCst) == 0;
+            run_loop_with_reap_cap(deps, &mut probe, cancel_for_loop, &mut reap_cap_once).await;
+        });
+
+        let assertion = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    ctl_rx.recv().await,
+                    Some(ControlMsg::SetInhibited {
+                        kind: InhibitorKind::AudioPlayback,
+                        inhibited: true,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            assertion.is_ok(),
+            "startup grace must assert after cooldown"
+        );
+        assert_eq!(
+            cap_checks.load(Ordering::SeqCst),
+            2,
+            "the first reap-cap check must suppress spawning until its cooldown completes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&spawned).expect("resumed probe marker"),
+            "S"
+        );
 
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle)

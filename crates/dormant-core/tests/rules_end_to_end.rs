@@ -208,6 +208,10 @@ async fn request_snapshot(ctl: &mpsc::Sender<ControlMsg>) -> StateSnapshot {
         .expect("snapshot reply (sender must not be dropped)")
 }
 
+async fn settle() {
+    tokio::time::advance(Duration::ZERO).await;
+}
+
 // ── 1: clear-grace-blank-then-instant-wake ─────────────────────────────────────
 
 #[tokio::test(start_paused = true)]
@@ -250,40 +254,39 @@ async fn clear_grace_blank_then_instant_wake() {
 
     let harness = spawn_engine(cfg, zones, execs, script);
 
-    // Wait long enough for the entire script to play out (virtual time).
-    tokio::time::sleep(Duration::from_secs(120)).await;
-
-    // Give the engine a moment to flush the final wake + result.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let log = sink.log();
-    // Find the first Blank and the first Wake.
-    let blank_at = log
-        .iter()
-        .find_map(|(t, c)| matches!(c, SinkCmd::Blank(_)).then_some(*t));
-    let wake_at = log
-        .iter()
-        .find_map(|(t, c)| matches!(c, SinkCmd::Wake).then_some(*t));
-
-    let blank_at = blank_at.expect("expected at least one Blank");
-    let wake_at = wake_at.expect("expected at least one Wake");
-
-    // Absent@10s + grace 60s → blank at ~70s (±1s virtual).
+    settle().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    settle().await;
     assert!(
-        blank_at.abs_diff(Duration::from_secs(70)) <= Duration::from_secs(1),
-        "blank at {blank_at:?}, expected ~70s"
+        sink.log()
+            .iter()
+            .all(|(_, command)| !matches!(command, SinkCmd::Blank(_)))
     );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
     assert!(
-        matches!(
-            log.iter().find(|(t, _c)| *t == blank_at).unwrap().1,
-            SinkCmd::Blank(BlankMode::PowerOff)
-        ),
-        "blank should be PowerOff"
+        sink.log()
+            .iter()
+            .any(|(_, command)| matches!(command, SinkCmd::Blank(BlankMode::PowerOff)))
     );
-    // Present@100s → wake at ~100s.
+
+    tokio::time::advance(Duration::from_secs(29)).await;
+    settle().await;
     assert!(
-        wake_at.abs_diff(Duration::from_secs(100)) <= Duration::from_secs(1),
-        "wake at {wake_at:?}, expected ~100s"
+        sink.log()
+            .iter()
+            .all(|(_, command)| !matches!(command, SinkCmd::Wake))
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    assert!(
+        sink.log()
+            .iter()
+            .any(|(_, command)| matches!(command, SinkCmd::Wake))
     );
 
     harness.cancel.cancel();
@@ -784,26 +787,36 @@ async fn motion_sensor_hold_time_stretches_pulse() {
         .expect("ctl open");
     let mut events_rx = sub_rx.await.expect("subscribe reply");
 
-    // Wait until just before 30s — no ZoneChanged{present:false} yet.
-    tokio::time::sleep(Duration::from_secs(29)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(28)).await;
+    settle().await;
     while let Ok(ev) = events_rx.try_recv() {
         if let DaemonEvent::ZoneChanged { present: false, .. } = ev {
             panic!("motion hold must NOT release the zone before 30s");
         }
     }
 
-    // Wait past 30s + grace (60s) → blank fires.
-    tokio::time::sleep(Duration::from_secs(70)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let log = sink.log();
-    let blank_at = log
-        .iter()
-        .find_map(|(t, c)| matches!(c, SinkCmd::Blank(_)).then_some(*t));
-    let blank_at = blank_at.expect("expected blank after motion hold + grace");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
     assert!(
-        blank_at.abs_diff(Duration::from_secs(90)) <= Duration::from_secs(2),
-        "blank at {blank_at:?}, expected ~90s"
+        events_rx.try_recv().is_ok(),
+        "motion hold should release at its deadline"
+    );
+    tokio::time::advance(Duration::from_secs(59)).await;
+    settle().await;
+    assert!(
+        sink.log()
+            .iter()
+            .all(|(_, command)| !matches!(command, SinkCmd::Blank(_)))
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    assert!(
+        sink.log()
+            .iter()
+            .any(|(_, command)| matches!(command, SinkCmd::Blank(_)))
     );
 
     harness.cancel.cancel();
@@ -864,18 +877,36 @@ async fn wake_failure_retries_until_success() {
         .expect("ctl open");
     let mut events_rx = sub_rx.await.expect("subscribe reply");
 
-    tokio::time::sleep(Duration::from_secs(130)).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    settle().await;
+    assert_eq!(
+        sink.log()
+            .iter()
+            .filter(|(_, command)| matches!(command, SinkCmd::Wake))
+            .count(),
+        0,
+        "no wake before the present edge"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
+    assert_eq!(
+        sink.log()
+            .iter()
+            .filter(|(_, command)| matches!(command, SinkCmd::Wake))
+            .count(),
+        3,
+        "wake failures immediately retry until the scripted success"
+    );
 
     let wake_count = sink
         .log()
         .iter()
         .filter(|(_, c)| matches!(c, SinkCmd::Wake))
         .count();
-    assert!(
-        wake_count >= 3,
-        "expected ≥3 Wake calls (initial + 2 retries), got {wake_count}"
-    );
+    assert_eq!(wake_count, 3, "initial wake plus two immediate retries");
 
     let mut retry_broadcasts = 0;
     while let Ok(ev) = events_rx.try_recv() {
@@ -883,9 +914,9 @@ async fn wake_failure_retries_until_success() {
             retry_broadcasts += 1;
         }
     }
-    assert!(
-        retry_broadcasts >= 1,
-        "expected ≥1 WakeRetry broadcast, got {retry_broadcasts}"
+    assert_eq!(
+        retry_broadcasts, 2,
+        "each failed wake emits one retry event"
     );
 
     let snap = request_snapshot(&harness.ctl_tx).await;
@@ -1425,9 +1456,11 @@ async fn set_inhibited_freezes_grace_until_released() {
 
     let harness = spawn_engine(cfg, zones, execs, script);
 
-    // Let the Absent land and grace start, then engage the inhibitor before
-    // grace would expire.
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(20)).await;
+    settle().await;
     harness
         .ctl_tx
         .send(ControlMsg::SetInhibited {
@@ -1437,9 +1470,10 @@ async fn set_inhibited_freezes_grace_until_released() {
         })
         .await
         .expect("ctl open");
+    settle().await;
 
-    // Well past the original grace deadline — frozen grace must not blank.
-    tokio::time::sleep(Duration::from_secs(90)).await;
+    tokio::time::advance(Duration::from_secs(120)).await;
+    settle().await;
     assert!(
         !sink
             .log()
@@ -1458,8 +1492,16 @@ async fn set_inhibited_freezes_grace_until_released() {
         })
         .await
         .expect("ctl open");
-    tokio::time::sleep(Duration::from_secs(90)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(39)).await;
+    settle().await;
+    assert!(
+        sink.log()
+            .iter()
+            .all(|(_, command)| !matches!(command, SinkCmd::Blank(_)))
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
     assert!(
         sink.log()
             .iter()
@@ -2538,12 +2580,17 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
 
     let harness = spawn_engine_with_render(cfg, zones, execs, renders, script);
 
-    // Advance past the grace period (absent@10 + 60s grace = 70s) — the
-    // render sink should be called with Show(RenderBlack).
-    tokio::time::sleep(Duration::from_secs(72)).await;
-    // Give the spawned render task a moment to complete and the engine to
-    // process the RenderResult.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    settle().await;
+    assert!(
+        render_sink.log().is_empty(),
+        "render must not start before grace expires"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
 
     let render_log = render_sink.log();
     let show_call = render_log.iter().find(|(_, c)| {
@@ -2560,10 +2607,8 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
         "expected RenderSink::show(RenderBlack), got {render_log:?}"
     );
 
-    // Before the dwell expires (70s + 30s = 100s), no controller blank
-    // must have fired — the machine should be in the Staged phase.
-    tokio::time::sleep(Duration::from_secs(25)).await; // now at ~97s
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    settle().await;
     let cmd_log_before = cmd_sink.log();
     let blanks_before = cmd_log_before
         .iter()
@@ -2574,9 +2619,8 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
         "no controller blank must fire before dwell elapses (log={cmd_log_before:?})"
     );
 
-    // Advance past the dwell deadline (100s).
-    tokio::time::sleep(Duration::from_secs(10)).await; // now at ~107s
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle().await;
 
     let cmd_log = cmd_sink.log();
     let blank = cmd_log
@@ -2585,12 +2629,6 @@ async fn render_ladder_dwell_advances_to_controller_blank() {
     assert!(
         blank.is_some(),
         "expected Blank(PowerOff) escalation after dwell, got {cmd_log:?}"
-    );
-    let (blank_at, _) = blank.unwrap();
-    // Should fire at ~100s (70s entry + 30s dwell).
-    assert!(
-        blank_at.abs_diff(Duration::from_secs(100)) <= Duration::from_secs(5),
-        "blank at {blank_at:?}, expected ~100s (entry@70 + dwell 30s)"
     );
 
     // The render surface that was up during the render stage must be torn

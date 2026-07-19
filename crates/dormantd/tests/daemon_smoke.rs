@@ -194,28 +194,6 @@ async fn wait_for_phase(
     }
 }
 
-/// Poll snapshots until a display's effective inhibition bit reaches `want`.
-async fn wait_for_display_inhibited(
-    ctl: &mpsc::Sender<ControlMsg>,
-    display: &str,
-    want: bool,
-    timeout: Duration,
-) -> bool {
-    let start = Instant::now();
-    loop {
-        let snap = snapshot_with_retry(ctl).await;
-        if let Some((_, display)) = snap.displays.iter().find(|(id, _)| id == display)
-            && display.inhibited == want
-        {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, contents).expect("write file");
@@ -3016,7 +2994,6 @@ async fn wear_disabled_creates_nothing() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let wear_dir = dir.path().join("state").join("wear");
     let entries: Vec<PathBuf> = fs::read_dir(&wear_dir)
         .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
@@ -5372,13 +5349,11 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
     )
     .await;
     assert!(
-        wait_for_display_inhibited(
-            &handle.control_sender(),
-            "mon",
-            true,
-            Duration::from_secs(3),
-        )
-        .await,
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, display)| id == "mon" && display.inhibited),
         "movie fixture must inhibit the display while grace is active"
     );
 
@@ -5468,13 +5443,11 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     )
     .await;
     assert!(
-        wait_for_display_inhibited(
-            &handle.control_sender(),
-            "mon",
-            true,
-            Duration::from_secs(3),
-        )
-        .await,
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, display)| id == "mon" && display.inhibited),
         "generation zero must be inhibited before its reload"
     );
 
@@ -5527,13 +5500,11 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     )
     .await;
     assert!(
-        wait_for_display_inhibited(
-            &handle.control_sender(),
-            "mon",
-            true,
-            Duration::from_secs(3),
-        )
-        .await,
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, display)| id == "mon" && display.inhibited),
         "fresh startup grace must inhibit the new generation before grace expires"
     );
     assert_eq!(count(&marker, 'B'), 0, "an inhibited grace must not blank");

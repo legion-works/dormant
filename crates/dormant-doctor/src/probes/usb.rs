@@ -19,6 +19,15 @@ use dormant_sensors::usb_ld2410::FrameParser;
 /// Probe a USB LD2410 sensor on the given serial port.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn probe_usb(port: &str, baud: u32) -> ProbeResult {
+    probe_usb_with_observer(port, baud, None).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn probe_usb_with_observer(
+    port: &str,
+    baud: u32,
+    opened_observer: Option<tokio::sync::oneshot::Sender<()>>,
+) -> ProbeResult {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
@@ -33,6 +42,9 @@ pub async fn probe_usb(port: &str, baud: u32) -> ProbeResult {
             return ProbeResult::fail(format!("usb {port}"), format!("failed to open port: {e}"));
         }
     };
+    if let Some(observer) = opened_observer {
+        let _ = observer.send(());
+    }
 
     let mut parser = FrameParser::new();
     let mut buf = [0u8; 256];
@@ -104,6 +116,8 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::types::ProbeStatus;
+    #[cfg(target_os = "linux")]
+    use tokio::sync::oneshot;
 
     #[test]
     fn usb_frame_parser_decodes_present() {
@@ -271,22 +285,20 @@ mod tests {
             .try_clone_master()
             .expect("dup master for writer thread");
         let frame = ld2410_present_frame();
-        let write_thread = std::thread::spawn(move || {
-            use std::io::Write;
-            // Give `probe_usb` time to open the slave and start reading
-            // before the frame lands — mirrors a real sensor streaming
-            // asynchronously rather than data being present at open time.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            writer.write_all(&frame).expect("write frame to pty master");
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let probe_path = slave_path.clone();
+        let probe = tokio::spawn(async move {
+            probe_usb_with_observer(&probe_path, 256_000, Some(opened_tx)).await
         });
+        opened_rx.await.expect("serial stream opened");
+        std::io::Write::write_all(&mut writer, &frame).expect("write frame to pty master");
 
         // `pty` (holding the ORIGINAL master fd) stays alive in this scope
         // for the whole `probe_usb` call below — see `try_clone_master`'s
         // docs for why an early close would flip a decoded Pass into a
         // spurious EOF Fail.
-        let result = probe_usb(&slave_path, 256_000).await;
+        let result = probe.await.expect("probe task panicked");
 
-        write_thread.join().expect("writer thread panicked");
         drop(pty);
 
         assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
@@ -295,5 +307,14 @@ mod tests {
             "detail should report last state: present; got: {}",
             result.detail
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn nonexistent_port_returns_structured_failure() {
+        let result = probe_usb("/dev/dormant-does-not-exist", 256_000).await;
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Fail, "{result:?}");
+        assert!(result.detail.contains("failed to open port"), "{result:?}");
     }
 }

@@ -1,0 +1,329 @@
+name: Nightly Soak
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, labeled, synchronize]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  soak-linux-daemon:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - name: Run Linux daemon soak filters
+        env:
+          PKG_CONFIG_PATH: /usr/lib/pkgconfig
+        run: |
+          set -uo pipefail
+          artifact_dir=target/soak-linux-daemon
+          command_output="$artifact_dir/command-output.txt"
+          mkdir -p "$artifact_dir"
+          : > "$command_output"
+          status=0
+          check_filter() {
+            label="$1"
+            filter="$2"
+            selected="$(cargo nextest list --workspace --all-features -E "$filter")"
+            printf '\n== %s ==\n%s\n' "$label" "$selected" | tee -a "$command_output"
+            if [[ -z "${selected//[[:space:]]/}" ]]; then
+              printf 'soak filter selected no tests: %s\n' "$filter" >&2
+              return 1
+            fi
+          }
+          check_filter reload 'test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload)' || status=1
+          check_filter hermeticity 'test(concurrent_apps_keep_wear_paths_and_observations_isolated)' || status=1
+          check_filter audio-child-contracts 'test(successful_probe_exits_before_its_outcome_is_returned) or test(timed_out_probe_is_killed_and_reaped)' || status=1
+          check_filter wear-corruption-and-persistence 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger)' || status=1
+          check_filter watcher-delivery 'test(temp_path_socket_receives_ready_then_watchdog)' || status=1
+          check_filter command-child-process 'test(command::tests::sleep_past_timeout_errs)' || status=1
+          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(successful_probe_exits_before_its_outcome_is_returned) or test(timed_out_probe_is_killed_and_reaped) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(temp_path_socket_receives_ready_then_watchdog) or test(command::tests::sleep_past_timeout_errs)'
+          set +e
+          cargo nextest run --profile soak --workspace --all-features --stress-count 10 --retries 0 -E "$soak_filter" 2>&1 | tee -a "$command_output"
+          run_status=${PIPESTATUS[0]}
+          set -e
+          ((status == 0 && run_status == 0)) || status=1
+          exit "$status"
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/soak/junit.xml | tee target/soak-linux-daemon/classifications.jsonl
+      - name: Update flake issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image ubuntu-24.04 --commit-sha "${{ github.sha }}" < target/soak-linux-daemon/classifications.jsonl
+      - name: Upload soak JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-linux-daemon-junit
+          path: target/nextest/soak/junit.xml
+          if-no-files-found: warn
+      - name: Upload soak command output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-linux-daemon-output
+          path: target/soak-linux-daemon
+          if-no-files-found: warn
+
+  soak-linux-mqtt:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev pkg-config mosquitto-clients
+      - name: Start Mosquitto broker
+        run: |
+          docker run -d --name mosquitto -p 127.0.0.1::1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+          port="$(docker port mosquitto 1883/tcp | awk -F: '{print $NF}')"
+          printf 'DORMANT_TEST_MQTT_PORT=%s\n' "$port" >> "$GITHUB_ENV"
+          bash scripts/ci/wait-for-mqtt.sh 127.0.0.1 "$port" 10
+      - name: Run MQTT retained-delivery soak filter
+        env:
+          DORMANT_TEST_MQTT: '1'
+          PKG_CONFIG_PATH: /usr/lib/pkgconfig
+        run: |
+          set -uo pipefail
+          artifact_dir=target/soak-linux-mqtt
+          command_output="$artifact_dir/command-output.txt"
+          filter='test(mqtt_retained_state_delivered_on_subscribe) or test(mqtt_retained_availability_offline_on_subscribe)'
+          mkdir -p "$artifact_dir"
+          selected="$(cargo nextest list -p dormant-sensors --test mqtt_integration --run-ignored only -E "$filter")"
+          printf '%s\n' "$selected" | tee "$command_output"
+          if [[ -z "${selected//[[:space:]]/}" ]]; then
+            printf 'soak filter selected no tests: %s\n' "$filter" >&2
+            exit 1
+          fi
+          set +e
+          cargo nextest run --profile soak -p dormant-sensors --test mqtt_integration --run-ignored only --stress-count 10 --retries 0 -E "$filter" 2>&1 | tee -a "$command_output"
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/soak/junit.xml | tee target/soak-linux-mqtt/classifications.jsonl
+      - name: Update flake issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image ubuntu-24.04 --commit-sha "${{ github.sha }}" < target/soak-linux-mqtt/classifications.jsonl
+      - name: Upload soak JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-linux-mqtt-junit
+          path: target/nextest/soak/junit.xml
+          if-no-files-found: warn
+      - name: Upload soak command output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-linux-mqtt-output
+          path: target/soak-linux-mqtt
+          if-no-files-found: warn
+
+  soak-macos-fixed:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - name: Run fixed macOS soak filters
+        run: |
+          set -uo pipefail
+          artifact_dir=target/soak-macos-fixed
+          command_output="$artifact_dir/command-output.txt"
+          mkdir -p "$artifact_dir"
+          : > "$command_output"
+          status=0
+          check_filter() {
+            label="$1"
+            filter="$2"
+            selected="$(cargo nextest list --workspace --all-features -E "$filter")"
+            printf '\n== %s ==\n%s\n' "$label" "$selected" | tee -a "$command_output"
+            if [[ -z "${selected//[[:space:]]/}" ]]; then
+              printf 'soak filter selected no tests: %s\n' "$filter" >&2
+              return 1
+            fi
+          }
+          check_filter reload 'test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload)' || status=1
+          check_filter hermeticity 'test(concurrent_apps_keep_wear_paths_and_observations_isolated)' || status=1
+          check_filter wear-corruption-and-persistence 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger)' || status=1
+          check_filter watcher-delivery 'test(temp_path_socket_receives_ready_then_watchdog)' || status=1
+          check_filter command-child-process 'test(command::tests::sleep_past_timeout_errs)' || status=1
+          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(temp_path_socket_receives_ready_then_watchdog) or test(command::tests::sleep_past_timeout_errs)'
+          set +e
+          cargo nextest run --profile soak --workspace --all-features --stress-count 10 --retries 0 -E "$soak_filter" 2>&1 | tee -a "$command_output"
+          run_status=${PIPESTATUS[0]}
+          set -e
+          ((status == 0 && run_status == 0)) || status=1
+          exit "$status"
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/soak/junit.xml | tee target/soak-macos-fixed/classifications.jsonl
+      - name: Update flake issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image macos-14 --commit-sha "${{ github.sha }}" < target/soak-macos-fixed/classifications.jsonl
+      - name: Upload soak JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-macos-fixed-junit
+          path: target/nextest/soak/junit.xml
+          if-no-files-found: warn
+      - name: Upload soak command output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-macos-fixed-output
+          path: target/soak-macos-fixed
+          if-no-files-found: warn
+
+  soak-macos-latest:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    # This is a compatibility canary. Branch protection remains pinned to soak-macos-fixed.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - name: Run latest macOS soak filters
+        run: |
+          set -uo pipefail
+          artifact_dir=target/soak-macos-latest
+          command_output="$artifact_dir/command-output.txt"
+          mkdir -p "$artifact_dir"
+          : > "$command_output"
+          status=0
+          check_filter() {
+            label="$1"
+            filter="$2"
+            selected="$(cargo nextest list --workspace --all-features -E "$filter")"
+            printf '\n== %s ==\n%s\n' "$label" "$selected" | tee -a "$command_output"
+            if [[ -z "${selected//[[:space:]]/}" ]]; then
+              printf 'soak filter selected no tests: %s\n' "$filter" >&2
+              return 1
+            fi
+          }
+          check_filter reload 'test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload)' || status=1
+          check_filter hermeticity 'test(concurrent_apps_keep_wear_paths_and_observations_isolated)' || status=1
+          check_filter wear-corruption-and-persistence 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger)' || status=1
+          check_filter watcher-delivery 'test(temp_path_socket_receives_ready_then_watchdog)' || status=1
+          check_filter command-child-process 'test(command::tests::sleep_past_timeout_errs)' || status=1
+          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(temp_path_socket_receives_ready_then_watchdog) or test(command::tests::sleep_past_timeout_errs)'
+          set +e
+          cargo nextest run --profile soak --workspace --all-features --stress-count 10 --retries 0 -E "$soak_filter" 2>&1 | tee -a "$command_output"
+          run_status=${PIPESTATUS[0]}
+          set -e
+          ((status == 0 && run_status == 0)) || status=1
+          exit "$status"
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/soak/junit.xml | tee target/soak-macos-latest/classifications.jsonl
+      - name: Update flake issues
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image macos-latest --commit-sha "${{ github.sha }}" < target/soak-macos-latest/classifications.jsonl
+      - name: Upload soak JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-macos-latest-junit
+          path: target/nextest/soak/junit.xml
+          if-no-files-found: warn
+      - name: Upload soak command output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-macos-latest-output
+          path: target/soak-macos-latest
+          if-no-files-found: warn
+
+  soak-hermeticity-ubuntu:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - name: Stress concurrent test binaries
+        run: bash scripts/ci/run-hermeticity-stress.sh --platform Linux --stress-count 100
+      - name: Upload first hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-ubuntu-process-one
+          path: target/hermeticity-stress/process-one
+          if-no-files-found: warn
+      - name: Upload second hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-ubuntu-process-two
+          path: target/hermeticity-stress/process-two
+          if-no-files-found: warn
+
+  soak-hermeticity-macos:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - name: Stress concurrent test binaries
+        run: bash scripts/ci/run-hermeticity-stress.sh --platform Darwin --stress-count 100
+      - name: Upload first hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-macos-process-one
+          path: target/hermeticity-stress/process-one
+          if-no-files-found: warn
+      - name: Upload second hermeticity process artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermeticity-stress-macos-process-two
+          path: target/hermeticity-stress/process-two
+          if-no-files-found: warn

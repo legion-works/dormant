@@ -6,18 +6,37 @@ pre-commit:
   parallel: true
   jobs:
     - name: fmt
-      run: cargo fmt --all -- --check
+      run: bash scripts/gates/fmt.sh
     - name: typos
-      run: PATH="$HOME/.cargo/bin:$PATH" typos
+      run: bash scripts/gates/typos.sh
     - name: taplo
-      run: PATH="$HOME/.cargo/bin:$PATH" taplo fmt --check
+      run: bash scripts/gates/taplo.sh
     - name: gitleaks
-      run: PATH="$HOME/go/bin:$HOME/.cargo/bin:$PATH" gitleaks git --staged --no-banner --redact
+      run: bash scripts/gates/gitleaks.sh staged
+    - name: test-timing
+      run: bash scripts/gates/test-timing.sh
 
 pre-push:
   parallel: true
   jobs:
     - name: clippy
-      run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
+      run: bash scripts/gates/changed-files.sh --pattern '*.rs' --pattern 'Cargo.toml' --pattern 'Cargo.lock' --pattern 'crates/**/Cargo.toml' --pattern '.cargo/**' --pattern '.config/nextest.toml' --pattern 'rust-toolchain*' --pattern 'vendor/**' -- bash scripts/gates/clippy.sh
+      use_stdin: true
     - name: rustdoc
-      run: RUSTDOCFLAGS="-D warnings" PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo doc --workspace --no-deps --all-features
+      run: bash scripts/gates/changed-files.sh --pattern '*.rs' --pattern 'Cargo.toml' --pattern 'Cargo.lock' --pattern 'crates/**/Cargo.toml' --pattern '.cargo/**' --pattern '.config/nextest.toml' --pattern 'rust-toolchain*' --pattern 'vendor/**' -- bash scripts/gates/rustdoc.sh
+      use_stdin: true
+    - name: rust-tests
+      run: bash scripts/gates/changed-files.sh --pattern '*.rs' --pattern 'Cargo.toml' --pattern 'Cargo.lock' --pattern 'crates/**/Cargo.toml' --pattern '.cargo/**' --pattern '.config/nextest.toml' --pattern 'rust-toolchain*' --pattern 'vendor/**' -- bash scripts/gates/rust-tests.sh
+      use_stdin: true
+    - name: webui
+      run: bash scripts/gates/changed-files.sh --pattern 'crates/dormant-web/webui/**' -- bash scripts/gates/webui.sh
+      use_stdin: true
+    - name: mdbook
+      run: bash scripts/gates/changed-files.sh --pattern 'docs/**' -- bash scripts/gates/mdbook.sh
+      use_stdin: true
+    - name: deny
+      run: bash scripts/gates/changed-files.sh --pattern 'Cargo.toml' --pattern 'Cargo.lock' --pattern 'crates/**/Cargo.toml' --pattern 'deny.toml' --pattern 'rust-toolchain*' -- bash scripts/gates/deny.sh
+      use_stdin: true
+    - name: msrv
+      run: bash scripts/gates/changed-files.sh --pattern 'Cargo.toml' --pattern 'Cargo.lock' --pattern 'crates/**/Cargo.toml' --pattern 'deny.toml' --pattern 'rust-toolchain*' -- bash scripts/gates/msrv.sh
+      use_stdin: true

@@ -1,0 +1,23 @@
+[profile.ci]
+retries = 2
+flaky-result = "fail"
+fail-fast = false
+# Each 60-second period gets up to two termination attempts, so the hard ceiling is 120 seconds.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "dormant-ci"
+store-success-output = false
+store-failure-output = true
+
+[profile.soak]
+inherits = "ci"
+retries = 0
+fail-fast = false
+
+[profile.soak.junit]
+path = "junit.xml"
+report-name = "dormant-soak"
+store-success-output = false
+store-failure-output = true

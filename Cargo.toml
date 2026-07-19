@@ -13,7 +13,7 @@ members = [
 ]
 # vendor/ddc-macos is a vendored, patched fork (see vendor/ddc-macos/README.dormant.md) pinned
 # via [patch.crates-io] below. It has its own package metadata and is not a workspace member.
-exclude = ["vendor/ddc-macos"]
+exclude = ["vendor/ddc-macos", ".github/fixtures/nextest-policy"]
 
 [workspace.package]
 version = "0.4.0"

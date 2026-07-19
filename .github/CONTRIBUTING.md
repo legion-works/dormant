@@ -36,37 +36,44 @@ Install once after cloning:
 lefthook install
 ```
 
-- **pre-commit** — `cargo fmt`, `typos`, `taplo fmt --check`, and a staged-only `gitleaks` scan.
-- **pre-push** — `cargo clippy -- -D warnings -W clippy::pedantic`, `cargo doc` (the two gates that most often fail CI).
+- **pre-commit** — formatting, spelling, staged gitleaks, and the staged test-timing policy.
+- **pre-push** — changed Rust/workspace inputs run Clippy, rustdoc, and nextest plus doctests. Web UI, mdBook, dependency-policy, and MSRV changes run their matching gates. This costs more than the old hook; it is intended to catch CI failures before the push.
 
 CI remains the authoritative gate — these are local mirrors, not replacements.
 
 ## Gate commands
 
-Run the core workspace gates before committing:
+Every local and CI gate enters through `scripts/gates/`; do not copy command bodies into YAML. Run the entry points directly when diagnosing one gate:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
-cargo test --workspace --all-features
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo deny check
-mdbook build docs
-taplo fmt --check
-typos
+bash scripts/gates/fmt.sh
+bash scripts/gates/clippy.sh
+bash scripts/gates/rust-tests.sh      # nextest plus doctests
+bash scripts/gates/rustdoc.sh
+bash scripts/gates/webui.sh
+bash scripts/gates/deny.sh
+bash scripts/gates/msrv.sh
+bash scripts/gates/mdbook.sh
+bash scripts/gates/taplo.sh
+bash scripts/gates/typos.sh
+bash scripts/gates/gitleaks.sh staged
 ```
+
+`rust-tests.sh` uses the `ci` nextest profile and then runs `cargo test --doc`; nextest does not run doctests. Missing optional tools print their install command and fail rather than silently skipping a gate.
+
+Do not rerun a failed test to clear it. Keep the first failing run URL, classify the failure, update `.github/flake-ledger.toml` when it is a flake, fix the root cause, then push a new commit. Same-SHA reruns are diagnostic only.
 
 The CI jobs in `.github/workflows/ci.yml` are:
 
 - `fmt` — `cargo fmt --all -- --check`
 - `webui` — `npm ci`, `npm run lint`, `npm run build`, `npx vitest run`
 - `clippy` — workspace/all-targets/all-features with warnings and Clippy pedantic denied
-- `test` — `cargo test --workspace --all-features`
+- `test` — nextest under the `ci` profile plus doctests
 - `render` — render-feature builds and tests for `dormant-core`, `dormantd`, and `dormant-render`
 - `windows-portability` — `cargo check --workspace` on Windows
 - `macos-test` — workspace tests plus the vendored DDC transport tests on macOS
 - `macos-msrv` — Rust 1.88 workspace and vendored DDC transport checks on macOS
-- `deny` and `audit` — dependency policy and RustSec advisories
+- `deny` — dependency policy and RustSec advisories
 - `msrv` — `cargo check --workspace` on Rust 1.88
 - `mqtt-integration` — live Mosquitto tests, including retained state and availability
 - `docs` and `mdbook` — rustdoc with warnings denied, then `mdbook build docs`

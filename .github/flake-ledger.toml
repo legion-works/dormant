@@ -1,0 +1,142 @@
+# Open-incident signatures are deterministic placeholders until a classifier records a real failure signature; prefix bare classifier output with sha256:.
+schema_version = 1
+
+[[incident]]
+id = "FLAKE-0009"
+test = "daemon_smoke::manual_only_display_full_lifecycle_across_reload"
+signature = "sha256:af2735473577639aa28799efd8f8640f00d6b21f8747b134ac81fa4f0b317bb5"
+first_run_url = ""
+last_run_url = ""
+mechanism = "cross-generation-lost-command-window-during-reload-teardown; canonical lifecycle anchor, while FLAKE-0094 uses its distinct phase-race symptom test"
+reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_full_lifecycle_across_reload)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-0047"
+test = "boot_rollback::bad_config_with_lkg_immediate_rollback"
+signature = "sha256:f184e0efb5599a8d44ec19f312cd6c967a0e6a0698874d1306739398dc8c3106"
+first_run_url = ""
+last_run_url = ""
+mechanism = "shared-global-subscriber-buffer-contention-across-boot-tests"
+reproduction = "cargo nextest run -p dormantd --test boot_rollback --stress-count 100 --retries 0 --flaky-result fail -E 'test(bad_config_with_lkg_immediate_rollback)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-0070"
+test = "audio_policy::tests::timing_policy_cases_are_deterministic"
+signature = "sha256:967e52e38eb53014530ff660a1665a8c37977d3ed46cbfe166e7107b6f38da07"
+first_run_url = ""
+last_run_url = ""
+mechanism = "real-clock-timing-window-on-a-loaded-runner; the original narrow audio_source poller assertion was replaced by this deterministic audio_policy coverage"
+reproduction = "cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(timing_policy_cases_are_deterministic)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-0080"
+test = "daemon_smoke::wear_shutdown_persists_final_ledger"
+signature = "sha256:94f35ab1c8c0965a66b098bee4e51f0105cb38e287fb84b646e7b941eecfa51d"
+first_run_url = ""
+last_run_url = ""
+mechanism = "persist-read-race-left-trailing-characters-in-the-wear-ledger"
+reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(wear_shutdown_persists_final_ledger)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-0086"
+test = "watchdog_schedule::tests::healthy_ticks_keep_a_fixed_cadence"
+signature = "sha256:270ba6942a1967bf4792bc613c01b1d3c92644f312aaf9aa2a1927db6f76209f"
+first_run_url = ""
+last_run_url = ""
+mechanism = "real-cadence-sleep-flake; the original daemon_smoke watchdog_ping_cadence_grows_on_healthy_ticks test was deleted and this schedule test is its replacement coverage"
+reproduction = "cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(healthy_ticks_keep_a_fixed_cadence)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-0092"
+test = "daemon_smoke::config_watch_updates_on_successful_reload_only"
+signature = "sha256:528ebd736514efab11359cf2a267153e2d3f712fe78e600168bef75be170640c"
+first_run_url = ""
+last_run_url = ""
+mechanism = "watcher-trigger-and-explicit-trigger-reloaded-the-same-content-twice"
+reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(config_watch_updates_on_successful_reload_only)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-0094"
+test = "daemon_smoke::manual_only_display_no_defensive_wake_on_reload"
+signature = "sha256:c89341cc0f4d657ec05d3b06c804309a07f2785f1f2d3edd469297190f79d845"
+first_run_url = ""
+last_run_url = ""
+mechanism = "marker-write-precedes-phase-landing-and-can-preserve-blanking; distinct symptom anchor resolves the historical FLAKE-0009 same-test collision"
+reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_no_defensive_wake_on_reload)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-2026-07-18-WEAR-CORRUPT"
+test = "wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed"
+signature = "sha256:28fc1067a28ff77488f407641ff792f872c9e97ded82592ea5fff9c0e0ddaf64"
+first_run_url = ""
+last_run_url = ""
+mechanism = "capture-plane-global-state-dependent-observation"
+reproduction = "cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-2026-07-18-MPV-FIRSTFRAME"
+test = "screensaver::tests::mpv_render_context_created_with_advanced_control"
+signature = "sha256:6c3c65304df27ffa40bf0088783c56e9adc175e97011ff2bbec3b3f7648ace3b"
+first_run_url = ""
+last_run_url = ""
+mechanism = "real-clock first-frame deadline in the libmpv render-context test; fails intermittently under full-workspace CPU contention, passes when run isolated (3 sightings during M1 T5/T6/T7 full-suite runs; re-observed by the ci profile during M3 T17)"
+reproduction = "cargo nextest run --profile ci --workspace --all-features"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"
+
+[[incident]]
+id = "FLAKE-2026-07-18-RENDER-FRAMES"
+test = "screensaver::tests::renders_non_zero_changing_frames"
+signature = "sha256:5ad1de95466bf0815d42052c0c74653b176e3015c1c0cde9ef884e824b30ef14"
+first_run_url = ""
+last_run_url = ""
+mechanism = "real-clock libmpv frame-production deadline in the screensaver render tests; sibling of FLAKE-2026-07-18-MPV-FIRSTFRAME — same mechanism, different test; retries-to-pass under full-workspace CPU contention, observed by the ci profile during M3 T18"
+reproduction = "cargo nextest run -p dormant-render --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(renders_non_zero_changing_frames)'"
+root_cause = ""
+fix_pr = ""
+proving_test = ""
+soak_evidence = []
+status = "open"

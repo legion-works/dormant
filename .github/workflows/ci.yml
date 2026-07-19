@@ -149,6 +149,53 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
 
+  changed-test-stress-ubuntu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig python3 scripts/ci/select_changed_tests.py --base "$BASE_SHA" --head HEAD --platform linux --stress-count 5
+      - name: Upload changed-test JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-changed-test-stress-ubuntu
+          path: target/nextest/changed
+          if-no-files-found: warn
+
+  changed-test-stress-macos:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig python3 scripts/ci/select_changed_tests.py --base "$BASE_SHA" --head HEAD --platform macos --stress-count 3
+      - name: Upload changed-test JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-changed-test-stress-macos
+          path: target/nextest/changed
+          if-no-files-found: warn
+
   macos-msrv:
     runs-on: macos-14
     timeout-minutes: 20

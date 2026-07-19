@@ -406,6 +406,13 @@ fn drain_capture() -> String {
     })
 }
 
+fn capture_contains(substr: &str) -> bool {
+    CAPTURE.get().is_some_and(|buf| {
+        let guard = buf.lock().unwrap();
+        String::from_utf8_lossy(&guard).contains(substr)
+    })
+}
+
 // ── Notify-sink isolation ───────────────────────────────────────────────────
 
 use dormantd::notifier::{NotifySink, zbus_sink_was_constructed};
@@ -1662,7 +1669,15 @@ async fn concurrent_reload_inputs_are_delivered_exactly_once() {
 // ── 10: web_nonloopback_enabled warning fires at startup ───────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes global trace capture; the lock is test-local and \
+              released promptly at test end"
+)]
 async fn web_nonloopback_warning_fires_at_startup() {
+    let _capture_guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     install_capture_subscriber();
     drain_capture(); // discard any startup noise from prior tests
 
@@ -1692,9 +1707,14 @@ async fn web_nonloopback_warning_fires_at_startup() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
+    let event_seen = wait_for(
+        || capture_contains("web_nonloopback_enabled"),
+        Duration::from_secs(3),
+    )
+    .await;
     let output = drain_capture();
     assert!(
-        output.contains("web_nonloopback_enabled"),
+        event_seen,
         "expected web_nonloopback_enabled event in captured trace output: {output}"
     );
 
@@ -1761,9 +1781,14 @@ async fn web_bind_change_ignored_on_reload() {
         .expect("reload bus open");
     assert_eq!(outcome, ReloadOutcome::Reloaded);
 
+    let event_seen = wait_for(
+        || capture_contains("web_bind_change_ignored"),
+        Duration::from_secs(3),
+    )
+    .await;
     let output = drain_capture();
     assert!(
-        output.contains("web_bind_change_ignored"),
+        event_seen,
         "expected web_bind_change_ignored event in captured trace output: {output}"
     );
 

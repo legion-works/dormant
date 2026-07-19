@@ -2,6 +2,21 @@
 
 dormant ingests presence from three sensor types: MQTT, Home Assistant WebSocket, and USB-serial. This page covers setup and the `dormantctl doctor` checks for each.
 
+## Two ways to wire the LD2410C
+
+The HLK-LD2410C mmWave radar is a plain serial device, so the same sensor reaches dormant through either of two topologies — pick per deployment; both are one config block apart.
+
+| Topology | dormant `type` | Path | When it wins |
+| --- | --- | --- | --- |
+| **Radar on an ESP32 → WiFi → MQTT** | `mqtt` | Radar → ESP32 (ESPHome) → WiFi → broker → dormant | Sensor placed anywhere with power; tuned live from Home Assistant; one radar can feed many consumers. Appears in HA natively over the ESPHome API. |
+| **Radar direct to the host** | `usb-ld2410` | Radar → USB-serial adapter → dormant | Sensor at the machine it guards: no WiFi, no broker, lowest latency. The ESP is not needed; dormant reads the raw UART frames itself. |
+
+A ready-to-flash ESPHome config for the MQTT topology ships at [`examples/esphome/ld2410c-c6-wifi-mqtt.yaml`](https://github.com/legion-works/dormant/blob/dev/examples/esphome/ld2410c-c6-wifi-mqtt.yaml) — it exposes near/far distance zones and the radar's tuning entities (detection range, per-gate sensitivity, zone cutoff), all adjustable from HA without reflashing. The USB topology needs only a `type = "usb-ld2410"` sensor block (see below) and a ~$2 adapter.
+
+Both are **fail-safe symmetric**: broker loss (MQTT, via the retained LWT) and USB unplug both mark the sensor `unavailable`, which the default zone policy treats as *present* — dormant never blanks a room it can't see, whichever transport drops.
+
+> **2D zones need different silicon.** The LD2410C reports one target along a single axis (distance), so it does 1D near/far zones only. True X/Y polygon zones (as on the Everything Presence Pro) need a multi-target radar like the LD2450, which wires to the same ESP32 identically — swap the module, keep the board and config shape.
+
 ## MQTT
 
 dormant connects as an MQTT client (using `rumqttc`, pure Rust, no system dependency). It subscribes to one topic per sensor and reads a JSON pointer into each payload.

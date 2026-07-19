@@ -188,6 +188,28 @@ async fn wait_for_phase(
     }
 }
 
+/// Poll snapshots until a display's effective inhibition bit reaches `want`.
+async fn wait_for_display_inhibited(
+    ctl: &mpsc::Sender<ControlMsg>,
+    display: &str,
+    want: bool,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let snap = snapshot_with_retry(ctl).await;
+        if let Some((_, display)) = snap.displays.iter().find(|(id, _)| id == display)
+            && display.inhibited == want
+        {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, contents).expect("write file");
@@ -5464,6 +5486,8 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
     // (`state_machine.rs:1213-1237`) — deterministic regardless of tick
     // jitter, rather than racing a partial freeze.
     let sensor_script = vec![(Duration::from_millis(800), ev("desk", SensorState::Absent))];
+    let observations = ObservationHub::new(64);
+    let mut observation_rx = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path,
         creds_path,
@@ -5472,34 +5496,62 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(observations)
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    // Grace (3s) would expire at ~3.8s if unfrozen (800ms Absent edge + 3s
-    // grace); wait comfortably past that. The movie fixture never changes
-    // in this phase, so the display must still be grace-frozen: no blank.
-    let blanked_early = wait_for(
-        || count(&marker, 'B') >= 1,
-        Duration::from_millis(800 + 3000 + 1500),
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero entering grace",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Grace { .. },
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
     )
     .await;
     assert!(
-        !blanked_early,
-        "movie fixture must keep the display grace-frozen past grace expiry"
-    );
-
-    // Swap the fixture to idle — the poller's next tick deasserts
-    // immediately (asymmetric debounce), unfreezing the countdown from its
-    // full stored remaining duration; the blank must now proceed.
-    rewrite_pw_dump_script(&script, AUDIO_IDLE_FIXTURE);
-    assert!(
-        wait_for(
-            || count(&marker, 'B') >= 1,
-            // 1s tick delay + 3s grace remaining + 2s margin = 6s.
-            Duration::from_secs(6),
+        wait_for_display_inhibited(
+            &handle.control_sender(),
+            "mon",
+            true,
+            Duration::from_secs(3),
         )
         .await,
-        "idle fixture must unfreeze grace and let the blank proceed"
+        "movie fixture must inhibit the display while grace is active"
+    );
+
+    rewrite_pw_dump_script(&script, AUDIO_IDLE_FIXTURE);
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(6),
+        "generation zero blanking completed after audio deassertion",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Blanking,
+                    new_phase: dormant_core::state_machine::Phase::Blanked,
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        count(&marker, 'B'),
+        1,
+        "the command controller must blank once"
     );
 
     shutdown(handle, join).await;
@@ -5510,6 +5562,10 @@ async fn audio_playback_freezes_grace_past_expiry_then_blanks_on_idle() {
 // Linux-only: see the audio integration note above.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reload's causal observations and configuration mutation must remain together"
+)]
 async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
@@ -5534,15 +5590,38 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(ObservationHub::new(64))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
-    let mut reloads = handle.subscribe_reload();
+    let mut observation_rx = handle.subscribe_observations();
 
-    // Pre-reload sanity: the first generation's own startup_grace exemption
-    // should already have the display grace-frozen on the movie fixture.
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation zero entering grace",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(0),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Grace { .. },
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
     assert!(
-        !wait_for(|| count(&marker, 'B') >= 1, Duration::from_millis(1500)).await,
-        "pre-reload generation must already be grace-frozen on the movie fixture"
+        wait_for_display_inhibited(
+            &handle.control_sender(),
+            "mon",
+            true,
+            Duration::from_secs(3),
+        )
+        .await,
+        "generation zero must be inhibited before its reload"
     );
 
     // Unrelated-key reload — `log_level` only; same display/rule/audio block.
@@ -5551,35 +5630,59 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
         audio_rule_config(&marker, &script, "3s", "5s", "debug"),
     )
     .unwrap();
-    assert!(handle.trigger_reload().await);
-    let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
+    let (request_id, receipt) = handle
+        .request_reload_with_id(ReloadSource::Control)
         .await
-        .expect("reload outcome in time")
-        .expect("reload bus open");
+        .expect("reload receipt");
+    assert!(receipt.request_ids.contains(&request_id));
     assert_eq!(
-        outcome,
+        receipt.outcome,
         ReloadOutcome::Reloaded,
         "the unrelated log_level edit must be accepted"
     );
-
-    // Anti-tautology pin (P4): min_active (5s) is set strictly greater than
-    // the post-reload observation window (grace 3s, zone-absent at 800ms).
-    // A missing startup_grace exemption on the NEW generation's poller
-    // would leave `overlays.inhibited` false when the zone's own fresh
-    // Absent edge arrives, so `enter_grace` starts a LIVE (unfrozen)
-    // countdown expiring at ~3.8s post-reload — long before ordinary
-    // debounce (5s) could ever assert — and the display blanks. The
-    // exemption must instead re-freeze grace before that, so no blank must
-    // appear even comfortably past that deadline.
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one started",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::GenerationStarted {
+                    generation: GenerationId(1)
+                }
+            )
+        },
+    )
+    .await;
+    recv_observation(
+        &mut observation_rx,
+        Duration::from_secs(3),
+        "generation one entering grace",
+        |observation| {
+            matches!(
+                observation,
+                DaemonObservation::DisplayPhaseChanged {
+                    generation: GenerationId(1),
+                    rule_id: Some(rule_id),
+                    display_id,
+                    old_phase: dormant_core::state_machine::Phase::Active,
+                    new_phase: dormant_core::state_machine::Phase::Grace { .. },
+                } if rule_id.0 == "r" && display_id.0 == "mon"
+            )
+        },
+    )
+    .await;
     assert!(
-        !wait_for(
-            || count(&marker, 'B') >= 1,
-            Duration::from_millis(800 + 3000 + 2000),
+        wait_for_display_inhibited(
+            &handle.control_sender(),
+            "mon",
+            true,
+            Duration::from_secs(3),
         )
         .await,
-        "the new generation's poller must re-freeze grace via its own fresh \
-         startup_grace exemption — grace must never expire"
+        "fresh startup grace must inhibit the new generation before grace expires"
     );
+    assert_eq!(count(&marker, 'B'), 0, "an inhibited grace must not blank");
 
     shutdown(handle, join).await;
 }

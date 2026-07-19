@@ -5,6 +5,7 @@
 //! `dormantd` binary is a thin wrapper over [`app::App`].
 
 pub mod app;
+mod audio_policy;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;

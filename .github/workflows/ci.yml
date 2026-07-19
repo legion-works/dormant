@@ -8,8 +8,6 @@ on:
     # `edited` so a PR-title-only fix re-triggers the pr-title conventional-commit
     # lint (default types omit it, leaving a retitle unable to clear a red check).
     types: [opened, synchronize, reopened, edited]
-  schedule:
-    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -21,18 +19,17 @@ concurrency:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: bash scripts/gates/fmt.sh
 
   webui:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/dormant-web/webui
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -41,12 +38,11 @@ jobs:
           cache: npm
           cache-dependency-path: crates/dormant-web/webui/package-lock.json
       - run: npm ci
-      - run: npm run lint
-      - run: npm run build
-      - run: npx vitest run
+      - run: bash scripts/gates/webui.sh
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,7 +50,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - run: bash scripts/gates/clippy.sh
 
   test:
     # No `needs: webui`: the Rust suite only asserts the SPA fallback serves
@@ -62,6 +58,7 @@ jobs:
     # (real-SPA coverage is the webui job's vitest + deploy-time checks). Serial
     # dependency + artifact download was pure latency on the critical path.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,13 +73,22 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
-      - run: cargo nextest run --workspace --all-features
-      # nextest does not run doctests; keep them covered separately (fast).
-      - run: cargo test --workspace --all-features --doc
+          tool: cargo-nextest@0.9.131
+      - run: bash scripts/gates/rust-tests.sh
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/ci/junit.xml
+      - name: Upload nextest JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-test
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -92,17 +98,27 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.131
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo build -p dormantd --features render
       # dormant-render has no `render` feature (it IS the impl crate — always
       # built); dormant-core/dormantd gate it. Run the feature-gated pair and
       # the bare render crate together under nextest.
-      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-core -p dormantd --features render
-      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo nextest run -p dormant-render
+      - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo-nextest ntr --profile ci -p dormant-core -p dormantd -p dormant-render --features render
       - run: PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo test -p dormant-core -p dormantd --features render --doc
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/ci/junit.xml
+      - name: Upload nextest JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-render
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
   windows-portability:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -110,17 +126,31 @@ jobs:
       - run: cargo check --workspace
 
   macos-test:
-    runs-on: macos-latest
+    runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: bash scripts/gates/rust-tests.sh
       - run: cargo test --manifest-path vendor/ddc-macos/Cargo.toml
-      - run: cargo test --workspace --all-features --doc
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/ci/junit.xml
+      - name: Upload nextest JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-macos-14
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
   macos-msrv:
-    runs-on: macos-latest
+    runs-on: macos-14
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
@@ -130,6 +160,7 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -141,32 +172,46 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
-      - run: cargo check --workspace
+      - run: bash scripts/gates/msrv.sh
 
   mqtt-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev mosquitto-clients
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
       - name: Start Mosquitto broker
         run: |
-          docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
-          for _ in $(seq 1 10); do nc -z localhost 1883 && break; sleep 1; done
-      - run: |
-          DORMANT_TEST_MQTT=1 cargo test -p dormant-sensors -- --ignored \
-            mqtt_round_trip_publishes_presence_event \
-            mqtt_retained_state_delivered_on_subscribe \
-            mqtt_retained_availability_offline_on_subscribe
+          docker run -d --name mosquitto -p 127.0.0.1::1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+          port="$(docker port mosquitto 1883/tcp | awk -F: '{print $NF}')"
+          printf 'DORMANT_TEST_MQTT_PORT=%s\n' "$port" >> "$GITHUB_ENV"
+          bash scripts/ci/wait-for-mqtt.sh 127.0.0.1 "$port" 10
+      - run: DORMANT_TEST_MQTT=1 PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo-nextest ntr --profile ci -p dormant-sensors --test mqtt_integration --run-ignored only -E 'test(#*mqtt_*)'
+      - name: Classify nextest JUnit
+        if: always()
+        run: python3 scripts/ci/classify_nextest_junit.py target/nextest/ci/junit.xml
+      - name: Upload nextest JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-mqtt
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -174,26 +219,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
-      - run: cargo doc --workspace --no-deps
+      - run: bash scripts/gates/rustdoc.sh
 
   mdbook:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: peaceiris/actions-mdbook@v2
+      - uses: taiki-e/install-action@v2
         with:
-          mdbook-version: latest
-      - run: mdbook build docs
+          tool: mdbook@0.4.52
+      - run: bash scripts/gates/mdbook.sh
 
   taplo:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: uncenter/setup-taplo@v1
-      - run: taplo fmt --check
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: taplo-cli@0.10.0
+      - run: bash scripts/gates/taplo.sh
 
   gitleaks:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -208,10 +258,11 @@ jobs:
           tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin/ gitleaks
           chmod +x /usr/local/bin/gitleaks
       - name: Run gitleaks
-        run: gitleaks git --no-banner --redact
+        run: bash scripts/gates/gitleaks.sh history
 
   typos:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: crate-ci/typos@v1
@@ -221,7 +272,23 @@ jobs:
     permissions:
       pull-requests: read
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: amannn/action-semantic-pull-request@v5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: python3 scripts/ci/verify_nextest_policy.py --nextest-version 0.9.131
+      - run: python3 scripts/ci/check_flake_ledger.py .github/flake-ledger.toml
+      - run: python3 scripts/ci/check_gate_parity.py --ci .github/workflows/ci.yml --lefthook lefthook.yml --manifest scripts/gates/parity.txt
+      - run: python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'

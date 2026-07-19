@@ -1,14 +1,12 @@
 # target<TAB>script
 ci	scripts/gates/fmt.sh
 ci	scripts/gates/taplo.sh
-ci	scripts/gates/typos.sh
 ci	scripts/gates/gitleaks.sh
 ci	scripts/gates/clippy.sh
 ci	scripts/gates/rustdoc.sh
 ci	scripts/gates/rust-tests.sh
 ci	scripts/gates/webui.sh
 ci	scripts/gates/mdbook.sh
-ci	scripts/gates/deny.sh
 ci	scripts/gates/msrv.sh
 pre-commit	scripts/gates/fmt.sh
 pre-commit	scripts/gates/taplo.sh

@@ -19,7 +19,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 tokio = { workspace = true, features = [
   "rt",
   "rt-multi-thread",
@@ -33,6 +33,36 @@ tokio-util = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
+  "NSApplication",
+  "NSRunningApplication",
+  "NSResponder",
+  "NSStatusBar",
+  "NSStatusItem",
+  "NSStatusBarButton",
+  "NSButton",
+  "NSControl",
+  "NSView",
+  "NSMenu",
+  "NSMenuItem",
+  "NSImage",
+  "NSEvent",
+  "NSGraphicsContext",
+  "objc2-core-foundation",
+] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+  "NSObject",
+  "NSString",
+  "NSData",
+  "NSGeometry",
+] }
+dispatch2 = { version = "=0.3.1", default-features = false, features = [
+  "alloc",
+] }
+png = "0.18"
 
 [build-dependencies]
 resvg = "0.47"

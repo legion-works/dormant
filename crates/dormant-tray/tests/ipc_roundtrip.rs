@@ -7,7 +7,7 @@
 //! with the daemon's own config + sensor factory plumbing and let it
 //! bring up its `ipc::spawn` server.
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +18,7 @@ use dormant_core::config::Strictness;
 use dormant_core::config::schema::Config;
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::rules::DaemonEvent;
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantctl::client;
@@ -135,8 +136,49 @@ fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
     std::sync::Arc::new(NoopNotifySink)
 }
 
+async fn assert_event_streams_a_daemon_event(
+    mut events: client::EventStream,
+    event_shutdown: client::EventShutdown,
+) {
+    let event = timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || events.next()),
+    )
+    .await
+    .expect("events timeout")
+    .expect("event reader task")
+    .expect("event stream closed")
+    .expect("event decode");
+    assert!(!matches!(event, DaemonEvent::Unknown));
+    assert!(
+        matches!(event, DaemonEvent::DisplayPhase { .. }),
+        "expected DisplayPhase event, got {event:?}"
+    );
+    event_shutdown.shutdown().expect("shutdown event stream");
+}
+
+async fn force_blank(socket_path: &std::path::Path) {
+    let p = socket_path.to_path_buf();
+    let blank_resp = timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            client::send_request(
+                &p,
+                &IpcRequest::Blank {
+                    display: "mon".to_string(),
+                },
+            )
+        }),
+    )
+    .await
+    .expect("blank timeout")
+    .expect("blank reader task")
+    .expect("blank send_request");
+    assert!(blank_resp.ok, "blank response: {blank_resp:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ipc_roundtrip_via_dormantctl_client() {
+async fn ipc_status_and_events_roundtrip_via_dormantctl_client() {
     let dir = TempDir::new().unwrap();
     let socket_path = dir.path().join("dormant.sock");
 
@@ -178,6 +220,12 @@ async fn ipc_roundtrip_via_dormantctl_client() {
         .expect("status should include snapshot");
     assert_eq!(snap.displays.len(), 1, "expected one display in snapshot");
     assert_eq!(snap.displays[0].0, "mon");
+
+    // ── Force blank + events ──────────────────────────────────────────────
+    let (events, event_shutdown) = client::connect_events(&socket_path).expect("connect events");
+    force_blank(&socket_path).await;
+
+    assert_event_streams_a_daemon_event(events, event_shutdown).await;
 
     // ── Pause ─────────────────────────────────────────────────────────────
     let pause_resp = timeout(Duration::from_secs(2), async {

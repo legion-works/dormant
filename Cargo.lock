@@ -1048,6 +1048,7 @@ dependencies = [
  "dormant-sensors",
  "futures-util",
  "humantime",
+ "libc",
  "rumqttc",
  "serde",
  "serde_json",

@@ -84,7 +84,8 @@ pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcRespo
 pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)> {
     #[cfg(unix)]
     {
-        use std::io::{BufRead, BufReader, ErrorKind, Write};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::io::AsRawFd;
 
         let mut stream = connect(socket_path)?;
         // Keep a clone of the FD just so we can shut the read direction
@@ -96,25 +97,42 @@ pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)
         stream.flush()?;
 
         let mut reader = BufReader::new(stream);
-        reader
-            .get_mut()
-            .set_read_timeout(Some(EVENTS_READY_TIMEOUT))?;
-        let mut readiness_line = String::new();
-        let readiness = match reader.read_line(&mut readiness_line) {
-            Ok(0) => Ok(None),
-            Ok(_) => serde_json::from_str(readiness_line.trim())
-                .map(|event| match event {
-                    DaemonEvent::Subscribed => None,
-                    event => Some(event),
-                })
-                .context("parse event stream readiness"),
-            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
-                Ok(None)
+        let fd = reader.get_ref().as_raw_fd();
+        let timeout_ms = i32::try_from(EVENTS_READY_TIMEOUT.as_millis()).unwrap_or(i32::MAX);
+        let readable = loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd is a valid, initialized single pollfd for the duration of the call.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll event stream readiness");
             }
-            Err(error) => Err(error.into()),
+            break rc > 0;
         };
-        reader.get_mut().set_read_timeout(None)?;
-        let pending = readiness?;
+        // poll(2) guarantees bytes are readable, not that a full line has arrived;
+        // acceptable for this trusted, newline-framed local daemon protocol.
+        let pending = if readable {
+            let mut readiness_line = String::new();
+            match reader.read_line(&mut readiness_line) {
+                Ok(0) => None,
+                Ok(_) => serde_json::from_str(readiness_line.trim())
+                    .map(|event| match event {
+                        DaemonEvent::Subscribed => None,
+                        event => Some(event),
+                    })
+                    .context("parse event stream readiness")?,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
 
         Ok((
             EventStream { reader, pending },

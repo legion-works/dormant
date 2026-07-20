@@ -1,4 +1,4 @@
-//! Throwaway AppKit status-item spike for the operator's macOS GO/NO-GO check.
+//! Throwaway `AppKit` status-item spike for the operator's macOS GO/NO-GO check.
 
 #[cfg(not(target_os = "macos"))]
 fn main() {

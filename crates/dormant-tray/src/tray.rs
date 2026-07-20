@@ -7,7 +7,7 @@
 //! lives in the platform-neutral modules; this file is the thin
 //! glue that hands the data to `ksni` and dispatches menu actions.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -23,38 +23,7 @@ use crate::icon::{IconSet, SIZES};
 use crate::menu::{Action, MenuEntry};
 use crate::state::IconState;
 use crate::tooltip::{TooltipInputs, build_tooltip};
-
-/// Shared state between the IPC loop and the `ksni::Tray` impl.
-///
-/// `ksni` calls `&self` methods (`icon_pixmap`, `menu`, `title`, …) from
-/// its D-Bus thread, while the IPC loop runs on a tokio task and wants
-/// `async` access.  A `tokio::sync::Mutex` is the simplest meeting point:
-/// the ksni side grabs a synchronous lock via `try_lock()` (no await,
-/// never blocks the D-Bus thread for long), and the IPC side awaits.
-pub struct TrayState {
-    /// Path to the daemon's Unix socket.
-    pub socket_path: PathBuf,
-    /// Latest snapshot from the daemon (or `None` until the first Status).
-    pub snapshot: Option<StateSnapshot>,
-    /// Whether the IPC loop currently reports the daemon as unreachable.
-    pub unreachable: bool,
-    /// The current icon state derived from `snapshot` / `unreachable`.
-    pub icon_state: IconState,
-}
-
-impl TrayState {
-    /// Create a fresh state with the given socket path; everything else
-    /// starts as "starting up" / unreachable until the IPC loop lands.
-    #[must_use]
-    pub fn new(socket_path: PathBuf) -> Self {
-        Self {
-            socket_path,
-            snapshot: None,
-            unreachable: true,
-            icon_state: IconState::Unreachable,
-        }
-    }
-}
+use crate::tray_state::TrayState;
 
 /// The `ksni::Tray` impl.  Holds an `Arc<TrayState>` (cheap to clone for
 /// the IPC loop) plus the pre-baked [`IconSet`].

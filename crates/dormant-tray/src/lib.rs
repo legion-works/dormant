@@ -13,6 +13,8 @@
 //!   it can be unit-tested against canned snapshots).
 //! - [`icon`] — pixmap construction + runtime variant overlays (paused
 //!   badge, greying).  Pure pixel ops, no D-Bus.
+//! - [`tray_state`] — cross-platform state shared by tray frontends and the
+//!   IPC loop.
 //!
 //! Linux-only:
 //!
@@ -33,6 +35,8 @@ pub mod icon;
 pub mod menu;
 pub mod state;
 pub mod tooltip;
+/// Cross-platform state shared by tray frontends and the IPC loop.
+pub mod tray_state;
 
 /// Default port for the M2 web UI.  The daemon does not expose its bound
 /// `web_port` through [`dormant_core::rules::StateSnapshot`]; we fall back

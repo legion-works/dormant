@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::state::IconState;
-use crate::tray::TrayState;
+use crate::tray_state::TrayState;
 
 /// Backoff bounds.  Capped exponential: 1, 2, 4, 8, 16, 30, 30, …
 const BACKOFF_MIN: Duration = Duration::from_secs(1);

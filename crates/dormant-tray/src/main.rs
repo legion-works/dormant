@@ -9,11 +9,11 @@
 //!   portability legs (memory-1718 — cross-platform CI gauntlet).
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use dormant_core::paths;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
+use dormant_core::paths;
 #[cfg(target_os = "linux")]
 use dormant_tray::DEFAULT_WEB_PORT;
 #[cfg(target_os = "linux")]
@@ -22,6 +22,8 @@ use dormant_tray::ipc_loop;
 use dormant_tray::tray;
 #[cfg(target_os = "linux")]
 use dormant_tray::tray_state::TrayState;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 // `tokio::sync::Mutex` is only used inside `run_linux`; keeping it inside
 // the linux-gated block keeps the macOS/Windows stub `main` compiling
 // without a `tokio` dependency (memory-1718 — cross-platform CI gauntlet).

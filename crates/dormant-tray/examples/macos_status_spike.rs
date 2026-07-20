@@ -10,7 +10,7 @@ fn main() {
     use objc2::MainThreadMarker;
     use objc2::rc::Retained;
     use objc2::runtime::{NSObject, NSObjectProtocol};
-    use objc2::*;
+    use objc2::{MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
         NSVariableStatusItemLength,

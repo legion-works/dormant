@@ -38,6 +38,8 @@ pub mod dispatch;
 pub mod icon;
 pub mod menu;
 pub mod state;
+/// Pure monochrome pixel renderer for macOS template tray icons.
+pub mod template_icon;
 pub mod tooltip;
 /// Cross-platform state shared by tray frontends and the IPC loop.
 pub mod tray_state;

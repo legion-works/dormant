@@ -399,7 +399,8 @@ async fn handle_events(
         return;
     }
     let Ok(mut events) = rx.await else { return };
-    let line = serde_json::to_string(&DaemonEvent::Subscribed).unwrap_or_default();
+    let line = serde_json::to_string(&DaemonEvent::Subscribed)
+        .expect("DaemonEvent::Subscribed serializes");
     if write_line(writer, &line).await.is_err() {
         return;
     }
@@ -407,14 +408,14 @@ async fn handle_events(
     loop {
         match events.recv().await {
             Ok(event) => {
-                let line = serde_json::to_string(&event).unwrap_or_default();
+                let line = serde_json::to_string(&event).expect("DaemonEvent serializes");
                 if write_line(writer, &line).await.is_err() {
                     return; // client disconnected
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 let lagged = serde_json::json!({"event":"stream_lagged","skipped":n});
-                let line = serde_json::to_string(&lagged).unwrap_or_default();
+                let line = serde_json::to_string(&lagged).expect("lagged frame serializes");
                 if write_line(writer, &line).await.is_err() {
                     return;
                 }

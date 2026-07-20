@@ -82,8 +82,9 @@ fn run_linux() -> anyhow::Result<()> {
     let ipc_cancel = cancel.clone();
     let ipc_state = state.clone();
     let ipc_socket = socket_path.clone();
+    let (refresh, _refresh_rx) = ipc_loop::refresh_channel();
     let ipc_task = handle.spawn(async move {
-        ipc_loop::run(ipc_socket, ipc_state, ipc_cancel).await;
+        ipc_loop::run(ipc_socket, ipc_state, ipc_cancel, refresh).await;
     });
 
     // Wait for either Quit (clicked from the menu) or Ctrl-C.

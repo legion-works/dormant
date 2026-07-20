@@ -20,11 +20,21 @@ use anyhow::{Context, Result};
 use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::rules::{DaemonEvent, StateSnapshot};
 use dormantctl::client;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::state::IconState;
 use crate::tray_state::TrayState;
+
+/// Sender half of the tray-state refresh notification channel.
+pub type RefreshSender = watch::Sender<()>;
+/// Receiver half of the tray-state refresh notification channel.
+pub type RefreshReceiver = watch::Receiver<()>;
+
+/// Create a channel that signals visible tray-state mutations.
+pub fn refresh_channel() -> (RefreshSender, RefreshReceiver) {
+    watch::channel(())
+}
 
 /// Backoff bounds.  Capped exponential: 1, 2, 4, 8, 16, 30, 30, …
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -111,10 +121,11 @@ pub async fn run(
     socket_path: PathBuf,
     state: Arc<Mutex<TrayState>>,
     cancel: tokio_util::sync::CancellationToken,
+    refresh: RefreshSender,
 ) {
     let mut backoff = BACKOFF_MIN;
     loop {
-        let outcome = tick(&socket_path, &state, &cancel).await;
+        let outcome = tick(&socket_path, &state, &cancel, &refresh).await;
         let connected = match &outcome {
             TickOutcome::Cancelled => return,
             TickOutcome::Closed => {
@@ -129,15 +140,7 @@ pub async fn run(
                 *connected
             }
         };
-        {
-            let mut s = state.lock().await;
-            if !s.unreachable {
-                warn!(?backoff, "ipc stream lost; entering reconnect loop");
-            }
-            s.unreachable = true;
-            s.snapshot = None;
-            s.icon_state = IconState::Unreachable;
-        }
+        mark_unreachable(&state, &refresh).await;
         tokio::select! {
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(backoff) => {}
@@ -169,6 +172,7 @@ async fn tick(
     socket_path: &Path,
     state: &Arc<Mutex<TrayState>>,
     cancel: &tokio_util::sync::CancellationToken,
+    refresh: &RefreshSender,
 ) -> TickOutcome {
     let mut connected = false;
 
@@ -182,7 +186,7 @@ async fn tick(
             };
         }
     };
-    publish_snapshot(state, snapshot).await;
+    publish_snapshot(state, snapshot, refresh).await;
     info!("ipc: connected, snapshot published");
     connected = true;
 
@@ -213,7 +217,7 @@ async fn tick(
                         // Refetch the snapshot — events are notifications
                         // but the snapshot is the truth.
                         match fetch_status(socket_path).await {
-                            Ok(snap) => publish_snapshot(state, snap).await,
+                            Ok(snap) => publish_snapshot(state, snap, refresh).await,
                             Err(e) => {
                                 debug!(error = %e, "post-event Status failed");
                                 return TickOutcome::Errored { connected, error: e };
@@ -252,21 +256,79 @@ async fn fetch_status(socket_path: &Path) -> Result<StateSnapshot> {
         .ok_or_else(|| anyhow::anyhow!("daemon returned no snapshot"))
 }
 
-async fn publish_snapshot(state: &Arc<Mutex<TrayState>>, snap: StateSnapshot) {
-    let new_icon_state = if state.lock().await.unreachable {
-        IconState::Unreachable
-    } else {
-        crate::state::derive_icon_state(&snap)
-    };
+async fn publish_snapshot(
+    state: &Arc<Mutex<TrayState>>,
+    snap: StateSnapshot,
+    refresh: &RefreshSender,
+) {
+    let new_icon_state = crate::state::derive_icon_state(&snap);
     let mut s = state.lock().await;
     s.snapshot = Some(snap);
     s.unreachable = false;
     s.icon_state = new_icon_state;
+    drop(s);
+    refresh.send_replace(());
+}
+
+async fn mark_unreachable(state: &Arc<Mutex<TrayState>>, refresh: &RefreshSender) {
+    let mut s = state.lock().await;
+    if !s.unreachable {
+        warn!("ipc stream lost; entering reconnect loop");
+    }
+    s.unreachable = true;
+    s.icon_state = IconState::Unreachable;
+    drop(s);
+    refresh.send_replace(());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap() -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![],
+            pending_reload: None,
+            rollback: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_snapshot_notifies_refresh_after_state_is_visible() {
+        let state = Arc::new(Mutex::new(TrayState::new("/tmp/dormant.sock".into())));
+        {
+            let mut state = state.lock().await;
+            state.unreachable = true;
+            state.icon_state = IconState::Unreachable;
+        }
+        let snapshot = snap();
+        let (refresh, mut changed) = refresh_channel();
+        publish_snapshot(&state, snapshot.clone(), &refresh).await;
+        assert!(changed.has_changed().expect("refresh sender alive"));
+        changed.borrow_and_update();
+        let state = state.lock().await;
+        assert!(!state.unreachable);
+        assert_eq!(state.icon_state, crate::state::derive_icon_state(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn mark_unreachable_notifies_refresh_after_state_is_visible() {
+        let state = Arc::new(Mutex::new(TrayState::new("/tmp/dormant.sock".into())));
+        {
+            let mut state = state.lock().await;
+            state.unreachable = false;
+            state.icon_state = IconState::Normal;
+        }
+        let (refresh, mut changed) = refresh_channel();
+        mark_unreachable(&state, &refresh).await;
+        assert!(changed.has_changed().expect("refresh sender alive"));
+        changed.borrow_and_update();
+        let state = state.lock().await;
+        assert!(state.unreachable);
+        assert_eq!(state.icon_state, IconState::Unreachable);
+    }
 
     // --- Existing tests (updated to new signature) ---
 
@@ -394,7 +456,8 @@ mod tests {
         let state = Arc::new(Mutex::new(TrayState::new(sock.clone())));
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let outcome = tick(&sock, &state, &cancel).await;
+        let (refresh, _changed) = refresh_channel();
+        let outcome = tick(&sock, &state, &cancel, &refresh).await;
 
         assert!(
             !matches!(outcome, TickOutcome::Errored { .. }),

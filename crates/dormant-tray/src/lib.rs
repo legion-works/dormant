@@ -17,18 +17,22 @@
 //! - [`tray_state`] — cross-platform state shared by tray frontends and the
 //!   IPC loop.
 //!
-//! Linux-only:
+//! Linux/macOS:
 //!
 //! - [`ipc_loop`] — the reconnecting event-stream reader driving the tray's
 //!   shared state.
+//!
+//! Linux-only:
 //! - [`tray`] — the [`ksni::Tray`] implementation.
+//!
+//! macOS-only:
+//! - [`tray_macos`] — the `AppKit` status-item implementation.
 //!
 //! ## Crate target
 //!
-//! Linux only.  The `ksni` and `tokio` deps are gated on
-//! `target_os = "linux"` so `cargo check --workspace` stays green on
-//! Windows/macOS portability legs (memory-1718 class — the recurring
-//! cross-platform CI gauntlet).
+//! `ksni` is Linux-only; the Tokio-backed IPC loop is shared by Linux and
+//! macOS. Platform-specific dependencies remain cfg-gated so portability
+//! checks stay green.
 
 #![warn(missing_docs)]
 
@@ -52,7 +56,7 @@ pub mod tray_state;
 /// `web_url` field to the snapshot.
 pub const DEFAULT_WEB_PORT: u16 = 8137;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod ipc_loop;
 #[cfg(target_os = "linux")]
 pub mod tray;

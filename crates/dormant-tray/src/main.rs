@@ -1,10 +1,11 @@
 //! `dormant-tray` binary entry point.
 //!
-//! Two cfg-gated variants:
+//! Three cfg-gated variants:
 //!
 //! - **Linux**: spawns the [`ksni`] tray, wires up the IPC loop on a
 //!   tokio runtime, and waits for Quit / Ctrl-C.
-//! - **other**: prints `"dormant-tray is Linux-only"` and exits 1.
+//! - **macOS**: runs the `AppKit` status item on the process main thread.
+//! - **other**: prints an unsupported-platform error and exits 1.
 //!   Keeps `cargo check --workspace` green on the Windows/macOS
 //!   portability legs (memory-1718 — cross-platform CI gauntlet).
 
@@ -34,20 +35,24 @@ fn main() -> ExitCode {
     install_tracing();
 
     #[cfg(target_os = "linux")]
+    let result = run_linux();
+
+    #[cfg(target_os = "macos")]
+    let result = dormant_tray::tray_macos::run();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        match run_linux() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("dormant-tray: {e:#}");
-                ExitCode::FAILURE
-            }
-        }
+        eprintln!("dormant-tray is not supported on this platform");
+        ExitCode::from(1)
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("dormant-tray is Linux-only");
-        ExitCode::from(1)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("dormant-tray: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -32,6 +32,7 @@ pub type RefreshSender = watch::Sender<()>;
 pub type RefreshReceiver = watch::Receiver<()>;
 
 /// Create a channel that signals visible tray-state mutations.
+#[must_use]
 pub fn refresh_channel() -> (RefreshSender, RefreshReceiver) {
     watch::channel(())
 }
@@ -140,6 +141,9 @@ pub async fn run(
                 *connected
             }
         };
+        if !state.lock().await.unreachable {
+            warn!(?backoff, "ipc stream lost; entering reconnect loop");
+        }
         mark_unreachable(&state, &refresh).await;
         tokio::select! {
             () = cancel.cancelled() => return,
@@ -272,10 +276,8 @@ async fn publish_snapshot(
 
 async fn mark_unreachable(state: &Arc<Mutex<TrayState>>, refresh: &RefreshSender) {
     let mut s = state.lock().await;
-    if !s.unreachable {
-        warn!("ipc stream lost; entering reconnect loop");
-    }
     s.unreachable = true;
+    s.snapshot = None;
     s.icon_state = IconState::Unreachable;
     drop(s);
     refresh.send_replace(());
@@ -320,6 +322,7 @@ mod tests {
             let mut state = state.lock().await;
             state.unreachable = false;
             state.icon_state = IconState::Normal;
+            state.snapshot = Some(snap());
         }
         let (refresh, mut changed) = refresh_channel();
         mark_unreachable(&state, &refresh).await;
@@ -328,6 +331,7 @@ mod tests {
         let state = state.lock().await;
         assert!(state.unreachable);
         assert_eq!(state.icon_state, IconState::Unreachable);
+        assert!(state.snapshot.is_none());
     }
 
     // --- Existing tests (updated to new signature) ---

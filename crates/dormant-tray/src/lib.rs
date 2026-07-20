@@ -32,6 +32,8 @@
 
 #![warn(missing_docs)]
 
+/// Tagged projection of menu actions for platform target/action callbacks.
+pub mod action_table;
 /// Pure action planning and injected platform I/O execution.
 #[cfg(unix)]
 pub mod dispatch;
@@ -54,3 +56,5 @@ pub const DEFAULT_WEB_PORT: u16 = 8137;
 pub mod ipc_loop;
 #[cfg(target_os = "linux")]
 pub mod tray;
+#[cfg(target_os = "macos")]
+pub mod tray_macos;

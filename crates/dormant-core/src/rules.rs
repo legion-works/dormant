@@ -402,6 +402,11 @@ pub enum DaemonEvent {
         #[serde(default)]
         attempts: u64,
     },
+    /// First frame emitted on a fresh event-stream connection, per-connection
+    /// (never broadcast). Marks that the daemon-side broadcast receiver is
+    /// registered, so events emitted after this line will be delivered.
+    /// Consumers may ignore it.
+    Subscribed,
     /// Wire-tolerance catch-all: any event tag this build does not
     /// recognize deserializes to this variant instead of failing the whole
     /// stream.  The daemon never constructs this — see

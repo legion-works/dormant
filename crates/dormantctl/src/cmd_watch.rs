@@ -95,6 +95,7 @@ fn fmt_event(event: &DaemonEvent) -> String {
         DaemonEvent::WakeRecovered { display, attempts } => {
             format!("display {display}: wake recovered after {attempts} attempts")
         }
+        DaemonEvent::Subscribed => "event stream subscribed".to_string(),
         DaemonEvent::Unknown => "unknown daemon event".to_string(),
     }
 }

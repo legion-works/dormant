@@ -7,18 +7,15 @@
 //! lives in the platform-neutral modules; this file is the thin
 //! glue that hands the data to `ksni` and dispatches menu actions.
 
-use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
-use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::rules::StateSnapshot;
-use dormantctl::client;
 use ksni::menu::{MenuItem, StandardItem, SubMenu};
 use ksni::{Icon, Tray, TrayMethods};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::warn;
 
+use crate::dispatch::{DispatchCapabilities, SystemCapabilities, execute_plan, plan_action};
 use crate::icon::{IconSet, SIZES};
 use crate::menu::{Action, MenuEntry};
 use crate::state::IconState;
@@ -195,8 +192,7 @@ fn menu_entry_to_ksni(entry: MenuEntry) -> MenuItem<DormantTray> {
     }
 }
 
-/// Build a `StandardItem` whose `activate` closure dispatches the given
-/// action through the shared IPC client.
+/// Build a `StandardItem` whose `activate` closure dispatches the given action.
 fn action_item(action: Action) -> StandardItem<DormantTray> {
     let mut item: StandardItem<DormantTray> = StandardItem {
         label: String::new(),
@@ -216,98 +212,23 @@ fn action_item(action: Action) -> StandardItem<DormantTray> {
         };
         let action_clone = action.clone();
         rt.spawn(async move {
-            if let Err(e) = dispatch(&state, action_clone).await {
+            let (socket, snapshot, unreachable) = {
+                let current = state.lock().await;
+                (
+                    current.socket_path.clone(),
+                    current.snapshot.clone(),
+                    current.unreachable,
+                )
+            };
+            let plan = plan_action(&action_clone, snapshot.as_ref(), unreachable);
+            let capabilities: Arc<dyn DispatchCapabilities> =
+                Arc::new(SystemCapabilities::new(Arc::new(crate::tray::request_quit)));
+            if let Err(e) = execute_plan(plan, socket, capabilities).await {
                 warn!(error = %e, "menu action dispatch failed");
             }
         });
     });
     item
-}
-
-/// Dispatch a menu action through the IPC client.
-async fn dispatch(state: &Arc<Mutex<TrayState>>, action: Action) -> Result<()> {
-    let (socket, paused_active) = {
-        let s = state.lock().await;
-        (s.socket_path.clone(), s.unreachable)
-    };
-    if paused_active && !matches!(action, Action::OpenWebUi { .. } | Action::Quit) {
-        // Defensive — the menu model already disables these in the UI;
-        // the runtime check is a belt-and-braces guard.
-        return Ok(());
-    }
-
-    let req = match action {
-        Action::Pause(dur) => IpcRequest::Pause {
-            rule: None,
-            duration_s: dur.map(|d| d.as_secs()),
-        },
-        Action::Resume => IpcRequest::Resume { rule: None },
-        Action::BlankAll => {
-            // Fan out Blank to every display the snapshot currently knows
-            // about.  Each call is independent.
-            let displays: Vec<String> = {
-                let s = state.lock().await;
-                s.snapshot.as_ref().map_or(vec![], |snap| {
-                    snap.displays.iter().map(|(id, _)| id.clone()).collect()
-                })
-            };
-            for id in displays {
-                send_one(&socket, &IpcRequest::Blank { display: id }).await?;
-            }
-            return Ok(());
-        }
-        Action::WakeAll => {
-            let displays: Vec<String> = {
-                let s = state.lock().await;
-                s.snapshot.as_ref().map_or(vec![], |snap| {
-                    snap.displays.iter().map(|(id, _)| id.clone()).collect()
-                })
-            };
-            for id in displays {
-                send_one(&socket, &IpcRequest::Wake { display: id }).await?;
-            }
-            return Ok(());
-        }
-        Action::BlankOne(id) => IpcRequest::Blank { display: id },
-        Action::WakeOne(id) => IpcRequest::Wake { display: id },
-        Action::OpenWebUi { port } => {
-            open_web_ui(port);
-            return Ok(());
-        }
-        Action::Quit => {
-            // The ksni Handle lives in main; we surface a quit request
-            // by cancelling the runtime's shutdown token.  We can't get
-            // to it from here, so main installs a oneshot receiver.
-            // (See main.rs for the wire-up.)
-            crate::tray::request_quit();
-            return Ok(());
-        }
-        Action::Separator => return Ok(()),
-    };
-    send_one(&socket, &req).await
-}
-
-async fn send_one(socket: &Path, req: &IpcRequest) -> Result<()> {
-    let socket = socket.to_path_buf();
-    let req = req.clone();
-    let resp = tokio::task::spawn_blocking(move || client::send_request(&socket, &req)).await??;
-    if !resp.ok {
-        anyhow::bail!(
-            "daemon returned error: {}",
-            resp.error.as_deref().unwrap_or("unknown")
-        );
-    }
-    Ok(())
-}
-
-fn open_web_ui(port: u16) {
-    let url = format!("http://127.0.0.1:{port}");
-    // Best-effort — `xdg-open` may not be installed everywhere; failures
-    // are logged at WARN and not propagated back to the menu.
-    match std::process::Command::new("xdg-open").arg(&url).spawn() {
-        Ok(_) => info!(%url, "opened web UI"),
-        Err(e) => warn!(error = %e, %url, "xdg-open failed"),
-    }
 }
 
 // ── Quit signalling ──────────────────────────────────────────────────────────

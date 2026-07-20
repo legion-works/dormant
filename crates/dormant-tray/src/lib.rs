@@ -11,6 +11,7 @@
 //! - [`tooltip`] — pure-logic tooltip construction.
 //! - [`menu`] — pure-logic menu model construction (without `ksni` types so
 //!   it can be unit-tested against canned snapshots).
+//! - [`dispatch`] — pure action plans plus injected platform I/O execution.
 //! - [`icon`] — pixmap construction + runtime variant overlays (paused
 //!   badge, greying).  Pure pixel ops, no D-Bus.
 //! - [`tray_state`] — cross-platform state shared by tray frontends and the
@@ -31,6 +32,9 @@
 
 #![warn(missing_docs)]
 
+/// Pure action planning and injected platform I/O execution.
+#[cfg(unix)]
+pub mod dispatch;
 pub mod icon;
 pub mod menu;
 pub mod state;

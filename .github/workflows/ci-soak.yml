@@ -174,9 +174,11 @@ jobs:
           check_filter reload 'test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload)' || status=1
           check_filter hermeticity 'test(concurrent_apps_keep_wear_paths_and_observations_isolated)' || status=1
           check_filter wear-corruption-and-persistence 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger)' || status=1
-          check_filter watcher-delivery 'test(temp_path_socket_receives_ready_then_watchdog)' || status=1
+          # watcher-delivery (sd_notify temp_path_socket_receives_ready_then_watchdog) is Linux/systemd-only
+          # (cfg(all(test, target_os = "linux")) in sd_notify.rs) — no macOS watchdog parity, so it is
+          # intentionally excluded from the macOS soak set.
           check_filter command-child-process 'test(command::tests::sleep_past_timeout_errs)' || status=1
-          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(temp_path_socket_receives_ready_then_watchdog) or test(command::tests::sleep_past_timeout_errs)'
+          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(command::tests::sleep_past_timeout_errs)'
           set +e
           cargo nextest run --profile soak --workspace --all-features --stress-count 10 --retries 0 -E "$soak_filter" 2>&1 | tee -a "$command_output"
           run_status=${PIPESTATUS[0]}
@@ -239,9 +241,11 @@ jobs:
           check_filter reload 'test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload)' || status=1
           check_filter hermeticity 'test(concurrent_apps_keep_wear_paths_and_observations_isolated)' || status=1
           check_filter wear-corruption-and-persistence 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger)' || status=1
-          check_filter watcher-delivery 'test(temp_path_socket_receives_ready_then_watchdog)' || status=1
+          # watcher-delivery (sd_notify temp_path_socket_receives_ready_then_watchdog) is Linux/systemd-only
+          # (cfg(all(test, target_os = "linux")) in sd_notify.rs) — no macOS watchdog parity, so it is
+          # intentionally excluded from the macOS soak set.
           check_filter command-child-process 'test(command::tests::sleep_past_timeout_errs)' || status=1
-          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(temp_path_socket_receives_ready_then_watchdog) or test(command::tests::sleep_past_timeout_errs)'
+          soak_filter='test(config_watch_updates_on_successful_reload_only) or test(manual_only_display_full_lifecycle_across_reload) or test(concurrent_apps_keep_wear_paths_and_observations_isolated) or test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed) or test(wear_shutdown_persists_final_ledger) or test(command::tests::sleep_past_timeout_errs)'
           set +e
           cargo nextest run --profile soak --workspace --all-features --stress-count 10 --retries 0 -E "$soak_filter" 2>&1 | tee -a "$command_output"
           run_status=${PIPESTATUS[0]}

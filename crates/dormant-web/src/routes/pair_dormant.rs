@@ -179,12 +179,18 @@ mod tests {
     use dormant_doctor::DoctorService;
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::thread;
     use tokio::sync::{broadcast, mpsc, watch};
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
     fn state(enabled: bool) -> WebState {
+        state_with_socket(enabled, None)
+    }
+
+    fn state_with_socket(enabled: bool, socket: Option<&std::path::Path>) -> WebState {
         let (ctl_tx, _ctl_rx) = mpsc::channel::<ControlMsg>(8);
         let (reload_tx, reload_rx) = broadcast::channel(8);
         let (reload_request_tx, _reload_request_rx) = mpsc::channel(8);
@@ -194,7 +200,10 @@ mod tests {
                 ..Default::default()
             },
             config_version: 1,
-            daemon: DaemonConfig::default(),
+            daemon: DaemonConfig {
+                socket_path: socket.map(std::path::Path::to_path_buf),
+                ..DaemonConfig::default()
+            },
             wear: WearConfig::default(),
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
@@ -228,6 +237,42 @@ mod tests {
 
     async fn call(router: axum::Router, request: Request<Body>) -> axum::response::Response {
         router.oneshot(request).await.unwrap()
+    }
+
+    fn ipc_server(
+        socket: &std::path::Path,
+        responses: Vec<IpcResponse>,
+        delay: std::time::Duration,
+    ) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                std::io::BufRead::read_line(
+                    &mut std::io::BufReader::new(stream.try_clone().unwrap()),
+                    &mut request,
+                )
+                .unwrap();
+                thread::sleep(delay);
+                std::io::Write::write_all(
+                    &mut stream,
+                    format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                )
+                .unwrap();
+            }
+        })
+    }
+
+    fn post_open() -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/instance")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", "http://127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"display_name":"Office"}"#))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -288,5 +333,191 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn pair_instance_second_attempt_returns_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ipc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(stream.try_clone().unwrap()),
+                &mut request,
+            )
+            .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let response = IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
+                pair_id: "pair-1".into(),
+                code: "ABCD1234".into(),
+                expires_at: "soon".into(),
+            });
+            std::io::Write::write_all(
+                &mut stream,
+                format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+            )
+            .unwrap();
+        });
+        let router = crate::server::build_router(state_with_socket(true, Some(&socket)));
+        let first = tokio::spawn(call(router.clone(), post_open()));
+        tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let second = call(router, post_open()).await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        release_tx.send(()).unwrap();
+        assert_eq!(first.await.unwrap().status(), StatusCode::ACCEPTED);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pair_instance_cancel_transitions_to_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ipc.sock");
+        let cancelled = dormant_core::ipc_proto::CoordinationPairStatus {
+            pair_id: "pair-1".into(),
+            state: "cancelled".into(),
+            peer_instance_id: None,
+        };
+        let server = ipc_server(
+            &socket,
+            vec![
+                IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
+                    pair_id: "pair-1".into(),
+                    code: "ABCD1234".into(),
+                    expires_at: "soon".into(),
+                }),
+                IpcResponse::coordination_pair(cancelled.clone()),
+                IpcResponse::coordination_pair(cancelled),
+            ],
+            std::time::Duration::ZERO,
+        );
+        let router = crate::server::build_router(state_with_socket(true, Some(&socket)));
+        assert_eq!(
+            call(router.clone(), post_open()).await.status(),
+            StatusCode::ACCEPTED
+        );
+        let cancel = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/instance/pair-1/cancel")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", "http://127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .body(Body::empty())
+            .unwrap();
+        let cancelled = call(router.clone(), cancel).await;
+        assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+        let status = call(
+            router,
+            Request::builder()
+                .uri("/api/pair/instance/pair-1")
+                .header("Host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pair_instance_expiry_surfaces_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ipc.sock");
+        let server = ipc_server(
+            &socket,
+            vec![IpcResponse::coordination_pair(
+                dormant_core::ipc_proto::CoordinationPairStatus {
+                    pair_id: "expired".into(),
+                    state: "timeout".into(),
+                    peer_instance_id: None,
+                },
+            )],
+            std::time::Duration::ZERO,
+        );
+        let router = crate::server::build_router(state_with_socket(true, Some(&socket)));
+        let response = call(
+            router,
+            Request::builder()
+                .uri("/api/pair/instance/expired")
+                .header("Host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("timeout"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pair_instance_responses_and_logs_are_code_free_except_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ipc.sock");
+        let secret = "SENTINEL-CODE";
+        let status = dormant_core::ipc_proto::CoordinationPairStatus {
+            pair_id: "pair-1".into(),
+            state: "cancelled".into(),
+            peer_instance_id: None,
+        };
+        let server = ipc_server(
+            &socket,
+            vec![
+                IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
+                    pair_id: "pair-1".into(),
+                    code: secret.into(),
+                    expires_at: "soon".into(),
+                }),
+                IpcResponse::coordination_pair(status.clone()),
+                IpcResponse::coordination_pair(status),
+                IpcResponse::coordination_peers(CoordinationPeers {
+                    discovered: vec![],
+                    paired: vec![],
+                }),
+            ],
+            std::time::Duration::ZERO,
+        );
+        let router = crate::server::build_router(state_with_socket(true, Some(&socket)));
+        let open = axum::body::to_bytes(
+            call(router.clone(), post_open()).await.into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(std::str::from_utf8(&open).unwrap().contains(secret));
+        for request in [
+            Request::builder()
+                .uri("/api/pair/instance/pair-1")
+                .header("Host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pair/instance/pair-1/cancel")
+                .header("Host", "127.0.0.1:8080")
+                .header("Origin", "http://127.0.0.1:8080")
+                .header("Content-Type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/api/pair/instance/peers")
+                .header("Host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let body =
+                axum::body::to_bytes(call(router.clone(), request).await.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+            assert!(!std::str::from_utf8(&body).unwrap().contains(secret));
+        }
+        server.join().unwrap();
     }
 }

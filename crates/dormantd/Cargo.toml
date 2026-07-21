@@ -30,6 +30,13 @@ async-trait = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
+mdns-sd = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+spake2 = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = [

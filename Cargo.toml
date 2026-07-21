@@ -52,9 +52,15 @@ ddc-hi = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 notify = "7"
-sha2 = "0.10"
+sha2 = "=0.10.9"
 tempfile = "3"
 rand = "0.8"
+base64 = "=0.22.1"
+ed25519-dalek = "=3.0.0"
+hmac = "=0.12.1"
+mdns-sd = "=0.20.2"
+rand_core = "=0.10.1"
+spake2 = "=0.5.0-pre.0"
 
 # The profile that 'dist' will build with
 [profile.dist]

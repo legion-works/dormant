@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod coordination;
 pub mod doctor;
 pub mod error;
 pub mod ipc_proto;

@@ -295,6 +295,9 @@ impl PairingManager {
 }
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CONCURRENT_PAIRING_CONNS: usize = 8;
+// The attempt cap burns code guesses; this separate cap bounds clients that never send a hello.
+const MAX_PAIRING_CONNS_PER_WINDOW: usize = 30;
 
 /// Owns short-lived TCP listeners and their matching mDNS advertisements.
 pub(crate) struct PairingTransport<B: MdnsBackend + 'static> {
@@ -489,6 +492,9 @@ async fn run_listener<B: MdnsBackend + 'static>(
     pair_id: String,
     cancel: tokio_util::sync::CancellationToken,
 ) {
+    use tokio::sync::{Semaphore, mpsc};
+    use tokio::task::JoinSet;
+
     let deadline = manager
         .windows
         .lock()
@@ -496,7 +502,14 @@ async fn run_listener<B: MdnsBackend + 'static>(
         .get(&pair_id)
         .map_or_else(Instant::now, |window| window.expires_at);
     let deadline = tokio::time::Instant::from_std(deadline);
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_PAIRING_CONNS));
+    let (success_tx, mut success_rx) = mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    let mut connections = 0_usize;
     loop {
+        if connections >= MAX_PAIRING_CONNS_PER_WINDOW {
+            break;
+        }
         tokio::select! {
             () = cancel.cancelled() => break,
             () = tokio::time::sleep_until(deadline) => {
@@ -507,18 +520,39 @@ async fn run_listener<B: MdnsBackend + 'static>(
                 }
                 break;
             }
+            Some(()) = success_rx.recv() => break,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             accepted = listener.accept() => {
                 let Ok((mut stream, _)) = accepted else { break; };
-                let result = tokio::time::timeout(
-                    CONNECTION_TIMEOUT,
-                    run_managed_responder(&mut stream, Arc::clone(&manager), &pair_id),
-                ).await;
-                if matches!(result, Ok(Ok(()))) {
-                    break;
-                }
+                connections += 1;
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    continue;
+                };
+                let manager = Arc::clone(&manager);
+                let pair_id = pair_id.clone();
+                let cancel = cancel.clone();
+                let success_tx = success_tx.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let result = tokio::select! {
+                        () = cancel.cancelled() => Err(PairSessionError::Wire(PairError::Cancelled)),
+                        result = tokio::time::timeout(
+                            CONNECTION_TIMEOUT,
+                            run_managed_responder(&mut stream, manager, &pair_id),
+                        ) => match result {
+                            Ok(result) => result,
+                            Err(_) => Err(PairSessionError::Local("pairing connection timed out".to_owned())),
+                        },
+                    };
+                    if result.is_ok() {
+                        let _ = success_tx.send(());
+                    }
+                });
             }
         }
     }
+    cancel.cancel();
+    while tasks.join_next().await.is_some() {}
     discovery
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -578,7 +612,6 @@ where
     let terminal = frame_for_wire(&read_pair_frame(stream).await?);
     let result = responder_receive_result(&terminal, &state)?;
     write_pair_frame(stream, &wire_to_frame(&result)?).await?;
-    responder.persist(&state.remote)?;
     let mut windows = manager
         .windows
         .lock()
@@ -586,7 +619,27 @@ where
     let window = windows
         .get_mut(pair_id)
         .ok_or(PairSessionError::UnknownPair)?;
+    if window.cancelled || window.completed || Instant::now() >= window.expires_at {
+        return Err(PairSessionError::Wire(PairError::Cancelled));
+    }
+    // Reserve completion before the durable write so another completed task cannot persist later.
     window.completed = true;
+    drop(windows);
+    if let Err(error) = responder.persist(&state.remote) {
+        if let Ok(mut windows) = manager.windows.lock()
+            && let Some(window) = windows.get_mut(pair_id)
+        {
+            window.state = PairingState::Error;
+        }
+        return Err(error);
+    }
+    let mut windows = manager
+        .windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let window = windows
+        .get_mut(pair_id)
+        .ok_or(PairSessionError::UnknownPair)?;
     window.state = PairingState::Paired;
     window.peer_instance_id = Some(state.remote.instance_id);
     tracing::info!(event = "pairing_confirmed");
@@ -2163,6 +2216,86 @@ mod tests {
         .await
         .unwrap();
         assert!(initiator.state_dir.join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn parallel_slow_connections_do_not_wedge_window() {
+        let (root, manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        let mut slow = Vec::new();
+        for _ in 0..6 {
+            slow.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        let initiator =
+            LocalPeer::load(root.path().join("initiator"), "Initiator".to_owned()).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(700),
+            run_initiator_over_stream(
+                &mut stream,
+                &initiator,
+                manager.identity.as_ref().unwrap().instance_id.clone(),
+                open.pair_id,
+                open.code.as_bytes(),
+            ),
+        )
+        .await
+        .expect("legitimate peer should not wait for serial slow-connection timeouts")
+        .unwrap();
+        drop(slow);
+        assert!(initiator.state_dir.join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn connection_cap_per_window_enforced() {
+        let (_root, _manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let _open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        let mut connections = Vec::new();
+        for _ in 0..MAX_PAIRING_CONNS_PER_WINDOW {
+            connections.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        drop(connections);
+    }
+
+    #[tokio::test]
+    async fn concurrent_correct_code_connections_pair_at_most_once() {
+        let (root, manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        let initiator_a = LocalPeer::load(root.path().join("initiator-a"), "A".to_owned()).unwrap();
+        let initiator_b = LocalPeer::load(root.path().join("initiator-b"), "B".to_owned()).unwrap();
+        let (mut stream_a, mut stream_b) = tokio::join!(
+            tokio::net::TcpStream::connect(address),
+            tokio::net::TcpStream::connect(address),
+        );
+        let (first, second) = tokio::join!(
+            run_initiator_over_stream(
+                stream_a.as_mut().unwrap(),
+                &initiator_a,
+                manager.identity.as_ref().unwrap().instance_id.clone(),
+                open.pair_id.clone(),
+                open.code.as_bytes(),
+            ),
+            run_initiator_over_stream(
+                stream_b.as_mut().unwrap(),
+                &initiator_b,
+                manager.identity.as_ref().unwrap().instance_id.clone(),
+                open.pair_id,
+                open.code.as_bytes(),
+            ),
+        );
+        assert!(first.is_ok() ^ second.is_ok());
+        let peers: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("peers.json")).unwrap())
+                .unwrap();
+        assert_eq!(peers["peers"].as_array().unwrap().len(), 1);
     }
 
     #[test]

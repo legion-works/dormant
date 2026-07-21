@@ -48,7 +48,7 @@ Every DPMS path (`kwin-dpms` included) tears the output down and takes the audio
 
 ## What's in the box
 
-Three binaries: **`dormantd`** (the daemon), **`dormantctl`** (the CLI), and **`dormant-tray`** (a KDE tray applet).
+Three binaries: **`dormantd`** (the daemon), **`dormantctl`** (the CLI), and **`dormant-tray`** (a desktop tray applet).
 
 ### Sensors
 
@@ -90,7 +90,7 @@ Build with `--features web-ui` for a loopback web dashboard: a live view of the 
 
 Build with `--features render` for blanking that never touches DPMS: a fullscreen black Wayland overlay, an escalation ladder (screensaver → black → power-off on your own dwell timers), and a muted streaming screensaver driven by mpv. The screensaver applies a 2 px pixel shift every 2 minutes by default; the uniform black overlay never shifts.
 
-The `dormant-tray` applet puts per-display status and blank/wake/pause controls in the KDE system tray.
+`dormant-tray` puts per-display status and blank/wake/pause controls in the KDE `StatusNotifierItem` tray on Linux and a native `NSStatusItem` menu-bar item on macOS. See the [installation guide](./docs/src/installation.md#tray-autostart) for systemd and launchd autostart.
 
 ## Quickstart
 
@@ -126,13 +126,14 @@ Checksums are published alongside every artifact; verify with
 Release tarballs include the matching systemd user units on Linux. Manual
 installation and source builds are covered in the [installation guide](./docs/src/installation.md).
 
-On macOS, install the per-user `LaunchAgent` and start it — see
-[Installation: LaunchAgent
+On macOS, install the per-user `LaunchAgents` for the daemon and tray, then
+start them — see [Installation: LaunchAgent
 (macOS)](./docs/src/installation.md#launchagent-macos):
 
 ```bash
 dormantctl launchd install
 launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant.plist"
+launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant-tray.plist"
 ```
 
 ### Build from source (Linux, Rust 1.88+)
@@ -195,7 +196,7 @@ Configuration reference, sensor and controller guides, and the `doctor` command 
 
 ## Status
 
-Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows; macOS (M1) is a genuinely supported target as of this milestone — DDC/CI, Quartz-gamma black, and `pmset` display-sleep controllers, a CoreGraphics idle source, and a launchd `LaunchAgent` — while Windows remains portability-only (no native display control). The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit (Linux). The shipped watchdog restarts a wedged engine on Linux via systemd's `WatchdogSec`; macOS has no equivalent wedged-daemon detection (see [Installation: LaunchAgent (macOS)](./docs/src/installation.md#launchagent-macos)). Last-known-good rollback can recover a bad boot config on both platforms — it is supervisor-agnostic. `dormant-tray` (the KDE tray applet) is Linux-only in function; it is packaged for macOS but nonfunctional there until M2.
+Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows; macOS (M1) is a genuinely supported target as of this milestone — DDC/CI, Quartz-gamma black, and `pmset` display-sleep controllers, a CoreGraphics idle source, launchd `LaunchAgents`, and a native menu-bar tray item — while Windows remains portability-only (no native display control). The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit (Linux). The shipped watchdog restarts a wedged engine on Linux via systemd's `WatchdogSec`; macOS has no equivalent wedged-daemon detection (see [Installation: LaunchAgent (macOS)](./docs/src/installation.md#launchagent-macos)). Last-known-good rollback can recover a bad boot config on both platforms — it is supervisor-agnostic.
 
 It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
 

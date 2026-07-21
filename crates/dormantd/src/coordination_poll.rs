@@ -319,6 +319,71 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn second_same_verdict_success_does_not_poke_again() {
+        let sink = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x12)), Ok(Some(0x12))]));
+        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
+        tick().await;
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::OwnershipPoll { .. })
+        ));
+        tick().await;
+        assert!(ctl_rx.try_recv().is_err());
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_shared_display_polls_independently() {
+        let failing = Arc::new(ScriptedSink::with_inputs([Err("unavailable".to_string())]));
+        let healthy = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x12))]));
+        let (config_tx, executors_tx, mut ctl_rx, state, cancel) = setup(failing);
+        state.reconcile_shared([
+            DisplayId("shared".to_string()),
+            DisplayId("healthy".to_string()),
+        ]);
+        let mut config = (**config_tx.borrow()).clone();
+        let healthy_config = config.displays["shared"].clone();
+        config
+            .displays
+            .insert("healthy".to_string(), healthy_config);
+        config_tx.send_replace(Arc::new(config));
+        let mut executors = (*executors_tx.borrow()).as_ref().clone();
+        executors.insert(
+            DisplayId("healthy".to_string()),
+            healthy as Arc<dyn CommandSink>,
+        );
+        executors_tx.send_replace(Arc::new(executors));
+        tokio::task::yield_now().await;
+        tick().await;
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::OwnershipPoll { display }) if display == DisplayId("healthy".to_string())
+        ));
+        assert!(state.snapshot()[&DisplayId("shared".to_string())].owned);
+        assert!(!state.snapshot()[&DisplayId("healthy".to_string())].owned);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_interval_change_via_config_reload_applies() {
+        let sink = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x11)), Ok(Some(0x11))]));
+        let (config_tx, _executors_tx, _ctl_rx, _state, cancel) = setup(sink.clone());
+        tick().await;
+        assert_eq!(sink.reads(), 1);
+        let mut config = (**config_tx.borrow()).clone();
+        config.coordination.poll_interval = Duration::from_secs(3);
+        config_tx.send_replace(Arc::new(config));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.reads(), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(sink.reads(), 2);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn transient_error_holds_false_and_does_not_poke() {
         let sink = Arc::new(ScriptedSink::with_inputs([
             Ok(Some(0x12)),

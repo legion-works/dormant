@@ -128,6 +128,9 @@ impl CoordinationHandle {
     }
 
     /// Whether any input-source read has succeeded since this display was seeded.
+    /// Test-only observability — production ownership decisions must use
+    /// [`CoordinationGate::owns`].
+    #[doc(hidden)]
     #[must_use]
     pub fn has_successful_read(&self, display: &DisplayId) -> bool {
         self.records

@@ -10,7 +10,8 @@
 //! `runtime.block_on(boot::boot(plan, inputs))`, which owns the actual
 //! build/lock/start/rollback machinery (`dormantd::boot`).
 
-#[allow(dead_code)] // T8 anchors this module in App startup.
+// Spawned from App startup once the coordination gate is wired (see app.rs).
+#[allow(dead_code)]
 mod coordination_poll;
 mod main_sequence;
 

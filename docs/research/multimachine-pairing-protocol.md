@@ -21,6 +21,10 @@ aborts the session and leaves no peer record on disk. The identity and
 protocol-version fields in that transcript prevent identity substitution and
 version downgrade from being accepted as a paired session.
 
+The selected stable PAKE stack is `spake2 v0.4.0`, which pulls
+`curve25519-dalek v4.1.3`. Both manifests declare Rust 1.60, below the
+workspace MSRV of Rust 1.88.
+
 `opaque-ke` is rejected because it has the wrong shape: it is an augmented
 PAKE with a client and a server holding a stored verifier. Dormant pairing is a
 symmetric peer-to-peer operation between two instances; it does not need a
@@ -57,7 +61,11 @@ port.
 `dormant_core::paths::state_dir()/instance-key` contains the private identity
 material. It is created with an atomic write and mode `0600`; its raw private
 bytes never enter logs, IPC replies, or web responses. The public instance ID
-is the base64url-without-padding encoding of the Ed25519 verifying key.
+and peer public-key field encode the same 32-byte Ed25519 verifying key:
+`instance_id` is base64url without padding, while `ed25519_pub` is standard
+base64. The daemon recomputes `instance_id` from key bytes when loading
+`peers.json` and when receiving `IdentityExchange`; a stored or claimed ID that
+does not match `ed25519_pub` is a hard error.
 
 ```rust
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -104,9 +112,21 @@ shape:
 
 `paired_at` is RFC 3339 UTC. Additive peer-store fields use `#[serde(default)]`;
 a breaking shape change increments `version` and gets an explicit migration.
-Duplicate `instance_id` records are replaced only after a fresh successful
-pairing with that same verified public key; an ID with a different key is a
-hard error requiring operator removal of the prior peer.
+A `peers.json` load containing duplicate `instance_id` records is a hard error:
+the daemon logs `event = "peer_store_invalid"`, refuses to load the peer store,
+and disables pairing until an operator fixes the file. It never silently picks
+one record. After a successful pairing, updating an existing record requires
+the same verified public key; an ID with a different key is a hard error.
+
+### Secret hygiene
+
+`spake2 v0.4.0` returns the session key as `Vec<u8>`. The implementation wraps
+that key in `zeroize::Zeroizing<Vec<u8>>` immediately, keeps intermediate
+SPAKE2 state in zeroizing storage, and drops both only after both HMAC
+confirmations complete or the session aborts. No key bytes, SPAKE2 message, or
+pairing code may be formatted into a log, status response, or error detail.
+`ed25519-dalek` is built with its `zeroize` feature (also part of its default
+feature set), so `SigningKey` zeroizes on drop.
 
 ## Wire protocol
 
@@ -146,6 +166,7 @@ pub enum PairFrame {
         protocol_version: u16,
         role: PairRole,
         instance_id: String,
+        display_name: String,
         window_id: String,
         nonce: String,
     },
@@ -172,7 +193,12 @@ pub enum PairError {
 `DiscoverAnnounce` maps directly to mDNS TXT records named `v`, `instance_id`,
 `display_name`, `pairing_port`, and `window_id`; the advertised service port is
 the same `pairing_port`. Discovery data is not proof of identity and is not
-persisted. `PairHello` verifies the protocol version before SPAKE2 begins.
+persisted. Before connecting, the initiator validates that `v` is present and
+strictly equal to `PAIR_PROTOCOL_VERSION`; `pairing_port` parses as a `u16` in
+`1..=65535`; `instance_id` base64url-decodes to exactly 32 bytes; `window_id`
+is present and non-empty; and `display_name` is present. Any invalid TXT record
+is skipped without opening TCP. `PairHello` performs the same strict equality
+check for `PAIR_PROTOCOL_VERSION = 2` before SPAKE2 begins.
 
 The initiator sends `PairHello`, `Spake2Msg1`, and `IdentityExchange`; the
 responder sends `Spake2Msg2` and `IdentityExchange`; both then send
@@ -185,13 +211,25 @@ single-use: once a session succeeds, every later frame for its `window_id` is
 rejected. Closing a failed connection does not reset its counted attempt.
 
 For a session key `K` returned by SPAKE2, each side computes
-`HMAC-SHA256(K, transcript)`. `transcript` is the unambiguous concatenation of
-the following values, in this order: big-endian `protocol_version`; length-
-prefixed ASCII role labels `initiator` then `responder`; length-prefixed UTF-8
-initiator and responder instance IDs; 32 raw bytes of initiator then responder
-Ed25519 public keys; then 32 raw bytes of initiator then responder nonces. A
-peer accepts only an exact 32-byte MAC equality. The version is therefore bound
-before a downgrade can become a paired state.
+`HMAC-SHA256(K, transcript)`. Every variable-width value below has a `u16`
+big-endian byte count immediately followed by its bytes. The exact transcript
+layout is, in order:
+
+1. `protocol_version` as one `u16` big-endian value.
+2. `initiator` as its `u16` big-endian byte count followed by ASCII bytes.
+3. `responder` as its `u16` big-endian byte count followed by ASCII bytes.
+4. Initiator `instance_id` as its `u16` big-endian byte count followed by UTF-8 bytes.
+5. Responder `instance_id` as its `u16` big-endian byte count followed by UTF-8 bytes.
+6. Initiator `display_name` as its `u16` big-endian byte count followed by UTF-8 bytes.
+7. Responder `display_name` as its `u16` big-endian byte count followed by UTF-8 bytes.
+8. The initiator's 32 raw Ed25519 public-key bytes, with no prefix.
+9. The responder's 32 raw Ed25519 public-key bytes, with no prefix.
+10. The initiator's 32 raw nonce bytes, with no prefix.
+11. The responder's 32 raw nonce bytes, with no prefix.
+
+A peer accepts only an exact 32-byte MAC equality. The version and both display
+names are therefore bound before a downgrade or name substitution can become a
+paired state.
 
 Operator cancellation cancels the local task, removes the advertisement, closes
 the listener or TCP stream, and sends `PairResult { accepted: false,
@@ -232,6 +270,13 @@ enforces the ten-attempt limit. An attacker can proxy or modify SPAKE2 traffic;
 the transcript-bound key confirmation fails. An attacker can offer an older
 protocol version; the version check plus its inclusion in the confirmation MAC
 prevents a downgrade from succeeding.
+
+`instance_id` in the TXT record is a stable cross-window correlation identifier.
+That privacy trade-off is accepted because it is advertised only during an
+operator-initiated pairing window. The attempt counter increments when a
+`PairHello` is received, so any LAN client can cheaply consume the ten-attempt
+budget and deny this window. This is accepted because the window is short,
+operator-initiated, and can be retried without persisting a peer.
 
 An on-path attacker during the active window can drop, delay, or flood traffic
 and deny service to pairing. That denial of service is not defended; no peer is

@@ -38,4 +38,5 @@ mod pairing_dep_probe {
     use rand_core as _;
     use sha2 as _;
     use spake2 as _;
+    use zeroize as _;
 }

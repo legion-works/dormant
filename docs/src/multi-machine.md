@@ -54,6 +54,9 @@ state, or a liveness heartbeat. MQTT is not required.
    `GET /api/pair/instance/peers`, and join at
    `POST /api/pair/instance/join`.
 
+   The web UI's `DormantPairing.tsx` component opens the pairing window, shows
+   the one-time code and expiry, and polls pairing status.
+
    The CLI has the same responder/initiator flow:
 
    ```bash

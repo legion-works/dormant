@@ -127,8 +127,9 @@ impl CoordinationHandle {
         displays
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_successful_read(&self, display: &DisplayId) -> bool {
+    /// Whether any input-source read has succeeded since this display was seeded.
+    #[must_use]
+    pub fn has_successful_read(&self, display: &DisplayId) -> bool {
         self.records
             .read()
             .unwrap_or_else(PoisonError::into_inner)

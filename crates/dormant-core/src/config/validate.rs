@@ -11,6 +11,7 @@
 //! The value is then deserialized into [`Config`] without `deny_unknown_fields`.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::types::{BlankMode, SensorId, StageKind};
@@ -59,7 +60,13 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     (
         "coordination",
-        &["enabled", "poll_interval", "pairing_port", "pairing_window"],
+        &[
+            "enabled",
+            "poll_interval",
+            "pairing_port",
+            "pairing_window",
+            "pairing_bind_address",
+        ],
     ),
     // ── audio ───────────────────────────────────────────────────────────────
     (
@@ -794,6 +801,19 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 "coordination pairing_window {pairing_window:?} is outside the permitted 30s..=15m range"
             ),
         });
+    }
+    if let Some(address) = cfg.coordination.pairing_bind_address.as_deref() {
+        let valid_lan_address = address
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        if !valid_lan_address {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "coordination pairing_bind_address {address:?} must be a valid non-loopback, non-wildcard IP address"
+                ),
+            });
+        }
     }
 }
 
@@ -5894,6 +5914,26 @@ availability_payload_offline = "down"
                 "expected pairing_window validation error for {pairing_window}, got {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn bind_address_override_parses_and_rejects_wildcard() {
+        for address in ["0.0.0.0", "127.0.0.1"] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\npairing_bind_address = \"{address}\"\n"
+            ));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.what == crate::error::E_CONFIG_INVALID),
+                "expected E_CONFIG_INVALID for {address}, got {errors:?}"
+            );
+        }
+
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\npairing_bind_address = \"10.1.1.5\"\n",
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 
     #[test]

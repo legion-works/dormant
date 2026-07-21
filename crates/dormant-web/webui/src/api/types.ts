@@ -429,6 +429,7 @@ export interface CoordinationConfig {
   poll_interval?: string;
   pairing_port?: number;
   pairing_window?: string;
+  pairing_bind_address?: string | null;
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */

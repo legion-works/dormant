@@ -134,6 +134,11 @@ pub struct CoordinationConfig {
         with = "humantime_serde"
     )]
     pub pairing_window: Duration,
+
+    /// LAN address the pairing listener binds during a pairing window; `None` =
+    /// auto-detect the primary non-loopback LAN address.
+    #[serde(default)]
+    pub pairing_bind_address: Option<String>,
 }
 
 impl Default for CoordinationConfig {
@@ -143,6 +148,7 @@ impl Default for CoordinationConfig {
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
             pairing_port: defaults::COORDINATION_PAIRING_PORT,
             pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
+            pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
         }
     }
 }
@@ -2037,12 +2043,13 @@ idle_source = "macos"
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(2));
         assert_eq!(cfg.coordination.pairing_port, 0);
         assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(300));
+        assert_eq!(cfg.coordination.pairing_bind_address, None);
     }
 
     #[test]
     fn coordination_enabled_false_parses_in_strict_mode() {
         let cfg: Config = toml::from_str(
-            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\npairing_port = 4567\npairing_window = \"7m\"\n",
+            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\npairing_port = 4567\npairing_window = \"7m\"\npairing_bind_address = \"10.1.1.5\"\n",
         )
         .unwrap();
 
@@ -2050,5 +2057,9 @@ idle_source = "macos"
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(3));
         assert_eq!(cfg.coordination.pairing_port, 4567);
         assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(420));
+        assert_eq!(
+            cfg.coordination.pairing_bind_address.as_deref(),
+            Some("10.1.1.5")
+        );
     }
 }

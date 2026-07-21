@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use dormant_core::peers::{
-    PAIR_PROTOCOL_VERSION, PairError, PairFrame, PairRole, PeerRecord, build_pairing_transcript,
-    instance_id_from_public_key, load_or_create_identity, upsert_peer,
+    MAX_PAIR_FRAME_BYTES, PAIR_PROTOCOL_VERSION, PairError, PairFrame, PairRole, PeerRecord,
+    build_pairing_transcript, instance_id_from_public_key, load_or_create_identity, upsert_peer,
 };
 use ed25519_dalek::VerifyingKey;
 use hmac::{Hmac, Mac};
@@ -949,16 +949,80 @@ fn frames_to_wire(frames: &[PairFrame]) -> Vec<Vec<u8>> {
 
 #[allow(dead_code, reason = "Task 14 parses length-prefixed TCP frames.")]
 fn wire_to_frame(wire: &[u8]) -> Result<PairFrame, PairSessionError> {
-    // TODO(T14): parse exactly one length-prefixed frame from a TCP byte stream.
     if wire.len() < 5 {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
-    let length = u32::from_be_bytes(wire[..4].try_into().expect("exact prefix"));
+    let length_bytes = wire[..4]
+        .try_into()
+        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
+    let length = u32::from_be_bytes(length_bytes);
     let payload = &wire[4..];
-    if !(1..=65_536).contains(&length) || usize::try_from(length).ok() != Some(payload.len()) {
+    if !(1..=MAX_PAIR_FRAME_BYTES).contains(&length)
+        || usize::try_from(length).ok() != Some(payload.len())
+    {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
     serde_json::from_slice(payload).map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))
+}
+
+/// Serialize and write exactly one length-prefixed pairing frame.
+#[allow(
+    dead_code,
+    reason = "Task 14a-2's pairing lifecycle writes frames after a TCP connection opens."
+)]
+async fn write_pair_frame<W>(writer: &mut W, frame: &PairFrame) -> Result<(), PairSessionError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let payload = serde_json::to_vec(frame)
+        .map_err(|error| PairSessionError::Local(format!("serialize pairing frame: {error}")))?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
+    if !(1..=MAX_PAIR_FRAME_BYTES).contains(&length) {
+        return Err(PairSessionError::Wire(PairError::InvalidFrame));
+    }
+
+    writer
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| PairSessionError::Local(format!("write pairing frame length: {error}")))?;
+    writer
+        .write_all(&payload)
+        .await
+        .map_err(|error| PairSessionError::Local(format!("write pairing frame payload: {error}")))
+}
+
+/// Read and deserialize exactly one bounded length-prefixed pairing frame.
+#[allow(
+    dead_code,
+    reason = "Task 14a-2's pairing lifecycle reads frames after a TCP connection opens."
+)]
+async fn read_pair_frame<R>(reader: &mut R) -> Result<PairFrame, PairSessionError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut length_bytes = [0_u8; 4];
+    reader
+        .read_exact(&mut length_bytes)
+        .await
+        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
+    let length = u32::from_be_bytes(length_bytes);
+    if !(1..=MAX_PAIR_FRAME_BYTES).contains(&length) {
+        return Err(PairSessionError::Wire(PairError::InvalidFrame));
+    }
+
+    let payload_len =
+        usize::try_from(length).map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
+    let mut payload = vec![0_u8; payload_len];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
+    serde_json::from_slice(&payload).map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))
 }
 
 #[cfg(test)]
@@ -1214,11 +1278,66 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt as _;
 
     macro_rules! assert_wire_error {
         ($actual:expr, $expected:pat) => {
             assert!(matches!($actual, Err(PairSessionError::Wire($expected))));
         };
+    }
+
+    #[tokio::test]
+    async fn frame_codec_roundtrips() {
+        let frame = PairFrame::PairResult {
+            accepted: true,
+            error: None,
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+
+        write_pair_frame(&mut writer, &frame).await.unwrap();
+        let decoded = read_pair_frame(&mut reader).await.unwrap();
+
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(frame).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_codec_rejects_oversized_without_alloc() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&(MAX_PAIR_FRAME_BYTES + 1).to_be_bytes())
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), read_pair_frame(&mut reader)).await;
+
+        assert!(matches!(
+            result,
+            Ok(Err(PairSessionError::Wire(PairError::InvalidFrame)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn frame_codec_rejects_truncated_stream() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(&10_u32.to_be_bytes()).await.unwrap();
+        writer.write_all(b"bad").await.unwrap();
+        drop(writer);
+
+        assert_wire_error!(read_pair_frame(&mut reader).await, PairError::InvalidFrame);
+    }
+
+    #[tokio::test]
+    async fn frame_codec_rejects_bad_json() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(&3_u32.to_be_bytes()).await.unwrap();
+        writer.write_all(b"{{}").await.unwrap();
+        drop(writer);
+
+        assert_wire_error!(read_pair_frame(&mut reader).await, PairError::InvalidFrame);
     }
 
     #[test]

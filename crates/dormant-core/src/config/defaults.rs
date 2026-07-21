@@ -109,6 +109,10 @@ pub const COORDINATION_PAIRING_PORT: u16 = 0;
 /// Maximum lifetime of an operator-initiated pairing window.
 pub const COORDINATION_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 
+/// Optional LAN address for a pairing listener; `None` selects the primary LAN
+/// address from the operating system's route table.
+pub const COORDINATION_PAIRING_BIND_ADDRESS: Option<&str> = None;
+
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);

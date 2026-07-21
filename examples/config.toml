@@ -74,6 +74,7 @@ config_version = 1
 # [coordination]
 # enabled = false               # mDNS discovery, pairing, and operator routes
 # poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
+# pairing_bind_address = "10.0.0.5" # omit to auto-detect the primary non-loopback LAN address
 
 # ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────
 #

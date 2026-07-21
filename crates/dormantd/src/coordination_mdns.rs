@@ -1,8 +1,9 @@
 //! mDNS advertisement and browsing for short-lived instance-pairing windows.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use dormant_core::coordination::CoordinationHandle;
 use dormant_core::peers::{DiscoverAnnounce, PAIR_PROTOCOL_VERSION};
@@ -15,7 +16,12 @@ pub const PAIR_SERVICE_TYPE: &str = "_dormant._tcp.local.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowseEvent {
     /// A responder is advertising a live pairing window.
-    Resolved(DiscoverAnnounce),
+    Resolved {
+        /// Validated TXT announcement carried by the service.
+        peer: DiscoverAnnounce,
+        /// Socket addresses reported by the mDNS resolver for this service.
+        addresses: BTreeSet<SocketAddr>,
+    },
     /// A responder has withdrawn its pairing window.
     Expired {
         /// Stable identifier of the responder whose discovery record expired.
@@ -59,6 +65,7 @@ pub struct PairDiscovery<B> {
     coordination: CoordinationHandle,
     advertisement: Option<Box<dyn AdvertisementHandle>>,
     browse: Option<Box<dyn BrowseStream>>,
+    resolved_addrs: BTreeMap<String, SocketAddr>,
     backend: B,
 }
 
@@ -71,6 +78,7 @@ impl<B: MdnsBackend> PairDiscovery<B> {
             coordination,
             advertisement: None,
             browse: None,
+            resolved_addrs: BTreeMap::new(),
             backend,
         }
     }
@@ -131,15 +139,21 @@ impl<B: MdnsBackend> PairDiscovery<B> {
 
         while let Some(event) = browse.try_next()? {
             match event {
-                BrowseEvent::Resolved(peer)
+                BrowseEvent::Resolved { peer, addresses }
                     if peer.instance_id != self.local_instance_id && valid_announce(&peer) =>
                 {
+                    self.resolved_addrs.remove(&peer.instance_id);
+                    if let Some(address) = select_resolved_addr(&addresses, peer.pairing_port) {
+                        self.resolved_addrs
+                            .insert(peer.instance_id.clone(), address);
+                    }
                     self.coordination.upsert_discovered_peer(peer);
                 }
                 BrowseEvent::Expired { instance_id } => {
                     self.coordination.expire_discovered_peer(&instance_id);
+                    self.resolved_addrs.remove(&instance_id);
                 }
-                BrowseEvent::Resolved(_) => {}
+                BrowseEvent::Resolved { .. } => {}
             }
         }
         Ok(())
@@ -150,6 +164,65 @@ impl<B: MdnsBackend> PairDiscovery<B> {
     pub fn discovered_peers(&self) -> BTreeMap<String, DiscoverAnnounce> {
         self.coordination.discovered_peers().into_iter().collect()
     }
+
+    /// Return the ephemeral connect address for one currently discovered peer.
+    #[must_use]
+    pub fn discovered_peer_addr(&self, instance_id: &str) -> Option<SocketAddr> {
+        self.resolved_addrs.get(instance_id).copied()
+    }
+}
+
+fn select_resolved_addr(addresses: &BTreeSet<SocketAddr>, pairing_port: u16) -> Option<SocketAddr> {
+    addresses
+        .iter()
+        .copied()
+        .find(|address| !address.ip().is_loopback() && !address.ip().is_unspecified())
+        // The TXT port is authenticated by the ratified announcement; the
+        // resolver's service port is not trusted as a connect target.
+        .map(|address| SocketAddr::new(address.ip(), pairing_port))
+}
+
+/// Discover the primary LAN address selected by the operating system's route table.
+#[allow(
+    dead_code,
+    reason = "Task 14a-2 resolves the bind target while opening a pairing listener."
+)]
+pub(crate) fn primary_lan_bind_ip() -> Result<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").context("bind UDP socket for LAN address probe")?;
+    socket
+        .connect("192.0.2.1:9")
+        .context("resolve a primary LAN address through the route table")?;
+    let address = socket
+        .local_addr()
+        .context("read primary LAN address from UDP socket")?
+        .ip();
+    ensure_bindable_lan_ip(address)
+}
+
+/// Resolve a validated configuration override or discover the primary LAN address.
+#[allow(
+    dead_code,
+    reason = "Task 14a-2 resolves the bind target while opening a pairing listener."
+)]
+pub(crate) fn resolve_bind_ip(config_override: Option<&str>) -> Result<IpAddr> {
+    match config_override {
+        Some(address) => address
+            .parse()
+            .context("parse coordination pairing_bind_address")
+            .and_then(ensure_bindable_lan_ip),
+        None => primary_lan_bind_ip(),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "Task 14a-2 reaches this through the pairing listener bind resolver."
+)]
+fn ensure_bindable_lan_ip(address: IpAddr) -> Result<IpAddr> {
+    if address.is_loopback() || address.is_unspecified() {
+        bail!("pairing listener requires a non-loopback, non-wildcard LAN address");
+    }
+    Ok(address)
 }
 
 /// Translate a discovery announcement into the ratified TXT surface.
@@ -265,11 +338,11 @@ impl BrowseStream for MdnsSdBrowse {
         match event {
             ServiceEvent::ServiceResolved(resolved) => {
                 let fullname = resolved.get_fullname().to_owned();
-                let peer = announce_from_resolved(&resolved);
-                if let Some(peer) = peer {
+                let resolved_peer = announce_from_resolved(&resolved);
+                if let Some((peer, addresses)) = resolved_peer {
                     self.fullname_to_instance
                         .insert(fullname, peer.instance_id.clone());
-                    Ok(Some(BrowseEvent::Resolved(peer)))
+                    Ok(Some(BrowseEvent::Resolved { peer, addresses }))
                 } else {
                     Ok(None)
                 }
@@ -291,7 +364,9 @@ impl Drop for MdnsSdBrowse {
     }
 }
 
-fn announce_from_resolved(service: &ResolvedService) -> Option<DiscoverAnnounce> {
+fn announce_from_resolved(
+    service: &ResolvedService,
+) -> Option<(DiscoverAnnounce, BTreeSet<SocketAddr>)> {
     let protocol_version = service.get_property_val_str("v")?.parse().ok()?;
     let pairing_port = service.get_property_val_str("pairing_port")?.parse().ok()?;
     let announcement = DiscoverAnnounce {
@@ -301,12 +376,23 @@ fn announce_from_resolved(service: &ResolvedService) -> Option<DiscoverAnnounce>
         pairing_port,
         window_id: service.get_property_val_str("window_id")?.to_owned(),
     };
-    valid_announce(&announcement).then_some(announcement)
+    valid_announce(&announcement).then(|| {
+        (
+            announcement,
+            service
+                .get_addresses()
+                .iter()
+                .map(mdns_sd::ScopedIp::to_ip_addr)
+                .map(|address| SocketAddr::new(address, service.get_port()))
+                .collect(),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, VecDeque};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
 
     use base64::Engine as _;
@@ -314,7 +400,10 @@ mod tests {
     use dormant_core::peers::{DiscoverAnnounce, PAIR_PROTOCOL_VERSION};
     use dormant_core::types::DisplayId;
 
-    use super::{AdvertisementHandle, BrowseEvent, BrowseStream, MdnsBackend, PairDiscovery};
+    use super::{
+        AdvertisementHandle, BrowseEvent, BrowseStream, MdnsBackend, PairDiscovery,
+        primary_lan_bind_ip, resolve_bind_ip,
+    };
 
     #[derive(Clone, Default)]
     struct FakeBackend {
@@ -387,6 +476,13 @@ mod tests {
         }
     }
 
+    fn resolved(peer: DiscoverAnnounce) -> BrowseEvent {
+        BrowseEvent::Resolved {
+            peer,
+            addresses: BTreeSet::new(),
+        }
+    }
+
     fn discovery(backend: FakeBackend, local_instance_id: String) -> PairDiscovery<FakeBackend> {
         PairDiscovery::new(backend, local_instance_id, CoordinationHandle::new([]))
     }
@@ -428,7 +524,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .events
-            .push_back(BrowseEvent::Resolved(service(1)));
+            .push_back(resolved(service(1)));
 
         discovery.drain_browse().unwrap();
         assert!(discovery.discovered_peers().is_empty());
@@ -445,7 +541,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .events
-            .push_back(BrowseEvent::Resolved(peer.clone()));
+            .push_back(resolved(peer.clone()));
         discovery.drain_browse().unwrap();
         assert_eq!(
             discovery.discovered_peers().get(&peer.instance_id),
@@ -462,6 +558,104 @@ mod tests {
             });
         discovery.drain_browse().unwrap();
         assert!(discovery.discovered_peers().is_empty());
+    }
+
+    #[test]
+    fn resolved_addr_retained_and_expired_with_peer() {
+        let backend = FakeBackend::default();
+        let mut discovery = discovery(backend.clone(), instance_id(1));
+        let peer = service(2);
+        let resolved_addr = Ipv4Addr::new(192, 168, 1, 50);
+        discovery.start_browse().unwrap();
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .push_back(BrowseEvent::Resolved {
+                peer: peer.clone(),
+                addresses: BTreeSet::from([SocketAddr::from((resolved_addr, 41_000))]),
+            });
+
+        discovery.drain_browse().unwrap();
+        assert_eq!(
+            discovery.discovered_peer_addr(&peer.instance_id),
+            Some(SocketAddr::from((resolved_addr, peer.pairing_port)))
+        );
+
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .push_back(BrowseEvent::Expired {
+                instance_id: peer.instance_id.clone(),
+            });
+        discovery.drain_browse().unwrap();
+        assert!(discovery.discovered_peer_addr(&peer.instance_id).is_none());
+    }
+
+    #[test]
+    fn malformed_resolved_addr_dropped() {
+        let backend = FakeBackend::default();
+        let mut discovery = discovery(backend.clone(), instance_id(1));
+        let peer = service(2);
+        discovery.start_browse().unwrap();
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .push_back(BrowseEvent::Resolved {
+                peer: peer.clone(),
+                addresses: BTreeSet::from([
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000)),
+                    SocketAddr::from((Ipv4Addr::UNSPECIFIED, 41_000)),
+                ]),
+            });
+
+        discovery.drain_browse().unwrap();
+        assert!(discovery.discovered_peer_addr(&peer.instance_id).is_none());
+    }
+
+    #[test]
+    fn resolved_addr_uses_txt_port_on_mismatch() {
+        let backend = FakeBackend::default();
+        let mut discovery = discovery(backend.clone(), instance_id(1));
+        let peer = service(2);
+        let resolved_addr = Ipv4Addr::new(10, 0, 0, 9);
+        discovery.start_browse().unwrap();
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .push_back(BrowseEvent::Resolved {
+                peer: peer.clone(),
+                addresses: BTreeSet::from([SocketAddr::from((resolved_addr, 41_000))]),
+            });
+
+        discovery.drain_browse().unwrap();
+        assert_eq!(
+            discovery.discovered_peer_addr(&peer.instance_id),
+            Some(SocketAddr::from((resolved_addr, peer.pairing_port)))
+        );
+    }
+
+    #[test]
+    fn primary_lan_address_is_non_loopback_or_errs_gracefully() {
+        match primary_lan_bind_ip() {
+            Ok(ip) => assert!(!ip.is_loopback() && !ip.is_unspecified()),
+            Err(error) => assert!(!error.to_string().is_empty()),
+        }
+    }
+
+    #[test]
+    fn resolve_bind_ip_prefers_override() {
+        assert_eq!(
+            resolve_bind_ip(Some("10.1.1.5")).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 1, 5))
+        );
     }
 
     #[test]
@@ -483,7 +677,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for peer in [bad_version, bad_port, bad_instance_id, missing_window_id] {
-            state.events.push_back(BrowseEvent::Resolved(peer));
+            state.events.push_back(resolved(peer));
         }
         drop(state);
 
@@ -503,7 +697,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .events
-            .push_back(BrowseEvent::Resolved(peer));
+            .push_back(resolved(peer));
 
         discovery.drain_browse().unwrap();
         assert!(discovery.discovered_peers().is_empty());
@@ -521,7 +715,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .events
-            .push_back(BrowseEvent::Resolved(peer));
+            .push_back(resolved(peer));
 
         discovery.drain_browse().unwrap();
         assert!(discovery.discovered_peers().is_empty());
@@ -560,7 +754,7 @@ mod tests {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.events.push_back(BrowseEvent::Resolved(peer.clone()));
+        state.events.push_back(resolved(peer.clone()));
         state.events.push_back(BrowseEvent::Expired {
             instance_id: peer.instance_id,
         });

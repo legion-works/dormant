@@ -53,7 +53,7 @@ use serde::Serialize;
 use dormant_core::config::schema::{Config, Credentials, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
-    load_credentials_from_bytes, validate,
+    load_credentials_from_bytes, validate_with_input_source_readers,
 };
 use dormant_core::observation::{
     ContentRevision, DaemonObservation, GenerationId, ObservationHub, ReloadReceipt, ReloadSource,
@@ -72,6 +72,7 @@ use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry::{
     ControllerBuildContext, build_controllers, capabilities, controller_chain_fingerprint,
+    input_source_readers,
 };
 use dormant_doctor::DoctorService;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -205,7 +206,8 @@ pub fn validate_only(
             };
         }
     };
-    let errors = validate(&cfg, &capabilities(), &creds);
+    let errors =
+        validate_with_input_source_readers(&cfg, &capabilities(), &input_source_readers(), &creds);
     ValidationReport {
         warnings,
         errors,
@@ -2067,7 +2069,12 @@ impl Runner {
         cfg: Config,
         creds: Credentials,
     ) -> Result<StaticAssembly, String> {
-        let errors = validate(&cfg, &capabilities(), &creds);
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &capabilities(),
+            &input_source_readers(),
+            &creds,
+        );
         if !errors.is_empty() {
             return Err(errors
                 .iter()
@@ -3249,6 +3256,7 @@ mod audio_rules_tests {
 
     fn cfg_with_rules(rules: IndexMap<String, RuleConfig>) -> Config {
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),
@@ -4272,6 +4280,8 @@ mod render_tests {
     /// helper to avoid coupling across crates.
     fn base_display_cfg_for_test() -> dormant_core::config::schema::DisplayConfig {
         dormant_core::config::schema::DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: Vec::new(),
             blank_mode: None,
             degraded_mode: None,
@@ -4348,6 +4358,7 @@ mod render_tests {
         use indexmap::IndexMap;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4361,6 +4372,8 @@ mod render_tests {
                 m.insert(
                     "mon".into(),
                     dormant_core::config::schema::DisplayConfig {
+                        scope: dormant_core::config::DisplayScope::default(),
+                        shared_input_code: None,
                         controllers: vec!["command".into()],
                         blank_mode: None,
                         degraded_mode: None,
@@ -4456,6 +4469,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4467,6 +4481,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     // Black-only ladder — NO RenderScreensaver stage.
                     ladder: vec![
@@ -4554,6 +4570,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4565,6 +4582,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![LadderStage {
                         kind: StageKind::RenderBlack,
@@ -4614,6 +4633,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4625,6 +4645,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -4704,6 +4726,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4715,6 +4738,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -4801,6 +4826,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4812,6 +4838,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -4889,6 +4917,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4900,6 +4929,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -5293,6 +5324,8 @@ mod macos_gamma_black_assembly_tests {
     #[tokio::test]
     async fn chain_with_no_effective_mode_fails_assembly_as_mode_unsupported() {
         let display = DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: vec!["command".into()],
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -5323,6 +5356,7 @@ mod macos_gamma_black_assembly_tests {
         displays.insert("panel".to_string(), display);
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),
@@ -5514,6 +5548,8 @@ mod gamma_reload_tests {
 
     fn gamma_display_cfg(controller: &str, selector: &str) -> DisplayConfig {
         DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: vec![controller.into()],
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
@@ -5564,6 +5600,7 @@ mod gamma_reload_tests {
             );
         }
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),

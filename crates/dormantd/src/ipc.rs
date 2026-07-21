@@ -544,6 +544,7 @@ mod tests {
     /// (these tests don't exercise the doctor path).
     fn fake_doctor(ctl_tx: mpsc::Sender<super::ControlMsg>) -> DoctorService {
         let (config_tx, config_rx) = watch::channel(Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

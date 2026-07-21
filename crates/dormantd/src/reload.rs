@@ -146,6 +146,7 @@ pub fn dispatch_relevant_eq(a: &DisplayConfig, b: &DisplayConfig) -> bool {
         samsung_restore_backlight: _a_samsung_restore_backlight,
         treat_unreachable_as_blanked: a_treat_unreachable_as_blanked,
         panel_type: _a_panel_type,
+        ..
     } = a;
     let DisplayConfig {
         controllers: b_controllers,
@@ -170,6 +171,7 @@ pub fn dispatch_relevant_eq(a: &DisplayConfig, b: &DisplayConfig) -> bool {
         samsung_restore_backlight: _b_samsung_restore_backlight,
         treat_unreachable_as_blanked: b_treat_unreachable_as_blanked,
         panel_type: _b_panel_type,
+        ..
     } = b;
 
     a_controllers == b_controllers
@@ -286,6 +288,8 @@ mod dispatch_gate_tests {
     /// have something to actually change.
     fn base_display_cfg() -> DisplayConfig {
         DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: vec!["ddcci".into()],
             blank_mode: Some(dormant_core::types::BlankMode::PowerOff),
             degraded_mode: None,
@@ -332,6 +336,7 @@ mod dispatch_gate_tests {
             map.insert(id.to_string(), dc);
         }
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),

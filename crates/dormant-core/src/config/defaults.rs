@@ -97,6 +97,12 @@ pub const ENTITY_CRUD_ENABLED: bool = true;
 /// Whether the Samsung pairing wizard route is enabled by default.
 pub const PAIRING_ENABLED: bool = true;
 
+/// Whether multi-machine coordination services and operator routes are enabled.
+pub const COORDINATION_ENABLED: bool = true;
+
+/// Cadence for polling shared-display ownership state.
+pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);

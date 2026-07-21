@@ -380,6 +380,7 @@ mod tests {
             }),
         );
         Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -578,6 +579,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn doctor_handles_empty_sensors() {
         let cfg = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

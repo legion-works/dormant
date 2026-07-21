@@ -751,6 +751,8 @@ mod tests {
     fn chain_config() -> DisplayConfig {
         DisplayConfig {
             controllers: vec!["command".into()],
+            scope: dormant_core::config::DisplayScope::Private,
+            shared_input_code: None,
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
             ladder: vec![],

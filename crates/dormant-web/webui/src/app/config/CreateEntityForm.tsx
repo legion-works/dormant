@@ -70,6 +70,7 @@ export default function CreateEntityForm({
   const [id, setId] = useState("");
   const [sensorType, setSensorType] = useState<SensorType>("mqtt");
   const [zoneMode, setZoneMode] = useState<ZoneMode>("any");
+  const [displayScope, setDisplayScope] = useState<"private" | "shared">("private");
   const [fields, setFields] = useState<Record<string, unknown>>(() => initialFields ?? {});
 
   const idHygiene = validateEntityId(id);
@@ -92,6 +93,7 @@ export default function CreateEntityForm({
     const value: Record<string, unknown> = { ...fields };
     if (collection === "sensors") value.type = sensorType;
     if (collection === "zones") value.mode = zoneMode;
+    if (collection === "displays") value.scope = displayScope;
     for (const key of Object.keys(value)) {
       const v = value[key];
       if (v === "" || v === undefined) delete value[key];
@@ -192,6 +194,10 @@ export default function CreateEntityForm({
             onEdit={(_p, v) => setField("controllers", v)}
             options={DISPLAY_CONTROLLER_OPTIONS}
           />
+          <EnumField path={p("scope")} label="scope" value={displayScope} locked={false} onEdit={(_p, v) => setDisplayScope(v as "private" | "shared")} options={["private", "shared"]} />
+          {displayScope === "shared" && (
+            <NumberField path={p("shared_input_code")} label="shared_input_code" value={fields.shared_input_code ?? ""} locked={false} onEdit={(_p, v) => setField("shared_input_code", v)} />
+          )}
           <TextField path={p("host")} label="host" value={fields.host ?? ""} locked={false} onEdit={(_p, v) => setField("host", v)} />
           <EnumField path={p("blank_mode")} label="blank_mode" value={fields.blank_mode ?? "power_off"} locked={false} onEdit={(_p, v) => setField("blank_mode", v)} options={BLANK_MODE_OPTIONS} />
           <TextField path={p("output")} label="output" value={fields.output ?? ""} locked={false} onEdit={(_p, v) => setField("output", v)} />

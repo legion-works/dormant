@@ -407,10 +407,18 @@ export interface ConfigInventory {
    * the wire (`null` or a string array); `pw_dump_command` is rendered
    * read-only per the T7 security fold (spec §6#10). */
   audio?: Record<string, unknown>;
+  /** rust: config/schema.rs CoordinationConfig — optional for older payloads. */
+  coordination?: CoordinationConfig;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
   rules: Record<string, RuleConfig>;
+}
+
+/** rust: config/schema.rs CoordinationConfig */
+export interface CoordinationConfig {
+  enabled?: boolean;
+  poll_interval?: string;
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */
@@ -514,6 +522,8 @@ export interface ScreensaverConfig {
 /** rust: config/schema.rs DisplayConfig */
 export interface DisplayConfig {
   controllers: string[];
+  scope?: "private" | "shared";
+  shared_input_code?: number;
   blank_mode?: BlankMode;
   degraded_mode?: BlankMode;
   ladder?: LadderStage[];

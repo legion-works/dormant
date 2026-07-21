@@ -68,6 +68,11 @@ config_version = 1
 # lkg_rollback_enabled = true  # counted crash-loop rollback; disable during rapid restart debugging
 # stability_window = "5m"      # healthy runtime before a config is promoted to LKG (>= 30s)
 
+# ── Multi-machine coordination ──────────────────────────────────────────────
+# [coordination]
+# enabled = true                # mDNS discovery, pairing, and operator routes
+# poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
+
 # ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────
 #
 # Optional, global (one PipeWire instance, one poller — unlike the per-rule
@@ -271,3 +276,10 @@ grace_period = "2m"
 wake_retries = 2
 wake_retry_backoff = "2s"
 wake_retry_interval = "60s"
+# A display shared with another dormant machine needs a controller that can
+# read its active input and this machine's input-source code.
+# [displays.shared_oled]
+# controllers = ["ddcci"]
+# blank_mode = "power_off"
+# scope = "shared"
+# shared_input_code = 0x0f       # doctor prints the active input in hex

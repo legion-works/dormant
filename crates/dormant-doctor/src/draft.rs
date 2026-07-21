@@ -598,6 +598,8 @@ mod tests {
 
     fn sample_display(controllers: Vec<&str>, host: Option<&str>) -> DisplayConfig {
         DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: controllers.into_iter().map(String::from).collect(),
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -625,6 +627,7 @@ mod tests {
 
     fn config_with_displays(displays: IndexMap<String, DisplayConfig>) -> Config {
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: WearConfig::default(),
@@ -858,6 +861,7 @@ mod tests {
             }),
         );
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             sensors,
             ..config_with_displays(displays)
         };

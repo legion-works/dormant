@@ -99,6 +99,38 @@ pub struct Config {
     /// Global `PipeWire` audio-inhibitor configuration.
     #[serde(default)]
     pub audio: AudioConfig,
+
+    /// Multi-machine coordination configuration.
+    #[serde(default)]
+    pub coordination: CoordinationConfig,
+}
+
+/// Multi-machine coordination settings.
+///
+/// `enabled = false` disables mDNS, pairing, and operator routes at runtime;
+/// it never disables local `0x60` ownership polling for a configured shared
+/// display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationConfig {
+    /// Whether mDNS discovery, pairing, and operator routes are available.
+    #[serde(default = "default_coordination_enabled")]
+    pub enabled: bool,
+
+    /// Interval between shared-display ownership polls.
+    #[serde(
+        default = "default_coordination_poll_interval",
+        with = "humantime_serde"
+    )]
+    pub poll_interval: Duration,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::COORDINATION_ENABLED,
+            poll_interval: defaults::COORDINATION_POLL_INTERVAL,
+        }
+    }
 }
 
 // ── DaemonConfig ────────────────────────────────────────────────────────────────
@@ -881,11 +913,31 @@ pub struct ScreensaverConfig {
     pub shift_interval: Duration,
 }
 
+/// Whether a display is owned by this machine alone or shared between machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayScope {
+    /// The display is controlled only by this machine.
+    #[default]
+    Private,
+    /// The display can be controlled by multiple coordinated machines.
+    Shared,
+}
+
 /// A display definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DisplayConfig {
     /// Ordered list of controller names to try.
     pub controllers: Vec<String>,
+
+    /// Whether this display is private to this machine or shared with peers.
+    #[serde(default)]
+    pub scope: DisplayScope,
+
+    /// DDC/CI input-source value used to identify this machine's ownership of
+    /// a shared display. The doctor reports the active input in hexadecimal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_input_code: Option<u8>,
 
     /// Primary blank mode to use.  Must be set unless `ladder` is provided.
     /// When `ladder` is present this field is ignored — the first
@@ -1211,6 +1263,14 @@ fn default_entity_crud_enabled() -> bool {
 }
 fn default_pairing_enabled() -> bool {
     defaults::PAIRING_ENABLED
+}
+
+fn default_coordination_enabled() -> bool {
+    defaults::COORDINATION_ENABLED
+}
+
+fn default_coordination_poll_interval() -> Duration {
+    defaults::COORDINATION_POLL_INTERVAL
 }
 fn default_pair_timeout() -> Duration {
     defaults::PAIR_TIMEOUT
@@ -1925,5 +1985,46 @@ idle_source = "macos"
             cfg.daemon.macos_idle_startup_grace,
             std::time::Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn display_scope_defaults_private_and_omits_shared_code() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"power_off\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.displays["desk"].scope, DisplayScope::Private);
+        assert_eq!(cfg.displays["desk"].shared_input_code, None);
+    }
+
+    #[test]
+    fn shared_display_keys_parse_in_strict_mode() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"power_off\"\nscope = \"shared\"\nshared_input_code = 15\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.displays["desk"].scope, DisplayScope::Shared);
+        assert_eq!(cfg.displays["desk"].shared_input_code, Some(15));
+    }
+
+    #[test]
+    fn coordination_defaults_enabled_and_two_seconds() {
+        let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
+
+        assert!(cfg.coordination.enabled);
+        assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn coordination_enabled_false_parses_in_strict_mode() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\n",
+        )
+        .unwrap();
+
+        assert!(!cfg.coordination.enabled);
+        assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(3));
     }
 }

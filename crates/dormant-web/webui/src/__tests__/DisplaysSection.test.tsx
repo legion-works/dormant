@@ -38,6 +38,22 @@ function renderSection(overrides: Partial<Parameters<typeof DisplaysSection>[0]>
 }
 
 describe("DisplaysSection — Add affordance", () => {
+  it("display_editor_round_trips_shared_scope_and_input_code", () => {
+    const { store } = renderSection({
+      displays: { "aoc-main": { controllers: ["ddcci"], blank_mode: "power_off", scope: "shared", shared_input_code: 15 } },
+    });
+
+    expect(screen.getByLabelText("scope")).toHaveValue("shared");
+    expect(screen.getByLabelText("shared_input_code")).toHaveValue(15);
+    fireEvent.change(screen.getByLabelText("shared_input_code"), { target: { value: "16" } });
+
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["displays", "aoc-main", "shared_input_code"],
+      value: 16,
+    });
+  });
+
   it("shows an Add button when entity_crud_enabled", () => {
     renderSection();
     expect(screen.getByRole("button", { name: /add display/i })).toBeInTheDocument();

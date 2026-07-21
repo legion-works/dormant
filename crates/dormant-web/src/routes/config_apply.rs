@@ -576,6 +576,7 @@ mod tests {
     /// A minimal valid config for apply tests.
     fn minimal_config() -> Config {
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -621,6 +622,7 @@ mod tests {
             },
         );
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -861,6 +863,7 @@ field = "/val"
             }),
         );
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

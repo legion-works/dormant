@@ -113,6 +113,7 @@ mod tests {
             mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

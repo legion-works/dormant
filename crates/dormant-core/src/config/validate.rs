@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
 
-use super::schema::{Config, Credentials, DisplayConfig, ValidationError};
+use super::schema::{Config, Credentials, DisplayConfig, DisplayScope, ValidationError};
 
 /// A single unknown-key finding from the TOML tree walk.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,8 +54,10 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "notifications",
             "watchdog",
             "audio",
+            "coordination",
         ],
     ),
+    ("coordination", &["enabled", "poll_interval"]),
     // ── audio ───────────────────────────────────────────────────────────────
     (
         "audio",
@@ -166,6 +168,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
         "displays.",
         &[
             "controllers",
+            "scope",
+            "shared_input_code",
             "blank_mode",
             "degraded_mode",
             "ladder",
@@ -440,6 +444,19 @@ pub fn validate(
     capabilities: &HashMap<String, Vec<BlankMode>>,
     creds: &Credentials,
 ) -> Vec<ValidationError> {
+    validate_with_input_source_readers(cfg, capabilities, &HashSet::new(), creds)
+}
+
+/// Run all cross-reference checks using the controller types that can read an
+/// active-input VCP for shared-display ownership.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn validate_with_input_source_readers(
+    cfg: &Config,
+    capabilities: &HashMap<String, Vec<BlankMode>>,
+    input_source_readers: &HashSet<String>,
+    creds: &Credentials,
+) -> Vec<ValidationError> {
     let mut errors: Vec<ValidationError> = Vec::new();
 
     // Build the sensor inventory from config keys.
@@ -458,7 +475,14 @@ pub fn validate(
 
     // ── Display validation ───────────────────────────────────────────────
     for (display_id, dc) in &cfg.displays {
-        validate_display(display_id, dc, capabilities, creds, &mut errors);
+        validate_display_with_input_source_readers(
+            display_id,
+            dc,
+            capabilities,
+            input_source_readers,
+            creds,
+            &mut errors,
+        );
     }
 
     // ── Rule validation ──────────────────────────────────────────────────
@@ -512,6 +536,7 @@ pub fn validate(
     validate_watchdog(cfg, &mut errors);
     // ── [audio] validation ──────────────────────────────────────────────
     validate_audio(cfg, &mut errors);
+    validate_coordination(cfg, &mut errors);
 
     // ── [sensors.<id>] mqtt availability validation ─────────────────────
     validate_sensors(cfg, &mut errors);
@@ -748,6 +773,18 @@ fn validate_watchdog(cfg: &Config, errors: &mut Vec<ValidationError>) {
 /// Validate the `[audio]` section: duration floors/ceilings, non-empty role
 /// strings, the F16 `playback_roles = []` trap, and a non-empty
 /// `pw_dump_command`.
+fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
+    if cfg.coordination.poll_interval < Duration::from_secs(1) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination poll_interval {:?} is below the minimum of 1s",
+                cfg.coordination.poll_interval
+            ),
+        });
+    }
+}
+
 fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let audio = &cfg.audio;
     if audio.poll_interval < Duration::from_secs(1) {
@@ -1015,10 +1052,30 @@ fn validate_zones(
 /// Validate a single display: controllers, modes (against union), per-controller
 /// required fields.
 #[allow(clippy::too_many_lines)] // per-controller field checks add bulk; extracting helpers would scatter the logic
+#[cfg(test)]
 fn validate_display(
     display_id: &str,
     dc: &DisplayConfig,
     capabilities: &HashMap<String, Vec<BlankMode>>,
+    creds: &Credentials,
+    errors: &mut Vec<ValidationError>,
+) {
+    validate_display_with_input_source_readers(
+        display_id,
+        dc,
+        capabilities,
+        &HashSet::new(),
+        creds,
+        errors,
+    );
+}
+
+#[allow(clippy::too_many_lines)] // per-controller field checks keep this validator grep-stable.
+fn validate_display_with_input_source_readers(
+    display_id: &str,
+    dc: &DisplayConfig,
+    capabilities: &HashMap<String, Vec<BlankMode>>,
+    input_source_readers: &HashSet<String>,
     creds: &Credentials,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1029,6 +1086,34 @@ fn validate_display(
             detail: format!("display '{display_id}' has no controllers"),
         });
         return;
+    }
+
+    match dc.scope {
+        DisplayScope::Private if dc.shared_input_code.is_some() => errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' is private but sets shared_input_code — remove it or set scope = \"shared\""
+            ),
+        }),
+        DisplayScope::Shared => {
+            if dc.shared_input_code.is_none() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is shared but has no shared_input_code"
+                    ),
+                });
+            }
+            if !dc.controllers.iter().any(|controller| input_source_readers.contains(controller)) {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is shared but no controller in its chain can read the active input"
+                    ),
+                });
+            }
+        }
+        DisplayScope::Private => {}
     }
 
     // Build the union of supported modes across all controllers.
@@ -1953,7 +2038,12 @@ gracee_period = "60s"
     /// fixtures.
     fn validate_str(toml: &str) -> Vec<ValidationError> {
         let cfg: Config = toml::from_str(toml).unwrap();
-        validate(&cfg, &test_capabilities(), &test_creds())
+        validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        )
     }
 
     #[test]
@@ -2521,6 +2611,8 @@ gracee_period = "60s"
         use crate::config::defaults;
         DisplayConfig {
             controllers: Vec::new(),
+            scope: crate::config::DisplayScope::Private,
+            shared_input_code: None,
             blank_mode: None,
             degraded_mode: None,
             ladder: Vec::new(),
@@ -2809,6 +2901,7 @@ gracee_period = "60s"
             notifications: super::super::schema::NotificationsConfig::default(),
             watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
+            coordination: super::super::schema::CoordinationConfig::default(),
         }
     }
 
@@ -2933,6 +3026,7 @@ gracee_period = "60s"
             notifications: super::super::schema::NotificationsConfig::default(),
             watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
+            coordination: super::super::schema::CoordinationConfig::default(),
         }
     }
 
@@ -3302,6 +3396,8 @@ password = "test-pass"
                 "main".into(),
                 DisplayConfig {
                     controllers: vec!["kwin-dpms".into(), "ddcci".into()],
+                    scope: crate::config::DisplayScope::Private,
+                    shared_input_code: None,
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
                     ladder: vec![],
@@ -3330,6 +3426,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -3358,6 +3455,8 @@ password = "test-pass"
                 "blankless".into(),
                 DisplayConfig {
                     controllers: vec!["command".into()],
+                    scope: crate::config::DisplayScope::Private,
+                    shared_input_code: None,
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
                     ladder: vec![],
@@ -3387,6 +3486,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -3493,6 +3593,8 @@ password = "test-pass"
         use crate::config::defaults;
         let dc = DisplayConfig {
             blank_mode: Some(BlankMode::PowerOff),
+            scope: crate::config::DisplayScope::Private,
+            shared_input_code: None,
             degraded_mode: None,
             ladder: vec![],
             screensaver: None,
@@ -3564,6 +3666,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3589,6 +3692,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3623,6 +3727,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let samsung_errors: Vec<_> = errors
@@ -3656,6 +3761,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3681,6 +3787,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let restore_errors: Vec<_> = errors
@@ -3710,6 +3817,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3735,6 +3843,7 @@ password = "test-pass"
             notifications: crate::config::schema::NotificationsConfig::default(),
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
+            coordination: crate::config::schema::CoordinationConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4400,6 +4509,8 @@ kind = "power_off"
         use crate::config::defaults;
         DisplayConfig {
             blank_mode: None,
+            scope: crate::config::DisplayScope::Private,
+            shared_input_code: None,
             degraded_mode: None,
             ladder: vec![],
             screensaver: None,
@@ -5745,5 +5856,60 @@ availability_payload_offline = "down"
             "the macos_idle_* defaults must pass validation, got: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn coordination_poll_interval_below_floor_rejected() {
+        let errors =
+            validate_str("config_version = 1\n[coordination]\npoll_interval = \"999ms\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID)
+        );
+    }
+
+    #[test]
+    fn shared_display_requires_input_code() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"power_off\"\nscope = \"shared\"\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID)
+        );
+    }
+
+    #[test]
+    fn private_display_rejects_shared_input_code() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"power_off\"\nshared_input_code = 15\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID)
+        );
+    }
+
+    #[test]
+    fn shared_display_requires_input_source_reader_capability() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.desk]\ncontrollers = [\"command\"]\nblank_mode = \"power_off\"\nmodes = [\"power_off\"]\nscope = \"shared\"\nshared_input_code = 15\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID)
+        );
+    }
+
+    #[test]
+    fn shared_display_accepts_reader_in_fallback_position() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.desk]\ncontrollers = [\"command\", \"ddcci\"]\nblank_mode = \"power_off\"\nmodes = [\"power_off\"]\nblank_command = \"true\"\nwake_command = \"true\"\nscope = \"shared\"\nshared_input_code = 15\n",
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 }

@@ -32,6 +32,17 @@ function locked(
 /* ────── tests ────── */
 
 describe("buildPatches", () => {
+  it("coordination_editor_round_trips_enabled_and_poll_interval", () => {
+    const s = createPatchStore();
+    set(s, "coordination.enabled", false);
+    set(s, "coordination.poll_interval", "3s");
+
+    expect(s.buildPatches()).toEqual<ConfigPatch[]>([
+      { op: "set", path: ["coordination", "enabled"], value: false },
+      { op: "set", path: ["coordination", "poll_interval"], value: "3s" },
+    ]);
+  });
+
   it("emits only tracked paths", () => {
     const s = createPatchStore();
     expect(s.buildPatches()).toEqual([]);

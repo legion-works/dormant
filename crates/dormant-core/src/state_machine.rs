@@ -1206,7 +1206,14 @@ impl DisplayStateMachine {
             Phase::Waking | Phase::Grace { .. } => vec![],
             Phase::RenderPending { .. } | Phase::Staged { .. } => {
                 let mut effects = self.teardown_render(now, "ownership_acquired");
-                effects.append(&mut self.issue_wake(vec![], now));
+                effects.append(&mut self.issue_wake(
+                    vec![Effect::LogTransition {
+                        from,
+                        to: "waking",
+                        cause: "ownership_acquired",
+                    }],
+                    now,
+                ));
                 effects
             }
             Phase::Active | Phase::Blanked => self.issue_wake(
@@ -2692,27 +2699,27 @@ mod tests {
     }
 
     #[test]
-    fn ownership_gain_active_absent_does_not_wake() {
+    fn ownership_gain_active_zone_unknown_does_not_wake() {
         let mut sm = sm(500);
-        sm.zone_present = Some(false);
         sm.step(Input::OwnershipChanged(false), t(10));
 
         let effects = sm.step(Input::OwnershipChanged(true), t(20));
 
         assert!(
             effects.is_empty(),
-            "absent Active must not wake on gain, got {effects:?}"
+            "unknown Active must not wake on gain, got {effects:?}"
         );
     }
 
     #[test]
     fn ownership_gain_absent_blanked_does_not_wake() {
         let mut sm = sm(500);
-        sm.phase = Phase::Blanked;
-        sm.owned = false;
-        sm.zone_present = Some(false);
+        sm.step(Input::ZonePresent(false), t(0));
+        drive_blank(&mut sm, t(10), true);
+        assert_eq!(sm.phase_name(), "blanked");
+        sm.step(Input::OwnershipChanged(false), t(20));
 
-        let effects = sm.step(Input::OwnershipChanged(true), t(20));
+        let effects = sm.step(Input::OwnershipChanged(true), t(30));
 
         assert!(
             effects.is_empty(),
@@ -2723,14 +2730,88 @@ mod tests {
     #[test]
     fn ownership_gain_blanked_zone_unknown_does_not_wake() {
         let mut sm = sm(500);
-        sm.phase = Phase::Blanked;
-        sm.owned = false;
+        drive_blank(&mut sm, t(0), true);
+        assert_eq!(sm.phase_name(), "blanked");
+        sm.step(Input::OwnershipChanged(false), t(10));
 
         let effects = sm.step(Input::OwnershipChanged(true), t(20));
 
         assert!(
             effects.is_empty(),
             "unknown Blanked must not wake on gain, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ownership_gain_during_blanking_sets_pending_wake_then_wakes_on_blank_result() {
+        let mut sm = sm(500);
+        let effects = sm.step(Input::ForceBlank, t(0));
+        let blank_gen = match effects.as_slice() {
+            [
+                Effect::LogTransition { .. },
+                Effect::IssueBlank { r#gen, .. },
+            ] => *r#gen,
+            other => panic!("expected blank effects, got {other:?}"),
+        };
+        sm.step(Input::OwnershipChanged(false), t(10));
+        sm.step(Input::ZonePresent(true), t(20));
+
+        let effects = sm.step(Input::OwnershipChanged(true), t(30));
+
+        assert!(
+            sm.pending_wake,
+            "ownership gain must defer wake until blank completes"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::IssueWake { .. })),
+            "in-flight blank must not issue wake immediately, got {effects:?}"
+        );
+
+        let effects = sm.step(
+            Input::BlankResult {
+                r#gen: blank_gen,
+                result: Ok(()),
+            },
+            t(40),
+        );
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::IssueWake { .. })),
+            "completed blank must issue the deferred wake, got {effects:?}"
+        );
+    }
+
+    #[test]
+    fn ownership_gain_render_pending_logs_wake_transition() {
+        let mut sm = sm_with_ladder(
+            500,
+            vec![
+                render_stage(StageKind::RenderBlack, None),
+                controller_stage(BlankMode::PowerOff),
+            ],
+        );
+        sm.step(Input::ZonePresent(false), t(0));
+        sm.step(Input::Tick, t(500));
+        assert_eq!(sm.phase_name(), "render_pending");
+        sm.zone_present = Some(true);
+        sm.owned = false;
+
+        let effects = sm.step(Input::OwnershipChanged(true), t(510));
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LogTransition {
+                    from: "render_pending",
+                    to: "waking",
+                    cause: "ownership_acquired",
+                }
+            )),
+            "render-pending ownership gain must log the wake transition, got {effects:?}"
         );
     }
 
@@ -2770,7 +2851,8 @@ mod tests {
     fn ownership_loss_from_blanked_still_yields_active() {
         // regression pin: ownership loss must continue to yield a blanked panel.
         let mut sm = sm(500);
-        sm.phase = Phase::Blanked;
+        drive_blank(&mut sm, t(0), true);
+        assert_eq!(sm.phase_name(), "blanked");
 
         sm.step(Input::OwnershipChanged(false), t(10));
 

@@ -26,7 +26,7 @@
 //! - [`tray`] — the [`ksni::Tray`] implementation.
 //!
 //! macOS-only:
-//! - [`tray_macos`] — the `AppKit` status-item implementation.
+//! - `tray_macos` — the `AppKit` status-item implementation.
 //!
 //! ## Crate target
 //!

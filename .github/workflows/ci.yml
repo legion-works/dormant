@@ -28,6 +28,7 @@ jobs:
         with:
           components: rustfmt
       - run: bash scripts/gates/fmt.sh
+      - run: bash .github/scripts/test-smoke-release-artifacts.sh
 
   webui:
     runs-on: ubuntu-latest

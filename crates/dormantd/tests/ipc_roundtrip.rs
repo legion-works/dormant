@@ -281,8 +281,19 @@ async fn events_streams_two_events_then_disconnect() {
     writer.write_all(b"\n").await.unwrap();
     writer.flush().await.unwrap();
 
-    // Give the server a moment to subscribe.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The sentinel proves the server registered its broadcast receiver before
+    // the test sends events, avoiding a timing-dependent subscription race.
+    let mut reader = BufReader::new(reader);
+    let mut subscribed_line = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        reader.read_line(&mut subscribed_line),
+    )
+    .await
+    .expect("timeout reading subscription sentinel")
+    .unwrap();
+    let subscribed: DaemonEvent = serde_json::from_str(subscribed_line.trim()).unwrap();
+    assert!(matches!(subscribed, DaemonEvent::Subscribed));
 
     // Send two events through the broadcast channel.
     let ev1 = DaemonEvent::ConfigReloaded;
@@ -294,7 +305,6 @@ async fn events_streams_two_events_then_disconnect() {
     assert!(event_tx.send(ev2).is_ok());
 
     // Read both events from the stream with a timeout.
-    let mut reader = BufReader::new(reader);
     let mut line1 = String::new();
     tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line1))
         .await

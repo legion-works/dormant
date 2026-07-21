@@ -3325,7 +3325,10 @@ mod tests {
                 displays: vec![DisplayRuntimeCfg {
                     display,
                     blank_mode: BlankMode::PowerOff,
-                    ladder: vec![],
+                    ladder: vec![LadderStage {
+                        kind: StageKind::Controller(BlankMode::PowerOff),
+                        dwell: None,
+                    }],
                     timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
                 }],
                 sensors: vec![],
@@ -3339,17 +3342,22 @@ mod tests {
         .expect("one-display engine config is valid")
     }
 
-    #[test]
-    fn ownership_poll_refeeds_changed_cached_verdict_without_timer_sweep() {
+    #[tokio::test]
+    async fn ownership_poll_refeeds_changed_cached_verdict_without_timer_sweep() {
         let display = DisplayId("mon".into());
+        let sink = Arc::new(RecordingSink::new());
+        let mut executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        executors.insert(display.clone(), sink.clone());
         let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut engine = manual_display_engine(
             display.clone(),
-            HashMap::new(),
+            executors,
             Arc::new(FlipGate(Arc::clone(&owned))),
         );
 
         assert_eq!(engine.last_owned.get(&display), Some(&false));
+        let before_poll = Tick::now();
+        engine.step_machine(&display, Input::ZonePresent(false), before_poll);
         owned.store(true, std::sync::atomic::Ordering::Relaxed);
 
         engine.handle_control(ControlMsg::OwnershipPoll {
@@ -3357,6 +3365,62 @@ mod tests {
         });
 
         assert_eq!(engine.last_owned.get(&display), Some(&true));
+
+        engine.step_machine(
+            &display,
+            Input::Tick,
+            Tick(before_poll.0 + Duration::from_secs(3600)),
+        );
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("post-poll tick reports the blank command");
+        assert!(matches!(result, InternalResult::Blank { .. }));
+        assert!(
+            sink.log()
+                .iter()
+                .any(|(_, command)| matches!(command, SinkCmd::Blank(BlankMode::PowerOff))),
+            "the ownership gain must reach the machine before its next timer tick"
+        );
+    }
+
+    #[test]
+    fn ownership_poll_unchanged_verdict_is_noop() {
+        use crate::state_machine::Phase;
+
+        let display = DisplayId("mon".into());
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine =
+            manual_display_engine(display.clone(), HashMap::new(), Arc::new(FlipGate(owned)));
+        let timings = DisplayRuntimeCfg::manual_defaults(Duration::ZERO);
+        let (restored, effects) = DisplayStateMachine::restore(
+            timings,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            Phase::Blanked,
+            1,
+            Tick::now(),
+        );
+        assert!(effects.is_empty());
+        engine.machines.insert(display.clone(), restored);
+
+        let (subscribe, mut events) = oneshot::channel();
+        engine.handle_control(ControlMsg::SubscribeEvents(subscribe));
+        let mut events = events.try_recv().expect("subscription reply sent inline");
+
+        engine.handle_control(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        });
+
+        // A duplicate false input would yield the restored Blanked machine.
+        assert_eq!(*engine.machines[&display].phase(), Phase::Blanked);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

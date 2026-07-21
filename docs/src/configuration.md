@@ -456,6 +456,23 @@ failure banner remain active. See [Failure notifications](./failure-notification
 The systemd watchdog interval comes from the unit, not this table. See
 [Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
+## `[coordination]` — multi-machine shared-display coordination
+
+This section is opt-in: `enabled = false` is the default. It disables mDNS,
+instance pairing, and their operator routes, but does not disable local DDC/CI
+`0x60` polling for displays configured with `scope = "shared"`.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Enable mDNS discovery, instance pairing, and instance-pairing routes. |
+| `poll_interval` | duration | `"2s"` | Shared-display ownership polling cadence; minimum `"1s"`. |
+| `pairing_port` | integer | `0` | Temporary pairing listener port; `0` requests an ephemeral OS port. |
+| `pairing_window` | duration | `"5m"` | Temporary listener and mDNS advertisement lifetime; `"30s"` to `"15m"`. |
+| `pairing_bind_address` | string or unset | unset | LAN address used by the temporary listener; unset auto-detects the primary non-loopback address. |
+
+See [Multi-machine coordination](./multi-machine.md) for pairing and the
+shared-display setup procedure.
+
 ## `[audio]` — PipeWire audio- and call-aware blanking
 
 Global (not per-rule) settings for the `pw-dump`-polling audio inhibitor.

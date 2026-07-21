@@ -74,7 +74,9 @@ config_version = 1
 # [coordination]
 # enabled = false               # mDNS discovery, pairing, and operator routes
 # poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
-# pairing_bind_address = "10.0.0.5" # omit to auto-detect the primary non-loopback LAN address
+# pairing_port = 0               # 0 asks the OS for an ephemeral temporary listener port
+# pairing_window = "5m"          # code/listener/mDNS lifetime (30s..=15m)
+# pairing_bind_address = "10.0.0.5" # unset defaults to the primary non-loopback LAN address
 
 # ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────
 #

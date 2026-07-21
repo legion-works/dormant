@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
-use dormant_core::rules::{ControlMsg, StateSnapshot};
+use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -399,18 +399,23 @@ async fn handle_events(
         return;
     }
     let Ok(mut events) = rx.await else { return };
+    let line = serde_json::to_string(&DaemonEvent::Subscribed)
+        .expect("DaemonEvent::Subscribed serializes");
+    if write_line(writer, &line).await.is_err() {
+        return;
+    }
 
     loop {
         match events.recv().await {
             Ok(event) => {
-                let line = serde_json::to_string(&event).unwrap_or_default();
+                let line = serde_json::to_string(&event).expect("DaemonEvent serializes");
                 if write_line(writer, &line).await.is_err() {
                     return; // client disconnected
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 let lagged = serde_json::json!({"event":"stream_lagged","skipped":n});
-                let line = serde_json::to_string(&lagged).unwrap_or_default();
+                let line = serde_json::to_string(&lagged).expect("lagged frame serializes");
                 if write_line(writer, &line).await.is_err() {
                     return;
                 }

@@ -11,28 +11,44 @@
 //! - [`tooltip`] — pure-logic tooltip construction.
 //! - [`menu`] — pure-logic menu model construction (without `ksni` types so
 //!   it can be unit-tested against canned snapshots).
+//! - [`dispatch`] — pure action plans plus injected platform I/O execution.
 //! - [`icon`] — pixmap construction + runtime variant overlays (paused
 //!   badge, greying).  Pure pixel ops, no D-Bus.
+//! - [`tray_state`] — cross-platform state shared by tray frontends and the
+//!   IPC loop.
 //!
-//! Linux-only:
+//! Linux/macOS:
 //!
 //! - [`ipc_loop`] — the reconnecting event-stream reader driving the tray's
 //!   shared state.
+//!
+//! Linux-only:
 //! - [`tray`] — the [`ksni::Tray`] implementation.
+//!
+//! macOS-only:
+//! - `tray_macos` — the `AppKit` status-item implementation.
 //!
 //! ## Crate target
 //!
-//! Linux only.  The `ksni` and `tokio` deps are gated on
-//! `target_os = "linux"` so `cargo check --workspace` stays green on
-//! Windows/macOS portability legs (memory-1718 class — the recurring
-//! cross-platform CI gauntlet).
+//! `ksni` is Linux-only; the Tokio-backed IPC loop is shared by Linux and
+//! macOS. Platform-specific dependencies remain cfg-gated so portability
+//! checks stay green.
 
 #![warn(missing_docs)]
 
+/// Tagged projection of menu actions for platform target/action callbacks.
+pub mod action_table;
+/// Pure action planning and injected platform I/O execution.
+#[cfg(unix)]
+pub mod dispatch;
 pub mod icon;
 pub mod menu;
 pub mod state;
+/// Pure monochrome pixel renderer for macOS template tray icons.
+pub mod template_icon;
 pub mod tooltip;
+/// Cross-platform state shared by tray frontends and the IPC loop.
+pub mod tray_state;
 
 /// Default port for the M2 web UI.  The daemon does not expose its bound
 /// `web_port` through [`dormant_core::rules::StateSnapshot`]; we fall back
@@ -40,7 +56,9 @@ pub mod tooltip;
 /// `web_url` field to the snapshot.
 pub const DEFAULT_WEB_PORT: u16 = 8137;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod ipc_loop;
 #[cfg(target_os = "linux")]
 pub mod tray;
+#[cfg(target_os = "macos")]
+pub mod tray_macos;

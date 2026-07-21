@@ -55,11 +55,11 @@ install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 
 Binaries land in `~/.local/bin/` — make sure this is on your `PATH`.
 
-### Tray applet (Linux only)
+### Tray applet
 
-`dormant-tray` is a KDE `StatusNotifierItem` applet: status glance +
-pause/resume + blank/wake controls, riding the daemon's Unix socket in
-the background.
+On Linux, `dormant-tray` is a KDE `StatusNotifierItem` applet. On macOS, it
+is a native `NSStatusItem` menu-bar item. Both provide status, pause/resume,
+and blank/wake controls through the daemon's Unix socket.
 
 ![The dormant tray applet: status tooltip and pause/blank/wake menu](images/tray.png)
 
@@ -154,6 +154,8 @@ chmod 600 ~/.config/dormant/credentials.toml
 
 ## Tray autostart
 
+### Linux (systemd)
+
 Run `dormant-tray` on every graphical session with the provided user
 unit — the same mechanism as the daemon. The unit file
 (`dormant-tray.service`) ships in the release tarball under
@@ -184,6 +186,36 @@ starts after `dormant.service` and restarts on failure. A plain XDG
 resolves a relative `Exec=` against a minimal boot `PATH` that excludes
 `~/.local/bin`, so no unit gets generated.
 
+### macOS (launchd)
+
+`dormantctl launchd install` writes both checked-in `LaunchAgent` plists to
+`~/Library/LaunchAgents/`: `com.legionworks.dormant.plist` for the daemon and
+`com.legionworks.dormant-tray.plist` for the tray. It does not bootstrap or
+start either job. Start them immediately, without waiting for the next login:
+
+```bash
+dormantctl launchd install
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.legionworks.dormant.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.legionworks.dormant-tray.plist
+```
+
+The tray agent runs only in an Aqua session. It starts at login, restarts
+after an unsuccessful exit, and throttles restarts to one per 10 seconds.
+Its stdout and stderr logs are `~/Library/Logs/dormant/dormant-tray.log` and
+`~/Library/Logs/dormant/dormant-tray.err.log`.
+
+To remove the managed plist files, first boot out any loaded jobs, then run:
+
+```bash
+launchctl bootout gui/$(id -u)/com.legionworks.dormant
+launchctl bootout gui/$(id -u)/com.legionworks.dormant-tray
+dormantctl launchd uninstall
+```
+
+`dormantctl launchd uninstall` removes the two files only. It does not boot
+out loaded jobs, so launchd retains their last-loaded definitions until they
+are explicitly booted out.
+
 ## macOS (M1)
 
 dormant runs natively on macOS (arm64 and x86_64), no root required. This
@@ -195,10 +227,9 @@ milestone (M1) ships:
 - Read-only diagnostics: `dormantctl doctor macos-idle`,
   `macos-display-sleep`, `macos-power`
 
-`dormant-tray` is also packaged for macOS, but it is **nonfunctional
-there** — it is a KDE `StatusNotifierItem` applet with no macOS
-equivalent yet. Do not expect tray parity (menu bar icon, pause/blank/wake
-from a menu) until M2; install and run `dormantd`/`dormantctl` only.
+`dormant-tray` runs as a native `NSStatusItem` menu-bar item on macOS. See
+[Tray autostart: macOS (launchd)](#macos-launchd) to install and start its
+LaunchAgent with the daemon.
 
 ### From release (macOS)
 
@@ -214,12 +245,11 @@ before you have configured it).
 
 ### LaunchAgent (macOS)
 
-dormant ships a per-user `LaunchAgent` — the macOS analog of the systemd
-user unit above — as a single checked-in plist,
-`crates/dormantd/share/com.legionworks.dormant.plist`. It is staged into
-every macOS release archive at that same relative path, and
-`dormantctl launchd install` embeds the identical bytes at build time, so
-the archived copy and the installed copy are provably the same file.
+dormant ships per-user `LaunchAgents` — the macOS analog of the systemd user
+units above — as checked-in daemon and tray plists:
+`crates/dormantd/share/com.legionworks.dormant.plist` and
+`crates/dormant-tray/share/com.legionworks.dormant-tray.plist`.
+`dormantctl launchd install` embeds byte-identical copies at build time.
 
 Install it (idempotent, non-root — writes only under your home directory):
 
@@ -227,12 +257,13 @@ Install it (idempotent, non-root — writes only under your home directory):
 dormantctl launchd install
 ```
 
-This atomically copies the plist to the one canonical path,
-`~/Library/LaunchAgents/com.legionworks.dormant.plist`, mode `0644`. It
-does **not** start the agent — bootstrap it explicitly:
+This atomically copies both plists to their canonical paths under
+`~/Library/LaunchAgents/`, mode `0644`. It does **not** start either agent —
+bootstrap them explicitly:
 
 ```bash
 launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant.plist"
+launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant-tray.plist"
 ```
 
 Check status and force an immediate (re)start:
@@ -248,22 +279,24 @@ Reload config the same way as Linux — signal, not restart:
 launchctl kill HUP gui/$UID/com.legionworks.dormant
 ```
 
-Logs land at `~/Library/Logs/dormant/dormantd.log` (stdout) and
-`dormantd.err.log` (stderr) — the LaunchAgent's `ProgramArguments` create
-that directory and redirect into it before `exec`-ing `dormantd`, so the
-shell never lingers as a supervisor between launchd and the daemon.
+Daemon logs land at `~/Library/Logs/dormant/dormantd.log` (stdout) and
+`dormantd.err.log` (stderr). Tray logs are
+`~/Library/Logs/dormant/dormant-tray.log` (stdout) and
+`dormant-tray.err.log` (stderr). Each LaunchAgent's `ProgramArguments`
+creates that directory and redirects into it before `exec`-ing the binary,
+so the shell never lingers as a supervisor.
 
 To stop and remove:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.legionworks.dormant
+launchctl bootout gui/$(id -u)/com.legionworks.dormant-tray
 dormantctl launchd uninstall
 ```
 
-`launchd uninstall` only ever removes that one canonical file — it does
-not bootout a still-loaded label, so run `bootout` first or launchd will
-keep the last-loaded definition in memory even after the on-disk file is
-gone.
+`launchd uninstall` only removes the two canonical files. It does not boot
+out a still-loaded label, so run `bootout` first or launchd will keep the
+last-loaded definition in memory after the on-disk files are gone.
 
 **Lifecycle semantics** (see the plist's own comments for the full
 rationale):

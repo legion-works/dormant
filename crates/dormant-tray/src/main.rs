@@ -1,25 +1,30 @@
 //! `dormant-tray` binary entry point.
 //!
-//! Two cfg-gated variants:
+//! Three cfg-gated variants:
 //!
 //! - **Linux**: spawns the [`ksni`] tray, wires up the IPC loop on a
 //!   tokio runtime, and waits for Quit / Ctrl-C.
-//! - **other**: prints `"dormant-tray is Linux-only"` and exits 1.
+//! - **macOS**: runs the `AppKit` status item on the process main thread.
+//! - **other**: prints an unsupported-platform error and exits 1.
 //!   Keeps `cargo check --workspace` green on the Windows/macOS
 //!   portability legs (memory-1718 — cross-platform CI gauntlet).
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use dormant_core::paths;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
+use dormant_core::paths;
 #[cfg(target_os = "linux")]
 use dormant_tray::DEFAULT_WEB_PORT;
 #[cfg(target_os = "linux")]
 use dormant_tray::ipc_loop;
 #[cfg(target_os = "linux")]
-use dormant_tray::tray::{self, TrayState};
+use dormant_tray::tray;
+#[cfg(target_os = "linux")]
+use dormant_tray::tray_state::TrayState;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 // `tokio::sync::Mutex` is only used inside `run_linux`; keeping it inside
 // the linux-gated block keeps the macOS/Windows stub `main` compiling
 // without a `tokio` dependency (memory-1718 — cross-platform CI gauntlet).
@@ -30,20 +35,24 @@ fn main() -> ExitCode {
     install_tracing();
 
     #[cfg(target_os = "linux")]
+    let result = run_linux();
+
+    #[cfg(target_os = "macos")]
+    let result = dormant_tray::tray_macos::run();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        match run_linux() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("dormant-tray: {e:#}");
-                ExitCode::FAILURE
-            }
-        }
+        eprintln!("dormant-tray is not supported on this platform");
+        ExitCode::from(1)
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("dormant-tray is Linux-only");
-        ExitCode::from(1)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("dormant-tray: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -80,8 +89,9 @@ fn run_linux() -> anyhow::Result<()> {
     let ipc_cancel = cancel.clone();
     let ipc_state = state.clone();
     let ipc_socket = socket_path.clone();
+    let (refresh, _refresh_rx) = ipc_loop::refresh_channel();
     let ipc_task = handle.spawn(async move {
-        ipc_loop::run(ipc_socket, ipc_state, ipc_cancel).await;
+        ipc_loop::run(ipc_socket, ipc_state, ipc_cancel, refresh).await;
     });
 
     // Wait for either Quit (clicked from the menu) or Ctrl-C.

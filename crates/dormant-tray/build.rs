@@ -13,6 +13,10 @@
 //!    inside its structure rather than leaning on the host theme.
 //!    Written as `glyph_<name>.png` and embedded via `include_bytes!`.
 //!
+//! 3. The brand mark at 36 px → straight RGBA template pixels for the macOS
+//!    tray icon. Visible pixels retain their alpha but are forced black, which
+//!    lets macOS tint the icon for the current appearance.
+//!
 //! Choosing build-time rasterization over a runtime `image`/`png`
 //! decoder keeps the tray's runtime dependency tree tiny (no
 //! `tiny-skia`/`usvg` in release) and freezes the brand assets at
@@ -51,6 +55,10 @@ const GLYPHS: &[&str] = &[
 /// `DBusMenu` icon size — Plasma renders it at the menu's text-line height.
 const GLYPH_PX: u32 = 16;
 
+/// Side length for the macOS template mark. This is intentionally separate
+/// from `SIZES`, which must continue matching `src/icon.rs`.
+const TEMPLATE_PX: u32 = 36;
+
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.join("..").join("..");
@@ -72,6 +80,7 @@ fn main() {
     );
 
     rasterize_mark(&mark_svg, &out_dir);
+    rasterize_template_mark(&mark_svg, &out_dir);
     rasterize_glyphs(&glyphs_dir, &out_dir);
 }
 
@@ -118,6 +127,29 @@ fn rasterize_mark(svg_path: &Path, out_dir: &Path) {
         let out_path = out_dir.join(format!("mark_{size}.bin"));
         write_blob(&out_path, &argb_be);
     }
+}
+
+/// Rasterize the macOS template mark as straight RGBA black plus source alpha.
+fn rasterize_template_mark(svg_path: &Path, out_dir: &Path) {
+    let svg_bytes = fs::read(svg_path)
+        .unwrap_or_else(|e| panic!("read mark.svg at {}: {e}", svg_path.display()));
+    let tree = Tree::from_data(&svg_bytes, &Options::default())
+        .unwrap_or_else(|e| panic!("parse mark.svg: {e}"));
+    let svg_size = tree.size();
+    let scale_x = f64::from(TEMPLATE_PX) / f64::from(svg_size.width());
+    let scale_y = f64::from(TEMPLATE_PX) / f64::from(svg_size.height());
+    // f64 avoids a precision-loss lint; tiny-skia accepts f32 transforms.
+    #[allow(clippy::cast_possible_truncation)]
+    let transform = Transform::from_scale(scale_x as f32, scale_y as f32);
+    let mut pixmap = Pixmap::new(TEMPLATE_PX, TEMPLATE_PX).expect("allocate template pixmap");
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let mut rgba = Vec::with_capacity(pixmap.data().len());
+    for pixel in pixmap.data().chunks_exact(4) {
+        rgba.extend_from_slice(&[0, 0, 0, pixel[3]]);
+    }
+
+    write_blob(&out_dir.join("template_mark_36.rgba"), &rgba);
 }
 
 /// Rasterize each per-item menu glyph into a PNG file.  PNG (not raw

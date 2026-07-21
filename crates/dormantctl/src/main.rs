@@ -313,15 +313,21 @@ fn main() -> ExitCode {
             }
         }
         Command::Launchd { subcommand } => match cmd_launchd::run(&subcommand) {
-            Ok(cmd_launchd::LaunchdOutcome::Installed(path)) => {
-                println!("installed {}", path.display());
+            Ok(cmd_launchd::LaunchdOutcome::Installed(paths)) => {
+                println!("installed {}", paths.daemon.display());
+                println!("installed {}", paths.tray.display());
                 Ok(())
             }
-            Ok(cmd_launchd::LaunchdOutcome::Uninstalled { path, removed }) => {
-                if removed {
-                    println!("removed {}", path.display());
+            Ok(cmd_launchd::LaunchdOutcome::Uninstalled(result)) => {
+                if result.daemon_removed {
+                    println!("removed {}", result.paths.daemon.display());
                 } else {
-                    println!("not installed: {}", path.display());
+                    println!("not installed: {}", result.paths.daemon.display());
+                }
+                if result.tray_removed {
+                    println!("removed {}", result.paths.tray.display());
+                } else {
+                    println!("not installed: {}", result.paths.tray.display());
                 }
                 Ok(())
             }

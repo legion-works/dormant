@@ -6,7 +6,7 @@ Guidance for AI coding agents (and humans) working in this repo.
 
 `dormant` — a Rust daemon that blanks OLED screens (PC monitors, TVs) when presence sensors say the room is empty, and wakes them instantly on return. Sensors come in via MQTT, Home Assistant WebSocket, or USB-serial (mmWave radar). Displays are controlled locally (KWin DPMS, DDC/CI) or over the network (Samsung Tizen `KEY_PICTURE_OFF` and IP Control G2 `backlightControl`, HA passthrough, arbitrary commands).
 
-Binaries: **`dormantd`** (daemon) · **`dormantctl`** (CLI + library) · **`dormant-tray`** (KDE tray, Linux only).
+Binaries: **`dormantd`** (daemon) · **`dormantctl`** (CLI + library) · **`dormant-tray`** (KDE tray on Linux, native menu-bar item on macOS).
 
 ## Current state
 
@@ -32,7 +32,7 @@ crates/dormant-render/     # Wayland layer-shell render sink: black overlay + li
 crates/dormant-web/        # loopback-only axum HTTP/WS bridge + SPA (crates/dormant-web/webui/) — gated behind the `web-ui` feature of dormantd
 crates/dormantd/           # daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, optional web UI spawn, logging + systemd/dormant.service
 crates/dormantctl/         # CLI binary + library (re-exports the IPC client for dormant-tray and other out-of-process consumers)
-crates/dormant-tray/       # KDE StatusNotifierItem tray applet (ksni): icon, menu, tooltip, reconnecting event stream; Linux-only + systemd/dormant-tray.service
+crates/dormant-tray/       # Desktop tray applet: KDE StatusNotifierItem (Linux) + native AppKit NSStatusItem (macOS), shared state + IPC loop; systemd and launchd service definitions
 ```
 
 ## Hard conventions (LLM-friendly codebase rules)

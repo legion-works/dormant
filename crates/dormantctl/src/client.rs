@@ -15,9 +15,15 @@ use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::DaemonEvent;
 #[cfg(unix)]
 use std::io::BufReader;
+#[cfg(unix)]
+use std::time::Duration;
 
 /// Maximum line length for IPC frames (1 MB).  Must match the server's limit.
 const MAX_LINE_BYTES: usize = 1_048_576;
+
+/// Maximum wait for the daemon's per-connection event-stream readiness frame.
+#[cfg(unix)]
+const EVENTS_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Connect to the daemon's socket and send one request, returning the
 /// response.
@@ -78,7 +84,8 @@ pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcRespo
 pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)> {
     #[cfg(unix)]
     {
-        use std::io::{BufReader, Write};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::io::AsRawFd;
 
         let mut stream = connect(socket_path)?;
         // Keep a clone of the FD just so we can shut the read direction
@@ -89,10 +96,46 @@ pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)
         writeln!(stream, "{line}")?;
         stream.flush()?;
 
+        let mut reader = BufReader::new(stream);
+        let fd = reader.get_ref().as_raw_fd();
+        let timeout_ms = i32::try_from(EVENTS_READY_TIMEOUT.as_millis()).unwrap_or(i32::MAX);
+        let readable = loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd is a valid, initialized single pollfd for the duration of the call.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll event stream readiness");
+            }
+            break rc > 0;
+        };
+        // poll(2) guarantees bytes are readable, not that a full line has arrived;
+        // acceptable for this trusted, newline-framed local daemon protocol.
+        let pending = if readable {
+            let mut readiness_line = String::new();
+            match reader.read_line(&mut readiness_line) {
+                Ok(0) => None,
+                Ok(_) => serde_json::from_str(readiness_line.trim())
+                    .map(|event| match event {
+                        DaemonEvent::Subscribed => None,
+                        event => Some(event),
+                    })
+                    .context("parse event stream readiness")?,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+
         Ok((
-            EventStream {
-                reader: BufReader::new(stream),
-            },
+            EventStream { reader, pending },
             EventShutdown {
                 stream: shutdown_fd,
             },
@@ -174,6 +217,7 @@ impl EventShutdown {
 #[cfg(unix)]
 pub struct EventStream<R = UnixStream> {
     reader: BufReader<R>,
+    pending: Option<DaemonEvent>,
 }
 
 #[cfg(not(unix))]
@@ -191,7 +235,10 @@ impl EventStream<UnixStream> {
     /// against a `UnixStream::pair()` or similar.
     #[must_use]
     pub fn from_reader(reader: BufReader<UnixStream>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            pending: None,
+        }
     }
 }
 
@@ -201,7 +248,10 @@ impl<R: std::io::Read> EventStream<R> {
     /// only. Production callers always go through [`EventStream::from_reader`]
     /// / [`connect_events`], both pinned to `UnixStream`.
     pub(crate) fn from_reader_for_test(reader: BufReader<R>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            pending: None,
+        }
     }
 }
 
@@ -211,6 +261,10 @@ impl<R: std::io::Read> Iterator for EventStream<R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         use std::io::{BufRead, Read};
+
+        if let Some(event) = self.pending.take() {
+            return Some(Ok(event));
+        }
 
         loop {
             let mut line = String::new();
@@ -268,6 +322,33 @@ mod tests {
         let lines = b"{\"event\":\"from_the_future\",\"x\":1}\n" as &[u8];
         let mut s = EventStream::from_reader_for_test(BufReader::new(lines));
         assert!(matches!(s.next(), Some(Ok(DaemonEvent::Unknown))));
+    }
+
+    #[test]
+    fn subscribed_sentinel_deserializes_to_known_event() {
+        let event: DaemonEvent = serde_json::from_str("{\"event\":\"subscribed\"}").unwrap();
+        assert!(matches!(event, DaemonEvent::Subscribed));
+    }
+
+    #[test]
+    fn future_event_tag_deserializes_to_unknown() {
+        let event: DaemonEvent = serde_json::from_str("{\"event\":\"some_future_tag\"}").unwrap();
+        assert!(matches!(event, DaemonEvent::Unknown));
+    }
+
+    #[test]
+    fn event_stream_yields_pending_event_before_reader() {
+        let lines = b"{\"event\":\"from_the_future\"}\n" as &[u8];
+        let mut stream = EventStream {
+            reader: BufReader::new(lines),
+            pending: Some(DaemonEvent::ConfigReloaded),
+        };
+
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(DaemonEvent::ConfigReloaded))
+        ));
+        assert!(matches!(stream.next(), Some(Ok(DaemonEvent::Unknown))));
     }
 }
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Smoke-test packaged Linux release artifacts (#38).
+# Smoke-test packaged release artifacts for each target (#38).
 #
-# Verifies that the cargo-dist-produced `dormantd` / `dormantctl` archives for
-# a given target triple actually contain runnable binaries, and that the
-# matching shell installer artifact exists, *before* the `host` job is allowed
-# to publish the GitHub release. This does not start the daemon or exercise
-# any hardware; it only proves archive integrity and dynamic-link startup
-# (`--version`, `--help`, `--validate-only`).
+# Verifies that the cargo-dist-produced archives for a given target triple
+# contain the expected runnable binaries and target-specific service files
+# *before* the `host` job is allowed to publish the GitHub release. This does
+# not start the daemon or exercise any hardware; it only proves archive
+# integrity and dynamic-link startup (`--version`, `--help`, `--validate-only`).
 #
 # Artifact selection is entirely manifest-driven (dist-manifest.json /
 # `dist plan --output-format=json`'s `.artifacts` map) — never `find | head`
@@ -204,9 +203,9 @@ stage_binary "dormantctl"
 # archive, and additionally lint it with `plutil` — the macOS system tool
 # that validates plist syntax/structure — on the two *-apple-darwin legs
 # where that tool actually exists.
-PLIST_NAME="com.legionworks.dormant.plist"
-STAGED_PLIST="$WORKDIR/$PLIST_NAME"
-stage_file "dormantd" "$PLIST_NAME" "$STAGED_PLIST"
+DAEMON_PLIST_NAME="com.legionworks.dormant.plist"
+STAGED_DAEMON_PLIST="$WORKDIR/$DAEMON_PLIST_NAME"
+stage_file "dormantd" "$DAEMON_PLIST_NAME" "$STAGED_DAEMON_PLIST"
 
 # Systemd user unit — dormant.service ships in dormantd's archive on every target
 # (it's a harmless 2 KB text file on macOS).
@@ -215,8 +214,15 @@ stage_file "dormantd" "dormant.service" "$STAGED_SERVICE"
 
 case "$TARGET_TRIPLE" in
     *-apple-darwin)
+        stage_binary "dormant-tray"
+        TRAY_PLIST_NAME="com.legionworks.dormant-tray.plist"
+        STAGED_TRAY_PLIST="$WORKDIR/$TRAY_PLIST_NAME"
+        stage_file "dormant-tray" "$TRAY_PLIST_NAME" "$STAGED_TRAY_PLIST"
         command -v plutil >/dev/null 2>&1 || die "plutil not found on $TARGET_TRIPLE runner"
-        plutil -lint "$STAGED_PLIST" >/dev/null || die "plist failed plutil -lint: $STAGED_PLIST"
+        plutil -lint "$STAGED_DAEMON_PLIST" >/dev/null \
+            || die "plist failed plutil -lint: $STAGED_DAEMON_PLIST"
+        plutil -lint "$STAGED_TRAY_PLIST" >/dev/null \
+            || die "plist failed plutil -lint: $STAGED_TRAY_PLIST"
         ;;
     *-linux*)
         # dormant-tray ships only on Linux
@@ -264,7 +270,7 @@ assert_version "dormantctl"
 
 case "$TARGET_TRIPLE" in
     *-apple-darwin)
-        echo "release-artifact-smoke: dormantd, dormantctl, $PLIST_NAME ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+        echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, $DAEMON_PLIST_NAME, $TRAY_PLIST_NAME ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
         ;;
     *-linux*)
         echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, systemd units ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"

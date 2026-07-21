@@ -11,11 +11,9 @@ ci = "github"
 installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax).
 # GNU, not musl: zbus (DBus) and libudev make static musl builds painful.
-# macOS (M1) targets ship the DDC/CI, macos-gamma-black, macos-display-sleep,
-# and CoreGraphics-idle controllers plus the read-only macOS doctor arms
-# built in earlier M1 milestones. `dormant-tray` is still packaged for macOS
-# (a StatusNotifierItem applet has no macOS equivalent), but it is
-# NONFUNCTIONAL there until M2 — see docs/src/installation.md.
+# macOS targets ship the DDC/CI, macos-gamma-black, macos-display-sleep, and
+# CoreGraphics-idle controllers, the read-only macOS doctor arms, and the
+# native AppKit `dormant-tray` menu-bar item. See docs/src/installation.md.
 # Windows remains excluded — dormant still uses facilities with no Windows
 # port (KWin DBus, DDC/CI via /dev/i2c or IOKit, udev, Wayland/X11 DPMS,
 # CoreGraphics gamma/idle).

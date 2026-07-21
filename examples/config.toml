@@ -69,8 +69,10 @@ config_version = 1
 # stability_window = "5m"      # healthy runtime before a config is promoted to LKG (>= 30s)
 
 # ── Multi-machine coordination ──────────────────────────────────────────────
+# Optional and off by default. Set enabled to true only to expose mDNS
+# discovery, pairing, and operator routes on the LAN.
 # [coordination]
-# enabled = true                # mDNS discovery, pairing, and operator routes
+# enabled = false               # mDNS discovery, pairing, and operator routes
 # poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
 
 # ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────

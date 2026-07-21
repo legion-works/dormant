@@ -171,6 +171,7 @@ fn valid_announce(service: &DiscoverAnnounce) -> bool {
             .decode(&service.instance_id)
             .is_ok_and(|bytes| bytes.len() == 32)
         && !service.window_id.is_empty()
+        && !service.display_name.is_empty()
 }
 
 /// Production backend backed by `mdns-sd`'s daemon thread.
@@ -485,6 +486,42 @@ mod tests {
             state.events.push_back(BrowseEvent::Resolved(peer));
         }
         drop(state);
+
+        discovery.drain_browse().unwrap();
+        assert!(discovery.discovered_peers().is_empty());
+    }
+
+    #[test]
+    fn empty_display_name_is_ignored() {
+        let backend = FakeBackend::default();
+        let mut discovery = discovery(backend.clone(), instance_id(1));
+        let mut peer = service(2);
+        peer.display_name.clear();
+        discovery.start_browse().unwrap();
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .push_back(BrowseEvent::Resolved(peer));
+
+        discovery.drain_browse().unwrap();
+        assert!(discovery.discovered_peers().is_empty());
+    }
+
+    #[test]
+    fn non_base64_instance_id_is_ignored() {
+        let backend = FakeBackend::default();
+        let mut discovery = discovery(backend.clone(), instance_id(1));
+        let mut peer = service(2);
+        peer.instance_id = "not-base64url!".into();
+        discovery.start_browse().unwrap();
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .push_back(BrowseEvent::Resolved(peer));
 
         discovery.drain_browse().unwrap();
         assert!(discovery.discovered_peers().is_empty());

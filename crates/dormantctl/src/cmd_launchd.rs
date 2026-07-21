@@ -1,7 +1,7 @@
 //! `dormantctl launchd` — install/uninstall the checked-in macOS
 //! `LaunchAgent` plist.
 //!
-//! `install`/`uninstall`/`installed_path` are NOT `cfg(target_os =
+//! `install`/`uninstall`/`installed_paths` are NOT `cfg(target_os =
 //! "macos")`-gated: they take an explicit `home` directory and touch only
 //! the filesystem beneath it, so they are fully exercisable on Linux (see
 //! the tests below). Only [`run`] — the CLI-facing entry point dispatched
@@ -61,24 +61,29 @@ pub struct UninstallResult {
 /// CLI surface for `dormantctl launchd <install|uninstall>`.
 #[derive(clap::Subcommand, Debug)]
 pub enum LaunchdSubcommand {
-    /// Install the checked-in `LaunchAgent` plist to
-    /// `~/Library/LaunchAgents/com.legionworks.dormant.plist`.
+    /// Install the checked-in `LaunchAgent` plists to
+    /// `~/Library/LaunchAgents/com.legionworks.dormant.plist` and
+    /// `~/Library/LaunchAgents/com.legionworks.dormant-tray.plist`.
     ///
-    /// Explicit, non-root, idempotent: re-running overwrites the file with
-    /// the same embedded bytes (atomically — a concurrent reader/launchctl
-    /// never observes a partially-written plist) rather than erroring.
-    /// Does NOT bootstrap or start the agent; run
+    /// Explicit, non-root, idempotent: re-running overwrites both files with
+    /// the same embedded bytes (atomically per file — a concurrent
+    /// reader/launchctl never observes a partially-written plist) rather than
+    /// erroring. Does NOT bootstrap or start either agent; run
     /// `launchctl bootstrap gui/$UID
-    /// "$HOME/Library/LaunchAgents/com.legionworks.dormant.plist"`
-    /// yourself afterward.
+    /// "$HOME/Library/LaunchAgents/com.legionworks.dormant.plist"` and
+    /// `launchctl bootstrap gui/$UID
+    /// "$HOME/Library/LaunchAgents/com.legionworks.dormant-tray.plist"`
+    /// yourself afterward for the `com.legionworks.dormant` and
+    /// `com.legionworks.dormant-tray` labels respectively.
     Install,
-    /// Remove the canonical installed plist, if present.
+    /// Remove the canonical installed `LaunchAgent` plists, if present.
     ///
-    /// Only ever removes that ONE file. Does not bootout the running
+    /// Only ever removes those two files. Does not bootout either running
     /// launchd label — run `launchctl bootout gui/$UID
-    /// com.legionworks.dormant` first if the agent is loaded, otherwise
-    /// launchd keeps the last-loaded definition in memory even after the
-    /// on-disk file is gone.
+    /// com.legionworks.dormant` and `launchctl bootout gui/$UID
+    /// com.legionworks.dormant-tray` first if the agents are loaded,
+    /// otherwise launchd keeps their last-loaded definitions in memory even
+    /// after the on-disk files are gone.
     Uninstall,
 }
 

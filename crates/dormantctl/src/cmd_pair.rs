@@ -3,10 +3,11 @@
 //! Pairs with network-connected devices that need an auth token before
 //! the daemon can control them (e.g. Samsung Tizen TVs).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dormant_core::config;
+use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::paths;
 
 /// Arguments for the `pair` command.
@@ -57,6 +58,78 @@ pub fn run(args: &PairArgs) -> anyhow::Result<()> {
         args.host,
         creds_path.display()
     );
+    Ok(())
+}
+
+/// Run the `pair instance` subcommand through the daemon IPC boundary.
+pub fn run_instance(
+    socket: &Path,
+    name: &str,
+    code: Option<&str>,
+    instance_id: Option<&str>,
+    open: bool,
+) -> anyhow::Result<()> {
+    if open {
+        let response = dormantctl::client::send_request(
+            socket,
+            &IpcRequest::CoordinationPairOpen {
+                display_name: name.to_owned(),
+            },
+        )?;
+        let opened = response.coordination_pair_open.ok_or_else(|| {
+            anyhow::anyhow!(
+                response
+                    .error
+                    .unwrap_or_else(|| "pairing unavailable".into())
+            )
+        })?;
+        println!("Pairing window open for {name}.");
+        println!("Code: {}", opened.code);
+        println!("Expires: {}", opened.expires_at);
+        return Ok(());
+    }
+
+    let inventory = dormantctl::client::send_request(socket, &IpcRequest::CoordinationPeersList)?;
+    let peers = inventory.coordination_peers.ok_or_else(|| {
+        anyhow::anyhow!(
+            inventory
+                .error
+                .unwrap_or_else(|| "pairing unavailable".into())
+        )
+    })?;
+    let matches: Vec<_> = peers
+        .discovered
+        .into_iter()
+        .filter(|peer| peer.display_name == name)
+        .collect();
+    let selected = match (instance_id, matches.as_slice()) {
+        (Some(id), _) => matches
+            .into_iter()
+            .find(|peer| peer.instance_id == id)
+            .ok_or_else(|| anyhow::anyhow!("no discovered instance '{id}' named '{name}'"))?,
+        (None, [peer]) => peer.clone(),
+        (None, []) => anyhow::bail!("no discovered instance named '{name}'"),
+        (None, many) => {
+            let ids = many
+                .iter()
+                .map(|peer| peer.instance_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("multiple instances named '{name}': {ids}; retry with --instance-id")
+        }
+    };
+    let response = dormantctl::client::send_request(
+        socket,
+        &IpcRequest::CoordinationPairJoin {
+            display_name: selected.display_name,
+            instance_id: selected.instance_id,
+            code: code.expect("clap requires --code unless --open").to_owned(),
+        },
+    )?;
+    if !response.ok {
+        anyhow::bail!(response.error.unwrap_or_else(|| "pairing failed".into()));
+    }
+    println!("Pairing request sent for {name}.");
     Ok(())
 }
 

@@ -292,6 +292,18 @@ impl PairingManager {
         window.cancel();
         Ok(window.status())
     }
+
+    /// Load the persisted public peer records for an operator inventory view.
+    pub(crate) fn paired_peers(
+        &self,
+    ) -> Result<Vec<dormant_core::peers::PeerRecord>, PairSessionError> {
+        if !self.enabled {
+            return Err(PairSessionError::Disabled);
+        }
+        dormant_core::peers::load_peer_store(&self.state_dir.join("peers.json"))
+            .map(|store| store.peers)
+            .map_err(|error| PairSessionError::Local(error.to_string()))
+    }
 }
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -347,6 +359,16 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             cancel,
             windows: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return the current public discovery snapshot without retaining addresses.
+    pub(crate) fn discovered_peers(&self) -> Vec<dormant_core::peers::DiscoverAnnounce> {
+        self.discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .discovered_peers()
+            .into_values()
+            .collect()
     }
 
     /// Open a bound-and-advertised responder window.

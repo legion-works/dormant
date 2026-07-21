@@ -87,6 +87,8 @@ pub enum IpcRequest {
         /// Opaque pairing-window identifier.
         pair_id: String,
     },
+    /// List public mDNS discoveries and persisted paired instances.
+    CoordinationPeersList,
 }
 
 /// Non-secret state exposed for a local instance-pairing window.
@@ -111,6 +113,39 @@ pub struct CoordinationPairOpenResponse {
     pub code: String,
     /// RFC 3339 UTC expiry timestamp for the displayed code.
     pub expires_at: String,
+}
+
+/// Public discovery information suitable for operator selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationDiscoveredPeer {
+    /// Public peer identity.
+    pub instance_id: String,
+    /// Operator-selected name advertised by the peer.
+    pub display_name: String,
+    /// Responder pairing port.
+    pub pairing_port: u16,
+    /// Current responder window identifier.
+    pub window_id: String,
+}
+
+/// Public persisted pairing information suitable for operator display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationPairedPeer {
+    /// Public peer identity.
+    pub instance_id: String,
+    /// Operator-selected peer label.
+    pub display_name: String,
+    /// RFC 3339 timestamp for the completed pairing.
+    pub paired_at: String,
+}
+
+/// Read-only public pairing inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationPeers {
+    /// Currently discovered responder windows.
+    pub discovered: Vec<CoordinationDiscoveredPeer>,
+    /// Persisted paired peers.
+    pub paired: Vec<CoordinationPairedPeer>,
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -145,6 +180,9 @@ pub struct IpcResponse {
     /// One-time responder-window open result. Status responses never populate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination_pair_open: Option<CoordinationPairOpenResponse>,
+    /// Read-only public pairing inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_peers: Option<CoordinationPeers>,
 }
 
 impl IpcResponse {
@@ -160,6 +198,7 @@ impl IpcResponse {
             exercise_report: None,
             coordination_pair: None,
             coordination_pair_open: None,
+            coordination_peers: None,
         }
     }
 
@@ -175,6 +214,7 @@ impl IpcResponse {
             exercise_report: None,
             coordination_pair: None,
             coordination_pair_open: None,
+            coordination_peers: None,
         }
     }
 
@@ -190,6 +230,7 @@ impl IpcResponse {
             exercise_report: None,
             coordination_pair: None,
             coordination_pair_open: None,
+            coordination_peers: None,
         }
     }
 
@@ -205,6 +246,7 @@ impl IpcResponse {
             exercise_report: None,
             coordination_pair: None,
             coordination_pair_open: None,
+            coordination_peers: None,
         }
     }
 
@@ -220,6 +262,7 @@ impl IpcResponse {
             exercise_report: Some(report),
             coordination_pair: None,
             coordination_pair_open: None,
+            coordination_peers: None,
         }
     }
 
@@ -235,6 +278,7 @@ impl IpcResponse {
             exercise_report: None,
             coordination_pair: Some(status),
             coordination_pair_open: None,
+            coordination_peers: None,
         }
     }
 
@@ -250,6 +294,23 @@ impl IpcResponse {
             exercise_report: None,
             coordination_pair: None,
             coordination_pair_open: Some(open),
+            coordination_peers: None,
+        }
+    }
+
+    /// Build a response carrying the public pairing inventory.
+    #[must_use]
+    pub fn coordination_peers(peers: CoordinationPeers) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            coordination_pair: None,
+            coordination_pair_open: None,
+            coordination_peers: Some(peers),
         }
     }
 }

@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{
-    CoordinationPairOpenResponse, CoordinationPairStatus, IpcRequest, IpcResponse,
+    CoordinationDiscoveredPeer, CoordinationPairOpenResponse, CoordinationPairStatus,
+    CoordinationPairedPeer, CoordinationPeers, IpcRequest, IpcResponse,
 };
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
@@ -355,6 +356,41 @@ async fn handle_connection(
                 let resp = result.map_or_else(
                     |error| IpcResponse::error(error.to_string()),
                     pairing_response,
+                );
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPeersList => {
+                let result = pairing.paired_peers().map(|paired| {
+                    let discovered =
+                        pairing_transport
+                            .as_ref()
+                            .map_or_else(Vec::new, |transport| {
+                                transport
+                                    .discovered_peers()
+                                    .into_iter()
+                                    .map(|peer| CoordinationDiscoveredPeer {
+                                        instance_id: peer.instance_id,
+                                        display_name: peer.display_name,
+                                        pairing_port: peer.pairing_port,
+                                        window_id: peer.window_id,
+                                    })
+                                    .collect()
+                            });
+                    CoordinationPeers {
+                        discovered,
+                        paired: paired
+                            .into_iter()
+                            .map(|peer| CoordinationPairedPeer {
+                                instance_id: peer.instance_id,
+                                display_name: peer.display_name,
+                                paired_at: peer.paired_at,
+                            })
+                            .collect(),
+                    }
+                });
+                let resp = result.map_or_else(
+                    |error| IpcResponse::error(error.to_string()),
+                    IpcResponse::coordination_peers,
                 );
                 let _ = write_json(&mut writer, &resp).await;
             }

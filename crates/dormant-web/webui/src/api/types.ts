@@ -670,6 +670,40 @@ export interface PairStatus {
   detail?: string | null;
 }
 
+/** Public instance-pairing responder window. */
+export interface InstancePairOpen {
+  pair_id: string;
+  code: string;
+  expires_at: string;
+}
+
+/** Non-secret instance-pairing lifecycle state. */
+export interface InstancePairStatus {
+  state: "pairing" | "paired" | "timeout" | "cancelled" | "error";
+  detail?: string | null;
+}
+
+/** Public mDNS discovery data. */
+export interface DiscoveredInstance {
+  instance_id: string;
+  display_name: string;
+  pairing_port: number;
+  window_id: string;
+}
+
+/** Public persisted instance-pairing data. */
+export interface PairedInstance {
+  instance_id: string;
+  display_name: string;
+  paired_at: string;
+}
+
+/** Read-only pairing inventory. */
+export interface InstancePairPeers {
+  discovered: DiscoveredInstance[];
+  paired: PairedInstance[];
+}
+
 /**
  * rust: config/routes.rs ConfigResponse
  * Full shape of GET /api/config.

@@ -20,6 +20,7 @@ import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
 import DisplaysSection from "./DisplaysSection";
 import PairingWizard from "./PairingWizard";
+import DormantPairing from "./DormantPairing";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
@@ -304,6 +305,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
         pairingEnabled={pairingEnabled}
         onDisplayCreateRequest={(prefill) => setPairingPrefill(prefill)}
       />
+      <DormantPairing enabled={config.inventory.coordination?.enabled === true} />
 
       {/* Banner-level errors not mapped to fields */}
       {bannerErrors.length > 0 && (

@@ -524,6 +524,7 @@ async fn reload_first_shared_display_is_rejected_with_restart_required_detail() 
             .iter()
             .any(|(id, _)| id == "mon")
     );
+    // Forward-compat guard: rejected reloads must not create M3's peer store.
     assert!(!paths.state.join("coord").exists());
     shutdown(handle, join).await;
 }

@@ -3234,6 +3234,13 @@ fn shared_displays(cfg: &Config) -> Vec<DisplayId> {
         .collect()
 }
 
+fn should_spawn_coordination_poller(
+    cfg: &Config,
+    coordination: Option<&CoordinationHandle>,
+) -> bool {
+    coordination.is_some() && !shared_displays(cfg).is_empty()
+}
+
 fn retry_timing_differs(a: &RuleConfig, b: &RuleConfig) -> bool {
     a.grace_period != b.grace_period
         || a.min_blank_time != b.min_blank_time
@@ -3624,7 +3631,9 @@ fn spawn_generation(
 
     let mut producer_handles = Vec::new();
 
-    if let Some(state) = coordination {
+    if should_spawn_coordination_poller(&assembly.cfg, coordination.as_ref())
+        && let Some(state) = coordination
+    {
         producer_handles.push(coordination_poll::spawn(CoordinationPollDeps {
             config_rx,
             ctl_tx: ctl_tx.clone(),

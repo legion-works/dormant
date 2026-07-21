@@ -36,7 +36,7 @@ use dormant_displays::ddc_lock::PanelLocks;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use dormant_displays::vcp_ops::RealVcp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use dormant_displays::vcp_ops::{VcpOps, VcpPriority};
+use dormant_displays::vcp_ops::{INPUT_SOURCE_SKIPPED, VCP_SKIPPED, VcpOps, VcpPriority};
 
 /// Bounded budget for the advisory `ddcutil detect --brief` second opinion.
 /// `ddcutil` walks I²C buses too, so a hung/rogue bus must never stall the
@@ -197,6 +197,16 @@ async fn probe_ddcci_with(
     ddcutil: &impl DdcutilOps,
     ddcutil_timeout: Duration,
 ) -> ProbeResult {
+    let panel_locks = PanelLocks::new();
+    probe_ddcci_with_locks(ops, ddcutil, ddcutil_timeout, &panel_locks).await
+}
+
+async fn probe_ddcci_with_locks(
+    ops: &impl VcpOps,
+    ddcutil: &impl DdcutilOps,
+    ddcutil_timeout: Duration,
+    panel_locks: &PanelLocks,
+) -> ProbeResult {
     let displays = ops.list_displays().await;
 
     let (all_ok, mut detail) = if displays.is_empty() {
@@ -210,8 +220,6 @@ async fn probe_ddcci_with(
         // §4.3) for the duration of the loop below, which is all this
         // diagnostic needs. Command priority: an operator-triggered diagnostic
         // read is command-path work, never periodic sampling.
-        let panel_locks = PanelLocks::new();
-
         let mut details: Vec<String> = Vec::new();
         let mut all_ok = true;
 
@@ -220,6 +228,16 @@ async fn probe_ddcci_with(
             let lock = panel_locks.get(ident);
             let brightness = ops.get_vcp(ident, 0x10, &lock, VcpPriority::Command).await;
             let d6 = ops.get_vcp(ident, 0xD6, &lock, VcpPriority::Command).await;
+            let input_source = ops
+                .get_vcp(ident, 0x60, &lock, VcpPriority::Sampler)
+                .await
+                .map_err(|error| {
+                    if error == VCP_SKIPPED {
+                        INPUT_SOURCE_SKIPPED.to_string()
+                    } else {
+                        error
+                    }
+                });
 
             let mut line = format!("  {ident}: brightness=");
             match brightness {
@@ -236,6 +254,15 @@ async fn probe_ddcci_with(
             match d6 {
                 Ok(_) => line.push_str("supported"),
                 Err(_) => line.push_str("not supported"),
+            }
+            line.push_str(", input_source=");
+            match input_source {
+                Ok(value) => {
+                    use std::fmt::Write;
+                    let _ = write!(line, "0x{value:02x}");
+                }
+                Err(error) if error == INPUT_SOURCE_SKIPPED => line.push_str("skipped"),
+                Err(_) => line.push_str("unreadable"),
             }
             details.push(line);
         }
@@ -350,9 +377,12 @@ mod tests {
             &self,
             ident: &str,
             code: u8,
-            _lock: &std::sync::Arc<dormant_displays::ddc_lock::PanelLock>,
-            _prio: VcpPriority,
+            lock: &std::sync::Arc<dormant_displays::ddc_lock::PanelLock>,
+            prio: VcpPriority,
         ) -> Result<u16, String> {
+            if prio == VcpPriority::Sampler && lock.sampler_try().is_none() {
+                return Err(VCP_SKIPPED.to_string());
+            }
             self.responses
                 .get(&(ident.to_string(), code))
                 .cloned()
@@ -376,12 +406,23 @@ mod tests {
 
         async fn get_vcp_raw(
             &self,
-            _ident: &str,
-            _code: u8,
-            _lock: &std::sync::Arc<dormant_displays::ddc_lock::PanelLock>,
-            _prio: VcpPriority,
+            ident: &str,
+            code: u8,
+            lock: &std::sync::Arc<dormant_displays::ddc_lock::PanelLock>,
+            prio: VcpPriority,
         ) -> Result<[u8; 4], String> {
-            Err("FakeVcp: get_vcp_raw unused by probe_ddcci".to_string())
+            if prio == VcpPriority::Sampler && lock.sampler_try().is_none() {
+                return Err(VCP_SKIPPED.to_string());
+            }
+            match self.responses.get(&(ident.to_string(), code)) {
+                Some(Ok(value)) => u8::try_from(*value)
+                    .map(|value| [0, 0, 0, value])
+                    .map_err(|_| "FakeVcp: raw value exceeds u8".to_string()),
+                Some(Err(error)) => Err(error.clone()),
+                None => Err(format!(
+                    "FakeVcp: no scripted raw response for {ident}/{code:#x}"
+                )),
+            }
         }
     }
 
@@ -405,6 +446,69 @@ mod tests {
         async fn detect_brief(&self, _timeout: Duration) -> DdcutilOutcome {
             self.outcome.clone()
         }
+    }
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_input_source_hex() {
+        let mut vcp = FakeVcp::single_ok("mon-1", 42);
+        vcp.responses.insert(("mon-1".to_string(), 0x60), Ok(0x0f));
+        let result = probe_ddcci_with(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("input_source=0x0f"),
+            "{}",
+            result.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_input_source_unreadable() {
+        let vcp = FakeVcp::single_ok("mon-1", 42);
+        let result = probe_ddcci_with(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("input_source=unreadable"),
+            "{}",
+            result.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_input_source_skipped_when_command_holds_lock() {
+        let mut vcp = FakeVcp::single_ok("mon-1", 42);
+        vcp.responses.insert(("mon-1".to_string(), 0x60), Ok(0x0f));
+        let locks = PanelLocks::new();
+        let lock = locks.get("mon-1");
+        let guard = lock.command_guard();
+        let result = probe_ddcci_with_locks(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+            &locks,
+        )
+        .await;
+        drop(guard);
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("input_source=skipped"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            !result.detail.contains("input_source=unreadable"),
+            "{}",
+            result.detail
+        );
     }
 
     // ── (a) executable missing ──────────────────────────────────────────────

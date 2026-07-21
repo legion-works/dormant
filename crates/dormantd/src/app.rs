@@ -3611,6 +3611,9 @@ fn spawn_generation(
         ownership,
     )
     .context("build engine")?;
+    if let Some(ref coordination) = coordination {
+        engine = engine.with_coordination_handle(coordination.clone());
+    }
     if let Some(observations) = observations {
         engine = engine.with_observation_hub(generation_id, observations);
     }
@@ -5210,6 +5213,10 @@ mod restore_tests {
             wake_attempts,
             last_blank_failed,
             stage: None,
+            scope: dormant_core::config::DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
         }
     }
 
@@ -5725,6 +5732,10 @@ mod gamma_reload_tests {
                     inhibited: false,
                     paused: false,
                     cmd_gen: 0,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
                     controllers: Vec::new(),
                     wake_attempts: 0,
                     last_blank_failed: false,

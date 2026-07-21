@@ -127,6 +127,31 @@ fn selector_for_display(display: CGDirectDisplayID) -> Option<String> {
     result.map(|uuid| format!("cg:{uuid}"))
 }
 
+/// Enumerate online displays as stable `cg:<lowercase-uuid>` selectors.
+///
+/// # Errors
+///
+/// Returns an error when Quartz cannot enumerate online displays.
+pub fn online_selectors() -> Result<Vec<String>, String> {
+    let mut displays = [0; MAX_ONLINE_DISPLAYS];
+    let mut count = 0;
+    let result = unsafe {
+        CGGetOnlineDisplayList(
+            MAX_ONLINE_DISPLAYS as u32,
+            displays.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if result != 0 {
+        return Err(format!("CGGetOnlineDisplayList failed: {result}"));
+    }
+    Ok(displays[..count as usize]
+        .iter()
+        .copied()
+        .filter_map(selector_for_display)
+        .collect())
+}
+
 /// Real macOS Quartz gamma-table backend for
 /// [`crate::macos_gamma_black::MacosGammaBlackController`].
 pub struct RealGammaApi;

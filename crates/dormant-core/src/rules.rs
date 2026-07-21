@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::SensorKind;
+use crate::config::{DisplayScope, SensorKind};
+use crate::coordination::CoordinationHandle;
 use crate::error::DormantError;
 use crate::observation::{DaemonObservation, GenerationId, ObservationHub};
 use crate::ownership::OwnershipGate;
@@ -487,6 +488,10 @@ pub struct StageInfo {
 }
 
 /// A display as seen by a [`StateSnapshot`].
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the status wire mirrors independent display machine and ownership flags"
+)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DisplaySnapshot {
     /// Literal phase name (`"active"`, `"grace"`, `"blanking"`, `"blanked"`,
@@ -499,6 +504,18 @@ pub struct DisplaySnapshot {
     /// The display machine's command-generation counter (carry-over across
     /// reloads).
     pub cmd_gen: u64,
+    /// Whether this display is private to this daemon or coordinated between machines.
+    #[serde(default)]
+    pub scope: DisplayScope,
+    /// Whether this daemon currently owns a shared display. Always `true` for private displays.
+    #[serde(default = "default_owned")]
+    pub owned: bool,
+    /// Last observed shared-display input source. Absent for private or stale displays.
+    #[serde(default)]
+    pub observed_input_code: Option<u8>,
+    /// Panel state observed with the shared-display input source. `None` is unknown or stale.
+    #[serde(default)]
+    pub panel_state: Option<PanelState>,
     /// Per-controller health from the last blank/wake attempt.  Empty until
     /// the first attempt or when deserializing legacy snapshots without this
     /// field (serde back-compat).
@@ -519,6 +536,10 @@ pub struct DisplaySnapshot {
     /// omitted when `None`, byte-identical to a pre-stage snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<StageInfo>,
+}
+
+const fn default_owned() -> bool {
+    true
 }
 
 /// Boot-time rollback metadata surfaced to operators through [`StateSnapshot`].
@@ -736,6 +757,7 @@ pub struct RulesEngine {
     /// display.  Feeds [`Input::OwnershipChanged`] to the state machine when
     /// the gate's verdict differs from the last-fed value.
     ownership: Arc<dyn OwnershipGate>,
+    coordination: Option<CoordinationHandle>,
     /// Last ownership value fed per display — change-detection to avoid
     /// redundant [`Input::OwnershipChanged`] edges every tick.
     last_owned: HashMap<DisplayId, bool>,
@@ -874,6 +896,7 @@ impl RulesEngine {
             executors,
             render_sinks,
             ownership,
+            coordination: None,
             last_owned,
             rule_displays,
             zone_rules,
@@ -893,6 +916,13 @@ impl RulesEngine {
             rollback: None,
             pending_restore: Vec::new(),
         })
+    }
+
+    /// Attach the daemon-lifetime shared-display observation cache.
+    #[must_use]
+    pub fn with_coordination_handle(mut self, coordination: CoordinationHandle) -> Self {
+        self.coordination = Some(coordination);
+        self
     }
 
     /// Attach the daemon observation hub for this engine generation.
@@ -1698,6 +1728,19 @@ impl RulesEngine {
                     .get(&dcfg.display)
                     .map(|exec| exec.controller_health())
                     .unwrap_or_default();
+                let coordination = self
+                    .coordination
+                    .as_ref()
+                    .and_then(|handle| handle.snapshot().remove(&dcfg.display));
+                let (scope, owned, observed_input_code, panel_state) = match coordination {
+                    Some(record) => (
+                        DisplayScope::Shared,
+                        record.owned,
+                        record.input_code,
+                        record.panel_state,
+                    ),
+                    None => (DisplayScope::Private, true, None, None),
+                };
                 displays.push((
                     dcfg.display.0.clone(),
                     DisplaySnapshot {
@@ -1705,6 +1748,10 @@ impl RulesEngine {
                         inhibited: m.overlays().inhibited,
                         paused: m.overlays().paused.is_some(),
                         cmd_gen: m.cmd_gen(),
+                        scope,
+                        owned,
+                        observed_input_code,
+                        panel_state,
                         controllers,
                         wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
                         last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
@@ -2856,6 +2903,10 @@ mod tests {
             inhibited: false,
             paused: false,
             cmd_gen: 0,
+            scope: DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
             controllers: vec![],
             wake_attempts: 0,
             last_blank_failed: false,
@@ -2873,6 +2924,10 @@ mod tests {
             inhibited: false,
             paused: false,
             cmd_gen: 1,
+            scope: DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
             controllers: vec![],
             wake_attempts: 0,
             last_blank_failed: false,
@@ -3021,6 +3076,68 @@ mod tests {
         let d: DisplaySnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(d.wake_attempts, 0);
         assert!(!d.last_blank_failed);
+    }
+
+    #[test]
+    fn legacy_display_snapshot_defaults_private_owned_and_unknown_panel() {
+        let json =
+            r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":3,"controllers":[]}"#;
+        let snapshot: DisplaySnapshot = serde_json::from_str(json).unwrap();
+
+        assert_eq!(snapshot.scope, DisplayScope::Private);
+        assert!(snapshot.owned);
+        assert_eq!(snapshot.observed_input_code, None);
+        assert_eq!(snapshot.panel_state, None);
+    }
+
+    #[test]
+    fn shared_display_snapshot_uses_hardware_observation_not_local_phase() {
+        let display = DisplayId("shared".into());
+        let coordination = crate::coordination::CoordinationHandle::new([display.clone()]);
+        coordination.record_success(
+            &display,
+            0x10,
+            0x0f,
+            Some(PanelState {
+                power: Some(PowerState::Standby),
+                brightness: Some(0),
+            }),
+        );
+        let mut engine = RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![DisplayRuntimeCfg {
+                    display: display.clone(),
+                    blank_mode: BlankMode::PowerOff,
+                    ladder: vec![LadderStage {
+                        kind: StageKind::Controller(BlankMode::PowerOff),
+                        dwell: None,
+                    }],
+                    timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                }],
+                sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::coordination::CoordinationGate::new(
+                coordination.clone(),
+            )),
+        )
+        .expect("shared display engine config is valid")
+        .with_coordination_handle(coordination);
+
+        let snapshot = snapshot_of(&mut engine);
+        let display = &snapshot.displays[0].1;
+        assert_eq!(display.phase, "active");
+        assert_eq!(display.scope, DisplayScope::Shared);
+        assert!(!display.owned);
+        assert_eq!(display.observed_input_code, Some(0x10));
+        assert_eq!(
+            display.panel_state.as_ref().and_then(|state| state.power),
+            Some(PowerState::Standby)
+        );
     }
 
     // ── `reported` cold-start diagnostic (spec §5) ──────────────────────────
@@ -3601,6 +3718,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         executors: HashMap::new(),
         render_sinks: HashMap::new(),
         ownership: Arc::new(AlwaysOwned),
+        coordination: None,
         last_owned: HashMap::new(),
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
@@ -3702,6 +3820,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         executors: HashMap::new(),
         render_sinks: HashMap::new(),
         ownership: Arc::new(NeverOwned),
+        coordination: None,
         last_owned: HashMap::new(),
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),

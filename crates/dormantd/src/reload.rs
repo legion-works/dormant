@@ -360,6 +360,10 @@ mod dispatch_gate_tests {
             wake_attempts,
             last_blank_failed,
             stage: None,
+            scope: dormant_core::config::DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
         }
     }
 

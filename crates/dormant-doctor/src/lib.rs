@@ -27,6 +27,8 @@ pub use probes::config::probe_config_inner;
 pub use probes::ddcci::probe_ddcci;
 pub use probes::ha::probe_ha_all;
 #[cfg(target_os = "macos")]
+pub use probes::macos_display_catalog::probe_macos_display_catalog;
+#[cfg(target_os = "macos")]
 pub use probes::macos_display_sleep::probe_macos_display_sleep;
 #[cfg(target_os = "macos")]
 pub use probes::macos_idle::probe_macos_idle;
@@ -163,6 +165,7 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
     #[cfg(target_os = "macos")]
     {
         results.push(probes::macos_idle::probe_macos_idle().await);
+        results.push(probes::macos_display_catalog::probe_macos_display_catalog());
         results.push(probes::macos_display_sleep::probe_macos_display_sleep().await);
         results.push(probes::macos_power::probe_macos_power().await);
     }

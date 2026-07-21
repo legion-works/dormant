@@ -1840,6 +1840,10 @@ mod promote_tests {
             wake_attempts: 0,
             last_blank_failed: false,
             stage: None,
+            scope: dormant_core::config::DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
         }
     }
 

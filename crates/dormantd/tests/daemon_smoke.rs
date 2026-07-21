@@ -555,6 +555,16 @@ async fn ownership_poll_after_reload_uses_updated_cache_not_stale_last_owned() {
         reload_from_file(&handle).await.outcome,
         ReloadOutcome::Reloaded
     );
+    let before_poke = snapshot_with_retry(&handle.control_sender()).await;
+    let before_poke_display = before_poke
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("shared display survives reload");
+    assert!(
+        !before_poke_display.1.owned,
+        "reloaded engine must surface the seeded false ownership cache"
+    );
     assert_eq!(
         coordination.record_success(&display, 0x0f, 0x0f, None),
         Some(false)
@@ -566,12 +576,15 @@ async fn ownership_poll_after_reload_uses_updated_cache_not_stale_last_owned() {
         })
         .await
         .expect("poke new engine");
+    let after_poke = snapshot_with_retry(&handle.control_sender()).await;
+    let after_poke_display = after_poke
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("shared display survives ownership poll");
     assert!(
-        snapshot_with_retry(&handle.control_sender())
-            .await
-            .displays
-            .iter()
-            .any(|(id, _)| id == "mon")
+        after_poke_display.1.owned,
+        "post-poll status round-trip must surface ownership=true"
     );
     assert!(coordination.snapshot()[&display].owned);
     shutdown(handle, join).await;

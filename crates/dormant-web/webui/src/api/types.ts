@@ -114,6 +114,14 @@ export interface DisplaySnapshot {
   inhibited: boolean;
   paused: boolean;
   cmd_gen: number;
+  /** Shared-display coordination scope. Absent on legacy wire. */
+  scope?: "private" | "shared";
+  /** Shared-display ownership verdict. Absent on legacy wire. */
+  owned?: boolean;
+  /** Last observed shared-display input source. */
+  observed_input_code?: number | null;
+  /** Panel state observed alongside the shared-display input source. */
+  panel_state?: PanelState | null;
   controllers: ControllerHealth[];
   /** Current wake-retry attempt counter for this display (0 once healthy
    * or before the first attempt). Absent on legacy wire. */

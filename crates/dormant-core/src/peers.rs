@@ -13,6 +13,7 @@ use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use getrandom::{SysRng, rand_core::UnwrapErr};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// The only peer-store schema version understood by this build.
 pub const PEER_STORE_VERSION: u32 = 1;
@@ -20,6 +21,8 @@ pub const PEER_STORE_VERSION: u32 = 1;
 pub const PAIR_PROTOCOL_VERSION: u16 = 2;
 /// Maximum accepted JSON frame payload size for the pairing transport.
 pub const MAX_PAIR_FRAME_BYTES: u32 = 65_536;
+/// Maximum permitted on-disk peer-store size before it is rejected without reading.
+pub const MAX_PEER_STORE_BYTES: u64 = 64 * 1024;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -216,7 +219,8 @@ pub fn load_or_create_identity(state_dir: &Path) -> Result<InstanceIdentity, Pee
     }
 
     let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
-    atomic_write(&key_path, |file| file.write_all(&signing_key.to_bytes()))?;
+    let secret = Zeroizing::new(signing_key.to_bytes());
+    atomic_write(&key_path, |file| file.write_all(&*secret))?;
     Ok(identity_from_signing_key(signing_key))
 }
 
@@ -235,6 +239,17 @@ pub fn load_peer_store(path: &Path) -> Result<PeerStore, PeerStoreError> {
     }
 
     ensure_private_permissions(path)?;
+    let length = fs::metadata(path)
+        .map_err(|source| PeerStoreError::Io {
+            operation: "inspect peer store size",
+            source,
+        })?
+        .len();
+    if length > MAX_PEER_STORE_BYTES {
+        return Err(PeerStoreError::Invalid {
+            detail: format!("peers.json exceeds {MAX_PEER_STORE_BYTES} bytes"),
+        });
+    }
     let bytes = fs::read(path).map_err(|source| PeerStoreError::Io {
         operation: "read peer store",
         source,
@@ -535,6 +550,16 @@ mod tests {
         dir.join("peers.json")
     }
 
+    fn write_private_peer_store(path: &Path, contents: &[u8]) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn identity_is_stable_across_reload() {
         let dir = tempfile::tempdir().unwrap();
@@ -599,7 +624,7 @@ mod tests {
             version: PEER_STORE_VERSION,
             peers: vec![test_record(9, "TV")],
         };
-        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        write_private_peer_store(&path, &serde_json::to_vec(&store).unwrap());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(load_peer_store(&path).is_err());
     }
@@ -677,7 +702,7 @@ mod tests {
             version: PEER_STORE_VERSION,
             peers: vec![record.clone(), record],
         };
-        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        write_private_peer_store(&path, &serde_json::to_vec(&store).unwrap());
 
         let error = load_peer_store(&path).unwrap_err();
 
@@ -694,7 +719,7 @@ mod tests {
             version: PEER_STORE_VERSION,
             peers: vec![record],
         };
-        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        write_private_peer_store(&path, &serde_json::to_vec(&store).unwrap());
 
         assert!(load_peer_store(&path).is_err());
     }
@@ -712,7 +737,7 @@ mod tests {
                 paired_at: "2026-07-21T12:00:00Z".to_owned(),
             }],
         };
-        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        write_private_peer_store(&path, &serde_json::to_vec(&store).unwrap());
 
         assert!(load_peer_store(&path).is_err());
     }
@@ -725,9 +750,24 @@ mod tests {
             version: PEER_STORE_VERSION + 1,
             peers: Vec::new(),
         };
-        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        write_private_peer_store(&path, &serde_json::to_vec(&store).unwrap());
 
         assert!(load_peer_store(&path).is_err());
+    }
+
+    #[test]
+    fn peer_store_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = peers_path(dir.path());
+        let padding = "x".repeat(70 * 1024);
+        write_private_peer_store(
+            &path,
+            format!(r#"{{"version":1,"peers":[],"padding":"{padding}"}}"#).as_bytes(),
+        );
+
+        let error = load_peer_store(&path).unwrap_err();
+
+        assert!(error.to_string().contains("peer_store_invalid"));
     }
 
     #[test]
@@ -796,6 +836,31 @@ mod tests {
     #[test]
     fn transcript_is_deterministic() {
         assert_eq!(transcript(), transcript());
+    }
+
+    #[test]
+    fn transcript_matches_golden_vector() {
+        let expected_parts: &[&[u8]] = &[
+            &[0, 2, 0, 9],
+            b"initiator",
+            &[0, 9],
+            b"responder",
+            &[0, 12],
+            b"initiator-id",
+            &[0, 12],
+            b"responder-id",
+            &[0, 17],
+            b"Initiator display",
+            &[0, 17],
+            b"Responder display",
+            &[1; 32],
+            &[2; 32],
+            &[3; 32],
+            &[4; 32],
+        ];
+        let expected = expected_parts.concat();
+
+        assert_eq!(transcript(), expected);
     }
 
     #[test]

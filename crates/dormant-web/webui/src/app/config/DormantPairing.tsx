@@ -40,6 +40,7 @@ export default function DormantPairing({ enabled }: { enabled: boolean }) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     function poll() {
       timer = setTimeout(() => {
+        if (!opened) return;
         getInstancePairStatus(opened.pair_id)
           .then((next) => {
             if (cancelled) return;

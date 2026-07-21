@@ -3,7 +3,6 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import DormantPairing from "../app/config/DormantPairing";
 import {
   getInstancePairPeers,
-  getInstancePairStatus,
   postInstancePair,
   postJoinInstancePair,
 } from "../api/client";

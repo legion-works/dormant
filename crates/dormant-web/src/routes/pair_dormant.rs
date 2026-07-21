@@ -99,6 +99,13 @@ pub(crate) async fn post_pair_instance(
     )
     .await?;
     drop(guard);
+    if response
+        .error
+        .as_deref()
+        .is_some_and(|error| error == "a pairing session is already active")
+    {
+        return Err(WebError::PairInProgress);
+    }
     let opened = response
         .coordination_pair_open
         .ok_or(WebError::CoordinationUnavailable)?;
@@ -316,6 +323,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pair_instance_cancel_missing_and_foreign_origin_are_rejected() {
+        for origin in [Some("http://evil.invalid"), None] {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/api/pair/instance/pair-1/cancel")
+                .header("Host", "127.0.0.1:8080")
+                .header("Content-Type", "application/json");
+            if let Some(origin) = origin {
+                builder = builder.header("Origin", origin);
+            }
+            let response = call(
+                crate::server::build_router(state(true)),
+                builder.body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
     async fn pair_instance_body_over_4kib_returns_413() {
         let response = call(
             crate::server::build_router(state(true)),
@@ -339,39 +366,23 @@ mod tests {
     async fn pair_instance_second_attempt_returns_409() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("ipc.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = String::new();
-            std::io::BufRead::read_line(
-                &mut std::io::BufReader::new(stream.try_clone().unwrap()),
-                &mut request,
-            )
-            .unwrap();
-            ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            let response = IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
-                pair_id: "pair-1".into(),
-                code: "ABCD1234".into(),
-                expires_at: "soon".into(),
-            });
-            std::io::Write::write_all(
-                &mut stream,
-                format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
-            )
-            .unwrap();
-        });
+        let server = ipc_server(
+            &socket,
+            vec![
+                IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
+                    pair_id: "pair-1".into(),
+                    code: "ABCD1234".into(),
+                    expires_at: "soon".into(),
+                }),
+                IpcResponse::error("a pairing session is already active"),
+            ],
+            std::time::Duration::ZERO,
+        );
         let router = crate::server::build_router(state_with_socket(true, Some(&socket)));
-        let first = tokio::spawn(call(router.clone(), post_open()));
-        tokio::task::spawn_blocking(move || ready_rx.recv().unwrap())
-            .await
-            .unwrap();
+        let first = call(router.clone(), post_open()).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
         let second = call(router, post_open()).await;
         assert_eq!(second.status(), StatusCode::CONFLICT);
-        release_tx.send(()).unwrap();
-        assert_eq!(first.await.unwrap().status(), StatusCode::ACCEPTED);
         server.join().unwrap();
     }
 

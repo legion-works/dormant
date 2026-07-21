@@ -122,11 +122,13 @@ pub(crate) async fn security_guard(
         // For strict-origin write endpoints, the Origin header MUST be
         // present (the generic is_same_origin allows absent Origin, which is
         // a CSRF gap for a write endpoint) and must exact-match the loopback
-        // origin including the actual bound port.  Membership in
-        // STRICT_ORIGIN_PATHS is checked against the raw, un-normalized
-        // `uri().path()` — see the structural test at the bottom of this
-        // module for why that's safe.
-        if STRICT_ORIGIN_PATHS.contains(&request.uri().path()) {
+        // origin including the actual bound port. Patterns are matched segment
+        // by segment so parameterized routes cannot silently fall back to the
+        // weaker absent-Origin policy.
+        if STRICT_ORIGIN_PATHS
+            .iter()
+            .any(|pattern| route_pattern_matches(pattern, request.uri().path()))
+        {
             let origin_ok = check_apply_origin(&headers, state.inner.web_bind);
             if !origin_ok {
                 tracing::warn!(event = "web_reject_origin", reason = "apply_origin");
@@ -155,6 +157,14 @@ pub(crate) async fn security_guard(
     }
 
     next.run(request).await
+}
+
+fn route_pattern_matches(pattern: &str, path: &str) -> bool {
+    pattern
+        .split('/')
+        .zip(path.split('/'))
+        .all(|(expected, actual)| expected.starts_with(':') || expected == actual)
+        && pattern.split('/').count() == path.split('/').count()
 }
 
 /// Detect a WebSocket upgrade request by checking for the presence of both

@@ -680,7 +680,7 @@ export interface InstancePairOpen {
 /** Non-secret instance-pairing lifecycle state. */
 export interface InstancePairStatus {
   state: "pairing" | "paired" | "timeout" | "cancelled" | "error";
-  detail?: string | null;
+  detail: string | null;
 }
 
 /** Public mDNS discovery data. */

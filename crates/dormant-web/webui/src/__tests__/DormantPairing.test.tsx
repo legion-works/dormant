@@ -33,7 +33,7 @@ describe("DormantPairing", () => {
 
   it("requires explicit code confirmation", async () => {
     vi.mocked(getInstancePairPeers).mockResolvedValue(peers);
-    vi.mocked(postJoinInstancePair).mockResolvedValue({ state: "pairing" });
+    vi.mocked(postJoinInstancePair).mockResolvedValue({ state: "pairing", detail: null });
     render(<DormantPairing enabled />);
     await screen.findByText(/Office Mac/);
     expect(screen.getByRole("button", { name: /confirm and join/i })).toBeDisabled();
@@ -49,15 +49,14 @@ describe("DormantPairing", () => {
     render(<DormantPairing enabled />);
     fireEvent.change(screen.getByLabelText(/local display name/i), { target: { value: "Desk" } });
     fireEvent.click(screen.getByRole("button", { name: /open pairing window/i }));
-    expect(await screen.findByText(/Expires: 2026-07-21T01:00:00Z/)).toBeInTheDocument();
+    expect(await screen.findByText(/Expires in/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /retry discovery/i }));
     expect(getInstancePairPeers).toHaveBeenCalledTimes(2);
   });
 
   it("never renders private key material", async () => {
     const privateKey = "SENTINEL-PRIVATE-KEY";
-    vi.mocked(getInstancePairPeers).mockResolvedValue(peers);
-    vi.mocked(getInstancePairStatus).mockResolvedValue({ state: "paired", detail: null });
+    vi.mocked(getInstancePairPeers).mockResolvedValue({ ...peers, private_key: privateKey } as never);
     render(<DormantPairing enabled />);
     await screen.findByText(/Office Mac/);
     expect(screen.queryByText(privateKey)).toBeNull();

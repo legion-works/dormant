@@ -16,6 +16,7 @@ export default function DormantPairing({ enabled }: { enabled: boolean }) {
   const [peers, setPeers] = useState<InstancePairPeers>({ discovered: [], paired: [] });
   const [name, setName] = useState("");
   const [opened, setOpened] = useState<InstancePairOpen | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -35,20 +36,29 @@ export default function DormantPairing({ enabled }: { enabled: boolean }) {
 
   useEffect(() => {
     if (!opened) return;
-    const timer = window.setInterval(() => {
-      getInstancePairStatus(opened.pair_id)
-        .then((status) => {
-          if (status.state !== "pairing") void refresh();
-        })
-        .catch(() => undefined);
-    }, 1000);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function poll() {
+      timer = setTimeout(() => {
+        getInstancePairStatus(opened.pair_id)
+          .then((next) => {
+            if (cancelled) return;
+            setStatus(next.state);
+            if (next.state === "pairing") poll();
+            else { setOpened(null); void refresh(); }
+          })
+          .catch(() => { if (!cancelled) poll(); });
+      }, 1000);
+    }
+    poll();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, [opened]);
 
   async function open() {
     setError(null);
     try {
       setOpened(await postInstancePair(name));
+      setStatus("pairing");
     } catch (caught) {
       setError(message(caught));
     }
@@ -76,7 +86,8 @@ export default function DormantPairing({ enabled }: { enabled: boolean }) {
         <input value={name} onChange={(event) => setName(event.target.value)} />
       </label>
       <button type="button" disabled={!name} onClick={() => void open()}>Open pairing window</button>
-      {opened && <p role="status">Code: <strong>{opened.code}</strong> · Expires: {opened.expires_at}</p>}
+      {opened && <p role="status">Code: <strong>{opened.code}</strong> · Expires in {Math.max(0, Math.ceil((Date.parse(opened.expires_at) - Date.now()) / 1000))}s</p>}
+      {status && status !== "pairing" && <p role="status">Pairing {status}. Retry to open another window.</p>}
       <h3>Discovered instances</h3>
       <button type="button" onClick={() => void refresh()}>Retry discovery</button>
       {peers.discovered.length === 0 ? <p>None discovered. Retry after a peer opens pairing.</p> : (

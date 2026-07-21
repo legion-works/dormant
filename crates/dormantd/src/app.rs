@@ -86,7 +86,7 @@ use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery};
-use crate::coordination_pairing::PairingManager;
+use crate::coordination_pairing::{PairingManager, PairingTransport};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
@@ -845,6 +845,15 @@ impl App {
             )
             .context("load persistent instance identity for pairing")?,
         );
+        let pairing_transport = coordination_mdns.map(|discovery| {
+            Arc::new(PairingTransport::new(
+                Arc::clone(&pairing_manager),
+                discovery,
+                cfg_clone.coordination.pairing_port,
+                cfg_clone.coordination.pairing_bind_address.clone(),
+                root.clone(),
+            ))
+        });
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
@@ -972,6 +981,7 @@ impl App {
                     reload_requester.clone(),
                     doctor_service.clone(),
                     Arc::clone(&pairing_manager),
+                    pairing_transport.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -1104,7 +1114,7 @@ impl App {
             notify_sink,
             ownership,
             coordination: coordination.clone(),
-            _coordination_mdns: coordination_mdns,
+            _coordination_mdns: None,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,

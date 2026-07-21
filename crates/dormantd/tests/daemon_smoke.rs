@@ -7,6 +7,8 @@
 
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -330,6 +332,72 @@ async fn start_coordinator_app(
     .start()
     .await
     .expect("start coordinator app")
+}
+
+#[tokio::test]
+async fn paired_peers_survive_restart() {
+    let paths_a = TestAppPaths::new();
+    let paths_b = TestAppPaths::new();
+    dormantd::coordination_pairing::pair_over_loopback_for_test(
+        paths_a.state.clone(),
+        paths_b.state.clone(),
+    )
+    .await
+    .expect("pair isolated daemon state directories over loopback TCP");
+
+    for paths in [&paths_a, &paths_b] {
+        let peers = paths.state.join("peers.json");
+        assert!(peers.exists(), "paired state should be durable");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&peers).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let config_a = write_file(
+        paths_a.root(),
+        "config.toml",
+        &one_display_config(&paths_a.marker, "1s"),
+    );
+    let config_b = write_file(
+        paths_b.root(),
+        "config.toml",
+        &one_display_config(&paths_b.marker, "1s"),
+    );
+    let creds_a = write_credentials(paths_a.root(), "");
+    let creds_b = write_credentials(paths_b.root(), "");
+    let app_a = App::build_with_sources(
+        config_a,
+        creds_a,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths_a.state.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .expect("rebuild first daemon from paired state");
+    let app_b = App::build_with_sources(
+        config_b,
+        creds_b,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths_b.state.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .expect("rebuild second daemon from paired state");
+    shutdown(app_a.0, app_a.1).await;
+    shutdown(app_b.0, app_b.1).await;
+
+    assert!(paths_a.state.join("peers.json").exists());
+    assert!(paths_b.state.join("peers.json").exists());
 }
 
 fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {

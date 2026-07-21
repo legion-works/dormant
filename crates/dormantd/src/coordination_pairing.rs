@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,14 +10,17 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use dormant_core::peers::{
-    MAX_PAIR_FRAME_BYTES, PAIR_PROTOCOL_VERSION, PairError, PairFrame, PairRole, PeerRecord,
-    build_pairing_transcript, instance_id_from_public_key, load_or_create_identity, upsert_peer,
+    DiscoverAnnounce, MAX_PAIR_FRAME_BYTES, PAIR_PROTOCOL_VERSION, PairError, PairFrame, PairRole,
+    PeerRecord, build_pairing_transcript, instance_id_from_public_key, load_or_create_identity,
+    upsert_peer,
 };
 use ed25519_dalek::VerifyingKey;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
+
+use crate::coordination_mdns::{MdnsBackend, PairDiscovery, resolve_bind_ip};
 
 #[allow(
     dead_code,
@@ -44,7 +48,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Local failures that are not part of the ratified pairing wire protocol.
 #[derive(Debug)]
-pub(crate) enum PairSessionError {
+pub enum PairSessionError {
     /// A protocol-level failure reported by the peer or detected locally.
     Wire(PairError),
     /// The selected discovery record identifies this daemon.
@@ -59,8 +63,6 @@ pub(crate) enum PairSessionError {
     Disabled,
     /// The requested pairing window no longer exists.
     UnknownPair,
-    /// The TCP transport adapter is not implemented until Task 14.
-    PairingTransportNotWired,
     /// Local persistence or entropy failure.
     Local(String),
 }
@@ -73,9 +75,6 @@ impl std::fmt::Display for PairSessionError {
             Self::Busy => formatter.write_str("a pairing session is already active"),
             Self::Disabled => formatter.write_str("coordination pairing is disabled"),
             Self::UnknownPair => formatter.write_str("pairing window not found"),
-            Self::PairingTransportNotWired => {
-                formatter.write_str("instance pairing TCP transport is not wired until Task 14")
-            }
             Self::Local(detail) => formatter.write_str(detail),
         }
     }
@@ -132,7 +131,7 @@ pub(crate) struct OpenPairing {
     dead_code,
     reason = "Task 14 constructs local peers for the TCP handshake adapter."
 )]
-struct LocalPeer {
+pub(crate) struct LocalPeer {
     state_dir: PathBuf,
     display_name: String,
     identity: dormant_core::peers::InstanceIdentity,
@@ -191,6 +190,7 @@ struct PeerIdentity {
 )]
 pub(crate) struct PairingWindow {
     pair_id: String,
+    display_name: String,
     code: Zeroizing<Vec<u8>>,
     expires_at: Instant,
     attempts: usize,
@@ -204,6 +204,7 @@ pub(crate) struct PairingWindow {
 
 /// Daemon-lifetime owner of responder windows and non-secret status.
 pub(crate) struct PairingManager {
+    state_dir: PathBuf,
     identity: Option<dormant_core::peers::InstanceIdentity>,
     enabled: bool,
     pairing_window: Duration,
@@ -222,6 +223,7 @@ impl PairingManager {
             .transpose()
             .map_err(|error| PairSessionError::Local(error.to_string()))?;
         Ok(Self {
+            state_dir: state_dir.to_path_buf(),
             identity,
             enabled,
             pairing_window,
@@ -229,13 +231,16 @@ impl PairingManager {
         })
     }
 
+    pub(crate) fn local_peer(&self, display_name: String) -> Result<LocalPeer, PairSessionError> {
+        LocalPeer::load(self.state_dir.clone(), display_name)
+    }
+
     /// Open one responder window. Transport advertisement is attached by Task 14.
-    pub(crate) fn open(&self, _display_name: String) -> Result<OpenPairing, PairSessionError> {
+    pub(crate) fn open(&self, display_name: String) -> Result<OpenPairing, PairSessionError> {
         if !self.enabled {
             return Err(PairSessionError::Disabled);
         }
-        let (window, open) = PairingWindow::open(self.pairing_window)?;
-        // TODO(T14): attach this window to the short-lived TCP listener and mDNS advertisement.
+        let (window, open) = PairingWindow::open_named(self.pairing_window, display_name)?;
         self.windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -289,6 +294,489 @@ impl PairingManager {
     }
 }
 
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Owns short-lived TCP listeners and their matching mDNS advertisements.
+pub(crate) struct PairingTransport<B: MdnsBackend + 'static> {
+    manager: Arc<PairingManager>,
+    discovery: Arc<Mutex<PairDiscovery<B>>>,
+    pairing_port: u16,
+    bind_override: Option<String>,
+    test_bind_ip: Option<IpAddr>,
+    cancel: tokio_util::sync::CancellationToken,
+    windows: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+}
+
+impl<B: MdnsBackend + 'static> PairingTransport<B> {
+    /// Construct a transport. It opens no socket until the operator opens a window.
+    pub(crate) fn new(
+        manager: Arc<PairingManager>,
+        discovery: PairDiscovery<B>,
+        pairing_port: u16,
+        bind_override: Option<String>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            manager,
+            discovery: Arc::new(Mutex::new(discovery)),
+            pairing_port,
+            bind_override,
+            test_bind_ip: None,
+            cancel,
+            windows: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_bind_ip_for_test(
+        manager: Arc<PairingManager>,
+        discovery: PairDiscovery<B>,
+        pairing_port: u16,
+        bind_ip: IpAddr,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            manager,
+            discovery: Arc::new(Mutex::new(discovery)),
+            pairing_port,
+            bind_override: None,
+            test_bind_ip: Some(bind_ip),
+            cancel,
+            windows: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Open a bound-and-advertised responder window.
+    pub(crate) async fn open(&self, display_name: String) -> Result<OpenPairing, PairSessionError> {
+        if !self.manager.enabled {
+            return Err(PairSessionError::Disabled);
+        }
+        if !self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            return Err(PairSessionError::Busy);
+        }
+        let bind_ip = match self.test_bind_ip {
+            Some(ip) => ip,
+            None => resolve_bind_ip(self.bind_override.as_deref()).map_err(|error| {
+                PairSessionError::Local(format!("resolve pairing bind address: {error}"))
+            })?,
+        };
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, self.pairing_port))
+            .await
+            .map_err(|error| {
+                PairSessionError::Local(format!("bind pairing listener at {bind_ip}: {error}"))
+            })?;
+        let actual = listener.local_addr().map_err(|error| {
+            PairSessionError::Local(format!("read pairing listener address: {error}"))
+        })?;
+        let open = self.manager.open(display_name.clone())?;
+        let identity = self
+            .manager
+            .identity
+            .as_ref()
+            .ok_or(PairSessionError::Disabled)?;
+        let announce = DiscoverAnnounce {
+            protocol_version: PAIR_PROTOCOL_VERSION,
+            instance_id: identity.instance_id.clone(),
+            display_name,
+            pairing_port: actual.port(),
+            window_id: open.pair_id.clone(),
+        };
+        if let Err(error) = self
+            .discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .open_pairing_window(announce)
+        {
+            let _ = self.manager.cancel(&open.pair_id);
+            return Err(PairSessionError::Local(format!(
+                "advertise pairing window: {error}"
+            )));
+        }
+        tracing::info!(event = "pairing_listener_bound", bind = %actual);
+
+        let window_cancel = self.cancel.child_token();
+        self.windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(open.pair_id.clone(), window_cancel.clone());
+        tokio::spawn(run_listener(
+            listener,
+            Arc::clone(&self.manager),
+            Arc::clone(&self.discovery),
+            Arc::clone(&self.windows),
+            open.pair_id.clone(),
+            window_cancel,
+        ));
+        Ok(open)
+    }
+
+    /// Join a discovered responder using its advertised window and address.
+    pub(crate) async fn join(
+        &self,
+        display_name: String,
+        target_instance_id: String,
+        code: String,
+    ) -> Result<(), PairSessionError> {
+        self.manager.join_preflight(&target_instance_id)?;
+        let (address, window_id) = {
+            let mut discovery = self
+                .discovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            discovery.start_browse().map_err(|error| {
+                PairSessionError::Local(format!("start pairing browse: {error}"))
+            })?;
+            discovery.drain_browse().map_err(|error| {
+                PairSessionError::Local(format!("drain pairing browse: {error}"))
+            })?;
+            let address = discovery
+                .discovered_peer_addr(&target_instance_id)
+                .ok_or_else(|| PairSessionError::Local("peer not discovered".to_owned()))?;
+            let window_id = discovery
+                .discovered_peers()
+                .get(&target_instance_id)
+                .map(|peer| peer.window_id.clone())
+                .ok_or_else(|| PairSessionError::Local("peer not discovered".to_owned()))?;
+            (address, window_id)
+        };
+        let mut stream =
+            tokio::time::timeout(CONNECTION_TIMEOUT, tokio::net::TcpStream::connect(address))
+                .await
+                .map_err(|_| PairSessionError::Local("pairing connection timed out".to_owned()))?
+                .map_err(|error| {
+                    PairSessionError::Local(format!("connect pairing peer: {error}"))
+                })?;
+        let local = self.manager.local_peer(display_name)?;
+        tokio::time::timeout(
+            CONNECTION_TIMEOUT,
+            run_initiator_over_stream(
+                &mut stream,
+                &local,
+                target_instance_id,
+                window_id,
+                code.as_bytes(),
+            ),
+        )
+        .await
+        .map_err(|_| PairSessionError::Local("pairing session timed out".to_owned()))?
+    }
+
+    /// Cancel a local responder window and close its listener immediately.
+    pub(crate) fn cancel(&self, pair_id: &str) -> Result<PairingStatus, PairSessionError> {
+        let status = self.manager.cancel(pair_id)?;
+        if let Some(cancel) = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(pair_id)
+        {
+            cancel.cancel();
+        }
+        Ok(status)
+    }
+}
+
+async fn run_listener<B: MdnsBackend + 'static>(
+    listener: tokio::net::TcpListener,
+    manager: Arc<PairingManager>,
+    discovery: Arc<Mutex<PairDiscovery<B>>>,
+    windows: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    pair_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let deadline = manager
+        .windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&pair_id)
+        .map_or_else(Instant::now, |window| window.expires_at);
+    let deadline = tokio::time::Instant::from_std(deadline);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            () = tokio::time::sleep_until(deadline) => {
+                if let Ok(mut windows) = manager.windows.lock()
+                    && let Some(window) = windows.get_mut(&pair_id)
+                    && !window.completed && !window.cancelled {
+                    window.state = PairingState::Timeout;
+                }
+                break;
+            }
+            accepted = listener.accept() => {
+                let Ok((mut stream, _)) = accepted else { break; };
+                let result = tokio::time::timeout(
+                    CONNECTION_TIMEOUT,
+                    run_managed_responder(&mut stream, Arc::clone(&manager), &pair_id),
+                ).await;
+                if matches!(result, Ok(Ok(()))) {
+                    break;
+                }
+            }
+        }
+    }
+    discovery
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .close_pairing_window();
+    windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&pair_id);
+}
+
+async fn run_managed_responder<S>(
+    stream: &mut S,
+    manager: Arc<PairingManager>,
+    pair_id: &str,
+) -> Result<(), PairSessionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let hello = read_pair_frame(stream).await?;
+    let (session, responder, remote, _flight) = {
+        let mut windows = manager
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let window = windows
+            .get_mut(pair_id)
+            .ok_or(PairSessionError::UnknownPair)?;
+        let flight = window.begin()?;
+        let responder = manager.local_peer(window.display_name.clone())?;
+        let remote = accept_hello(window, &responder, hello)?;
+        let session = PairingWindow {
+            pair_id: window.pair_id.clone(),
+            display_name: window.display_name.clone(),
+            code: window.code.clone(),
+            expires_at: window.expires_at,
+            attempts: 0,
+            seen_initiator_nonces: HashSet::new(),
+            cancelled: false,
+            completed: false,
+            in_flight: Arc::new(AtomicBool::new(false)),
+            state: PairingState::Pairing,
+            peer_instance_id: None,
+        };
+        (session, responder, remote, flight)
+    };
+    let (mut state, start) =
+        responder_receive_msg1(&session, &responder, remote, read_pair_frame(stream).await?)?;
+    for frame in &start {
+        write_pair_frame(stream, &wire_to_frame(frame)?).await?;
+    }
+    let initiator_confirmation = [
+        frame_for_wire(&read_pair_frame(stream).await?),
+        frame_for_wire(&read_pair_frame(stream).await?),
+    ];
+    let confirmation = responder_receive_initiator(&mut state, &initiator_confirmation)?;
+    write_pair_frame(stream, &wire_to_frame(&confirmation[0])?).await?;
+    let terminal = frame_for_wire(&read_pair_frame(stream).await?);
+    let result = responder_receive_result(&terminal, &state)?;
+    write_pair_frame(stream, &wire_to_frame(&result)?).await?;
+    responder.persist(&state.remote)?;
+    let mut windows = manager
+        .windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let window = windows
+        .get_mut(pair_id)
+        .ok_or(PairSessionError::UnknownPair)?;
+    window.completed = true;
+    window.state = PairingState::Paired;
+    window.peer_instance_id = Some(state.remote.instance_id);
+    tracing::info!(event = "pairing_confirmed");
+    Ok(())
+}
+
+/// Drive the initiator half of the ratified pairing state machine over one stream.
+///
+/// Nothing is persisted until both transcript confirmations and the responder's
+/// terminal result have been verified.
+pub(crate) async fn run_initiator_over_stream<S>(
+    stream: &mut S,
+    local: &LocalPeer,
+    remote_instance_id: String,
+    window_id: String,
+    code: &[u8],
+) -> Result<(), PairSessionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut state, start) = begin_initiator(local, remote_instance_id, window_id, code)?;
+    for frame in &start {
+        write_pair_frame(stream, &wire_to_frame(frame)?).await?;
+    }
+
+    let responder_start = [
+        frame_for_wire(&read_pair_frame(stream).await?),
+        frame_for_wire(&read_pair_frame(stream).await?),
+        frame_for_wire(&read_pair_frame(stream).await?),
+    ];
+    let confirmation = match initiator_receive_responder(&mut state, &responder_start) {
+        Ok(confirmation) => confirmation,
+        Err(error) => {
+            write_rejection(stream, &error).await;
+            return Err(error);
+        }
+    };
+    for frame in &confirmation {
+        write_pair_frame(stream, &wire_to_frame(frame)?).await?;
+    }
+
+    let responder_confirmation = frame_for_wire(&read_pair_frame(stream).await?);
+    let result = match initiator_receive_confirmation(&state, &responder_confirmation) {
+        Ok(result) => result,
+        Err(error) => {
+            write_rejection(stream, &error).await;
+            return Err(error);
+        }
+    };
+    write_pair_frame(stream, &wire_to_frame(&result)?).await?;
+
+    let PairFrame::PairResult {
+        accepted: true,
+        error: None,
+    } = read_pair_frame(stream).await?
+    else {
+        return Err(PairSessionError::Wire(PairError::InvalidFrame));
+    };
+
+    let remote = PeerIdentity {
+        instance_id: state.remote_instance_id.clone(),
+        display_name: state
+            .remote_display_name
+            .clone()
+            .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?,
+        public_key: state
+            .remote_public_key
+            .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?,
+        nonce: state
+            .remote_nonce
+            .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?,
+    };
+    local.persist(&remote)
+}
+
+/// Drive the responder half of the ratified pairing state machine over one stream.
+///
+/// The caller owns the window for the session so its attempt and single-flight
+/// guards remain authoritative across reconnects.
+#[allow(
+    dead_code,
+    reason = "The direct stream driver is exercised by loopback transport tests."
+)]
+pub(crate) async fn run_responder_over_stream<S>(
+    stream: &mut S,
+    window: &mut PairingWindow,
+    responder: &LocalPeer,
+) -> Result<(), PairSessionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let _flight = window.begin()?;
+    let remote = accept_hello(window, responder, read_pair_frame(stream).await?)?;
+    let (mut state, start) =
+        match responder_receive_msg1(window, responder, remote, read_pair_frame(stream).await?) {
+            Ok(start) => start,
+            Err(error) => {
+                write_rejection(stream, &error).await;
+                return Err(error);
+            }
+        };
+    for frame in &start {
+        write_pair_frame(stream, &wire_to_frame(frame)?).await?;
+    }
+
+    let initiator_confirmation = [
+        frame_for_wire(&read_pair_frame(stream).await?),
+        frame_for_wire(&read_pair_frame(stream).await?),
+    ];
+    let confirmation = responder_receive_initiator(&mut state, &initiator_confirmation)?;
+    write_pair_frame(stream, &wire_to_frame(&confirmation[0])?).await?;
+
+    let terminal = frame_for_wire(&read_pair_frame(stream).await?);
+    let result = responder_receive_result(&terminal, &state)?;
+    write_pair_frame(stream, &wire_to_frame(&result)?).await?;
+
+    responder.persist(&state.remote)?;
+    window.completed = true;
+    window.state = PairingState::Paired;
+    window.peer_instance_id = Some(state.remote.instance_id.clone());
+    tracing::info!(event = "pairing_confirmed");
+    Ok(())
+}
+
+async fn write_rejection<S>(stream: &mut S, error: &PairSessionError)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let wire_error = match error {
+        PairSessionError::Wire(error) => *error,
+        _ => PairError::InvalidFrame,
+    };
+    let _ = write_pair_frame(
+        stream,
+        &PairFrame::PairResult {
+            accepted: false,
+            error: Some(wire_error),
+        },
+    )
+    .await;
+}
+
+/// Pair two isolated state directories through a real loopback TCP listener.
+///
+/// This is an integration-test seam: production windows always resolve a
+/// non-loopback LAN address before binding.
+///
+/// # Errors
+///
+/// Returns an error when either identity, TCP operation, pairing frame, or
+/// durable peer write fails.
+#[cfg(feature = "test-util")]
+pub async fn pair_over_loopback_for_test(
+    initiator_state_dir: PathBuf,
+    responder_state_dir: PathBuf,
+) -> Result<(), PairSessionError> {
+    let initiator = LocalPeer::load(initiator_state_dir, "Initiator".to_owned())?;
+    let responder = LocalPeer::load(responder_state_dir, "Responder".to_owned())?;
+    let (mut window, open) =
+        PairingWindow::open_named(Duration::from_secs(2), "Responder".to_owned())?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| {
+            PairSessionError::Local(format!("bind loopback pairing listener: {error}"))
+        })?;
+    let address = listener.local_addr().map_err(|error| {
+        PairSessionError::Local(format!("read loopback pairing listener: {error}"))
+    })?;
+    let (connected, accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+    let mut initiator_stream = connected.map_err(|error| {
+        PairSessionError::Local(format!("connect loopback pairing listener: {error}"))
+    })?;
+    let (mut responder_stream, _) = accepted.map_err(|error| {
+        PairSessionError::Local(format!("accept loopback pairing listener: {error}"))
+    })?;
+    let (initiator_result, responder_result) = tokio::join!(
+        run_initiator_over_stream(
+            &mut initiator_stream,
+            &initiator,
+            responder.identity.instance_id.clone(),
+            open.pair_id,
+            open.code.as_bytes(),
+        ),
+        run_responder_over_stream(&mut responder_stream, &mut window, &responder),
+    );
+    initiator_result?;
+    responder_result
+}
+
 #[allow(
     dead_code,
     reason = "Task 14 drives responder windows from the TCP accept loop."
@@ -296,6 +784,13 @@ impl PairingManager {
 impl PairingWindow {
     /// Open a responder window with fresh OS entropy for both its code and ID.
     pub(crate) fn open(pairing_window: Duration) -> Result<(Self, OpenPairing), PairSessionError> {
+        Self::open_named(pairing_window, String::new())
+    }
+
+    fn open_named(
+        pairing_window: Duration,
+        display_name: String,
+    ) -> Result<(Self, OpenPairing), PairSessionError> {
         let mut code_bytes = [0_u8; 5];
         getrandom::fill(&mut code_bytes)
             .map_err(|error| PairSessionError::Local(format!("generate pairing code: {error}")))?;
@@ -322,6 +817,7 @@ impl PairingWindow {
         Ok((
             Self {
                 pair_id,
+                display_name,
                 code: Zeroizing::new(code.into_bytes()),
                 expires_at,
                 attempts: 0,
@@ -1278,7 +1774,111 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination_mdns::{AdvertisementHandle, BrowseEvent, BrowseStream};
+    use dormant_core::coordination::CoordinationHandle;
     use tokio::io::AsyncWriteExt as _;
+
+    #[derive(Clone, Default)]
+    struct TransportFakeBackend {
+        advertised: Arc<Mutex<Option<DiscoverAnnounce>>>,
+    }
+
+    struct TransportFakeAdvertisement(Arc<Mutex<Option<DiscoverAnnounce>>>);
+
+    impl AdvertisementHandle for TransportFakeAdvertisement {}
+
+    impl Drop for TransportFakeAdvertisement {
+        fn drop(&mut self) {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    struct TransportFakeBrowse;
+
+    impl BrowseStream for TransportFakeBrowse {
+        fn try_next(&mut self) -> anyhow::Result<Option<BrowseEvent>> {
+            Ok(None)
+        }
+    }
+
+    impl MdnsBackend for TransportFakeBackend {
+        fn advertise(
+            &self,
+            service: DiscoverAnnounce,
+        ) -> anyhow::Result<Box<dyn AdvertisementHandle>> {
+            *self
+                .advertised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(service);
+            Ok(Box::new(TransportFakeAdvertisement(Arc::clone(
+                &self.advertised,
+            ))))
+        }
+
+        fn browse(&self) -> anyhow::Result<Box<dyn BrowseStream>> {
+            Ok(Box::new(TransportFakeBrowse))
+        }
+    }
+
+    type TransportHarness = (
+        tempfile::TempDir,
+        Arc<PairingManager>,
+        PairingTransport<TransportFakeBackend>,
+        Arc<Mutex<Option<DiscoverAnnounce>>>,
+    );
+
+    fn transport_harness(enabled: bool, window: Duration) -> TransportHarness {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(PairingManager::new(root.path(), enabled, window).unwrap());
+        let backend = TransportFakeBackend::default();
+        let advertised = Arc::clone(&backend.advertised);
+        let discovery = PairDiscovery::new(
+            backend,
+            manager.identity.as_ref().map_or_else(
+                || "disabled".to_owned(),
+                |identity| identity.instance_id.clone(),
+            ),
+            CoordinationHandle::new([]),
+        );
+        let transport = PairingTransport::new_with_bind_ip_for_test(
+            Arc::clone(&manager),
+            discovery,
+            0,
+            "127.0.0.1".parse().unwrap(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        (root, manager, transport, advertised)
+    }
+
+    fn advertised_addr(advertised: &Arc<Mutex<Option<DiscoverAnnounce>>>) -> SocketAddr {
+        let port = advertised
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .unwrap()
+            .pairing_port;
+        SocketAddr::new("127.0.0.1".parse().unwrap(), port)
+    }
+
+    async fn wait_for_advertisement_withdrawal(advertised: &Arc<Mutex<Option<DiscoverAnnounce>>>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if advertised
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_none()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("advertisement should withdraw before the test deadline");
+    }
 
     macro_rules! assert_wire_error {
         ($actual:expr, $expected:pat) => {
@@ -1338,6 +1938,231 @@ mod tests {
         drop(writer);
 
         assert_wire_error!(read_pair_frame(&mut reader).await, PairError::InvalidFrame);
+    }
+
+    #[tokio::test]
+    async fn two_daemons_pair_over_real_stream() {
+        let mut harness = PairingHarness::new().unwrap();
+        let code = harness.code().as_bytes().to_vec();
+        let responder_id = harness.responder.identity.instance_id.clone();
+        let window_id = harness.window.pair_id.clone();
+        let (mut initiator_stream, mut responder_stream) = tokio::io::duplex(131_072);
+
+        let (initiator, responder) = tokio::join!(
+            run_initiator_over_stream(
+                &mut initiator_stream,
+                &harness.initiator,
+                responder_id,
+                window_id,
+                &code,
+            ),
+            run_responder_over_stream(
+                &mut responder_stream,
+                &mut harness.window,
+                &harness.responder,
+            ),
+        );
+
+        assert!(initiator.is_ok(), "initiator: {initiator:?}");
+        assert!(responder.is_ok(), "responder: {responder:?}");
+        assert_eq!(harness.window.state, PairingState::Paired);
+        assert!(harness.initiator.state_dir.join("peers.json").exists());
+        assert!(harness.responder.state_dir.join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn wrong_code_over_stream_persists_nothing() {
+        let mut harness = PairingHarness::new().unwrap();
+        let responder_id = harness.responder.identity.instance_id.clone();
+        let window_id = harness.window.pair_id.clone();
+        let (mut initiator_stream, mut responder_stream) = tokio::io::duplex(131_072);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                run_initiator_over_stream(
+                    &mut initiator_stream,
+                    &harness.initiator,
+                    responder_id,
+                    window_id,
+                    b"WRONG-CODE",
+                ),
+                run_responder_over_stream(
+                    &mut responder_stream,
+                    &mut harness.window,
+                    &harness.responder,
+                ),
+            )
+        })
+        .await;
+
+        assert!(
+            result.is_err()
+                || result
+                    .is_ok_and(|(initiator, responder)| initiator.is_err() || responder.is_err())
+        );
+        assert!(!harness.initiator.state_dir.join("peers.json").exists());
+        assert!(!harness.responder.state_dir.join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn two_daemons_pair_over_real_tcp() {
+        let (root, manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        assert_eq!(address.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+
+        let initiator =
+            LocalPeer::load(root.path().join("initiator"), "Initiator".to_owned()).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        run_initiator_over_stream(
+            &mut stream,
+            &initiator,
+            manager.identity.as_ref().unwrap().instance_id.clone(),
+            open.pair_id.clone(),
+            open.code.as_bytes(),
+        )
+        .await
+        .unwrap();
+        wait_for_advertisement_withdrawal(&advertised).await;
+
+        assert!(initiator.state_dir.join("peers.json").exists());
+        assert!(root.path().join("peers.json").exists());
+        assert_eq!(
+            manager.status(&open.pair_id).unwrap().state,
+            PairingState::Paired
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_frame_over_tcp_closes_not_panics() {
+        let (_root, _manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let _open = transport.open("Responder".to_owned()).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(advertised_addr(&advertised))
+            .await
+            .unwrap();
+        write_pair_frame(
+            &mut stream,
+            &PairFrame::PairResult {
+                accepted: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+        let closed =
+            tokio::time::timeout(Duration::from_secs(1), read_pair_frame(&mut stream)).await;
+        assert!(matches!(
+            closed,
+            Ok(Err(PairSessionError::Wire(PairError::InvalidFrame)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn attempt_limit_survives_reconnects() {
+        let (root, manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let open = transport.open("Responder".to_owned()).await.unwrap();
+        let attacker =
+            LocalPeer::load(root.path().join("attacker"), "Attacker".to_owned()).unwrap();
+        let address = advertised_addr(&advertised);
+        for attempt in 0_u8..11 {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut nonce = [0_u8; NONCE_BYTES];
+            nonce[0] = attempt;
+            write_pair_frame(
+                &mut stream,
+                &PairFrame::PairHello {
+                    protocol_version: PAIR_PROTOCOL_VERSION,
+                    role: PairRole::Initiator,
+                    instance_id: attacker.identity.instance_id.clone(),
+                    display_name: attacker.display_name.clone(),
+                    window_id: open.pair_id.clone(),
+                    nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
+                },
+            )
+            .await
+            .unwrap();
+            stream.shutdown().await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.status(&open.pair_id).unwrap().state == PairingState::Error {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the eleventh hello must trip the window attempt limit");
+        assert!(!root.path().join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn window_expiry_closes_listener_and_withdraws_advertisement() {
+        let (_root, _manager, transport, advertised) =
+            transport_harness(true, Duration::from_millis(80));
+        let _open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        wait_for_advertisement_withdrawal(&advertised).await;
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_closes_listener_persists_nothing() {
+        let (root, _manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(2));
+        let open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        assert_eq!(
+            transport.cancel(&open.pair_id).unwrap().state,
+            PairingState::Cancelled
+        );
+        wait_for_advertisement_withdrawal(&advertised).await;
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        assert!(!root.path().join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn disabled_coordination_opens_no_listener() {
+        let (_root, _manager, transport, advertised) =
+            transport_harness(false, Duration::from_secs(2));
+        assert!(matches!(
+            transport.open("Responder".to_owned()).await,
+            Err(PairSessionError::Disabled)
+        ));
+        assert!(
+            advertised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_connection_times_out() {
+        let (root, manager, transport, advertised) =
+            transport_harness(true, Duration::from_secs(3));
+        let open = transport.open("Responder".to_owned()).await.unwrap();
+        let address = advertised_addr(&advertised);
+        let slow = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        drop(slow);
+
+        let initiator =
+            LocalPeer::load(root.path().join("initiator"), "Initiator".to_owned()).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        run_initiator_over_stream(
+            &mut stream,
+            &initiator,
+            manager.identity.as_ref().unwrap().instance_id.clone(),
+            open.pair_id,
+            open.code.as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert!(initiator.state_dir.join("peers.json").exists());
     }
 
     #[test]

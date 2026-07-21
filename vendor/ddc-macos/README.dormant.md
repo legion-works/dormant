@@ -47,6 +47,12 @@ macOS PR CI lane.
 - The upstream package version (`0.2.2`) and MIT `LICENSE` are unchanged. See
   `[package.metadata.dormant]` in `Cargo.toml` for patch provenance metadata.
 
+On 2026-07-21, the fork's generic `DdcCommandRaw` surface was proven for the VCP 0x60
+input-source GET request. The fork-local packet test pins `[0x51, 0x82, 0x01, 0x60, 0xDC]`,
+including its DDC/CI checksum, and the ignored macOS hardware test reads and prints the current
+input source. No `arm.rs` change was necessary: the existing generic transport accepts the raw
+opcode without a controller-specific branch.
+
 ## Files changed from upstream
 
 - `src/arm.rs`: `CoreDisplaySymbols` + `SymbolLoader`/`ArmI2c` seam, m1ddc transaction shape,

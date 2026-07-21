@@ -98,10 +98,16 @@ pub const ENTITY_CRUD_ENABLED: bool = true;
 pub const PAIRING_ENABLED: bool = true;
 
 /// Whether multi-machine coordination services and operator routes are enabled.
-pub const COORDINATION_ENABLED: bool = true;
+pub const COORDINATION_ENABLED: bool = false;
 
 /// Cadence for polling shared-display ownership state.
 pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Requested TCP port for a pairing listener; zero requests an ephemeral port.
+pub const COORDINATION_PAIRING_PORT: u16 = 0;
+
+/// Maximum lifetime of an operator-initiated pairing window.
+pub const COORDINATION_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).

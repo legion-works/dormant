@@ -71,7 +71,7 @@ pub struct PeerRecord {
 }
 
 /// mDNS discovery data carried into a pairing attempt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoverAnnounce {
     /// Advertised pairing protocol version.
     pub protocol_version: u16,

@@ -5,6 +5,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use crate::ownership::OwnershipGate;
+use crate::peers::DiscoverAnnounce;
 use crate::traits::PanelState;
 use crate::types::DisplayId;
 
@@ -42,6 +43,7 @@ impl CoordRecord {
 #[derive(Clone, Debug)]
 pub struct CoordinationHandle {
     records: Arc<RwLock<HashMap<DisplayId, CoordRecord>>>,
+    discovered_peers: Arc<RwLock<HashMap<String, DiscoverAnnounce>>>,
 }
 
 impl CoordinationHandle {
@@ -54,6 +56,7 @@ impl CoordinationHandle {
             .collect();
         Self {
             records: Arc::new(RwLock::new(records)),
+            discovered_peers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -109,6 +112,31 @@ impl CoordinationHandle {
     #[must_use]
     pub fn snapshot(&self) -> HashMap<DisplayId, CoordRecord> {
         self.records
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record an mDNS-discovered pairing peer independently of display ownership.
+    pub fn upsert_discovered_peer(&self, peer: DiscoverAnnounce) {
+        self.discovered_peers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(peer.instance_id.clone(), peer);
+    }
+
+    /// Remove an mDNS peer that is no longer advertised without changing ownership.
+    pub fn expire_discovered_peer(&self, instance_id: &str) {
+        self.discovered_peers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(instance_id);
+    }
+
+    /// Return the current non-persistent mDNS discovery snapshot.
+    #[must_use]
+    pub fn discovered_peers(&self) -> HashMap<String, DiscoverAnnounce> {
+        self.discovered_peers
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()

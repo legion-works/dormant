@@ -427,6 +427,8 @@ export interface ConfigInventory {
 export interface CoordinationConfig {
   enabled?: boolean;
   poll_interval?: string;
+  pairing_port?: number;
+  pairing_window?: string;
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */

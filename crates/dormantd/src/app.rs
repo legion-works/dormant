@@ -61,6 +61,7 @@ use dormant_core::observation::{
     RuntimeRevision,
 };
 use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
+use dormant_core::peers::load_or_create_identity;
 use dormant_core::rules::{
     ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
     RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
@@ -84,6 +85,7 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
+use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
@@ -820,6 +822,20 @@ impl App {
             || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
             |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
         );
+        let coordination_mdns = if cfg_clone.coordination.enabled {
+            let identity = load_or_create_identity(&self.state_dir)
+                .context("load persistent instance identity for mDNS discovery")?;
+            let discovery_state = coordination
+                .clone()
+                .unwrap_or_else(|| CoordinationHandle::new([]));
+            Some(PairDiscovery::new(
+                MdnsSdBackend::new()?,
+                identity.instance_id,
+                discovery_state,
+            ))
+        } else {
+            None
+        };
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
@@ -1078,6 +1094,7 @@ impl App {
             notify_sink,
             ownership,
             coordination: coordination.clone(),
+            _coordination_mdns: coordination_mdns,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1379,6 +1396,9 @@ struct Runner {
     ownership: Arc<dyn OwnershipGate>,
     /// Shared-display cache, absent only when startup had no shared displays.
     coordination: Option<CoordinationHandle>,
+    /// Retained while enabled so later pairing windows can advertise or browse;
+    /// construction alone does not expose a service on the LAN.
+    _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,

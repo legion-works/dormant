@@ -57,7 +57,10 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "coordination",
         ],
     ),
-    ("coordination", &["enabled", "poll_interval"]),
+    (
+        "coordination",
+        &["enabled", "poll_interval", "pairing_port", "pairing_window"],
+    ),
     // ── audio ───────────────────────────────────────────────────────────────
     (
         "audio",
@@ -780,6 +783,15 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             detail: format!(
                 "coordination poll_interval {:?} is below the minimum of 1s",
                 cfg.coordination.poll_interval
+            ),
+        });
+    }
+    let pairing_window = cfg.coordination.pairing_window;
+    if !(Duration::from_secs(30)..=Duration::from_secs(15 * 60)).contains(&pairing_window) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination pairing_window {pairing_window:?} is outside the permitted 30s..=15m range"
             ),
         });
     }
@@ -5867,6 +5879,21 @@ availability_payload_offline = "down"
                 .iter()
                 .any(|error| error.what == crate::error::E_CONFIG_INVALID)
         );
+    }
+
+    #[test]
+    fn coordination_pairing_window_outside_bounds_rejected() {
+        for pairing_window in ["29s", "15m1s"] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\npairing_window = \"{pairing_window}\"\n"
+            ));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.detail.contains("pairing_window")),
+                "expected pairing_window validation error for {pairing_window}, got {errors:?}"
+            );
+        }
     }
 
     #[test]

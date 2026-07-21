@@ -9,6 +9,7 @@ mod audio_policy;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;
+pub mod coordination_mdns;
 mod coordination_poll;
 pub mod gamma_recovery;
 pub mod idle_source;

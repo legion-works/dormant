@@ -339,6 +339,22 @@ fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {
     )
 }
 
+#[tokio::test]
+async fn all_private_start_passes_always_owned() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &coordinator_config(&paths.marker, "0s"),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+
+    let (handle, join) = start_coordinator_app(config_path, creds_path).await;
+
+    assert!(handle.coordination_for_test().is_none());
+    shutdown(handle, join).await;
+}
+
 /// Write a credentials file with correct 0o600 permissions (Unix).
 fn write_credentials(dir: &Path, toml: &str) -> PathBuf {
     let path = dir.join("credentials.toml");

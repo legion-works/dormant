@@ -50,16 +50,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use dormant_core::config::schema::{Config, Credentials, RuleConfig};
+use dormant_core::config::schema::{Config, Credentials, DisplayScope, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
     load_credentials_from_bytes, validate_with_input_source_readers,
 };
+use dormant_core::coordination::{CoordinationGate, CoordinationHandle};
 use dormant_core::observation::{
     ContentRevision, DaemonObservation, GenerationId, ObservationHub, ReloadReceipt, ReloadSource,
     RuntimeRevision,
 };
-use dormant_core::ownership::AlwaysOwned;
+use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
 use dormant_core::rules::{
     ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
     RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
@@ -83,6 +84,7 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
+use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
@@ -809,6 +811,20 @@ impl App {
             .await
             .context("assemble initial runtime")?;
 
+        // Coordination state is process-lifetime state, like notifier episodes:
+        // generations only borrow its gate, so a reload cannot discard a verdict
+        // between the old poller stopping and its replacement starting.
+        let shared = shared_displays(&cfg_clone);
+        let coordination = (!shared.is_empty()).then(|| CoordinationHandle::new(shared));
+        let ownership: Arc<dyn OwnershipGate> = coordination.as_ref().map_or_else(
+            || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
+            |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
+        );
+
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
+        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
+
         let spawn = spawn_generation(
             &root,
             assembly,
@@ -817,6 +833,10 @@ impl App {
             None,
             notify_state.clone(),
             notify_sink.clone(),
+            ownership.clone(),
+            coordination.clone(),
+            config_rx.clone(),
+            executors_rx.clone(),
             GenerationId(0),
             Some(self.observations.clone()),
         )?;
@@ -837,7 +857,7 @@ impl App {
             .iter()
             .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
             .collect();
-        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors0));
+        executors_tx.send_replace(Arc::new(executors0));
 
         // The daemon's single wear-ledger map (spec §5) — shared with the
         // tracker and, in future, IPC/WebUI readers.
@@ -864,9 +884,6 @@ impl App {
         let reload_requester =
             ReloadRequester::new_with_observations(reload_request_tx, self.observations.clone());
         let observations = reload_requester.observations();
-
-        let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
-        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
 
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
         // over the front ctl channel (rides the `GenerationRouter`'s
@@ -1059,6 +1076,8 @@ impl App {
             ctrl_ctx,
             notify_state,
             notify_sink,
+            ownership,
+            coordination: coordination.clone(),
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1104,6 +1123,8 @@ impl App {
             creds_rx,
             config_path: self.operator_config_path.clone(),
             doctor_service,
+            #[cfg(any(test, feature = "test-util"))]
+            coordination,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
@@ -1156,6 +1177,8 @@ pub struct AppHandle {
     /// from the LKG substitute instead, `App::config_path`).
     config_path: PathBuf,
     doctor_service: DoctorService,
+    #[cfg(any(test, feature = "test-util"))]
+    coordination: Option<CoordinationHandle>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
     /// Test-only LKG-candidate observation seam — see
@@ -1271,6 +1294,14 @@ impl AppHandle {
         self.doctor_service.clone()
     }
 
+    /// Test-only access to the daemon-lifetime shared-display cache.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn coordination_for_test(&self) -> Option<CoordinationHandle> {
+        self.coordination.clone()
+    }
+
     /// Test-util seam (rollback-recovery plan, Task 1 §5 / Task 2): a
     /// point-in-time snapshot of the `Runner`'s current LKG-candidate
     /// state. Used to prove whether a candidate is armed and, if so, from
@@ -1343,6 +1374,11 @@ struct Runner {
     /// Daemon-lifetime notification sink, constructed once in
     /// [`App::start`] and threaded unchanged into every generation.
     notify_sink: Arc<dyn NotifySink>,
+    /// Daemon-lifetime ownership gate. Private-only startup keeps this as
+    /// `AlwaysOwned`; shared startup keeps the same coordination-backed gate.
+    ownership: Arc<dyn OwnershipGate>,
+    /// Shared-display cache, absent only when startup had no shared displays.
+    coordination: Option<CoordinationHandle>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,
@@ -1585,6 +1621,23 @@ impl Runner {
                 );
             }
         };
+
+        let new_shared = shared_displays(&new_assembly.cfg);
+        if self.coordination.is_none() && !new_shared.is_empty() {
+            let detail =
+                "E_CONFIG_INVALID: adding the first shared display requires daemon restart"
+                    .to_string();
+            tracing::error!(event = "config_reload_rejected", detail = %detail);
+            let _ = old_ctl
+                .send(ControlMsg::SetPendingReload(Some(detail.clone())))
+                .await;
+            let outcome = ReloadOutcome::Rejected(detail);
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
+        }
+        if let Some(coordination) = &self.coordination {
+            coordination.reconcile_shared(new_shared);
+        }
 
         // Step-boundary ping 1/7 (spec §6.3): after `load_and_assemble`
         // returns (probes done). The spec names this as a boundary DISTINCT
@@ -1829,6 +1882,10 @@ impl Runner {
             None,
             self.notify_state.clone(),
             self.notify_sink.clone(),
+            self.ownership.clone(),
+            self.coordination.clone(),
+            self.config_tx.subscribe(),
+            self.executors_tx.subscribe(),
             next_generation,
             Some(self.observations.clone()),
         );
@@ -2140,6 +2197,10 @@ impl Runner {
             self.rollback_status.clone(),
             self.notify_state.clone(),
             self.notify_sink.clone(),
+            self.ownership.clone(),
+            self.coordination.clone(),
+            self.config_tx.subscribe(),
+            self.executors_tx.subscribe(),
             self.generation_id,
             Some(self.observations.clone()),
         );
@@ -3165,6 +3226,14 @@ fn index_display_rules(cfg: &Config) -> HashMap<DisplayId, RuleConfig> {
     map
 }
 
+fn shared_displays(cfg: &Config) -> Vec<DisplayId> {
+    cfg.displays
+        .iter()
+        .filter(|(_, display)| display.scope == DisplayScope::Shared)
+        .map(|(name, _)| DisplayId(name.clone()))
+        .collect()
+}
+
 fn retry_timing_differs(a: &RuleConfig, b: &RuleConfig) -> bool {
     a.grace_period != b.grace_period
         || a.min_blank_time != b.min_blank_time
@@ -3505,6 +3574,10 @@ fn spawn_generation(
     rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
+    ownership: Arc<dyn OwnershipGate>,
+    coordination: Option<CoordinationHandle>,
+    config_rx: watch::Receiver<Arc<Config>>,
+    executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
 ) -> Result<GenSpawn> {
@@ -3528,7 +3601,7 @@ fn spawn_generation(
         zone,
         executors,
         assembly.render_sinks.clone(),
-        Arc::new(AlwaysOwned),
+        ownership,
     )
     .context("build engine")?;
     if let Some(observations) = observations {
@@ -3550,6 +3623,16 @@ fn spawn_generation(
     });
 
     let mut producer_handles = Vec::new();
+
+    if let Some(state) = coordination {
+        producer_handles.push(coordination_poll::spawn(CoordinationPollDeps {
+            config_rx,
+            ctl_tx: ctl_tx.clone(),
+            executors_rx,
+            state,
+            cancel: producer_token.clone(),
+        }));
+    }
 
     // ── InputWake drain (feature-gated: render surfaces emit InputWake) ──
     // Each LayerShellRenderSink pushes DisplayId through an unbounded
@@ -3730,6 +3813,10 @@ fn spawn_generation_for_reload(
     rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
+    ownership: Arc<dyn OwnershipGate>,
+    coordination: Option<CoordinationHandle>,
+    config_rx: watch::Receiver<Arc<Config>>,
+    executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
 ) -> Result<GenSpawn> {
@@ -3744,6 +3831,10 @@ fn spawn_generation_for_reload(
         rollback,
         notify_state,
         notify_sink,
+        ownership,
+        coordination,
+        config_rx,
+        executors_rx,
         generation_id,
         observations,
     )

@@ -10,9 +10,6 @@
 //! `runtime.block_on(boot::boot(plan, inputs))`, which owns the actual
 //! build/lock/start/rollback machinery (`dormantd::boot`).
 
-// Spawned from App startup once the coordination gate is wired (see app.rs).
-#[allow(dead_code)]
-mod coordination_poll;
 mod main_sequence;
 
 use std::path::PathBuf;

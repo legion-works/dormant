@@ -408,7 +408,9 @@ fn validate_peer_record(record: &PeerRecord) -> Result<(), PeerStoreError> {
     Ok(())
 }
 
-fn instance_id_from_public_key(public_key: &[u8; 32]) -> String {
+/// Encode an Ed25519 public key as its stable base64url instance identifier.
+#[must_use]
+pub fn instance_id_from_public_key(public_key: &[u8; 32]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(public_key)
 }
 

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{CoordinationPairStatus, IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::{
+    CoordinationPairOpenResponse, CoordinationPairStatus, IpcRequest, IpcResponse,
+};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -59,10 +61,10 @@ pub fn spawn(
         reload_requester,
         doctor_service,
         Arc::new(PairingManager::new(
-            dormant_core::paths::state_dir(),
+            &dormant_core::paths::state_dir(),
             false,
             Duration::from_secs(300),
-        )),
+        )?),
         cancel,
     )
 }
@@ -292,10 +294,10 @@ async fn handle_connection(
             }
             IpcRequest::CoordinationPairOpen { display_name } => {
                 let resp = match pairing.open(display_name) {
-                    Ok(open) => IpcResponse::coordination_pair(CoordinationPairStatus {
+                    Ok(open) => IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
                         pair_id: open.pair_id,
-                        state: pairing_state_name(PairingState::Pairing).to_owned(),
-                        peer_instance_id: None,
+                        code: open.code,
+                        expires_at: open.expires_at,
                     }),
                     Err(error) => IpcResponse::error(error.to_string()),
                 };
@@ -311,7 +313,7 @@ async fn handle_connection(
                 let resp = match pairing.join_preflight(&instance_id) {
                     Err(error) => IpcResponse::error(error.to_string()),
                     Ok(()) => {
-                        IpcResponse::error(PairSessionError::TransportUnavailable.to_string())
+                        IpcResponse::error(PairSessionError::PairingTransportNotWired.to_string())
                     }
                 };
                 let _ = write_json(&mut writer, &resp).await;

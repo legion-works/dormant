@@ -1,13 +1,8 @@
 //! Confirmed SPAKE2 pairing sessions for dormant instances.
 
-#![allow(
-    dead_code,
-    reason = "Task 14 supplies the TCP adapter; Task 13 keeps its independently testable frame state machine private until then."
-)]
-
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,7 +10,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use dormant_core::peers::{
     PAIR_PROTOCOL_VERSION, PairError, PairFrame, PairRole, PeerRecord, build_pairing_transcript,
-    load_or_create_identity, upsert_peer,
+    instance_id_from_public_key, load_or_create_identity, upsert_peer,
 };
 use ed25519_dalek::VerifyingKey;
 use hmac::{Hmac, Mac};
@@ -23,12 +18,28 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
 
+#[allow(
+    dead_code,
+    reason = "Task 14's TCP adapter invokes the SPAKE2 state machine."
+)]
 const PAIRING_CONTEXT: &[u8] = b"dormant-pairing-v2";
+#[allow(
+    dead_code,
+    reason = "Task 14's TCP adapter invokes the SPAKE2 state machine."
+)]
 const MAX_PAIR_ATTEMPTS: usize = 10;
 const NONCE_BYTES: usize = 32;
+#[allow(
+    dead_code,
+    reason = "Task 14's TCP adapter invokes the SPAKE2 state machine."
+)]
 const MAC_BYTES: usize = 32;
 const CROCKFORD_BASE32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+#[allow(
+    dead_code,
+    reason = "Task 14's TCP adapter invokes the SPAKE2 state machine."
+)]
 type HmacSha256 = Hmac<Sha256>;
 
 /// Local failures that are not part of the ratified pairing wire protocol.
@@ -39,13 +50,17 @@ pub(crate) enum PairSessionError {
     /// The selected discovery record identifies this daemon.
     SelfPair,
     /// A session is already active for this pairing window.
+    #[allow(
+        dead_code,
+        reason = "Task 14 acquires this single-flight guard around TCP sessions."
+    )]
     Busy,
     /// Pairing is disabled by runtime configuration.
     Disabled,
     /// The requested pairing window no longer exists.
     UnknownPair,
-    /// The transport layer has not yet connected a discovered peer.
-    TransportUnavailable,
+    /// The TCP transport adapter is not implemented until Task 14.
+    PairingTransportNotWired,
     /// Local persistence or entropy failure.
     Local(String),
 }
@@ -58,7 +73,9 @@ impl std::fmt::Display for PairSessionError {
             Self::Busy => formatter.write_str("a pairing session is already active"),
             Self::Disabled => formatter.write_str("coordination pairing is disabled"),
             Self::UnknownPair => formatter.write_str("pairing window not found"),
-            Self::TransportUnavailable => formatter.write_str("pairing transport is unavailable"),
+            Self::PairingTransportNotWired => {
+                formatter.write_str("instance pairing TCP transport is not wired until Task 14")
+            }
             Self::Local(detail) => formatter.write_str(detail),
         }
     }
@@ -72,12 +89,21 @@ pub(crate) enum PairingState {
     /// The responder window is accepting one session.
     Pairing,
     /// Both peers completed confirmation and persisted each other.
+    #[allow(
+        dead_code,
+        reason = "Task 14 sets this after transport confirmation completes."
+    )]
     Paired,
     /// The operator cancelled the window.
     Cancelled,
     /// The window elapsed before a successful confirmation.
+    #[allow(
+        dead_code,
+        reason = "Task 14 observes expiry while accepting TCP sessions."
+    )]
     Timeout,
     /// A session ended without producing a peer record.
+    #[allow(dead_code, reason = "Task 14 exposes failed responder-session status.")]
     Error,
 }
 
@@ -92,22 +118,30 @@ pub(crate) struct PairingStatus {
     pub peer_instance_id: Option<String>,
 }
 
-/// A freshly opened responder window. The code is held only in daemon memory.
+/// A responder window newly opened for the local operator.
 pub(crate) struct OpenPairing {
     /// Public pairing-window identifier.
     pub pair_id: String,
-    /// Pairing code for the local operator surface; never returned by daemon IPC.
+    /// Pairing code returned once in the loopback-only open response.
     pub code: String,
-    /// Public window deadline.
-    pub expires_at: Instant,
+    /// RFC 3339 UTC deadline returned with the code.
+    pub expires_at: String,
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 constructs local peers for the TCP handshake adapter."
+)]
 struct LocalPeer {
     state_dir: PathBuf,
     display_name: String,
     identity: dormant_core::peers::InstanceIdentity,
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 constructs local peers for the TCP handshake adapter."
+)]
 impl LocalPeer {
     fn load(state_dir: PathBuf, display_name: String) -> Result<Self, PairSessionError> {
         let identity = load_or_create_identity(&state_dir)
@@ -139,6 +173,10 @@ impl LocalPeer {
 }
 
 #[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "Task 14 passes authenticated peer identities through the frame state machine."
+)]
 struct PeerIdentity {
     instance_id: String,
     display_name: String,
@@ -147,6 +185,10 @@ struct PeerIdentity {
 }
 
 /// A bounded responder pairing window.
+#[allow(
+    dead_code,
+    reason = "Task 14 mutates these session bounds while accepting TCP frames."
+)]
 pub(crate) struct PairingWindow {
     pair_id: String,
     code: Zeroizing<Vec<u8>>,
@@ -162,7 +204,7 @@ pub(crate) struct PairingWindow {
 
 /// Daemon-lifetime owner of responder windows and non-secret status.
 pub(crate) struct PairingManager {
-    state_dir: PathBuf,
+    identity: Option<dormant_core::peers::InstanceIdentity>,
     enabled: bool,
     pairing_window: Duration,
     windows: Mutex<HashMap<String, PairingWindow>>,
@@ -170,14 +212,21 @@ pub(crate) struct PairingManager {
 
 impl PairingManager {
     /// Construct the runtime pairing manager. It opens no listener by itself.
-    #[must_use]
-    pub(crate) fn new(state_dir: PathBuf, enabled: bool, pairing_window: Duration) -> Self {
-        Self {
-            state_dir,
+    pub(crate) fn new(
+        state_dir: &Path,
+        enabled: bool,
+        pairing_window: Duration,
+    ) -> Result<Self, PairSessionError> {
+        let identity = enabled
+            .then(|| load_or_create_identity(state_dir))
+            .transpose()
+            .map_err(|error| PairSessionError::Local(error.to_string()))?;
+        Ok(Self {
+            identity,
             enabled,
             pairing_window,
             windows: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// Open one responder window. Transport advertisement is attached by Task 14.
@@ -186,6 +235,7 @@ impl PairingManager {
             return Err(PairSessionError::Disabled);
         }
         let (window, open) = PairingWindow::open(self.pairing_window)?;
+        // TODO(T14): attach this window to the short-lived TCP listener and mDNS advertisement.
         self.windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -198,8 +248,11 @@ impl PairingManager {
         if !self.enabled {
             return Err(PairSessionError::Disabled);
         }
-        let local = LocalPeer::load(self.state_dir.clone(), String::new())?;
-        if local.identity.instance_id == instance_id {
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity.instance_id == instance_id)
+        {
             return Err(PairSessionError::SelfPair);
         }
         decode_base64url_key(instance_id)?;
@@ -236,6 +289,10 @@ impl PairingManager {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 drives responder windows from the TCP accept loop."
+)]
 impl PairingWindow {
     /// Open a responder window with fresh OS entropy for both its code and ID.
     pub(crate) fn open(pairing_window: Duration) -> Result<(Self, OpenPairing), PairSessionError> {
@@ -249,10 +306,18 @@ impl PairingWindow {
             .map_err(|error| PairSessionError::Local(format!("generate pairing id: {error}")))?;
         let pair_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pair_id_bytes);
         let expires_at = Instant::now() + pairing_window;
+        let expires_at_wall = time::OffsetDateTime::now_utc()
+            .checked_add(
+                time::Duration::try_from(pairing_window)
+                    .map_err(|error| PairSessionError::Local(error.to_string()))?,
+            )
+            .ok_or_else(|| PairSessionError::Local("pairing expiry is out of range".to_owned()))?
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| PairSessionError::Local(error.to_string()))?;
         let open = OpenPairing {
             pair_id: pair_id.clone(),
             code: code.clone(),
-            expires_at,
+            expires_at: expires_at_wall,
         };
         Ok((
             Self {
@@ -314,16 +379,28 @@ impl PairingWindow {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 holds this guard across one TCP pairing session."
+)]
 struct SessionFlight {
     in_flight: Arc<AtomicBool>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 holds this guard across one TCP pairing session."
+)]
 impl Drop for SessionFlight {
     fn drop(&mut self) {
         self.in_flight.store(false, Ordering::Release);
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 advances this state from inbound TCP frames."
+)]
 struct InitiatorState {
     spake: Option<Spake2<Ed25519Group>>,
     local: PeerIdentity,
@@ -335,6 +412,10 @@ struct InitiatorState {
     key: Option<Zeroizing<Vec<u8>>>,
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 advances this state from inbound TCP frames."
+)]
 struct ResponderState {
     local: PeerIdentity,
     remote: PeerIdentity,
@@ -342,6 +423,10 @@ struct ResponderState {
     confirmation_seen: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this when opening an outbound TCP pairing session."
+)]
 fn begin_initiator(
     local: &LocalPeer,
     remote_instance_id: String,
@@ -392,6 +477,10 @@ fn begin_initiator(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this on an inbound TCP PairHello."
+)]
 fn accept_hello(
     window: &mut PairingWindow,
     responder: &LocalPeer,
@@ -420,7 +509,7 @@ fn accept_hello(
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
     let instance_bytes = decode_base64url_key(&instance_id)?;
-    let nonce = decode_exact(&nonce, NONCE_BYTES)?;
+    let nonce = decode_exact(&nonce)?;
     if !window.seen_initiator_nonces.insert(nonce) {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
@@ -432,6 +521,10 @@ fn accept_hello(
     })
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this on an inbound TCP Spake2Msg1."
+)]
 fn responder_receive_msg1(
     window: &PairingWindow,
     responder: &LocalPeer,
@@ -485,6 +578,7 @@ fn responder_receive_msg1(
     ))
 }
 
+#[allow(dead_code, reason = "Task 14 invokes this on responder TCP frames.")]
 fn initiator_receive_responder(
     state: &mut InitiatorState,
     frames: &[Vec<u8>],
@@ -515,7 +609,7 @@ fn initiator_receive_responder(
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
     let expected_public_key = decode_base64url_key(&instance_id)?;
-    let remote_nonce = decode_exact(&nonce, NONCE_BYTES)?;
+    let remote_nonce = decode_exact(&nonce)?;
     let msg2 = wire_to_frame(&frames[1])?;
     let PairFrame::Spake2Msg2 { message } = msg2 else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
@@ -524,16 +618,16 @@ fn initiator_receive_responder(
     let key = state
         .spake
         .take()
-        .expect("SPAKE2 state is consumed exactly once")
+        .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?
         .finish(&inbound)
         .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
     let identity = wire_to_frame(&frames[2])?;
     let PairFrame::IdentityExchange { ed25519_pub } = identity else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
-    let remote_public_key = decode_exact(&ed25519_pub, 32)?;
+    let remote_public_key = decode_exact(&ed25519_pub)?;
     if remote_public_key != expected_public_key
-        || instance_id_for_key(&remote_public_key) != state.remote_instance_id
+        || instance_id_from_public_key(&remote_public_key) != state.remote_instance_id
         || VerifyingKey::from_bytes(&remote_public_key).is_err()
     {
         return Err(PairSessionError::Wire(PairError::InstanceIdConflict));
@@ -544,7 +638,11 @@ fn initiator_receive_responder(
     state.key = Some(Zeroizing::new(key));
 
     let transcript = transcript_for_initiator(state)?;
-    let mac = confirmation(state.key.as_deref().expect("set above"), &transcript);
+    let key = state
+        .key
+        .as_deref()
+        .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?;
+    let mac = confirmation(key, &transcript);
     Ok(frames_to_wire(&[
         PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(state.local.public_key),
@@ -555,6 +653,7 @@ fn initiator_receive_responder(
     ]))
 }
 
+#[allow(dead_code, reason = "Task 14 invokes this on initiator TCP frames.")]
 fn responder_receive_initiator(
     state: &mut ResponderState,
     frames: &[Vec<u8>],
@@ -566,8 +665,10 @@ fn responder_receive_initiator(
     let PairFrame::IdentityExchange { ed25519_pub } = identity else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
-    let key = decode_exact(&ed25519_pub, 32)?;
-    if key != state.remote.public_key || instance_id_for_key(&key) != state.remote.instance_id {
+    let key = decode_exact(&ed25519_pub)?;
+    if key != state.remote.public_key
+        || instance_id_from_public_key(&key) != state.remote.instance_id
+    {
         return Err(PairSessionError::Wire(PairError::InstanceIdConflict));
     }
     let confirm = wire_to_frame(&frames[1])?;
@@ -579,6 +680,10 @@ fn responder_receive_initiator(
     }]))
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this on an inbound TCP KeyConfirm."
+)]
 fn initiator_receive_confirmation(
     state: &InitiatorState,
     frame: &[u8],
@@ -588,7 +693,7 @@ fn initiator_receive_confirmation(
         state
             .key
             .as_deref()
-            .expect("initiator key set before confirmation"),
+            .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?,
         &transcript,
         wire_to_frame(frame)?,
     )?;
@@ -598,6 +703,10 @@ fn initiator_receive_confirmation(
     }))
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this on an inbound TCP PairResult."
+)]
 fn responder_receive_result(
     frame: &[u8],
     state: &ResponderState,
@@ -618,6 +727,7 @@ fn responder_receive_result(
     }))
 }
 
+#[cfg(test)]
 fn run_in_process_pairing(
     initiator: &LocalPeer,
     responder: &LocalPeer,
@@ -646,7 +756,7 @@ fn run_in_process_pairing(
         let PairFrame::PairHello { nonce, .. } = wire_to_frame(&responder_start[0])? else {
             unreachable!("responder emits PairHello");
         };
-        let mut nonce: [u8; NONCE_BYTES] = decode_exact(&nonce, NONCE_BYTES)?;
+        let mut nonce: [u8; NONCE_BYTES] = decode_exact(&nonce)?;
         nonce[0] ^= 1;
         let PairFrame::PairHello {
             protocol_version,
@@ -673,7 +783,7 @@ fn run_in_process_pairing(
         else {
             unreachable!("responder emits identity exchange");
         };
-        let mut public_key: [u8; 32] = decode_exact(&ed25519_pub, 32)?;
+        let mut public_key: [u8; 32] = decode_exact(&ed25519_pub)?;
         public_key[0] ^= 1;
         responder_start[2] = frame_for_wire(&PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(public_key),
@@ -712,6 +822,10 @@ fn run_in_process_pairing(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this while confirming the initiator transcript."
+)]
 fn transcript_for_initiator(state: &InitiatorState) -> Result<Vec<u8>, PairSessionError> {
     let responder_nonce = state
         .remote_nonce
@@ -736,6 +850,10 @@ fn transcript_for_initiator(state: &InitiatorState) -> Result<Vec<u8>, PairSessi
     .map_err(|error| PairSessionError::Local(error.to_string()))
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this while confirming the responder transcript."
+)]
 fn transcript_for_responder(state: &ResponderState) -> Result<Vec<u8>, PairSessionError> {
     build_pairing_transcript(
         PAIR_PROTOCOL_VERSION,
@@ -751,12 +869,20 @@ fn transcript_for_responder(state: &ResponderState) -> Result<Vec<u8>, PairSessi
     .map_err(|error| PairSessionError::Local(error.to_string()))
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this to emit TCP KeyConfirm frames."
+)]
 fn confirmation(key: &[u8], transcript: &[u8]) -> [u8; MAC_BYTES] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
     mac.update(transcript);
     mac.finalize().into_bytes().into()
 }
 
+#[allow(
+    dead_code,
+    reason = "Task 14 invokes this on inbound TCP KeyConfirm frames."
+)]
 fn verify_confirmation(
     key: &[u8],
     transcript: &[u8],
@@ -765,7 +891,7 @@ fn verify_confirmation(
     let PairFrame::KeyConfirm { mac } = frame else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
-    let received: [u8; MAC_BYTES] = decode_exact(&mac, MAC_BYTES)?;
+    let received: [u8; MAC_BYTES] = decode_exact(&mac)?;
     let mut expected = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key lengths");
     expected.update(transcript);
     expected
@@ -780,23 +906,18 @@ fn encode_crockford(bytes: [u8; 5]) -> String {
         .collect()
 }
 
-fn decode_exact<const N: usize>(
-    encoded: &str,
-    expected: usize,
-) -> Result<[u8; N], PairSessionError> {
+#[allow(
+    dead_code,
+    reason = "Task 14 validates exact-width fields from TCP frames."
+)]
+fn decode_exact<const N: usize>(encoded: &str) -> Result<[u8; N], PairSessionError> {
     let bytes = decode_base64(encoded)?;
     bytes
         .try_into()
         .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))
-        .and_then(|array: [u8; N]| {
-            if expected == N {
-                Ok(array)
-            } else {
-                Err(PairSessionError::Wire(PairError::InvalidFrame))
-            }
-        })
 }
 
+#[allow(dead_code, reason = "Task 14 decodes byte fields from TCP frames.")]
 fn decode_base64(encoded: &str) -> Result<Vec<u8>, PairSessionError> {
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
@@ -811,10 +932,7 @@ fn decode_base64url_key(encoded: &str) -> Result<[u8; 32], PairSessionError> {
         .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))
 }
 
-fn instance_id_for_key(key: &[u8; 32]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
-}
-
+#[allow(dead_code, reason = "Task 14 writes length-prefixed TCP frames.")]
 fn frame_for_wire(frame: &PairFrame) -> Vec<u8> {
     let payload = serde_json::to_vec(&frame).expect("PairFrame serialization is infallible");
     let length = u32::try_from(payload.len()).expect("PairFrame payload fits u32");
@@ -824,11 +942,14 @@ fn frame_for_wire(frame: &PairFrame) -> Vec<u8> {
     wire
 }
 
+#[allow(dead_code, reason = "Task 14 writes ordered TCP handshake frames.")]
 fn frames_to_wire(frames: &[PairFrame]) -> Vec<Vec<u8>> {
     frames.iter().map(frame_for_wire).collect()
 }
 
+#[allow(dead_code, reason = "Task 14 parses length-prefixed TCP frames.")]
 fn wire_to_frame(wire: &[u8]) -> Result<PairFrame, PairSessionError> {
+    // TODO(T14): parse exactly one length-prefixed frame from a TCP byte stream.
     if wire.len() < 5 {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
@@ -1256,5 +1377,25 @@ mod tests {
         );
         assert_eq!(pairing.attempts(), 1);
         pairing.assert_nothing_persisted();
+    }
+
+    #[test]
+    fn out_of_order_confirmation_is_invalid_frame_not_panic() {
+        let pairing = PairingHarness::new().unwrap();
+        let (state, _) = begin_initiator(
+            &pairing.initiator,
+            pairing.responder.identity.instance_id.clone(),
+            pairing.window.pair_id.clone(),
+            pairing.code().as_bytes(),
+        )
+        .unwrap();
+        let premature = frame_for_wire(&PairFrame::KeyConfirm {
+            mac: base64::engine::general_purpose::STANDARD.encode([0_u8; MAC_BYTES]),
+        });
+
+        assert_wire_error!(
+            initiator_receive_confirmation(&state, &premature),
+            PairError::InvalidFrame
+        );
     }
 }

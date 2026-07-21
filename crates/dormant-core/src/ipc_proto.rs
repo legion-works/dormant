@@ -95,10 +95,22 @@ pub struct CoordinationPairStatus {
     /// Opaque local pairing-window identifier.
     pub pair_id: String,
     /// Public lifecycle state (`pairing`, `paired`, `timeout`, `cancelled`, or `error`).
+    /// Consumers must validate this bounded producer vocabulary before switching on it.
     pub state: String,
     /// Public peer identity once pairing succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_instance_id: Option<String>,
+}
+
+/// One-time secret response returned only when opening a pairing window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationPairOpenResponse {
+    /// Opaque local pairing-window identifier.
+    pub pair_id: String,
+    /// Eight-character code shown to the local operator exactly once.
+    pub code: String,
+    /// RFC 3339 UTC expiry timestamp for the displayed code.
+    pub expires_at: String,
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -130,6 +142,9 @@ pub struct IpcResponse {
     /// Public state for instance-pairing IPC requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination_pair: Option<CoordinationPairStatus>,
+    /// One-time responder-window open result. Status responses never populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_pair_open: Option<CoordinationPairOpenResponse>,
 }
 
 impl IpcResponse {
@@ -144,6 +159,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             coordination_pair: None,
+            coordination_pair_open: None,
         }
     }
 
@@ -158,6 +174,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             coordination_pair: None,
+            coordination_pair_open: None,
         }
     }
 
@@ -172,6 +189,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             coordination_pair: None,
+            coordination_pair_open: None,
         }
     }
 
@@ -186,6 +204,7 @@ impl IpcResponse {
             emergency_report: Some(report),
             exercise_report: None,
             coordination_pair: None,
+            coordination_pair_open: None,
         }
     }
 
@@ -200,6 +219,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: Some(report),
             coordination_pair: None,
+            coordination_pair_open: None,
         }
     }
 
@@ -214,6 +234,22 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             coordination_pair: Some(status),
+            coordination_pair_open: None,
+        }
+    }
+
+    /// Build the one-time local operator response for a pairing-window open request.
+    #[must_use]
+    pub fn coordination_pair_open(open: CoordinationPairOpenResponse) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            coordination_pair: None,
+            coordination_pair_open: Some(open),
         }
     }
 }
@@ -590,6 +626,27 @@ mod tests {
             r#"{"req":"coordination_pair_open","display_name":"Office Mac"}"#
         );
         assert!(!json.contains("code"));
+    }
+
+    #[test]
+    fn coordination_pair_open_response_carries_code_once_status_stays_secret_free() {
+        let open = IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
+            pair_id: "pair-id".to_owned(),
+            code: "ABCD1234".to_owned(),
+            expires_at: "2026-07-21T12:00:00Z".to_owned(),
+        });
+        let open_json = serde_json::to_string(&open).unwrap();
+        assert!(open_json.contains("ABCD1234"));
+        assert!(open_json.contains("expires_at"));
+
+        let status = IpcResponse::coordination_pair(CoordinationPairStatus {
+            pair_id: "pair-id".to_owned(),
+            state: "pairing".to_owned(),
+            peer_instance_id: None,
+        });
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("ABCD1234"));
+        assert!(!status_json.contains("expires_at"));
     }
 
     #[test]

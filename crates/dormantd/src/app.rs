@@ -837,11 +837,14 @@ impl App {
         } else {
             None
         };
-        let pairing_manager = Arc::new(PairingManager::new(
-            self.state_dir.clone(),
-            cfg_clone.coordination.enabled,
-            cfg_clone.coordination.pairing_window,
-        ));
+        let pairing_manager = Arc::new(
+            PairingManager::new(
+                &self.state_dir,
+                cfg_clone.coordination.enabled,
+                cfg_clone.coordination.pairing_window,
+            )
+            .context("load persistent instance identity for pairing")?,
+        );
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));

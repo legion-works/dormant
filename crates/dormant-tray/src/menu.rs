@@ -34,7 +34,7 @@
 
 use std::time::Duration;
 
-use dormant_core::rules::StateSnapshot;
+use dormant_core::{config::DisplayScope, rules::StateSnapshot, traits::PowerState};
 
 use crate::icon::Glyph;
 
@@ -138,7 +138,17 @@ fn submenu_label(display_id: &str, d: &dormant_core::rules::DisplaySnapshot) -> 
         (Some(stage), "staged") => format!("staged: {}", stage_kind_label(stage.kind)),
         (_, phase) => phase.to_string(),
     };
-    format!("{glyph} {display_id} — {phase_text}")
+    if d.scope == DisplayScope::Shared {
+        let ownership = if d.owned { "owner" } else { "deferred" };
+        let panel = match d.panel_state.as_ref().and_then(|state| state.power) {
+            Some(PowerState::On) => "ON",
+            Some(PowerState::Standby) => "OFF",
+            None => "unknown",
+        };
+        format!("{glyph} {display_id} — {phase_text} — {ownership} — panel {panel}")
+    } else {
+        format!("{glyph} {display_id} — {phase_text}")
+    }
 }
 
 /// Stringify a [`StageKind`] for display.  Uses the serde
@@ -262,6 +272,11 @@ pub fn build_menu(
 
         for (id, d) in sorted {
             let label = submenu_label(id, d);
+            let blank_label = if d.scope == DisplayScope::Shared {
+                "Blank shared panel — affects all connected machines"
+            } else {
+                "Blank now"
+            };
             // Submenu shell stays openable regardless of reachability
             // so the operator can still inspect what's inside; the
             // children carry the disabled state.
@@ -270,7 +285,7 @@ pub fn build_menu(
                 enabled: true,
                 entries: vec![
                     MenuEntry::Action {
-                        label: "Blank now".into(),
+                        label: blank_label.into(),
                         enabled: !unreachable,
                         icon: glyph_for(&Action::BlankOne(id.clone())),
                         action: Action::BlankOne(id.clone()),
@@ -310,8 +325,12 @@ pub fn build_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dormant_core::rules::{DisplaySnapshot, StageInfo, StateSnapshot};
     use dormant_core::types::StageKind;
+    use dormant_core::{
+        config::DisplayScope,
+        rules::{DisplaySnapshot, StageInfo, StateSnapshot},
+        traits::{PanelState, PowerState},
+    };
 
     fn disp(id: &str, phase: &str) -> (String, DisplaySnapshot) {
         disp_with(id, phase, false, None)
@@ -340,6 +359,22 @@ mod tests {
                 stage,
             },
         )
+    }
+
+    fn shared_disp(
+        id: &str,
+        phase: &str,
+        owned: bool,
+        power: Option<PowerState>,
+    ) -> (String, DisplaySnapshot) {
+        let (id, mut display) = disp(id, phase);
+        display.scope = DisplayScope::Shared;
+        display.owned = owned;
+        display.panel_state = power.map(|power| PanelState {
+            power: Some(power),
+            brightness: None,
+        });
+        (id, display)
     }
 
     fn snap(displays: Vec<(String, DisplaySnapshot)>) -> StateSnapshot {
@@ -703,6 +738,91 @@ mod tests {
             }
             other => panic!("expected submenu, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_submenu_shows_owner_and_panel_state() {
+        let snapshot = snap(vec![shared_disp(
+            "tv",
+            "blanked",
+            true,
+            Some(PowerState::On),
+        )]);
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        let submenu = menu
+            .iter()
+            .find(|entry| matches!(entry, MenuEntry::Submenu { .. }))
+            .expect("shared display submenu");
+        assert!(matches!(submenu, MenuEntry::Submenu { label, .. }
+            if label == "○ tv — blanked — owner — panel ON"));
+    }
+
+    #[test]
+    fn shared_nonowner_off_still_offers_wake() {
+        let snapshot = snap(vec![shared_disp(
+            "tv",
+            "active",
+            false,
+            Some(PowerState::Standby),
+        )]);
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        let submenu = menu
+            .iter()
+            .find(|entry| matches!(entry, MenuEntry::Submenu { .. }))
+            .expect("shared display submenu");
+        let MenuEntry::Submenu { label, entries, .. } = submenu else {
+            unreachable!("expected shared display submenu");
+        };
+        assert_eq!(label, "● tv — active — deferred — panel OFF");
+        assert!(matches!(
+            entries.get(1),
+            Some(MenuEntry::Action {
+                label,
+                enabled: true,
+                action: Action::WakeOne(id),
+                ..
+            }) if label == "Wake now" && id == "tv"
+        ));
+    }
+
+    #[test]
+    fn shared_blank_warns_all_connected_machines() {
+        let snapshot = snap(vec![shared_disp("tv", "active", true, None)]);
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        let submenu = menu
+            .iter()
+            .find(|entry| matches!(entry, MenuEntry::Submenu { .. }))
+            .expect("shared display submenu");
+        let MenuEntry::Submenu { entries, .. } = submenu else {
+            unreachable!("expected shared display submenu");
+        };
+        assert!(matches!(
+            entries.first(),
+            Some(MenuEntry::Action { label, .. })
+                if label == "Blank shared panel — affects all connected machines"
+        ));
+    }
+
+    #[test]
+    fn private_display_labels_remain_byte_identical() {
+        let snapshot = snap(vec![disp("private-panel", "blanked")]);
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        let submenu = menu
+            .iter()
+            .find(|entry| matches!(entry, MenuEntry::Submenu { .. }))
+            .expect("private display submenu");
+        let MenuEntry::Submenu { label, entries, .. } = submenu else {
+            unreachable!("expected private display submenu");
+        };
+        assert_eq!(label, "○ private-panel — blanked");
+        assert!(matches!(entries.as_slice(), [
+            MenuEntry::Action { label: blank_label, .. },
+            MenuEntry::Action { label: wake_label, .. },
+        ] if blank_label == "Blank now" && wake_label == "Wake now"));
     }
 
     #[test]

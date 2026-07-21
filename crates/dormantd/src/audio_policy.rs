@@ -1,5 +1,9 @@
 //! Deterministic timing policy for the audio inhibitor poller.
 
+// The cancellation-only non-Linux poller never reaches these PipeWire
+// transitions, which remain compiled to support shared unit tests.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use dormant_core::rules::InhibitorKind;
 use std::time::{Duration, Instant};
 

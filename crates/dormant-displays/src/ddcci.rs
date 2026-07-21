@@ -185,7 +185,7 @@ impl DdcciController {
     /// Test-only accessor: read the configured primary mode the registry
     /// wired in. Used by the registry-path test that asserts end-to-end
     /// config → controller wiring (mirrors `SamsungTizenController::configured_primary_mode`).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn configured_primary_mode(&self) -> BlankMode {
         self.configured_primary_mode
     }

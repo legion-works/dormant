@@ -423,7 +423,9 @@ async fn run_macos_display_sleep() -> Result<DoctorOutcome> {
 }
 
 /// `doctor macos-display-catalog` — stable CoreGraphics display selectors.
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+// The catalog probe is synchronous, but this shared dispatcher awaits every
+// macOS doctor arm so their platform-specific implementations remain uniform.
+#[allow(clippy::unused_async)]
 async fn run_macos_display_catalog() -> Result<DoctorOutcome> {
     #[cfg(target_os = "macos")]
     {

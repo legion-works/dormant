@@ -59,7 +59,7 @@ const STDERR_TAIL: usize = 200;
 /// enumerate — mirrors `crate::macos_display_catalog::MAX_ONLINE_DISPLAYS`.
 const MAX_ONLINE_DISPLAYS: usize = 32;
 
-/// `IOReturn` — IOKit's C error code (`typedef kern_return_t IOReturn`,
+/// `IOReturn` — `IOKit`'s C error code (`typedef kern_return_t IOReturn`,
 /// itself `typedef int kern_return_t`). `0` is `kIOReturnSuccess`.
 type IoReturn = i32;
 const K_IO_RETURN_SUCCESS: IoReturn = 0;
@@ -118,16 +118,12 @@ unsafe extern "C" {
 /// The returned reference is +1-retained per Core Foundation's "Create"
 /// naming rule — the caller must `CFRelease` it exactly once.
 fn cfstring_from_str(s: &str) -> Option<CFStringRef> {
-    let c_string = CString::new(s).ok()?;
+    let utf8 = CString::new(s).ok()?;
     // Safety: `kCFAllocatorDefault` is a valid allocator constant;
-    // `c_string` is a valid, NUL-terminated C string for the duration of
+    // `utf8` is a valid, NUL-terminated C string for the duration of
     // this call.
     let cf_string = unsafe {
-        CFStringCreateWithCString(
-            kCFAllocatorDefault,
-            c_string.as_ptr(),
-            kCFStringEncodingUTF8,
-        )
+        CFStringCreateWithCString(kCFAllocatorDefault, utf8.as_ptr(), kCFStringEncodingUTF8)
     };
     if cf_string.is_null() {
         None
@@ -211,7 +207,11 @@ impl DisplaySleepTransport for RealDisplaySleepTransport {
         // Safety: `name_ref` was just checked non-null and is a valid,
         // owned CFStringRef; `assertion_id` is a valid out-param.
         let err = unsafe {
-            IOPMAssertionDeclareUserActivity(name_ref, K_IO_PM_USER_ACTIVE_LOCAL, &mut assertion_id)
+            IOPMAssertionDeclareUserActivity(
+                name_ref,
+                K_IO_PM_USER_ACTIVE_LOCAL,
+                &raw mut assertion_id,
+            )
         };
         // Safety: `name_ref` is a +1-retained reference owned by this
         // function; release it exactly once, after the call that consumes
@@ -244,11 +244,11 @@ impl DisplaySleepTransport for RealDisplaySleepTransport {
     fn online_sleep_states(&self) -> Result<Vec<(CGDirectDisplayID, bool)>, CmdFailure> {
         let mut ids = [0u32; MAX_ONLINE_DISPLAYS];
         let mut count: u32 = 0;
+        let max_displays = u32::try_from(MAX_ONLINE_DISPLAYS)
+            .map_err(|_| io_err("online display limit does not fit in u32"))?;
         // Safety: `ids` has `MAX_ONLINE_DISPLAYS` capacity, matching
         // `maxDisplays`; `count` is a valid out-param.
-        let err = unsafe {
-            CGGetOnlineDisplayList(MAX_ONLINE_DISPLAYS as u32, ids.as_mut_ptr(), &mut count)
-        };
+        let err = unsafe { CGGetOnlineDisplayList(max_displays, ids.as_mut_ptr(), &raw mut count) };
         if err != K_CG_ERROR_SUCCESS {
             return Err(io_err(format!(
                 "CGGetOnlineDisplayList failed: CGError {err}"

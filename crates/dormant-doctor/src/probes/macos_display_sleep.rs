@@ -104,7 +104,7 @@ mod real {
     /// Real backend: checks for an active window-server session, then
     /// delegates the per-display readback to
     /// `dormant_displays::macos_power::RealDisplaySleepTransport` — the
-    /// exact same IOKit/`CoreGraphics` call `MacosDisplaySleepController::wake`
+    /// exact same `IOKit`/`CoreGraphics` call `MacosDisplaySleepController::wake`
     /// polls, called here in isolation (no assertion declared, no `pmset
     /// displaysleepnow` spawned).
     pub struct RealMacosPowerProbeOps;

@@ -40,8 +40,11 @@
 
 #![warn(missing_docs)]
 
+#[cfg(target_os = "linux")]
 mod command;
+#[cfg(target_os = "linux")]
 mod latch;
+#[cfg(target_os = "linux")]
 mod shift;
 
 pub mod playlist;

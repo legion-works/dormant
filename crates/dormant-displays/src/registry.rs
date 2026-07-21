@@ -228,6 +228,9 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "kwin-dpms",
     "samsung-tizen",
 ];
+/// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
+///
+/// macOS advertises controllers supported by its local display backends.
 #[cfg(target_os = "macos")]
 pub const CONTROLLER_TYPES: &[&str] = &[
     "command",
@@ -237,6 +240,9 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "macos-gamma-black",
     "samsung-tizen",
 ];
+/// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
+///
+/// Other platforms advertise only portable controller backends.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-tizen"];
 

@@ -36,10 +36,13 @@
 //! A future path may use `org.kde.KWin` `DBus` for per-output control, but the
 //! shipped mechanism is `kscreen-doctor` (verified per-output on Plasma 6.7.2).
 
-use std::env;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use std::env;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_DISPLAY_IO};
@@ -49,9 +52,11 @@ use dormant_core::types::{BlankMode, CmdFailure};
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 /// Binary name — literal anchor for PATH checks and error messages.
+#[cfg(target_os = "linux")]
 const KSCREEN_DOCTOR: &str = "kscreen-doctor";
 
 /// Maximum stderr bytes surfaced in a `CmdFailure` on non-zero exit.
+#[cfg(target_os = "linux")]
 const STDERR_TAIL: usize = 200;
 
 // ── Argument construction (pure, testable) ─────────────────────────────────────
@@ -363,6 +368,7 @@ fn parse_connectors(stdout: &str) -> Vec<String> {
 /// Keep the last `max` characters (best-effort) of `s` as valid UTF-8.
 ///
 /// "Tail" semantics: the diagnostic usually lives at the end of stderr.
+#[cfg(target_os = "linux")]
 fn truncate_utf8_tail(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();

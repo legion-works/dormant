@@ -42,6 +42,11 @@
 //! `ClassifyError` is reserved for TOP-LEVEL JSON syntax failure and the
 //! 4 MiB input cap ONLY (F5) — never for per-node anomalies.
 
+// The non-Linux poller is deliberately a cancellation-only stub; the
+// PipeWire implementation remains available to shared tests without being
+// reachable in a macOS production build.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use dormant_core::config::schema::AudioConfig;
 use serde_json::Value;
 

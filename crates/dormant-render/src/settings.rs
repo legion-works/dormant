@@ -12,6 +12,7 @@ use crate::playlist::PlaylistItem;
 /// the caller for this duration; if no successful render lands before
 /// it fires, the show reply is resolved with `Err(E_RENDER_UNAVAILABLE)`
 /// so the engine falls through.
+#[cfg(target_os = "linux")]
 pub(crate) const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How the screensaver transitions between two consecutive playlist items
@@ -165,6 +166,7 @@ impl Default for ScaleMode {
 ///   allowed because no scheme prefix is plausible there.
 ///
 /// Empty / whitespace-only items are rejected.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn scheme_allowed(item: &str) -> bool {
     let s = item.trim();
     if s.is_empty() {

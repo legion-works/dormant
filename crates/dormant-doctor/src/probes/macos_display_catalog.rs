@@ -9,6 +9,7 @@ fn format_selectors(selectors: &[String]) -> String {
 }
 
 /// Report the online CoreGraphics display selectors without changing display state.
+#[must_use]
 pub fn probe_macos_display_catalog() -> ProbeResult {
     match dormant_displays::macos_display_catalog::online_selectors() {
         Ok(selectors) if selectors.is_empty() => ProbeResult::skip(

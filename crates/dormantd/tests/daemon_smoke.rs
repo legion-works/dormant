@@ -4830,6 +4830,7 @@ async fn watchdog_reload_mid_window_resets_candidate() {
 /// (and, via `include_displays`, from `[displays]` entirely) on reload —
 /// enough removed displays to distinguish "one ping per removed display"
 /// from "one ping for the whole loop" (P9).
+#[cfg(target_os = "linux")]
 fn three_display_config(
     m1: &Path,
     m2: &Path,
@@ -5541,11 +5542,14 @@ async fn rejected_reload_can_repeat_after_rollback_restore() {
 //     unfrozen grace countdown that expires before ordinary debounce would
 //     ever assert, and the display blanks — visibly RED.
 
+#[cfg(target_os = "linux")]
 const AUDIO_MOVIE_FIXTURE: &str = include_str!("fixtures/pw_dump/movie.json");
+#[cfg(target_os = "linux")]
 const AUDIO_IDLE_FIXTURE: &str = include_str!("fixtures/pw_dump/idle.json");
 
 /// Wrap a raw `pw-dump` JSON fixture in a `#!/bin/sh` script that `cat`s it
 /// verbatim (the `audio_source.rs` poller-test precedent, same mechanism).
+#[cfg(target_os = "linux")]
 fn audio_cat_script(json: &str) -> String {
     format!("#!/bin/sh\ncat <<'AUDIO_FIXTURE_EOF'\n{json}\nAUDIO_FIXTURE_EOF\n")
 }
@@ -5553,6 +5557,7 @@ fn audio_cat_script(json: &str) -> String {
 /// Write a fake `pw-dump` script emitting `json`, executable (0o755 — the
 /// `write_credentials` `PermissionsExt` precedent above; same mechanism,
 /// 0o755 not 0o600 because this file must be executable).
+#[cfg(target_os = "linux")]
 fn write_pw_dump_script(dir: &Path, json: &str) -> PathBuf {
     let path = dir.join("pw-dump");
     fs::write(&path, audio_cat_script(json)).unwrap();
@@ -5568,6 +5573,7 @@ fn write_pw_dump_script(dir: &Path, json: &str) -> PathBuf {
 /// write-temp + `chmod` 0o755 BEFORE rename — rename carries the temp's
 /// mode, so losing the exec bit would silently flip the poller onto its
 /// failure path (R2-N, `audio_source.rs`'s `rewrite_script` precedent).
+#[cfg(target_os = "linux")]
 fn rewrite_pw_dump_script(path: &Path, json: &str) {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, audio_cat_script(json)).unwrap();
@@ -5585,6 +5591,7 @@ fn rewrite_pw_dump_script(path: &Path, json: &str) {
 /// `grace`/`min_active` are tunable per case (P3/P4); `log_level` is the
 /// unrelated daemon-level knob the reload test flips (`reload_carry_config`
 /// precedent above).
+#[cfg(target_os = "linux")]
 fn audio_rule_config(
     marker: &Path,
     script: &Path,

@@ -360,23 +360,28 @@ async fn handle_connection(
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::CoordinationPeersList => {
-                let result = pairing.paired_peers().map(|paired| {
-                    let discovered =
-                        pairing_transport
-                            .as_ref()
-                            .map_or_else(Vec::new, |transport| {
-                                transport
-                                    .discovered_peers()
-                                    .into_iter()
-                                    .map(|peer| CoordinationDiscoveredPeer {
-                                        instance_id: peer.instance_id,
-                                        display_name: peer.display_name,
-                                        pairing_port: peer.pairing_port,
-                                        window_id: peer.window_id,
-                                    })
-                                    .collect()
-                            });
-                    CoordinationPeers {
+                let result: Result<
+                    CoordinationPeers,
+                    crate::coordination_pairing::PairSessionError,
+                > = (|| {
+                    let paired = pairing.paired_peers()?;
+                    let discovered = match pairing_transport.as_ref() {
+                        Some(transport) => {
+                            transport.kick_browse()?;
+                            transport
+                                .discovered_peers()
+                                .into_iter()
+                                .map(|peer| CoordinationDiscoveredPeer {
+                                    instance_id: peer.instance_id,
+                                    display_name: peer.display_name,
+                                    pairing_port: peer.pairing_port,
+                                    window_id: peer.window_id,
+                                })
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    Ok(CoordinationPeers {
                         discovered,
                         paired: paired
                             .into_iter()
@@ -386,8 +391,8 @@ async fn handle_connection(
                                 paired_at: peer.paired_at,
                             })
                             .collect(),
-                    }
-                });
+                    })
+                })();
                 let resp = result.map_or_else(
                     |error| IpcResponse::error(error.to_string()),
                     IpcResponse::coordination_peers,

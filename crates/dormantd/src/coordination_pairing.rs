@@ -307,6 +307,9 @@ impl PairingManager {
 }
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(1);
+const BROWSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+const BROWSE_SETTLE_POLL: Duration = Duration::from_millis(150);
+const BROWSE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_PAIRING_CONNS: usize = 8;
 // The attempt cap burns code guesses; this separate cap bounds clients that never send a hello.
 const MAX_PAIRING_CONNS_PER_WINDOW: usize = 30;
@@ -320,6 +323,7 @@ pub(crate) struct PairingTransport<B: MdnsBackend + 'static> {
     test_bind_ip: Option<IpAddr>,
     cancel: tokio_util::sync::CancellationToken,
     windows: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    browse_last_activity: Arc<Mutex<Option<Instant>>>,
 }
 
 impl<B: MdnsBackend + 'static> PairingTransport<B> {
@@ -339,6 +343,7 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             test_bind_ip: None,
             cancel,
             windows: Arc::new(Mutex::new(HashMap::new())),
+            browse_last_activity: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -358,6 +363,7 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             test_bind_ip: Some(bind_ip),
             cancel,
             windows: Arc::new(Mutex::new(HashMap::new())),
+            browse_last_activity: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -369,6 +375,30 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             .discovered_peers()
             .into_values()
             .collect()
+    }
+
+    /// Start or refresh the short-lived browse used by operator pairing actions.
+    pub(crate) fn kick_browse(&self) -> Result<(), PairSessionError> {
+        let now = Instant::now();
+        let mut discovery = self
+            .discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last_activity = self
+            .browse_last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_activity.is_some_and(|last| now.duration_since(last) >= BROWSE_IDLE_TIMEOUT) {
+            discovery.stop_browse();
+        }
+        discovery
+            .start_browse()
+            .map_err(|error| PairSessionError::Local(format!("start pairing browse: {error}")))?;
+        discovery
+            .drain_browse()
+            .map_err(|error| PairSessionError::Local(format!("drain pairing browse: {error}")))?;
+        *last_activity = Some(now);
+        Ok(())
     }
 
     /// Open a bound-and-advertised responder window.
@@ -448,26 +478,31 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
         code: String,
     ) -> Result<(), PairSessionError> {
         self.manager.join_preflight(&target_instance_id)?;
-        let (address, window_id) = {
-            let mut discovery = self
-                .discovery
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            discovery.start_browse().map_err(|error| {
-                PairSessionError::Local(format!("start pairing browse: {error}"))
-            })?;
-            discovery.drain_browse().map_err(|error| {
-                PairSessionError::Local(format!("drain pairing browse: {error}"))
-            })?;
-            let address = discovery
-                .discovered_peer_addr(&target_instance_id)
-                .ok_or_else(|| PairSessionError::Local("peer not discovered".to_owned()))?;
-            let window_id = discovery
-                .discovered_peers()
-                .get(&target_instance_id)
-                .map(|peer| peer.window_id.clone())
-                .ok_or_else(|| PairSessionError::Local("peer not discovered".to_owned()))?;
-            (address, window_id)
+        self.kick_browse()?;
+        let deadline = Instant::now() + BROWSE_SETTLE_TIMEOUT;
+        let (address, window_id) = loop {
+            let discovered = {
+                let mut discovery = self
+                    .discovery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                discovery.drain_browse().map_err(|error| {
+                    PairSessionError::Local(format!("drain pairing browse: {error}"))
+                })?;
+                discovery.discovered_peer_addr(&target_instance_id).zip(
+                    discovery
+                        .discovered_peers()
+                        .get(&target_instance_id)
+                        .map(|peer| peer.window_id.clone()),
+                )
+            };
+            if let Some(discovered) = discovered {
+                break discovered;
+            }
+            if Instant::now() >= deadline {
+                return Err(PairSessionError::Local("peer not discovered".to_owned()));
+            }
+            tokio::time::sleep(BROWSE_SETTLE_POLL).await;
         };
         let mut stream =
             tokio::time::timeout(CONNECTION_TIMEOUT, tokio::net::TcpStream::connect(address))
@@ -1851,11 +1886,16 @@ mod tests {
     use super::*;
     use crate::coordination_mdns::{AdvertisementHandle, BrowseEvent, BrowseStream};
     use dormant_core::coordination::CoordinationHandle;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::AsyncWriteExt as _;
 
     #[derive(Clone, Default)]
     struct TransportFakeBackend {
         advertised: Arc<Mutex<Option<DiscoverAnnounce>>>,
+        browse_calls: Arc<AtomicUsize>,
+        browse_events: Arc<Mutex<VecDeque<BrowseEvent>>>,
+        empty_browse_polls: Arc<AtomicUsize>,
     }
 
     struct TransportFakeAdvertisement(Arc<Mutex<Option<DiscoverAnnounce>>>);
@@ -1871,11 +1911,27 @@ mod tests {
         }
     }
 
-    struct TransportFakeBrowse;
+    struct TransportFakeBrowse {
+        events: Arc<Mutex<VecDeque<BrowseEvent>>>,
+        empty_polls: Arc<AtomicUsize>,
+    }
 
     impl BrowseStream for TransportFakeBrowse {
         fn try_next(&mut self) -> anyhow::Result<Option<BrowseEvent>> {
-            Ok(None)
+            if self
+                .empty_polls
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |polls| {
+                    polls.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Ok(None);
+            }
+            Ok(self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front())
         }
     }
 
@@ -1894,7 +1950,11 @@ mod tests {
         }
 
         fn browse(&self) -> anyhow::Result<Box<dyn BrowseStream>> {
-            Ok(Box::new(TransportFakeBrowse))
+            self.browse_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(TransportFakeBrowse {
+                events: Arc::clone(&self.browse_events),
+                empty_polls: Arc::clone(&self.empty_browse_polls),
+            }))
         }
     }
 
@@ -1926,6 +1986,31 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
         );
         (root, manager, transport, advertised)
+    }
+
+    #[test]
+    fn kick_browse_starts_discovery_for_an_operator_pairing_action() {
+        let root = tempfile::tempdir().unwrap();
+        let manager =
+            Arc::new(PairingManager::new(root.path(), true, Duration::from_secs(2)).unwrap());
+        let backend = TransportFakeBackend::default();
+        let browse_calls = Arc::clone(&backend.browse_calls);
+        let discovery = PairDiscovery::new(
+            backend,
+            manager.identity.as_ref().unwrap().instance_id.clone(),
+            CoordinationHandle::new([]),
+        );
+        let transport = PairingTransport::new_with_bind_ip_for_test(
+            manager,
+            discovery,
+            0,
+            "127.0.0.1".parse().unwrap(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        transport.kick_browse().unwrap();
+
+        assert_eq!(browse_calls.load(Ordering::SeqCst), 1);
     }
 
     fn advertised_addr(advertised: &Arc<Mutex<Option<DiscoverAnnounce>>>) -> SocketAddr {
@@ -2077,6 +2162,90 @@ mod tests {
         );
         assert!(!harness.initiator.state_dir.join("peers.json").exists());
         assert!(!harness.responder.state_dir.join("peers.json").exists());
+    }
+
+    #[tokio::test]
+    async fn join_waits_for_a_peer_announced_after_initial_browse_drains() {
+        let bind_ip = resolve_bind_ip(None).unwrap();
+        let responder_root = tempfile::tempdir().unwrap();
+        let responder_manager = Arc::new(
+            PairingManager::new(responder_root.path(), true, Duration::from_secs(2)).unwrap(),
+        );
+        let responder_backend = TransportFakeBackend::default();
+        let advertised = Arc::clone(&responder_backend.advertised);
+        let responder_discovery = PairDiscovery::new(
+            responder_backend,
+            responder_manager
+                .identity
+                .as_ref()
+                .unwrap()
+                .instance_id
+                .clone(),
+            CoordinationHandle::new([]),
+        );
+        let responder_transport = PairingTransport::new_with_bind_ip_for_test(
+            Arc::clone(&responder_manager),
+            responder_discovery,
+            0,
+            bind_ip,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let open = responder_transport
+            .open("Responder".to_owned())
+            .await
+            .unwrap();
+        let announce = advertised
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap();
+        let mut addresses = BTreeSet::new();
+        addresses.insert(SocketAddr::new(bind_ip, announce.pairing_port));
+
+        let initiator_root = tempfile::tempdir().unwrap();
+        let initiator_manager = Arc::new(
+            PairingManager::new(initiator_root.path(), true, Duration::from_secs(2)).unwrap(),
+        );
+        let backend = TransportFakeBackend::default();
+        backend.empty_browse_polls.store(1, Ordering::SeqCst);
+        backend
+            .browse_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(BrowseEvent::Resolved {
+                peer: announce.clone(),
+                addresses,
+            });
+        let discovery = PairDiscovery::new(
+            backend,
+            initiator_manager
+                .identity
+                .as_ref()
+                .unwrap()
+                .instance_id
+                .clone(),
+            CoordinationHandle::new([]),
+        );
+        let initiator_transport = PairingTransport::new_with_bind_ip_for_test(
+            Arc::clone(&initiator_manager),
+            discovery,
+            0,
+            "127.0.0.1".parse().unwrap(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        initiator_transport
+            .join("Initiator".to_owned(), announce.instance_id, open.code)
+            .await
+            .unwrap();
+        wait_for_advertisement_withdrawal(&advertised).await;
+
+        assert!(initiator_root.path().join("peers.json").exists());
+        assert!(responder_root.path().join("peers.json").exists());
+        assert_eq!(
+            responder_manager.status(&open.pair_id).unwrap().state,
+            PairingState::Paired
+        );
     }
 
     #[tokio::test]

@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_instance_cancel_transitions_to_cancelled() {
+    async fn pair_instance_cancel_route_maps_ipc_response() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("ipc.sock");
         let cancelled = dormant_core::ipc_proto::CoordinationPairStatus {
@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_instance_expiry_surfaces_timeout() {
+    async fn pair_instance_status_route_maps_timeout_response() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("ipc.sock");
         let server = ipc_server(
@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_instance_responses_and_logs_are_code_free_except_open() {
+    async fn pair_instance_response_bodies_are_code_free_except_open() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("ipc.sock");
         let secret = "SENTINEL-CODE";

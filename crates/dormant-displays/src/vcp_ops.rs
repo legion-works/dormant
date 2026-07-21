@@ -70,6 +70,11 @@ pub enum VcpPriority {
 /// sampled path collapse this (like any other error) to `None`.
 pub const VCP_SKIPPED: &str = "VCP_SKIPPED: sampler yielded to a command-path caller";
 
+/// Stable input-source readback error for a sampler that yielded to a
+/// command-path caller. Coordination and doctor consumers match this literal
+/// instead of parsing the generic VCP lock-skip error.
+pub const INPUT_SOURCE_SKIPPED: &str = "skipped: command holds panel lock";
+
 /// Sentinel error returned when the wrapped ddc-hi operation panics.
 /// `catch_unwind` converts the panic into this string so a single bad
 /// transaction cannot crash the `spawn_blocking` worker thread.

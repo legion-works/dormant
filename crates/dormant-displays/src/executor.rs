@@ -621,6 +621,30 @@ impl CommandSink for DisplayExecutor {
         None
     }
 
+    /// Walk the configured chain for an active input-source read at sampler
+    /// priority. Controllers without readback fall through; if none succeeds,
+    /// the last attempted-read error is preserved for coordination and doctor
+    /// consumers to distinguish it from absent readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last controller error when no controller reports an input
+    /// source successfully.
+    async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+        let mut last_error = None;
+        for controller in &self.chain {
+            match controller.read_input_source_sampled().await {
+                Ok(Some(code)) => return Ok(Some(code)),
+                Ok(None) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
     /// Walk the configured chain and return the first non-`None`
     /// usage-hours reading — mirrors [`Self::read_state`]'s chain-walk
     /// shape exactly. Used once, at wear-ledger seeding time (task T7),
@@ -694,6 +718,7 @@ mod tests {
         /// Scripted [`DisplayController::panel_identity`] response — used
         /// by the T7 chain-walk test.
         panel_identity: Option<String>,
+        input_sources: VecDeque<Result<Option<u8>, String>>,
     }
 
     impl FakeController {
@@ -735,6 +760,10 @@ mod tests {
 
         fn set_panel_identity(&self, id: Option<String>) {
             self.inner.lock().unwrap().panel_identity = id;
+        }
+
+        fn push_input_source(&self, result: Result<Option<u8>, String>) {
+            self.inner.lock().unwrap().input_sources.push_back(result);
         }
 
         fn count_op(&self, op: &'static str) -> usize {
@@ -823,6 +852,15 @@ mod tests {
 
         async fn read_usage_hours(&self) -> Option<u32> {
             self.inner.lock().unwrap().usage_hours
+        }
+
+        async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+            self.inner
+                .lock()
+                .unwrap()
+                .input_sources
+                .pop_front()
+                .unwrap_or(Ok(None))
         }
 
         fn panel_identity(&self) -> Option<String> {
@@ -1374,6 +1412,28 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let (exec, _) = executor_with(vec![a], default_retry());
         assert_eq!(exec.read_usage_hours().await, None);
+    }
+
+    #[tokio::test]
+    async fn input_source_chain_walks_to_reader() {
+        let no_readback = FakeController::new("no-readback", vec![BlankMode::PowerOff]);
+        let reader = FakeController::new("reader", vec![BlankMode::PowerOff]);
+        reader.push_input_source(Ok(Some(0x11)));
+        let (executor, _) = executor_with(vec![no_readback, reader], default_retry());
+
+        assert_eq!(executor.read_input_source_sampled().await, Ok(Some(0x11)));
+    }
+
+    #[tokio::test]
+    async fn input_source_chain_returns_reader_error() {
+        let reader = FakeController::new("reader", vec![BlankMode::PowerOff]);
+        reader.push_input_source(Err("read failed".into()));
+        let (executor, _) = executor_with(vec![reader], default_retry());
+
+        assert_eq!(
+            executor.read_input_source_sampled().await,
+            Err("read failed".into())
+        );
     }
 
     // ── T7 fix M1: panel_identity chain-walk ─────────────────────────────────

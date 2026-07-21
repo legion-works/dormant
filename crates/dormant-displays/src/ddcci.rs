@@ -36,7 +36,7 @@ use dormant_core::types::{BlankMode, CmdFailure};
 use crate::ddc_lock::{PanelLock, PanelLocks};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::vcp_ops::RealVcp;
-use crate::vcp_ops::{VcpOps, VcpPriority};
+use crate::vcp_ops::{INPUT_SOURCE_SKIPPED, VCP_SKIPPED, VcpOps, VcpPriority};
 
 // ── VCP code constants ─────────────────────────────────────────────────────────
 
@@ -51,6 +51,9 @@ const VCP_POWER: u8 = 0xD6;
 /// [`crate::vcp_ops::VcpOps::get_vcp_raw`] and decoded per
 /// [`decode_usage_hours`] rather than the plain `get_vcp` u16 path.
 const VCP_USAGE_HOURS: u8 = 0xC0;
+
+/// VCP code for the currently active input source.
+const VCP_INPUT_SOURCE: u8 = 0x60;
 
 /// D6 value: display on.
 const D6_ON: u16 = 0x01;
@@ -556,6 +559,37 @@ impl DisplayController for DdcciController {
         self.read_state_at(VcpPriority::Sampler).await
     }
 
+    /// Read the active input source at sampler priority (VCP `0x60`).
+    ///
+    /// Unlike [`Self::read_state_sampled`], this preserves read failures and
+    /// lock skips so coordination and doctor consumers can distinguish an
+    /// unreadable panel from a skipped sample.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the controller has been probed but its VCP read
+    /// fails, including [`INPUT_SOURCE_SKIPPED`] when sampler priority yields
+    /// to a command-path caller, or if the reply cannot fit in an input code.
+    async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+        let (ident, lock) = {
+            let state = self.state.lock().unwrap();
+            match (&state.matched_ident, &state.panel_lock) {
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                _ => return Ok(None),
+            }
+        };
+
+        match self
+            .ops
+            .get_vcp_raw(&ident, VCP_INPUT_SOURCE, &lock, VcpPriority::Sampler)
+            .await
+        {
+            Ok(raw) => decode_input_source(raw).map(Some),
+            Err(error) if error == VCP_SKIPPED => Err(INPUT_SOURCE_SKIPPED.to_string()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Read the panel's cumulative usage-hours counter (VCP `0xC0`,
     /// MCCS "Display Usage Time").
     ///
@@ -731,6 +765,20 @@ impl DdcciController {
 fn decode_usage_hours(raw: [u8; 4]) -> u32 {
     let [_mh, ml, sh, sl] = raw;
     (u32::from(ml) << 16) | (u32::from(sh) << 8) | u32::from(sl)
+}
+
+/// Decode a VCP `0x60` raw reply `[mh, ml, sh, sl]` into an input-source code.
+///
+/// The maximum bytes are intentionally opaque: some panels report source codes
+/// outside their advertised capability map. Input-source codes must fit in the
+/// low byte, so a non-zero current-value high byte is rejected.
+fn decode_input_source(raw: [u8; 4]) -> Result<u8, String> {
+    let [_mh, _ml, sh, sl] = raw;
+    if sh == 0 {
+        Ok(sl)
+    } else {
+        Err(format!("input source value exceeds u8: 0x{sh:02X}{sl:02X}"))
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1744,6 +1792,89 @@ mod tests {
             "read_usage_hours must flow through exactly one get_vcp_raw(0xC0) \
              call, not get_vcp or any other opcode: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ddcci_input_source_uses_raw_0x60_at_sampler_priority() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_get_raw(ident, VCP_INPUT_SOURCE, Ok([0xFF, 0xFF, 0x00, 0x11]));
+
+        assert_eq!(ctrl.read_input_source_sampled().await, Ok(Some(0x11)));
+        assert_eq!(
+            fake.take_call_log(),
+            vec![format!("get_vcp_raw({ident}, 0x{VCP_INPUT_SOURCE:02X})")]
+        );
+    }
+
+    #[test]
+    fn decode_input_source_ignores_maximum_and_rejects_wide_values() {
+        assert_eq!(decode_input_source([0xFF, 0xFF, 0x00, 0x11]), Ok(0x11));
+        assert_eq!(
+            decode_input_source([0x00, 0x00, 0x01, 0x11]),
+            Err("input source value exceeds u8: 0x0111".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn input_source_sampler_skips_when_command_waits() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let lock = ctrl
+            .panel_lock_for_test()
+            .expect("a probed DdcciController has resolved a panel lock");
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let held_lock = Arc::clone(&lock);
+        let holder = std::thread::spawn(move || {
+            let _guard = held_lock.command_guard();
+            acquired_tx
+                .send(())
+                .expect("test receiver must wait for the command holder");
+            release_rx
+                .recv()
+                .expect("test must release the command holder");
+        });
+        acquired_rx
+            .recv()
+            .expect("command holder must acquire the panel lock");
+
+        assert_eq!(
+            ctrl.read_input_source_sampled().await,
+            Err(crate::vcp_ops::INPUT_SOURCE_SKIPPED.to_string())
+        );
+        release_tx
+            .send(())
+            .expect("command holder must still await release");
+        holder.join().unwrap();
     }
 
     #[tokio::test]

@@ -141,6 +141,21 @@ pub trait DisplayController: Any + Send + Sync {
         self.read_state().await
     }
 
+    /// Read the active input-source code at sampler priority.
+    ///
+    /// Default returns `Ok(None)`: this controller has no input-source
+    /// readback. Unlike [`Self::read_state_sampled`], this preserves failed
+    /// attempts as errors because coordination and doctor consumers must
+    /// distinguish an unreadable panel from a skipped sampler transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a controller attempted the read but could not
+    /// complete it, including when sampler priority yielded to a command.
+    async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+        Ok(None)
+    }
+
     /// Read the panel's cumulative usage-hours counter, if the controller
     /// exposes one (DDC/CI VCP `0xC0`).
     ///
@@ -224,6 +239,21 @@ pub trait CommandSink: Send + Sync {
     /// boundary, so that override is mandatory, not cosmetic.
     async fn read_state_sampled(&self) -> Option<PanelState> {
         self.read_state().await
+    }
+
+    /// Read the active input-source code through the controller chain at
+    /// sampler priority.
+    ///
+    /// Default returns `Ok(None)`: this sink has no input-source readback.
+    /// Production controller chains override it to distinguish absent
+    /// readback from an attempted read that failed or yielded to a command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no controller read a code and the last
+    /// controller that attempted the read failed.
+    async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+        Ok(None)
     }
 
     /// Read the panel's cumulative usage-hours counter through whichever

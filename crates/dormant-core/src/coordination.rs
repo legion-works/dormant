@@ -60,6 +60,8 @@ impl CoordinationHandle {
     /// Record a successful source-input read and return a changed prior verdict.
     ///
     /// Returns `Some(previous_owned)` only when the ownership verdict changed.
+    /// Unknown displays are a no-op and return `None`: private displays are not
+    /// cached, and a shared display can be removed concurrently with reload.
     pub fn record_success(
         &self,
         display: &DisplayId,
@@ -79,6 +81,9 @@ impl CoordinationHandle {
     }
 
     /// Record an input-source read failure without changing the ownership verdict.
+    ///
+    /// Unknown displays are a no-op: private displays are not cached, and a
+    /// shared display can be removed concurrently with reload.
     pub fn record_failure(&self, display: &DisplayId) {
         if let Some(record) = self
             .records
@@ -163,6 +168,7 @@ mod tests {
 
     use super::{CoordinationGate, CoordinationHandle};
     use crate::ownership::OwnershipGate;
+    use crate::traits::{PanelState, PowerState};
     use crate::types::DisplayId;
 
     fn display(id: &str) -> DisplayId {
@@ -229,11 +235,23 @@ mod tests {
         let tv = display("tv");
         let projector = display("projector");
         let handle = CoordinationHandle::new([aoc.clone(), tv]);
-        handle.record_success(&aoc, 2, 1, None);
+        handle.record_success(
+            &aoc,
+            2,
+            1,
+            Some(PanelState {
+                power: Some(PowerState::On),
+                brightness: Some(42),
+            }),
+        );
+        handle.record_failure(&aoc);
+        handle.record_failure(&aoc);
+        let survivor = handle.snapshot()[&aoc].clone();
 
         handle.reconcile_shared([aoc.clone(), projector.clone()]);
 
         assert_eq!(handle.seeded_ids(), vec![aoc.clone(), projector.clone()]);
+        assert_eq!(handle.snapshot()[&aoc], survivor);
         assert!(!CoordinationGate::new(handle.clone()).owns(&aoc));
         assert!(CoordinationGate::new(handle.clone()).owns(&projector));
         assert!(!handle.has_successful_read(&projector));

@@ -530,7 +530,7 @@ async fn reload_first_shared_display_is_rejected_with_restart_required_detail() 
 }
 
 #[tokio::test]
-async fn ownership_poll_after_reload_uses_updated_cache_not_stale_last_owned() {
+async fn ownership_poll_after_reload_reflects_cache_round_trip_through_wire() {
     let paths = TestAppPaths::new();
     let config_path = write_file(
         paths.root(),
@@ -561,6 +561,10 @@ async fn ownership_poll_after_reload_uses_updated_cache_not_stale_last_owned() {
         .iter()
         .find(|(id, _)| id == "mon")
         .expect("shared display survives reload");
+    // These assertions verify the CoordinationHandle cache round-trips through the
+    // engine to the wire snapshot: DisplaySnapshot.owned reads the daemon-lifetime
+    // cache directly (not the engine's last_owned field). They fail if the CACHE is
+    // stale; the engine seeds last_owned from this same cache via install_restored_machine.
     assert!(
         !before_poke_display.1.owned,
         "reloaded engine must surface the seeded false ownership cache"

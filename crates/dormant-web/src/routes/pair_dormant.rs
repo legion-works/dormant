@@ -162,3 +162,131 @@ pub(crate) async fn get_pair_instance_peers(
         .map(Json)
         .ok_or(WebError::CoordinationUnavailable)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use dormant_core::config::CoordinationConfig;
+    use dormant_core::config::schema::{
+        AudioConfig, Config, Credentials, DaemonConfig, NotificationsConfig, WatchdogConfig,
+        WearConfig,
+    };
+    use dormant_core::reload::ReloadRequester;
+    use dormant_core::rules::ControlMsg;
+    use dormant_core::wear::WearHandle;
+    use dormant_doctor::DoctorService;
+    use indexmap::IndexMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
+    use tokio::sync::{broadcast, mpsc, watch};
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    fn state(enabled: bool) -> WebState {
+        let (ctl_tx, _ctl_rx) = mpsc::channel::<ControlMsg>(8);
+        let (reload_tx, reload_rx) = broadcast::channel(8);
+        let (reload_request_tx, _reload_request_rx) = mpsc::channel(8);
+        let config = Arc::new(Config {
+            coordination: CoordinationConfig {
+                enabled,
+                ..Default::default()
+            },
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            watchdog: WatchdogConfig::default(),
+            audio: AudioConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+        });
+        let (config_tx, config_rx) = watch::channel(config);
+        let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
+        std::mem::forget((reload_tx, config_tx, creds_tx));
+        let doctor = DoctorService::new(ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+        WebState::new(crate::state::WebStateInner::new_for_test(
+            crate::state::WebStateInnerParams {
+                ctl_tx,
+                reload_requester: ReloadRequester::new(reload_request_tx),
+                reload_rx,
+                config_rx,
+                creds_rx,
+                config_path: PathBuf::from("/dev/null"),
+                creds_path: PathBuf::from("/dev/null"),
+                doctor,
+                wear: WearHandle::default(),
+                web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                cancel: CancellationToken::new(),
+                reload_timeout: std::time::Duration::from_secs(1),
+            },
+        ))
+    }
+
+    async fn call(router: axum::Router, request: Request<Body>) -> axum::response::Response {
+        router.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pair_instance_coordination_disabled_returns_403() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/pair/instance")
+            .header("Host", "127.0.0.1:8080")
+            .header("Origin", "http://127.0.0.1:8080")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"display_name":"Office"}"#))
+            .unwrap();
+        let response = call(crate::server::build_router(state(false)), request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, r#"{"error":"coordination_disabled"}"#);
+    }
+
+    #[tokio::test]
+    async fn pair_instance_cross_and_missing_origin_are_rejected() {
+        for origin in [Some("http://evil.invalid"), None] {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/api/pair/instance")
+                .header("Host", "127.0.0.1:8080")
+                .header("Content-Type", "application/json");
+            if let Some(origin) = origin {
+                builder = builder.header("Origin", origin);
+            }
+            let response = call(
+                crate::server::build_router(state(true)),
+                builder
+                    .body(Body::from(r#"{"display_name":"Office"}"#))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_instance_body_over_4kib_returns_413() {
+        let response = call(
+            crate::server::build_router(state(true)),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pair/instance")
+                .header("Host", "127.0.0.1:8080")
+                .header("Origin", "http://127.0.0.1:8080")
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"display_name":"{}"}}"#,
+                    "x".repeat(4097)
+                )))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}

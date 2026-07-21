@@ -78,6 +78,7 @@ export default function DormantPairing({ enabled }: { enabled: boolean }) {
       <button type="button" disabled={!name} onClick={() => void open()}>Open pairing window</button>
       {opened && <p role="status">Code: <strong>{opened.code}</strong> · Expires: {opened.expires_at}</p>}
       <h3>Discovered instances</h3>
+      <button type="button" onClick={() => void refresh()}>Retry discovery</button>
       {peers.discovered.length === 0 ? <p>None discovered. Retry after a peer opens pairing.</p> : (
         <ul>{peers.discovered.map((peer) => (
           <li key={peer.instance_id}>

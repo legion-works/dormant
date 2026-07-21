@@ -60,6 +60,7 @@ ed25519-dalek = { version = "=3.0.0", features = ["zeroize"] }
 hmac = "=0.12.1"
 mdns-sd = "=0.20.2"
 rand_core = "=0.10.1"
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
 spake2 = "=0.4.0"
 zeroize = "=1.9.0"
 

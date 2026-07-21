@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  dormant-tray per-user LaunchAgent (macOS).
+
+  launchd does not expand $HOME in plist strings. The shell expands it while
+  creating the log directory and before exec replaces the shell with the tray
+  process that launchd supervises.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.legionworks.dormant-tray</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-lc</string>
+		<string>mkdir -p "$HOME/Library/Logs/dormant" &amp;&amp; exec "$HOME/.local/bin/dormant-tray" &gt;&gt;"$HOME/Library/Logs/dormant/dormant-tray.log" 2&gt;&gt;"$HOME/Library/Logs/dormant/dormant-tray.err.log"</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+</dict>
+</plist>

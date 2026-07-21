@@ -1878,6 +1878,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_input_source_none_when_not_probed() {
+        let ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::new(single_display_vcp()) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+
+        assert_eq!(ctrl.read_input_source_sampled().await, Ok(None));
+    }
+
+    #[tokio::test]
     async fn read_usage_hours_none_when_not_probed() {
         let fake = Arc::new(single_display_vcp());
         let ctrl = DdcciController::with_ops(

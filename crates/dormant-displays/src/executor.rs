@@ -718,6 +718,7 @@ mod tests {
         /// Scripted [`DisplayController::panel_identity`] response — used
         /// by the T7 chain-walk test.
         panel_identity: Option<String>,
+        /// Scripted [`DisplayController::read_input_source_sampled`] responses.
         input_sources: VecDeque<Result<Option<u8>, String>>,
     }
 
@@ -1434,6 +1435,17 @@ mod tests {
             executor.read_input_source_sampled().await,
             Err("read failed".into())
         );
+    }
+
+    #[tokio::test]
+    async fn input_source_chain_walks_past_reader_error_to_success() {
+        let failing_reader = FakeController::new("failing-reader", vec![BlankMode::PowerOff]);
+        failing_reader.push_input_source(Err("read failed".into()));
+        let reader = FakeController::new("reader", vec![BlankMode::PowerOff]);
+        reader.push_input_source(Ok(Some(0x11)));
+        let (executor, _) = executor_with(vec![failing_reader, reader], default_retry());
+
+        assert_eq!(executor.read_input_source_sampled().await, Ok(Some(0x11)));
     }
 
     // ── T7 fix M1: panel_identity chain-walk ─────────────────────────────────

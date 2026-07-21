@@ -86,6 +86,7 @@ use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery};
+use crate::coordination_pairing::PairingManager;
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
@@ -836,6 +837,11 @@ impl App {
         } else {
             None
         };
+        let pairing_manager = Arc::new(PairingManager::new(
+            self.state_dir.clone(),
+            cfg_clone.coordination.enabled,
+            cfg_clone.coordination.pairing_window,
+        ));
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
@@ -957,11 +963,12 @@ impl App {
             None
         } else {
             Some(
-                crate::ipc::spawn(
+                crate::ipc::spawn_with_pairing(
                     &socket_path,
                     front_ctl_tx.clone(),
                     reload_requester.clone(),
                     doctor_service.clone(),
+                    Arc::clone(&pairing_manager),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,

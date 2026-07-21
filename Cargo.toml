@@ -62,6 +62,7 @@ mdns-sd = "=0.20.2"
 rand_core = "=0.10.1"
 getrandom = { version = "=0.4.3", features = ["sys_rng"] }
 spake2 = "=0.4.0"
+time = { version = "=0.3.53", features = ["formatting"] }
 zeroize = "=1.9.0"
 
 # The profile that 'dist' will build with

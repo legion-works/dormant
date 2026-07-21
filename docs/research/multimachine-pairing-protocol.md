@@ -1,7 +1,10 @@
-# Multi-machine pairing protocol — REV-2
+# Multi-machine pairing protocol — REV-2.1
 
 Date: 2026-07-21
 Status: ratified implementation contract for Tasks 11–14
+
+REV-2.1 wire clarification (2026-07-21): both peers send `PairHello` before
+SPAKE2 so each transcript nonce and display name has an authoritative wire source.
 
 ## Decisions
 
@@ -200,10 +203,20 @@ is present and non-empty; and `display_name` is present. Any invalid TXT record
 is skipped without opening TCP. `PairHello` performs the same strict equality
 check for `PAIR_PROTOCOL_VERSION = 2` before SPAKE2 begins.
 
-The initiator sends `PairHello`, `Spake2Msg1`, and `IdentityExchange`; the
-responder sends `Spake2Msg2` and `IdentityExchange`; both then send
-`KeyConfirm` and a terminal `PairResult`. `PairResult { accepted: true,
-error: None }` is sent only after receiving the peer's valid confirmation.
+The initiator sends `PairHello { role: Initiator }`, then `Spake2Msg1`; the
+responder replies with `PairHello { role: Responder }`, then `Spake2Msg2`.
+Both peers then send `IdentityExchange`, `KeyConfirm`, and a terminal
+`PairResult`. `PairResult { accepted: true, error: None }` is sent only after
+receiving the peer's valid confirmation.
+
+Each transcript field has exactly one authoritative wire source: the initiator
+and responder nonces, display names, and instance IDs each come from that
+party's `PairHello`. Each instance ID is validated against that party's later
+`IdentityExchange` public key. The mDNS display name remains discovery-only and
+is never used to build the transcript. Both sides validate the received
+`PairHello`: strict protocol-version equality, expected role, non-empty matching
+`window_id`, base64url instance ID decoding to 32 bytes, and a base64 nonce of
+exactly 32 bytes.
 
 Each role generates a new 32-byte nonce for every connection. The responder
 records both nonces for the window lifetime and rejects reuse. A code window is

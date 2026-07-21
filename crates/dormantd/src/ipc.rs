@@ -7,10 +7,11 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::{CoordinationPairStatus, IpcRequest, IpcResponse};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -20,6 +21,8 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::coordination_pairing::{PairSessionError, PairingManager, PairingState};
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -48,6 +51,29 @@ pub fn spawn(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
+    cancel: CancellationToken,
+) -> Result<JoinHandle<()>> {
+    spawn_with_pairing(
+        socket_path,
+        ctl_tx,
+        reload_requester,
+        doctor_service,
+        Arc::new(PairingManager::new(
+            dormant_core::paths::state_dir(),
+            false,
+            Duration::from_secs(300),
+        )),
+        cancel,
+    )
+}
+
+/// Spawn the IPC server with the daemon-lifetime instance-pairing manager.
+pub(crate) fn spawn_with_pairing(
+    socket_path: &Path,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    reload_requester: ReloadRequester,
+    doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -129,6 +155,7 @@ pub fn spawn(
             ctl_tx,
             reload_requester,
             doctor_service,
+            pairing,
             cancel,
             &socket_owned,
         )
@@ -144,6 +171,7 @@ async fn run(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -161,7 +189,8 @@ async fn run(
                         let ctl = ctl_tx.clone();
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor));
+                        let pairing = Arc::clone(&pairing);
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, pairing));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -176,11 +205,16 @@ async fn run(
 /// Handle one client connection: read line-delimited JSON, dispatch, write
 /// responses.  Lines are capped at [`MAX_LINE_BYTES`]; oversized lines get an
 /// error response and the connection stays usable.
+#[allow(
+    clippy::too_many_lines,
+    reason = "IPC variants deliberately remain visible in one exhaustive dispatch match."
+)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -256,7 +290,65 @@ async fn handle_connection(
                 let resp = handle_exercise(&ctl_tx, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::CoordinationPairOpen { display_name } => {
+                let resp = match pairing.open(display_name) {
+                    Ok(open) => IpcResponse::coordination_pair(CoordinationPairStatus {
+                        pair_id: open.pair_id,
+                        state: pairing_state_name(PairingState::Pairing).to_owned(),
+                        peer_instance_id: None,
+                    }),
+                    Err(error) => IpcResponse::error(error.to_string()),
+                };
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPairJoin {
+                display_name,
+                instance_id,
+                code,
+            } => {
+                let _ = display_name;
+                let _ = code;
+                let resp = match pairing.join_preflight(&instance_id) {
+                    Err(error) => IpcResponse::error(error.to_string()),
+                    Ok(()) => {
+                        IpcResponse::error(PairSessionError::TransportUnavailable.to_string())
+                    }
+                };
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPairStatus { pair_id } => {
+                let resp = pairing.status(&pair_id).map_or_else(
+                    |error| IpcResponse::error(error.to_string()),
+                    pairing_response,
+                );
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPairCancel { pair_id } => {
+                let resp = pairing.cancel(&pair_id).map_or_else(
+                    |error| IpcResponse::error(error.to_string()),
+                    pairing_response,
+                );
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
+    }
+}
+
+fn pairing_response(status: crate::coordination_pairing::PairingStatus) -> IpcResponse {
+    IpcResponse::coordination_pair(CoordinationPairStatus {
+        pair_id: status.pair_id,
+        state: pairing_state_name(status.state).to_owned(),
+        peer_instance_id: status.peer_instance_id,
+    })
+}
+
+const fn pairing_state_name(state: PairingState) -> &'static str {
+    match state {
+        PairingState::Pairing => "pairing",
+        PairingState::Paired => "paired",
+        PairingState::Cancelled => "cancelled",
+        PairingState::Timeout => "timeout",
+        PairingState::Error => "error",
     }
 }
 

@@ -63,6 +63,42 @@ pub enum IpcRequest {
         /// Display id to exercise.
         display: String,
     },
+    /// Open a short-lived responder window for instance pairing.
+    CoordinationPairOpen {
+        /// Local display name to bind into the pairing transcript.
+        display_name: String,
+    },
+    /// Join a discovered instance pairing window.
+    CoordinationPairJoin {
+        /// Discovered peer display name.
+        display_name: String,
+        /// Discovered peer public instance identifier.
+        instance_id: String,
+        /// Operator-entered eight-character pairing code. It is never echoed.
+        code: String,
+    },
+    /// Fetch non-secret state for a local responder pairing window.
+    CoordinationPairStatus {
+        /// Opaque pairing-window identifier.
+        pair_id: String,
+    },
+    /// Cancel a local responder pairing window.
+    CoordinationPairCancel {
+        /// Opaque pairing-window identifier.
+        pair_id: String,
+    },
+}
+
+/// Non-secret state exposed for a local instance-pairing window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinationPairStatus {
+    /// Opaque local pairing-window identifier.
+    pub pair_id: String,
+    /// Public lifecycle state (`pairing`, `paired`, `timeout`, `cancelled`, or `error`).
+    pub state: String,
+    /// Public peer identity once pairing succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_instance_id: Option<String>,
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -91,6 +127,9 @@ pub struct IpcResponse {
     /// exactly the same JSON as before this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exercise_report: Option<ExerciseReport>,
+    /// Public state for instance-pairing IPC requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination_pair: Option<CoordinationPairStatus>,
 }
 
 impl IpcResponse {
@@ -104,6 +143,7 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: None,
+            coordination_pair: None,
         }
     }
 
@@ -117,6 +157,7 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: None,
+            coordination_pair: None,
         }
     }
 
@@ -130,6 +171,7 @@ impl IpcResponse {
             doctor_report: Some(report),
             emergency_report: None,
             exercise_report: None,
+            coordination_pair: None,
         }
     }
 
@@ -143,6 +185,7 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: Some(report),
             exercise_report: None,
+            coordination_pair: None,
         }
     }
 
@@ -156,6 +199,21 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: Some(report),
+            coordination_pair: None,
+        }
+    }
+
+    /// Build a response carrying non-secret instance-pairing status.
+    #[must_use]
+    pub fn coordination_pair(status: CoordinationPairStatus) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            coordination_pair: Some(status),
         }
     }
 }
@@ -519,5 +577,34 @@ mod tests {
             .unwrap()
             .contains("exercise_report")
         );
+    }
+
+    #[test]
+    fn coordination_pair_open_serializes_without_secret_response_fields() {
+        let request = IpcRequest::CoordinationPairOpen {
+            display_name: "Office Mac".to_owned(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"req":"coordination_pair_open","display_name":"Office Mac"}"#
+        );
+        assert!(!json.contains("code"));
+    }
+
+    #[test]
+    fn coordination_pair_response_is_additive_and_old_ok_shape_survives() {
+        let old = serde_json::to_string(&IpcResponse::ok(None)).unwrap();
+        assert_eq!(old, r#"{"ok":true}"#);
+
+        let response = IpcResponse::coordination_pair(CoordinationPairStatus {
+            pair_id: "pair-id".to_owned(),
+            state: "pairing".to_owned(),
+            peer_instance_id: None,
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""coordination_pair""#));
+        assert!(!json.contains("code"));
+        assert!(!json.contains("key"));
     }
 }

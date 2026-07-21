@@ -1294,11 +1294,11 @@ impl AppHandle {
         self.doctor_service.clone()
     }
 
-    /// Test-only access to the daemon-lifetime shared-display cache.
+    /// Test-only observability — production paths receive the handle by construction.
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     #[must_use]
-    pub fn coordination_for_test(&self) -> Option<CoordinationHandle> {
+    pub fn coordination_handle(&self) -> Option<CoordinationHandle> {
         self.coordination.clone()
     }
 

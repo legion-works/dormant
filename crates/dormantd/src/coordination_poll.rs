@@ -127,7 +127,7 @@ async fn poll_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{CoordinationPollDeps, spawn};
+    use super::{CoordinationPollDeps, poll_once, spawn};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -502,12 +502,23 @@ mod tests {
         let sink = Arc::new(ScriptedSink::with_inputs(inputs));
         let events = capture.0.clone();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
-        let (config_tx, executors_tx, _ctl_rx, _state, cancel) = setup(sink);
+        let (config_tx, config_rx) = watch::channel(Arc::new(config()));
+        let display = DisplayId("shared".to_string());
+        let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let deps = CoordinationPollDeps {
+            config_rx,
+            ctl_tx,
+            executors_rx,
+            state: CoordinationHandle::new([display]),
+            cancel: CancellationToken::new(),
+        };
+        let mut last_failing_log = HashMap::new();
         for _ in 0..ticks {
-            tick().await;
+            tokio::time::advance(Duration::from_secs(6)).await;
+            poll_once(&deps, &mut last_failing_log).await;
         }
-        cancel.cancel();
-        tokio::task::yield_now().await;
         drop((config_tx, executors_tx));
         events.lock().unwrap().clone()
     }

@@ -339,6 +339,27 @@ fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {
     )
 }
 
+fn shared_display_config(marker: &Path) -> String {
+    one_display_config(marker, "1s")
+        .replace(
+            "controllers = [\"command\"]",
+            "controllers = [\"command\", \"ddcci\"]\nscope = \"shared\"\nshared_input_code = 0x0f",
+        )
+        .replace(
+            "blank_mode = \"power_off\"",
+            "blank_mode = \"brightness_zero\"",
+        )
+        .replace("modes = [\"power_off\"]", "modes = [\"brightness_zero\"]")
+}
+
+fn additional_shared_display(name: &str, marker: &Path) -> String {
+    format!(
+        "\n[displays.{name}]\ncontrollers = [\"command\", \"ddcci\"]\nscope = \"shared\"\nshared_input_code = 0x0f\nblank_mode = \"brightness_zero\"\nblank_command = \"printf B >> '{}'\"\nwake_command = \"printf W >> '{}'\"\nmodes = [\"brightness_zero\"]\n",
+        marker.display(),
+        marker.display(),
+    )
+}
+
 #[tokio::test]
 async fn all_private_start_passes_always_owned() {
     let paths = TestAppPaths::new();
@@ -351,7 +372,207 @@ async fn all_private_start_passes_always_owned() {
 
     let (handle, join) = start_coordinator_app(config_path, creds_path).await;
 
-    assert!(handle.coordination_for_test().is_none());
+    assert!(handle.coordination_handle().is_none());
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn initial_shared_start_passes_coordination_gate() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+
+    let (handle, join) = start_coordinator_app(config_path, creds_path).await;
+
+    assert!(handle.coordination_handle().is_some());
+    shutdown(handle, join).await;
+}
+
+async fn reload_from_file(
+    handle: &dormantd::app::AppHandle,
+) -> dormant_core::observation::ReloadReceipt {
+    handle
+        .request_control_reload()
+        .await
+        .expect("reload coordinator returns a receipt")
+}
+
+#[tokio::test]
+async fn reload_retains_false_verdict_for_surviving_shared_display() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+    let display = DisplayId("mon".into());
+    assert_eq!(
+        coordination.record_success(&display, 0x10, 0x0f, None),
+        Some(true)
+    );
+
+    fs::write(
+        &config_path,
+        shared_display_config(&paths.marker)
+            .replace("grace_period = \"1s\"", "grace_period = \"2s\""),
+    )
+    .expect("rewrite shared config");
+    let receipt = reload_from_file(&handle).await;
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    let record = &coordination.snapshot()[&display];
+    assert!(!record.owned);
+    assert!(record.has_successful_input_read);
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn reload_seeds_new_shared_and_drops_removed() {
+    let paths = TestAppPaths::new();
+    let initial = format!(
+        "{}{}",
+        shared_display_config(&paths.marker),
+        additional_shared_display("removed", &paths.marker)
+    );
+    let config_path = write_file(paths.root(), "config.toml", &initial);
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+    let mon = DisplayId("mon".into());
+    let removed = DisplayId("removed".into());
+    coordination.record_success(&mon, 0x10, 0x0f, None);
+
+    fs::write(
+        &config_path,
+        format!(
+            "{}{}",
+            shared_display_config(&paths.marker),
+            additional_shared_display("added", &paths.marker)
+        ),
+    )
+    .expect("replace shared displays");
+    assert_eq!(
+        reload_from_file(&handle).await.outcome,
+        ReloadOutcome::Reloaded
+    );
+    let records = coordination.snapshot();
+    assert!(!records[&mon].owned);
+    assert!(!records.contains_key(&removed));
+    let added = &records[&DisplayId("added".into())];
+    assert!(added.owned);
+    assert!(!added.has_successful_input_read);
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn reload_removing_last_shared_reverts_to_always_owned_behavior() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+
+    fs::write(&config_path, one_display_config(&paths.marker, "1s"))
+        .expect("rewrite private config");
+    assert_eq!(
+        reload_from_file(&handle).await.outcome,
+        ReloadOutcome::Reloaded
+    );
+    assert!(coordination.snapshot().is_empty());
+    let snapshot = snapshot_with_retry(&handle.control_sender()).await;
+    assert!(snapshot.displays.iter().any(|(id, _)| id == "mon"));
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn reload_first_shared_display_is_rejected_with_restart_required_detail() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &one_display_config(&paths.marker, "1s"),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+
+    fs::write(&config_path, shared_display_config(&paths.marker)).expect("rewrite shared config");
+    let receipt = reload_from_file(&handle).await;
+    assert!(
+        matches!(receipt.outcome, ReloadOutcome::Rejected(ref detail) if detail == "E_CONFIG_INVALID: adding the first shared display requires daemon restart")
+    );
+    assert!(handle.coordination_handle().is_none());
+    assert!(
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, _)| id == "mon")
+    );
+    assert!(!paths.state.join("coord").exists());
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn ownership_poll_after_reload_uses_updated_cache_not_stale_last_owned() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+    let display = DisplayId("mon".into());
+    coordination.record_success(&display, 0x10, 0x0f, None);
+
+    fs::write(
+        &config_path,
+        shared_display_config(&paths.marker)
+            .replace("grace_period = \"1s\"", "grace_period = \"2s\""),
+    )
+    .expect("rewrite shared config");
+    assert_eq!(
+        reload_from_file(&handle).await.outcome,
+        ReloadOutcome::Reloaded
+    );
+    assert_eq!(
+        coordination.record_success(&display, 0x0f, 0x0f, None),
+        Some(false)
+    );
+    handle
+        .control_sender()
+        .send(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        })
+        .await
+        .expect("poke new engine");
+    assert!(
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, _)| id == "mon")
+    );
+    assert!(coordination.snapshot()[&display].owned);
     shutdown(handle, join).await;
 }
 

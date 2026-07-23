@@ -62,19 +62,30 @@
 //! Three locks govern physical DDC access, acquired in this order and never
 //! held across an `.await` (every call site is inside `spawn_blocking`):
 //!
-//! 1. **Panel lock** (outer, when present) — per-panel serialization via
-//!    [`crate::ddc_lock::PanelLock`], acquired before cache resolution. A
+//! 1. **Panel lock** (outer, when present) — the per-panel PRIORITY mechanism
+//!    via [`crate::ddc_lock::PanelLock`]: command-path callers block, sampler-
+//!    path callers yield. Acquired before the DDC gate. A
 //!    [`VcpPriority::Sampler`] that loses the race skips BEFORE any hardware
-//!    touch — it must not enumerate or access the cache.
-//! 2. **Enumeration barrier** (inner) — a process-wide mutex serializing
-//!    every `ddc_hi::Display::enumerate()` call (cache resolver AND
-//!    `list_displays`). A per-panel lock cannot serialize an all-bus scan
-//!    against OTHER panels' locks, so enumeration — which opens every
-//!    `/dev/i2c-*` node — needs its own process-wide serialization (issue
-//!    #127). `list_displays` acquires the barrier alone (no panel lock,
-//!    which does not exist yet during `probe`).
+//!    touch — it must not acquire the gate or access the cache.
+//! 2. **Physical-DDC gate** (inner) — a process-wide mutex serializing ALL
+//!    physical DDC/CI traffic: every VCP transaction (cache checkout,
+//!    resolution-if-miss enumeration, the VCP op, reinsert, and handle drops)
+//!    AND every `list_displays` scan. A per-panel lock cannot serialize an
+//!    all-bus scan against OTHER panels' locks, and a cached VCP transaction
+//!    under only its panel's lock could still collide on bus Y with another
+//!    panel's in-flight enumeration — the same concurrent-i²c hazard
+//!    `PanelLock` exists for. The gate closes it: one physical DDC access at
+//!    a time, process-wide. `list_displays` acquires the gate alone (no
+//!    panel lock exists yet during `probe`).
 //! 3. **Cache mutex** (innermost) — held only for `HashMap` take/insert,
 //!    never across I/O, enumeration, or panel-lock acquisition.
+//!
+//! VCP transactions are millisecond-scale at seconds-scale cadence, so
+//! process-wide serialization is behavior-neutral: the gate is uncontended
+//! in practice. Enumeration is rare (first use, invalidation, or max-age
+//! revalidation); steady state is one gate acquire per VCP op against a
+//! cached handle, and the operations are already spaced by the coordination
+//! poll.
 //!
 //! [`VcpPriority`] selects the panel-lock acquisition strategy:
 //! [`VcpPriority::Command`] blocks until the panel is free (command/blank/
@@ -102,6 +113,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -243,27 +255,35 @@ fn acquire(lock: &PanelLock, prio: VcpPriority) -> Result<crate::ddc_lock::Panel
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const CACHE_REVALIDATE_AFTER: Duration = Duration::from_secs(300);
 
-/// Process-wide barrier serializing every physical `ddc_hi::Display::enumerate()`
-/// call — the cache resolver path AND `list_displays`. A per-panel
-/// [`PanelLock`] cannot serialize an all-bus scan against OTHER panels' locks,
-/// so enumeration — which opens every `/dev/i2c-*` node — needs its own
-/// process-wide serialization (issue #127). Acquired AFTER the panel lock
-/// (when present) and BEFORE the cache mutex; never held across an `.await`
-/// (all call sites are inside `spawn_blocking`). See the *Lock discipline*
-/// section of the module docs.
+/// Process-wide gate serializing ALL physical DDC/CI traffic — every VCP
+/// transaction (cache checkout, resolution-if-miss enumeration, the VCP op,
+/// reinsert, and handle drops) AND every `list_displays` scan. A per-panel
+/// [`PanelLock`] cannot serialize an all-bus scan against OTHER panels'
+/// locks, and a cached VCP transaction under only its panel's lock could
+/// still collide on bus Y with another panel's in-flight enumeration — the
+/// same concurrent-i²c hazard `PanelLock` exists for. The gate closes it:
+/// one physical DDC access at a time, process-wide. Acquired AFTER the
+/// panel lock (when present) and BEFORE the cache mutex; never held across
+/// an `.await` (all call sites are inside `spawn_blocking`). See the *Lock
+/// discipline* section of the module docs.
+///
+/// Poison recovery matches [`PanelLock`]: the guarded payload is `()`, so a
+/// panicked transaction leaves nothing to distrust — acquisitions recover
+/// unconditionally rather than wedging all DDC access for the life of the
+/// process.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-static ENUMERATION_BARRIER: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+static DDC_PHYSICAL_GATE: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
 
-/// Run `f` under the [`ENUMERATION_BARRIER`]. Called only inside
-/// `spawn_blocking` (blocking context); the guard is dropped before `f`'s
-/// return value is used, so the critical section is just the enumeration I/O.
+/// Acquire the process-wide physical-DDC gate. The returned guard is held
+/// until the caller drops it — the entire transaction (checkout →
+/// resolve-if-miss → op → reinsert → drops) runs inside. Called only inside
+/// `spawn_blocking` (blocking context).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn with_enumeration_barrier<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = ENUMERATION_BARRIER
+fn ddc_gate() -> std::sync::MutexGuard<'static, ()> {
+    DDC_PHYSICAL_GATE
         .get_or_init(|| StdMutex::new(()))
         .lock()
-        .unwrap();
-    f()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Returns `true` if `err_msg` indicates a transport/I2C-class error
@@ -449,11 +469,14 @@ impl RealVcp {
     }
 
     /// Hardware enumeration + ident match, called by `HandleCache` on miss.
-    /// The `ddc_hi::Display::enumerate()` call runs under the process-wide
-    /// [`ENUMERATION_BARRIER`] so it cannot overlap another panel's locked
-    /// VCP transaction or a concurrent `list_displays` scan.
+    /// Runs inside the caller's physical-DDC gate (acquired by
+    /// `vcp_transaction` or `list_displays`); does NOT re-acquire it (the
+    /// gate is a non-reentrant `StdMutex` — re-locking would deadlock). The
+    /// non-target `Display` handles drop at the end of this fn, still inside
+    /// the gate, so the `/dev/i2c-*` closes (NVIDIA RM teardown) are
+    /// serialized too.
     fn resolve_display(ident: &str) -> Result<(String, ddc_hi::Display), String> {
-        let displays: Vec<ddc_hi::Display> = with_enumeration_barrier(ddc_hi::Display::enumerate);
+        let displays: Vec<ddc_hi::Display> = ddc_hi::Display::enumerate();
         let mapped: Vec<(String, ddc_hi::Display)> = displays
             .into_iter()
             .map(|d| (d.info.to_string(), d))
@@ -483,11 +506,15 @@ impl Default for RealVcp {
 /// Run a VCP operation with cache semantics and lock discipline.
 ///
 /// Called inside `spawn_blocking` (after the panel lock is acquired). The
-/// `op` closure receives `&mut H` (the cached handle type) and must return
-/// `Result<T, String>`. On success the handle is returned to the cache with
-/// its original `resolved_at` preserved; on transport/IO error or panic it is
-/// dropped (invalidation); on protocol error (unsupported VCP code, etc.)
-/// the handle is returned transparently.
+/// process-wide physical-DDC gate is acquired FIRST and held through cache
+/// checkout, resolution-if-miss (enumeration), the VCP op, reinsert, and
+/// handle drops — so a cached transaction cannot collide on bus Y with
+/// another panel's in-flight enumeration. The `op` closure receives `&mut H`
+/// (the cached handle type) and must return `Result<T, String>`. On success
+/// the handle is returned to the cache with its original `resolved_at`
+/// preserved; on transport/IO error or panic it is dropped (invalidation);
+/// on protocol error (unsupported VCP code, etc.) the handle is returned
+/// transparently.
 ///
 /// Generic over `H` so the cache + error-classification logic is testable
 /// with a fake handle and a fake `resolve_fn` — no DDC hardware required
@@ -499,6 +526,10 @@ fn vcp_transaction<H, T>(
     ident: &str,
     op: impl FnOnce(&mut H) -> Result<T, String>,
 ) -> Result<T, String> {
+    // Process-wide physical-DDC gate: held through checkout, resolution-if-
+    // miss, the VCP op, reinsert, and handle drops. Acquired AFTER the panel
+    // lock (the caller holds it) and BEFORE the cache mutex (innermost).
+    let _gate = ddc_gate();
     let (mut handle, resolved_at) = cache.get_or_resolve(ident)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&mut handle)));
     match result {
@@ -526,20 +557,21 @@ fn vcp_transaction<H, T>(
 #[async_trait]
 impl VcpOps for RealVcp {
     async fn list_displays(&self) -> Vec<VcpDisplayInfo> {
-        // Enumerate under the process-wide barrier so a probe's all-bus scan
-        // cannot overlap another panel's locked VCP transaction. No panel
-        // lock exists yet (probe derives identity from this scan), so the
-        // barrier is acquired alone.
-        let displays =
-            tokio::task::spawn_blocking(|| with_enumeration_barrier(ddc_hi::Display::enumerate))
-                .await
-                .unwrap_or_default();
-        displays
-            .into_iter()
-            .map(|d| VcpDisplayInfo {
-                ident_string: d.info.to_string(),
-            })
-            .collect()
+        // Acquire the physical-DDC gate for the whole scan — enumerate,
+        // conversion, and the non-target handle drops (NVIDIA RM teardown)
+        // all run inside it. No panel lock exists yet (probe derives identity
+        // from this scan), so the gate is acquired alone.
+        tokio::task::spawn_blocking(|| {
+            let _gate = ddc_gate();
+            ddc_hi::Display::enumerate()
+                .into_iter()
+                .map(|d| VcpDisplayInfo {
+                    ident_string: d.info.to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn get_vcp(
@@ -1426,6 +1458,67 @@ mod tests {
         drop(held);
     }
 
+    /// A cached VCP op (cache hit, no resolve) still acquires the process-wide
+    /// physical-DDC gate — the gate serializes ALL physical DDC traffic, not
+    /// just enumeration. Proven by mutual exclusion: while the gate is held by
+    /// another caller, a cached op blocks; once released, it completes (and
+    /// still hits the cache — no re-resolve). Uses the HandleCache/fake-handle
+    /// seam (no DDC hardware) and a bounded `recv_timeout` (not a raw sleep)
+    /// to assert the block.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn cached_op_acquires_physical_gate() {
+        let cache = std::sync::Arc::new(HandleCache::<TestHandle>::new(
+            test_resolve,
+            CACHE_REVALIDATE_AFTER,
+        ));
+        let ident = "i2c-dev:1 TST TEST";
+        // Populate the cache (acquires + releases the gate).
+        vcp_transaction(&cache, ident, |_| Ok::<(), String>(())).unwrap();
+        assert_eq!(cache.resolve_count(), 1);
+
+        // Hold the process-wide gate from an OS thread.
+        let (holding_tx, holding_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let gate_thread = std::thread::spawn(move || {
+            let _gate = ddc_gate();
+            let _ = holding_tx.send(());
+            let _ = release_rx.recv();
+        });
+        holding_rx
+            .recv()
+            .expect("gate holder must signal it holds the gate");
+
+        // Cached op (cache hit) on an OS thread; signals completion on a
+        // channel so the test can time-bound the wait without a raw sleep.
+        let (op_done_tx, op_done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let cache2 = std::sync::Arc::clone(&cache);
+        let op_thread = std::thread::spawn(move || {
+            let _ = vcp_transaction(&cache2, ident, |_| Ok::<(), String>(()));
+            let _ = op_done_tx.send(());
+        });
+
+        // A non-blocked cached op completes in microseconds; a 300 ms
+        // `recv_timeout` firing therefore proves the op is blocked on the
+        // gate, not merely unscheduled.
+        let recv = op_done_rx.recv_timeout(Duration::from_millis(300));
+        assert!(
+            recv.is_err(),
+            "cached op must block on the physical-DDC gate while it's held"
+        );
+
+        // Release the gate → cached op completes; resolve_count unchanged (hit).
+        let _ = release_tx.send(());
+        op_thread.join().expect("op thread must join");
+        assert_eq!(
+            cache.resolve_count(),
+            1,
+            "cached op must hit the cache — no re-resolve"
+        );
+
+        gate_thread.join().expect("gate holder thread must join");
+    }
+
     // ── RealVcp cache tests (require DDC-capable display) ────────────────────
 
     /// Test seam: read the hardware-enumeration counter inside `RealVcp`.
@@ -1435,9 +1528,11 @@ mod tests {
     }
 
     /// Enumerate once to discover the ident of the first DDC display.
-    /// Returns `None` if no display is available (CI / headless).
+    /// Returns `None` if no display is available (CI / headless). Runs under
+    /// the physical-DDC gate like every other enumerate call site.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn first_display_ident() -> Option<String> {
+        let _gate = ddc_gate();
         ddc_hi::Display::enumerate()
             .first()
             .map(|d| d.info.to_string())

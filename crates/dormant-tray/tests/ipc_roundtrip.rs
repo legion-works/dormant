@@ -24,7 +24,8 @@ use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantctl::client;
 use dormantd::app::App;
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout};
 
 fn write_file(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
@@ -136,25 +137,74 @@ fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
     std::sync::Arc::new(NoopNotifySink)
 }
 
+/// Drain the event stream until a `DisplayPhase` frame arrives, skipping any
+/// non-target frames the daemon legitimately emits first.
+///
+/// Only event ARRIVAL is guaranteed — the daemon may publish a
+/// `WearSnapshot` (the wear tracker's first tick fires at startup and emits
+/// one because each display's persist clock starts at zero), a
+/// `CompensationAdvisory`, or `SensorChanged`/`ZoneChanged` (the fake
+/// sensor's startup sample) before the blank's `DisplayPhase`, and the
+/// ordering shifts under load. Asserting the FIRST frame is `DisplayPhase`
+/// is an event-ORDER assumption the daemon does not guarantee. This drain
+/// mirrors `recv_terminal_outcome` in `daemon_smoke.rs` (bounded by a
+/// deadline, no sleeps) and the `spawn_event_pump` reader in `ipc_loop.rs`:
+/// an honest timeout panic lists every frame observed so the failure stays
+/// diagnosable.
 async fn assert_event_streams_a_daemon_event(
-    mut events: client::EventStream,
+    events: client::EventStream,
     event_shutdown: client::EventShutdown,
 ) {
-    let event = timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || events.next()),
-    )
-    .await
-    .expect("events timeout")
-    .expect("event reader task")
-    .expect("event stream closed")
-    .expect("event decode");
-    assert!(!matches!(event, DaemonEvent::Unknown));
-    assert!(
-        matches!(event, DaemonEvent::DisplayPhase { .. }),
-        "expected DisplayPhase event, got {event:?}"
-    );
-    event_shutdown.shutdown().expect("shutdown event stream");
+    let (tx, mut rx) = mpsc::channel::<Result<DaemonEvent, anyhow::Error>>(32);
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut events = events;
+        for result in events.by_ref() {
+            if tx.blocking_send(result).is_err() {
+                break; // driver dropped the receiver — stop reading
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed: Vec<String> = Vec::new();
+    let mut got: Option<DaemonEvent> = None;
+    let mut stopped: Option<&'static str> = None;
+    while got.is_none() && stopped.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            stopped = Some("deadline hit while waiting for DisplayPhase");
+            break;
+        }
+        match timeout(remaining, rx.recv()).await {
+            Ok(Some(Ok(event))) => {
+                if matches!(event, DaemonEvent::DisplayPhase { .. }) {
+                    got = Some(event);
+                } else {
+                    observed.push(format!("{event:?}"));
+                }
+            }
+            Ok(Some(Err(e))) => observed.push(format!("decode error: {e}")),
+            Ok(None) => stopped = Some("event stream closed before DisplayPhase"),
+            Err(_) => stopped = Some("deadline hit while waiting for DisplayPhase"),
+        }
+    }
+
+    // Release the reader: drop the receiver so a parked `blocking_send`
+    // returns, and shutdown the socket so a parked `read_line` returns EOF.
+    drop(rx);
+    let _ = event_shutdown.shutdown();
+    let _ = timeout(Duration::from_secs(2), reader).await;
+
+    match got {
+        Some(event) => assert!(
+            matches!(event, DaemonEvent::DisplayPhase { .. }),
+            "internal: drain returned a non-DisplayPhase event: {event:?}"
+        ),
+        None => panic!(
+            "{}; observed: {observed:?}",
+            stopped.unwrap_or("stopped waiting for DisplayPhase")
+        ),
+    }
 }
 
 async fn force_blank(socket_path: &std::path::Path) {

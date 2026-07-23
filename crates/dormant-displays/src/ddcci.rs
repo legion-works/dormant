@@ -96,6 +96,11 @@ struct DdcState {
     /// `None` means no blank has happened yet (daemon just started /
     /// reloaded); wake falls through to [`DdcciController::configured_primary_mode`].
     last_blank_mode: Option<BlankMode>,
+    /// The EDID-derived cross-machine claim identity (spec F5), derived from
+    /// the matched display's EDID text fields during `probe` — independent of
+    /// `matched_ident` (which carries the machine-local bus prefix). `None`
+    /// before `probe()` or when the panel exposed no EDID manufacturer/model.
+    claim_identity: Option<String>,
 }
 
 /// Display controller that blanks/wakes monitors via DDC/CI VCP commands.
@@ -203,12 +208,12 @@ impl DdcciController {
     /// Find the matching display from an enumerated list.
     ///
     /// The match is a **case-sensitive substring** check against each display's
-    /// `ident_string`. Returns the `ident_string` of the matched display, or an
-    /// error.
-    fn find_match(
+    /// `ident_string`. Returns a reference to the matched display's
+    /// [`crate::vcp_ops::VcpDisplayInfo`], or an error.
+    fn find_match<'a>(
         matcher: Option<&String>,
-        displays: &[crate::vcp_ops::VcpDisplayInfo],
-    ) -> Result<String, DormantError> {
+        displays: &'a [crate::vcp_ops::VcpDisplayInfo],
+    ) -> Result<&'a crate::vcp_ops::VcpDisplayInfo, DormantError> {
         match matcher {
             Some(pattern) => {
                 let matched_displays: Vec<&crate::vcp_ops::VcpDisplayInfo> = displays
@@ -224,7 +229,7 @@ impl DdcciController {
                             displays.len()
                         ),
                     }),
-                    1 => Ok(matched_displays[0].ident_string.clone()),
+                    1 => Ok(matched_displays[0]),
                     _ => Err(DormantError::DisplayIo {
                         controller: "ddcci".into(),
                         detail: format!(
@@ -239,7 +244,7 @@ impl DdcciController {
                     controller: "ddcci".into(),
                     detail: "no DDC/CI displays detected".into(),
                 }),
-                1 => Ok(displays[0].ident_string.clone()),
+                1 => Ok(&displays[0]),
                 n => Err(DormantError::DisplayIo {
                     controller: "ddcci".into(),
                     detail: format!(
@@ -280,7 +285,13 @@ impl DisplayController for DdcciController {
         // right below — is already serialized against every other
         // controller instance for the same physical panel.
         let displays = self.ops.list_displays().await;
-        let matched = Self::find_match(self.matcher.as_ref(), &displays)?;
+        let (matched, claim_identity) = {
+            let matched_info = Self::find_match(self.matcher.as_ref(), &displays)?;
+            (
+                matched_info.ident_string.clone(),
+                matched_info.claim_identity(),
+            )
+        };
         let panel_lock = self.locks.get(&matched);
 
         // Test D6 power control support — the first physical VCP
@@ -310,6 +321,7 @@ impl DisplayController for DdcciController {
         let mut state = self.state.lock().unwrap();
         state.matched_ident = Some(matched);
         state.panel_lock = Some(panel_lock);
+        state.claim_identity = claim_identity;
         state.d6_supported = d6_ok;
         Ok(())
     }
@@ -633,6 +645,16 @@ impl DisplayController for DdcciController {
     fn panel_identity(&self) -> Option<String> {
         self.state.lock().unwrap().matched_ident.clone()
     }
+
+    /// Cross-machine claim identity (spec F5): the EDID-derived
+    /// `manufacturer:model[:serial]` resolved during `probe`, independent of
+    /// the bus-prefixed `panel_identity`. `None` before `probe()` or when the
+    /// panel exposed no EDID manufacturer/model — the honest answer that makes
+    /// the claim broadcast answer `Denied(identity_unavailable)` rather than
+    /// match on a fabricated key.
+    fn claim_identity(&self) -> Option<String> {
+        self.state.lock().unwrap().claim_identity.clone()
+    }
 }
 
 impl DdcciController {
@@ -801,6 +823,9 @@ mod tests {
     fn single_display_vcp() -> FakeVcp {
         FakeVcp::new(vec![VcpDisplayInfo {
             ident_string: "i2c-dev:56 DEL DELL U2723QE".into(),
+            manufacturer: None,
+            model: None,
+            serial: None,
         }])
     }
 
@@ -809,9 +834,15 @@ mod tests {
         FakeVcp::new(vec![
             VcpDisplayInfo {
                 ident_string: "i2c-dev:56 DEL DELL U2723QE".into(),
+                manufacturer: None,
+                model: None,
+                serial: None,
             },
             VcpDisplayInfo {
                 ident_string: "i2c-dev:57 SAM SAMSUNG".into(),
+                manufacturer: None,
+                model: None,
+                serial: None,
             },
         ])
     }
@@ -1010,6 +1041,40 @@ mod tests {
         assert!(
             !log2.iter().any(|c| c.contains("0xD6")),
             "tick 2: 0xD6 must still be skipped: {log2:?}"
+        );
+    }
+
+    // ── F5: claim_identity retention through probe ─────────────────────────
+
+    /// F5: `DdcciController::probe` retains the EDID-derived `claim_identity`
+    /// from the matched display's [`VcpDisplayInfo`], exposed via the
+    /// [`DisplayController::claim_identity`] trait method — independent of
+    /// the bus-prefixed `panel_identity` (which stays the `ident_string`).
+    #[tokio::test]
+    async fn probe_retains_claim_identity_from_matched_display() {
+        let fake = Arc::new(FakeVcp::new(vec![VcpDisplayInfo::for_test(
+            "i2c-dev:56 DEL DELL U2723QE",
+            "DEL",
+            "U2723QE",
+            Some("SN-42"),
+        )]));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        assert_eq!(
+            ctrl.claim_identity().as_deref(),
+            Some("DEL:U2723QE:SN-42"),
+            "probe must retain the EDID-derived claim identity"
+        );
+        // panel_identity stays the bus-prefixed ident_string (unchanged).
+        assert_eq!(
+            ctrl.panel_identity().as_deref(),
+            Some("i2c-dev:56 DEL DELL U2723QE"),
         );
     }
 

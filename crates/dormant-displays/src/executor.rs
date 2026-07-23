@@ -674,6 +674,21 @@ impl CommandSink for DisplayExecutor {
         }
         None
     }
+
+    /// Walk the configured chain and return the first non-`None`
+    /// cross-machine claim identity — mirrors [`Self::panel_identity`]'s
+    /// chain-walk shape exactly (spec F5). Used by the claim broadcast to
+    /// match the same physical panel across paired machines; a chain with a
+    /// primary controller that has no EDID identity (e.g. `command`,
+    /// `kwin-dpms`) falls through to a `ddcci` fallback that does.
+    fn claim_identity(&self) -> Option<String> {
+        for controller in &self.chain {
+            if let Some(id) = controller.claim_identity() {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -718,6 +733,9 @@ mod tests {
         /// Scripted [`DisplayController::panel_identity`] response — used
         /// by the T7 chain-walk test.
         panel_identity: Option<String>,
+        /// Scripted [`DisplayController::claim_identity`] response — used
+        /// by the F5 chain-walk test.
+        claim_identity: Option<String>,
         /// Scripted [`DisplayController::read_input_source_sampled`] responses.
         input_sources: VecDeque<Result<Option<u8>, String>>,
     }
@@ -761,6 +779,10 @@ mod tests {
 
         fn set_panel_identity(&self, id: Option<String>) {
             self.inner.lock().unwrap().panel_identity = id;
+        }
+
+        fn set_claim_identity(&self, id: Option<String>) {
+            self.inner.lock().unwrap().claim_identity = id;
         }
 
         fn push_input_source(&self, result: Result<Option<u8>, String>) {
@@ -866,6 +888,10 @@ mod tests {
 
         fn panel_identity(&self) -> Option<String> {
             self.inner.lock().unwrap().panel_identity.clone()
+        }
+
+        fn claim_identity(&self) -> Option<String> {
+            self.inner.lock().unwrap().claim_identity.clone()
         }
     }
 
@@ -1474,6 +1500,32 @@ mod tests {
         assert_eq!(exec.panel_identity(), None);
     }
 
+    // ── F5: claim_identity chain-walk ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn claim_identity_chain_walk_primary_none_fallback_some() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // A has no claim identity (default None, mirroring a
+        // `kwin-dpms`/`command` primary); B does (mirroring a `ddcci`
+        // fallback that derived its EDID identity during probe).
+        b.set_claim_identity(Some("AOC:AG326UZD:ABC123".into()));
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+
+        assert_eq!(
+            exec.claim_identity().as_deref(),
+            Some("AOC:AG326UZD:ABC123"),
+            "chain-walk must fall through A's None to B's Some(..)"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_identity_none_when_no_controller_reports_it() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a], default_retry());
+        assert_eq!(exec.claim_identity(), None);
+    }
+
     // ── Task 3: owner-first wake (RED-first probe; assertions extended post-impl) ──
 
     #[tokio::test]
@@ -1855,6 +1907,9 @@ mod tests {
         let fake = Arc::new({
             let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
                 ident_string: ident.into(),
+                manufacturer: None,
+                model: None,
+                serial: None,
             }]);
             f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
             f
@@ -1965,6 +2020,9 @@ mod tests {
         let fake = Arc::new({
             let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
                 ident_string: ident.into(),
+                manufacturer: None,
+                model: None,
+                serial: None,
             }]);
             f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
             f

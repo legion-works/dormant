@@ -182,6 +182,23 @@ pub trait DisplayController: Any + Send + Sync {
     fn panel_identity(&self) -> Option<String> {
         None
     }
+
+    /// Cross-machine claim identity for the shared-panel KVM-switch protocol
+    /// (spec F5): a canonical `manufacturer:model[:serial]` string derived
+    /// ONLY from EDID text fields — never the machine-local bus prefix that
+    /// [`Self::panel_identity`] embeds (the i²c bus index differs across
+    /// machines, so it cannot match a panel shared between them).
+    ///
+    /// Default returns `None` — the honest answer for every controller with
+    /// no EDID-derived identity (`command`, `kwin-dpms`, `ha-passthrough`).
+    /// `DdcciController` overrides with the value its `probe` derived from
+    /// the matched display's EDID. Used by the claim broadcast to match the
+    /// same physical panel across paired machines; an absent identity makes
+    /// the display answer `Denied(identity_unavailable)` rather than match on
+    /// a fabricated string.
+    fn claim_identity(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The narrow interface [`crate::rules::RulesEngine`] uses to issue commands to
@@ -275,6 +292,18 @@ pub trait CommandSink: Send + Sync {
     /// implementation in `dormant-displays` (`DisplayExecutor`) overrides
     /// this with a chain-walk identical in shape to `read_usage_hours`.
     fn panel_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Read the cross-machine claim identity through whichever controller in
+    /// the chain can report it — mirrors [`Self::panel_identity`]'s
+    /// chain-walk contract; see [`DisplayController::claim_identity`] for
+    /// the per-controller contract (spec F5).
+    ///
+    /// Default returns `None`. The production [`crate::traits::CommandSink`]
+    /// implementation in `dormant-displays` (`DisplayExecutor`) overrides
+    /// this with a chain-walk identical in shape to `panel_identity`.
+    fn claim_identity(&self) -> Option<String> {
         None
     }
 }
@@ -375,6 +404,11 @@ mod tests {
             None,
             "default panel_identity must be honest None, not a fabricated identity"
         );
+        assert_eq!(
+            c.claim_identity(),
+            None,
+            "default claim_identity must be honest None, not a fabricated identity"
+        );
     }
 
     #[tokio::test]
@@ -392,5 +426,20 @@ mod tests {
             None,
             "default panel_identity must be honest None, not a fabricated identity"
         );
+        assert_eq!(
+            s.claim_identity(),
+            None,
+            "default claim_identity must be honest None, not a fabricated identity"
+        );
+    }
+
+    /// F5: `claim_identity` is additive with an honest `None` default — a
+    /// controller/sink that cannot derive an EDID identity must never
+    /// fabricate one, or the cross-machine claim broadcast could match on an
+    /// invented string. Mirrors the `panel_identity` default contract.
+    #[tokio::test]
+    async fn trait_defaults_do_not_fabricate_claim_identity() {
+        assert_eq!(BareController.claim_identity(), None);
+        assert_eq!(BareSink.claim_identity(), None);
     }
 }

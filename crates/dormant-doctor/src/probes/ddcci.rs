@@ -266,6 +266,11 @@ async fn probe_ddcci_with_locks(
                 Err(error) if error == INPUT_SOURCE_SKIPPED => line.push_str("skipped"),
                 Err(_) => line.push_str("unreadable"),
             }
+            line.push_str(", claim_identity=");
+            match display.claim_identity() {
+                Some(id) => line.push_str(&id),
+                None => line.push_str("unavailable"),
+            }
             details.push(line);
         }
 
@@ -338,6 +343,9 @@ mod tests {
             Self {
                 displays: vec![VcpDisplayInfo {
                     ident_string: ident.to_string(),
+                    manufacturer: None,
+                    model: None,
+                    serial: None,
                 }],
                 responses,
             }
@@ -354,6 +362,9 @@ mod tests {
             Self {
                 displays: vec![VcpDisplayInfo {
                     ident_string: ident.to_string(),
+                    manufacturer: None,
+                    model: None,
+                    serial: None,
                 }],
                 responses,
             }
@@ -509,6 +520,55 @@ mod tests {
         assert!(
             !result.detail.contains("input_source=unreadable"),
             "{}",
+            result.detail
+        );
+    }
+
+    // ── F5: claim_identity in the ddcci probe detail ─────────────────────────
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_claim_identity() {
+        let vcp = FakeVcp {
+            displays: vec![VcpDisplayInfo {
+                ident_string: "i2c-dev:7 AOC AG326UZD".into(),
+                manufacturer: Some("AOC".into()),
+                model: Some("AG326UZD".into()),
+                serial: Some("ABC123".into()),
+            }],
+            responses: {
+                let mut r = HashMap::new();
+                r.insert(("i2c-dev:7 AOC AG326UZD".to_string(), 0x10), Ok(42));
+                r.insert(("i2c-dev:7 AOC AG326UZD".to_string(), 0xD6), Ok(1));
+                r
+            },
+        };
+        let result = probe_ddcci_with(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("claim_identity=AOC:AG326UZD:ABC123"),
+            "expected claim_identity in detail: {}",
+            result.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_claim_identity_unavailable_when_edid_absent() {
+        let vcp = FakeVcp::single_ok("mon-1", 42);
+        let result = probe_ddcci_with(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("claim_identity=unavailable"),
+            "expected claim_identity=unavailable when EDID fields absent: {}",
             result.detail
         );
     }

@@ -159,10 +159,63 @@ pub const INPUT_SOURCE_SKIPPED: &str = "skipped: command holds panel lock";
 pub const VCP_PANIC: &str = "E_DISPLAY_IO: vcp operation panicked";
 
 /// Information about a detected display returned by [`VcpOps::list_displays`].
+///
+/// `ident_string` carries the machine-local bus prefix (`backend:id …`) and
+/// is the canonical panel-lock key; the EDID text fields below are the
+/// bus-independent identity used by [`VcpDisplayInfo::claim_identity`] (spec F5).
 #[derive(Debug, Clone)]
 pub struct VcpDisplayInfo {
     /// Human-readable identifier string (backend:id manufacturer `model_name`).
     pub ident_string: String,
+    /// EDID manufacturer id (e.g. `"AOC"`, `"DEL"`) — the 3-letter vendor code.
+    pub manufacturer: Option<String>,
+    /// EDID model/product name (e.g. `"AG326UZD"`, `"U2723QE"`).
+    pub model: Option<String>,
+    /// EDID serial-number string, when the descriptor is present.
+    pub serial: Option<String>,
+}
+
+impl VcpDisplayInfo {
+    /// Cross-machine claim identity (spec F5): `manufacturer:model`, plus
+    /// `:serial` when the EDID serial is present — derived ONLY from the
+    /// EDID text fields, never `ident_string` (which embeds the machine-local
+    /// bus prefix). Returns `None` when manufacturer or model is absent: a
+    /// panel that cannot be EDID-identified cannot be claim-matched, and
+    /// must never fabricate a key. EDID text is trimmed (case-preserved) so
+    /// vendor descriptor padding does not leak into the canonical key.
+    #[must_use]
+    pub fn claim_identity(&self) -> Option<String> {
+        let manufacturer = self.manufacturer.as_deref()?.trim();
+        let model = self.model.as_deref()?.trim();
+        let serial = self.serial.as_deref().map(str::trim);
+        if manufacturer.is_empty() || model.is_empty() {
+            return None;
+        }
+        match serial.filter(|s| !s.is_empty()) {
+            Some(serial) => Some(format!("{manufacturer}:{model}:{serial}")),
+            None => Some(format!("{manufacturer}:{model}")),
+        }
+    }
+
+    /// Test fixture constructor: build a [`VcpDisplayInfo`] with explicit
+    /// EDID text fields so [`Self::claim_identity`] is testable without DDC
+    /// hardware. `manufacturer`/`model` are stored verbatim (empty stays
+    /// `Some("")` so the trim/empty-handling in [`Self::claim_identity`] is
+    /// what gets exercised); `serial` is `None` when absent.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        ident_string: &str,
+        manufacturer: &str,
+        model: &str,
+        serial: Option<&str>,
+    ) -> Self {
+        Self {
+            ident_string: ident_string.to_string(),
+            manufacturer: Some(manufacturer.to_string()),
+            model: Some(model.to_string()),
+            serial: serial.map(str::to_string),
+        }
+    }
 }
 
 /// Abstract DDC/CI operations — real or fake.
@@ -585,6 +638,21 @@ fn vcp_transaction<H, T>(
     }
 }
 
+/// Map a ddc-hi [`DisplayInfo`] onto a [`VcpDisplayInfo`], copying the EDID
+/// text fields (`manufacturer_id` / `model_name` / `serial_number`) verbatim —
+/// pure, no I/O, so the EDID → claim-identity path is testable with a fixture
+/// `DisplayInfo` instead of real hardware. The `ident_string` stays ddc-hi's
+/// `Display::info` `to_string()` (the bus-prefixed panel-lock key, unchanged).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo {
+    VcpDisplayInfo {
+        ident_string: info.to_string(),
+        manufacturer: info.manufacturer_id.clone(),
+        model: info.model_name.clone(),
+        serial: info.serial_number.clone(),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait]
 impl VcpOps for RealVcp {
@@ -597,9 +665,7 @@ impl VcpOps for RealVcp {
             let _gate = ddc_gate();
             ddc_hi::Display::enumerate()
                 .into_iter()
-                .map(|d| VcpDisplayInfo {
-                    ident_string: d.info.to_string(),
-                })
+                .map(|d| vcp_display_info_from_ddc_info(&d.info))
                 .collect::<Vec<_>>()
         })
         .await
@@ -1009,10 +1075,116 @@ mod tests {
     fn single_display_fake() -> FakeVcp {
         FakeVcp::new(vec![VcpDisplayInfo {
             ident_string: "i2c-dev:1 TST TEST".into(),
+            manufacturer: None,
+            model: None,
+            serial: None,
         }])
     }
 
     const IDENT: &str = "i2c-dev:1 TST TEST";
+
+    // ── F5: claim_identity (EDID-derived, bus-independent) ─────────────────
+
+    /// F5: two display infos that differ ONLY in the machine-local bus
+    /// prefix (`i2c:7` vs `iokit:4`) derive the SAME claim identity — the
+    /// broadcast claim model's hard precondition (byte-identical across
+    /// machines). `ident_string` carries the bus prefix; `claim_identity`
+    /// is derived only from EDID manufacturer/model/serial.
+    #[test]
+    fn claim_identity_is_machine_local_bus_independent() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "AOC", "AG326UZD", Some("ABC123"));
+        let b = VcpDisplayInfo::for_test("iokit:4 AOC AG326UZD", "AOC", "AG326UZD", Some("ABC123"));
+        assert_eq!(a.claim_identity(), Some("AOC:AG326UZD:ABC123".into()));
+        assert_eq!(a.claim_identity(), b.claim_identity());
+    }
+
+    /// EDID text is trimmed (case-preserved) before formatting — vendors
+    /// pad descriptor strings with whitespace, which would otherwise leak
+    /// into the canonical key and break byte-identical matching.
+    #[test]
+    fn claim_identity_trims_edid_fields() {
+        let a = VcpDisplayInfo::for_test(
+            "i2c:7 AOC AG326UZD",
+            "  AOC  ",
+            " AG326UZD ",
+            Some("  ABC123  "),
+        );
+        assert_eq!(a.claim_identity(), Some("AOC:AG326UZD:ABC123".into()));
+    }
+
+    /// An absent EDID serial degrades to `manufacturer:model` (no trailing
+    /// colon) — still specific enough to claim-match, and honest about what
+    /// the panel exposed.
+    #[test]
+    fn claim_identity_absent_serial_produces_manufacturer_model() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "AOC", "AG326UZD", None);
+        assert_eq!(a.claim_identity(), Some("AOC:AG326UZD".into()));
+    }
+
+    /// Missing manufacturer → `None` (honest default): a panel that did not
+    /// expose an EDID manufacturer cannot be claim-matched, and must never
+    /// fabricate a key from model+serial alone.
+    #[test]
+    fn claim_identity_missing_manufacturer_returns_none() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "", "AG326UZD", Some("ABC123"));
+        assert_eq!(a.claim_identity(), None);
+    }
+
+    /// Missing model → `None`, symmetric with the manufacturer case.
+    #[test]
+    fn claim_identity_missing_model_returns_none() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "AOC", "", Some("ABC123"));
+        assert_eq!(a.claim_identity(), None);
+    }
+
+    /// The production path: ddc-hi leaves `manufacturer_id` `None` when the
+    /// EDID lacks a manufacturer descriptor. `claim_identity` must treat that
+    /// the same as a missing field (not as `Some("")`).
+    #[test]
+    fn claim_identity_none_when_manufacturer_field_absent() {
+        let info = VcpDisplayInfo {
+            ident_string: "i2c:7 AOC AG326UZD".into(),
+            manufacturer: None,
+            model: Some("AG326UZD".into()),
+            serial: Some("ABC123".into()),
+        };
+        assert_eq!(info.claim_identity(), None);
+    }
+
+    /// `vcp_display_info_from_ddc_info` maps the EDID text fields a Linux
+    /// i2c-dev backend exposes onto [`VcpDisplayInfo`], so `claim_identity`
+    /// is derivable from a real enumeration without parsing `ident_string`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn vcp_display_info_from_ddc_info_maps_edid_fields_i2c() {
+        let mut info = ddc_hi::DisplayInfo::new(ddc_hi::Backend::I2cDevice, "7".into());
+        info.manufacturer_id = Some("AOC".into());
+        info.model_name = Some("AG326UZD".into());
+        info.serial_number = Some("ABC123".into());
+        let vcp = vcp_display_info_from_ddc_info(&info);
+        assert_eq!(vcp.manufacturer.as_deref(), Some("AOC"));
+        assert_eq!(vcp.model.as_deref(), Some("AG326UZD"));
+        assert_eq!(vcp.serial.as_deref(), Some("ABC123"));
+        assert_eq!(vcp.claim_identity(), Some("AOC:AG326UZD:ABC123".into()));
+    }
+
+    /// macOS `IOKit` backend: the same EDID fields produce the SAME
+    /// `claim_identity` as the Linux i2c-dev case — the bus-independence
+    /// property at the mapper level (F5 pre-implementation gate, unit form).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn vcp_display_info_from_ddc_info_maps_edid_fields_macos() {
+        let mut info = ddc_hi::DisplayInfo::new(ddc_hi::Backend::MacOS, "4".into());
+        info.manufacturer_id = Some("AOC".into());
+        info.model_name = Some("AG326UZD".into());
+        info.serial_number = Some("ABC123".into());
+        let vcp = vcp_display_info_from_ddc_info(&info);
+        assert_eq!(
+            vcp.claim_identity(),
+            Some("AOC:AG326UZD:ABC123".into()),
+            "macOS IOKit and Linux i2c must derive the same claim identity"
+        );
+    }
 
     #[tokio::test]
     async fn get_vcp_returns_scripted_value() {

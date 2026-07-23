@@ -70,7 +70,7 @@ async fn poll_once(
     }
 
     let config = deps.config_rx.borrow().clone();
-    let state_poll_interval = config.coordination.state_poll_interval;
+    let state_poll_interval = config.coordination.effective_state_poll_interval();
     let now = Instant::now();
     // Snapshot once per tick: displays not due for a state read preserve their
     // last recorded panel_state, so record_success rewrites the same value and
@@ -91,7 +91,8 @@ async fn poll_once(
         // Ownership arbitration (VCP 0x60) runs every tick; panel-state cosmetics
         // (brightness/power) refresh only at the slower state_poll cadence to
         // cut per-transaction i2c traffic on cached-fd NVIDIA nodes. Hardware
-        // reads may wait on controller locks; mutate only after both finish.
+        // reads may wait on controller locks; mutate the verdict cache only
+        // after the input read (and, on a due tick, the state read) completes.
         let input = executor.read_input_source_sampled().await;
         let due = last_state_read
             .get(&display_id)
@@ -160,7 +161,7 @@ mod tests {
     use dormant_core::config::{Config, CoordinationConfig};
     use dormant_core::coordination::{COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle};
     use dormant_core::rules::{ControlMsg, ControllerHealth};
-    use dormant_core::traits::{CommandSink, PanelState};
+    use dormant_core::traits::{CommandSink, PanelState, PowerState};
     use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
     use dormant_core::wear::PanelType;
     use indexmap::IndexMap;
@@ -191,6 +192,17 @@ mod tests {
         fn with_inputs(inputs: impl IntoIterator<Item = Result<Option<u8>, String>>) -> Self {
             Self {
                 inputs: Mutex::new(inputs.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn with_inputs_and_states(
+            inputs: impl IntoIterator<Item = Result<Option<u8>, String>>,
+            states: impl IntoIterator<Item = Option<PanelState>>,
+        ) -> Self {
+            Self {
+                inputs: Mutex::new(inputs.into_iter().collect()),
+                states: Mutex::new(states.into_iter().collect()),
                 ..Self::default()
             }
         }
@@ -277,7 +289,7 @@ mod tests {
         Config {
             coordination: CoordinationConfig {
                 poll_interval: Duration::from_secs(6),
-                state_poll_interval: Duration::from_secs(30),
+                state_poll_interval: Some(Duration::from_secs(30)),
                 ..CoordinationConfig::default()
             },
             config_version: 1,
@@ -493,14 +505,20 @@ mod tests {
         // poll_interval = 6s, state_poll_interval = 30s. VCP 0x60 (input) is read
         // every tick; panel-state reads happen on the first tick and again once
         // 30s have elapsed since the last state read.
-        let sink = Arc::new(ScriptedSink::with_inputs(std::iter::repeat_n(
-            Ok(Some(0x11)),
-            6,
-        )));
+        let panel = PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(50),
+        };
+        let sink = Arc::new(ScriptedSink::with_inputs_and_states(
+            std::iter::repeat_n(Ok(Some(0x11)), 6),
+            [Some(panel.clone()), Some(panel.clone())],
+        ));
         let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink.clone());
+        let shared = DisplayId("shared".to_string());
         tick().await; // t=6s: first tick, due
         assert_eq!(sink.reads(), 1);
         assert_eq!(sink.state_reads(), 1);
+        assert_eq!(state.snapshot()[&shared].panel_state, Some(panel.clone()));
         // t=12,18,24,30s: state_poll_interval (30s) not yet elapsed since t=6s.
         for _ in 0..4 {
             tick().await;
@@ -510,6 +528,13 @@ mod tests {
             sink.state_reads(),
             1,
             "state read skipped below state_poll_interval"
+        );
+        // Non-due ticks preserve the last panel_state from the verdict-cache
+        // snapshot — it does NOT reset to None between state reads.
+        assert_eq!(
+            state.snapshot()[&shared].panel_state,
+            Some(panel.clone()),
+            "panel_state preserved across non-due ticks"
         );
         // t=36s: 36s - 6s = 30s >= state_poll_interval → due again.
         tick().await;
@@ -521,7 +546,7 @@ mod tests {
         );
         // Ownership is fed every tick: six successful 0x60 reads, all matching
         // the expected 0x11, so the display stays owned with no failures.
-        let record = &state.snapshot()[&DisplayId("shared".to_string())];
+        let record = &state.snapshot()[&shared];
         assert!(record.owned);
         assert!(record.has_successful_input_read);
         assert_eq!(record.consecutive_failures, 0);

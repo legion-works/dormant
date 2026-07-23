@@ -124,14 +124,18 @@ pub struct CoordinationConfig {
     pub poll_interval: Duration,
 
     /// Interval between shared-display panel-state refreshes (brightness/power
-    /// for `DisplaySnapshot` cosmetics). Slower than `poll_interval` to cut
-    /// per-transaction i2c traffic; ownership arbitration (VCP `0x60`) still
-    /// runs every `poll_interval`. Validated `>= poll_interval`.
+    /// for `DisplaySnapshot` cosmetics); slower than `poll_interval` to cut
+    /// per-transaction i2c traffic. When unset, the effective cadence is the
+    /// larger of [`defaults::COORDINATION_STATE_POLL_INTERVAL`] and
+    /// `poll_interval` via [`Self::effective_state_poll_interval`]; when set,
+    /// must be `>= poll_interval` (see [`mod@super::validate`]). The rationale
+    /// for the slower cadence lives on [`defaults::COORDINATION_STATE_POLL_INTERVAL`].
     #[serde(
-        default = "default_coordination_state_poll_interval",
-        with = "humantime_serde"
+        default,
+        with = "humantime_serde::option",
+        skip_serializing_if = "Option::is_none"
     )]
-    pub state_poll_interval: Duration,
+    pub state_poll_interval: Option<Duration>,
 
     /// Requested TCP port for the short-lived pairing listener; zero requests
     /// an ephemeral port from the operating system.
@@ -156,11 +160,24 @@ impl Default for CoordinationConfig {
         Self {
             enabled: defaults::COORDINATION_ENABLED,
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
-            state_poll_interval: defaults::COORDINATION_STATE_POLL_INTERVAL,
+            state_poll_interval: None,
             pairing_port: defaults::COORDINATION_PAIRING_PORT,
             pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
             pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
         }
+    }
+}
+
+impl CoordinationConfig {
+    /// Effective panel-state refresh cadence: the explicit `state_poll_interval`
+    /// when set, otherwise the larger of [`defaults::COORDINATION_STATE_POLL_INTERVAL`]
+    /// and `poll_interval`, so the default is never below the ownership-poll cadence.
+    #[must_use]
+    pub fn effective_state_poll_interval(&self) -> Duration {
+        self.state_poll_interval.unwrap_or_else(|| {
+            self.poll_interval
+                .max(defaults::COORDINATION_STATE_POLL_INTERVAL)
+        })
     }
 }
 
@@ -1303,9 +1320,6 @@ fn default_coordination_enabled() -> bool {
 fn default_coordination_poll_interval() -> Duration {
     defaults::COORDINATION_POLL_INTERVAL
 }
-fn default_coordination_state_poll_interval() -> Duration {
-    defaults::COORDINATION_STATE_POLL_INTERVAL
-}
 fn default_coordination_pairing_port() -> u16 {
     defaults::COORDINATION_PAIRING_PORT
 }
@@ -2055,8 +2069,10 @@ idle_source = "macos"
 
         assert!(!cfg.coordination.enabled);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(2));
+        assert_eq!(cfg.coordination.state_poll_interval, None);
+        // Absent key resolves to max(30s, poll_interval=2s) = 30s.
         assert_eq!(
-            cfg.coordination.state_poll_interval,
+            cfg.coordination.effective_state_poll_interval(),
             Duration::from_secs(30)
         );
         assert_eq!(cfg.coordination.pairing_port, 0);
@@ -2075,13 +2091,51 @@ idle_source = "macos"
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(3));
         assert_eq!(
             cfg.coordination.state_poll_interval,
-            Duration::from_secs(30)
+            Some(Duration::from_secs(30))
         );
         assert_eq!(cfg.coordination.pairing_port, 4567);
         assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(420));
         assert_eq!(
             cfg.coordination.pairing_bind_address.as_deref(),
             Some("10.1.1.5")
+        );
+    }
+
+    #[test]
+    fn coordination_state_poll_interval_absent_resolves_to_max_of_floor_and_poll() {
+        // Absent key: effective cadence is max(30s, poll_interval). A fixed 30s
+        // default would sit below poll_interval=60s and fail validation.
+        let cfg: Config =
+            toml::from_str("config_version = 1\n[coordination]\npoll_interval = \"60s\"\n")
+                .unwrap();
+        assert_eq!(cfg.coordination.state_poll_interval, None);
+        assert_eq!(
+            cfg.coordination.effective_state_poll_interval(),
+            Duration::from_secs(60)
+        );
+
+        // Default poll_interval (2s) → max(30s, 2s) = 30s.
+        let cfg_default: Config = toml::from_str("config_version = 1\n").unwrap();
+        assert_eq!(cfg_default.coordination.state_poll_interval, None);
+        assert_eq!(
+            cfg_default.coordination.effective_state_poll_interval(),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn coordination_state_poll_interval_explicit_value_round_trips() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[coordination]\npoll_interval = \"2s\"\nstate_poll_interval = \"10s\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.coordination.state_poll_interval,
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            cfg.coordination.effective_state_poll_interval(),
+            Duration::from_secs(10)
         );
     }
 }

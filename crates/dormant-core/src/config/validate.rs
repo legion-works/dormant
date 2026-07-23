@@ -794,12 +794,14 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             ),
         });
     }
-    if cfg.coordination.state_poll_interval < cfg.coordination.poll_interval {
+    if let Some(explicit) = cfg.coordination.state_poll_interval
+        && explicit < cfg.coordination.poll_interval
+    {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!(
-                "coordination state_poll_interval {:?} must be >= poll_interval {:?}",
-                cfg.coordination.state_poll_interval, cfg.coordination.poll_interval
+                "coordination state_poll_interval {explicit:?} must be >= poll_interval {:?}",
+                cfg.coordination.poll_interval
             ),
         });
     }
@@ -5912,9 +5914,23 @@ availability_payload_offline = "down"
     }
 
     #[test]
-    fn coordination_state_poll_interval_below_poll_interval_rejected() {
+    fn coordination_state_poll_interval_absent_with_large_poll_interval_passes() {
+        // Regression: a fixed 30s default would sit below poll_interval=60s and
+        // fail validation. The absent key must resolve to max(30s, poll_interval)
+        // and pass.
+        let errors = validate_str("config_version = 1\n[coordination]\npoll_interval = \"60s\"\n");
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.detail.contains("state_poll_interval")),
+            "absent state_poll_interval with poll_interval=60s should pass, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn coordination_state_poll_interval_explicit_below_poll_interval_rejected() {
         let errors = validate_str(
-            "config_version = 1\n[coordination]\npoll_interval = \"2s\"\nstate_poll_interval = \"1s\"\n",
+            "config_version = 1\n[coordination]\npoll_interval = \"10s\"\nstate_poll_interval = \"5s\"\n",
         );
         assert!(
             errors
@@ -5925,7 +5941,7 @@ availability_payload_offline = "down"
     }
 
     #[test]
-    fn coordination_state_poll_interval_equal_to_poll_interval_accepted() {
+    fn coordination_state_poll_interval_explicit_equal_to_poll_interval_accepted() {
         let errors = validate_str(
             "config_version = 1\n[coordination]\npoll_interval = \"2s\"\nstate_poll_interval = \"2s\"\n",
         );

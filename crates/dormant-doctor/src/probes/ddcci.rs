@@ -149,6 +149,7 @@ impl DdcutilOps for RealDdcutil {
 /// either; it only gives the operator a second view of the bus so a
 /// phantom display (one tool sees it, the other doesn't) is easy to spot.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn format_second_opinion(outcome: &DdcutilOutcome) -> String {
     match outcome {
         DdcutilOutcome::NotInstalled => "ddcutil: not installed".to_string(),
@@ -203,6 +204,7 @@ async fn probe_ddcci_with(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 async fn probe_ddcci_with_locks(
     ops: &impl VcpOps,
     ddcutil: &impl DdcutilOps,
@@ -211,6 +213,7 @@ async fn probe_ddcci_with_locks(
 ) -> ProbeResult {
     let displays = ops.list_displays().await;
 
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let (all_ok, mut detail) = if displays.is_empty() {
         (false, "no DDC/CI displays detected".to_string())
     } else {
@@ -278,14 +281,21 @@ async fn probe_ddcci_with_locks(
     };
 
     // ddcutil is advisory (see module docs): its outcome is only ever
-    // appended below, never folded into `all_ok`.
-    let outcome = ddcutil.detect_brief(ddcutil_timeout).await;
-    let second_opinion = format_second_opinion(&outcome);
-    if detail.is_empty() {
-        detail = second_opinion;
-    } else {
-        detail.push('\n');
-        detail.push_str(&second_opinion);
+    // appended below, never folded into `all_ok`. Linux-only — `ddcutil` is a
+    // Linux I²C tool with no macOS build, so consulting it on macOS would
+    // unconditionally append "ddcutil: not installed" (a Linux-only check
+    // leaking into the macOS arm). The macOS arm reports the ddc-hi detail
+    // alone.
+    #[cfg(target_os = "linux")]
+    {
+        let outcome = ddcutil.detect_brief(ddcutil_timeout).await;
+        let second_opinion = format_second_opinion(&outcome);
+        if detail.is_empty() {
+            detail = second_opinion;
+        } else {
+            detail.push('\n');
+            detail.push_str(&second_opinion);
+        }
     }
 
     if all_ok {
@@ -311,6 +321,7 @@ mod tests {
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(target_os = "linux")]
     fn ddcutil_is_on_path() -> bool {
         let Some(path) = std::env::var_os("PATH") else {
             return false;
@@ -576,6 +587,7 @@ mod tests {
     // ── (a) executable missing ──────────────────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_missing_executable_leaves_ddchi_result_unchanged() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::NotInstalled);
@@ -599,6 +611,7 @@ mod tests {
     /// from `PATH`; developer hosts with the optional package installed skip
     /// this environment-specific assertion while CI preserves the coverage.
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn real_ddcutil_reports_not_installed_in_this_sandbox() {
         if ddcutil_is_on_path() {
             eprintln!(
@@ -616,6 +629,7 @@ mod tests {
     // ── (b) exit 0 with brief detect output ─────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_success_appends_normalized_second_opinion() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -637,6 +651,7 @@ mod tests {
     // ── (c) exit nonzero / "Invalid display" ────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_disagreement_does_not_flip_a_passing_ddchi_result() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -660,6 +675,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_agreement_does_not_rescue_a_failing_ddchi_result() {
         let vcp = FakeVcp::single_failing("mon-1");
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -679,6 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_disagreement_surfaces_phantom_bus_when_ddchi_finds_nothing() {
         let vcp = FakeVcp::none();
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -697,6 +714,7 @@ mod tests {
     // ── (d) timeout ──────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_timeout_appends_timed_out_and_never_hangs() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::TimedOut);
@@ -726,6 +744,7 @@ mod tests {
     /// process (`sleep`) so the real `tokio::time::timeout` around
     /// `Command::output()` is exercised end to end.
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn real_ddcutil_enforces_bounded_timeout_against_a_slow_process() {
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("ddcutil");

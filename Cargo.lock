@@ -1017,6 +1017,7 @@ dependencies = [
  "base64",
  "core-foundation-sys",
  "ddc-hi",
+ "ddc-macos",
  "dormant-core",
  "futures-util",
  "rcgen",

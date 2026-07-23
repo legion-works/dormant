@@ -146,11 +146,13 @@ id = "FLAKE-2026-07-23-TRAY-IPC-EVENT-ORDER"
 test = "ipc_roundtrip::ipc_status_and_events_roundtrip_via_dormantctl_client"
 signature = "sha256:f2f4bd460f4e28af11b53d150070cd8c14b4896aeeeac2e8c0b3a10527775793"
 first_run_url = "https://github.com/legion-works/dormant/actions/runs/30028323908"
-last_run_url = ""
+last_run_url = "https://github.com/legion-works/dormant/actions/runs/30032324404"
 mechanism = "event-order assumption vs wear-tracker emission race; the test asserted the FIRST event frame after subscribing was DisplayPhase, but the wear tracker's first tick fires at startup and emits a WearSnapshot for every display (each display's persist clock starts at zero, so the persist-cadence check trips on tick one) and SensorChanged/ZoneChanged from the fake sensor's startup sample can also land first under load — only event ARRIVAL is guaranteed; fixed by draining non-target frames (bounded deadline, no sleeps, mirroring recv_terminal_outcome in daemon_smoke.rs and the spawn_event_pump reader in ipc_loop.rs) until DisplayPhase arrives, with an honest timeout panic listing every observed frame"
 reproduction = "cargo nextest run -p dormant-tray --test ipc_roundtrip --stress-count 100 --retries 0 --flaky-result fail -E 'test(ipc_status_and_events_roundtrip_via_dormantctl_client)'"
-root_cause = ""
-fix_pr = ""
-proving_test = ""
-soak_evidence = []
-status = "open"
+root_cause = "the test assumed the first subscribed event was DisplayPhase, but the wear tracker emits an immediate WearSnapshot and startup sensor/zone events can arrive first under load"
+fix_pr = "https://github.com/legion-works/dormant/pull/130"
+proving_test = "ipc_roundtrip::ipc_status_and_events_roundtrip_via_dormantctl_client"
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/30032324404",
+]
+status = "fixed"

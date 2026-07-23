@@ -4,6 +4,7 @@
 import argparse
 import dataclasses
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -325,10 +326,38 @@ def target_arguments(target: Target) -> list[str]:
     return arguments
 
 
-def nextest_commands(target: Target, stress_count: int) -> tuple[list[str], list[str]]:
-    """Build the list and stress-run commands for one target."""
+def nextest_commands(
+    target: Target,
+    stress_count: int,
+    repo_root: pathlib.Path | None = None,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """Build the list and stress-run commands for one target.
+
+    Returns the commands plus the extra environment they need. A target with a
+    ``manifest_path`` lives in a separate workspace (the vendored ``ddc-macos``
+    fork, excluded from the root workspace) that has no ``.config/nextest.toml``
+    and its own ``target/`` dir: point nextest at the repo config so ``--profile
+    ci`` resolves, and build into the repo's shared ``target/`` so the JUnit
+    report lands where ``_copy_junit`` expects it.
+    """
     selectors = target_arguments(target)
-    list_command = ["cargo", "nextest", "list", *selectors, "--all-features", "--profile", "ci"]
+    extra: list[str] = []
+    env: dict[str, str] = {}
+    if target.manifest_path is not None and repo_root is not None:
+        repo_config = repo_root / ".config" / "nextest.toml"
+        if repo_config.is_file():
+            extra += ["--config-file", str(repo_config)]
+        env["CARGO_TARGET_DIR"] = str(repo_root / "target")
+    list_command = [
+        "cargo",
+        "nextest",
+        "list",
+        *selectors,
+        "--all-features",
+        "--profile",
+        "ci",
+        *extra,
+    ]
     run_command = [
         "cargo",
         "nextest",
@@ -343,8 +372,9 @@ def nextest_commands(target: Target, stress_count: int) -> tuple[list[str], list
         "fail",
         "--stress-count",
         str(stress_count),
+        *extra,
     ]
-    return list_command, run_command
+    return list_command, run_command, env
 
 
 def junit_destination(root: pathlib.Path, target: Target) -> pathlib.Path:
@@ -368,6 +398,7 @@ def load_source_files(
     base: str,
     head: str,
     diff: str,
+    metadata: Metadata | None = None,
 ) -> dict[str, tuple[str | None, str | None]]:
     """Load both revisions of changed Rust files for conservative test ownership."""
     sources: dict[str, tuple[str | None, str | None]] = {}
@@ -384,6 +415,17 @@ def load_source_files(
         if change.new_path and change.new_path.endswith(".rs"):
             old = sources.get(change.new_path, (None, None))[0]
             sources[change.new_path] = (old, show(head, change.new_path))
+
+    # Ownership resolution walks `mod` chains from crate roots (lib.rs/main.rs/mod.rs).
+    # Those roots are rarely in the diff, so load them from HEAD too — otherwise a
+    # changed non-root file cannot be mapped to its owning lib/bin target and the
+    # selector falls back to every candidate (e.g. selecting a zero-test --bin
+    # alongside the --lib that actually owns the tests).
+    if metadata is not None:
+        for package in metadata.packages.values():
+            for root_path in package.source_paths:
+                if root_path.endswith(".rs") and root_path not in sources:
+                    sources[root_path] = (None, show(head, root_path))
     return sources
 
 
@@ -393,8 +435,9 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
     reports: list[pathlib.Path] = []
     junit = root / "target/nextest/ci/junit.xml"
     for target in targets:
-        list_command, run_command = nextest_commands(target, stress_count)
-        listed = subprocess.run(list_command, cwd=root, text=True, capture_output=True)
+        list_command, run_command, env = nextest_commands(target, stress_count, root)
+        run_env = {**os.environ, **env} if env else None
+        listed = subprocess.run(list_command, cwd=root, text=True, capture_output=True, env=run_env)
         if listed.returncode != 0:
             print(listed.stdout, end="")
             print(listed.stderr, end="", file=sys.stderr)
@@ -406,7 +449,7 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
             continue
 
         junit.unlink(missing_ok=True)
-        completed = subprocess.run(run_command, cwd=root)
+        completed = subprocess.run(run_command, cwd=root, env=run_env)
         report = _copy_junit(root, target)
         if report is None:
             first_failure = first_failure or 1
@@ -445,11 +488,12 @@ def main() -> int:
             capture_output=True,
             check=True,
         ).stdout
+        parsed_metadata = parse_metadata(metadata, root)
         targets = select_targets(
             diff,
-            parse_metadata(metadata, root),
+            parsed_metadata,
             args.platform,
-            load_source_files(root, args.base, args.head, diff),
+            load_source_files(root, args.base, args.head, diff, parsed_metadata),
         )
     except (SelectionError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
         print(f"changed-test selection failed: {error}", file=sys.stderr)
@@ -458,7 +502,7 @@ def main() -> int:
     print(f"selected {len(targets)} changed Rust tests")
     if args.dry_run:
         for target in targets:
-            for command in nextest_commands(target, args.stress_count):
+            for command in nextest_commands(target, args.stress_count, root)[:2]:
                 print(shlex.join(command))
         return 0
     return run_targets(root, targets, args.stress_count)

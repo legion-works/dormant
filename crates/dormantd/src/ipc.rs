@@ -7,10 +7,14 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::{
+    CoordinationDiscoveredPeer, CoordinationPairOpenResponse, CoordinationPairStatus,
+    CoordinationPairedPeer, CoordinationPeers, IpcRequest, IpcResponse,
+};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -20,6 +24,9 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::coordination_mdns::MdnsSdBackend;
+use crate::coordination_pairing::{PairingManager, PairingState, PairingTransport};
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -48,6 +55,31 @@ pub fn spawn(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
+    cancel: CancellationToken,
+) -> Result<JoinHandle<()>> {
+    spawn_with_pairing(
+        socket_path,
+        ctl_tx,
+        reload_requester,
+        doctor_service,
+        Arc::new(PairingManager::new(
+            &dormant_core::paths::state_dir(),
+            false,
+            Duration::from_secs(300),
+        )?),
+        None,
+        cancel,
+    )
+}
+
+/// Spawn the IPC server with the daemon-lifetime instance-pairing manager.
+pub(crate) fn spawn_with_pairing(
+    socket_path: &Path,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    reload_requester: ReloadRequester,
+    doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
+    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -129,6 +161,8 @@ pub fn spawn(
             ctl_tx,
             reload_requester,
             doctor_service,
+            pairing,
+            pairing_transport,
             cancel,
             &socket_owned,
         )
@@ -139,11 +173,17 @@ pub fn spawn(
 }
 
 /// The accept loop — runs until cancelled.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "IPC dependencies remain explicit at the daemon lifecycle boundary."
+)]
 async fn run(
     listener: UnixListener,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
+    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -161,7 +201,9 @@ async fn run(
                         let ctl = ctl_tx.clone();
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor));
+                        let pairing = Arc::clone(&pairing);
+                        let pairing_transport = pairing_transport.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, pairing, pairing_transport));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -176,11 +218,17 @@ async fn run(
 /// Handle one client connection: read line-delimited JSON, dispatch, write
 /// responses.  Lines are capped at [`MAX_LINE_BYTES`]; oversized lines get an
 /// error response and the connection stays usable.
+#[allow(
+    clippy::too_many_lines,
+    reason = "IPC variants deliberately remain visible in one exhaustive dispatch match."
+)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
+    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -256,7 +304,120 @@ async fn handle_connection(
                 let resp = handle_exercise(&ctl_tx, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::CoordinationPairOpen { display_name } => {
+                let result = match pairing_transport.as_ref() {
+                    Some(transport) => transport.open(display_name).await,
+                    None => pairing.open(display_name),
+                };
+                let resp = match result {
+                    Ok(open) => IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
+                        pair_id: open.pair_id,
+                        code: open.code,
+                        expires_at: open.expires_at,
+                    }),
+                    Err(error) => IpcResponse::error(error.to_string()),
+                };
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPairJoin {
+                display_name,
+                instance_id,
+                code,
+            } => {
+                let resp = match pairing_transport.as_ref() {
+                    Some(transport) => transport
+                        .join(display_name, instance_id, code)
+                        .await
+                        .map_or_else(
+                            |error| IpcResponse::error(error.to_string()),
+                            |()| IpcResponse::ok(None),
+                        ),
+                    None => {
+                        IpcResponse::error(pairing.join_preflight(&instance_id).err().map_or_else(
+                            || "peer not discovered".to_owned(),
+                            |error| error.to_string(),
+                        ))
+                    }
+                };
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPairStatus { pair_id } => {
+                let resp = pairing.status(&pair_id).map_or_else(
+                    |error| IpcResponse::error(error.to_string()),
+                    pairing_response,
+                );
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPairCancel { pair_id } => {
+                let result = pairing_transport.as_ref().map_or_else(
+                    || pairing.cancel(&pair_id),
+                    |transport| transport.cancel(&pair_id),
+                );
+                let resp = result.map_or_else(
+                    |error| IpcResponse::error(error.to_string()),
+                    pairing_response,
+                );
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::CoordinationPeersList => {
+                let result: Result<
+                    CoordinationPeers,
+                    crate::coordination_pairing::PairSessionError,
+                > = (|| {
+                    let paired = pairing.paired_peers()?;
+                    let discovered = match pairing_transport.as_ref() {
+                        Some(transport) => {
+                            transport.kick_browse()?;
+                            transport
+                                .discovered_peers()
+                                .into_iter()
+                                .map(|peer| CoordinationDiscoveredPeer {
+                                    instance_id: peer.instance_id,
+                                    display_name: peer.display_name,
+                                    pairing_port: peer.pairing_port,
+                                    window_id: peer.window_id,
+                                })
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    Ok(CoordinationPeers {
+                        discovered,
+                        paired: paired
+                            .into_iter()
+                            .map(|peer| CoordinationPairedPeer {
+                                instance_id: peer.instance_id,
+                                display_name: peer.display_name,
+                                paired_at: peer.paired_at,
+                            })
+                            .collect(),
+                    })
+                })();
+                let resp = result.map_or_else(
+                    |error| IpcResponse::error(error.to_string()),
+                    IpcResponse::coordination_peers,
+                );
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
+    }
+}
+
+fn pairing_response(status: crate::coordination_pairing::PairingStatus) -> IpcResponse {
+    IpcResponse::coordination_pair(CoordinationPairStatus {
+        pair_id: status.pair_id,
+        state: pairing_state_name(status.state).to_owned(),
+        peer_instance_id: status.peer_instance_id,
+    })
+}
+
+const fn pairing_state_name(state: PairingState) -> &'static str {
+    match state {
+        PairingState::Pairing => "pairing",
+        PairingState::Paired => "paired",
+        PairingState::Cancelled => "cancelled",
+        PairingState::Timeout => "timeout",
+        PairingState::Error => "error",
     }
 }
 
@@ -544,6 +705,7 @@ mod tests {
     /// (these tests don't exercise the doctor path).
     fn fake_doctor(ctl_tx: mpsc::Sender<super::ControlMsg>) -> DoctorService {
         let (config_tx, config_rx) = watch::channel(Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

@@ -114,6 +114,14 @@ export interface DisplaySnapshot {
   inhibited: boolean;
   paused: boolean;
   cmd_gen: number;
+  /** Shared-display coordination scope. Absent on legacy wire. */
+  scope?: "private" | "shared";
+  /** Shared-display ownership verdict. Absent on legacy wire. */
+  owned?: boolean;
+  /** Last observed shared-display input source. */
+  observed_input_code?: number | null;
+  /** Panel state observed alongside the shared-display input source. */
+  panel_state?: PanelState | null;
   controllers: ControllerHealth[];
   /** Current wake-retry attempt counter for this display (0 once healthy
    * or before the first attempt). Absent on legacy wire. */
@@ -407,10 +415,22 @@ export interface ConfigInventory {
    * the wire (`null` or a string array); `pw_dump_command` is rendered
    * read-only per the T7 security fold (spec §6#10). */
   audio?: Record<string, unknown>;
+  /** rust: config/schema.rs CoordinationConfig — optional for older payloads. */
+  coordination?: CoordinationConfig;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
   rules: Record<string, RuleConfig>;
+}
+
+/** rust: config/schema.rs CoordinationConfig */
+export interface CoordinationConfig {
+  enabled?: boolean;
+  poll_interval?: string;
+  state_poll_interval?: string;
+  pairing_port?: number;
+  pairing_window?: string;
+  pairing_bind_address?: string | null;
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */
@@ -514,6 +534,8 @@ export interface ScreensaverConfig {
 /** rust: config/schema.rs DisplayConfig */
 export interface DisplayConfig {
   controllers: string[];
+  scope?: "private" | "shared";
+  shared_input_code?: number;
   blank_mode?: BlankMode;
   degraded_mode?: BlankMode;
   ladder?: LadderStage[];
@@ -647,6 +669,40 @@ export interface PairAccepted {
 export interface PairStatus {
   state: "pairing" | "paired" | "timeout" | "error";
   detail?: string | null;
+}
+
+/** Public instance-pairing responder window. */
+export interface InstancePairOpen {
+  pair_id: string;
+  code: string;
+  expires_at: string;
+}
+
+/** Non-secret instance-pairing lifecycle state. */
+export interface InstancePairStatus {
+  state: "pairing" | "paired" | "timeout" | "cancelled" | "error";
+  detail: string | null;
+}
+
+/** Public mDNS discovery data. */
+export interface DiscoveredInstance {
+  instance_id: string;
+  display_name: string;
+  pairing_port: number;
+  window_id: string;
+}
+
+/** Public persisted instance-pairing data. */
+export interface PairedInstance {
+  instance_id: string;
+  display_name: string;
+  paired_at: string;
+}
+
+/** Read-only pairing inventory. */
+export interface InstancePairPeers {
+  discovered: DiscoveredInstance[];
+  paired: PairedInstance[];
 }
 
 /**

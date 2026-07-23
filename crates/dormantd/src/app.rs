@@ -50,16 +50,18 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use dormant_core::config::schema::{Config, Credentials, RuleConfig};
+use dormant_core::config::schema::{Config, Credentials, DisplayScope, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
-    load_credentials_from_bytes, validate,
+    load_credentials_from_bytes, validate_with_input_source_readers,
 };
+use dormant_core::coordination::{CoordinationGate, CoordinationHandle};
 use dormant_core::observation::{
     ContentRevision, DaemonObservation, GenerationId, ObservationHub, ReloadReceipt, ReloadSource,
     RuntimeRevision,
 };
-use dormant_core::ownership::AlwaysOwned;
+use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
+use dormant_core::peers::load_or_create_identity;
 use dormant_core::rules::{
     ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
     RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
@@ -72,6 +74,7 @@ use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry::{
     ControllerBuildContext, build_controllers, capabilities, controller_chain_fingerprint,
+    input_source_readers,
 };
 use dormant_doctor::DoctorService;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -82,6 +85,9 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
+use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery};
+use crate::coordination_pairing::{PairingManager, PairingTransport};
+use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
@@ -205,7 +211,8 @@ pub fn validate_only(
             };
         }
     };
-    let errors = validate(&cfg, &capabilities(), &creds);
+    let errors =
+        validate_with_input_source_readers(&cfg, &capabilities(), &input_source_readers(), &creds);
     ValidationReport {
         warnings,
         errors,
@@ -807,6 +814,51 @@ impl App {
             .await
             .context("assemble initial runtime")?;
 
+        // Coordination state is process-lifetime state, like notifier episodes:
+        // generations only borrow its gate, so a reload cannot discard a verdict
+        // between the old poller stopping and its replacement starting.
+        let shared = shared_displays(&cfg_clone);
+        let coordination = (!shared.is_empty()).then(|| CoordinationHandle::new(shared));
+        let ownership: Arc<dyn OwnershipGate> = coordination.as_ref().map_or_else(
+            || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
+            |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
+        );
+        let coordination_mdns = if cfg_clone.coordination.enabled {
+            let identity = load_or_create_identity(&self.state_dir)
+                .context("load persistent instance identity for mDNS discovery")?;
+            let discovery_state = coordination
+                .clone()
+                .unwrap_or_else(|| CoordinationHandle::new([]));
+            Some(PairDiscovery::new(
+                MdnsSdBackend::new()?,
+                identity.instance_id,
+                discovery_state,
+            ))
+        } else {
+            None
+        };
+        let pairing_manager = Arc::new(
+            PairingManager::new(
+                &self.state_dir,
+                cfg_clone.coordination.enabled,
+                cfg_clone.coordination.pairing_window,
+            )
+            .context("load persistent instance identity for pairing")?,
+        );
+        let pairing_transport = coordination_mdns.map(|discovery| {
+            Arc::new(PairingTransport::new(
+                Arc::clone(&pairing_manager),
+                discovery,
+                cfg_clone.coordination.pairing_port,
+                cfg_clone.coordination.pairing_bind_address.clone(),
+                root.clone(),
+            ))
+        });
+
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
+        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
+
         let spawn = spawn_generation(
             &root,
             assembly,
@@ -815,6 +867,10 @@ impl App {
             None,
             notify_state.clone(),
             notify_sink.clone(),
+            ownership.clone(),
+            coordination.clone(),
+            config_rx.clone(),
+            executors_rx.clone(),
             GenerationId(0),
             Some(self.observations.clone()),
         )?;
@@ -835,7 +891,7 @@ impl App {
             .iter()
             .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
             .collect();
-        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors0));
+        executors_tx.send_replace(Arc::new(executors0));
 
         // The daemon's single wear-ledger map (spec §5) — shared with the
         // tracker and, in future, IPC/WebUI readers.
@@ -862,9 +918,6 @@ impl App {
         let reload_requester =
             ReloadRequester::new_with_observations(reload_request_tx, self.observations.clone());
         let observations = reload_requester.observations();
-
-        let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
-        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
 
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
         // over the front ctl channel (rides the `GenerationRouter`'s
@@ -922,11 +975,13 @@ impl App {
             None
         } else {
             Some(
-                crate::ipc::spawn(
+                crate::ipc::spawn_with_pairing(
                     &socket_path,
                     front_ctl_tx.clone(),
                     reload_requester.clone(),
                     doctor_service.clone(),
+                    Arc::clone(&pairing_manager),
+                    pairing_transport.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -1057,6 +1112,9 @@ impl App {
             ctrl_ctx,
             notify_state,
             notify_sink,
+            ownership,
+            coordination: coordination.clone(),
+            _coordination_mdns: None,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1102,6 +1160,8 @@ impl App {
             creds_rx,
             config_path: self.operator_config_path.clone(),
             doctor_service,
+            #[cfg(any(test, feature = "test-util"))]
+            coordination,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
@@ -1154,6 +1214,8 @@ pub struct AppHandle {
     /// from the LKG substitute instead, `App::config_path`).
     config_path: PathBuf,
     doctor_service: DoctorService,
+    #[cfg(any(test, feature = "test-util"))]
+    coordination: Option<CoordinationHandle>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
     /// Test-only LKG-candidate observation seam — see
@@ -1269,6 +1331,14 @@ impl AppHandle {
         self.doctor_service.clone()
     }
 
+    /// Test-only observability — production paths receive the handle by construction.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn coordination_handle(&self) -> Option<CoordinationHandle> {
+        self.coordination.clone()
+    }
+
     /// Test-util seam (rollback-recovery plan, Task 1 §5 / Task 2): a
     /// point-in-time snapshot of the `Runner`'s current LKG-candidate
     /// state. Used to prove whether a candidate is armed and, if so, from
@@ -1341,6 +1411,14 @@ struct Runner {
     /// Daemon-lifetime notification sink, constructed once in
     /// [`App::start`] and threaded unchanged into every generation.
     notify_sink: Arc<dyn NotifySink>,
+    /// Daemon-lifetime ownership gate. Private-only startup keeps this as
+    /// `AlwaysOwned`; shared startup keeps the same coordination-backed gate.
+    ownership: Arc<dyn OwnershipGate>,
+    /// Shared-display cache, absent only when startup had no shared displays.
+    coordination: Option<CoordinationHandle>,
+    /// Retained while enabled so later pairing windows can advertise or browse;
+    /// construction alone does not expose a service on the LAN.
+    _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,
@@ -1583,6 +1661,23 @@ impl Runner {
                 );
             }
         };
+
+        let new_shared = shared_displays(&new_assembly.cfg);
+        if self.coordination.is_none() && !new_shared.is_empty() {
+            let detail =
+                "E_CONFIG_INVALID: adding the first shared display requires daemon restart"
+                    .to_string();
+            tracing::error!(event = "config_reload_rejected", detail = %detail);
+            let _ = old_ctl
+                .send(ControlMsg::SetPendingReload(Some(detail.clone())))
+                .await;
+            let outcome = ReloadOutcome::Rejected(detail);
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
+        }
+        if let Some(coordination) = &self.coordination {
+            coordination.reconcile_shared(new_shared);
+        }
 
         // Step-boundary ping 1/7 (spec §6.3): after `load_and_assemble`
         // returns (probes done). The spec names this as a boundary DISTINCT
@@ -1827,6 +1922,10 @@ impl Runner {
             None,
             self.notify_state.clone(),
             self.notify_sink.clone(),
+            self.ownership.clone(),
+            self.coordination.clone(),
+            self.config_tx.subscribe(),
+            self.executors_tx.subscribe(),
             next_generation,
             Some(self.observations.clone()),
         );
@@ -2067,7 +2166,12 @@ impl Runner {
         cfg: Config,
         creds: Credentials,
     ) -> Result<StaticAssembly, String> {
-        let errors = validate(&cfg, &capabilities(), &creds);
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &capabilities(),
+            &input_source_readers(),
+            &creds,
+        );
         if !errors.is_empty() {
             return Err(errors
                 .iter()
@@ -2133,6 +2237,10 @@ impl Runner {
             self.rollback_status.clone(),
             self.notify_state.clone(),
             self.notify_sink.clone(),
+            self.ownership.clone(),
+            self.coordination.clone(),
+            self.config_tx.subscribe(),
+            self.executors_tx.subscribe(),
             self.generation_id,
             Some(self.observations.clone()),
         );
@@ -3158,6 +3266,21 @@ fn index_display_rules(cfg: &Config) -> HashMap<DisplayId, RuleConfig> {
     map
 }
 
+fn shared_displays(cfg: &Config) -> Vec<DisplayId> {
+    cfg.displays
+        .iter()
+        .filter(|(_, display)| display.scope == DisplayScope::Shared)
+        .map(|(name, _)| DisplayId(name.clone()))
+        .collect()
+}
+
+fn should_spawn_coordination_poller(
+    cfg: &Config,
+    coordination: Option<&CoordinationHandle>,
+) -> bool {
+    coordination.is_some() && !shared_displays(cfg).is_empty()
+}
+
 fn retry_timing_differs(a: &RuleConfig, b: &RuleConfig) -> bool {
     a.grace_period != b.grace_period
         || a.min_blank_time != b.min_blank_time
@@ -3249,6 +3372,7 @@ mod audio_rules_tests {
 
     fn cfg_with_rules(rules: IndexMap<String, RuleConfig>) -> Config {
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),
@@ -3497,6 +3621,10 @@ fn spawn_generation(
     rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
+    ownership: Arc<dyn OwnershipGate>,
+    coordination: Option<CoordinationHandle>,
+    config_rx: watch::Receiver<Arc<Config>>,
+    executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
 ) -> Result<GenSpawn> {
@@ -3520,9 +3648,12 @@ fn spawn_generation(
         zone,
         executors,
         assembly.render_sinks.clone(),
-        Arc::new(AlwaysOwned),
+        ownership,
     )
     .context("build engine")?;
+    if let Some(ref coordination) = coordination {
+        engine = engine.with_coordination_handle(coordination.clone());
+    }
     if let Some(observations) = observations {
         engine = engine.with_observation_hub(generation_id, observations);
     }
@@ -3542,6 +3673,18 @@ fn spawn_generation(
     });
 
     let mut producer_handles = Vec::new();
+
+    if should_spawn_coordination_poller(&assembly.cfg, coordination.as_ref())
+        && let Some(state) = coordination
+    {
+        producer_handles.push(coordination_poll::spawn(CoordinationPollDeps {
+            config_rx,
+            ctl_tx: ctl_tx.clone(),
+            executors_rx,
+            state,
+            cancel: producer_token.clone(),
+        }));
+    }
 
     // ── InputWake drain (feature-gated: render surfaces emit InputWake) ──
     // Each LayerShellRenderSink pushes DisplayId through an unbounded
@@ -3722,6 +3865,10 @@ fn spawn_generation_for_reload(
     rollback: Option<RollbackStatus>,
     notify_state: Arc<Mutex<NotifyState>>,
     notify_sink: Arc<dyn NotifySink>,
+    ownership: Arc<dyn OwnershipGate>,
+    coordination: Option<CoordinationHandle>,
+    config_rx: watch::Receiver<Arc<Config>>,
+    executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
 ) -> Result<GenSpawn> {
@@ -3736,6 +3883,10 @@ fn spawn_generation_for_reload(
         rollback,
         notify_state,
         notify_sink,
+        ownership,
+        coordination,
+        config_rx,
+        executors_rx,
         generation_id,
         observations,
     )
@@ -4272,6 +4423,8 @@ mod render_tests {
     /// helper to avoid coupling across crates.
     fn base_display_cfg_for_test() -> dormant_core::config::schema::DisplayConfig {
         dormant_core::config::schema::DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: Vec::new(),
             blank_mode: None,
             degraded_mode: None,
@@ -4348,6 +4501,7 @@ mod render_tests {
         use indexmap::IndexMap;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4361,6 +4515,8 @@ mod render_tests {
                 m.insert(
                     "mon".into(),
                     dormant_core::config::schema::DisplayConfig {
+                        scope: dormant_core::config::DisplayScope::default(),
+                        shared_input_code: None,
                         controllers: vec!["command".into()],
                         blank_mode: None,
                         degraded_mode: None,
@@ -4456,6 +4612,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4467,6 +4624,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     // Black-only ladder — NO RenderScreensaver stage.
                     ladder: vec![
@@ -4554,6 +4713,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4565,6 +4725,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![LadderStage {
                         kind: StageKind::RenderBlack,
@@ -4614,6 +4776,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4625,6 +4788,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -4704,6 +4869,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4715,6 +4881,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -4801,6 +4969,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4812,6 +4981,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -4889,6 +5060,7 @@ mod render_tests {
         use std::sync::Mutex;
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -4900,6 +5072,8 @@ mod render_tests {
             displays: indexmap::IndexMap::from([(
                 "mon".into(),
                 DisplayConfig {
+                    scope: dormant_core::config::DisplayScope::default(),
+                    shared_input_code: None,
                     controllers: vec!["kwin-dpms".into()],
                     ladder: vec![
                         LadderStage {
@@ -5079,6 +5253,10 @@ mod restore_tests {
             wake_attempts,
             last_blank_failed,
             stage: None,
+            scope: dormant_core::config::DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
         }
     }
 
@@ -5293,6 +5471,8 @@ mod macos_gamma_black_assembly_tests {
     #[tokio::test]
     async fn chain_with_no_effective_mode_fails_assembly_as_mode_unsupported() {
         let display = DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: vec!["command".into()],
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -5323,6 +5503,7 @@ mod macos_gamma_black_assembly_tests {
         displays.insert("panel".to_string(), display);
 
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),
@@ -5514,6 +5695,8 @@ mod gamma_reload_tests {
 
     fn gamma_display_cfg(controller: &str, selector: &str) -> DisplayConfig {
         DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: vec![controller.into()],
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
@@ -5564,6 +5747,7 @@ mod gamma_reload_tests {
             );
         }
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             sensors: IndexMap::new(),
@@ -5588,6 +5772,10 @@ mod gamma_reload_tests {
                     inhibited: false,
                     paused: false,
                     cmd_gen: 0,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
                     controllers: Vec::new(),
                     wake_attempts: 0,
                     last_blank_failed: false,

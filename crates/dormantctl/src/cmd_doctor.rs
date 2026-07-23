@@ -106,6 +106,8 @@ pub enum DoctorSubcommand {
     /// asleep/awake state. Read-only — never blanks or wakes a display.
     /// macOS only.
     MacosDisplaySleep,
+    /// List stable CoreGraphics display selectors. macOS only.
+    MacosDisplayCatalog,
     /// Probe active macOS power assertions preventing display sleep.
     /// `Fail` when a dormant-owned assertion is still active. macOS only.
     MacosPower,
@@ -219,6 +221,7 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
         Some(DoctorSubcommand::Kwin) => Ok(DoctorOutcome::NotSupported("kwin-dpms".into())),
         Some(DoctorSubcommand::MacosIdle) => run_macos_idle().await,
         Some(DoctorSubcommand::MacosDisplaySleep) => run_macos_display_sleep().await,
+        Some(DoctorSubcommand::MacosDisplayCatalog) => run_macos_display_catalog().await,
         Some(DoctorSubcommand::MacosPower) => run_macos_power().await,
         Some(DoctorSubcommand::Samsung) => {
             let (cfg, creds, note) = load_config_and_creds(args)?;
@@ -416,6 +419,23 @@ async fn run_macos_display_sleep() -> Result<DoctorOutcome> {
     #[cfg(not(target_os = "macos"))]
     {
         Ok(DoctorOutcome::NotSupported("macos-display-sleep".into()))
+    }
+}
+
+/// `doctor macos-display-catalog` — stable CoreGraphics display selectors.
+// The catalog probe is synchronous, but this shared dispatcher awaits every
+// macOS doctor arm so their platform-specific implementations remain uniform.
+#[allow(clippy::unused_async)]
+async fn run_macos_display_catalog() -> Result<DoctorOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        let results = vec![dormant_doctor::probe_macos_display_catalog()];
+        print_table(&results);
+        Ok(outcome(&results))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(DoctorOutcome::NotSupported("macos-display-catalog".into()))
     }
 }
 

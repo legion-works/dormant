@@ -9,7 +9,7 @@ import Displays from "../app/views/Displays";
 import { LiveStateProvider } from "../app/state";
 import { LiveStateContext } from "../app/hooks/useLiveState";
 import { liveStateFixture } from "./fixtures/live-state";
-import type { DisplayConfig } from "../api/types";
+import type { DisplayConfig, DisplaySnapshot } from "../api/types";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
@@ -123,6 +123,37 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
+
+function renderDisplayCard(id: string, display: DisplaySnapshot) {
+  const state = liveStateFixture({
+    snapshot: {
+      sensors: [],
+      zones: [],
+      displays: [[id, display]],
+      pending_reload: null,
+    },
+    displayConfigs: {
+      [id]: { controllers: [], blank_mode: "power_off" } as DisplayConfig,
+    },
+    displayRules: { [id]: { rule: "office-rule", zone: "office" } },
+  });
+  render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+}
+
+function sharedDisplay(overrides: Partial<DisplaySnapshot> = {}): DisplaySnapshot {
+  return {
+    phase: "active",
+    inhibited: false,
+    paused: false,
+    cmd_gen: 1,
+    scope: "shared",
+    owned: true,
+    observed_input_code: 96,
+    panel_state: { power: "standby" },
+    controllers: [],
+    ...overrides,
+  };
+}
 
 describe("Displays", () => {
   it("renders display cards with IDs and phases", async () => {
@@ -269,6 +300,42 @@ describe("Displays", () => {
     expect(screen.getAllByText("Resume rule").length).toBeGreaterThanOrEqual(1);
     // aoc-main is not paused → "Pause rule"
     expect(screen.getAllByText("Pause rule").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("shared card uses panel state instead of local phase", () => {
+    renderDisplayCard("shared-tv", sharedDisplay());
+
+    expect(screen.getByText("○ OFF")).toBeInTheDocument();
+    expect(screen.getByText("owner")).toBeInTheDocument();
+  });
+
+  it("deferred shared card keeps force wake enabled", () => {
+    renderDisplayCard("shared-tv", sharedDisplay({ owned: false }));
+
+    expect(screen.getByText("deferred")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Force wake" })).toBeEnabled();
+  });
+
+  it("shared force blank has affects-all copy", () => {
+    renderDisplayCard("shared-tv", sharedDisplay());
+
+    expect(screen.getByRole("button", {
+      name: "Blank shared panel — affects all connected machines",
+    })).toBeInTheDocument();
+  });
+
+  it("private card copy unchanged", () => {
+    renderDisplayCard("private-panel", {
+      phase: "active",
+      inhibited: false,
+      paused: false,
+      cmd_gen: 1,
+      controllers: [],
+    });
+
+    expect(screen.getByText("● ON")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Force blank" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Force wake" })).toBeInTheDocument();
   });
 });
 

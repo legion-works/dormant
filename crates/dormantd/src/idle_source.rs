@@ -13,6 +13,10 @@
 //! or unavailability treats the user as **inactive** (inhibitor OFF → blanking
 //! ALLOWED). A broken idle probe must never wedge displays awake.
 
+// Linux owns the D-Bus and Wayland idle implementations. Non-Linux builds
+// retain their shared test seams and platform fallbacks without reaching them.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::time::Duration;
 

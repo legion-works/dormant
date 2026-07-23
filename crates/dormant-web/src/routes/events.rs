@@ -302,6 +302,7 @@ mod tests {
         let (event_tx, _event_rx) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -448,6 +449,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -566,6 +568,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<DaemonEvent>(2);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -681,6 +684,7 @@ mod tests {
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -847,6 +851,7 @@ mod tests {
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -1019,6 +1024,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -1182,6 +1188,7 @@ mod tests {
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -1413,6 +1420,7 @@ mod tests {
         let (gen2_tx, _gen2_rx) = broadcast::channel::<DaemonEvent>(64);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

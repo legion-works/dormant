@@ -9,6 +9,10 @@ mod audio_policy;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;
+pub mod coordination_mdns;
+#[cfg_attr(any(test, feature = "test-util"), allow(private_interfaces))]
+pub mod coordination_pairing;
+mod coordination_poll;
 pub mod gamma_recovery;
 pub mod idle_source;
 pub mod inhibit_activity;
@@ -23,3 +27,19 @@ pub mod sd_notify;
 pub mod single_instance;
 mod watchdog_schedule;
 pub mod wear_tracker;
+
+/// Compile-time dependency probe for the instance-pairing implementation.
+///
+/// Task 11 replaces this once the pairing runtime owns these crates directly.
+#[doc(hidden)]
+#[allow(unused_imports)]
+mod pairing_dep_probe {
+    use base64 as _;
+    use ed25519_dalek as _;
+    use hmac as _;
+    use mdns_sd as _;
+    use rand_core as _;
+    use sha2 as _;
+    use spake2 as _;
+    use zeroize as _;
+}

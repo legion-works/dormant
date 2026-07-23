@@ -41,6 +41,11 @@ pub struct LayerShellRenderSink {
 impl LayerShellRenderSink {
     /// Construct a stub. Never fails on non-Linux — the absence of a real
     /// backend is reported on the first [`RenderSink::show`] call.
+    ///
+    /// # Errors
+    ///
+    /// This stub cannot fail construction; the `Result` preserves the Linux
+    /// backend's shared constructor contract.
     pub fn new(
         display_id: DisplayId,
         output_name: String,

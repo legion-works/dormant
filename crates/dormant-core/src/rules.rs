@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::SensorKind;
+use crate::config::{DisplayScope, SensorKind};
+use crate::coordination::CoordinationHandle;
 use crate::error::DormantError;
 use crate::observation::{DaemonObservation, GenerationId, ObservationHub};
 use crate::ownership::OwnershipGate;
@@ -142,6 +143,11 @@ pub enum ControlMsg {
     /// Input-wake event from the render surface — route to the display
     /// machine's [`Input::InputWake`].
     InputWake(DisplayId),
+    /// Re-consult ownership for one display without waiting for a timer sweep.
+    OwnershipPoll {
+        /// Display whose ownership verdict must be refreshed.
+        display: DisplayId,
+    },
     /// Publish a daemon-side event onto this generation's event bus.
     /// Debug-asserts the event is not [`DaemonEvent::Unknown`] — the daemon
     /// never constructs that variant; it exists purely for forward-compat
@@ -482,6 +488,10 @@ pub struct StageInfo {
 }
 
 /// A display as seen by a [`StateSnapshot`].
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the status wire mirrors independent display machine and ownership flags"
+)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DisplaySnapshot {
     /// Literal phase name (`"active"`, `"grace"`, `"blanking"`, `"blanked"`,
@@ -494,6 +504,18 @@ pub struct DisplaySnapshot {
     /// The display machine's command-generation counter (carry-over across
     /// reloads).
     pub cmd_gen: u64,
+    /// Whether this display is private to this daemon or coordinated between machines.
+    #[serde(default)]
+    pub scope: DisplayScope,
+    /// Whether this daemon currently owns a shared display. Always `true` for private displays.
+    #[serde(default = "default_owned")]
+    pub owned: bool,
+    /// Last observed shared-display input source. Absent for private or stale displays.
+    #[serde(default)]
+    pub observed_input_code: Option<u8>,
+    /// Panel state observed with the shared-display input source. `None` is unknown or stale.
+    #[serde(default)]
+    pub panel_state: Option<PanelState>,
     /// Per-controller health from the last blank/wake attempt.  Empty until
     /// the first attempt or when deserializing legacy snapshots without this
     /// field (serde back-compat).
@@ -514,6 +536,10 @@ pub struct DisplaySnapshot {
     /// omitted when `None`, byte-identical to a pre-stage snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<StageInfo>,
+}
+
+const fn default_owned() -> bool {
+    true
 }
 
 /// Boot-time rollback metadata surfaced to operators through [`StateSnapshot`].
@@ -731,6 +757,7 @@ pub struct RulesEngine {
     /// display.  Feeds [`Input::OwnershipChanged`] to the state machine when
     /// the gate's verdict differs from the last-fed value.
     ownership: Arc<dyn OwnershipGate>,
+    coordination: Option<CoordinationHandle>,
     /// Last ownership value fed per display — change-detection to avoid
     /// redundant [`Input::OwnershipChanged`] edges every tick.
     last_owned: HashMap<DisplayId, bool>,
@@ -869,6 +896,7 @@ impl RulesEngine {
             executors,
             render_sinks,
             ownership,
+            coordination: None,
             last_owned,
             rule_displays,
             zone_rules,
@@ -888,6 +916,13 @@ impl RulesEngine {
             rollback: None,
             pending_restore: Vec::new(),
         })
+    }
+
+    /// Attach the daemon-lifetime shared-display observation cache.
+    #[must_use]
+    pub fn with_coordination_handle(mut self, coordination: CoordinationHandle) -> Self {
+        self.coordination = Some(coordination);
+        self
     }
 
     /// Attach the daemon observation hub for this engine generation.
@@ -1205,6 +1240,7 @@ impl RulesEngine {
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
             ControlMsg::InputWake(d) => self.step_one(&d, Input::InputWake),
+            ControlMsg::OwnershipPoll { display } => self.feed_ownership(&display, Tick::now()),
             ControlMsg::PublishDaemonEvent(ev) => {
                 debug_assert!(
                     !matches!(ev, DaemonEvent::Unknown),
@@ -1692,6 +1728,19 @@ impl RulesEngine {
                     .get(&dcfg.display)
                     .map(|exec| exec.controller_health())
                     .unwrap_or_default();
+                let coordination = self
+                    .coordination
+                    .as_ref()
+                    .and_then(|handle| handle.snapshot().remove(&dcfg.display));
+                let (scope, owned, observed_input_code, panel_state) = match coordination {
+                    Some(record) => (
+                        DisplayScope::Shared,
+                        record.owned,
+                        record.input_code,
+                        record.panel_state,
+                    ),
+                    None => (DisplayScope::Private, true, None, None),
+                };
                 displays.push((
                     dcfg.display.0.clone(),
                     DisplaySnapshot {
@@ -1699,6 +1748,10 @@ impl RulesEngine {
                         inhibited: m.overlays().inhibited,
                         paused: m.overlays().paused.is_some(),
                         cmd_gen: m.cmd_gen(),
+                        scope,
+                        owned,
+                        observed_input_code,
+                        panel_state,
                         controllers,
                         wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
                         last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
@@ -2297,6 +2350,7 @@ fn is_blanked_family_phase(phase: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fakes::{RecordingSink, SinkCmd};
     use crate::traits::{PanelState, PowerState};
 
     // ── InhibitorKind::from_config literal pin ──────────────────────────────
@@ -2849,6 +2903,10 @@ mod tests {
             inhibited: false,
             paused: false,
             cmd_gen: 0,
+            scope: DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
             controllers: vec![],
             wake_attempts: 0,
             last_blank_failed: false,
@@ -2866,6 +2924,10 @@ mod tests {
             inhibited: false,
             paused: false,
             cmd_gen: 1,
+            scope: DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
             controllers: vec![],
             wake_attempts: 0,
             last_blank_failed: false,
@@ -3014,6 +3076,68 @@ mod tests {
         let d: DisplaySnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(d.wake_attempts, 0);
         assert!(!d.last_blank_failed);
+    }
+
+    #[test]
+    fn legacy_display_snapshot_defaults_private_owned_and_unknown_panel() {
+        let json =
+            r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":3,"controllers":[]}"#;
+        let snapshot: DisplaySnapshot = serde_json::from_str(json).unwrap();
+
+        assert_eq!(snapshot.scope, DisplayScope::Private);
+        assert!(snapshot.owned);
+        assert_eq!(snapshot.observed_input_code, None);
+        assert_eq!(snapshot.panel_state, None);
+    }
+
+    #[test]
+    fn shared_display_snapshot_uses_hardware_observation_not_local_phase() {
+        let display = DisplayId("shared".into());
+        let coordination = crate::coordination::CoordinationHandle::new([display.clone()]);
+        coordination.record_success(
+            &display,
+            0x10,
+            0x0f,
+            Some(PanelState {
+                power: Some(PowerState::Standby),
+                brightness: Some(0),
+            }),
+        );
+        let mut engine = RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![DisplayRuntimeCfg {
+                    display: display.clone(),
+                    blank_mode: BlankMode::PowerOff,
+                    ladder: vec![LadderStage {
+                        kind: StageKind::Controller(BlankMode::PowerOff),
+                        dwell: None,
+                    }],
+                    timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                }],
+                sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::coordination::CoordinationGate::new(
+                coordination.clone(),
+            )),
+        )
+        .expect("shared display engine config is valid")
+        .with_coordination_handle(coordination);
+
+        let snapshot = snapshot_of(&mut engine);
+        let display = &snapshot.displays[0].1;
+        assert_eq!(display.phase, "active");
+        assert_eq!(display.scope, DisplayScope::Shared);
+        assert!(!display.owned);
+        assert_eq!(display.observed_input_code, Some(0x10));
+        assert_eq!(
+            display.panel_state.as_ref().and_then(|state| state.power),
+            Some(PowerState::Standby)
+        );
     }
 
     // ── `reported` cold-start diagnostic (spec §5) ──────────────────────────
@@ -3298,6 +3422,186 @@ mod tests {
         .expect("minimal engine config is valid")
     }
 
+    /// Shared mutable ownership gate for control-path tests.
+    struct FlipGate(Arc<std::sync::atomic::AtomicBool>);
+
+    impl OwnershipGate for FlipGate {
+        fn owns(&self, _display: &DisplayId) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn manual_display_engine(
+        display: DisplayId,
+        executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+        ownership: Arc<dyn OwnershipGate>,
+    ) -> RulesEngine {
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![DisplayRuntimeCfg {
+                    display,
+                    blank_mode: BlankMode::PowerOff,
+                    ladder: vec![LadderStage {
+                        kind: StageKind::Controller(BlankMode::PowerOff),
+                        dwell: None,
+                    }],
+                    timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                }],
+                sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
+            executors,
+            HashMap::new(),
+            ownership,
+        )
+        .expect("one-display engine config is valid")
+    }
+
+    #[tokio::test]
+    async fn ownership_poll_refeeds_changed_cached_verdict_without_timer_sweep() {
+        let display = DisplayId("mon".into());
+        let sink = Arc::new(RecordingSink::new());
+        let mut executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        executors.insert(display.clone(), sink.clone());
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine = manual_display_engine(
+            display.clone(),
+            executors,
+            Arc::new(FlipGate(Arc::clone(&owned))),
+        );
+
+        assert_eq!(engine.last_owned.get(&display), Some(&false));
+        let before_poll = Tick::now();
+        engine.step_machine(&display, Input::ZonePresent(false), before_poll);
+        owned.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        engine.handle_control(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        });
+
+        assert_eq!(engine.last_owned.get(&display), Some(&true));
+
+        engine.step_machine(
+            &display,
+            Input::Tick,
+            Tick(before_poll.0 + Duration::from_secs(3600)),
+        );
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("post-poll tick reports the blank command");
+        assert!(matches!(result, InternalResult::Blank { .. }));
+        assert!(
+            sink.log()
+                .iter()
+                .any(|(_, command)| matches!(command, SinkCmd::Blank(BlankMode::PowerOff))),
+            "the ownership gain must reach the machine before its next timer tick"
+        );
+    }
+
+    #[test]
+    fn ownership_poll_unchanged_verdict_is_noop() {
+        use crate::state_machine::Phase;
+
+        let display = DisplayId("mon".into());
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine =
+            manual_display_engine(display.clone(), HashMap::new(), Arc::new(FlipGate(owned)));
+        let timings = DisplayRuntimeCfg::manual_defaults(Duration::ZERO);
+        let (restored, effects) = DisplayStateMachine::restore(
+            timings,
+            vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            Phase::Blanked,
+            1,
+            Tick::now(),
+        );
+        assert!(effects.is_empty());
+        engine.machines.insert(display.clone(), restored);
+
+        let (subscribe, mut events) = oneshot::channel();
+        engine.handle_control(ControlMsg::SubscribeEvents(subscribe));
+        let mut events = events.try_recv().expect("subscription reply sent inline");
+
+        engine.handle_control(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        });
+
+        // A duplicate false input would yield the restored Blanked machine.
+        assert_eq!(*engine.machines[&display].phase(), Phase::Blanked);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn force_blank_bypasses_never_owned_gate() {
+        let display = DisplayId("mon".into());
+        let sink = Arc::new(RecordingSink::new());
+        let mut executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        executors.insert(display.clone(), sink.clone());
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine =
+            manual_display_engine(display.clone(), executors, Arc::new(FlipGate(owned)));
+
+        engine.handle_control(ControlMsg::ForceBlank(display));
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("forced blank command reports a result");
+
+        // Regression pin: operator force commands deliberately bypass ownership.
+        assert!(matches!(result, InternalResult::Blank { .. }));
+        assert!(
+            sink.log()
+                .iter()
+                .any(|(_, command)| matches!(command, SinkCmd::Blank(BlankMode::PowerOff))),
+            "ForceBlank must issue a command when the ownership gate denies control"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_wake_bypasses_never_owned_gate() {
+        let display = DisplayId("mon".into());
+        let sink = Arc::new(RecordingSink::new());
+        let mut executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        executors.insert(display.clone(), sink.clone());
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine =
+            manual_display_engine(display.clone(), executors, Arc::new(FlipGate(owned)));
+
+        engine.handle_control(ControlMsg::ForceBlank(display.clone()));
+        let blank_result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("setup forced blank command reports a result");
+        engine.handle_internal_result(blank_result, Tick::now());
+
+        engine.handle_control(ControlMsg::ForceWake(display));
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("forced wake command reports a result");
+
+        // Regression pin: recovery wake remains available after ownership yield.
+        assert!(matches!(result, InternalResult::Wake { .. }));
+        assert!(
+            sink.log()
+                .iter()
+                .any(|(_, command)| matches!(command, SinkCmd::Wake)),
+            "ForceWake must issue a command when the ownership gate denies control"
+        );
+    }
+
     #[test]
     fn state_snapshot_rollback_field_is_additive() {
         let legacy = r#"{"sensors":[],"zones":[],"displays":[],"pending_reload":null}"#;
@@ -3414,6 +3718,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         executors: HashMap::new(),
         render_sinks: HashMap::new(),
         ownership: Arc::new(AlwaysOwned),
+        coordination: None,
         last_owned: HashMap::new(),
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
@@ -3515,6 +3820,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         executors: HashMap::new(),
         render_sinks: HashMap::new(),
         ownership: Arc::new(NeverOwned),
+        coordination: None,
         last_owned: HashMap::new(),
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),

@@ -40,7 +40,13 @@ const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 /// mounted, it is already strict by construction — there is no window
 /// where a forgotten classification decision defaults to the weaker
 /// same-origin check.
-pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &["/api/config/apply", "/api/pair/samsung"];
+pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &[
+    "/api/config/apply",
+    "/api/pair/samsung",
+    "/api/pair/instance",
+    "/api/pair/instance/join",
+    "/api/pair/instance/:id/cancel",
+];
 
 /// Full `/api`-prefixed `POST` routes that are deliberately left on the
 /// generic same-origin check (`is_same_origin`) rather than the strict
@@ -116,11 +122,13 @@ pub(crate) async fn security_guard(
         // For strict-origin write endpoints, the Origin header MUST be
         // present (the generic is_same_origin allows absent Origin, which is
         // a CSRF gap for a write endpoint) and must exact-match the loopback
-        // origin including the actual bound port.  Membership in
-        // STRICT_ORIGIN_PATHS is checked against the raw, un-normalized
-        // `uri().path()` — see the structural test at the bottom of this
-        // module for why that's safe.
-        if STRICT_ORIGIN_PATHS.contains(&request.uri().path()) {
+        // origin including the actual bound port. Patterns are matched segment
+        // by segment so parameterized routes cannot silently fall back to the
+        // weaker absent-Origin policy.
+        if STRICT_ORIGIN_PATHS
+            .iter()
+            .any(|pattern| route_pattern_matches(pattern, request.uri().path()))
+        {
             let origin_ok = check_apply_origin(&headers, state.inner.web_bind);
             if !origin_ok {
                 tracing::warn!(event = "web_reject_origin", reason = "apply_origin");
@@ -149,6 +157,14 @@ pub(crate) async fn security_guard(
     }
 
     next.run(request).await
+}
+
+fn route_pattern_matches(pattern: &str, path: &str) -> bool {
+    pattern
+        .split('/')
+        .zip(path.split('/'))
+        .all(|(expected, actual)| expected.starts_with(':') || expected == actual)
+        && pattern.split('/').count() == path.split('/').count()
 }
 
 /// Detect a WebSocket upgrade request by checking for the presence of both
@@ -324,6 +340,7 @@ mod tests {
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

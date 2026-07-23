@@ -36,7 +36,7 @@ use dormant_core::types::{BlankMode, CmdFailure};
 use crate::ddc_lock::{PanelLock, PanelLocks};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::vcp_ops::RealVcp;
-use crate::vcp_ops::{VcpOps, VcpPriority};
+use crate::vcp_ops::{INPUT_SOURCE_SKIPPED, VCP_SKIPPED, VcpOps, VcpPriority};
 
 // ── VCP code constants ─────────────────────────────────────────────────────────
 
@@ -51,6 +51,9 @@ const VCP_POWER: u8 = 0xD6;
 /// [`crate::vcp_ops::VcpOps::get_vcp_raw`] and decoded per
 /// [`decode_usage_hours`] rather than the plain `get_vcp` u16 path.
 const VCP_USAGE_HOURS: u8 = 0xC0;
+
+/// VCP code for the currently active input source.
+const VCP_INPUT_SOURCE: u8 = 0x60;
 
 /// D6 value: display on.
 const D6_ON: u16 = 0x01;
@@ -152,7 +155,7 @@ impl DdcciController {
             matcher,
             restore_brightness,
             configured_primary_mode,
-            ops: Arc::new(RealVcp),
+            ops: Arc::new(RealVcp::new()),
             locks: Arc::clone(locks),
             state: StdMutex::new(DdcState::default()),
         }
@@ -182,7 +185,7 @@ impl DdcciController {
     /// Test-only accessor: read the configured primary mode the registry
     /// wired in. Used by the registry-path test that asserts end-to-end
     /// config → controller wiring (mirrors `SamsungTizenController::configured_primary_mode`).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn configured_primary_mode(&self) -> BlankMode {
         self.configured_primary_mode
     }
@@ -556,6 +559,37 @@ impl DisplayController for DdcciController {
         self.read_state_at(VcpPriority::Sampler).await
     }
 
+    /// Read the active input source at sampler priority (VCP `0x60`).
+    ///
+    /// Unlike [`Self::read_state_sampled`], this preserves read failures and
+    /// lock skips so coordination and doctor consumers can distinguish an
+    /// unreadable panel from a skipped sample.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the controller has been probed but its VCP read
+    /// fails, including [`INPUT_SOURCE_SKIPPED`] when sampler priority yields
+    /// to a command-path caller, or if the reply cannot fit in an input code.
+    async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+        let (ident, lock) = {
+            let state = self.state.lock().unwrap();
+            match (&state.matched_ident, &state.panel_lock) {
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                _ => return Ok(None),
+            }
+        };
+
+        match self
+            .ops
+            .get_vcp_raw(&ident, VCP_INPUT_SOURCE, &lock, VcpPriority::Sampler)
+            .await
+        {
+            Ok(raw) => decode_input_source(raw).map(Some),
+            Err(error) if error == VCP_SKIPPED => Err(INPUT_SOURCE_SKIPPED.to_string()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Read the panel's cumulative usage-hours counter (VCP `0xC0`,
     /// MCCS "Display Usage Time").
     ///
@@ -677,10 +711,10 @@ impl DdcciController {
     async fn read_state_at(&self, prio: VcpPriority) -> Option<dormant_core::traits::PanelState> {
         use dormant_core::traits::{PanelState, PowerState};
 
-        let (ident, lock) = {
+        let (ident, lock, d6_supported) = {
             let state = self.state.lock().unwrap();
             match (&state.matched_ident, &state.panel_lock) {
-                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock), state.d6_supported),
                 _ => return None,
             }
         };
@@ -693,9 +727,10 @@ impl DdcciController {
             .ok();
 
         // Power: 0xD6 only exists on displays that advertised D6 support
-        // during probe.  Reading on a non-D6 display returns an error; we
-        // surface the `power` field as `None` in that case so the
-        // brightness read still ships in the report.
+        // during probe. Skip the read entirely on a non-D6 panel — an
+        // unsupported-code read every 2s coordination tick is wasted bus
+        // traffic under the panel lock, and a misclassified error reply
+        // would needlessly invalidate the handle cache (issue #127).
         //
         // Map the VCP value to `PowerState`:
         // - 0x01 → On
@@ -703,10 +738,14 @@ impl DdcciController {
         //   0x04 off-soft, 0x05 off-hard — all "panel not in use" family)
         // - read error / unsupported (including a sampler-priority skip) →
         //   None
-        let power = match self.ops.get_vcp(&ident, VCP_POWER, &lock, prio).await {
-            Ok(D6_ON) => Some(PowerState::On),
-            Ok(_) => Some(PowerState::Standby),
-            Err(_) => None,
+        let power = if d6_supported {
+            match self.ops.get_vcp(&ident, VCP_POWER, &lock, prio).await {
+                Ok(D6_ON) => Some(PowerState::On),
+                Ok(_) => Some(PowerState::Standby),
+                Err(_) => None,
+            }
+        } else {
+            None
         };
 
         // Return Some only when at least one read succeeded; an empty
@@ -731,6 +770,20 @@ impl DdcciController {
 fn decode_usage_hours(raw: [u8; 4]) -> u32 {
     let [_mh, ml, sh, sl] = raw;
     (u32::from(ml) << 16) | (u32::from(sh) << 8) | u32::from(sl)
+}
+
+/// Decode a VCP `0x60` raw reply `[mh, ml, sh, sl]` into an input-source code.
+///
+/// The maximum bytes are intentionally opaque: some panels report source codes
+/// outside their advertised capability map. Input-source codes must fit in the
+/// low byte, so a non-zero current-value high byte is rejected.
+fn decode_input_source(raw: [u8; 4]) -> Result<u8, String> {
+    let [_mh, _ml, sh, sl] = raw;
+    if sh == 0 {
+        Ok(sl)
+    } else {
+        Err(format!("input source value exceeds u8: 0x{sh:02X}{sl:02X}"))
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -887,6 +940,76 @@ mod tests {
         assert!(
             !ctrl2.supported_modes().contains(&BlankMode::PowerOff),
             "PowerOff should NOT be in supported_modes when D6 is unsupported"
+        );
+    }
+
+    /// `read_state_at` skips the VCP 0xD6 read when `probe()` recorded
+    /// `d6_supported = false`. A non-D6 panel returns an unsupported-code
+    /// error on every D6 read; without the skip, each 2s coordination tick
+    /// would issue a wasted bus transaction under the panel lock (and risk a
+    /// misclassified error invalidating the handle cache — issue #127). The
+    /// skip is stable across ticks.
+    #[tokio::test]
+    async fn read_state_at_skips_d6_when_unsupported() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            // probe: D6 read errors → d6_supported = false.
+            f.expect_get(ident, VCP_POWER, Err("DDC/CI error: unsupported".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        assert!(
+            !ctrl.state.lock().unwrap().d6_supported,
+            "probe must record d6_supported = false when the D6 read errors"
+        );
+        // Drop the probe's call log so only the tick reads remain.
+        let _ = fake.take_call_log();
+
+        // A coordination tick reads input source (0x60) then panel state
+        // (brightness 0x10 + power 0xD6). On a non-D6 panel the 0xD6 read is
+        // skipped — only 0x60 and 0x10 hit the bus.
+        fake.expect_get_raw(ident, VCP_INPUT_SOURCE, Ok([0xFF, 0xFF, 0x00, 0x11]));
+        fake.expect_get(ident, VCP_BRIGHTNESS, Ok(42));
+
+        assert_eq!(ctrl.read_input_source_sampled().await, Ok(Some(0x11)));
+        let state = ctrl
+            .read_state_sampled()
+            .await
+            .expect("brightness read succeeds → Some(PanelState)");
+        assert_eq!(state.brightness, Some(42));
+        assert!(state.power.is_none(), "non-D6 panel: power must be None");
+
+        let log = fake.take_call_log();
+        assert!(
+            !log.iter().any(|c| c.contains("0xD6")),
+            "non-D6 panel: 0xD6 must never be read: {log:?}"
+        );
+        assert_eq!(
+            log,
+            vec![
+                format!("get_vcp_raw({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+                format!("get_vcp({ident}, 0x{VCP_BRIGHTNESS:02X})"),
+            ]
+        );
+
+        // Tick 2: D6 still skipped — the skip is stable, not one-shot.
+        fake.expect_get_raw(ident, VCP_INPUT_SOURCE, Ok([0xFF, 0xFF, 0x00, 0x12]));
+        fake.expect_get(ident, VCP_BRIGHTNESS, Ok(43));
+        let _ = ctrl.read_input_source_sampled().await;
+        let _ = ctrl.read_state_sampled().await;
+        let log2 = fake.take_call_log();
+        assert!(
+            !log2.iter().any(|c| c.contains("0xD6")),
+            "tick 2: 0xD6 must still be skipped: {log2:?}"
         );
     }
 
@@ -1744,6 +1867,102 @@ mod tests {
             "read_usage_hours must flow through exactly one get_vcp_raw(0xC0) \
              call, not get_vcp or any other opcode: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ddcci_input_source_uses_raw_0x60_at_sampler_priority() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_get_raw(ident, VCP_INPUT_SOURCE, Ok([0xFF, 0xFF, 0x00, 0x11]));
+
+        assert_eq!(ctrl.read_input_source_sampled().await, Ok(Some(0x11)));
+        assert_eq!(
+            fake.take_call_log(),
+            vec![format!("get_vcp_raw({ident}, 0x{VCP_INPUT_SOURCE:02X})")]
+        );
+    }
+
+    #[test]
+    fn decode_input_source_ignores_maximum_and_rejects_wide_values() {
+        assert_eq!(decode_input_source([0xFF, 0xFF, 0x00, 0x11]), Ok(0x11));
+        assert_eq!(
+            decode_input_source([0x00, 0x00, 0x01, 0x11]),
+            Err("input source value exceeds u8: 0x0111".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn input_source_sampler_skips_when_command_waits() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let lock = ctrl
+            .panel_lock_for_test()
+            .expect("a probed DdcciController has resolved a panel lock");
+
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let held_lock = Arc::clone(&lock);
+        let holder = std::thread::spawn(move || {
+            let _guard = held_lock.command_guard();
+            acquired_tx
+                .send(())
+                .expect("test receiver must wait for the command holder");
+            release_rx
+                .recv()
+                .expect("test must release the command holder");
+        });
+        acquired_rx
+            .recv()
+            .expect("command holder must acquire the panel lock");
+
+        assert_eq!(
+            ctrl.read_input_source_sampled().await,
+            Err(crate::vcp_ops::INPUT_SOURCE_SKIPPED.to_string())
+        );
+        release_tx
+            .send(())
+            .expect("command holder must still await release");
+        holder.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_input_source_none_when_not_probed() {
+        let ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::new(single_display_vcp()) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+
+        assert_eq!(ctrl.read_input_source_sampled().await, Ok(None));
     }
 
     #[tokio::test]

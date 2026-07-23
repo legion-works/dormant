@@ -20,10 +20,13 @@ pub mod schema;
 pub mod validate;
 
 pub use schema::{
-    Config, Credentials, DaemonConfig, DisplayConfig, IdleSource, IdleTimeUnit, MqttCredential,
-    RuleConfig, SensorConfig, SensorKind, Strictness, ValidationError, Warning, ZoneConfig,
+    Config, CoordinationConfig, Credentials, DaemonConfig, DisplayConfig, DisplayScope, IdleSource,
+    IdleTimeUnit, MqttCredential, RuleConfig, SensorConfig, SensorKind, Strictness,
+    ValidationError, Warning, ZoneConfig,
 };
-pub use validate::{STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate};
+pub use validate::{
+    STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate, validate_with_input_source_readers,
+};
 
 use std::path::Path;
 

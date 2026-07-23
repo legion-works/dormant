@@ -11,6 +11,17 @@ import CreateEntityForm from "../app/config/CreateEntityForm";
 afterEach(() => cleanup());
 
 describe("CreateEntityForm — id hygiene live feedback", () => {
+  it("display_creator_hides_input_code_for_private_scope", () => {
+    render(
+      <CreateEntityForm collection="displays" existingIds={[]} onCreate={() => {}} onCancel={() => {}} />,
+    );
+
+    expect(screen.getByLabelText("scope")).toHaveValue("private");
+    expect(screen.queryByLabelText("shared_input_code")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("scope"), { target: { value: "shared" } });
+    expect(screen.getByLabelText("shared_input_code")).toBeInTheDocument();
+  });
+
   it("shows no error for an empty id (not yet typed)", () => {
     render(
       <CreateEntityForm collection="sensors" existingIds={[]} onCreate={() => {}} onCancel={() => {}} />,

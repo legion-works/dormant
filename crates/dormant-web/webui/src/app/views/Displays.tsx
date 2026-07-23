@@ -53,8 +53,24 @@ function DisplayCard({
   onPause,
   onResume,
 }: DisplayCardProps) {
-  // Screen preview glyph by phase
+  const isShared = snap.scope === "shared";
+  const panelLabel = (() => {
+    switch (snap.panel_state?.power) {
+      case "on": return "ON";
+      case "standby": return "OFF";
+      default: return "unknown";
+    }
+  })();
+
+  // A peer can own a shared panel, so its local phase cannot describe hardware state.
   const previewGlyph = (() => {
+    if (isShared) {
+      switch (snap.panel_state?.power) {
+        case "on": return "● ON";
+        case "standby": return "○ OFF";
+        default: return "? unknown";
+      }
+    }
     switch (snap.phase) {
       case "active": return "● ON";
       case "grace": return "◐ grace";
@@ -67,8 +83,13 @@ function DisplayCard({
     }
   })();
 
-  const phaseIsAlive = snap.phase === "active" || snap.phase === "waking";
+  const phaseIsAlive = isShared
+    ? snap.panel_state?.power === "on"
+    : snap.phase === "active" || snap.phase === "waking";
   const isPaused = snap.paused;
+  const blankLabel = isShared
+    ? "Blank shared panel — affects all connected machines"
+    : "Force blank";
 
   const blankModeLabel = blankMode.split("_").map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
 
@@ -115,6 +136,18 @@ function DisplayCard({
               <div className="display-metric__label">Cmd gen</div>
               <div className="display-metric__value">{snap.cmd_gen}</div>
             </div>
+            {isShared && (
+              <>
+                <div className="display-metric">
+                  <div className="display-metric__label">Ownership</div>
+                  <div className="display-metric__value">{snap.owned ? "owner" : "deferred"}</div>
+                </div>
+                <div className="display-metric">
+                  <div className="display-metric__label">Panel</div>
+                  <div className="display-metric__value">{panelLabel}</div>
+                </div>
+              </>
+            )}
           </div>
 
           {/* Controller chain */}
@@ -145,7 +178,7 @@ function DisplayCard({
               className="display-action display-action--blank"
               onClick={() => onBlank(id)}
             >
-              Force blank
+              {blankLabel}
             </button>
             <button
               type="button"

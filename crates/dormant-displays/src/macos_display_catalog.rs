@@ -95,6 +95,7 @@ fn selector_for_display(display: CGDirectDisplayID) -> Option<String> {
         None
     } else {
         let mut buf = [0i8; 64];
+        let buffer_len = isize::try_from(buf.len()).ok()?;
         // Safety: `cf_string` is non-null and valid; `buf` is large enough
         // for any CFUUID string representation
         // ("XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" is 36 bytes + NUL).
@@ -102,7 +103,7 @@ fn selector_for_display(display: CGDirectDisplayID) -> Option<String> {
             CFStringGetCString(
                 cf_string,
                 buf.as_mut_ptr(),
-                buf.len() as isize,
+                buffer_len,
                 kCFStringEncodingUTF8,
             )
         };
@@ -127,6 +128,28 @@ fn selector_for_display(display: CGDirectDisplayID) -> Option<String> {
     result.map(|uuid| format!("cg:{uuid}"))
 }
 
+/// Enumerate online displays as stable `cg:<lowercase-uuid>` selectors.
+///
+/// # Errors
+///
+/// Returns an error when Quartz cannot enumerate online displays.
+pub fn online_selectors() -> Result<Vec<String>, String> {
+    let mut displays = [0; MAX_ONLINE_DISPLAYS];
+    let mut count = 0;
+    let max_displays = u32::try_from(MAX_ONLINE_DISPLAYS)
+        .map_err(|_| "online display limit does not fit in u32")?;
+    let result =
+        unsafe { CGGetOnlineDisplayList(max_displays, displays.as_mut_ptr(), &raw mut count) };
+    if result != 0 {
+        return Err(format!("CGGetOnlineDisplayList failed: {result}"));
+    }
+    Ok(displays[..count as usize]
+        .iter()
+        .copied()
+        .filter_map(selector_for_display)
+        .collect())
+}
+
 /// Real macOS Quartz gamma-table backend for
 /// [`crate::macos_gamma_black::MacosGammaBlackController`].
 pub struct RealGammaApi;
@@ -135,11 +158,11 @@ impl GammaApi for RealGammaApi {
     fn resolve(&self, selector: &str) -> Result<CGDirectDisplayID, GammaError> {
         let mut ids = [0u32; MAX_ONLINE_DISPLAYS];
         let mut count: u32 = 0;
+        let max_displays = u32::try_from(MAX_ONLINE_DISPLAYS)
+            .map_err(|_| GammaError::from("online display limit does not fit in u32"))?;
         // Safety: `ids` has `MAX_ONLINE_DISPLAYS` capacity, matching
         // `maxDisplays`; `count` is a valid out-param.
-        let err = unsafe {
-            CGGetOnlineDisplayList(MAX_ONLINE_DISPLAYS as u32, ids.as_mut_ptr(), &mut count)
-        };
+        let err = unsafe { CGGetOnlineDisplayList(max_displays, ids.as_mut_ptr(), &raw mut count) };
         if err != 0 {
             return Err(GammaError::from(format!(
                 "CGGetOnlineDisplayList failed: CGError {err}"
@@ -181,7 +204,7 @@ impl GammaApi for RealGammaApi {
                 red.as_mut_ptr(),
                 green.as_mut_ptr(),
                 blue.as_mut_ptr(),
-                &mut sample_count,
+                &raw mut sample_count,
             )
         };
         if err != 0 {

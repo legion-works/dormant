@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Multi-machine shared-display coordination: local DDC/CI input ownership,
+  opt-in mDNS discovery, and SPAKE2-protected dormant-instance pairing.
+
 ## [0.5.0] - 2026-07-19
 
 ### Added

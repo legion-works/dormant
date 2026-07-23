@@ -3,6 +3,7 @@
 - [Introduction](./introduction.md)
 - [Installation](./installation.md)
 - [Configuration](./configuration.md)
+- [Multi-machine coordination](./multi-machine.md)
 - [Sensors](./sensors.md)
 - [Displays](./displays.md)
 - [Panel-wear tracking](./oled-health.md)

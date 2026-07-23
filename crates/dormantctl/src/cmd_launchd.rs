@@ -33,6 +33,7 @@ pub const EMBEDDED_TRAY_PLIST: &[u8] =
     include_bytes!("../../dormant-tray/share/com.legionworks.dormant-tray.plist");
 
 /// Backward-compatible alias for the embedded daemon plist.
+#[allow(dead_code)] // Retained for callers migrating to the explicit daemon/tray constants.
 pub const EMBEDDED_PLIST: &[u8] = EMBEDDED_DAEMON_PLIST;
 
 const DAEMON_PLIST_FILE_NAME: &str = "com.legionworks.dormant.plist";
@@ -99,6 +100,7 @@ pub enum LaunchdOutcome {
     /// Uninstall result for both managed agents.
     Uninstalled(UninstallResult),
     /// Not macOS — `launchd` has no meaning on this platform.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     NotSupported,
 }
 

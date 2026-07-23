@@ -5,6 +5,8 @@
 pub mod config;
 pub mod ddcci;
 pub mod ha;
+#[cfg(target_os = "macos")]
+pub mod macos_display_catalog;
 pub mod macos_display_sleep;
 pub mod macos_idle;
 pub mod macos_power;

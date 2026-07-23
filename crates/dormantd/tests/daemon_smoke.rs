@@ -7,6 +7,8 @@
 
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -332,11 +334,332 @@ async fn start_coordinator_app(
     .expect("start coordinator app")
 }
 
+#[tokio::test]
+async fn paired_peers_survive_restart() {
+    let paths_a = TestAppPaths::new();
+    let paths_b = TestAppPaths::new();
+    dormantd::coordination_pairing::pair_over_loopback_for_test(
+        paths_a.state.clone(),
+        paths_b.state.clone(),
+    )
+    .await
+    .expect("pair isolated daemon state directories over loopback TCP");
+
+    for paths in [&paths_a, &paths_b] {
+        let peers = paths.state.join("peers.json");
+        assert!(peers.exists(), "paired state should be durable");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&peers).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let config_a = write_file(
+        paths_a.root(),
+        "config.toml",
+        &one_display_config(&paths_a.marker, "1s"),
+    );
+    let config_b = write_file(
+        paths_b.root(),
+        "config.toml",
+        &one_display_config(&paths_b.marker, "1s"),
+    );
+    let creds_a = write_credentials(paths_a.root(), "");
+    let creds_b = write_credentials(paths_b.root(), "");
+    let app_a = App::build_with_sources(
+        config_a,
+        creds_a,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths_a.state.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .expect("rebuild first daemon from paired state");
+    let app_b = App::build_with_sources(
+        config_b,
+        creds_b,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths_b.state.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .expect("rebuild second daemon from paired state");
+    shutdown(app_a.0, app_a.1).await;
+    shutdown(app_b.0, app_b.1).await;
+
+    assert!(paths_a.state.join("peers.json").exists());
+    assert!(paths_b.state.join("peers.json").exists());
+}
+
 fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {
     one_display_config(marker, "1s").replace(
         "startup_holdoff = \"0s\"",
         &format!("startup_holdoff = \"{startup_holdoff}\"\nreload_debounce = \"100ms\""),
     )
+}
+
+fn shared_display_config(marker: &Path) -> String {
+    one_display_config(marker, "1s")
+        .replace(
+            "controllers = [\"command\"]",
+            "controllers = [\"command\", \"ddcci\"]\nscope = \"shared\"\nshared_input_code = 0x0f",
+        )
+        .replace(
+            "blank_mode = \"power_off\"",
+            "blank_mode = \"brightness_zero\"",
+        )
+        .replace("modes = [\"power_off\"]", "modes = [\"brightness_zero\"]")
+}
+
+fn additional_shared_display(name: &str, marker: &Path) -> String {
+    format!(
+        "\n[displays.{name}]\ncontrollers = [\"command\", \"ddcci\"]\nscope = \"shared\"\nshared_input_code = 0x0f\nblank_mode = \"brightness_zero\"\nblank_command = \"printf B >> '{}'\"\nwake_command = \"printf W >> '{}'\"\nmodes = [\"brightness_zero\"]\n",
+        marker.display(),
+        marker.display(),
+    )
+}
+
+#[tokio::test]
+async fn all_private_start_passes_always_owned() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &coordinator_config(&paths.marker, "0s"),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+
+    let (handle, join) = start_coordinator_app(config_path, creds_path).await;
+
+    assert!(handle.coordination_handle().is_none());
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn initial_shared_start_passes_coordination_gate() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+
+    let (handle, join) = start_coordinator_app(config_path, creds_path).await;
+
+    assert!(handle.coordination_handle().is_some());
+    shutdown(handle, join).await;
+}
+
+async fn reload_from_file(
+    handle: &dormantd::app::AppHandle,
+) -> dormant_core::observation::ReloadReceipt {
+    handle
+        .request_control_reload()
+        .await
+        .expect("reload coordinator returns a receipt")
+}
+
+#[tokio::test]
+async fn reload_retains_false_verdict_for_surviving_shared_display() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+    let display = DisplayId("mon".into());
+    assert_eq!(
+        coordination.record_success(&display, 0x10, 0x0f, None),
+        Some(true)
+    );
+
+    fs::write(
+        &config_path,
+        shared_display_config(&paths.marker)
+            .replace("grace_period = \"1s\"", "grace_period = \"2s\""),
+    )
+    .expect("rewrite shared config");
+    let receipt = reload_from_file(&handle).await;
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    let record = &coordination.snapshot()[&display];
+    assert!(!record.owned);
+    assert!(record.has_successful_input_read);
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn reload_seeds_new_shared_and_drops_removed() {
+    let paths = TestAppPaths::new();
+    let initial = format!(
+        "{}{}",
+        shared_display_config(&paths.marker),
+        additional_shared_display("removed", &paths.marker)
+    );
+    let config_path = write_file(paths.root(), "config.toml", &initial);
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+    let mon = DisplayId("mon".into());
+    let removed = DisplayId("removed".into());
+    coordination.record_success(&mon, 0x10, 0x0f, None);
+
+    fs::write(
+        &config_path,
+        format!(
+            "{}{}",
+            shared_display_config(&paths.marker),
+            additional_shared_display("added", &paths.marker)
+        ),
+    )
+    .expect("replace shared displays");
+    assert_eq!(
+        reload_from_file(&handle).await.outcome,
+        ReloadOutcome::Reloaded
+    );
+    let records = coordination.snapshot();
+    assert!(!records[&mon].owned);
+    assert!(!records.contains_key(&removed));
+    let added = &records[&DisplayId("added".into())];
+    assert!(added.owned);
+    assert!(!added.has_successful_input_read);
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn reload_removing_last_shared_reverts_to_always_owned_behavior() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+
+    fs::write(&config_path, one_display_config(&paths.marker, "1s"))
+        .expect("rewrite private config");
+    assert_eq!(
+        reload_from_file(&handle).await.outcome,
+        ReloadOutcome::Reloaded
+    );
+    assert!(coordination.snapshot().is_empty());
+    let snapshot = snapshot_with_retry(&handle.control_sender()).await;
+    assert!(snapshot.displays.iter().any(|(id, _)| id == "mon"));
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn reload_first_shared_display_is_rejected_with_restart_required_detail() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &one_display_config(&paths.marker, "1s"),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+
+    fs::write(&config_path, shared_display_config(&paths.marker)).expect("rewrite shared config");
+    let receipt = reload_from_file(&handle).await;
+    assert!(
+        matches!(receipt.outcome, ReloadOutcome::Rejected(ref detail) if detail == "E_CONFIG_INVALID: adding the first shared display requires daemon restart")
+    );
+    assert!(handle.coordination_handle().is_none());
+    assert!(
+        snapshot_with_retry(&handle.control_sender())
+            .await
+            .displays
+            .iter()
+            .any(|(id, _)| id == "mon")
+    );
+    // Forward-compat guard: rejected reloads must not create M3's peer store.
+    assert!(!paths.state.join("coord").exists());
+    shutdown(handle, join).await;
+}
+
+#[tokio::test]
+async fn ownership_poll_after_reload_reflects_cache_round_trip_through_wire() {
+    let paths = TestAppPaths::new();
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &shared_display_config(&paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+    let (handle, join) = start_coordinator_app(config_path.clone(), creds_path).await;
+    let coordination = handle
+        .coordination_handle()
+        .expect("shared startup has cache");
+    let display = DisplayId("mon".into());
+    coordination.record_success(&display, 0x10, 0x0f, None);
+
+    fs::write(
+        &config_path,
+        shared_display_config(&paths.marker)
+            .replace("grace_period = \"1s\"", "grace_period = \"2s\""),
+    )
+    .expect("rewrite shared config");
+    assert_eq!(
+        reload_from_file(&handle).await.outcome,
+        ReloadOutcome::Reloaded
+    );
+    let before_poke = snapshot_with_retry(&handle.control_sender()).await;
+    let before_poke_display = before_poke
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("shared display survives reload");
+    // These assertions verify the CoordinationHandle cache round-trips through the
+    // engine to the wire snapshot: DisplaySnapshot.owned reads the daemon-lifetime
+    // cache directly (not the engine's last_owned field). They fail if the CACHE is
+    // stale; the engine seeds last_owned from this same cache via install_restored_machine.
+    assert!(
+        !before_poke_display.1.owned,
+        "reloaded engine must surface the seeded false ownership cache"
+    );
+    assert_eq!(
+        coordination.record_success(&display, 0x0f, 0x0f, None),
+        Some(false)
+    );
+    handle
+        .control_sender()
+        .send(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        })
+        .await
+        .expect("poke new engine");
+    let after_poke = snapshot_with_retry(&handle.control_sender()).await;
+    let after_poke_display = after_poke
+        .displays
+        .iter()
+        .find(|(id, _)| id == "mon")
+        .expect("shared display survives ownership poll");
+    assert!(
+        after_poke_display.1.owned,
+        "post-poll status round-trip must surface ownership=true"
+    );
+    assert!(coordination.snapshot()[&display].owned);
+    shutdown(handle, join).await;
 }
 
 /// Write a credentials file with correct 0o600 permissions (Unix).
@@ -4507,6 +4830,7 @@ async fn watchdog_reload_mid_window_resets_candidate() {
 /// (and, via `include_displays`, from `[displays]` entirely) on reload —
 /// enough removed displays to distinguish "one ping per removed display"
 /// from "one ping for the whole loop" (P9).
+#[cfg(target_os = "linux")]
 fn three_display_config(
     m1: &Path,
     m2: &Path,
@@ -5218,11 +5542,14 @@ async fn rejected_reload_can_repeat_after_rollback_restore() {
 //     unfrozen grace countdown that expires before ordinary debounce would
 //     ever assert, and the display blanks — visibly RED.
 
+#[cfg(target_os = "linux")]
 const AUDIO_MOVIE_FIXTURE: &str = include_str!("fixtures/pw_dump/movie.json");
+#[cfg(target_os = "linux")]
 const AUDIO_IDLE_FIXTURE: &str = include_str!("fixtures/pw_dump/idle.json");
 
 /// Wrap a raw `pw-dump` JSON fixture in a `#!/bin/sh` script that `cat`s it
 /// verbatim (the `audio_source.rs` poller-test precedent, same mechanism).
+#[cfg(target_os = "linux")]
 fn audio_cat_script(json: &str) -> String {
     format!("#!/bin/sh\ncat <<'AUDIO_FIXTURE_EOF'\n{json}\nAUDIO_FIXTURE_EOF\n")
 }
@@ -5230,6 +5557,7 @@ fn audio_cat_script(json: &str) -> String {
 /// Write a fake `pw-dump` script emitting `json`, executable (0o755 — the
 /// `write_credentials` `PermissionsExt` precedent above; same mechanism,
 /// 0o755 not 0o600 because this file must be executable).
+#[cfg(target_os = "linux")]
 fn write_pw_dump_script(dir: &Path, json: &str) -> PathBuf {
     let path = dir.join("pw-dump");
     fs::write(&path, audio_cat_script(json)).unwrap();
@@ -5245,6 +5573,7 @@ fn write_pw_dump_script(dir: &Path, json: &str) -> PathBuf {
 /// write-temp + `chmod` 0o755 BEFORE rename — rename carries the temp's
 /// mode, so losing the exec bit would silently flip the poller onto its
 /// failure path (R2-N, `audio_source.rs`'s `rewrite_script` precedent).
+#[cfg(target_os = "linux")]
 fn rewrite_pw_dump_script(path: &Path, json: &str) {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, audio_cat_script(json)).unwrap();
@@ -5262,6 +5591,7 @@ fn rewrite_pw_dump_script(path: &Path, json: &str) {
 /// `grace`/`min_active` are tunable per case (P3/P4); `log_level` is the
 /// unrelated daemon-level knob the reload test flips (`reload_carry_config`
 /// precedent above).
+#[cfg(target_os = "linux")]
 fn audio_rule_config(
     marker: &Path,
     script: &Path,

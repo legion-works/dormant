@@ -13,7 +13,7 @@
 import FormSection from "./FormSection";
 import LadderEditor from "./LadderEditor";
 import ScreensaverEditor from "./ScreensaverEditor";
-import { EnumField, PANEL_TYPES } from "./fields";
+import { EnumField, NumberField, PANEL_TYPES } from "./fields";
 import { useState, useEffect } from "react";
 import type { DisplayConfig, LadderStage, RuleConfig } from "../../api/types";
 import type { PatchStore } from "./patch";
@@ -112,7 +112,8 @@ export default function DisplaysSection({
     <FormSection title="Displays">
       {ids.map((id) => {
         const cfg = displays[id];
-        const basePath = ["displays", id];
+              const basePath = ["displays", id];
+              const scope = (store.getEdit([...basePath, "scope"]) ?? cfg.scope ?? "private") as "private" | "shared";
 
         // Fetched state
         const fetchedLadder = cfg.ladder && cfg.ladder.length > 0;
@@ -151,8 +152,27 @@ export default function DisplaysSection({
               </p>
             )}
 
-            <div className="cf-card__fields">
-              {/* ── Mode toggle ── */}
+                  <div className="cf-card__fields">
+                    <EnumField
+                      path={[...basePath, "scope"]}
+                      label="scope"
+                      value={scope}
+                      locked={store.isLocked([...basePath, "scope"], redactedPaths)}
+                      onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                      options={["private", "shared"]}
+                      error={fieldErrors[[...basePath, "scope"].join(".")]}
+                    />
+                    {scope === "shared" && (
+                      <NumberField
+                        path={[...basePath, "shared_input_code"]}
+                        label="shared_input_code"
+                        value={cfg.shared_input_code ?? ""}
+                        locked={store.isLocked([...basePath, "shared_input_code"], redactedPaths)}
+                        onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                        error={fieldErrors[[...basePath, "shared_input_code"].join(".")]}
+                      />
+                    )}
+                    {/* ── Mode toggle ── */}
               <div className="cf-field">
                 <label className="cf-field__label">Mode</label>
                 <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>

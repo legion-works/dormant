@@ -1,6 +1,8 @@
 import json
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -285,6 +287,112 @@ rename to crates/example/tests/renamed.rs
 
         with self.assertRaisesRegex(select_changed_tests.SelectionError, "examples/tests/forgotten.rs.*unmappable"):
             select_changed_tests.select_targets(change, self.metadata, "linux")
+
+    def test_lib_owned_nested_module_selects_library_target(self):
+        # A changed module reached only from the library root (`pub mod menu`)
+        # maps to --lib, not --bin, when both roots are available to the
+        # ownership walk. This is the dormant-tray shape: menu.rs is `pub mod
+        # menu` in lib.rs and unreached by main.rs (which `use`s the crate).
+        change = diff(
+            "crates/hybrid/src/menu.rs",
+            "18,1",
+            "18,1",
+            "-    assert_eq!(old(), 1);\n+    assert_eq!(new(), 1);",
+            "fn checks_menu()",
+        )
+        sources = {
+            "crates/hybrid/src/main.rs": ("fn main() {}", "fn main() {}"),
+            "crates/hybrid/src/lib.rs": ("pub mod menu;", "pub mod menu;"),
+            "crates/hybrid/src/menu.rs": ("#[cfg(test)] mod tests {}", "#[cfg(test)] mod tests {}"),
+        }
+
+        selected = select_changed_tests.select_targets(change, self.metadata, "linux", sources)
+
+        self.assertEqual([(target.package, target.kind, target.name) for target in selected], [("hybrid", "lib", "hybrid")])
+
+    def test_nextest_commands_for_manifest_path_target_uses_repo_config(self):
+        target = select_changed_tests.Target("ddc-macos", "lib", "ddc-macos", "vendor/ddc-macos/Cargo.toml")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / ".config").mkdir()
+            (root / ".config" / "nextest.toml").write_text("[profile.ci]\n")
+            list_cmd, run_cmd, env = select_changed_tests.nextest_commands(target, 3, root)
+
+        self.assertIn("--config-file", list_cmd)
+        # CARGO_TARGET_DIR is deliberately NOT set: nextest resolves the JUnit
+        # report relative to the manifest workspace root, so redirecting build
+        # artifacts to the repo target/ would split the report away from where
+        # _copy_junit looks.
+        self.assertEqual(env, {})
+        self.assertIn("--config-file", run_cmd)
+        self.assertIn("--stress-count", run_cmd)
+
+    def test_copy_junit_source_follows_manifest_workspace_root(self):
+        # Regression: for a --manifest-path target in a separate workspace (the
+        # vendored ddc-macos fork), nextest writes JUnit to that workspace's own
+        # target/, not the repo target/ and not CARGO_TARGET_DIR. _copy_junit must
+        # look at the manifest workspace root, or it reports "nextest did not
+        # produce ..." and the job exits nonzero even though every test passed.
+        root = pathlib.Path("/repo")
+        manifest_target = select_changed_tests.Target("ddc-macos", "lib", "ddc-macos", "vendor/ddc-macos/Cargo.toml")
+        workspace_target = select_changed_tests.Target("dormant-core", "lib", "dormant-core")
+
+        self.assertEqual(
+            select_changed_tests._manifest_workspace_root(root, manifest_target),
+            pathlib.Path("/repo/vendor/ddc-macos"),
+        )
+        self.assertEqual(select_changed_tests._manifest_workspace_root(root, workspace_target), root)
+
+    def test_nextest_commands_for_workspace_target_has_no_extra_config(self):
+        target = select_changed_tests.Target("dormant-core", "lib", "dormant-core")
+
+        list_cmd, run_cmd, env = select_changed_tests.nextest_commands(target, 5, pathlib.Path("/repo"))
+
+        self.assertNotIn("--config-file", list_cmd)
+        self.assertEqual(env, {})
+
+    def test_load_source_files_loads_crate_roots_for_ownership(self):
+        # Regression: a changed non-root file whose crate roots (lib.rs/main.rs)
+        # are NOT in the diff must still resolve to its owning target. Before the
+        # fix, load_source_files only loaded changed files, so the ownership walk
+        # had no roots and fell back to every candidate (selecting a zero-test
+        # --bin alongside the --lib that owns the tests).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+            src = root / "crates/hybrid/src"
+            src.mkdir(parents=True)
+            (src / "lib.rs").write_text("pub mod menu;\n")
+            (src / "main.rs").write_text("fn main() {}\n")
+            (src / "menu.rs").write_text("pub fn m() {}\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=root, check=True)
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            (src / "menu.rs").write_text("pub fn m() {}\n#[cfg(test)] mod tests { #[test] fn t() {} }\n")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "head"], cwd=root, check=True)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=True).stdout.strip()
+            diff = subprocess.run(["git", "diff", "--unified=0", f"{base}..{head}"], cwd=root, text=True, capture_output=True, check=True).stdout
+            metadata_json = json.dumps({"packages": [{
+                "name": "hybrid",
+                "manifest_path": str(root / "crates/hybrid/Cargo.toml"),
+                "targets": [
+                    {"name": "hybrid", "kind": ["lib"], "src_path": str(src / "lib.rs")},
+                    {"name": "hybrid", "kind": ["bin"], "src_path": str(src / "main.rs")},
+                ],
+            }]})
+            metadata = select_changed_tests.parse_metadata(metadata_json, root)
+
+            sources = select_changed_tests.load_source_files(root, base, head, diff, metadata)
+
+            self.assertIn("crates/hybrid/src/lib.rs", sources)
+            self.assertIn("crates/hybrid/src/main.rs", sources)
+            self.assertIn("crates/hybrid/src/menu.rs", sources)
+            selected = select_changed_tests.select_targets(diff, metadata, "linux", sources)
+            self.assertEqual([(t.package, t.kind, t.name) for t in selected], [("hybrid", "lib", "hybrid")])
 
     def test_junit_destination_includes_target_kind(self):
         root = pathlib.Path("/repo")

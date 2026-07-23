@@ -417,6 +417,7 @@ mod tests {
             }),
         );
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -452,6 +453,7 @@ mod tests {
             },
         );
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -524,6 +526,7 @@ mod tests {
     #[test]
     fn redact_config_secrets_redacts_ha_sensor_urls() {
         let mut cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -603,6 +606,8 @@ mod tests {
         displays.insert(
             "tv".into(),
             DisplayConfig {
+                scope: dormant_core::config::DisplayScope::default(),
+                shared_input_code: None,
                 controllers: vec!["kwin-dpms".into()],
                 blank_mode: None,
                 degraded_mode: None,
@@ -629,6 +634,7 @@ mod tests {
         );
 
         let mut cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -678,6 +684,7 @@ mod tests {
             }),
         );
         let mut cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -796,6 +803,7 @@ entity = "binary_sensor.motion"
             }),
         );
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -836,6 +844,7 @@ entity = "binary_sensor.motion"
             },
         );
         let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -932,6 +941,8 @@ field = "/val"
     /// no screensaver.
     fn display_all_optionals_absent(controller: &str) -> DisplayConfig {
         DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: vec![controller.into()],
             blank_mode: None,
             degraded_mode: None,
@@ -982,6 +993,8 @@ field = "/val"
             shift_interval: defaults::SHIFT_INTERVAL,
         };
         DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             ladder: vec![LadderStage {
                 kind: StageKind::RenderScreensaver,
                 dwell: None,
@@ -993,6 +1006,7 @@ field = "/val"
 
     fn config_with_displays(displays: IndexMap<String, DisplayConfig>) -> Config {
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),

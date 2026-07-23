@@ -50,6 +50,10 @@ fn spawn_fake_engine() -> (
                     inhibited: false,
                     paused: false,
                     cmd_gen: 1,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
                     controllers: vec![],
                     wake_attempts: 0,
                     last_blank_failed: false,
@@ -63,6 +67,10 @@ fn spawn_fake_engine() -> (
                     inhibited: false,
                     paused: false,
                     cmd_gen: 3,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
                     controllers: vec![],
                     wake_attempts: 0,
                     last_blank_failed: false,
@@ -115,6 +123,7 @@ async fn send_request(socket_path: &Path, request: &IpcRequest) -> IpcResponse {
 /// signature is satisfied) and will not be invoked.
 fn fake_doctor(ctl_tx: mpsc::Sender<ControlMsg>) -> DoctorService {
     let (config_tx, config_rx) = watch::channel(Arc::new(Config {
+        coordination: dormant_core::config::CoordinationConfig::default(),
         config_version: 1,
         daemon: DaemonConfig::default(),
         wear: dormant_core::config::schema::WearConfig::default(),

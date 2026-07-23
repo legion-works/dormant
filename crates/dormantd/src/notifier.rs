@@ -943,6 +943,10 @@ mod tests {
                             wake_attempts: *wake_attempts,
                             last_blank_failed: *last_blank_failed,
                             stage: None,
+                            scope: dormant_core::config::DisplayScope::Private,
+                            owned: true,
+                            observed_input_code: None,
+                            panel_state: None,
                         },
                     )
                 })

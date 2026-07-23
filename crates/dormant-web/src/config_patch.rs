@@ -1872,6 +1872,48 @@ grace_period = "30s" # trailing grace_period comment
     }
 
     #[test]
+    fn apply_preserves_display_scope_and_shared_input_code() {
+        let mut doc = doc(r#"
+config_version = 1
+
+[displays.shared_oled]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+scope = "shared"
+shared_input_code = 0x0f
+restore_brightness = 80
+"#);
+
+        let unrelated = [set(
+            &["displays", "shared_oled", "restore_brightness"],
+            json!(70),
+        )];
+        check_ok(&unrelated, &doc, &[]);
+        apply_patches(&mut doc, &unrelated).unwrap();
+
+        let after_unrelated: dormant_core::config::Config =
+            toml::from_str(&doc.to_string()).unwrap();
+        let display = &after_unrelated.displays["shared_oled"];
+        assert_eq!(display.scope, dormant_core::config::DisplayScope::Shared);
+        assert_eq!(display.shared_input_code, Some(0x0f));
+
+        let set_scope = [set(&["displays", "shared_oled", "scope"], json!("private"))];
+        check_ok(&set_scope, &doc, &[]);
+        apply_patches(&mut doc, &set_scope).unwrap();
+
+        let after_scope_set: dormant_core::config::Config =
+            toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(
+            after_scope_set.displays["shared_oled"].scope,
+            dormant_core::config::DisplayScope::Private
+        );
+        assert_eq!(
+            after_scope_set.displays["shared_oled"].shared_input_code,
+            Some(0x0f)
+        );
+    }
+
+    #[test]
     fn remove_playback_roles_actually_unsets_key() {
         let mut doc = doc(r#"
 config_version = 1

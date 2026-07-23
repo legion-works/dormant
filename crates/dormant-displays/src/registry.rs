@@ -14,7 +14,7 @@
 //!   empty vec for it and the per-display `modes` array is what fills in.
 //! - the per-display chain assembly (via [`build_controllers`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -172,7 +172,7 @@ pub fn controller_chain_fingerprint(cfg: &DisplayConfig) -> String {
         restore_brightness: _,
         samsung_restore_backlight: _,
         treat_unreachable_as_blanked,
-        panel_type: _,
+        ..
     } = cfg;
 
     format!(
@@ -228,6 +228,9 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "kwin-dpms",
     "samsung-tizen",
 ];
+/// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
+///
+/// macOS advertises controllers supported by its local display backends.
 #[cfg(target_os = "macos")]
 pub const CONTROLLER_TYPES: &[&str] = &[
     "command",
@@ -237,6 +240,9 @@ pub const CONTROLLER_TYPES: &[&str] = &[
     "macos-gamma-black",
     "samsung-tizen",
 ];
+/// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
+///
+/// Other platforms advertise only portable controller backends.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-tizen"];
 
@@ -285,6 +291,15 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
         ],
     );
     m
+}
+
+/// Controller type names that can read a panel's active-input VCP.
+#[must_use]
+pub fn input_source_readers() -> HashSet<String> {
+    let mut readers = HashSet::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    readers.insert("ddcci".to_string());
+    readers
 }
 
 /// Build the ordered controller chain for one display.
@@ -510,6 +525,8 @@ mod tests {
     fn command_cfg() -> DisplayConfig {
         DisplayConfig {
             controllers: vec!["command".into()],
+            scope: dormant_core::config::DisplayScope::Private,
+            shared_input_code: None,
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
             ladder: vec![],
@@ -829,6 +846,8 @@ mod tests {
 
         let cfg = DisplayConfig {
             controllers: vec!["samsung-tizen".into()],
+            scope: dormant_core::config::DisplayScope::Private,
+            shared_input_code: None,
             blank_mode: None,
             degraded_mode: None,
             ladder: vec![LadderStage {

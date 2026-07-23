@@ -261,4 +261,37 @@ mod tests {
             "encoded packet {encoded:?} does not match the hand-derived expected packet {expected:?}"
         );
     }
+
+    #[test]
+    fn raw_command_surface_accepts_input_source_opcode() {
+        fn assert_raw<T: DdcCommandRaw>() {}
+        assert_raw::<Monitor>();
+
+        let mut packet = [0u8; 36 + 3];
+        let encoded = Monitor::encode_command_for_test(0x37, &[0x01, 0x60], &mut packet);
+        let expected: [u8; 5] = [0x51, 0x82, 0x01, 0x60, 0xDC];
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a physical DDC/CI display"]
+    fn live_input_source_0x60_reads_current_input() {
+        let mut monitor = Monitor::enumerate()
+            .expect("enumerating DDC/CI displays should succeed")
+            .into_iter()
+            .next()
+            .expect("a physical DDC/CI display should be available");
+        let mut response = [0u8; 11];
+        let response = monitor
+            .execute_raw(&[0x01, 0x60], &mut response, Duration::from_millis(50))
+            .expect("raw input-source read should succeed");
+
+        assert_eq!(response[0], 0x02);
+        assert_eq!(response[1], 0x00);
+        assert_eq!(response[2], 0x60);
+        let input_source = u16::from_be_bytes([response[6], response[7]]);
+        println!("input source: 0x{input_source:02x}");
+    }
 }

@@ -97,6 +97,34 @@ pub const ENTITY_CRUD_ENABLED: bool = true;
 /// Whether the Samsung pairing wizard route is enabled by default.
 pub const PAIRING_ENABLED: bool = true;
 
+/// Whether multi-machine coordination services and operator routes are enabled.
+pub const COORDINATION_ENABLED: bool = false;
+
+/// Cadence for polling shared-display ownership state.
+pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cadence for refreshing shared-display panel state (brightness/power) for
+/// `DisplaySnapshot` cosmetics. Slower than [`COORDINATION_POLL_INTERVAL`]:
+/// every state read is a per-transaction VCP ioctl that takes the NVIDIA i2c
+/// driver's global `rwsem` in write mode — the residual compositor-stall
+/// source on cached-fd nodes. Ownership arbitration (VCP `0x60`) still runs at
+/// [`COORDINATION_POLL_INTERVAL`]; only panel-state cosmetics refresh here.
+/// When the config key is absent, the effective cadence is
+/// `max(COORDINATION_STATE_POLL_INTERVAL, poll_interval)` so the default is
+/// never below the ownership-poll cadence; an explicit value is validated
+/// `>= poll_interval` (see [`mod@super::validate`]).
+pub const COORDINATION_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Requested TCP port for a pairing listener; zero requests an ephemeral port.
+pub const COORDINATION_PAIRING_PORT: u16 = 0;
+
+/// Maximum lifetime of an operator-initiated pairing window.
+pub const COORDINATION_PAIRING_WINDOW: Duration = Duration::from_secs(300);
+
+/// Optional LAN address for a pairing listener; `None` selects the primary LAN
+/// address from the operating system's route table.
+pub const COORDINATION_PAIRING_BIND_ADDRESS: Option<&str> = None;
+
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);

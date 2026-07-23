@@ -972,6 +972,10 @@ mod tests {
                     inhibited: false,
                     paused: false,
                     cmd_gen: 0,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
                     controllers: Vec::new(),
                     wake_attempts: 0,
                     last_blank_failed: false,
@@ -1000,6 +1004,7 @@ mod tests {
     /// reads `.displays` and `.wear` from it.
     fn minimal_config() -> Config {
         Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: dormant_core::config::schema::DaemonConfig::default(),
             sensors: indexmap::IndexMap::new(),
@@ -1020,6 +1025,8 @@ mod tests {
         controllers: &[&str],
     ) -> dormant_core::config::schema::DisplayConfig {
         dormant_core::config::schema::DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
             controllers: controllers.iter().map(|s| (*s).to_string()).collect(),
             blank_mode: None,
             degraded_mode: None,

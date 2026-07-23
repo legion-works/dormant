@@ -21,7 +21,7 @@ use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
 use crate::routes::{
-    command, config, config_apply, daemon, doctor, events, operations, pair, wear,
+    command, config, config_apply, daemon, doctor, events, operations, pair, pair_dormant, wear,
 };
 use crate::security::security_guard;
 
@@ -107,6 +107,21 @@ pub(crate) fn build_router(state: WebState) -> Router {
         "/config/apply",
         post(config_apply::post_apply).layer(DefaultBodyLimit::max(64 * 1024))
     );
+    let api = route_post!(
+        api,
+        "/pair/instance",
+        post(pair_dormant::post_pair_instance).layer(DefaultBodyLimit::max(4 * 1024))
+    );
+    let api = route_post!(
+        api,
+        "/pair/instance/join",
+        post(pair_dormant::post_join_pair_instance).layer(DefaultBodyLimit::max(4 * 1024))
+    );
+    let api = route_post!(
+        api,
+        "/pair/instance/:id/cancel",
+        post(pair_dormant::post_cancel_pair_instance).layer(DefaultBodyLimit::max(4 * 1024))
+    );
     let api = route_post!(api, "/blank", post(command::post_blank));
     let api = route_post!(api, "/wake", post(command::post_wake));
     let api = route_post!(api, "/pause", post(command::post_pause));
@@ -131,6 +146,11 @@ pub(crate) fn build_router(state: WebState) -> Router {
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
         .route("/pair/samsung/:id", get(pair::get_pair_samsung))
+        .route(
+            "/pair/instance/peers",
+            get(pair_dormant::get_pair_instance_peers),
+        )
+        .route("/pair/instance/:id", get(pair_dormant::get_pair_instance))
         // API miss → 404, never the SPA fallback.
         .fallback(api_not_found)
         .with_state(state.clone());
@@ -235,6 +255,7 @@ mod tests {
         let (reload_tx, reload_rx) = tokio::sync::broadcast::channel(16);
 
         let config = Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
             wear: dormant_core::config::schema::WearConfig::default(),
@@ -568,6 +589,10 @@ mod tests {
                                     inhibited: false,
                                     paused: false,
                                     cmd_gen: 1,
+                                    scope: dormant_core::config::DisplayScope::Private,
+                                    owned: true,
+                                    observed_input_code: None,
+                                    panel_state: None,
                                     controllers: Vec::new(),
                                     wake_attempts: 0,
                                     last_blank_failed: false,

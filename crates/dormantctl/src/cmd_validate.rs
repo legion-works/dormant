@@ -7,9 +7,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use dormant_core::config::{Strictness, load_config, load_credentials, validate};
+use dormant_core::config::{
+    Strictness, load_config, load_credentials, validate_with_input_source_readers,
+};
 use dormant_core::paths;
-use dormant_displays::registry::capabilities;
+use dormant_displays::registry::{capabilities, input_source_readers};
 
 /// Validate the configuration offline.
 #[derive(Parser, Debug)]
@@ -53,7 +55,8 @@ pub fn run(args: &ValidateArgs) -> Result<()> {
 
     let creds = load_credentials(&creds_path)?;
 
-    let errors = validate(&cfg, &capabilities(), &creds);
+    let errors =
+        validate_with_input_source_readers(&cfg, &capabilities(), &input_source_readers(), &creds);
     if errors.is_empty() {
         println!("configuration OK");
         Ok(())

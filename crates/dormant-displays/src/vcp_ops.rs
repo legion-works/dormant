@@ -76,7 +76,11 @@
 //!    panel's in-flight enumeration — the same concurrent-i²c hazard
 //!    `PanelLock` exists for. The gate closes it: one physical DDC access at
 //!    a time, process-wide. `list_displays` acquires the gate alone (no
-//!    panel lock exists yet during `probe`).
+//!    panel lock exists yet during `probe`). Cache teardown — the old
+//!    generation's last `Arc<RealVcpState>` dropping on reload — also
+//!    acquires the gate (`RealVcpState`'s `Drop`), so the cached handles'
+//!    `/dev/i2c-*` closes are serialized rather than racing the new
+//!    generation's gated transactions.
 //! 3. **Cache mutex** (innermost) — held only for `HashMap` take/insert,
 //!    never across I/O, enumeration, or panel-lock acquisition.
 //!
@@ -85,7 +89,8 @@
 //! in practice. Enumeration is rare (first use, invalidation, or max-age
 //! revalidation); steady state is one gate acquire per VCP op against a
 //! cached handle, and the operations are already spaced by the coordination
-//! poll.
+//! poll. Teardown is rarer still (one per reload) and may block briefly on a
+//! runtime thread — tolerated because it is both rare and bounded.
 //!
 //! [`VcpPriority`] selects the panel-lock acquisition strategy:
 //! [`VcpPriority::Command`] blocks until the panel is free (command/blank/
@@ -404,6 +409,16 @@ impl<H> HandleCache<H> {
             .insert(ident.to_string(), (handle, resolved_at));
     }
 
+    /// Drain all entries for teardown. The caller (a `Drop` impl) acquires
+    /// the physical-DDC gate FIRST, then calls this; the returned map drops
+    /// under that gate so the cached handles' fd closes are serialized. The
+    /// cache mutex is released before the map drops — only the gate spans the
+    /// handle closes (gate outer, cache mutex innermost, same order as
+    /// `vcp_transaction`).
+    fn drain_for_teardown(&self) -> HashMap<String, (H, Instant)> {
+        std::mem::take(&mut *self.entries.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Test seam: read the resolve count.
     #[cfg(test)]
     fn resolve_count(&self) -> usize {
@@ -453,6 +468,23 @@ impl Clone for RealVcp {
         Self {
             state: Arc::clone(&self.state),
         }
+    }
+}
+
+/// Gate the cached handles' teardown so the `/dev/i2c-*` fd closes (NVIDIA
+/// RM teardown — the #127 mechanism) are serialized like every other physical
+/// DDC access. Runs when the old generation's last `Arc<RealVcpState>` drops
+/// on reload — possibly on an async-runtime thread; blocking briefly here is
+/// tolerated (rare, ms-scale, and the old generation is already retired from
+/// service). Lock order matches `vcp_transaction`: gate (outer) → cache
+/// mutex (innermost).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for RealVcpState {
+    fn drop(&mut self) {
+        let _gate = ddc_gate();
+        // Drain under the cache mutex; the returned map drops at the end of
+        // this block, inside the gate guard, closing the cached handles.
+        let _drained = self.cache.drain_for_teardown();
     }
 }
 
@@ -1460,63 +1492,40 @@ mod tests {
 
     /// A cached VCP op (cache hit, no resolve) still acquires the process-wide
     /// physical-DDC gate — the gate serializes ALL physical DDC traffic, not
-    /// just enumeration. Proven by mutual exclusion: while the gate is held by
-    /// another caller, a cached op blocks; once released, it completes (and
-    /// still hits the cache — no re-resolve). Uses the HandleCache/fake-handle
-    /// seam (no DDC hardware) and a bounded `recv_timeout` (not a raw sleep)
-    /// to assert the block.
+    /// just enumeration. Proven deterministically: the op closure runs inside
+    /// `vcp_transaction`'s gate, so a `try_lock` on the gate from within the
+    /// closure must return `WouldBlock`. No timing, no threads — if the gate
+    /// were NOT acquired, `try_lock` would succeed and the assertion would
+    /// fail. Uses the HandleCache/fake-handle seam (no DDC hardware).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn cached_op_acquires_physical_gate() {
-        let cache = std::sync::Arc::new(HandleCache::<TestHandle>::new(
-            test_resolve,
-            CACHE_REVALIDATE_AFTER,
-        ));
+    #[test]
+    fn cached_op_acquires_physical_gate() {
+        let cache = HandleCache::<TestHandle>::new(test_resolve, CACHE_REVALIDATE_AFTER);
         let ident = "i2c-dev:1 TST TEST";
         // Populate the cache (acquires + releases the gate).
         vcp_transaction(&cache, ident, |_| Ok::<(), String>(())).unwrap();
         assert_eq!(cache.resolve_count(), 1);
 
-        // Hold the process-wide gate from an OS thread.
-        let (holding_tx, holding_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let gate_thread = std::thread::spawn(move || {
-            let _gate = ddc_gate();
-            let _ = holding_tx.send(());
-            let _ = release_rx.recv();
-        });
-        holding_rx
-            .recv()
-            .expect("gate holder must signal it holds the gate");
-
-        // Cached op (cache hit) on an OS thread; signals completion on a
-        // channel so the test can time-bound the wait without a raw sleep.
-        let (op_done_tx, op_done_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let cache2 = std::sync::Arc::clone(&cache);
-        let op_thread = std::thread::spawn(move || {
-            let _ = vcp_transaction(&cache2, ident, |_| Ok::<(), String>(()));
-            let _ = op_done_tx.send(());
-        });
-
-        // A non-blocked cached op completes in microseconds; a 300 ms
-        // `recv_timeout` firing therefore proves the op is blocked on the
-        // gate, not merely unscheduled.
-        let recv = op_done_rx.recv_timeout(Duration::from_millis(300));
-        assert!(
-            recv.is_err(),
-            "cached op must block on the physical-DDC gate while it's held"
-        );
-
-        // Release the gate → cached op completes; resolve_count unchanged (hit).
-        let _ = release_tx.send(());
-        op_thread.join().expect("op thread must join");
+        // Cached op (cache hit). The closure observes the gate state from
+        // inside vcp_transaction's critical section — try_lock MUST find the
+        // gate held (WouldBlock). Deterministic: no scheduler dependence.
+        vcp_transaction(&cache, ident, |_| {
+            let gate = DDC_PHYSICAL_GATE
+                .get()
+                .expect("DDC_PHYSICAL_GATE initialized by the populate call above");
+            assert!(
+                matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                "vcp_transaction must hold the physical-DDC gate during the op closure"
+            );
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        // Still a cache hit — no re-resolve.
         assert_eq!(
             cache.resolve_count(),
             1,
             "cached op must hit the cache — no re-resolve"
         );
-
-        gate_thread.join().expect("gate holder thread must join");
     }
 
     // ── RealVcp cache tests (require DDC-capable display) ────────────────────

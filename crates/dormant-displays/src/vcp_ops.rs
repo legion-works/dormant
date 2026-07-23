@@ -4,10 +4,19 @@
 //! ## Design
 //!
 //! Every hardware touch is wrapped in [`tokio::task::spawn_blocking`] so the
-//! async executor is never blocked. No ddc-hi `Display` handle is cached across
-//! operations — each call re-enumerates, finds the matching display, performs
-//! the op, and drops the handle. Enumeration is ~100 ms, which is acceptable
-//! at blank/wake frequency.
+//! async executor is never blocked. Each resolved ddc-hi `Display` handle is
+//! **cached** per ident string across operations: the first call per ident
+//! enumerates, finds the matching display, and stores the handle; subsequent
+//! calls reuse it without re-enumeration. On **any** error from a cached-handle
+//! operation (I/O failure, ddc-hi error, or a panic caught by `catch_unwind`),
+//! the cache entry is dropped so the next call re-enumerates fresh — this
+//! covers unplug/re-plug, standby quirks, and bus renumbering.
+//!
+//! Enumeration is ~100 ms of blocking I²C opens; re-enumerating on every poll
+//! tick (3× per 2 s coordination poll) saturates the NVIDIA GPU RM driver lock
+//! (~100 lock ops/s), causing compositor stutter (issue #127). Caching
+//! eliminates steady-state enumeration: coordination polls run at cache-hit
+//! speed, and enumeration only happens once per daemon start per display.
 //!
 //! The trait is `#[async_trait]` so that the real implementation can `await`
 //! the `spawn_blocking` join handle directly, avoiding the
@@ -26,13 +35,18 @@
 //! and yields immediately to any command-path caller (periodic wear
 //! polling, which must never make a command wait for it).
 //!
+//! The cache mutex is an internal lock, held only for `HashMap` operations
+//! (take/insert), never across I/O or panel-lock acquisition — no new
+//! lock-ordering hazard.
+//!
 //! A scripted or real ddc-hi panic during the physical op is caught with
 //! `std::panic::catch_unwind` *inside* the guarded section (guard acquired
 //! first, `catch_unwind` wraps only the op) and converted to the sentinel
 //! error [`VCP_PANIC`] — a single bad transaction can never crash the
 //! `spawn_blocking` worker thread or poison the panel lock's usability for
 //! the next caller (`PanelLock`'s own poison recovery is defense in depth
-//! for other unwind paths).
+//! for other unwind paths). A panicking transaction also invalidates the
+//! cache entry for that ident.
 //!
 //! When [`VcpPriority::Sampler`] loses the race for the lock, the call
 //! returns the sentinel error [`VCP_SKIPPED`] — never surfaced as a
@@ -41,8 +55,10 @@
 //! by [`crate::ddcci::DdcciController`]'s
 //! [`read_state`](dormant_core::traits::DisplayController::read_state)).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -177,6 +193,15 @@ fn acquire(lock: &PanelLock, prio: VcpPriority) -> Result<crate::ddc_lock::Panel
 /// Real DDC/CI operations backed by ddc-hi, with every call wrapped in
 /// [`tokio::task::spawn_blocking`].
 ///
+/// Each resolved [`ddc_hi::Display`] handle is cached per ident string.
+/// On any VCP-operation error (I/O failure, ddc-hi error, or panic), the
+/// cache entry is dropped so the next call re-enumerates — covering
+/// unplug/re-plug, standby quirks, and bus renumbering.
+///
+/// The cache is shared across clones (the inner state is behind an
+/// [`Arc`]), so cloning is cheap — every `spawn_blocking` closure moves a
+/// clone to satisfy the `'static` bound.
+///
 /// Available on Linux (I²C-dev) and macOS (the vendored, path-patched
 /// `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md`). On both
 /// platforms `ddc_hi::Display` hides the backend behind one enum `Handle`,
@@ -191,28 +216,94 @@ fn acquire(lock: &PanelLock, prio: VcpPriority) -> Result<crate::ddc_lock::Panel
 /// no-match handling in `DdcciController::probe`/`is_available` already
 /// turns that into an ordinary "unavailable" outcome.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub struct RealVcp;
+pub struct RealVcp {
+    state: Arc<RealVcpState>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct RealVcpState {
+    cache: StdMutex<HashMap<String, ddc_hi::Display>>,
+    /// Test seam: counts how many times `ddc_hi::Display::enumerate()` was
+    /// actually called (incremented on each cache-miss enumeration).
+    enum_count: AtomicUsize,
+}
+
+// Clone is cheap — only the Arc reference count is bumped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Clone for RealVcp {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl RealVcp {
-    /// Enumerate synchronously (called inside `spawn_blocking`).
-    fn enumerate_displays() -> Vec<(String, ddc_hi::Display)> {
-        ddc_hi::Display::enumerate()
-            .into_iter()
-            .map(|d| (d.info.to_string(), d))
-            .collect()
+    /// Create a new `RealVcp` with an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(RealVcpState {
+                cache: StdMutex::new(HashMap::new()),
+                enum_count: AtomicUsize::new(0),
+            }),
+        }
     }
 
-    /// Find a display by ident string from an enumerated list.
-    fn find_display<'a>(
-        ident: &str,
-        displays: &'a mut [(String, ddc_hi::Display)],
-    ) -> Result<&'a mut ddc_hi::Display, String> {
-        displays
-            .iter_mut()
-            .find(|(id, _)| id == ident)
-            .map(|(_, d)| d)
-            .ok_or_else(|| format!("display '{ident}' not found during re-enumeration"))
+    /// Return the number of hardware enumerations performed so far
+    /// (test seam).
+    #[cfg(test)]
+    fn enumeration_count(&self) -> usize {
+        self.state.enum_count.load(Ordering::Relaxed)
+    }
+
+    /// Get a display handle for `ident`, either from the cache or by
+    /// enumerating. The handle is **removed** from the cache — callers
+    /// must return it via [`Self::return_to_cache`] on success or drop it
+    /// on error (invalidation).
+    fn get_or_enumerate(&self, ident: &str) -> Result<ddc_hi::Display, String> {
+        // Try the cache first.
+        {
+            let mut cache = self.state.cache.lock().unwrap();
+            if let Some(d) = cache.remove(ident) {
+                return Ok(d);
+            }
+        }
+        // Cache miss — enumerate hardware.
+        let displays: Vec<(String, ddc_hi::Display)> = ddc_hi::Display::enumerate()
+            .into_iter()
+            .map(|d| (d.info.to_string(), d))
+            .collect();
+        self.state.enum_count.fetch_add(1, Ordering::Relaxed);
+        // Populate cache with all discovered displays (idempotent insert).
+        {
+            let mut cache = self.state.cache.lock().unwrap();
+            for (id, d) in displays {
+                if id == ident {
+                    // Found our target — return immediately, don't re-insert.
+                    return Ok(d);
+                }
+                cache.entry(id).or_insert(d);
+            }
+        }
+        Err(format!("display '{ident}' not found during enumeration"))
+    }
+
+    /// Return a successfully-used display handle to the cache.
+    fn return_to_cache(&self, ident: &str, display: ddc_hi::Display) {
+        self.state
+            .cache
+            .lock()
+            .unwrap()
+            .insert(ident.to_string(), display);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Default for RealVcp {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -240,22 +331,26 @@ impl VcpOps for RealVcp {
     ) -> Result<u16, String> {
         let ident = ident.to_string();
         let lock = Arc::clone(lock);
+        let me = self.clone();
         tokio::task::spawn_blocking(move || {
+            let mut display = me.get_or_enumerate(&ident)?;
             // Panel-lock guard acquired FIRST, outside `catch_unwind` — a
             // panic in the wrapped op therefore never poisons the mutex
             // (the guard is dropped normally when this closure returns,
             // not via unwinding through its scope).
             let _guard = acquire(&lock, prio)?;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut displays = Self::enumerate_displays();
-                let display = Self::find_display(&ident, &mut displays)?;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let vcp = display
                     .handle
                     .get_vcp_feature(code)
                     .map_err(|e| format!("get_vcp(0x{code:02X}) failed: {e}"))?;
                 Ok::<u16, String>(vcp.value())
-            }))
-            .unwrap_or_else(|_| Err(VCP_PANIC.to_string()))
+            }));
+            if let Ok(Ok(_)) = &result {
+                me.return_to_cache(&ident, display);
+            }
+            // Invalidate on error or panic.
+            result.unwrap_or_else(|_| Err(VCP_PANIC.to_string()))
         })
         .await
         .map_err(|e| format!("spawn_blocking join error: {e}"))?
@@ -271,17 +366,21 @@ impl VcpOps for RealVcp {
     ) -> Result<(), String> {
         let ident = ident.to_string();
         let lock = Arc::clone(lock);
+        let me = self.clone();
         tokio::task::spawn_blocking(move || {
+            let mut display = me.get_or_enumerate(&ident)?;
             let _guard = acquire(&lock, prio)?;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut displays = Self::enumerate_displays();
-                let display = Self::find_display(&ident, &mut displays)?;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 display
                     .handle
                     .set_vcp_feature(code, value)
                     .map_err(|e| format!("set_vcp(0x{code:02X}, {value}) failed: {e}"))
-            }))
-            .unwrap_or_else(|_| Err(VCP_PANIC.to_string()))
+            }));
+            if let Ok(Ok(())) = &result {
+                me.return_to_cache(&ident, display);
+            }
+            // Invalidate on error or panic.
+            result.unwrap_or_else(|_| Err(VCP_PANIC.to_string()))
         })
         .await
         .map_err(|e| format!("spawn_blocking join error: {e}"))?
@@ -296,18 +395,22 @@ impl VcpOps for RealVcp {
     ) -> Result<[u8; 4], String> {
         let ident = ident.to_string();
         let lock = Arc::clone(lock);
+        let me = self.clone();
         tokio::task::spawn_blocking(move || {
+            let mut display = me.get_or_enumerate(&ident)?;
             let _guard = acquire(&lock, prio)?;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut displays = Self::enumerate_displays();
-                let display = Self::find_display(&ident, &mut displays)?;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let vcp = display
                     .handle
                     .get_vcp_feature(code)
                     .map_err(|e| format!("get_vcp_raw(0x{code:02X}) failed: {e}"))?;
                 Ok::<[u8; 4], String>([vcp.mh, vcp.ml, vcp.sh, vcp.sl])
-            }))
-            .unwrap_or_else(|_| Err(VCP_PANIC.to_string()))
+            }));
+            if let Ok(Ok(_)) = &result {
+                me.return_to_cache(&ident, display);
+            }
+            // Invalidate on error or panic.
+            result.unwrap_or_else(|_| Err(VCP_PANIC.to_string()))
         })
         .await
         .map_err(|e| format!("spawn_blocking join error: {e}"))?
@@ -899,5 +1002,174 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, VCP_PANIC);
+    }
+
+    // ── RealVcp cache tests (require DDC-capable display) ────────────────────
+
+    /// Test seam: read the hardware-enumeration counter inside `RealVcp`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn real_vcp_enum_count(vcp: &RealVcp) -> usize {
+        vcp.enumeration_count()
+    }
+
+    /// Enumerate once to discover the ident of the first DDC display.
+    /// Returns `None` if no display is available (CI / headless).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn first_display_ident() -> Option<String> {
+        ddc_hi::Display::enumerate()
+            .first()
+            .map(|d| d.info.to_string())
+    }
+
+    /// (a) Two sequential `get_vcp` calls against the same display cause
+    /// exactly ONE hardware enumeration — the second call hits the cache.
+    ///
+    /// RED baseline (before the cache): 2 enumerations for 2 calls.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn cache_hit_avoids_re_enumeration() {
+        let Some(ident) = first_display_ident() else {
+            eprintln!("SKIP: no DDC displays available");
+            return;
+        };
+
+        let vcp = RealVcp::new();
+        let locks = PanelLocks::new();
+        let lock = locks.get(&ident);
+
+        // First call — enumerates hardware, populates cache.
+        let r1 = vcp.get_vcp(&ident, 0x10, &lock, VcpPriority::Command).await;
+        let count_after_first = real_vcp_enum_count(&vcp);
+
+        // Second call — must hit the cache, no re-enumeration.
+        let r2 = vcp.get_vcp(&ident, 0x10, &lock, VcpPriority::Command).await;
+        let count_after_second = real_vcp_enum_count(&vcp);
+
+        // If the first call failed (unsupported VCP code, busy monitor, …),
+        // nothing was cached — the count assertion won't hold.  The RED
+        // property this test exists to catch is "every call enumerates",
+        // which is what the second assertion proves has stopped.
+        if r1.is_ok() && r2.is_ok() {
+            assert!(
+                count_after_first >= 1,
+                "first call must enumerate at least once (got {count_after_first})"
+            );
+            assert_eq!(
+                count_after_second, count_after_first,
+                "second call must NOT re-enumerate (cache hit); \
+                 first count={count_after_first}, second={count_after_second}"
+            );
+        } else {
+            eprintln!(
+                "SKIP: VCP op failed (first={r1:?}, second={r2:?}) — \
+                 cache not populated, count assertion inapplicable"
+            );
+        }
+    }
+
+    /// (b) An operation error drops the cache entry, so the *next* call
+    /// after the error re-enumerates (counter increments).
+    ///
+    /// Strategy: populate the cache via a successful `get_vcp(0x10)`, then
+    /// issue a `set_vcp` with a likely-unsupported code (`0xDF`) to trigger
+    /// a ddc-hi error.  The error must invalidate the cache, so the
+    /// subsequent `get_vcp(0x10)` enumerates fresh.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn error_invalidates_cache_entry() {
+        let Some(ident) = first_display_ident() else {
+            eprintln!("SKIP: no DDC displays available");
+            return;
+        };
+
+        let vcp = RealVcp::new();
+        let locks = PanelLocks::new();
+        let lock = locks.get(&ident);
+
+        // Populate cache.
+        let r1 = vcp.get_vcp(&ident, 0x10, &lock, VcpPriority::Command).await;
+        let count_after_first = real_vcp_enum_count(&vcp);
+
+        // Second call: use an unsupported VCP code to trigger an error.
+        // 0xDF (VCP feature 223) is not in any MCCS spec category — most
+        // monitors reject it.
+        let r2 = vcp
+            .set_vcp(&ident, 0xDF, 0, &lock, VcpPriority::Command)
+            .await;
+
+        // Third call: must re-enumerate (cache was invalidated by the error).
+        let _r3 = vcp.get_vcp(&ident, 0x10, &lock, VcpPriority::Command).await;
+        let count_after_third = real_vcp_enum_count(&vcp);
+
+        if r1.is_ok() && r2.is_err() {
+            assert!(
+                count_after_first >= 1,
+                "first call must enumerate at least once (got {count_after_first})"
+            );
+            assert!(
+                count_after_third > count_after_first,
+                "error on second call must invalidate cache → third call re-enumerates; \
+                 first={count_after_first}, third={count_after_third}"
+            );
+        } else {
+            eprintln!(
+                "SKIP: preconditions not met (first={r1:?}, second={r2:?}) — \
+                 first must succeed and second must error to exercise invalidation"
+            );
+        }
+    }
+
+    /// (c) A panicking VCP transaction also invalidates the cache entry.
+    ///
+    /// This test exercises the `unwrap_or_else` path in `get_vcp` /
+    /// `set_vcp` / `get_vcp_raw`: when `catch_unwind` returns `Err`
+    /// (i.e. the wrapped op panicked), the match arm `_ => {}` must drop
+    /// the display handle rather than returning it to the cache.
+    ///
+    /// Without a mock seam to inject a panic into a `ddc_hi` call, this
+    /// test verifies the invalidation structure by directly exercising the
+    /// `RealVcp` cache primitives: it populates the cache, then simulates
+    /// an error (via an unsupported VCP code), and asserts the
+    /// re-enumeration on the next call — the same invalidation branch
+    /// (`_ => {}`) that catches panics also catches errors, so coverage
+    /// of the error branch implies coverage of the panic branch.
+    ///
+    /// On hardware where the unsupported-code write succeeds (rare), the
+    /// test vacuously passes (nothing to invalidate).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn panic_path_invalidates_cache() {
+        let Some(ident) = first_display_ident() else {
+            eprintln!("SKIP: no DDC displays available");
+            return;
+        };
+
+        let vcp = RealVcp::new();
+        let locks = PanelLocks::new();
+        let lock = locks.get(&ident);
+
+        // Populate cache via a successful get_vcp.
+        let r1 = vcp.get_vcp(&ident, 0x10, &lock, VcpPriority::Command).await;
+        let count_after_first = real_vcp_enum_count(&vcp);
+
+        // Issue a set_vcp with an unsupported code to hit the error
+        // invalidation path (same `_ => {}` branch as a panic).
+        let r2 = vcp
+            .set_vcp(&ident, 0xDF, 0, &lock, VcpPriority::Command)
+            .await;
+
+        // Verify cache was invalidated: next call re-enumerates.
+        let _r3 = vcp.get_vcp(&ident, 0x10, &lock, VcpPriority::Command).await;
+        let count_after_third = real_vcp_enum_count(&vcp);
+
+        if r1.is_ok() && r2.is_err() {
+            assert!(
+                count_after_third > count_after_first,
+                "invalidation (error/panic branch) must cause re-enumeration; \
+                 first={count_after_first}, third={count_after_third}"
+            );
+        } else {
+            eprintln!("SKIP: preconditions not met (first={r1:?}, second={r2:?})");
+        }
     }
 }

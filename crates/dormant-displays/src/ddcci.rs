@@ -155,7 +155,7 @@ impl DdcciController {
             matcher,
             restore_brightness,
             configured_primary_mode,
-            ops: Arc::new(RealVcp),
+            ops: Arc::new(RealVcp::new()),
             locks: Arc::clone(locks),
             state: StdMutex::new(DdcState::default()),
         }

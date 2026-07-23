@@ -182,7 +182,8 @@ fn format_second_opinion(outcome: &DdcutilOutcome) -> String {
 /// `ddcutil`-backed implementations; tests inject fakes for both instead.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn probe_ddcci() -> ProbeResult {
-    probe_ddcci_with(&RealVcp, &RealDdcutil::new(), DDCUTIL_TIMEOUT).await
+    let vcp = RealVcp::new();
+    probe_ddcci_with(&vcp, &RealDdcutil::new(), DDCUTIL_TIMEOUT).await
 }
 
 /// Probe DDC/CI-capable displays via `ops`, plus an advisory `ddcutil`

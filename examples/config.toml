@@ -74,6 +74,7 @@ config_version = 1
 # [coordination]
 # enabled = false               # mDNS discovery, pairing, and operator routes
 # poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
+# state_poll_interval = "30s"   # panel-state (brightness/power) refresh cadence (>= poll_interval)
 # pairing_port = 0               # 0 asks the OS for an ephemeral temporary listener port
 # pairing_window = "5m"          # code/listener/mDNS lifetime (30s..=15m)
 # pairing_bind_address = "10.0.0.5" # unset defaults to the primary non-loopback LAN address

@@ -36,6 +36,7 @@ pub fn spawn(deps: CoordinationPollDeps) -> tokio::task::JoinHandle<()> {
 async fn run(mut deps: CoordinationPollDeps) {
     let mut interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
     let mut last_failing_log = HashMap::new();
+    let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
     loop {
         tokio::select! {
             () = deps.cancel.cancelled() => break,
@@ -45,7 +46,7 @@ async fn run(mut deps: CoordinationPollDeps) {
                 }
                 interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
             }
-            _ = interval.tick() => poll_once(&deps, &mut last_failing_log).await,
+            _ = interval.tick() => poll_once(&deps, &mut last_failing_log, &mut last_state_read).await,
         }
     }
 }
@@ -60,6 +61,7 @@ fn new_interval(period: Duration) -> tokio::time::Interval {
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
+    last_state_read: &mut HashMap<DisplayId, Instant>,
 ) {
     let executors = deps.executors_rx.borrow().clone();
     // Reload intentionally publishes this sentinel while an old generation tears down.
@@ -68,6 +70,12 @@ async fn poll_once(
     }
 
     let config = deps.config_rx.borrow().clone();
+    let state_poll_interval = config.coordination.state_poll_interval;
+    let now = Instant::now();
+    // Snapshot once per tick: displays not due for a state read preserve their
+    // last recorded panel_state, so record_success rewrites the same value and
+    // the DisplaySnapshot field stays stable between state reads.
+    let prior_panel_state = deps.state.snapshot();
     for (name, display_config) in &config.displays {
         if display_config.scope != DisplayScope::Shared {
             continue;
@@ -80,9 +88,22 @@ async fn poll_once(
             continue;
         };
 
-        // Hardware reads may wait on controller locks; mutate only after both finish.
+        // Ownership arbitration (VCP 0x60) runs every tick; panel-state cosmetics
+        // (brightness/power) refresh only at the slower state_poll cadence to
+        // cut per-transaction i2c traffic on cached-fd NVIDIA nodes. Hardware
+        // reads may wait on controller locks; mutate only after both finish.
         let input = executor.read_input_source_sampled().await;
-        let panel_state = executor.read_state_sampled().await;
+        let due = last_state_read
+            .get(&display_id)
+            .is_none_or(|last| now.duration_since(*last) >= state_poll_interval);
+        let panel_state = if due {
+            last_state_read.insert(display_id.clone(), now);
+            executor.read_state_sampled().await
+        } else {
+            prior_panel_state
+                .get(&display_id)
+                .and_then(|record| record.panel_state.clone())
+        };
         if let Ok(Some(observed)) = input {
             let before = deps.state.snapshot();
             let prior = deps
@@ -162,6 +183,7 @@ mod tests {
         inputs: Mutex<VecDeque<Result<Option<u8>, String>>>,
         states: Mutex<VecDeque<Option<PanelState>>>,
         reads: Mutex<u32>,
+        state_reads: Mutex<u32>,
         cache_probe: Mutex<Option<CoordinationHandle>>,
     }
 
@@ -175,6 +197,10 @@ mod tests {
 
         fn reads(&self) -> u32 {
             *self.reads.lock().unwrap()
+        }
+
+        fn state_reads(&self) -> u32 {
+            *self.state_reads.lock().unwrap()
         }
 
         fn probe_cache(&self, state: CoordinationHandle) {
@@ -212,6 +238,7 @@ mod tests {
         }
 
         async fn read_state_sampled(&self) -> Option<PanelState> {
+            *self.state_reads.lock().unwrap() += 1;
             self.states.lock().unwrap().pop_front().unwrap_or(None)
         }
     }
@@ -250,6 +277,7 @@ mod tests {
         Config {
             coordination: CoordinationConfig {
                 poll_interval: Duration::from_secs(6),
+                state_poll_interval: Duration::from_secs(30),
                 ..CoordinationConfig::default()
             },
             config_version: 1,
@@ -460,6 +488,46 @@ mod tests {
         cancel.cancel();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn state_read_skipped_until_state_poll_interval_elapses() {
+        // poll_interval = 6s, state_poll_interval = 30s. VCP 0x60 (input) is read
+        // every tick; panel-state reads happen on the first tick and again once
+        // 30s have elapsed since the last state read.
+        let sink = Arc::new(ScriptedSink::with_inputs(std::iter::repeat_n(
+            Ok(Some(0x11)),
+            6,
+        )));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink.clone());
+        tick().await; // t=6s: first tick, due
+        assert_eq!(sink.reads(), 1);
+        assert_eq!(sink.state_reads(), 1);
+        // t=12,18,24,30s: state_poll_interval (30s) not yet elapsed since t=6s.
+        for _ in 0..4 {
+            tick().await;
+        }
+        assert_eq!(sink.reads(), 5);
+        assert_eq!(
+            sink.state_reads(),
+            1,
+            "state read skipped below state_poll_interval"
+        );
+        // t=36s: 36s - 6s = 30s >= state_poll_interval → due again.
+        tick().await;
+        assert_eq!(sink.reads(), 6, "0x60 read every tick");
+        assert_eq!(
+            sink.state_reads(),
+            2,
+            "state read after state_poll_interval elapsed"
+        );
+        // Ownership is fed every tick: six successful 0x60 reads, all matching
+        // the expected 0x11, so the display stays owned with no failures.
+        let record = &state.snapshot()[&DisplayId("shared".to_string())];
+        assert!(record.owned);
+        assert!(record.has_successful_input_read);
+        assert_eq!(record.consecutive_failures, 0);
+        cancel.cancel();
+    }
+
     struct EventVisitor {
         event: Option<String>,
     }
@@ -515,9 +583,10 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         let mut last_failing_log = HashMap::new();
+        let mut last_state_read = HashMap::new();
         for _ in 0..ticks {
             tokio::time::advance(Duration::from_secs(6)).await;
-            poll_once(&deps, &mut last_failing_log).await;
+            poll_once(&deps, &mut last_failing_log, &mut last_state_read).await;
         }
         drop((config_tx, executors_tx));
         events.lock().unwrap().clone()

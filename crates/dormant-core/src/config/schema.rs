@@ -123,6 +123,16 @@ pub struct CoordinationConfig {
     )]
     pub poll_interval: Duration,
 
+    /// Interval between shared-display panel-state refreshes (brightness/power
+    /// for `DisplaySnapshot` cosmetics). Slower than `poll_interval` to cut
+    /// per-transaction i2c traffic; ownership arbitration (VCP `0x60`) still
+    /// runs every `poll_interval`. Validated `>= poll_interval`.
+    #[serde(
+        default = "default_coordination_state_poll_interval",
+        with = "humantime_serde"
+    )]
+    pub state_poll_interval: Duration,
+
     /// Requested TCP port for the short-lived pairing listener; zero requests
     /// an ephemeral port from the operating system.
     #[serde(default = "default_coordination_pairing_port")]
@@ -146,6 +156,7 @@ impl Default for CoordinationConfig {
         Self {
             enabled: defaults::COORDINATION_ENABLED,
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
+            state_poll_interval: defaults::COORDINATION_STATE_POLL_INTERVAL,
             pairing_port: defaults::COORDINATION_PAIRING_PORT,
             pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
             pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
@@ -1292,6 +1303,9 @@ fn default_coordination_enabled() -> bool {
 fn default_coordination_poll_interval() -> Duration {
     defaults::COORDINATION_POLL_INTERVAL
 }
+fn default_coordination_state_poll_interval() -> Duration {
+    defaults::COORDINATION_STATE_POLL_INTERVAL
+}
 fn default_coordination_pairing_port() -> u16 {
     defaults::COORDINATION_PAIRING_PORT
 }
@@ -2041,6 +2055,10 @@ idle_source = "macos"
 
         assert!(!cfg.coordination.enabled);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(2));
+        assert_eq!(
+            cfg.coordination.state_poll_interval,
+            Duration::from_secs(30)
+        );
         assert_eq!(cfg.coordination.pairing_port, 0);
         assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(300));
         assert_eq!(cfg.coordination.pairing_bind_address, None);
@@ -2049,12 +2067,16 @@ idle_source = "macos"
     #[test]
     fn coordination_enabled_false_parses_in_strict_mode() {
         let cfg: Config = toml::from_str(
-            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\npairing_port = 4567\npairing_window = \"7m\"\npairing_bind_address = \"10.1.1.5\"\n",
+            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\npairing_port = 4567\npairing_window = \"7m\"\npairing_bind_address = \"10.1.1.5\"\n",
         )
         .unwrap();
 
         assert!(!cfg.coordination.enabled);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(3));
+        assert_eq!(
+            cfg.coordination.state_poll_interval,
+            Duration::from_secs(30)
+        );
         assert_eq!(cfg.coordination.pairing_port, 4567);
         assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(420));
         assert_eq!(

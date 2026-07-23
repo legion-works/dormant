@@ -427,6 +427,7 @@ export interface ConfigInventory {
 export interface CoordinationConfig {
   enabled?: boolean;
   poll_interval?: string;
+  state_poll_interval?: string;
   pairing_port?: number;
   pairing_window?: string;
   pairing_bind_address?: string | null;

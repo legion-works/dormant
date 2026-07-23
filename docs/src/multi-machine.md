@@ -113,7 +113,8 @@ for configured shared displays.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enables mDNS discovery, pairing, and instance-pairing routes. |
-| `poll_interval` | duration | `"2s"` | Shared-display ownership poll cadence; minimum `"1s"`. |
+| `poll_interval` | duration | `"2s"` | Shared-display ownership poll cadence (VCP `0x60`); minimum `"1s"`. |
+| `state_poll_interval` | duration | `"30s"` | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics; must be `>= poll_interval`. Ownership still polls at `poll_interval`; only panel state refreshes here, to cut per-transaction i2c traffic. |
 | `pairing_port` | integer | `0` | TCP port for a pairing window; `0` requests an ephemeral OS port. |
 | `pairing_window` | duration | `"5m"` | Lifetime of the listener and mDNS advertisement; `"30s"` to `"15m"`. |
 | `pairing_bind_address` | string or unset | unset | LAN address for the temporary listener; unset auto-detects the primary non-loopback address. |

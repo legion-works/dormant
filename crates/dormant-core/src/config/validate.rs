@@ -63,6 +63,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
         &[
             "enabled",
             "poll_interval",
+            "state_poll_interval",
             "pairing_port",
             "pairing_window",
             "pairing_bind_address",
@@ -790,6 +791,15 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             detail: format!(
                 "coordination poll_interval {:?} is below the minimum of 1s",
                 cfg.coordination.poll_interval
+            ),
+        });
+    }
+    if cfg.coordination.state_poll_interval < cfg.coordination.poll_interval {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination state_poll_interval {:?} must be >= poll_interval {:?}",
+                cfg.coordination.state_poll_interval, cfg.coordination.poll_interval
             ),
         });
     }
@@ -5898,6 +5908,32 @@ availability_payload_offline = "down"
             errors
                 .iter()
                 .any(|error| error.what == crate::error::E_CONFIG_INVALID)
+        );
+    }
+
+    #[test]
+    fn coordination_state_poll_interval_below_poll_interval_rejected() {
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\npoll_interval = \"2s\"\nstate_poll_interval = \"1s\"\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.detail.contains("state_poll_interval")),
+            "expected state_poll_interval validation error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn coordination_state_poll_interval_equal_to_poll_interval_accepted() {
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\npoll_interval = \"2s\"\nstate_poll_interval = \"2s\"\n",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.detail.contains("state_poll_interval")),
+            "state_poll_interval == poll_interval should be accepted, got {errors:?}"
         );
     }
 

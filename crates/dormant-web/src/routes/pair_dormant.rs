@@ -1,6 +1,5 @@
 //! Instance pairing routes backed exclusively by the daemon IPC service.
 
-use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
 use axum::Json;
@@ -50,19 +49,36 @@ async fn request(state: &WebState, request: IpcRequest) -> Result<IpcResponse, W
         state.inner.config_rx.borrow().daemon.socket_path.as_deref(),
     );
     tokio::task::spawn_blocking(move || {
-        let mut stream = std::os::unix::net::UnixStream::connect(socket)
-            .map_err(|_| WebError::CoordinationUnavailable)?;
-        let line =
-            serde_json::to_string(&request).map_err(|_| WebError::CoordinationUnavailable)?;
-        writeln!(stream, "{line}").map_err(|_| WebError::CoordinationUnavailable)?;
-        stream
-            .flush()
-            .map_err(|_| WebError::CoordinationUnavailable)?;
-        let mut line = String::new();
-        BufReader::new(stream)
-            .read_line(&mut line)
-            .map_err(|_| WebError::CoordinationUnavailable)?;
-        serde_json::from_str(&line).map_err(|_| WebError::CoordinationUnavailable)
+        // The daemon IPC socket is a Unix domain socket, so the whole bridge is
+        // unix-only. On non-unix (the Windows portability leg) the route still
+        // compiles but the transport returns the same runtime error the daemon
+        // being down would — mirroring `dormantctl::client::send_request`'s
+        // `#[cfg(not(unix))]` arm rather than a compile_error, so dormant-web keeps
+        // building standalone and under dormantd's `web-ui` feature there.
+        #[cfg(unix)]
+        {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixStream;
+
+            let mut stream =
+                UnixStream::connect(socket).map_err(|_| WebError::CoordinationUnavailable)?;
+            let line =
+                serde_json::to_string(&request).map_err(|_| WebError::CoordinationUnavailable)?;
+            writeln!(stream, "{line}").map_err(|_| WebError::CoordinationUnavailable)?;
+            stream
+                .flush()
+                .map_err(|_| WebError::CoordinationUnavailable)?;
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .map_err(|_| WebError::CoordinationUnavailable)?;
+            serde_json::from_str(&line).map_err(|_| WebError::CoordinationUnavailable)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (socket, request);
+            Err(WebError::CoordinationUnavailable)
+        }
     })
     .await
     .map_err(|_| WebError::CoordinationUnavailable)?
@@ -170,7 +186,7 @@ pub(crate) async fn get_pair_instance_peers(
         .ok_or(WebError::CoordinationUnavailable)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use axum::body::Body;

@@ -711,10 +711,10 @@ impl DdcciController {
     async fn read_state_at(&self, prio: VcpPriority) -> Option<dormant_core::traits::PanelState> {
         use dormant_core::traits::{PanelState, PowerState};
 
-        let (ident, lock) = {
+        let (ident, lock, d6_supported) = {
             let state = self.state.lock().unwrap();
             match (&state.matched_ident, &state.panel_lock) {
-                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock), state.d6_supported),
                 _ => return None,
             }
         };
@@ -727,9 +727,10 @@ impl DdcciController {
             .ok();
 
         // Power: 0xD6 only exists on displays that advertised D6 support
-        // during probe.  Reading on a non-D6 display returns an error; we
-        // surface the `power` field as `None` in that case so the
-        // brightness read still ships in the report.
+        // during probe. Skip the read entirely on a non-D6 panel — an
+        // unsupported-code read every 2s coordination tick is wasted bus
+        // traffic under the panel lock, and a misclassified error reply
+        // would needlessly invalidate the handle cache (issue #127).
         //
         // Map the VCP value to `PowerState`:
         // - 0x01 → On
@@ -737,10 +738,14 @@ impl DdcciController {
         //   0x04 off-soft, 0x05 off-hard — all "panel not in use" family)
         // - read error / unsupported (including a sampler-priority skip) →
         //   None
-        let power = match self.ops.get_vcp(&ident, VCP_POWER, &lock, prio).await {
-            Ok(D6_ON) => Some(PowerState::On),
-            Ok(_) => Some(PowerState::Standby),
-            Err(_) => None,
+        let power = if d6_supported {
+            match self.ops.get_vcp(&ident, VCP_POWER, &lock, prio).await {
+                Ok(D6_ON) => Some(PowerState::On),
+                Ok(_) => Some(PowerState::Standby),
+                Err(_) => None,
+            }
+        } else {
+            None
         };
 
         // Return Some only when at least one read succeeded; an empty
@@ -935,6 +940,76 @@ mod tests {
         assert!(
             !ctrl2.supported_modes().contains(&BlankMode::PowerOff),
             "PowerOff should NOT be in supported_modes when D6 is unsupported"
+        );
+    }
+
+    /// M3a: `read_state_at` skips the VCP 0xD6 read when `probe()` recorded
+    /// `d6_supported = false`. A non-D6 panel returns an unsupported-code
+    /// error on every D6 read; without the skip, each 2s coordination tick
+    /// would issue a wasted bus transaction under the panel lock (and risk a
+    /// misclassified error invalidating the handle cache — issue #127). The
+    /// skip is stable across ticks.
+    #[tokio::test]
+    async fn read_state_at_skips_d6_when_unsupported() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            // probe: D6 read errors → d6_supported = false.
+            f.expect_get(ident, VCP_POWER, Err("DDC/CI error: unsupported".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        assert!(
+            !ctrl.state.lock().unwrap().d6_supported,
+            "probe must record d6_supported = false when the D6 read errors"
+        );
+        // Drop the probe's call log so only the tick reads remain.
+        let _ = fake.take_call_log();
+
+        // A coordination tick reads input source (0x60) then panel state
+        // (brightness 0x10 + power 0xD6). On a non-D6 panel the 0xD6 read is
+        // skipped — only 0x60 and 0x10 hit the bus.
+        fake.expect_get_raw(ident, VCP_INPUT_SOURCE, Ok([0xFF, 0xFF, 0x00, 0x11]));
+        fake.expect_get(ident, VCP_BRIGHTNESS, Ok(42));
+
+        assert_eq!(ctrl.read_input_source_sampled().await, Ok(Some(0x11)));
+        let state = ctrl
+            .read_state_sampled()
+            .await
+            .expect("brightness read succeeds → Some(PanelState)");
+        assert_eq!(state.brightness, Some(42));
+        assert!(state.power.is_none(), "non-D6 panel: power must be None");
+
+        let log = fake.take_call_log();
+        assert!(
+            !log.iter().any(|c| c.contains("0xD6")),
+            "non-D6 panel: 0xD6 must never be read: {log:?}"
+        );
+        assert_eq!(
+            log,
+            vec![
+                format!("get_vcp_raw({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+                format!("get_vcp({ident}, 0x{VCP_BRIGHTNESS:02X})"),
+            ]
+        );
+
+        // Tick 2: D6 still skipped — the skip is stable, not one-shot.
+        fake.expect_get_raw(ident, VCP_INPUT_SOURCE, Ok([0xFF, 0xFF, 0x00, 0x12]));
+        fake.expect_get(ident, VCP_BRIGHTNESS, Ok(43));
+        let _ = ctrl.read_input_source_sampled().await;
+        let _ = ctrl.read_state_sampled().await;
+        let log2 = fake.take_call_log();
+        assert!(
+            !log2.iter().any(|c| c.contains("0xD6")),
+            "tick 2: 0xD6 must still be skipped: {log2:?}"
         );
     }
 

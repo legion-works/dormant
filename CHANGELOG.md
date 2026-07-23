@@ -6,10 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-23
+
 ### Added
 
-- Multi-machine shared-display coordination: local DDC/CI input ownership,
-  opt-in mDNS discovery, and SPAKE2-protected dormant-instance pairing.
+- Multi-machine shared-display coordination: opt-in `scope = "shared"` displays arbitrate ownership through DDC/CI VCP `0x60` (active input source) — a daemon reads the live input, polls and caches ownership verdicts, reconciles a panel on ownership acquisition, exposes ownership on the IPC wire, and preserves coordination state across config reloads. Configured through the new `[coordination]` section; the ownership poller self-disables when no shared displays remain. Tray, web, and doctor surfaces report shared-panel ownership and recovery.
+- SPAKE2-protected dormant-instance pairing: window-gated mDNS discovery of dormant peers, a code-confirmed SPAKE2 pairing handshake with a hardened frame transport (bounded concurrent connections to resist a slow-loris window, strict-origin on parameterized routes, honest 409/cancel/expiry semantics), a persistent paired-instance peer store, and operator surfaces in `dormantctl pair instance`, web routes, and a web pairing wizard.
+- Native macOS menu-bar tray (`NSStatusItem`) with launchd autostart, replacing the non-functional KDE-`StatusNotifierItem`-only tray on macOS (#115).
+
+### Fixed
+
+- NVIDIA DDC polling no longer convoys the RM driver lock or busy-loops a core: the ddc-hi display handle is cached across VCP ops (serialized under panel lock, with VCP error classification and a bounded/absolute handle max-age), DDC enumeration is gated behind a process-wide physical-DDC barrier, and input-poll and state-poll cadences are split (`state_poll_interval` derives from `poll_interval`). Eliminates the desktop-wide compositor stutter and drops the userspace busy-loop from ~40% to ~6% of a core (#127, resolves #120).
+- Instance-pairing hardening: bounded concurrent pairing connections resist a slow-loris window, the pairing code is surfaced in the open response with hardened frame-order handling and dedup identity derivation, parameterized pairing routes enforce strict-origin with honest 409/cancel/expiry semantics and wizard lifecycle parity, the peer store caps load size and zeroizes write temporaries, and the pairing wizard drops an unused import and null-guards its inputs.
+- Coordination correctness: a panel is reconciled on ownership acquisition, the ownership poller is skipped when no shared displays remain, and mDNS validation enforces non-empty `display_name` (with a corrected coordination default comment).
+- The web IPC bridge's unix-socket path is gated for Windows portability (#128).
+- `dormantctl doctor` gates the `probe_ddcci_with_locks` probe to Linux + macOS (#128).
+- CI/test harness: nextest JUnit output is resolved from the manifest workspace root, and changed-test stress handles the vendored workspace and crate-root ownership (#128). The macOS soak jobs drop a Linux-only watcher-delivery filter (#113).
+- macOS: clippy pedantic debt cleared in the vendored `ddc-macos` backend (cfg-gated linux items, raw-ref ffi pointers).
+
+### Docs
+
+- Multi-machine coordination and instance-pairing documentation: protocol ratification (SPAKE2 + mdns-sd), a folded pairing-protocol security review (pinning spake2 0.4.0, transcript/zeroize/peer-store invariants), and structure-docs registration of the pairing wizard.
+
+### Known issues
+
+- macOS over USB-C: `blank_mode = "power_off"` with a `ddcci`-led chain is a one-way door — ddcci D6 standby makes the panel's DDC service vanish, and `macos-gamma-black` is ineligible in PowerOff mode (it registers only BrightnessZero), so wake cannot re-enumerate the display and may require physical intervention. Prefer a non-`power_off` blank mode on macOS USB-C until #126 is resolved.
 
 ## [0.5.0] - 2026-07-19
 
@@ -135,7 +156,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/legion-works/dormant/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/legion-works/dormant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/legion-works/dormant/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/legion-works/dormant/compare/v0.3.0...v0.3.1

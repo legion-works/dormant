@@ -320,9 +320,29 @@ rename to crates/example/tests/renamed.rs
             list_cmd, run_cmd, env = select_changed_tests.nextest_commands(target, 3, root)
 
         self.assertIn("--config-file", list_cmd)
-        self.assertEqual(env.get("CARGO_TARGET_DIR"), str(root / "target"))
+        # CARGO_TARGET_DIR is deliberately NOT set: nextest resolves the JUnit
+        # report relative to the manifest workspace root, so redirecting build
+        # artifacts to the repo target/ would split the report away from where
+        # _copy_junit looks.
+        self.assertEqual(env, {})
         self.assertIn("--config-file", run_cmd)
         self.assertIn("--stress-count", run_cmd)
+
+    def test_copy_junit_source_follows_manifest_workspace_root(self):
+        # Regression: for a --manifest-path target in a separate workspace (the
+        # vendored ddc-macos fork), nextest writes JUnit to that workspace's own
+        # target/, not the repo target/ and not CARGO_TARGET_DIR. _copy_junit must
+        # look at the manifest workspace root, or it reports "nextest did not
+        # produce ..." and the job exits nonzero even though every test passed.
+        root = pathlib.Path("/repo")
+        manifest_target = select_changed_tests.Target("ddc-macos", "lib", "ddc-macos", "vendor/ddc-macos/Cargo.toml")
+        workspace_target = select_changed_tests.Target("dormant-core", "lib", "dormant-core")
+
+        self.assertEqual(
+            select_changed_tests._manifest_workspace_root(root, manifest_target),
+            pathlib.Path("/repo/vendor/ddc-macos"),
+        )
+        self.assertEqual(select_changed_tests._manifest_workspace_root(root, workspace_target), root)
 
     def test_nextest_commands_for_workspace_target_has_no_extra_config(self):
         target = select_changed_tests.Target("dormant-core", "lib", "dormant-core")

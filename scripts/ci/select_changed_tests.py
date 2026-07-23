@@ -347,7 +347,12 @@ def nextest_commands(
         repo_config = repo_root / ".config" / "nextest.toml"
         if repo_config.is_file():
             extra += ["--config-file", str(repo_config)]
-        env["CARGO_TARGET_DIR"] = str(repo_root / "target")
+        # Do NOT set CARGO_TARGET_DIR: nextest resolves the JUnit report path
+        # relative to the manifest's workspace root (ignoring CARGO_TARGET_DIR),
+        # so redirecting build artifacts to the repo target/ would split the
+        # report away from where _copy_junit (now manifest-root-aware) looks.
+        # Letting both land in the separate workspace's own target/ keeps them
+        # together and avoids a cross-workdir copy race.
     list_command = [
         "cargo",
         "nextest",
@@ -377,13 +382,28 @@ def nextest_commands(
     return list_command, run_command, env
 
 
+def _manifest_workspace_root(root: pathlib.Path, target: Target) -> pathlib.Path:
+    """Workspace root nextest resolves JUnit paths against.
+
+    For a workspace target (no ``manifest_path``) that is the repo root. For a
+    target run via ``--manifest-path`` into a separate workspace (the vendored
+    ``ddc-macos`` fork, excluded from the root workspace) nextest resolves its
+    ``junit.path`` relative to *that* manifest's workspace root, not
+    ``CARGO_TARGET_DIR`` — so the report lands in the separate workspace's
+    ``target/``, and ``_copy_junit`` must look there.
+    """
+    if target.manifest_path is None:
+        return root
+    return (root / target.manifest_path).resolve().parent
+
+
 def junit_destination(root: pathlib.Path, target: Target) -> pathlib.Path:
     """Return a per-kind JUnit destination that cannot collide within a package."""
     return root / "target/nextest/changed" / f"{target.package}-{target.kind}-{target.name}.xml"
 
 
 def _copy_junit(root: pathlib.Path, target: Target) -> pathlib.Path | None:
-    source = root / "target/nextest/ci/junit.xml"
+    source = _manifest_workspace_root(root, target) / "target/nextest/ci/junit.xml"
     destination = junit_destination(root, target)
     if not source.is_file():
         print(f"{target.package}/{target.name}: nextest did not produce {source}", file=sys.stderr)
@@ -433,7 +453,6 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
     """Run every selected target, retaining reports and the first failing status."""
     first_failure = 0
     reports: list[pathlib.Path] = []
-    junit = root / "target/nextest/ci/junit.xml"
     for target in targets:
         list_command, run_command, env = nextest_commands(target, stress_count, root)
         run_env = {**os.environ, **env} if env else None
@@ -448,6 +467,7 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
             first_failure = first_failure or 1
             continue
 
+        junit = _manifest_workspace_root(root, target) / "target/nextest/ci/junit.xml"
         junit.unlink(missing_ok=True)
         completed = subprocess.run(run_command, cwd=root, env=run_env)
         report = _copy_junit(root, target)

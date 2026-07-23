@@ -202,6 +202,7 @@ async fn probe_ddcci_with(
     probe_ddcci_with_locks(ops, ddcutil, ddcutil_timeout, &panel_locks).await
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn probe_ddcci_with_locks(
     ops: &impl VcpOps,
     ddcutil: &impl DdcutilOps,

@@ -52,6 +52,7 @@ const DDCUTIL_TIMEOUT: Duration = Duration::from_secs(5);
 /// from the `ddc-hi` reads alone.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 enum DdcutilOutcome {
     /// The `ddcutil` executable is not on `PATH` (`io::ErrorKind::NotFound`).
     /// The overwhelmingly common case: `ddcutil` is an optional package most
@@ -77,6 +78,7 @@ enum DdcutilOutcome {
 /// bus. [`RealDdcutil`] is the only production implementation.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait::async_trait]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 trait DdcutilOps: Send + Sync {
     /// Run `ddcutil detect --brief`, bounded by `timeout`.
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome;
@@ -90,6 +92,7 @@ trait DdcutilOps: Send + Sync {
 /// [`format_second_opinion`]; it is never retried with different arguments
 /// or through a shell.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 struct RealDdcutil {
     /// Program name/path passed to `Command::new`. Production code always
     /// uses the default `"ddcutil"` (a bare name resolved via `PATH` at
@@ -100,6 +103,7 @@ struct RealDdcutil {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl RealDdcutil {
     /// Production constructor: resolves `ddcutil` via `PATH` at spawn time,
     /// exactly as before this seam existed.
@@ -122,6 +126,7 @@ impl RealDdcutil {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait::async_trait]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl DdcutilOps for RealDdcutil {
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome {
         let child = tokio::process::Command::new(&self.program)

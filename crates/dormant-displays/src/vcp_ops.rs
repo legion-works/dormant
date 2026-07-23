@@ -784,9 +784,7 @@ fn backfill_edid_identity_from_macos(vcp: &mut VcpDisplayInfo, handle: &ddc_hi::
     if vcp.claim_identity().is_some() {
         return;
     }
-    let ddc_hi::Handle::MacOS(monitor) = handle else {
-        return;
-    };
+    let ddc_hi::Handle::MacOS(monitor) = handle;
     let Some(edid) = monitor.edid() else {
         return;
     };

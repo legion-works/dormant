@@ -7,18 +7,22 @@
 //! async executor is never blocked. Each resolved ddc-hi `Display` handle is
 //! **cached** per ident string across operations: the first call per ident
 //! enumerates, finds the matching display, and stores the handle; subsequent
-//! calls reuse it without re-enumeration. On a **transport/I2C error** or a
-//! panic caught by `catch_unwind`, the cache entry is dropped so the next
-//! call re-enumerates fresh — covering unplug/re-plug, standby quirks, and
-//! bus renumbering. Protocol-level errors (unsupported VCP code, checksum
-//! mismatch) do NOT invalidate — the handle is healthy, only the feature is
-//! absent.
+//! calls reuse it without re-enumeration. A cached handle is reused until one
+//! of three things ends its life: a **transport/I2C error** or a **panic**
+//! (caught by `catch_unwind`) drops it so the next call re-enumerates fresh —
+//! covering unplug/re-plug, standby quirks, and bus renumbering; or it ages
+//! past `CACHE_REVALIDATE_AFTER` (see *Revalidation window*). Protocol-level
+//! errors (unsupported VCP code, checksum mismatch) do NOT invalidate — the
+//! handle is healthy, only the feature is absent.
 //!
 //! Enumeration is ~100 ms of blocking I²C opens; re-enumerating on every poll
 //! tick (3× per 2 s coordination poll) saturates the NVIDIA GPU RM driver lock
 //! (~100 lock ops/s), causing compositor stutter (issue #127). Caching
 //! eliminates steady-state enumeration: coordination polls run at cache-hit
-//! speed, and enumeration only happens once per daemon start per display.
+//! speed, and a handle is resolved once on first use and reused for the rest
+//! of its bounded life — not on every tick, and not "once per daemon start"
+//! (a swapped panel on the same connector is caught by the revalidation
+//! window or by a transport error mid-swap).
 //!
 //! ## Cache invalidation classes
 //!
@@ -35,31 +39,49 @@
 //!
 //! Cached handles are revalidated after `CACHE_REVALIDATE_AFTER` (5 min)
 //! — a panel swapped on the same connector could be driven under the old
-//! ident. Mid-window swaps are caught by error-invalidation when a 2 s poll
-//! lands during the physical swap gap.
+//! ident. The deadline is **absolute**: it is stamped when a fresh
+//! enumeration resolves the handle and carried unchanged through every
+//! checkout/reinsert, so steady 2 s polling cannot slide it forward
+//! indefinitely. Mid-window swaps are caught by error-invalidation when a
+//! 2 s poll lands during the physical swap gap.
+//!
+//! `CACHE_REVALIDATE_AFTER` is a hard-coded const, deliberately NOT a config
+//! key: it bounds an internal DDC transport-layer plumbing window, not
+//! operator-facing blank/wake policy, and is behavior-neutral except for
+//! limiting how long a stale identity can persist. Exposing it later would
+//! not break the config schema, so the door is left open without adding a
+//! knob nobody needs today.
 //!
 //! The trait is `#[async_trait]` so that the real implementation can `await`
 //! the `spawn_blocking` join handle directly, avoiding the
 //! `block_in_place`/`block_on` triple-wrap that panics on current-thread
 //! runtimes.
 //!
-//! ## Panel-lock discipline (spec §4.3, §9#1)
+//! ## Lock discipline
 //!
-//! Every physical VCP transaction (one `get_vcp` / `set_vcp` / `get_vcp_raw`
-//! call) is serialized per panel through a [`crate::ddc_lock::PanelLock`],
-//! acquired **inside** the `spawn_blocking` closure that performs the
-//! transaction — never held across an `.await`. The panel lock is acquired
-//! **before** cache resolution and enumeration (spec §4.3 ordering).
-//! [`VcpPriority`] selects which acquisition strategy that closure uses:
+//! Three locks govern physical DDC access, acquired in this order and never
+//! held across an `.await` (every call site is inside `spawn_blocking`):
+//!
+//! 1. **Panel lock** (outer, when present) — per-panel serialization via
+//!    [`crate::ddc_lock::PanelLock`], acquired before cache resolution. A
+//!    [`VcpPriority::Sampler`] that loses the race skips BEFORE any hardware
+//!    touch — it must not enumerate or access the cache.
+//! 2. **Enumeration barrier** (inner) — a process-wide mutex serializing
+//!    every `ddc_hi::Display::enumerate()` call (cache resolver AND
+//!    `list_displays`). A per-panel lock cannot serialize an all-bus scan
+//!    against OTHER panels' locks, so enumeration — which opens every
+//!    `/dev/i2c-*` node — needs its own process-wide serialization (issue
+//!    #127). `list_displays` acquires the barrier alone (no panel lock,
+//!    which does not exist yet during `probe`).
+//! 3. **Cache mutex** (innermost) — held only for `HashMap` take/insert,
+//!    never across I/O, enumeration, or panel-lock acquisition.
+//!
+//! [`VcpPriority`] selects the panel-lock acquisition strategy:
 //! [`VcpPriority::Command`] blocks until the panel is free (command/blank/
 //! wake/exercise/seeding callers, which must never starve);
 //! [`VcpPriority::Sampler`] tries once and yields immediately to any
 //! command-path caller (periodic wear polling, which must never make a
-//! command wait for it). A sampler that loses the race skips BEFORE any
-//! hardware touch — it must not enumerate or access the cache.
-//!
-//! The cache mutex is held only for `HashMap` operations (take/insert),
-//! never across I/O or panel-lock acquisition — it is the innermost lock.
+//! command wait for it).
 //!
 //! A scripted or real ddc-hi panic during the physical op is caught with
 //! `std::panic::catch_unwind` *inside* the guarded section (guard acquired
@@ -221,6 +243,29 @@ fn acquire(lock: &PanelLock, prio: VcpPriority) -> Result<crate::ddc_lock::Panel
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const CACHE_REVALIDATE_AFTER: Duration = Duration::from_secs(300);
 
+/// Process-wide barrier serializing every physical `ddc_hi::Display::enumerate()`
+/// call — the cache resolver path AND `list_displays`. A per-panel
+/// [`PanelLock`] cannot serialize an all-bus scan against OTHER panels' locks,
+/// so enumeration — which opens every `/dev/i2c-*` node — needs its own
+/// process-wide serialization (issue #127). Acquired AFTER the panel lock
+/// (when present) and BEFORE the cache mutex; never held across an `.await`
+/// (all call sites are inside `spawn_blocking`). See the *Lock discipline*
+/// section of the module docs.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static ENUMERATION_BARRIER: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+
+/// Run `f` under the [`ENUMERATION_BARRIER`]. Called only inside
+/// `spawn_blocking` (blocking context); the guard is dropped before `f`'s
+/// return value is used, so the critical section is just the enumeration I/O.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn with_enumeration_barrier<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = ENUMERATION_BARRIER
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap();
+    f()
+}
+
 /// Returns `true` if `err_msg` indicates a transport/I2C-class error
 /// (unreachable device, bus error) rather than a protocol-level reply
 /// (unsupported VCP code, checksum mismatch — handle is healthy).
@@ -246,15 +291,23 @@ fn is_transport_error(err_msg: &str) -> bool {
 /// unit-testability. Production use is `HandleCache<ddc_hi::Display>`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct HandleCache<H> {
-    /// Map from ident string to `(handle, inserted_at)`.
+    /// Map from ident string to `(handle, resolved_at)`. `resolved_at` is the
+    /// **absolute** instant the handle was freshly enumerated — stamped once
+    /// at resolution and carried unchanged through every checkout/reinsert,
+    /// so steady polling cannot slide the revalidation deadline forward.
     entries: StdMutex<HashMap<String, (H, Instant)>>,
     /// Resolves an ident to a `(canonical_ident, handle)` pair.
     /// Must enumerate hardware — called only on cache miss or revalidation.
     resolve_fn: fn(ident: &str) -> Result<(String, H), String>,
     /// Test seam: incremented on each call to `resolve_fn`.
     resolve_count: AtomicUsize,
-    /// Entries older than this are treated as misses.
+    /// Entries whose age (`now − resolved_at`) is `>=` this are treated as
+    /// misses and re-resolved.
     revalidate_after: Duration,
+    /// Clock seam: `Instant::now` in production, injectable in tests so the
+    /// absolute-deadline behavior is exercised without a 5-minute wall-clock
+    /// wait.
+    now_fn: fn() -> Instant,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -263,27 +316,41 @@ impl<H> HandleCache<H> {
         resolve_fn: fn(ident: &str) -> Result<(String, H), String>,
         revalidate_after: Duration,
     ) -> Self {
+        Self::new_with_clock(resolve_fn, revalidate_after, Instant::now)
+    }
+
+    /// Constructor with an injected clock — used by `new` (production,
+    /// `Instant::now`) and by tests (a fake clock so the absolute-deadline
+    /// behavior is exercised without a 5-minute wall-clock wait).
+    fn new_with_clock(
+        resolve_fn: fn(ident: &str) -> Result<(String, H), String>,
+        revalidate_after: Duration,
+        now_fn: fn() -> Instant,
+    ) -> Self {
         Self {
             entries: StdMutex::new(HashMap::new()),
             resolve_fn,
             resolve_count: AtomicUsize::new(0),
             revalidate_after,
+            now_fn,
         }
     }
 
     /// Get a handle for `ident`, either from the cache or by resolving.
-    /// The handle is **removed** from the cache — callers must return it
-    /// via [`Self::return_entry`] on success or drop it on error.
-    fn get_or_resolve(&self, ident: &str) -> Result<H, String> {
-        let now = Instant::now();
+    /// Returns the handle **and its original `resolved_at`** — callers must
+    /// pass that instant back to [`Self::return_entry`] so the deadline stays
+    /// absolute. The handle is **removed** from the cache; callers must return
+    /// it on success or drop it on error.
+    fn get_or_resolve(&self, ident: &str) -> Result<(H, Instant), String> {
+        let now = (self.now_fn)();
         // Try the cache first.
         {
             let mut entries = self.entries.lock().unwrap();
             match entries.remove(ident) {
-                Some((handle, inserted))
-                    if now.duration_since(inserted) < self.revalidate_after =>
+                Some((handle, resolved_at))
+                    if now.duration_since(resolved_at) < self.revalidate_after =>
                 {
-                    return Ok(handle);
+                    return Ok((handle, resolved_at));
                 }
                 // Stale entry (fd freed on drop) or no entry — fall through
                 // to re-resolve below.
@@ -293,26 +360,28 @@ impl<H> HandleCache<H> {
         // Cache miss or expired — resolve via hardware enumeration.
         let (canonical_ident, handle) = (self.resolve_fn)(ident)?;
         self.resolve_count.fetch_add(1, Ordering::Relaxed);
-        // Cache only the resolved ident (S6: don't populate all).
+        // Stamp the absolute resolution instant; reinsertion preserves it.
+        let resolved_at = (self.now_fn)();
         self.entries
             .lock()
             .unwrap()
-            .insert(canonical_ident, (handle, now));
+            .insert(canonical_ident, (handle, resolved_at));
         // Re-lookup — must find it.
         self.entries
             .lock()
             .unwrap()
             .remove(ident)
-            .map(|(h, _)| h)
             .ok_or_else(|| format!("display '{ident}' not found after resolution"))
     }
 
-    /// Return a successfully-used handle to the cache.
-    fn return_entry(&self, ident: &str, handle: H) {
+    /// Return a successfully-used handle to the cache, preserving its
+    /// original `resolved_at` — NOT re-stamped. This is what makes the
+    /// revalidation deadline absolute rather than a sliding idle timeout.
+    fn return_entry(&self, ident: &str, handle: H, resolved_at: Instant) {
         self.entries
             .lock()
             .unwrap()
-            .insert(ident.to_string(), (handle, Instant::now()));
+            .insert(ident.to_string(), (handle, resolved_at));
     }
 
     /// Test seam: read the resolve count.
@@ -380,12 +449,16 @@ impl RealVcp {
     }
 
     /// Hardware enumeration + ident match, called by `HandleCache` on miss.
+    /// The `ddc_hi::Display::enumerate()` call runs under the process-wide
+    /// [`ENUMERATION_BARRIER`] so it cannot overlap another panel's locked
+    /// VCP transaction or a concurrent `list_displays` scan.
     fn resolve_display(ident: &str) -> Result<(String, ddc_hi::Display), String> {
-        let displays: Vec<(String, ddc_hi::Display)> = ddc_hi::Display::enumerate()
+        let displays: Vec<ddc_hi::Display> = with_enumeration_barrier(ddc_hi::Display::enumerate);
+        let mapped: Vec<(String, ddc_hi::Display)> = displays
             .into_iter()
             .map(|d| (d.info.to_string(), d))
             .collect();
-        displays
+        mapped
             .into_iter()
             .find(|(id, _)| id == ident)
             .ok_or_else(|| format!("display '{ident}' not found during enumeration"))
@@ -409,9 +482,10 @@ impl Default for RealVcp {
 
 /// Run a VCP operation with cache semantics and lock discipline.
 ///
-/// Called inside `spawn_blocking`. The `op` closure receives `&mut H` (the
-/// cached handle type) and must return `Result<T, String>`. On success the
-/// handle is returned to the cache; on transport/IO error or panic it is
+/// Called inside `spawn_blocking` (after the panel lock is acquired). The
+/// `op` closure receives `&mut H` (the cached handle type) and must return
+/// `Result<T, String>`. On success the handle is returned to the cache with
+/// its original `resolved_at` preserved; on transport/IO error or panic it is
 /// dropped (invalidation); on protocol error (unsupported VCP code, etc.)
 /// the handle is returned transparently.
 ///
@@ -425,16 +499,16 @@ fn vcp_transaction<H, T>(
     ident: &str,
     op: impl FnOnce(&mut H) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut handle = cache.get_or_resolve(ident)?;
+    let (mut handle, resolved_at) = cache.get_or_resolve(ident)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| op(&mut handle)));
     match result {
         Ok(Ok(value)) => {
-            cache.return_entry(ident, handle);
+            cache.return_entry(ident, handle, resolved_at);
             Ok(value)
         }
         Ok(Err(ref e)) if !is_transport_error(e) => {
             // Protocol error — handle is healthy, return it to cache.
-            cache.return_entry(ident, handle);
+            cache.return_entry(ident, handle, resolved_at);
             Err(e.clone())
         }
         Ok(Err(e)) => {
@@ -452,9 +526,14 @@ fn vcp_transaction<H, T>(
 #[async_trait]
 impl VcpOps for RealVcp {
     async fn list_displays(&self) -> Vec<VcpDisplayInfo> {
-        let displays = tokio::task::spawn_blocking(ddc_hi::Display::enumerate)
-            .await
-            .unwrap_or_default();
+        // Enumerate under the process-wide barrier so a probe's all-bus scan
+        // cannot overlap another panel's locked VCP transaction. No panel
+        // lock exists yet (probe derives identity from this scan), so the
+        // barrier is acquired alone.
+        let displays =
+            tokio::task::spawn_blocking(|| with_enumeration_barrier(ddc_hi::Display::enumerate))
+                .await
+                .unwrap_or_default();
         displays
             .into_iter()
             .map(|d| VcpDisplayInfo {
@@ -474,9 +553,9 @@ impl VcpOps for RealVcp {
         let lock = Arc::clone(lock);
         let me = self.clone();
         tokio::task::spawn_blocking(move || {
-            // Panel-lock guard acquired FIRST (M1: lock ordering), outside
-            // `catch_unwind` — a panic in the wrapped op therefore never
-            // poisons the mutex.
+            // Panel lock acquired before cache resolution and held outside
+            // `catch_unwind` (inside `vcp_transaction`) — a panic in the
+            // wrapped op therefore never poisons the mutex.
             let _guard = acquire(&lock, prio)?;
             vcp_transaction(&me.state.cache, &ident, |display| {
                 let vcp = display
@@ -1126,14 +1205,15 @@ mod tests {
         assert_eq!(err, VCP_PANIC);
     }
 
-    // ── HandleCache hardware-free tests (S5) ───────────────────────────────
+    // ── HandleCache hardware-free tests ───────────────────────────────────
     //
     // The cache + error-classification logic is exercised through the generic
     // `HandleCache<H>` + `vcp_transaction` seam with a fake resolve function
     // and a fake handle — no DDC hardware required, every assertion
     // unconditional (no skip-to-green). The three `RealVcp` hardware tests
     // below are `#[ignore]`d: they passed vacuously on headless machines and
-    // their invalidation premise predates the M3b protocol/transport split.
+    // assume an unsupported VCP code invalidates the cache (it does not —
+    // only transport errors do).
 
     /// Fake resolved handle for the hardware-free cache tests.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1152,8 +1232,8 @@ mod tests {
         Ok((ident.to_string(), TestHandle(0)))
     }
 
-    /// S5: two sequential ops against the same ident cause exactly ONE
-    /// resolve — the second op hits the cache.
+    /// Two sequential ops against the same ident cause exactly ONE resolve —
+    /// the second op hits the cache.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn cache_sequential_hit_one_resolve_per_two_ops() {
@@ -1171,7 +1251,7 @@ mod tests {
         );
     }
 
-    /// S5: a transport/I2C error invalidates the cache entry — the next op
+    /// A transport/I2C error invalidates the cache entry — the next op
     /// re-resolves. The error-bearing op itself hits the cache (it does not
     /// re-resolve); invalidation happens after the op, by dropping the handle.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1202,9 +1282,9 @@ mod tests {
         );
     }
 
-    /// S5: a protocol error (unsupported VCP code, checksum mismatch) does
-    /// NOT invalidate — the handle is healthy, only the feature is absent.
-    /// The next op hits the cache.
+    /// A protocol error (unsupported VCP code, checksum mismatch) does NOT
+    /// invalidate — the handle is healthy, only the feature is absent. The
+    /// next op hits the cache.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn cache_protocol_error_does_not_invalidate() {
@@ -1232,7 +1312,7 @@ mod tests {
         );
     }
 
-    /// S5: a panic inside the op invalidates the cache entry — the next op
+    /// A panic inside the op invalidates the cache entry — the next op
     /// re-resolves.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -1257,42 +1337,73 @@ mod tests {
         );
     }
 
-    /// S5: a cache entry older than `CACHE_REVALIDATE_AFTER` is treated as a
-    /// miss and re-resolved; a fresh entry within the window is a hit.
+    /// The revalidation deadline is ABSOLUTE, not a sliding idle timeout:
+    /// `resolved_at` is stamped once at resolution and carried unchanged
+    /// through every checkout/reinsert, so steady polling well inside the
+    /// window cannot push the deadline forward forever. A fake clock advances
+    /// "2 s" per hit (the coordination-poll cadence) against a 5-min window;
+    /// `resolve_count` must stay 1 until total elapsed crosses the absolute
+    /// deadline, then go to 2 — never before. This fails against a reinsert
+    /// that re-stamps `now()` (the deadline would slide and never fire).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn cache_max_age_revalidates() {
-        // (a) Fresh entry within a 300s window is a hit.
-        let fresh = HandleCache::<TestHandle>::new(test_resolve, Duration::from_secs(300));
-        let ident = "i2c-dev:1 TST TEST";
-        vcp_transaction(&fresh, ident, |_| Ok::<(), String>(())).unwrap();
-        assert_eq!(fresh.resolve_count(), 1);
-        vcp_transaction(&fresh, ident, |_| Ok::<(), String>(())).unwrap();
-        assert_eq!(
-            fresh.resolve_count(),
-            1,
-            "fresh entry within window must hit"
-        );
+    fn cache_max_age_absolute_deadline_survives_steady_polling() {
+        // Fake clock: a fixed base (captured once) plus a test-advanced offset.
+        // The base cancels out of every `now − resolved_at` age computation, so
+        // only the offset delta matters — fully deterministic, no wall-clock
+        // wait and no `tokio::time::sleep` (which the test-timing gate rejects).
+        static OFFSET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        fn fake_now() -> Instant {
+            *BASE.get_or_init(Instant::now)
+                + Duration::from_millis(OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        fn advance(ms: u64) {
+            OFFSET_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+        }
 
-        // (b) A zero max-age window forces every entry to revalidate — the
-        // same `duration_since(inserted) < revalidate_after` branch a
-        // 5-min-old entry takes (the bound is strict `<`, so any age >= 0
-        // fails it). Avoids a 5-minute wall-clock wait and `Instant` underflow.
-        let stale = HandleCache::<TestHandle>::new(test_resolve, Duration::ZERO);
-        vcp_transaction(&stale, ident, |_| Ok::<(), String>(())).unwrap();
-        assert_eq!(stale.resolve_count(), 1);
-        vcp_transaction(&stale, ident, |_| Ok::<(), String>(())).unwrap();
+        OFFSET_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let cache = HandleCache::<TestHandle>::new_with_clock(
+            test_resolve,
+            CACHE_REVALIDATE_AFTER,
+            fake_now,
+        );
+        let ident = "i2c-dev:1 TST TEST";
+
+        // First op resolves at t=0.
+        vcp_transaction(&cache, ident, |_| Ok::<(), String>(())).unwrap();
+        assert_eq!(cache.resolve_count(), 1);
+
+        // Poll every 2 s — each hit is well inside the 5-min (300 s) window, so
+        // each is a cache hit. The absolute age grows toward the deadline.
+        for hit in 1..=149 {
+            advance(2_000);
+            vcp_transaction(&cache, ident, |_| Ok::<(), String>(())).unwrap();
+            assert_eq!(
+                cache.resolve_count(),
+                1,
+                "hit {hit} at ~{} s is inside the 300 s window — must hit, not re-resolve",
+                hit * 2,
+            );
+        }
+
+        // 149 hits × 2 s = 298 s < 300 s: still cached. One more 2 s crosses the
+        // absolute deadline → re-resolve.
+        advance(2_000);
+        vcp_transaction(&cache, ident, |_| Ok::<(), String>(())).unwrap();
         assert_eq!(
-            stale.resolve_count(),
+            cache.resolve_count(),
             2,
-            "entry older than the max-age window must re-resolve"
+            "after the 300 s absolute deadline, the entry must re-resolve — \
+             a sliding (re-stamped) deadline would still be 2 s old here and \
+             would NOT have re-resolved"
         );
     }
 
-    /// S5 / M2: a sampler that loses the panel-lock race skips BEFORE any
-    /// enumeration or cache touch — `enumeration_count` stays zero. This is
-    /// hardware-free: the skip happens before `resolve_display` is ever
-    /// called, so no DDC device is needed.
+    /// A sampler that loses the panel-lock race skips BEFORE any enumeration
+    /// or cache touch — `enumeration_count` stays zero. Hardware-free: the
+    /// skip happens before `resolve_display` is ever called, so no DDC device
+    /// is needed.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn sampler_skip_before_enumeration() {
@@ -1387,7 +1498,7 @@ mod tests {
     /// a ddc-hi error.  The error must invalidate the cache, so the
     /// subsequent `get_vcp(0x10)` enumerates fresh.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[ignore = "superseded by cache_transport_error_invalidates / cache_protocol_error_does_not_invalidate; its 'unsupported code invalidates' premise predates the M3b protocol/transport split"]
+    #[ignore = "superseded by the hardware-free cache_transport_error_invalidates / cache_protocol_error_does_not_invalidate; run on hardware via --ignored"]
     #[tokio::test]
     async fn error_invalidates_cache_entry() {
         let Some(ident) = first_display_ident() else {
@@ -1450,7 +1561,7 @@ mod tests {
     /// On hardware where the unsupported-code write succeeds (rare), the
     /// test vacuously passes (nothing to invalidate).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[ignore = "superseded by cache_panic_invalidates; its unsupported-code-error premise predates the M3b protocol/transport split"]
+    #[ignore = "superseded by the hardware-free cache_panic_invalidates; run on hardware via --ignored"]
     #[tokio::test]
     async fn panic_path_invalidates_cache() {
         let Some(ident) = first_display_ident() else {

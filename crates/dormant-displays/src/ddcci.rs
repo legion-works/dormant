@@ -943,7 +943,7 @@ mod tests {
         );
     }
 
-    /// M3a: `read_state_at` skips the VCP 0xD6 read when `probe()` recorded
+    /// `read_state_at` skips the VCP 0xD6 read when `probe()` recorded
     /// `d6_supported = false`. A non-D6 panel returns an unsupported-code
     /// error on every D6 read; without the skip, each 2s coordination tick
     /// would issue a wasted bus transaction under the panel lock (and risk a

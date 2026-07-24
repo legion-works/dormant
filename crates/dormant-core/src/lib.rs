@@ -1,6 +1,7 @@
 //! Core domain types, traits, zone and rules engines for dormant — pure logic, no I/O.
 #![warn(missing_docs)]
 
+pub mod claim;
 pub mod config;
 pub mod coordination;
 pub mod doctor;

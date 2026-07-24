@@ -137,6 +137,7 @@ for configured shared displays.
 | `enabled` | boolean | `false` | Enables mDNS discovery, pairing, and instance-pairing routes. |
 | `poll_interval` | duration | `"2s"` | Shared-display ownership poll cadence (VCP `0x60`); minimum `"1s"`. |
 | `state_poll_interval` | duration | `"30s"` | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics. When unset, defaults to `max(30s, poll_interval)`; when set, must be `>= poll_interval`. Ownership still polls at `poll_interval`; only panel state refreshes here, to cut per-transaction i2c traffic. |
+| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached ownership verdict flips `true → false` (defends against garbled reads from concurrent cross-machine DDC traffic; issue #134). Validated `1..=10`. Ownership *gain* (`false → true`) stays eager — waking on a possibly-wrong "I own" read is idempotent and the next poll re-confirms. |
 | `pairing_port` | integer | `0` | TCP port for a pairing window; `0` requests an ephemeral OS port. |
 | `pairing_window` | duration | `"5m"` | Lifetime of the listener and mDNS advertisement; `"30s"` to `"15m"`. |
 | `pairing_bind_address` | string or unset | unset | LAN address for the temporary listener; unset auto-detects the primary non-loopback address. |
@@ -153,6 +154,13 @@ for configured shared displays.
 - A DDC read error holds the last ownership verdict. At cold start or after a
   stale observation, ownership stays conservative. An unknown zone acquiring
   ownership does not wake the panel.
+- Two daemons polling the **same** physical panel will see occasional
+  successful-but-wrong reads on each other's bus traffic. The
+  `loss_confirmations` debounce holds the prior verdict on a stray "not mine"
+  reading; `coord_poll_disagreement` (when consecutive observations disagree)
+  and `coord_ownership_loss_deferred` (when the pending counter is below the
+  threshold) are emitted as literal anchors so the operator can see the bus is
+  dirty without parsing the verdict cache.
 - `dormantctl doctor` can report `input_source=skipped` when a controller has no
   usable input-source readback, or `input_source=unreadable` when a read was
   attempted and failed. Fix that before relying on a shared display.

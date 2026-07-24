@@ -363,6 +363,7 @@ fn shared_display_config(display: &str, code: u8, hooks: HookSlots) -> Arc<Confi
             enabled: true,
             poll_interval: Duration::from_secs(2),
             state_poll_interval: None,
+            loss_confirmations: 3,
             pairing_port: 0,
             pairing_window: Duration::from_secs(300),
             pairing_bind_address: None,

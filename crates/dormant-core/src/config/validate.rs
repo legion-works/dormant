@@ -86,6 +86,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "enabled",
             "poll_interval",
             "state_poll_interval",
+            "loss_confirmations",
             "pairing_port",
             "pairing_window",
             "pairing_bind_address",
@@ -869,6 +870,7 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             ),
         });
     }
+    validate_loss_confirmations(&cfg.coordination, errors);
     let pairing_window = cfg.coordination.pairing_window;
     if !(Duration::from_secs(30)..=Duration::from_secs(15 * 60)).contains(&pairing_window) {
         errors.push(ValidationError {
@@ -944,6 +946,25 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!("keymap claim_hotkey {hotkey:?} is not a valid accelerator"),
+        });
+    }
+}
+
+/// Validate `coordination.loss_confirmations` against `1..=10`. The floor
+/// protects against a misconfiguration that would commit a loss on no
+/// observation at all; the ceiling protects against a value that would
+/// deadlock a real handoff behind a 20s+ window on a 2s poll (issue #134).
+fn validate_loss_confirmations(
+    coordination: &super::schema::CoordinationConfig,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !(1..=10).contains(&coordination.loss_confirmations) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination loss_confirmations {} is outside the permitted 1..=10 range",
+                coordination.loss_confirmations
+            ),
         });
     }
 }
@@ -6379,6 +6400,36 @@ availability_payload_offline = "down"
                 .any(|error| error.detail.contains("state_poll_interval")),
             "state_poll_interval == poll_interval should be accepted, got {errors:?}"
         );
+    }
+
+    #[test]
+    fn coordination_loss_confirmations_outside_bounds_rejected() {
+        // Floor (0): would commit on no observation at all. Ceiling (>10): would
+        // deadlock a real handoff behind a 20s+ ceiling on a 2s poll.
+        for (value, label) in [(0u32, "zero"), (11u32, "above ceiling")] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\nloss_confirmations = {value}\n"
+            ));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                        && error.detail.contains("loss_confirmations")
+                        && error.detail.contains("1..=10")),
+                "{label} loss_confirmations={value} must be rejected, got {errors:?}"
+            );
+        }
+        for value in [1u32, 3, 10] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\nloss_confirmations = {value}\n"
+            ));
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| error.detail.contains("loss_confirmations")),
+                "loss_confirmations={value} must be accepted, got {errors:?}"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,28 @@ use crate::types::DisplayId;
 /// Interval used to rate-limit logs while shared-display input polling fails.
 pub const COORD_POLL_FAILING_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Outcome of one input-source observation fed through the loss-debounce path.
+///
+/// The poll task logs disagreement / deferred-loss signals from this struct and
+/// only sends an `OwnershipPoll` control message when `committed_prior_owned`
+/// is `Some(_)`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InputObservationOutcome {
+    /// The verdict that was committed on this observation, plus the prior
+    /// verdict. `Some(prior)` means a real ownership transition was committed
+    /// and the rules engine should be re-consulted; `None` means the cached
+    /// verdict was held (gain or loss was deferred or reads disagreed).
+    pub committed_prior_owned: Option<bool>,
+    /// `Some(pending_count)` when a potential loss was observed but is still
+    /// pending further confirming reads (the cached verdict is still owned).
+    pub deferred_loss_count: Option<u32>,
+    /// `Some(previous_code)` when the freshly observed code disagreed with the
+    /// last successful observation for this display. The disagreement signal
+    /// lets the operator distinguish "poll is healthy" from "the bus is
+    /// returning inconsistent values" without parsing the cache.
+    pub disagreement_with: Option<u8>,
+}
+
 /// Last known ownership and readback state for one shared display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoordRecord {
@@ -29,6 +51,14 @@ pub struct CoordRecord {
     /// `None` when this instance owns the display or the owner is unknown.
     /// Populated by the claim runtime on ownership transitions.
     pub owner_instance_id: Option<String>,
+    /// Consecutive agreeing "not mine" readings observed while the cached
+    /// verdict was `owned = true`. Reset to 0 on any disagreement or any
+    /// subsequent "mine" reading. Triggers a committed ownership loss once
+    /// it reaches the configured `loss_confirmations` threshold.
+    pub pending_loss_count: u32,
+    /// Last successful observation's raw input code; used to detect
+    /// disagreements between consecutive successful reads (issue #134).
+    pub last_observed_code: Option<u8>,
 }
 
 impl CoordRecord {
@@ -40,6 +70,8 @@ impl CoordRecord {
             panel_state: None,
             consecutive_failures: 0,
             owner_instance_id: None,
+            pending_loss_count: 0,
+            last_observed_code: None,
         }
     }
 }
@@ -70,6 +102,12 @@ impl CoordinationHandle {
     /// Returns `Some(previous_owned)` only when the ownership verdict changed.
     /// Unknown displays are a no-op and return `None`: private displays are not
     /// cached, and a shared display can be removed concurrently with reload.
+    ///
+    /// This is the single-tick legacy path: it commits a loss on the first
+    /// "not mine" reading. The poll task uses [`Self::record_input_observation`]
+    /// with the configured `loss_confirmations` to debounce against garbled DDC
+    /// reads (issue #134).
+    #[allow(clippy::must_use_candidate)] // existing single-tick callers (test setup) fire-and-forget
     pub fn record_success(
         &self,
         display: &DisplayId,
@@ -77,15 +115,91 @@ impl CoordinationHandle {
         expected: u8,
         panel_state: Option<PanelState>,
     ) -> Option<bool> {
+        self.record_input_observation(display, observed, expected, 1, panel_state)
+            .committed_prior_owned
+    }
+
+    /// Record a successful source-input read through the loss-debounce path
+    /// (issue #134).
+    ///
+    /// Ownership **gain** (`false → true`) commits eagerly: a possibly-wrong
+    /// "I own" reading triggers an idempotent wake, which the next poll
+    /// re-confirms. This asymmetry with **loss** is intentional — blanking
+    /// the panel on a corrupted read strands the operator looking at a dark
+    /// screen (live incident journal: 38 ownership flips / 30 min on the
+    /// operator's hardware with two daemons polling one panel).
+    ///
+    /// Ownership **loss** (`true → false`) requires `loss_confirmations`
+    /// consecutive agreeing "not mine" readings before the verdict flips.
+    /// Any disagreement between consecutive observations resets the pending
+    /// counter and is surfaced through `disagreement_with` so the operator
+    /// can distinguish "the bus is returning inconsistent values" from
+    /// "the input really switched".
+    ///
+    /// Returns `None` for unknown displays (private displays are never
+    /// cached; a shared display can be removed concurrently with reload).
+    #[must_use]
+    pub fn record_input_observation(
+        &self,
+        display: &DisplayId,
+        observed: u8,
+        expected: u8,
+        loss_confirmations: u32,
+        panel_state: Option<PanelState>,
+    ) -> InputObservationOutcome {
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
-        let record = records.get_mut(display)?;
+        let Some(record) = records.get_mut(display) else {
+            return InputObservationOutcome::default();
+        };
+        let mut outcome = InputObservationOutcome::default();
         let prior_owned = record.owned;
-        record.owned = observed == expected;
+        let new_owned = observed == expected;
+
+        // Disagreement: the freshly observed code differs from the last
+        // successful observation for this display. The pending-loss counter
+        // resets on every disagreement so two different not-mine codes in
+        // a row cannot collude to commit a loss.
+        if let Some(previous_code) = record.last_observed_code
+            && previous_code != observed
+        {
+            outcome.disagreement_with = Some(previous_code);
+            record.pending_loss_count = 0;
+        }
+
+        match (prior_owned, new_owned) {
+            (false, false) => {
+                // Already not owned; the counter and verdict stay put.
+                record.pending_loss_count = 0;
+            }
+            (true, true) => {
+                // Already owned and still reading mine; counter resets.
+                record.pending_loss_count = 0;
+            }
+            (false, true) => {
+                // GAIN — eager by design (see doc comment above).
+                record.owned = true;
+                record.pending_loss_count = 0;
+                outcome.committed_prior_owned = Some(prior_owned);
+            }
+            (true, false) => {
+                // Candidate LOSS — debounce.
+                record.pending_loss_count = record.pending_loss_count.saturating_add(1);
+                if record.pending_loss_count >= loss_confirmations.max(1) {
+                    record.owned = false;
+                    record.pending_loss_count = 0;
+                    outcome.committed_prior_owned = Some(prior_owned);
+                } else {
+                    outcome.deferred_loss_count = Some(record.pending_loss_count);
+                }
+            }
+        }
+
         record.has_successful_input_read = true;
         record.input_code = Some(observed);
         record.panel_state = panel_state;
         record.consecutive_failures = 0;
-        (prior_owned != record.owned).then_some(prior_owned)
+        record.last_observed_code = Some(observed);
+        outcome
     }
 
     /// Record an input-source read failure without changing the ownership verdict.
@@ -321,5 +435,162 @@ mod tests {
             Some(true)
         );
         assert!(!CoordinationGate::new(handle).owns(&display("aoc")));
+    }
+
+    // ── issue #134 — ownership-loss debounce against garbled DDC reads ────────
+
+    /// Stray garbled read embedded in an owned sequence does not flip the
+    /// verdict — a single misread of `0x60` while the input is still ours
+    /// must not blank the panel. Anchored on the live #134 journal evidence
+    /// (six direct `ddcutil getvcp 60` samples were stable sl=0x0f while the
+    /// daemon was logging garbled values).
+    #[test]
+    fn garbled_read_in_owned_sequence_does_not_change_verdict() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+
+        // owned: 0x11 (mine), 0x11 (mine), 0x99 (garbled stray), 0x11 (mine)
+        let outcome = handle.record_input_observation(&aoc, 0x11, 0x11, 3, None);
+        assert!(outcome.committed_prior_owned.is_none());
+        let outcome = handle.record_input_observation(&aoc, 0x11, 0x11, 3, None);
+        assert!(outcome.committed_prior_owned.is_none());
+        let outcome = handle.record_input_observation(&aoc, 0x99, 0x11, 3, None);
+        // A single stray "not mine" must NOT commit a loss — only the pending
+        // counter advances. The verdict stays owned.
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+        // Garbled code disagrees with the last observation → emit a disagreement
+        // signal so the operator learns something was off.
+        assert_eq!(outcome.disagreement_with, Some(0x11));
+        assert!(handle.snapshot()[&aoc].owned);
+
+        // A subsequent "mine" reading resets the pending counter and holds the
+        // verdict — never blanks. The return-to-mine also disagrees with the
+        // garbled observation, so the disagreement signal fires here too.
+        let outcome = handle.record_input_observation(&aoc, 0x11, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, None);
+        assert_eq!(outcome.disagreement_with, Some(0x99));
+        assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    /// Sustained transition (the input really did switch) commits exactly one
+    /// loss after `loss_confirmations` consecutive agreeing "not mine" reads.
+    /// Subsequent stable "not mine" readings do NOT emit further changes.
+    #[test]
+    fn sustained_other_input_commits_exactly_one_loss() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+
+        // First not-mine reading — counter advances, verdict still owned.
+        let outcome = handle.record_input_observation(&aoc, 0x12, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+        assert!(handle.snapshot()[&aoc].owned);
+
+        // Second consecutive agreeing not-mine reading — still pending.
+        let outcome = handle.record_input_observation(&aoc, 0x12, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, Some(2));
+        assert!(handle.snapshot()[&aoc].owned);
+
+        // Third consecutive agreeing not-mine reading — the verdict flips once.
+        let outcome = handle.record_input_observation(&aoc, 0x12, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, Some(true));
+        assert_eq!(outcome.deferred_loss_count, None);
+        assert!(!handle.snapshot()[&aoc].owned);
+
+        // A fourth consecutive agreeing not-mine reading — already not owned,
+        // no further transition. The pending counter must reset.
+        let outcome = handle.record_input_observation(&aoc, 0x12, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, None);
+        assert!(!handle.snapshot()[&aoc].owned);
+    }
+
+    /// Disagreement between consecutive not-mine codes (e.g., the bus returned
+    /// two different non-matching codes in a row) must hold the prior verdict —
+    /// neither commit a loss nor advance the pending-loss counter past the
+    /// freshly-observed disagreement. Anchored on the #134 cross-machine DDC
+    /// traffic pattern where successful-but-wrong reads vary.
+    #[test]
+    fn disagreeing_not_mine_reads_hold_prior_verdict() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+
+        // Garbled reading #1: pending=1, no commitment.
+        let outcome = handle.record_input_observation(&aoc, 0x12, 0x11, 3, None);
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+        assert!(handle.snapshot()[&aoc].owned);
+
+        // Garbled reading #2 with a DIFFERENT not-mine code: counter resets to
+        // 1 (fresh disagreement), verdict stays owned.
+        let outcome = handle.record_input_observation(&aoc, 0x13, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+        assert_eq!(outcome.disagreement_with, Some(0x12));
+        assert!(handle.snapshot()[&aoc].owned);
+
+        // A third agreeing garbled reading of 0x13 advances the counter to 2,
+        // still below the 3-confirmation threshold — verdict still owned.
+        let outcome = handle.record_input_observation(&aoc, 0x13, 0x11, 3, None);
+        assert_eq!(outcome.deferred_loss_count, Some(2));
+        assert_eq!(outcome.disagreement_with, None);
+        assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    /// Ownership *gain* stays eager — waking on a possibly-wrong "I own" read
+    /// is harmless (the wake path is idempotent and re-confirmed by the next
+    /// poll). The asymmetry with loss (which blanks) is intentional and
+    /// documented on `record_input_observation`.
+    #[test]
+    fn ownership_gain_is_eager_with_no_confirmation() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+
+        // Drive to not-owned via the confirmed-loss path (3 agreeing readings).
+        for _ in 0..3 {
+            let _ = handle.record_input_observation(&aoc, 0x12, 0x11, 3, None);
+        }
+        assert!(!handle.snapshot()[&aoc].owned);
+
+        // A single "mine" reading immediately flips the verdict back to owned.
+        let outcome = handle.record_input_observation(&aoc, 0x11, 0x11, 3, None);
+        assert_eq!(outcome.committed_prior_owned, Some(false));
+        assert_eq!(outcome.deferred_loss_count, None);
+        assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    /// Single-not-mine commits a loss when `loss_confirmations == 1` —
+    /// preserves the legacy one-tick semantics for setups that explicitly
+    /// opt out of debouncing.
+    #[test]
+    fn loss_confirmations_one_preserves_legacy_single_tick_semantics() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+
+        let outcome = handle.record_input_observation(&aoc, 0x12, 0x11, 1, None);
+        assert_eq!(outcome.committed_prior_owned, Some(true));
+        assert!(!handle.snapshot()[&aoc].owned);
+    }
+
+    /// Disagreement detected on a transition from owned to mine after a garbled
+    /// window — the fresh "mine" reading disagrees with the last observed code
+    /// (the garbled one) and must reset the pending counter while leaving the
+    /// verdict untouched (it was never flipped during the garble).
+    #[test]
+    fn return_to_mine_after_garbled_window_holds_verdict_and_resets_counter() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+
+        let _ = handle.record_input_observation(&aoc, 0x99, 0x11, 3, None); // garbled #1
+        let _ = handle.record_input_observation(&aoc, 0x9a, 0x11, 3, None); // garbled #2 (differs)
+        let outcome = handle.record_input_observation(&aoc, 0x11, 0x11, 3, None);
+        // 0x11 disagrees with the last observed 0x9a, the verdict was never
+        // flipped, and the counter must reset to 0.
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, None);
+        assert_eq!(outcome.disagreement_with, Some(0x9a));
+        assert!(handle.snapshot()[&aoc].owned);
     }
 }

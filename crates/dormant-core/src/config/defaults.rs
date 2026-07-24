@@ -115,6 +115,16 @@ pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// `>= poll_interval` (see [`mod@super::validate`]).
 pub const COORDINATION_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Number of consecutive agreeing "not mine" `0x60` readings required before
+/// the cached ownership verdict flips `true → false`. Defends against
+/// garbled reads from concurrent cross-machine DDC traffic on a shared panel
+/// (issue #134): a single corrupted read should not blank a panel that's
+/// still ours. Ownership **gain** (`false → true`) stays eager — waking on
+/// a possibly-wrong "I own" read is idempotent and the next poll re-confirms.
+/// Validated `>= 1` (a threshold of `0` would commit on no observation at
+/// all) and `<= 10` (a defensive upper bound; production defaults are small).
+pub const COORDINATION_LOSS_CONFIRMATIONS: u32 = 3;
+
 /// Requested TCP port for a pairing listener; zero requests an ephemeral port.
 pub const COORDINATION_PAIRING_PORT: u16 = 0;
 

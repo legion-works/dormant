@@ -186,6 +186,20 @@ pub struct CoordinationConfig {
     )]
     pub state_poll_interval: Option<Duration>,
 
+    /// Number of consecutive agreeing "not mine" VCP `0x60` readings required
+    /// before the cached ownership verdict flips `true → false` (issue #134).
+    ///
+    /// Defends against garbled reads from concurrent cross-machine DDC
+    /// traffic on a shared panel: a single corrupted read should not blank a
+    /// panel that's still ours. Ownership **gain** (`false → true`) stays
+    /// eager — a possibly-wrong "I own" read triggers an idempotent wake that
+    /// the next poll re-confirms. See
+    /// [`defaults::COORDINATION_LOSS_CONFIRMATIONS`] for the default and the
+    /// floor / ceiling rationale; validated to `1..=10` in
+    /// [`mod@super::validate`].
+    #[serde(default = "default_coordination_loss_confirmations")]
+    pub loss_confirmations: u32,
+
     /// Requested TCP port for the short-lived pairing listener; zero requests
     /// an ephemeral port from the operating system.
     #[serde(default = "default_coordination_pairing_port")]
@@ -254,6 +268,7 @@ impl Default for CoordinationConfig {
             enabled: defaults::COORDINATION_ENABLED,
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
             state_poll_interval: None,
+            loss_confirmations: defaults::COORDINATION_LOSS_CONFIRMATIONS,
             pairing_port: defaults::COORDINATION_PAIRING_PORT,
             pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
             pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
@@ -1481,6 +1496,9 @@ fn default_coordination_enabled() -> bool {
 fn default_coordination_poll_interval() -> Duration {
     defaults::COORDINATION_POLL_INTERVAL
 }
+fn default_coordination_loss_confirmations() -> u32 {
+    defaults::COORDINATION_LOSS_CONFIRMATIONS
+}
 fn default_coordination_pairing_port() -> u16 {
     defaults::COORDINATION_PAIRING_PORT
 }
@@ -2264,6 +2282,8 @@ idle_source = "macos"
             cfg.coordination.effective_state_poll_interval(),
             Duration::from_secs(30)
         );
+        // loss_confirmations default — defends against issue #134 garbled reads.
+        assert_eq!(cfg.coordination.loss_confirmations, 3);
         assert_eq!(cfg.coordination.pairing_port, 0);
         assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(300));
         assert_eq!(cfg.coordination.pairing_bind_address, None);

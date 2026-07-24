@@ -119,6 +119,7 @@ async fn poll_once(
             last_failing_log.remove(&display_id);
             if let Some(previous_owned) = prior {
                 let owned = observed == expected;
+                deps.state.set_owner(&display_id, None);
                 tracing::info!(event = "coord_ownership_changed", display = %display_id, previous_owned, owned);
                 let _ = deps
                     .ctl_tx
@@ -351,13 +352,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn successful_other_input_changes_false_and_pokes_once() {
         let sink = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x12))]));
-        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
+        let display = DisplayId("shared".to_owned());
+        state.set_owner(&display, Some("prior-owner".to_owned()));
         tick().await;
         assert!(matches!(
             ctl_rx.recv().await,
             Some(ControlMsg::OwnershipPoll { .. })
         ));
         assert!(ctl_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .snapshot()
+                .get(&display)
+                .and_then(|record| record.owner_instance_id.as_deref()),
+            None
+        );
         cancel.cancel();
     }
 

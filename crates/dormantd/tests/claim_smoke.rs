@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dormant_core::claim::{ClaimFrame, ClaimMessage, ClaimRequest, ClaimVerdict};
+use dormant_core::claim::{ClaimFrame, ClaimMessage, ClaimRequest, ClaimResponse, ClaimVerdict};
 use dormant_core::claim_engine::{Action, ClaimEngine, RequesterEvent, Terminal};
 use dormant_core::config::schema::{
     ActivityClaimPolicy, AudioConfig, Config, HookAction, HookSlots, KeymapConfig,
@@ -1654,4 +1654,69 @@ async fn matching_owner_idle_report_is_accepted() {
         "Matching-owner IdleReport must fire a claim; log = {:?}",
         harness.log_events()
     );
+}
+
+#[tokio::test]
+async fn accepted_claim_response_records_owner_for_idle_report_gate() {
+    let display = DisplayId("owner_tracking".to_owned());
+    let harness = ClaimHarness::build(&display.0, 0x0f).await;
+    harness.coord.record_success(&display, 0x11, 0x0f, None);
+
+    let result = harness
+        .handle
+        .try_claim(display.clone())
+        .await
+        .expect("claim runtime must accept the local request");
+    assert!(matches!(result, ClaimSharedResult::Accepted { .. }));
+
+    let nonce = harness
+        .handle
+        .requester_nonce_for_test(display.clone())
+        .await
+        .expect("requester nonce query must succeed")
+        .expect("requester flight must be active");
+
+    let owner_signing = SigningKey::from_bytes(&[88; 32]);
+    let owner_instance_id = instance_id_from_public_key(&owner_signing.verifying_key().to_bytes());
+    let owner_identity = InstanceIdentity {
+        instance_id: owner_instance_id.clone(),
+        signing_key: owner_signing.clone(),
+        verifying_key: owner_signing.verifying_key(),
+    };
+    let frame = ClaimFrame::sign(
+        &owner_identity,
+        "peer-epoch-00001".to_owned(),
+        harness.local_identity.instance_id.clone(),
+        "recv-epoch-00001".to_owned(),
+        1,
+        "accepted-frame-1".to_owned(),
+        ClaimMessage::ClaimResponse(ClaimResponse {
+            nonce,
+            verdict: ClaimVerdict::Accepted { eta_ms: 1_000 },
+        }),
+    )
+    .expect("accepted response frame must sign");
+
+    harness
+        .handle
+        .inject_inbound_for_test(frame)
+        .await
+        .expect("accepted response must reach the runtime");
+    assert!(
+        harness
+            .wait_for_log("claim_accepted", Duration::from_secs(2))
+            .await,
+        "accepted response must traverse the requester handler"
+    );
+
+    let record = harness
+        .coord
+        .snapshot()
+        .remove(&display)
+        .expect("shared display must remain in coordination state");
+    assert_eq!(
+        record.owner_instance_id.as_deref(),
+        Some(owner_instance_id.as_str())
+    );
+    harness.shutdown();
 }

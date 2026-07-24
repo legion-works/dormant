@@ -165,6 +165,11 @@ enum RuntimeEvent {
         nonce: String,
         idle_ms: u64,
     },
+    #[cfg(any(test, feature = "test-util"))]
+    RequesterNonce {
+        display: DisplayId,
+        reply: oneshot::Sender<Option<String>>,
+    },
 }
 
 /// Local verdict surfaced to the IPC caller.
@@ -352,6 +357,26 @@ impl ClaimRuntimeHandle {
             .send(RuntimeEvent::InjectIdleReport { nonce, idle_ms })
             .await
             .map_err(|_| "claim runtime not available")
+    }
+
+    /// Return the active requester nonce for an integration test.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver exits before answering.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn requester_nonce_for_test(
+        &self,
+        display: DisplayId,
+    ) -> Result<Option<String>, &'static str> {
+        let (reply, received) = oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeEvent::RequesterNonce { display, reply })
+            .await
+            .map_err(|_| "claim runtime not available")?;
+        received
+            .await
+            .map_err(|_| "claim runtime dropped acknowledgement")
     }
 
     /// Inject an asynchronous owner completion through the driver's event loop.
@@ -685,6 +710,14 @@ impl Driver {
                     let _ = tx.send(idle_ms);
                 }
             }
+            #[cfg(any(test, feature = "test-util"))]
+            RuntimeEvent::RequesterNonce { display, reply } => {
+                let nonce = self
+                    .flights
+                    .get(&display)
+                    .map(|flight| flight.nonce.clone());
+                let _ = reply.send(nonce);
+            }
         }
     }
 
@@ -761,6 +794,7 @@ impl Driver {
                 let Some(display) = self.find_display_by_requester_nonce(&response.nonce) else {
                     return;
                 };
+                let accepted = matches!(&response.verdict, ClaimVerdict::Accepted { .. });
                 let actions = self
                     .engines
                     .get_mut(&display)
@@ -774,6 +808,15 @@ impl Driver {
                         },
                         Instant::now(),
                     );
+                if accepted
+                    && actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Trace("claim_accepted")))
+                {
+                    if let Some(coordination) = &self.coordination {
+                        coordination.set_owner(&display, Some(sender_instance_id));
+                    }
+                }
                 self.dispatch_actions(&display, &actions);
                 if self
                     .engines
@@ -840,18 +883,24 @@ impl Driver {
                 self.record_event("idle_report_sent");
             }
             ClaimMessage::IdleReport(report) => {
-                // Requester side: resolve the pending query only if the
-                // sender is the expected owner of the queried display.
-                if let Some((display, tx)) = self.pending_idle_queries.remove(&report.nonce) {
-                    let sender_is_expected_owner = self
-                        .coordination
-                        .as_ref()
-                        .and_then(|c| c.snapshot().get(&display).cloned())
-                        .and_then(|r| r.owner_instance_id)
-                        .is_none_or(|oid| oid == sender_instance_id);
-                    if sender_is_expected_owner {
-                        let _ = tx.send(report.idle_ms);
-                    }
+                let Some(display) = self
+                    .pending_idle_queries
+                    .get(&report.nonce)
+                    .map(|(display, _)| display.clone())
+                else {
+                    return;
+                };
+                let sender_is_expected_owner = self
+                    .coordination
+                    .as_ref()
+                    .and_then(|c| c.snapshot().get(&display).cloned())
+                    .and_then(|r| r.owner_instance_id)
+                    .is_some_and(|owner| owner == sender_instance_id);
+                if !sender_is_expected_owner {
+                    return;
+                }
+                if let Some((_display, tx)) = self.pending_idle_queries.remove(&report.nonce) {
+                    let _ = tx.send(report.idle_ms);
                 }
             }
         }

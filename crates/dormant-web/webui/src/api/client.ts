@@ -35,6 +35,8 @@ import type {
   InstancePairOpen,
   InstancePairStatus,
   InstancePairPeers,
+  ClaimSharedResult,
+  ClaimArmResult,
 } from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -99,6 +101,17 @@ export function postWake(display: string): Promise<void> {
     method: "POST",
     headers: JSON_CT,
     body: JSON.stringify({ display }),
+  });
+}
+
+/** POST /api/switch — claim or arm a shared display. */
+export function postSwitch(display: string, arm: false): Promise<ClaimSharedResult>;
+export function postSwitch(display: string, arm: true): Promise<ClaimArmResult>;
+export function postSwitch(display: string, arm: boolean): Promise<ClaimSharedResult | ClaimArmResult> {
+  return request<ClaimSharedResult | ClaimArmResult>("/switch", {
+    method: "POST",
+    headers: JSON_CT,
+    body: JSON.stringify({ display, arm }),
   });
 }
 

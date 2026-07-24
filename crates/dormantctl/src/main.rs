@@ -13,6 +13,7 @@ mod cmd_launchd;
 mod cmd_pair;
 mod cmd_pause;
 mod cmd_status;
+mod cmd_switch;
 mod cmd_validate;
 mod cmd_watch;
 
@@ -94,6 +95,14 @@ enum Command {
     Wake {
         /// Display id to wake.
         display: String,
+    },
+    /// Request a shared-panel switch, or arm activity claim.
+    Switch {
+        /// Shared display id to claim.
+        display: String,
+        /// Arm activity claim instead of switching immediately.
+        #[arg(long)]
+        arm: bool,
     },
     /// Trigger a config reload.
     Reload,
@@ -205,6 +214,7 @@ fn main() -> ExitCode {
         Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
         Command::Blank { display } => cmd_blank::run_blank(&socket_path, &display),
         Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
+        Command::Switch { display, arm } => cmd_switch::run(&socket_path, &display, arm),
         Command::Reload => {
             match dormantctl::client::send_request(&socket_path, &IpcRequest::Reload) {
                 Ok(resp) if resp.ok => {
@@ -456,6 +466,15 @@ mod tests {
             Command::Launchd {
                 subcommand: cmd_launchd::LaunchdSubcommand::Uninstall
             }
+        ));
+    }
+
+    #[test]
+    fn parse_switch_arm() {
+        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor", "--arm"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Switch { display, arm: true } if display == "monitor"
         ));
     }
 }

@@ -39,6 +39,13 @@ pub(crate) struct WakeBody {
 }
 
 #[derive(Deserialize, Debug)]
+pub(crate) struct SwitchBody {
+    pub(crate) display: String,
+    #[serde(default)]
+    pub(crate) arm: bool,
+}
+
+#[derive(Deserialize, Debug)]
 pub(crate) struct PauseBody {
     pub(crate) rule: Option<String>,
     /// Duration in seconds; `None` = indefinite.
@@ -51,6 +58,50 @@ pub(crate) struct ResumeBody {
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
+
+fn request_for_switch(display: &str, arm: bool) -> dormant_core::ipc_proto::IpcRequest {
+    if arm {
+        dormant_core::ipc_proto::IpcRequest::ClaimArm {
+            display: display.to_string(),
+        }
+    } else {
+        dormant_core::ipc_proto::IpcRequest::ClaimShared {
+            display: display.to_string(),
+        }
+    }
+}
+
+/// `POST /api/switch` — request or arm a shared-panel claim.
+pub(crate) async fn post_switch(
+    State(state): State<WebState>,
+    Json(body): Json<SwitchBody>,
+) -> Result<Json<serde_json::Value>, WebError> {
+    validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
+    let response =
+        crate::request_daemon_ipc(&state, request_for_switch(&body.display, body.arm)).await?;
+    if !response.ok {
+        return Err(WebError::BadRequest(
+            response
+                .error
+                .unwrap_or_else(|| "claim rejected".to_string()),
+        ));
+    }
+    let value = if body.arm {
+        serde_json::to_value(
+            response
+                .claim_arm
+                .ok_or_else(|| WebError::BadRequest("daemon returned no arm result".into()))?,
+        )
+    } else {
+        serde_json::to_value(
+            response
+                .claim_shared
+                .ok_or_else(|| WebError::BadRequest("daemon returned no claim result".into()))?,
+        )
+    }
+    .map_err(|error| WebError::BadRequest(error.to_string()))?;
+    Ok(Json(value))
+}
 
 /// `POST /api/blank` — validate display exists, then force-blank.
 pub(crate) async fn post_blank(
@@ -292,6 +343,7 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     axum::Router::new()
         .route("/api/blank", axum::routing::post(post_blank))
         .route("/api/wake", axum::routing::post(post_wake))
+        .route("/api/switch", axum::routing::post(post_switch))
         .route("/api/pause", axum::routing::post(post_pause))
         .route("/api/resume", axum::routing::post(post_resume))
         .route("/api/reload", axum::routing::post(post_reload))
@@ -821,5 +873,20 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({"error": "emergency_wake_in_progress"})
         );
+    }
+    #[test]
+    fn switch_arm_maps_to_claim_arm() {
+        assert!(matches!(
+            request_for_switch("monitor", true),
+            dormant_core::ipc_proto::IpcRequest::ClaimArm { display } if display == "monitor"
+        ));
+    }
+
+    #[test]
+    fn switch_plain_maps_to_claim_shared() {
+        assert!(matches!(
+            request_for_switch("monitor", false),
+            dormant_core::ipc_proto::IpcRequest::ClaimShared { display } if display == "monitor"
+        ));
     }
 }

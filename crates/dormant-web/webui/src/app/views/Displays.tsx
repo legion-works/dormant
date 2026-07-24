@@ -17,7 +17,7 @@
  */
 import { useLiveState } from "../hooks/useLiveState";
 import { Card, StatusChip, HealthChip, phaseChipLabel, useConfirmDialog } from "../components";
-import { postBlank, postWake, postPause, postResume } from "../../api/client";
+import { postBlank, postWake, postPause, postResume, postSwitch } from "../../api/client";
 import { useCallback, useEffect, useState } from "react";
 import type { DisplaySnapshot } from "../../api/types";
 import DisplayDetail from "./DisplayDetail";
@@ -31,12 +31,14 @@ interface DisplayCardProps {
   zone: string;
   rule: string | undefined;
   dialogOpen: boolean;
+  claimCapable: boolean;
   error?: string;
   onOpenDetail: (id: string) => void;
   onBlank: (id: string) => void;
   onWake: (id: string) => void;
   onPause: (id: string, rule: string) => void;
   onResume: (id: string, rule: string) => void;
+  onClaim: (id: string) => void;
 }
 
 function DisplayCard({
@@ -46,12 +48,14 @@ function DisplayCard({
   zone,
   rule,
   dialogOpen,
+  claimCapable,
   error,
   onOpenDetail,
   onBlank,
   onWake,
   onPause,
   onResume,
+  onClaim,
 }: DisplayCardProps) {
   const isShared = snap.scope === "shared";
   const panelLabel = (() => {
@@ -187,6 +191,19 @@ function DisplayCard({
             >
               Force wake
             </button>
+            {isShared && (
+              <>
+                <button
+                  type="button"
+                  className="display-action display-action--wake"
+                  onClick={() => onClaim(id)}
+                  disabled={!claimCapable}
+                >
+                  Claim panel
+                </button>
+                {!claimCapable && <span>Claim unavailable for this display</span>}
+              </>
+            )}
             {isPaused ? (
               <button
                 type="button"
@@ -279,6 +296,18 @@ export default function Displays() {
     }
   }, [clearActionError]);
 
+  const handleClaim = useCallback(async (id: string) => {
+    clearActionError(id);
+    try {
+      const result = await postSwitch(id, false);
+      if (result.verdict !== "accepted") {
+        throw new Error("reason" in result ? result.reason : result.verdict);
+      }
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Claim failed" }));
+    }
+  }, [clearActionError]);
+
   const handlePause = useCallback(async (id: string, rule: string) => {
     const accepted = await confirm({
       title: `Pause ${rule}?`,
@@ -343,12 +372,14 @@ export default function Displays() {
             zone={dr?.zone ?? "—"}
             rule={dr?.rule}
             dialogOpen={!!dialog}
+            claimCapable={snapshot.kvm?.claim_capable_displays.includes(id) ?? false}
             error={actionErrors[id]}
             onOpenDetail={selectDisplay}
             onBlank={handleBlank}
             onWake={handleWake}
             onPause={handlePause}
             onResume={handleResume}
+            onClaim={handleClaim}
           />
         );
       })}

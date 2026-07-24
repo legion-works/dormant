@@ -45,43 +45,7 @@ fn enabled(state: &WebState) -> Result<(), WebError> {
 }
 
 async fn request(state: &WebState, request: IpcRequest) -> Result<IpcResponse, WebError> {
-    let socket = dormant_core::paths::resolve_socket_path(
-        state.inner.config_rx.borrow().daemon.socket_path.as_deref(),
-    );
-    tokio::task::spawn_blocking(move || {
-        // The daemon IPC socket is a Unix domain socket, so the whole bridge is
-        // unix-only. On non-unix (the Windows portability leg) the route still
-        // compiles but the transport returns the same runtime error the daemon
-        // being down would — mirroring `dormantctl::client::send_request`'s
-        // `#[cfg(not(unix))]` arm rather than a compile_error, so dormant-web keeps
-        // building standalone and under dormantd's `web-ui` feature there.
-        #[cfg(unix)]
-        {
-            use std::io::{BufRead, BufReader, Write};
-            use std::os::unix::net::UnixStream;
-
-            let mut stream =
-                UnixStream::connect(socket).map_err(|_| WebError::CoordinationUnavailable)?;
-            let line =
-                serde_json::to_string(&request).map_err(|_| WebError::CoordinationUnavailable)?;
-            writeln!(stream, "{line}").map_err(|_| WebError::CoordinationUnavailable)?;
-            stream
-                .flush()
-                .map_err(|_| WebError::CoordinationUnavailable)?;
-            let mut line = String::new();
-            BufReader::new(stream)
-                .read_line(&mut line)
-                .map_err(|_| WebError::CoordinationUnavailable)?;
-            serde_json::from_str(&line).map_err(|_| WebError::CoordinationUnavailable)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (socket, request);
-            Err(WebError::CoordinationUnavailable)
-        }
-    })
-    .await
-    .map_err(|_| WebError::CoordinationUnavailable)?
+    crate::request_daemon_ipc(state, request).await
 }
 
 fn status(response: IpcResponse) -> Result<InstancePairStatus, WebError> {

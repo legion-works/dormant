@@ -230,6 +230,23 @@ export interface DaemonIdentity {
  * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
  * `pending_reload` is `Option<String>` → null or string.
  */
+export interface KvmStatus {
+  keymap: { claim_hotkey?: string };
+  claim_capable_displays: string[];
+  activity_claim: "off" | "owner-idle" | "edge" | "armed";
+}
+
+export type ClaimSharedResult =
+  | { verdict: "accepted"; deadline_ms: number }
+  | { verdict: "busy" }
+  | { verdict: "denied" | "failed"; reason: string };
+
+export interface ClaimArmResult {
+  armed: boolean;
+  deadline_ms: number;
+  reason?: string;
+}
+
 export interface StateSnapshot {
   sensors: SensorSnapshot[];
   zones: ZoneSnapshot[];
@@ -237,6 +254,8 @@ export interface StateSnapshot {
   pending_reload: string | null;
   /** Omitted when the daemon is not running from a rollback. */
   rollback?: RollbackStatus;
+  /** KVM claim presentation state; absent when coordination is unavailable. */
+  kvm?: KvmStatus;
 }
 
 /**

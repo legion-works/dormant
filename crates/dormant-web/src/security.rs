@@ -68,6 +68,7 @@ pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &[
 pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/blank",
     "/api/wake",
+    "/api/switch",
     "/api/pause",
     "/api/resume",
     "/api/reload",

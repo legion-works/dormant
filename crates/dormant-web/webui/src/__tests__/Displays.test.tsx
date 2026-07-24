@@ -17,8 +17,9 @@ const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
   const postWake = vi.fn().mockResolvedValue(undefined);
   const postPause = vi.fn().mockResolvedValue(undefined);
   const postResume = vi.fn().mockResolvedValue(undefined);
+  const postSwitch = vi.fn().mockResolvedValue({ verdict: "accepted", deadline_ms: 123 });
   return {
-    mocks: { postBlank, postWake, postPause, postResume },
+    mocks: { postBlank, postWake, postPause, postResume, postSwitch },
     SAMPLE_STATE: {
       sensors: [
         { id: "desk-mmwave", state: "present" as const, last_seen_secs_ago: 3 },
@@ -107,6 +108,7 @@ vi.mock("../api/client", () => ({
   postWake: mocks.postWake,
   postPause: mocks.postPause,
   postResume: mocks.postResume,
+  postSwitch: mocks.postSwitch,
   getWear: vi.fn().mockResolvedValue({ displays: [] }),
   getWearDetail: vi.fn().mockRejectedValue(new Error("unexpected wear detail request")),
   getOperations: vi.fn().mockResolvedValue({
@@ -131,6 +133,7 @@ function renderDisplayCard(id: string, display: DisplaySnapshot) {
       zones: [],
       displays: [[id, display]],
       pending_reload: null,
+      kvm: { keymap: {}, claim_capable_displays: [id], activity_claim: "off" },
     },
     displayConfigs: {
       [id]: { controllers: [], blank_mode: "power_off" } as DisplayConfig,
@@ -336,6 +339,34 @@ describe("Displays", () => {
     expect(screen.getByText("● ON")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force blank" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force wake" })).toBeInTheDocument();
+  });
+  it("claims a capable shared display", async () => {
+    renderDisplayCard("shared-tv", sharedDisplay());
+    fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
+    await waitFor(() => expect(mocks.postSwitch).toHaveBeenCalledWith("shared-tv", false));
+  });
+
+  it("disables claim for a shared display not reported capable", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        kvm: { keymap: {}, claim_capable_displays: [], activity_claim: "off" },
+      },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    expect(screen.getByRole("button", { name: "Claim panel" })).toBeDisabled();
+    expect(screen.getByText(/claim unavailable/i)).toBeInTheDocument();
+    expect(mocks.postSwitch).not.toHaveBeenCalled();
+  });
+
+  it("renders a rejected claim reason", async () => {
+    mocks.postSwitch.mockRejectedValueOnce(new Error("unsupported"));
+    renderDisplayCard("shared-tv", sharedDisplay());
+    fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
+    expect(await screen.findByText("unsupported")).toBeInTheDocument();
   });
 });
 

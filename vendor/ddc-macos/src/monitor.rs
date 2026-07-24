@@ -146,18 +146,21 @@ impl Monitor {
         Some(edid_data.bytes().into())
     }
 
-    /// Apple Silicon fallback: locate the `IOPortTransportStateDisplayPort`
-    /// child of `AppleATCDPINAdapterPort` whose `Metadata.EDID` CFData is
-    /// set, then return those bytes. On a Mac with a single external
-    /// display attached, exactly one such transport-state node carries an
-    /// EDID (the internal LCD's transport state has empty `Metadata`), so
-    /// returning the first match is unambiguous. If the Mac ever has
-    /// multiple externals, the upstream `AvService` walk in
+    /// Apple Silicon fallback: locate an `IOPortTransportStateDisplayPort`
+    /// IORegistry node whose `Metadata.EDID` CFData is set, then return
+    /// those bytes. On a Mac with a single external display attached,
+    /// exactly one such transport-state node carries an EDID (the internal
+    /// LCD's transport state has empty `Metadata`), so returning the
+    /// first match is unambiguous. If the Mac ever has multiple externals,
+    /// the upstream `AvService` walk in
     /// [`crate::arm::get_display_av_service`] would have to be extended in
     /// tandem to disambiguate — see the module-level note.
+    ///
+    /// `for_services` (not `for_service_names`) matches by IORegistry
+    /// class — the node's *name* is `DisplayPort`, the *class* is
+    /// `IOPortTransportStateDisplayPort`; the class is what we want.
     fn edid_from_apple_display_crossbar(&self) -> Option<Vec<u8>> {
-        let mut iter =
-            crate::iokit::IoIterator::for_service_names("IOPortTransportStateDisplayPort")?;
+        let mut iter = crate::iokit::IoIterator::for_services("IOPortTransportStateDisplayPort")?;
         while let Some(entry) = iter.next() {
             let edid_ref = unsafe {
                 IORegistryEntryCreateCFProperty(

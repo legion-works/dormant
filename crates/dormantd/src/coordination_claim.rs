@@ -50,6 +50,21 @@ pub struct ClaimPeer {
     pub claim_port: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointKind {
+    Verified,
+    Dns,
+}
+
+impl EndpointKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Dns => "dns",
+        }
+    }
+}
+
 /// Persistent paired-peer store with a live snapshot for claim transport consumers.
 pub(crate) struct PeerStoreFeed {
     path: PathBuf,
@@ -700,20 +715,24 @@ fn allow_ip(rates: &mut HashMap<IpAddr, VecDeque<Instant>>, ip: IpAddr) -> bool 
     true
 }
 
-fn peer_endpoints(peer: &ClaimPeer) -> Vec<SocketAddr> {
+fn peer_endpoints(peer: &ClaimPeer) -> Vec<(EndpointKind, SocketAddr)> {
     let Some(port) = peer.claim_port else {
         return Vec::new();
     };
-    [peer.last_addr, peer.dns_addr]
-        .into_iter()
-        .flatten()
-        .map(|address| SocketAddr::new(address.ip(), port))
-        .collect()
+    let mut endpoints = Vec::new();
+    if let Some(address) = peer.last_addr {
+        endpoints.push((EndpointKind::Verified, SocketAddr::new(address.ip(), port)));
+    }
+    if let Some(address) = peer.dns_addr {
+        endpoints.push((EndpointKind::Dns, SocketAddr::new(address.ip(), port)));
+    }
+    endpoints
 }
 
 async fn send_to_peer(peer: &ClaimPeer, frame: &ClaimFrame) -> io::Result<()> {
     let mut last_error = None;
-    for address in peer_endpoints(peer) {
+    for (kind, address) in peer_endpoints(peer) {
+        log_dial_endpoint(kind, &peer.instance_id, address);
         match send_frame(address, frame).await {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
@@ -721,6 +740,17 @@ async fn send_to_peer(peer: &ClaimPeer, frame: &ClaimFrame) -> io::Result<()> {
     }
     Err(last_error
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer has no endpoint")))
+}
+
+fn log_dial_endpoint(kind: EndpointKind, peer: &str, endpoint: SocketAddr) {
+    match kind {
+        EndpointKind::Verified => {
+            tracing::debug!(event = "claim_dial_endpoint", kind = kind.as_str(), %peer, %endpoint);
+        }
+        EndpointKind::Dns => {
+            tracing::info!(event = "claim_dial_endpoint", kind = kind.as_str(), %peer, %endpoint);
+        }
+    }
 }
 
 async fn send_frame(address: SocketAddr, frame: &ClaimFrame) -> io::Result<()> {
@@ -765,7 +795,9 @@ mod tests {
 
     use crate::coordination_frame::write_frame;
 
-    use super::{ClaimPeer, ClaimTransportDeps, PeerStoreFeed, allow_ip, peer_endpoints, spawn};
+    use super::{
+        ClaimPeer, ClaimTransportDeps, EndpointKind, PeerStoreFeed, allow_ip, peer_endpoints, spawn,
+    };
 
     const LOCAL_EPOCH: &str = "local-epoch-0001";
     const REMOTE_EPOCH: &str = "remote-epoch-001";
@@ -1014,8 +1046,11 @@ mod tests {
         assert_eq!(
             peer_endpoints(&peer),
             vec![
-                SocketAddr::from(([127, 0, 0, 1], 1234)),
-                SocketAddr::from(([192, 0, 2, 9], 1234)),
+                (
+                    EndpointKind::Verified,
+                    SocketAddr::from(([127, 0, 0, 1], 1234))
+                ),
+                (EndpointKind::Dns, SocketAddr::from(([192, 0, 2, 9], 1234))),
             ]
         );
     }

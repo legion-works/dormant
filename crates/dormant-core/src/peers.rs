@@ -28,6 +28,7 @@ pub const MAX_PEER_STORE_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Persistent Ed25519 identity for one dormant instance.
+#[derive(Clone)]
 pub struct InstanceIdentity {
     /// Stable base64url instance identifier derived from `verifying_key`.
     pub instance_id: String,

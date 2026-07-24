@@ -114,6 +114,13 @@ struct ActiveFlight {
     /// pre-acquire wake decision).
     #[allow(dead_code)]
     local_input_code: u16,
+    /// The code the OWNER side must select when it writes the
+    /// input. For the requester side this is `local_input_code`
+    /// (the fallback writes the local code). Stored explicitly
+    /// so the driver's `write_input_source` action can pick the
+    /// right code per side without re-deriving it from the
+    /// engine's `Action::WriteInput` (which is unparameterized).
+    write_code: u8,
 }
 
 /// Runtime events consumed by the driver.
@@ -224,6 +231,41 @@ impl ClaimRuntimeHandle {
     pub async fn display_removed(&self, display: DisplayId) -> Result<(), &'static str> {
         self.cmd_tx
             .send(RuntimeEvent::DisplayRemoved(display))
+            .await
+            .map_err(|_| "claim runtime not available")
+    }
+
+    /// **Test seam**: inject an authenticated inbound `ClaimFrame`
+    /// directly into the driver as if it had arrived via the
+    /// transport. Used by the smoke tests to drive the OWNER
+    /// path without the second in-process daemon the task
+    /// description calls out (a `loopback` harness would be
+    /// heavier; this seam exercises the same code paths).
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn inject_inbound_for_test(&self, frame: ClaimFrame) -> Result<(), &'static str> {
+        self.cmd_tx
+            .send(RuntimeEvent::Inbound(frame))
+            .await
+            .map_err(|_| "claim runtime not available")
+    }
+
+    /// **Test seam**: feed an ownership-changed observation as
+    /// the coordination poller would (the requester's
+    /// `FlipObserved` event fires when the observed code
+    /// matches the local input code).
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn inject_ownership_for_test(
+        &self,
+        display: DisplayId,
+        owned: bool,
+        observed: Option<u8>,
+    ) -> Result<(), &'static str> {
+        self.cmd_tx
+            .send(RuntimeEvent::OwnershipChanged {
+                display,
+                owned,
+                observed,
+            })
             .await
             .map_err(|_| "claim runtime not available")
     }
@@ -424,7 +466,7 @@ impl Driver {
                 maybe = self.owner_event_rx.recv() => {
                     let Some((display, event)) = maybe else { break };
                     let actions = self.feed_owner_event(&display, event);
-                    self.dispatch_actions(&display, &actions).await;
+                    self.dispatch_actions(&display, &actions);
                 }
                 _ = tick.tick() => {
                     self.sweep_deadlines();
@@ -463,7 +505,7 @@ impl Driver {
             }
             RuntimeEvent::OwnerHookOutcome { display, event } => {
                 let actions = self.feed_owner_event(&display, event);
-                self.dispatch_actions(&display, &actions).await;
+                self.dispatch_actions(&display, &actions);
             }
         }
     }
@@ -490,7 +532,7 @@ impl Driver {
                     .get_mut(&display)
                     .expect("display has engine")
                     .owner_event(&display, OwnerEvent::abort(nonce));
-                self.dispatch_actions(&display, &actions).await;
+                self.dispatch_actions(&display, &actions);
             }
             ClaimMessage::ReleaseFailed(release) => {
                 let Some(display) = self.find_display_by_requester_nonce(&release.nonce) else {
@@ -505,7 +547,7 @@ impl Driver {
                         RequesterEvent::release_failed(release.nonce, release.reason),
                         Instant::now(),
                     );
-                self.dispatch_actions(&display, &actions).await;
+                self.dispatch_actions(&display, &actions);
                 if self
                     .engines
                     .get(&display)
@@ -532,7 +574,7 @@ impl Driver {
                         },
                         Instant::now(),
                     );
-                self.dispatch_actions(&display, &actions).await;
+                self.dispatch_actions(&display, &actions);
                 if self
                     .engines
                     .get(&display)
@@ -612,6 +654,11 @@ impl Driver {
         let actions = engine.begin_owner(owner_request, &nonce, now, release_cap);
         // Record the flight: the nonce is now the owner-side
         // correlation key; the peer is the inbound sender.
+        // The OWNER writes the REQUESTER's input code (to
+        // hand the panel over), not the local code — track
+        // the code-to-write explicitly so the driver can pick
+        // it without re-deriving it from the engine's
+        // unparameterized `WriteInput` action.
         self.flights.insert(
             display.clone(),
             ActiveFlight {
@@ -619,9 +666,10 @@ impl Driver {
                 peer_instance_id: sender_instance_id,
                 peer_input_code: u16::from(request.requester_input_code),
                 local_input_code: u16::from(local_input_code),
+                write_code: u8::try_from(request.requester_input_code).unwrap_or(0),
             },
         );
-        self.dispatch_actions(&display, &actions).await;
+        self.dispatch_actions(&display, &actions);
     }
 
     async fn handle_ownership_changed(
@@ -652,7 +700,7 @@ impl Driver {
                 .get_mut(display)
                 .expect("engine present")
                 .requester_event(display, RequesterEvent::FlipObserved, Instant::now());
-            self.dispatch_actions(display, &actions).await;
+            self.dispatch_actions(display, &actions);
         }
     }
 
@@ -703,7 +751,9 @@ impl Driver {
         // Advance to AwaitingAck. Also record the flight
         // (the requester is the local side; the peer is the
         // first known peer — the Accepted-verdict sender will
-        // overwrite this).
+        // overwrite this). The fallback path's direct write
+        // uses the LOCAL code, so `write_code` is the local
+        // code here.
         self.flights.insert(
             display.clone(),
             ActiveFlight {
@@ -711,6 +761,7 @@ impl Driver {
                 peer_instance_id: String::new(),
                 peer_input_code: 0,
                 local_input_code: ctx.local_input_code.unwrap_or(0) as u16,
+                write_code: ctx.local_input_code.unwrap_or(0),
             },
         );
         let _ = self
@@ -768,7 +819,7 @@ impl Driver {
             } else {
                 engine.owner_event(display, OwnerEvent::DisplayRemoved)
             };
-            self.dispatch_actions(display, &actions).await;
+            self.dispatch_actions(display, &actions);
         }
         self.contexts.remove(display);
         self.flights.remove(display);
@@ -810,6 +861,7 @@ impl Driver {
         let now = Instant::now();
         let displays: Vec<DisplayId> = self.engines.keys().cloned().collect();
         let mut lift_displays = Vec::new();
+        let mut to_dispatch: Vec<(DisplayId, Vec<Action>)> = Vec::new();
         for display in displays {
             let Some(engine) = self.engines.get_mut(&display) else {
                 continue;
@@ -829,10 +881,13 @@ impl Driver {
                 }
                 lift_displays.push(display.clone());
             }
-            for action in &actions {
-                self.record_action(action);
+            if !actions.is_empty() {
+                to_dispatch.push((display.clone(), actions));
             }
-            if actions.iter().any(|a| matches!(a, Action::Terminal(_))) {
+            if to_dispatch
+                .last()
+                .is_some_and(|(_, a)| a.iter().any(|x| matches!(x, Action::Terminal(_))))
+            {
                 self.flights.remove(&display);
             }
         }
@@ -849,6 +904,15 @@ impl Driver {
                     })
                     .await;
             });
+        }
+        // Dispatch the deadline-expired actions so the
+        // `attempt_fallback` spawned task fires. The
+        // `dispatch_actions` queue iterates each action and
+        // dispatches it (e.g. `Trace` is recorded,
+        // `SendAbort` is spawned, `AttemptFallback` is
+        // dispatched).
+        for (display, actions) in to_dispatch {
+            self.dispatch_actions(&display, &actions);
         }
     }
 
@@ -873,7 +937,7 @@ impl Driver {
         }
     }
 
-    async fn dispatch_actions(&mut self, display: &DisplayId, actions: &[Action]) {
+    fn dispatch_actions(&mut self, display: &DisplayId, actions: &[Action]) {
         // Iterative work-queue drain. The engine can chain
         // (e.g. owner `RunBeforeRelease` -> `BeforeRelease`
         // event -> `WriteInput` -> `AfterRelease` event -> ...),
@@ -992,7 +1056,15 @@ impl Driver {
             Action::WakeDisplay => self.wake_display(display),
             Action::SendVerdict(verdict) => {
                 self.send_owner_verdict(display, verdict);
-                Vec::new()
+                // After sending the verdict, drive the OWNER
+                // path forward: the engine is in `OwnerStage::AckSent`
+                // and must be fed `OwnerEvent::AckDelivered` to
+                // progress to `RunBeforeRelease` → `WriteInput` →
+                // `RunAfterRelease` → `Terminal::Released`. The
+                // engine returns the next action sequence
+                // (which is `RunBeforeRelease` for a powered
+                // owner); we re-queue that.
+                self.feed_owner_event(display, OwnerEvent::AckDelivered)
             }
             Action::SendReleaseFailed => {
                 self.send_release_failed_to_requester(display);
@@ -1080,16 +1152,28 @@ impl Driver {
     }
 
     fn write_input_source(&mut self, display: &DisplayId) -> Vec<Action> {
-        let Some((sink, target_code)) = self.lookup_executor(display) else {
+        // The OWNER path uses the requester's input code (the
+        // code the OWNER must select when handing the panel
+        // over). The requester path uses the local code (the
+        // fallback writes the local code). The flight record
+        // carries the `write_code` set when the flight was
+        // armed.
+        let write_code = self
+            .flights
+            .get(display)
+            .map(|f| f.write_code)
+            .or_else(|| self.contexts.get(display).and_then(|c| c.local_input_code));
+        let Some((sink, _local_code)) = self.lookup_executor(display) else {
             return self.feed_owner_event(
                 display,
                 OwnerEvent::WriteFailed("E_DISPLAY_IO: no executor".to_owned()),
             );
         };
+        let target = write_code.unwrap_or(_local_code);
         let display_for_task = display.clone();
         let outcome_tx = self.owner_event_tx.clone();
         tokio::spawn(async move {
-            let result = sink.write_input_source(target_code).await;
+            let result = sink.write_input_source(target).await;
             let event = match result {
                 Ok(()) => OwnerEvent::WriteSucceeded,
                 Err(failure) => OwnerEvent::WriteFailed(failure.error),
@@ -1316,6 +1400,7 @@ impl Driver {
             }
             if observed == 0 {
                 // Standby: F4 forbids the direct fallback.
+                eprintln!("DEBUG: standby branch reached for {}", display_for_task.0);
                 if let Some(log) = &event_log {
                     if let Ok(mut g) = log.lock() {
                         g.push("claim_failed:standby".to_string());

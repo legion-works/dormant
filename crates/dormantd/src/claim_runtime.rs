@@ -54,7 +54,7 @@ use dormant_core::coordination::CoordinationHandle;
 use dormant_core::peers::InstanceIdentity;
 use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -68,6 +68,24 @@ pub use dormant_core::claim_engine::CLAIM_EVENTS;
 /// Deadline-sweep period (100 ms — tight enough for a smooth UX,
 /// loose enough to keep the busy loop cold).
 const DEADLINE_SWEEP_PERIOD: Duration = Duration::from_millis(100);
+
+fn append_event(
+    event_log: Option<&Arc<Mutex<Vec<String>>>>,
+    event_notify: Option<&Arc<Notify>>,
+    event: impl Into<String>,
+) {
+    let appended = event_log.is_some_and(|log| {
+        log.lock().is_ok_and(|mut events| {
+            events.push(event.into());
+            true
+        })
+    });
+    if appended {
+        if let Some(notify) = event_notify {
+            notify.notify_one();
+        }
+    }
+}
 
 /// Per-display generation-stable facts.
 #[derive(Clone)]
@@ -371,6 +389,8 @@ pub struct ClaimRuntimeDeps {
     pub cancel: CancellationToken,
     /// Test seam — an append-only log of emitted anchors.
     pub event_log: Option<Arc<Mutex<Vec<String>>>>,
+    /// Signals test waiters after an anchor is appended.
+    pub event_notify: Option<Arc<Notify>>,
 }
 
 /// Spawn the claim runtime driver. The returned handle is the
@@ -414,6 +434,7 @@ pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
         front_ctl_tx: deps.front_ctl_tx,
         cancel: deps.cancel,
         event_log: deps.event_log,
+        event_notify: deps.event_notify,
         outbound_counter: 0,
         outbound_nonces: VecDeque::with_capacity(64),
         handle: driver_handle,
@@ -462,6 +483,7 @@ struct Driver {
     front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
     cancel: CancellationToken,
     event_log: Option<Arc<Mutex<Vec<String>>>>,
+    event_notify: Option<Arc<Notify>>,
     outbound_counter: u64,
     outbound_nonces: VecDeque<String>,
     /// Back-reference to the handle so the driver can update the
@@ -847,11 +869,11 @@ impl Driver {
     }
 
     fn record_event(&self, name: &str) {
-        if let Some(log) = &self.event_log {
-            if let Ok(mut g) = log.lock() {
-                g.push(name.to_string());
-            }
-        }
+        append_event(
+            self.event_log.as_ref(),
+            self.event_notify.as_ref(),
+            name.to_string(),
+        );
         if matches!(
             name,
             "claim_requested"
@@ -1375,13 +1397,14 @@ impl Driver {
         };
         self.record_event("claim_fallback_direct");
         let event_log = self.event_log.clone();
+        let event_notify = self.event_notify.clone();
         tokio::spawn(async move {
             let Ok(Some(observed)) = sink.read_input_source_sampled().await else {
-                if let Some(log) = &event_log {
-                    if let Ok(mut g) = log.lock() {
-                        g.push("claim_failed:identity_unavailable".to_string());
-                    }
-                }
+                append_event(
+                    event_log.as_ref(),
+                    event_notify.as_ref(),
+                    "claim_failed:identity_unavailable",
+                );
                 return;
             };
             if observed == target_code {
@@ -1390,28 +1413,24 @@ impl Driver {
                 // `claim_completed` so the operator's UI can
                 // distinguish "the panel flipped" from "we
                 // didn't need to flip it".
-                if let Some(log) = &event_log {
-                    if let Ok(mut g) = log.lock() {
-                        g.push("claim_completed".to_string());
-                    }
-                }
+                append_event(event_log.as_ref(), event_notify.as_ref(), "claim_completed");
                 return;
             }
             if observed == Self::MAGIC_STANDBY {
                 // Standby: F4 forbids the direct fallback.
-                if let Some(log) = &event_log {
-                    if let Ok(mut g) = log.lock() {
-                        g.push("claim_failed:standby".to_string());
-                    }
-                }
+                append_event(
+                    event_log.as_ref(),
+                    event_notify.as_ref(),
+                    "claim_failed:standby",
+                );
                 return;
             }
             if let Err(_failure) = sink.write_input_source(target_code).await {
-                if let Some(log) = &event_log {
-                    if let Ok(mut g) = log.lock() {
-                        g.push("claim_failed:write".to_string());
-                    }
-                }
+                append_event(
+                    event_log.as_ref(),
+                    event_notify.as_ref(),
+                    "claim_failed:write",
+                );
             } else {
                 // The direct write succeeded. The next
                 // coordination poll will observe the flip
@@ -1419,23 +1438,27 @@ impl Driver {
                 // rules engine (the fallback's contribution
                 // ends here; the rules engine drives the
                 // post-flip state machine).
-                if let Some(log) = &event_log {
-                    if let Ok(mut g) = log.lock() {
-                        g.push("claim_fallback_direct:wrote".to_string());
-                    }
-                }
+                append_event(
+                    event_log.as_ref(),
+                    event_notify.as_ref(),
+                    "claim_fallback_direct:wrote",
+                );
             }
         });
     }
 
     fn feed_requester_failed(&mut self, display: &DisplayId, failure: ClaimFailure) {
         self.record_event("claim_failed");
-        if let Some(log) = &self.event_log {
-            if let Ok(mut g) = log.lock() {
-                g.push(format!("claim_failed:{}", display.0));
-                g.push(format!("reason:{failure:?}"));
-            }
-        }
+        append_event(
+            self.event_log.as_ref(),
+            self.event_notify.as_ref(),
+            format!("claim_failed:{}", display.0),
+        );
+        append_event(
+            self.event_log.as_ref(),
+            self.event_notify.as_ref(),
+            format!("reason:{failure:?}"),
+        );
     }
 
     fn local_identity_view(&self) -> dormant_core::peers::InstanceIdentity {

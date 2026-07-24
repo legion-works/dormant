@@ -64,6 +64,7 @@ struct SinkInner {
 pub struct RecordingSink {
     name: String,
     inner: Arc<Mutex<SinkInner>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl RecordingSink {
@@ -71,6 +72,7 @@ impl RecordingSink {
         Self {
             name: name.into(),
             inner: Arc::new(Mutex::new(SinkInner::default())),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
     fn set_claim_identity(&self, id: impl Into<String>) {
@@ -100,6 +102,7 @@ impl CommandSink for RecordingSink {
             arg: None,
         };
         self.inner.lock().unwrap().wakes.push(call);
+        self.changed.notify_one();
         Ok(())
     }
     fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
@@ -133,6 +136,8 @@ impl CommandSink for RecordingSink {
             })
         } else {
             g.writes.push(call);
+            drop(g);
+            self.changed.notify_one();
             Ok(())
         }
     }
@@ -169,6 +174,7 @@ struct CommandBarrier {
 pub struct RecordingHookRunner {
     inner: Arc<Mutex<HookInner>>,
     command_barriers: Mutex<VecDeque<CommandBarrier>>,
+    calls_changed: Arc<tokio::sync::Notify>,
 }
 
 impl Default for RecordingHookRunner {
@@ -182,6 +188,7 @@ impl RecordingHookRunner {
         Self {
             inner: Arc::new(Mutex::new(HookInner::default())),
             command_barriers: Mutex::new(VecDeque::new()),
+            calls_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
     fn push_completed(&self, started: usize, failed: usize, spawned: usize) {
@@ -239,6 +246,7 @@ impl HookRunner for RecordingHookRunner {
             index: 0,
             kind,
         });
+        self.calls_changed.notify_one();
         let barrier = self.command_barriers.lock().unwrap().pop_front();
         if let Some(barrier) = barrier {
             barrier.entered.notify_one();
@@ -397,6 +405,7 @@ struct ClaimHarness {
     sink: Arc<RecordingSink>,
     runner: Arc<RecordingHookRunner>,
     log: Arc<Mutex<Vec<String>>>,
+    log_changed: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     // The watch senders MUST stay alive for the driver's
     // `select!` to keep its `changed()` arms pending (a closed
@@ -454,6 +463,7 @@ impl ClaimHarness {
         coord.record_success(&DisplayId(display.to_owned()), code, code, None);
         let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
         let log = Arc::new(Mutex::new(Vec::new()));
+        let log_changed = Arc::new(tokio::sync::Notify::new());
         let handle = claim_runtime::spawn(ClaimRuntimeDeps {
             identity: Arc::new(local_identity.clone()),
             transport,
@@ -464,22 +474,25 @@ impl ClaimHarness {
             front_ctl_tx,
             cancel: cancel.clone(),
             event_log: Some(log.clone()),
+            event_notify: Some(Arc::clone(&log_changed)),
         });
-        // NOTE: we deliberately KEEP `config_tx` and
-        // `executors_tx` alive in the harness struct. The
-        // driver's `select!` watches `config.changed()` and
-        // `executors.changed()`; dropping the senders makes
-        // those futures return `Err`, which the runtime
-        // treats as a quit signal — and the next `try_claim`
-        // would see a closed `cmd_tx`. Holding the senders
-        // keeps the runtime alive for the test's duration.
-        // Let the driver subscribe to the watches.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The acknowledged injection cannot run until initial context refresh
+        // completes, so it is also the harness's startup barrier.
+        let accepted = handle
+            .inject_owner_completion_for_test(
+                DisplayId(display.to_owned()),
+                "startup-barrier",
+                dormant_core::claim_engine::OwnerEvent::DisplayRemoved,
+            )
+            .await
+            .expect("claim runtime startup barrier");
+        assert!(!accepted, "startup barrier must not match a flight");
         Self {
             handle,
             sink,
             runner,
             log,
+            log_changed,
             cancel,
             _config_tx: config_tx,
             _executors_tx: executors_tx,
@@ -513,28 +526,56 @@ impl ClaimHarness {
         self.log.lock().unwrap().clone()
     }
     async fn wait_for_log(&self, needle: &str, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if self.log_events().iter().any(|s| s == needle) {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        self.wait_for_log_matching(timeout, |event| event == needle)
+            .await
     }
+
+    async fn wait_for_log_prefix(&self, prefix: &str, timeout: Duration) -> bool {
+        self.wait_for_log_matching(timeout, |event| event.starts_with(prefix))
+            .await
+    }
+
+    async fn wait_for_log_matching(
+        &self,
+        timeout: Duration,
+        predicate: impl Fn(&str) -> bool,
+    ) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self.log_events().iter().any(|event| predicate(event)) {
+                    return;
+                }
+                self.log_changed.notified().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     async fn wait_for_n_writes(&self, n: usize, timeout: Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if self.sink_writes().len() >= n {
-                return true;
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self.sink_writes().len() >= n {
+                    return;
+                }
+                self.sink.changed.notified().await;
             }
-            if std::time::Instant::now() >= deadline {
-                return false;
+        })
+        .await
+        .is_ok()
+    }
+
+    async fn wait_for_n_hook_calls(&self, n: usize, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if self.hook_calls().len() >= n {
+                    return;
+                }
+                self.runner.calls_changed.notified().await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .is_ok()
     }
 
     fn shutdown(&self) {
@@ -638,7 +679,12 @@ async fn negotiated_claim_order_is_release_write_flip_acquire() {
         harness.wait_for_n_writes(1, Duration::from_secs(2)).await,
         "OWNER path must produce EXACTLY ONE write_input_source call"
     );
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        harness
+            .wait_for_n_hook_calls(2, Duration::from_secs(2))
+            .await,
+        "OWNER path must complete its release hooks"
+    );
     let writes = harness.sink_writes();
     assert_eq!(
         writes.len(),
@@ -780,7 +826,12 @@ async fn fallback_claim_order_emits_fallback_direct_then_direct_write() {
             .await,
         "fallback must emit claim_fallback_direct"
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        harness
+            .wait_for_log("claim_completed", Duration::from_secs(2))
+            .await,
+        "already-local fallback must reach its terminal event"
+    );
     let events = harness.log_events();
     assert!(
         events.iter().any(|e| e == "claim_fallback_direct"),
@@ -841,18 +892,9 @@ async fn fallback_unknown_state_writes_zero_times() {
             .await,
         "fallback trace must fire on standby read"
     );
-    // Drain enough time for the spawned `attempt_fallback`
-    // task to push the standby marker.
-    let mut found_standby = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        let events = harness.log_events();
-        if events.iter().any(|e| e.starts_with("claim_failed")) {
-            found_standby = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let found_standby = harness
+        .wait_for_log_prefix("claim_failed", Duration::from_secs(2))
+        .await;
     let writes = harness.sink_writes();
     assert_eq!(
         writes.len(),
@@ -904,18 +946,9 @@ async fn fallback_foreign_code_writes_local_code_exactly_once() {
             .await,
         "fallback trace must fire on foreign-code read"
     );
-    // The spawned `attempt_fallback` task does the read +
-    // write. The event log must surface the success marker.
-    let mut found_wrote = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        let events = harness.log_events();
-        if events.iter().any(|e| e == "claim_fallback_direct:wrote") {
-            found_wrote = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let found_wrote = harness
+        .wait_for_log("claim_fallback_direct:wrote", Duration::from_secs(2))
+        .await;
     let writes = harness.sink_writes();
     assert_eq!(
         writes.len(),
@@ -972,7 +1005,12 @@ async fn concurrent_local_claim_returns_busy() {
         ClaimSharedResult::Busy,
         "second concurrent claim must return Busy; got {second:?}"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        harness
+            .wait_for_log("claim_busy", Duration::from_secs(2))
+            .await,
+        "second claim must emit claim_busy"
+    );
     let events = harness.log_events();
     assert!(
         events.iter().any(|e| e == "claim_busy"),
@@ -1010,7 +1048,6 @@ async fn display_removed_mid_claim_lifts_with_failed() {
             .await,
         "DisplayRemoved must surface claim_failed"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let events = harness.log_events();
     assert!(
         events.iter().any(|e| e == "claim_failed"),

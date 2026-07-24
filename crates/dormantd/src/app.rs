@@ -990,6 +990,7 @@ impl App {
                 front_ctl_tx: front_ctl_tx.clone(),
                 cancel: root.clone(),
                 event_log: None,
+                event_notify: None,
             }))
         } else {
             None

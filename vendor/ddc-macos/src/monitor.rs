@@ -13,12 +13,7 @@ use ddc::{
     DdcCommand, DdcCommandMarker, DdcCommandRaw, DdcCommandRawMarker, DdcHost, Delay, ErrorCode,
     I2C_ADDRESS_DDC_CI, SUB_ADDRESS_DDC_CI,
 };
-use io_kit_sys::keys::kIOServicePlane;
-use io_kit_sys::types::{io_object_t, io_registry_entry_t};
-use io_kit_sys::{
-    IORegistryEntryCreateCFProperty, IORegistryEntryGetParentEntry, IORegistryEntryGetPath,
-};
-use std::ffi::CStr;
+use io_kit_sys::IORegistryEntryCreateCFProperty;
 use std::time::Duration;
 use std::{fmt, iter};
 
@@ -299,29 +294,6 @@ impl DdcCommandRawMarker for Monitor {
     fn set_sleep_delay(&mut self, delay: Delay) {
         self.delay = delay;
     }
-}
-
-/// IORegistry path of the parent entry (typically the `AppleDisplayCrossbar`)
-/// of `entry`. Used by [`Monitor::edid_from_apple_display_crossbar`] to anchor
-/// the ARM EDID fallback lookup to the same physical panel the
-/// `AvService` walk targets. Returns `None` if the entry has no parent or
-/// the kernel refuses the path copy.
-fn get_parent_registry_entry_path(entry: io_object_t) -> Option<String> {
-    let mut parent: io_registry_entry_t = 0;
-    let kr = unsafe { IORegistryEntryGetParentEntry(entry, kIOServicePlane, &mut parent) };
-    if kr != io_kit_sys::ret::kIOReturnSuccess || parent == 0 {
-        return None;
-    }
-    let mut buf = [0_i8; 1024];
-    let kr = unsafe { IORegistryEntryGetPath(parent, kIOServicePlane, buf.as_mut_ptr()) };
-    if kr != io_kit_sys::ret::kIOReturnSuccess {
-        return None;
-    }
-    Some(
-        unsafe { CStr::from_ptr(buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
 }
 
 #[cfg(test)]

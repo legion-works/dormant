@@ -7,11 +7,18 @@ use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
+use core_foundation_sys::base::kCFAllocatorDefault;
 use core_graphics::display::CGDisplay;
 use ddc::{
     DdcCommand, DdcCommandMarker, DdcCommandRaw, DdcCommandRawMarker, DdcHost, Delay, ErrorCode,
     I2C_ADDRESS_DDC_CI, SUB_ADDRESS_DDC_CI,
 };
+use io_kit_sys::keys::kIOServicePlane;
+use io_kit_sys::types::{io_object_t, io_registry_entry_t};
+use io_kit_sys::{
+    IORegistryEntryCreateCFProperty, IORegistryEntryGetParentEntry, IORegistryEntryGetPath,
+};
+use std::ffi::CStr;
 use std::time::Duration;
 use std::{fmt, iter};
 
@@ -113,7 +120,22 @@ impl Monitor {
     }
 
     /// Returns Extended display identification data (EDID) for this [Monitor] as raw bytes data
+    ///
+    /// On Intel Macs the CoreDisplay private display-info dict exposes
+    /// `IODisplayEDIDOriginal` directly; on Apple Silicon (M1+) that key is
+    /// absent and the EDID lives on the `AppleATCDPINAdapterPort` subtree
+    /// of `AppleDisplayCrossbar` under `Metadata.EDID`. We try the Intel
+    /// path first, then fall back to the IORegistry walk so the macOS arm
+    /// of `dormantctl doctor ddcci` can derive the cross-machine
+    /// `claim_identity` (spec F5).
     pub fn edid(&self) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.edid_from_display_info_dict() {
+            return Some(bytes);
+        }
+        self.edid_from_apple_display_crossbar()
+    }
+
+    fn edid_from_display_info_dict(&self) -> Option<Vec<u8>> {
         let info: CFDictionary<CFString, CFType> = unsafe {
             CFDictionary::wrap_under_create_rule(
                 arm::display_create_info_dictionary(self.monitor.id).ok()?,
@@ -122,6 +144,49 @@ impl Monitor {
         let display_product_name_key = CFString::from_static_string("IODisplayEDIDOriginal");
         let edid_data = info.find(&display_product_name_key)?.downcast::<CFData>()?;
         Some(edid_data.bytes().into())
+    }
+
+    /// Apple Silicon fallback: locate the `IOPortTransportStateDisplayPort`
+    /// child of `AppleATCDPINAdapterPort` whose `Metadata.EDID` CFData is
+    /// set, then return those bytes. On a Mac with a single external
+    /// display attached, exactly one such transport-state node carries an
+    /// EDID (the internal LCD's transport state has empty `Metadata`), so
+    /// returning the first match is unambiguous. If the Mac ever has
+    /// multiple externals, the upstream `AvService` walk in
+    /// [`crate::arm::get_display_av_service`] would have to be extended in
+    /// tandem to disambiguate — see the module-level note.
+    fn edid_from_apple_display_crossbar(&self) -> Option<Vec<u8>> {
+        let mut iter =
+            crate::iokit::IoIterator::for_service_names("IOPortTransportStateDisplayPort")?;
+        while let Some(entry) = iter.next() {
+            let edid_ref = unsafe {
+                IORegistryEntryCreateCFProperty(
+                    (&entry).into(),
+                    CFString::from_static_string("Metadata").as_concrete_TypeRef(),
+                    kCFAllocatorDefault,
+                    0,
+                )
+            };
+            if edid_ref.is_null() {
+                continue;
+            }
+            let metadata = unsafe { CFType::wrap_under_create_rule(edid_ref) };
+            let Some(metadata) = metadata.downcast::<CFDictionary>() else {
+                continue;
+            };
+            let Some(edid_value) = metadata.find(CFString::from_static_string("EDID")) else {
+                continue;
+            };
+            let Some(edid) = edid_value.downcast::<CFData>() else {
+                continue;
+            };
+            let bytes = edid.bytes();
+            if bytes.is_empty() {
+                continue;
+            }
+            return Some(bytes.into());
+        }
+        None
     }
 
     /// CoreGraphics display handle for this monitor
@@ -219,6 +284,29 @@ impl DdcCommandRawMarker for Monitor {
     fn set_sleep_delay(&mut self, delay: Delay) {
         self.delay = delay;
     }
+}
+
+/// IORegistry path of the parent entry (typically the `AppleDisplayCrossbar`)
+/// of `entry`. Used by [`Monitor::edid_from_apple_display_crossbar`] to anchor
+/// the ARM EDID fallback lookup to the same physical panel the
+/// `AvService` walk targets. Returns `None` if the entry has no parent or
+/// the kernel refuses the path copy.
+fn get_parent_registry_entry_path(entry: io_object_t) -> Option<String> {
+    let mut parent: io_registry_entry_t = 0;
+    let kr = unsafe { IORegistryEntryGetParentEntry(entry, kIOServicePlane, &mut parent) };
+    if kr != io_kit_sys::ret::kIOReturnSuccess || parent == 0 {
+        return None;
+    }
+    let mut buf = [0_i8; 1024];
+    let kr = unsafe { IORegistryEntryGetPath(parent, kIOServicePlane, buf.as_mut_ptr()) };
+    if kr != io_kit_sys::ret::kIOReturnSuccess {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 #[cfg(test)]

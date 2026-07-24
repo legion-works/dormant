@@ -718,18 +718,22 @@ fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
 
 /// Walk the four 18-byte descriptor slots and pull the first monitor-name
 /// (0xFC) and serial-number (0xFF) string descriptors. A slot is a monitor
-/// descriptor (vs a detailed timing) when it starts with `0x00 0x00`; byte 2
-/// is then the tag and bytes 4..18 the data.
+/// descriptor (vs a detailed timing) when it starts with `0x00 0x00 0x00`;
+/// per EDID 1.4 §3.10.4 byte 3 is then the tag and bytes 5..18 the data
+/// (byte 4 is reserved zero). The AOC's panel on this Mac puts the tag at
+/// byte 3 — the previous code checked byte 2, which is always zero, and
+/// so never matched any descriptor.
 #[cfg(any(target_os = "macos", test))]
 fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
     let mut model = None;
     let mut serial = None;
     for block in slots.chunks_exact(18) {
-        if block[0] != 0 || block[1] != 0 {
+        // 0x00 0x00 0x00 = monitor-descriptor signature (per EDID 1.4 §3.10.4).
+        if block[0] != 0 || block[1] != 0 || block[2] != 0 {
             continue;
         }
-        let text = descriptor_string(&block[4..18]);
-        match (block[2], text) {
+        let text = descriptor_string(&block[5..18]);
+        match (block[3], text) {
             (0xFC, Some(t)) if model.is_none() => model = Some(t),
             (0xFF, Some(t)) if serial.is_none() => serial = Some(t),
             _ => {}
@@ -1350,22 +1354,28 @@ mod tests {
         e[8..10].copy_from_slice(&[0x05, 0xE3]);
         e[18] = 0x01; // EDID version
         e[19] = 0x04; // revision
-        // descriptor 1 (offset 54): monitor name 0xFC = "AG326UZD"
+        // descriptor 1 (offset 54): monitor name 0xFC = "AG326UZD".
+        // EDID 1.4 §3.10.4 monitor-descriptor layout: bytes 0-1 = 0x00 0x00
+        // signature, byte 2 reserved 0x00, byte 3 tag, byte 4 reserved 0x00,
+        // bytes 5..18 data. The AOC on this Mac uses the standard layout —
+        // the previous non-standard fixture (tag at byte 2) masked the bug.
         e[54] = 0x00;
         e[55] = 0x00;
-        e[56] = 0xFC;
-        e[57] = 0x00;
+        e[56] = 0x00;
+        e[57] = 0xFC;
+        e[58] = 0x00;
         let name = b"AG326UZD";
-        e[58..58 + name.len()].copy_from_slice(name);
-        e[58 + name.len()] = 0x0A; // LF terminator
+        e[59..59 + name.len()].copy_from_slice(name);
+        e[59 + name.len()] = 0x0A; // LF terminator
         // descriptor 2 (offset 72): serial 0xFF = "XK2R9JA000013"
         e[72] = 0x00;
         e[73] = 0x00;
-        e[74] = 0xFF;
-        e[75] = 0x00;
+        e[74] = 0x00;
+        e[75] = 0xFF;
+        e[76] = 0x00;
         let serial = b"XK2R9JA000013";
-        e[76..76 + serial.len()].copy_from_slice(serial);
-        e[76 + serial.len()] = 0x0A;
+        e[77..77 + serial.len()].copy_from_slice(serial);
+        e[77 + serial.len()] = 0x0A;
         recompute_checksum(&mut e);
         e
     }
@@ -1443,6 +1453,36 @@ mod tests {
     #[test]
     fn parse_edid_identity_too_short_returns_none() {
         assert!(parse_edid_identity(&[0u8; 64]).is_none());
+    }
+
+    /// Captured from a real Mac M3 Pro's `IORegistry` (`AppleDisplayCrossbar`
+    /// → `AppleATCDPINAdapterPort` → `IOPortTransportStateDisplayPort` →
+    /// `Metadata.EDID`) on the AOC AG326UZD attached via USB-C DP Alt-Mode.
+    /// 384 bytes = 128-byte base block + 256-byte CTA extension; the base
+    /// block alone is sufficient for `parse_edid_identity`. This is the
+    /// byte-exact fixture that exposed the v1 bug — the fork lookup path
+    /// surfaced a 128+256-byte EDID where the monitor descriptors put the
+    /// tag at byte 3 (EDID 1.4 §3.10.4), not byte 2 as v1's parser
+    /// assumed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_real_mac_arm_edid_byte_identical_to_desktop() {
+        let edid = include_bytes!("fixtures/aoc-ag326uzd-mac.edid");
+        let id = parse_edid_identity(edid).expect("Mac EDID parses");
+        assert_eq!(id.manufacturer.as_deref(), Some("AOC"));
+        assert_eq!(id.model.as_deref(), Some("AG326UZD"));
+        assert_eq!(id.serial.as_deref(), Some("XK2R9JA000013"));
+        let vcp = VcpDisplayInfo {
+            ident_string: "macos:4 AOC AG326UZD".into(),
+            manufacturer: id.manufacturer,
+            model: id.model,
+            serial: id.serial,
+        };
+        assert_eq!(
+            vcp.claim_identity().as_deref(),
+            Some("AOC:AG326UZD:XK2R9JA000013"),
+            "macOS EDID-derived identity must be byte-identical to the Linux i²c path"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

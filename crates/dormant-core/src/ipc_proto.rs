@@ -89,6 +89,22 @@ pub enum IpcRequest {
     },
     /// List public mDNS discoveries and persisted paired instances.
     CoordinationPeersList,
+    /// Initiate a KVM claim on the named shared display (local
+    /// hotkey / CLI / tray). Replied with a [`ClaimSharedResult`]
+    /// over [`IpcResponse::claim_shared`].
+    ClaimShared {
+        /// Display id (matches a `[displays.<id>]` key with
+        /// `scope = "shared"`).
+        display: String,
+    },
+    /// Arm `display` for the `armed` activity-claim policy. The
+    /// armed window auto-expires after `coordination.armed_window`
+    /// (spec §3); a second arm refreshes the deadline. Replied
+    /// via [`IpcResponse::claim_arm`].
+    ClaimArm {
+        /// Display id.
+        display: String,
+    },
 }
 
 /// Non-secret state exposed for a local instance-pairing window.
@@ -183,6 +199,50 @@ pub struct IpcResponse {
     /// Read-only public pairing inventory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination_peers: Option<CoordinationPeers>,
+    /// Local claim verdict for a `ClaimShared` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_shared: Option<ClaimSharedResultWire>,
+    /// Arming deadline for a `ClaimArm` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_arm: Option<ClaimArmResultWire>,
+}
+
+/// Wire-stable IPC verdict for a `ClaimShared` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum ClaimSharedResultWire {
+    /// Owner accepted the request and committed to the release.
+    Accepted {
+        /// Unix-epoch milliseconds at which the requester
+        /// should give up if the flip has not been observed.
+        deadline_ms: u64,
+    },
+    /// Another local trigger is in flight.
+    Busy,
+    /// Owner denied the request for a diagnosable reason.
+    Denied {
+        /// Stable reason tag (e.g. `unsupported`,
+        /// `identity_unavailable`).
+        reason: String,
+    },
+    /// No usable peer accepted and the fallback did not apply.
+    Failed {
+        /// Stable reason tag.
+        reason: String,
+    },
+}
+
+/// Wire-stable IPC arming verdict for a `ClaimArm` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimArmResultWire {
+    /// Whether the arming succeeded.
+    pub armed: bool,
+    /// Unix-epoch milliseconds at which the arming auto-expires
+    /// (`0` when `armed` is `false`).
+    pub deadline_ms: u64,
+    /// Stable reason tag for a non-armed response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl IpcResponse {
@@ -199,6 +259,8 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: None,
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -215,6 +277,8 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: None,
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -231,6 +295,8 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: None,
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -247,6 +313,8 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: None,
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -263,6 +331,8 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: None,
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -279,6 +349,8 @@ impl IpcResponse {
             coordination_pair: Some(status),
             coordination_pair_open: None,
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -295,6 +367,8 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: Some(open),
             coordination_peers: None,
+            claim_shared: None,
+            claim_arm: None,
         }
     }
 
@@ -311,6 +385,44 @@ impl IpcResponse {
             coordination_pair: None,
             coordination_pair_open: None,
             coordination_peers: Some(peers),
+            claim_shared: None,
+            claim_arm: None,
+        }
+    }
+
+    /// Build a response carrying a `ClaimShared` verdict.
+    #[must_use]
+    pub fn claim_shared(verdict: ClaimSharedResultWire) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            coordination_pair: None,
+            coordination_pair_open: None,
+            coordination_peers: None,
+            claim_shared: Some(verdict),
+            claim_arm: None,
+        }
+    }
+
+    /// Build a response carrying a `ClaimArm` deadline.
+    #[must_use]
+    pub fn claim_arm(result: ClaimArmResultWire) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            coordination_pair: None,
+            coordination_pair_open: None,
+            coordination_peers: None,
+            claim_shared: None,
+            claim_arm: Some(result),
         }
     }
 }
@@ -506,6 +618,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let resp = IpcResponse::ok(Some(snap));
         let json = serde_json::to_string(&resp).unwrap();

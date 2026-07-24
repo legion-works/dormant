@@ -395,6 +395,22 @@ impl ClaimTransportHandle {
         self.send_to_peer(peer_instance_id, frame).await;
     }
 
+    /// Snapshot the currently-known paired peers (read-only). The
+    /// runtime driver uses this to resolve the per-display owner /
+    /// requester peer instance id without the supervisor holding
+    /// the snapshot in a side channel.
+    #[must_use]
+    pub fn snapshot_peers(&self) -> Vec<ClaimPeer> {
+        self.peer_snapshot()
+    }
+
+    fn peer_snapshot(&self) -> Vec<ClaimPeer> {
+        self.peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Stop the supervisor and close its listener and channels.
     pub async fn shutdown(&self) {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -414,13 +430,6 @@ impl ClaimTransportHandle {
         if let Some(task) = task {
             let _ = task.await;
         }
-    }
-
-    fn peer_snapshot(&self) -> Vec<ClaimPeer> {
-        self.peers
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     async fn send_to_peer(&self, peer_instance_id: &str, frame: &ClaimFrame) {

@@ -12,12 +12,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use dormant_core::ipc_proto::{
-    CoordinationDiscoveredPeer, CoordinationPairOpenResponse, CoordinationPairStatus,
-    CoordinationPairedPeer, CoordinationPeers, IpcRequest, IpcResponse,
+    ClaimArmResultWire, ClaimSharedResultWire, CoordinationDiscoveredPeer,
+    CoordinationPairOpenResponse, CoordinationPairStatus, CoordinationPairedPeer,
+    CoordinationPeers, IpcRequest, IpcResponse,
 };
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
+use dormant_core::types::DisplayId;
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -25,6 +27,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::claim_runtime::{ArmFailure, ClaimRuntimeHandle, ClaimSharedResult};
 use crate::coordination_mdns::MdnsSdBackend;
 use crate::coordination_pairing::{PairingManager, PairingState, PairingTransport};
 
@@ -80,6 +83,37 @@ pub(crate) fn spawn_with_pairing(
     doctor_service: DoctorService,
     pairing: Arc<PairingManager>,
     pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    cancel: CancellationToken,
+) -> Result<JoinHandle<()>> {
+    spawn_with_claim_runtime(
+        socket_path,
+        ctl_tx,
+        reload_requester,
+        doctor_service,
+        pairing,
+        pairing_transport,
+        None,
+        cancel,
+    )
+}
+
+/// Like the crate-internal `spawn_with_pairing` but with the KVM
+/// claim runtime handle attached (used by the production
+/// orchestrator). Not linked from the public surface — the
+/// link to the private helper is intentional.
+#[allow(
+    clippy::too_many_arguments,
+    private_interfaces,
+    reason = "IPC dependencies remain explicit at the daemon lifecycle boundary."
+)]
+pub fn spawn_with_claim_runtime(
+    socket_path: &Path,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    reload_requester: ReloadRequester,
+    doctor_service: DoctorService,
+    pairing: Arc<PairingManager>,
+    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    claim_runtime: Option<ClaimRuntimeHandle>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -163,6 +197,7 @@ pub(crate) fn spawn_with_pairing(
             doctor_service,
             pairing,
             pairing_transport,
+            claim_runtime,
             cancel,
             &socket_owned,
         )
@@ -184,6 +219,7 @@ async fn run(
     doctor_service: DoctorService,
     pairing: Arc<PairingManager>,
     pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    claim_runtime: Option<ClaimRuntimeHandle>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -203,7 +239,8 @@ async fn run(
                         let doctor = doctor_service.clone();
                         let pairing = Arc::clone(&pairing);
                         let pairing_transport = pairing_transport.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, pairing, pairing_transport));
+                        let claim = claim_runtime.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, pairing, pairing_transport, claim));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -229,6 +266,7 @@ async fn handle_connection(
     doctor_service: DoctorService,
     pairing: Arc<PairingManager>,
     pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    claim_runtime: Option<ClaimRuntimeHandle>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -399,8 +437,94 @@ async fn handle_connection(
                 );
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::ClaimShared { display } => {
+                let resp = match claim_runtime.as_ref() {
+                    Some(runtime) => match runtime.try_claim(DisplayId(display.clone())).await {
+                        Ok(verdict) => IpcResponse::claim_shared(claim_shared_wire(verdict)),
+                        Err(_) => IpcResponse::error("claim runtime not available"),
+                    },
+                    None => IpcResponse::error("coordination disabled"),
+                };
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::ClaimArm { display } => {
+                let resp = match claim_runtime.as_ref() {
+                    Some(runtime) => {
+                        let policy = runtime.kvm_status().activity_claim;
+                        match runtime.arm(DisplayId(display.clone()), policy).await {
+                            Ok(Ok(deadline)) => IpcResponse::claim_arm(ClaimArmResultWire {
+                                armed: true,
+                                deadline_ms: deadline_ms(deadline),
+                                reason: None,
+                            }),
+                            Ok(Err(failure)) => IpcResponse::claim_arm(ClaimArmResultWire {
+                                armed: false,
+                                deadline_ms: 0,
+                                reason: Some(arm_failure_reason(&failure).to_owned()),
+                            }),
+                            Err(_) => IpcResponse::error("claim runtime not available"),
+                        }
+                    }
+                    None => IpcResponse::error("coordination disabled"),
+                };
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
     }
+}
+
+fn claim_shared_wire(verdict: ClaimSharedResult) -> ClaimSharedResultWire {
+    match verdict {
+        ClaimSharedResult::Accepted { deadline } => ClaimSharedResultWire::Accepted {
+            deadline_ms: deadline_ms(deadline),
+        },
+        ClaimSharedResult::Busy => ClaimSharedResultWire::Busy,
+        ClaimSharedResult::Denied(reason) => ClaimSharedResultWire::Denied {
+            reason: denied_reason_tag(&reason).to_owned(),
+        },
+        ClaimSharedResult::Failed(failure) => ClaimSharedResultWire::Failed {
+            reason: failure_reason_tag(&failure).to_owned(),
+        },
+    }
+}
+
+fn denied_reason_tag(reason: &dormant_core::claim::ClaimDeniedReason) -> &'static str {
+    use dormant_core::claim::ClaimDeniedReason;
+    match reason {
+        ClaimDeniedReason::Unsupported => "unsupported",
+        ClaimDeniedReason::IdentityUnavailable => "identity_unavailable",
+        ClaimDeniedReason::InputCodeConflict => "input_code_conflict",
+        ClaimDeniedReason::DisplayRemoved => "display_removed",
+        ClaimDeniedReason::CoordinationDisabled => "coordination_disabled",
+        ClaimDeniedReason::StaleEpoch { .. } => "stale_epoch",
+        ClaimDeniedReason::Unknown => "unknown",
+    }
+}
+
+fn failure_reason_tag(failure: &dormant_core::claim_engine::ClaimFailure) -> &'static str {
+    use dormant_core::claim_engine::ClaimFailure;
+    match failure {
+        ClaimFailure::StaleEpoch => "stale_epoch",
+        ClaimFailure::Denied(_) => "denied",
+        ClaimFailure::ReleaseFailed(_) => "release_failed",
+    }
+}
+
+fn arm_failure_reason(failure: &ArmFailure) -> &'static str {
+    match failure {
+        ArmFailure::CoordinationDisabled => "coordination_disabled",
+        ArmFailure::NotArmed => "not_armed",
+        ArmFailure::NotClaimCapable => "not_claim_capable",
+    }
+}
+
+fn deadline_ms(deadline: std::time::Instant) -> u64 {
+    let now = std::time::Instant::now();
+    if deadline <= now {
+        return 0;
+    }
+    let delta = deadline.duration_since(now);
+    u64::try_from(delta.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn pairing_response(status: crate::coordination_pairing::PairingStatus) -> IpcResponse {

@@ -567,6 +567,28 @@ pub struct StateSnapshot {
     /// Boot-time rollback metadata, omitted when no rollback is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackStatus>,
+    /// KVM-switch status payload (resolved keymap, claim-capable
+    /// display set, activity-claim policy). Additive — older
+    /// clients omit the key. `#[serde(default)]` so legacy
+    /// snapshots without the key deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvm: Option<KvmStatus>,
+}
+
+/// KVM-switch snapshot payload — the tray refetches this on every
+/// `ConfigReloaded` event (spec §3, IPC contract).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvmStatus {
+    /// Resolved keymap (keymap.claim_hotkey).
+    #[serde(default)]
+    pub keymap: crate::config::KeymapConfig,
+    /// Post-probe claim-capable display set (shared scope AND
+    /// input-source write capable AND claim identity present).
+    #[serde(default)]
+    pub claim_capable_displays: Vec<crate::types::DisplayId>,
+    /// Resolved activity-claim policy.
+    #[serde(default)]
+    pub activity_claim: crate::config::ActivityClaimPolicy,
 }
 
 // ── Per-runtime configuration shapes ─────────────────────────────────────────
@@ -809,6 +831,13 @@ pub struct RulesEngine {
     /// Drained into timer / dispatch structures at the start of
     /// [`RulesEngine::run`].
     pending_restore: Vec<(DisplayId, Vec<Effect>)>,
+    /// KVM-switch snapshot payload (keymap + claim-capable
+    /// displays + activity-claim policy). Updated by the
+    /// orchestrator on every successful generation install; the
+    /// rules engine reads it from
+    /// [`RulesEngine::send_snapshot`]. `None` until the first
+    /// orchestrator-side install completes.
+    kvm: Option<KvmStatus>,
 }
 
 impl RulesEngine {
@@ -914,6 +943,7 @@ impl RulesEngine {
             observations: None,
             pending_reload: None,
             rollback: None,
+            kvm: None,
             pending_restore: Vec::new(),
         })
     }
@@ -1766,6 +1796,7 @@ impl RulesEngine {
             displays,
             pending_reload: self.pending_reload.clone(),
             rollback: self.rollback.clone(),
+            kvm: self.kvm.clone(),
         });
     }
 
@@ -3736,6 +3767,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         observations: None,
         pending_reload: None,
         rollback: None,
+        kvm: None,
         pending_restore: Vec::new(),
     };
 
@@ -3838,6 +3870,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         observations: None,
         pending_reload: None,
         rollback: None,
+        kvm: None,
         pending_restore: Vec::new(),
     };
 

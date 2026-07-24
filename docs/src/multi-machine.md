@@ -81,6 +81,28 @@ panel — affects all connected machines**. Use Force wake for immediate recover
 when a panel is dark; force blank bypasses normal presence rules and affects
 whichever source is selected.
 
+### Claim methods
+
+Shared-display claims can be initiated in four ways:
+
+- **Hotkey** — immediate claim (factory-mapped to `Meta+Ctrl+Shift+B`).
+- **`dormantctl switch <display>`** — immediate claim from the CLI.
+- **`activity_claim = "edge"`** — claims on a local input edge (keyboard,
+  mouse, tablet).
+- **`activity_claim = "owner-idle"`** — claims once the current owner (the peer
+  selected on the monitor) has been idle for at least `owner_idle_window`.
+
+`owner-idle` has a warm-up requirement: it needs one prior successful claim
+per display before it engages. The daemon learns the owner's identity from
+`ClaimResponse::Accepted` — not from the config, because ownership is local
+hardware truth and is never broadcast between peers. Until the first claim
+completes (via hotkey, `dormantctl switch`, or `activity_claim = "edge"`),
+`owner-idle` will not fire. This is a one-time per-display requirement; after
+the daemon restarts, the owner identity must be relearned.
+
+See [`activity_claim`](#coordination-reference) and
+[`Limits and failure behavior`](#limits-and-failure-behavior) for details.
+
 ## Pairing security
 
 Opening a pairing window makes one machine the responder. It displays an
@@ -118,6 +140,8 @@ for configured shared displays.
 | `pairing_port` | integer | `0` | TCP port for a pairing window; `0` requests an ephemeral OS port. |
 | `pairing_window` | duration | `"5m"` | Lifetime of the listener and mDNS advertisement; `"30s"` to `"15m"`. |
 | `pairing_bind_address` | string or unset | unset | LAN address for the temporary listener; unset auto-detects the primary non-loopback address. |
+| `activity_claim` | enum | `"off"` | Claim policy triggered by local input activity. `"off"` — no automatic claims. `"owner-idle"` — claim when the current owner is idle (requires one prior claim per display; see [Claim methods](#claim-methods)). `"edge"` — claim on a local input edge (keyboard/mouse/tablet). `"armed"` — claim while an explicit arm window is active. |
+| `owner_idle_window` | duration | `"2m"` | Minimum owner-idle duration before an `owner-idle` claim fires. See [`activity_claim`](#coordination-reference) for the warm-up requirement. |
 
 ## Limits and failure behavior
 
@@ -134,6 +158,14 @@ for configured shared displays.
   attempted and failed. Fix that before relying on a shared display.
 - Discovery is not a heartbeat. Losing an mDNS peer does not change local panel
   ownership, and local presence state is never shared between instances.
+- **`owner-idle` warm-up.** The `owner-idle` activity-claim policy needs one
+  prior successful claim per display before it engages. The daemon learns the
+  owner from the first `ClaimResponse::Accepted`, which only arrives after a
+  claim initiated via hotkey, `dormantctl switch`, or `activity_claim = "edge"`.
+  Until that claim completes, `owner-idle` IdleReports are dropped (security:
+  the daemon must not accept reports from an unknown peer). After a daemon
+  restart, the owner identity must be relearned — `owner_instance_id` lives
+  in memory, not on disk.
 
 ## Troubleshooting
 

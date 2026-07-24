@@ -130,6 +130,12 @@ pub struct InputFilterConfig {
 }
 
 /// Policy that may initiate a claim from local activity.
+///
+/// `owner-idle` requires one prior successful claim per display — the local
+/// machine learns the owner's instance identity from `ClaimResponse::Accepted`
+/// and uses it to verify subsequent `IdleReport`s. Until that first claim
+/// completes (via a hotkey, `dormantctl switch`, or an `edge`/`armed` policy),
+/// `owner-idle` will never fire on its own on a fresh daemon.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ActivityClaimPolicy {
@@ -137,6 +143,10 @@ pub enum ActivityClaimPolicy {
     #[default]
     Off,
     /// Claim only after the current owner is idle.
+    ///
+    /// Warm-up requirement: the daemon must have completed one successful claim
+    /// for this display before `owner-idle` will engage — the owner's instance
+    /// identity is learned from the first accepted claim, not from the config.
     OwnerIdle,
     /// Claim on a local input edge.
     Edge,
@@ -194,10 +204,22 @@ pub struct CoordinationConfig {
     pub pairing_bind_address: Option<String>,
 
     /// Activity policy that may initiate a shared-display claim.
+    ///
+    /// `owner-idle` requires one prior successful claim per display before it
+    /// engages. Until `ClaimResponse::Accepted` populates the owner identity
+    /// (triggered by a hotkey, `dormantctl switch`, or an `edge`/`armed` policy
+    /// claim), `owner-idle` will not fire. This is a security property — the
+    /// daemon learns the owner via authenticated claim responses, not from the
+    /// config, because ownership is local hardware truth and is never
+    /// broadcast.
     #[serde(default)]
     pub activity_claim: ActivityClaimPolicy,
 
     /// Required owner-idle duration before an owner-idle claim.
+    ///
+    /// See [`activity_claim`](Self::activity_claim) for the warm-up
+    /// requirement: an `owner-idle` claim needs the owner identity populated
+    /// first.
     #[serde(default = "default_owner_idle_window", with = "humantime_serde")]
     pub owner_idle_window: Duration,
 

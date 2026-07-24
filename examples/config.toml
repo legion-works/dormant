@@ -78,6 +78,21 @@ config_version = 1
 # pairing_port = 0               # 0 asks the OS for an ephemeral temporary listener port
 # pairing_window = "5m"          # code/listener/mDNS lifetime (30s..=15m)
 # pairing_bind_address = "10.0.0.5" # unset defaults to the primary non-loopback LAN address
+# claim_port = 0                  # always-on claim listener; 0 = OS-assigned port
+# claim_bind_address = "10.0.0.5"  # unset = auto-detect LAN address
+# claim_advertise_mdns = false     # advertise the claim listener via mDNS (optional)
+#
+# Claim policies triggered by local input activity:
+# activity_claim = "off"         # "off" | "owner-idle" | "edge" | "armed"
+# owner_idle_window = "2m"       # min idle before an owner-idle claim fires
+# armed_window = "1m"            # arm window lifetime
+# claim_timeout = "5s"           # request/ack round-trip bound
+# release_deadline_cap = "30s"    # upper cap on a computed release deadline
+#
+# owner-idle warm-up: the policy needs one prior successful claim per display
+# before it will engage. The daemon learns the owning peer's identity from
+# ClaimResponse::Accepted, not from the config. Trigger the first claim via a
+# hotkey, `dormantctl switch <display>`, or `activity_claim = "edge"`.
 
 # ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────
 #

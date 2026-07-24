@@ -2299,6 +2299,169 @@ gracee_period = "60s"
     }
 
     #[test]
+    fn kvm_coordination_duration_floors_reject_below_and_accept_boundaries() {
+        for (key, below, floor, fragment) in [
+            ("claim_timeout", "999ms", "1s", "claim_timeout"),
+            (
+                "release_deadline_cap",
+                "14999ms",
+                "15s",
+                "release_deadline_cap",
+            ),
+            ("armed_window", "4999ms", "5s", "armed_window"),
+            ("owner_idle_window", "4999ms", "5s", "owner_idle_window"),
+        ] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\n{key} = \"{below}\"\n"
+            ));
+            assert!(
+                errors.iter().any(|error| {
+                    error.what == crate::error::E_CONFIG_INVALID
+                        && error.detail.contains(fragment)
+                        && error.detail.contains("below the minimum")
+                }),
+                "{key} below its floor must be rejected: {errors:?}"
+            );
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\n{key} = \"{floor}\"\n"
+            ));
+            assert!(
+                !errors.iter().any(|error| error.detail.contains(fragment)),
+                "{key} at its floor must be accepted: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kvm_duplicate_shared_input_code_is_rejected_but_distinct_codes_pass() {
+        let displays = |second_code| {
+            format!(
+                "[displays.left]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n\n[displays.right]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = {second_code}\nblank_mode = \"power_off\"\n"
+            )
+        };
+        let errors = validate_str(&format!("config_version = 1\n{}", displays(1)));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error
+                        .detail
+                        .contains("duplicates a local shared_input_code")),
+            "duplicate shared input codes must be rejected: {errors:?}"
+        );
+        let errors = validate_str(&format!("config_version = 1\n{}", displays(2)));
+        assert!(
+            !errors.iter().any(|error| error
+                .detail
+                .contains("duplicates a local shared_input_code")),
+            "distinct shared input codes must pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_claim_transport_and_activity_fatal_rules_are_enforced() {
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\nclaim_advertise_mdns = false\nclaim_port = 0\n",
+        );
+        assert!(errors.iter().any(|error| {
+            error.what == crate::error::E_CONFIG_INVALID
+                && error
+                    .detail
+                    .contains("requires a fixed non-zero claim_port")
+        }));
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\nclaim_advertise_mdns = false\nclaim_port = 1234\n",
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.detail.contains("claim_port"))
+        );
+
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\nactivity_claim = \"edge\"\nenabled = false\n",
+        );
+        assert!(errors.iter().any(|error| {
+            error.what == crate::error::E_CONFIG_INVALID
+                && error
+                    .detail
+                    .contains("activity_claim requires coordination enabled")
+        }));
+    }
+
+    #[test]
+    fn kvm_accelerator_grammar_rejects_invalid_hotkeys() {
+        let errors = validate_str("config_version = 1\n[keymap]\nclaim_hotkey = \"Meta++F12\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("claim_hotkey")
+                    && error.detail.contains("not a valid accelerator"))
+        );
+    }
+
+    #[test]
+    fn kvm_hook_fatal_rules_are_enforced() {
+        let shared = |hook| {
+            format!(
+                "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{hook}]\n"
+            )
+        };
+        for (hook, fragment) in [
+            ("{ command = [] }", "command argv must not be empty"),
+            (
+                "{ command = [\"true\"], timeout = \"99ms\" }",
+                "below the minimum of 100ms",
+            ),
+            (
+                "{ command = [\"true\"], mqtt = { topic = \"x\", payload = \"y\" } }",
+                "exactly one of command or mqtt",
+            ),
+            (
+                "{ mqtt = { topic = \"x\", payload = \"y\" } }",
+                "mqtt action requires a configured MQTT broker",
+            ),
+        ] {
+            let errors = validate_str(&shared(hook));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                        && error.detail.contains(fragment)),
+                "hook rule {fragment:?} must be rejected: {errors:?}"
+            );
+        }
+        let errors = validate_str(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"] }]\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("has hooks but is not shared"))
+        );
+    }
+
+    #[test]
+    fn kvm_hook_unknown_slot_is_rejected_in_strict_mode() {
+        let result = load_str_strict(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = []\nafter_release = []\nbefore_acquire = []\nafter_acquire = []\nafter_acquiree = []\n",
+        );
+        assert!(
+            result.is_err(),
+            "unknown hook slots must fail strict parsing"
+        );
+    }
+
+    #[test]
+    fn kvm_known_keys_accept_every_new_config_key() {
+        let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\nactivity_claim = \"off\"\nowner_idle_window = \"5s\"\narmed_window = \"5s\"\nclaim_timeout = \"1s\"\nrelease_deadline_cap = \"15s\"\nclaim_port = 42\nclaim_bind_address = \"\"\nclaim_advertise_mdns = false\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(collect_unknown_keys(&value).is_empty());
+    }
+
+    #[test]
     fn validate_accepts_valid_full_config() {
         let cfg = valid_full_config();
         let errors = validate(&cfg, &test_capabilities(), &test_creds());

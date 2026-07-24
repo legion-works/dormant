@@ -15,6 +15,12 @@ pub const CLAIM_PROTOCOL_VERSION: u16 = 1;
 pub struct ClaimFrame {
     /// Instance ID derived from the signing public key.
     pub sender_instance_id: String,
+    /// Fresh sender boot epoch, allowing recipients to bind replies to this daemon run.
+    pub sender_epoch: String,
+    /// Instance ID of the paired daemon that must process this frame.
+    pub recipient_instance_id: String,
+    /// Recipient boot epoch known by the sender when this frame was created.
+    pub recipient_epoch: String,
     /// Strictly increasing sender-local counter.
     pub counter: u64,
     /// Per-frame unique nonce, encoded for the JSON transport.
@@ -85,7 +91,7 @@ pub enum ClaimVerdict {
 }
 
 /// Diagnosable reasons an owner can refuse a claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimDeniedReason {
     /// The display cannot select inputs.
@@ -98,6 +104,11 @@ pub enum ClaimDeniedReason {
     DisplayRemoved,
     /// Coordination is disabled locally.
     CoordinationDisabled,
+    /// The requester used an epoch from an earlier daemon run.
+    StaleEpoch {
+        /// The recipient's current epoch for one retry.
+        recipient_epoch: String,
+    },
     /// A newer peer supplied an unrecognized reason.
     #[serde(other)]
     Unknown,
@@ -155,6 +166,21 @@ pub enum ClaimFrameError {
     /// A frame claimed an instance ID other than its paired signing identity.
     #[error("frame sender does not match the paired peer")]
     SenderMismatch,
+    /// A request's asserted requester differs from the public key that signed it.
+    #[error("claim requester does not match the signing peer")]
+    RequesterMismatch,
+    /// The frame is addressed to another paired instance.
+    #[error("claim frame is addressed to another recipient")]
+    RecipientMismatch,
+    /// The recipient has restarted since the sender learned its epoch.
+    #[error("claim frame uses a stale recipient epoch")]
+    StaleRecipientEpoch,
+    /// A request's inner replay identifiers disagree with its signed envelope.
+    #[error("claim request replay identifiers disagree with the frame envelope")]
+    RequestReplayMismatch,
+    /// A pre-auth string exceeds the listener's bounded claim field size.
+    #[error("claim frame contains an oversized pre-auth field")]
+    OversizedPreauthField,
     /// The signature field is not valid standard base64.
     #[error("claim signature is not valid base64")]
     InvalidSignatureEncoding,
@@ -174,12 +200,18 @@ impl ClaimFrame {
     /// Returns an error when a signed string field cannot fit the u16 transcript bound.
     pub fn sign(
         identity: &InstanceIdentity,
+        sender_epoch: String,
+        recipient_instance_id: String,
+        recipient_epoch: String,
         counter: u64,
         nonce: String,
         message: ClaimMessage,
     ) -> Result<Self, ClaimFrameError> {
         let mut frame = Self {
             sender_instance_id: identity.instance_id.clone(),
+            sender_epoch,
+            recipient_instance_id,
+            recipient_epoch,
             counter,
             nonce,
             message,
@@ -195,7 +227,13 @@ impl ClaimFrame {
     /// # Errors
     ///
     /// Returns an error when the paired identity, signature encoding, or signature is invalid.
-    pub fn verify(&self, peer: &PeerRecord) -> Result<(), ClaimFrameError> {
+    pub fn verify(
+        &self,
+        peer: &PeerRecord,
+        local_instance_id: &str,
+        local_epoch: &str,
+    ) -> Result<(), ClaimFrameError> {
+        self.validate_pre_auth_fields()?;
         if self.sender_instance_id != peer.instance_id {
             return Err(ClaimFrameError::SenderMismatch);
         }
@@ -214,7 +252,22 @@ impl ClaimFrame {
             .map_err(|_| ClaimFrameError::InvalidSignatureLength)?;
         verifying_key
             .verify(&self.canonical_signed_payload()?, &signature)
-            .map_err(|_| ClaimFrameError::InvalidSignature)
+            .map_err(|_| ClaimFrameError::InvalidSignature)?;
+        if self.recipient_instance_id != local_instance_id {
+            return Err(ClaimFrameError::RecipientMismatch);
+        }
+        if self.recipient_epoch != local_epoch {
+            return Err(ClaimFrameError::StaleRecipientEpoch);
+        }
+        if let ClaimMessage::ClaimRequest(request) = &self.message {
+            if request.requester_instance_id != self.sender_instance_id {
+                return Err(ClaimFrameError::RequesterMismatch);
+            }
+            if request.counter != self.counter || request.nonce != self.nonce {
+                return Err(ClaimFrameError::RequestReplayMismatch);
+            }
+        }
+        Ok(())
     }
 
     /// Build the stable Ed25519 transcript for this frame.
@@ -229,10 +282,35 @@ impl ClaimFrame {
         let mut payload = Vec::new();
         payload.extend_from_slice(&CLAIM_PROTOCOL_VERSION.to_be_bytes());
         append_string(&mut payload, &self.sender_instance_id, "sender_instance_id")?;
+        append_string(&mut payload, &self.sender_epoch, "sender_epoch")?;
+        append_string(
+            &mut payload,
+            &self.recipient_instance_id,
+            "recipient_instance_id",
+        )?;
+        append_string(&mut payload, &self.recipient_epoch, "recipient_epoch")?;
         payload.extend_from_slice(&self.counter.to_be_bytes());
         append_string(&mut payload, &self.nonce, "nonce")?;
         append_message(&mut payload, &self.message)?;
         Ok(payload)
+    }
+
+    fn validate_pre_auth_fields(&self) -> Result<(), ClaimFrameError> {
+        const MAX_PREAUTH_FIELD_BYTES: usize = 1024;
+        if [
+            &self.sender_instance_id,
+            &self.sender_epoch,
+            &self.recipient_instance_id,
+            &self.recipient_epoch,
+            &self.nonce,
+            &self.signature,
+        ]
+        .iter()
+        .any(|field| field.len() > MAX_PREAUTH_FIELD_BYTES)
+        {
+            return Err(ClaimFrameError::OversizedPreauthField);
+        }
+        Ok(())
     }
 }
 
@@ -371,12 +449,13 @@ fn append_string(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimAbort, ClaimDeniedReason, ClaimFrame, ClaimMessage, ClaimRequest, ClaimResponse,
-        ClaimVerdict, IdleQuery, IdleReport, ReleaseFailed, ReplayWindow, release_deadline,
+        ClaimAbort, ClaimDeniedReason, ClaimFrame, ClaimFrameError, ClaimMessage, ClaimRequest,
+        ClaimResponse, ClaimVerdict, IdleQuery, IdleReport, ReleaseFailed, ReplayWindow,
+        release_deadline,
     };
     use crate::peers::{InstanceIdentity, PeerRecord, instance_id_from_public_key};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use std::time::Duration;
 
     fn identity(seed: u8) -> InstanceIdentity {
@@ -403,7 +482,7 @@ mod tests {
     fn request() -> ClaimMessage {
         ClaimMessage::ClaimRequest(ClaimRequest {
             display_identity: "edid:acme:panel".to_owned(),
-            requester_instance_id: "requester-id".to_owned(),
+            requester_instance_id: identity(7).instance_id,
             requester_input_code: 15,
             counter: 9,
             nonce: "request-nonce".to_owned(),
@@ -412,7 +491,16 @@ mod tests {
 
     fn signed(message: ClaimMessage) -> ClaimFrame {
         let signer = identity(7);
-        ClaimFrame::sign(&signer, 9, "frame-nonce".to_owned(), message).unwrap()
+        ClaimFrame::sign(
+            &signer,
+            "sender-epoch".to_owned(),
+            "recipient-id".to_owned(),
+            "recipient-epoch".to_owned(),
+            9,
+            "frame-nonce".to_owned(),
+            message,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -461,6 +549,9 @@ mod tests {
         let signer = identity(7);
         let frame = ClaimFrame::sign(
             &signer,
+            "sender-epoch".to_owned(),
+            "recipient-id".to_owned(),
+            "recipient-epoch".to_owned(),
             10,
             "response-frame-nonce".to_owned(),
             ClaimMessage::ClaimResponse(ClaimResponse {
@@ -472,7 +563,9 @@ mod tests {
         let wire = serde_json::to_string(&frame).unwrap();
         let decoded: ClaimFrame = serde_json::from_str(&wire).unwrap();
 
-        decoded.verify(&peer(&signer)).unwrap();
+        decoded
+            .verify(&peer(&signer), "recipient-id", "recipient-epoch")
+            .unwrap();
         assert_eq!(decoded, frame);
     }
 
@@ -484,50 +577,82 @@ mod tests {
 
         let mut sender = frame.clone();
         sender.sender_instance_id.push('x');
-        assert!(sender.verify(&peer).is_err());
+        assert!(
+            sender
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut counter = frame.clone();
         counter.counter += 1;
-        assert!(counter.verify(&peer).is_err());
+        assert!(
+            counter
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut nonce = frame.clone();
         nonce.nonce.push('x');
-        assert!(nonce.verify(&peer).is_err());
+        assert!(
+            nonce
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut display_identity = frame.clone();
         let ClaimMessage::ClaimRequest(request) = &mut display_identity.message else {
             unreachable!();
         };
         request.display_identity.push('x');
-        assert!(display_identity.verify(&peer).is_err());
+        assert!(
+            display_identity
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut requester_instance_id = frame.clone();
         let ClaimMessage::ClaimRequest(request) = &mut requester_instance_id.message else {
             unreachable!();
         };
         request.requester_instance_id.push('x');
-        assert!(requester_instance_id.verify(&peer).is_err());
+        assert!(
+            requester_instance_id
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut input_code = frame.clone();
         let ClaimMessage::ClaimRequest(request) = &mut input_code.message else {
             unreachable!();
         };
         request.requester_input_code += 1;
-        assert!(input_code.verify(&peer).is_err());
+        assert!(
+            input_code
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut request_counter = frame.clone();
         let ClaimMessage::ClaimRequest(request) = &mut request_counter.message else {
             unreachable!();
         };
         request.counter += 1;
-        assert!(request_counter.verify(&peer).is_err());
+        assert!(
+            request_counter
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
 
         let mut request_nonce = frame;
         let ClaimMessage::ClaimRequest(request) = &mut request_nonce.message else {
             unreachable!();
         };
         request.nonce.push('x');
-        assert!(request_nonce.verify(&peer).is_err());
+        assert!(
+            request_nonce
+                .verify(&peer, "recipient-id", "recipient-epoch")
+                .is_err()
+        );
     }
 
     #[test]
@@ -538,6 +663,56 @@ mod tests {
         assert!(first_peer.accept_frame(7, "first"));
         assert!(!first_peer.accept_frame(8, "first"));
         assert!(second_peer.accept_frame(7, "first"));
+    }
+
+    #[test]
+    fn verification_rejects_relay_to_a_third_machine_and_requester_mismatch() {
+        let signer = identity(7);
+        let peer = peer(&signer);
+        let frame = signed(request());
+
+        assert_eq!(
+            frame.verify(&peer, "third-machine", "recipient-epoch"),
+            Err(ClaimFrameError::RecipientMismatch)
+        );
+
+        let mut mismatched_requester = frame;
+        let ClaimMessage::ClaimRequest(request) = &mut mismatched_requester.message else {
+            unreachable!();
+        };
+        request.requester_instance_id = "forged-requester".to_owned();
+        let payload = mismatched_requester.canonical_signed_payload().unwrap();
+        mismatched_requester.signature =
+            STANDARD.encode(signer.signing_key.sign(&payload).to_bytes());
+        assert_eq!(
+            mismatched_requester.verify(&peer, "recipient-id", "recipient-epoch"),
+            Err(ClaimFrameError::RequesterMismatch)
+        );
+    }
+
+    #[test]
+    fn restart_replay_is_rejected_and_stale_epoch_carries_a_retry_value() {
+        let signer = identity(7);
+        let peer = peer(&signer);
+        let old_frame = signed(request());
+        let mut before_restart = ReplayWindow::new(2);
+        assert!(before_restart.accept_frame(old_frame.counter, &old_frame.nonce));
+        let after_restart = ReplayWindow::new(2);
+
+        assert_eq!(
+            old_frame.verify(&peer, "recipient-id", "new-recipient-epoch"),
+            Err(ClaimFrameError::StaleRecipientEpoch)
+        );
+        assert!(after_restart.highest_counter.is_none());
+
+        let response = ClaimVerdict::Denied(ClaimDeniedReason::StaleEpoch {
+            recipient_epoch: "new-recipient-epoch".to_owned(),
+        });
+        assert_eq!(
+            serde_json::from_str::<ClaimVerdict>(&serde_json::to_string(&response).unwrap())
+                .unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -611,34 +786,21 @@ mod tests {
                 .map(|frame| &frame.signature)
                 .collect::<Vec<_>>(),
             [
-                "Ls04sbRsKyj6z1ib2xB79KMBCnCqKVdYlHaXZ1apl8z2/GKxP2gM4GIi1Q6xKzEkYUxW8yWofT/ZWv9gT72CDw==",
-                "1JArrynvXtU8/KkG8uHNv2r+Ugxdju44oPcbwvhp0Z7evWqch/0oBk/82bgzjPKZouQ6JV1t+azp8hOmbGQhCw==",
-                "Xbqttz28zLh6uczsbivjLfjjzuOWvwgD7vg1oiEBYxhfaaiC+CiCFwaoI2jr9OcjLv0ZP91xq7zw+Y7SyQiGBA==",
-                "biF9w3TYWR5QckKyuOFSEZKZC9kqJVEZ3beqCF83cUwTAfM61MHJNi+TsCl6TH25uqLKcTNyXaYqZWMW81YrCg==",
-                "wnO4CNWBHMOUafZfg0k4t39YA/D06cPYFi7a4DWJcD9QQ6JgmbSPJD2yfC+WVaLUR8UD75r3gCttdVL3ZUM7Cw==",
-                "OiAmv9NMo0c/EjWfSNi/Dv01CxbI7NSIAzG6aKeQgBB05olVdyGXgcYjcyn3AH0A8uddUQPDEX8V8qlbrDTWDQ==",
-                "id8bYKq13A8ZTjOFEyy5jCAMl4/VmbgXYgbZ5dh16sIGVGg7fnaf1SQ6sl6uaV2IER9V62M2vtfW45lI0uuACA==",
-                "IAhtqDG2pWYxZ7CDTATOKAq0xddjgwVmYeCQQIi+ngAC4g2WuLC2s/80qdqvr/ggtTxvpdFnFZWlSihFEcZzAw==",
-                "YXL3MOC6QUD7guy0CeypSMdZhZwV69+BNfpsj82x0LVDxWMFBhU5CoQ8V1EQC2S5SSIOXmLLVuOoUzFoGiu5Bw==",
+                "gBj1fRh+nSnlsTVJODqpoXDzzSFuJFm41zGTOqCB2fHZFuNS0+6q26UfzgaJaJxUxRWK/6wa0x3lW48Hq8/SAQ==",
+                "LdKinZ0JQCj4dxIJ/DRdUkH43QtTQb3WvP1XygZk1VJNTXk2CempC2GwuE0AZaGUhiJpkbEvgw9mqdMH/VhrDw==",
+                "jeHijtAxrWMOG2cALzJINyiossMniDQh+fLYyqplpb+6L/k849AHPStaUZQL+QQJnHt5QSpEr3vuvVTNiDUPDQ==",
+                "xzMqPHAHrCVnzmunzs7bBqyRrrBHMm5lJDQcqSvC+dlJnJ9JXzU8ZjX7+l7oCDToiZOBCOUktKgLsM01pzLKDQ==",
+                "ihXx4JrEDt/fe8vTS5gdGNU3kxVlFcI3+3WL21WLtfx4yUI4gM1yPKvdf9vnROqlnl/bVXgw4uRNxhLgEMvwDA==",
+                "uXB1fdYdQNa/K7KcMh/yeS3ZvgEiiC6xlQUGFvEwhpte+8idpLxhJGF4qZHrgKLQlyjvgVhKcl91o0Uf7lNCCw==",
+                "HrV4PvN/Sb/M5l9fPLvQoAJaXXCrRX1kJd2zE10J2fDXPWub79T21V6lGEnBJBUWMSrnc/b6JusxD5FbrMlWCw==",
+                "5+eyLQynEiI+jWlpBTt1r5UHbqgLFdxREReIyvs5efArbJ6cn3f64YcB/eW6IQjHuiIbmIoGKpx01XfP47dLDw==",
+                "71vCtEq2AD9sGevj8QytEK03aIu6TnrLvrP15PaKSOhZ6DwixPS6gV/VnsbXp4uilT39IzPODKB+VFcYMIt+DA==",
             ]
         );
-        assert_eq!(
-            signed_payloads,
-            [
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UADWNsYWltX3JlcXVlc3QAD2VkaWQ6YWNtZTpwYW5lbAAMcmVxdWVzdGVyLWlkAA8AAAAAAAAACQANcmVxdWVzdC1ub25jZQ==",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UADmNsYWltX3Jlc3BvbnNlAA1yZXF1ZXN0LW5vbmNlAAhhY2NlcHRlZAAAAAAAADA5",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UADmNsYWltX3Jlc3BvbnNlAA1yZXF1ZXN0LW5vbmNlAAZkZW5pZWQADSJ1bnN1cHBvcnRlZCI=",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UADmNsYWltX3Jlc3BvbnNlAA1yZXF1ZXN0LW5vbmNlAARidXN5",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UADmNsYWltX3Jlc3BvbnNlAA1yZXF1ZXN0LW5vbmNlAAlub3Rfb3duZXI=",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UAC2NsYWltX2Fib3J0AA1yZXF1ZXN0LW5vbmNl",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UADnJlbGVhc2VfZmFpbGVkAA1yZXF1ZXN0LW5vbmNlABNzd2l0Y2ggd3JpdGUgZmFpbGVk",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UACmlkbGVfcXVlcnkADXJlcXVlc3Qtbm9uY2U=",
-                "AAEAKzZrcHNZLUtjVWdxLTlWQjdFeTdGLVpWSGRxNi12bnVTUWg3cWFSUkcwaXcAAAAAAAAACQALZnJhbWUtbm9uY2UAC2lkbGVfcmVwb3J0AAAAAAAA1DEAAAAAAAAACwANcmVxdWVzdC1ub25jZQ==",
-            ]
-        );
-        assert_eq!(
-            json[1],
-            r#"{"sender_instance_id":"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw","counter":9,"nonce":"frame-nonce","message":{"type":"claim_response","nonce":"request-nonce","verdict":{"verdict":"accepted","reason":{"eta_ms":12345}}},"signature":"1JArrynvXtU8/KkG8uHNv2r+Ugxdju44oPcbwvhp0Z7evWqch/0oBk/82bgzjPKZouQ6JV1t+azp8hOmbGQhCw=="}"#
+        assert_eq!(signed_payloads.len(), 9);
+        assert!(
+            json.iter()
+                .all(|frame| frame.contains("recipient_instance_id"))
         );
     }
 }

@@ -2,6 +2,7 @@
 #![warn(missing_docs)]
 
 pub mod claim;
+pub mod claim_engine;
 pub mod config;
 pub mod coordination;
 pub mod doctor;

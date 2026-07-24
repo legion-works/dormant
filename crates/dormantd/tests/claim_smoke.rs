@@ -73,17 +73,17 @@ impl RecordingSink {
             inner: Arc::new(Mutex::new(SinkInner::default())),
         }
     }
-    pub fn set_claim_identity(&self, id: impl Into<String>) {
+    fn set_claim_identity(&self, id: impl Into<String>) {
         self.inner.lock().unwrap().identity = Some(id.into());
     }
-    pub fn script_reads(&self, reads: Vec<ScriptedRead>) {
+    fn script_reads(&self, reads: Vec<ScriptedRead>) {
         let mut g = self.inner.lock().unwrap();
         g.reads = Mutex::new(reads.into());
     }
-    pub fn write_calls(&self) -> Vec<RecordedCall> {
+    fn write_calls(&self) -> Vec<RecordedCall> {
         self.inner.lock().unwrap().writes.clone()
     }
-    pub fn wake_calls(&self) -> Vec<RecordedCall> {
+    fn wake_calls(&self) -> Vec<RecordedCall> {
         self.inner.lock().unwrap().wakes.clone()
     }
 }
@@ -116,8 +116,7 @@ impl CommandSink for RecordingSink {
         Ok(match next {
             Some(ScriptedRead::Powered(v)) => Some(v),
             Some(ScriptedRead::Standby) => Some(0),
-            Some(ScriptedRead::Unknown) => None,
-            None => None,
+            Some(ScriptedRead::Unknown) | None => None,
         })
     }
     async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
@@ -172,12 +171,12 @@ impl Default for RecordingHookRunner {
 }
 
 impl RecordingHookRunner {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HookInner::default())),
         }
     }
-    pub fn push_completed(&self, started: usize, failed: usize, spawned: usize) {
+    fn push_completed(&self, started: usize, failed: usize, spawned: usize) {
         self.inner
             .lock()
             .unwrap()
@@ -190,7 +189,7 @@ impl RecordingHookRunner {
                 spawned,
             });
     }
-    pub fn calls(&self) -> Vec<RecordedHook> {
+    fn calls(&self) -> Vec<RecordedHook> {
         self.inner.lock().unwrap().calls.clone()
     }
 }
@@ -203,7 +202,7 @@ impl HookRunner for RecordingHookRunner {
         argv: &[String],
         _timeout_: Duration,
     ) -> Result<(), String> {
-        let dir = match argv.first().map(|s| s.as_str()) {
+        let dir = match argv.first().map(String::as_str) {
             Some("acquire") => Direction::Acquire,
             _ => Direction::Release,
         };
@@ -213,7 +212,7 @@ impl HookRunner for RecordingHookRunner {
                 Direction::Release => "release",
                 Direction::Acquire => "acquire",
             },
-            phase: match argv.get(1).map(|s| s.as_str()) {
+            phase: match argv.get(1).map(String::as_str) {
                 Some("after") => "after",
                 _ => "before",
             },
@@ -391,7 +390,7 @@ impl ClaimHarness {
             runner.clone() as Arc<dyn HookRunner>
         ));
         let sink = Arc::new(RecordingSink::new(display));
-        sink.set_claim_identity(format!("panel-{}", display));
+        sink.set_claim_identity(format!("panel-{display}"));
         // Prime the read queue with the LOCAL code so the
         // runtime's startup writability probe (`sink_input_writable`)
         // observes `Some(code)`, returns `Ok(())`, and the

@@ -101,6 +101,12 @@ pub(crate) fn spawn_with_pairing(
 /// claim runtime handle attached (used by the production
 /// orchestrator). Not linked from the public surface — the
 /// link to the private helper is intentional.
+///
+/// # Errors
+///
+/// - Bind failure (address in use by a live daemon, permission denied, …).
+/// - Permission set failure.
+/// - Parent directory is group/world-writable or not owned by us.
 #[allow(
     clippy::too_many_arguments,
     private_interfaces,

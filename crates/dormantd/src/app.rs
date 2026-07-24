@@ -780,6 +780,11 @@ impl App {
     /// sources, inhibitor, and config watcher, and return a control handle plus
     /// the run-loop join handle.
     ///
+    /// # Panics
+    ///
+    /// Panics if coordination is enabled without the claim transport that
+    /// startup constructs alongside it. Those states are created in lockstep.
+    ///
     /// # Errors
     ///
     /// Fails if the initial runtime cannot be assembled (controller build,

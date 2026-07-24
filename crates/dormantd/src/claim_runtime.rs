@@ -177,6 +177,15 @@ pub struct ClaimRuntimeHandle {
 
 impl ClaimRuntimeHandle {
     /// Initiate a claim on `display` from a local trigger.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("claim runtime not available")` if the
+    /// runtime's command channel is closed (the driver task
+    /// has exited), and `Err("claim runtime dropped reply")`
+    /// if the runtime processes the event but the reply
+    /// oneshot is dropped before the driver can populate it
+    /// (a panic in the dispatch path).
     pub async fn try_claim(&self, display: DisplayId) -> Result<ClaimSharedResult, &'static str> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -187,6 +196,13 @@ impl ClaimRuntimeHandle {
     }
 
     /// Arm `display` for the `armed` activity-claim policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("claim runtime not available")` if the
+    /// runtime's command channel is closed, or
+    /// `Err("claim runtime dropped reply")` if the dispatch
+    /// path drops the reply oneshot.
     pub async fn arm(
         &self,
         display: DisplayId,
@@ -205,6 +221,11 @@ impl ClaimRuntimeHandle {
 
     /// Notify the runtime that a display disappeared from the
     /// generation. Drives `DisplayRemoved` for every active flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("claim runtime not available")` if the
+    /// runtime's command channel is closed.
     pub async fn display_removed(&self, display: DisplayId) -> Result<(), &'static str> {
         self.cmd_tx
             .send(RuntimeEvent::DisplayRemoved(display))
@@ -218,6 +239,11 @@ impl ClaimRuntimeHandle {
     /// path without the second in-process daemon the task
     /// description calls out (a `loopback` harness would be
     /// heavier; this seam exercises the same code paths).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("claim runtime not available")` if the
+    /// runtime's command channel is closed.
     #[cfg(any(test, feature = "test-util"))]
     pub async fn inject_inbound_for_test(&self, frame: ClaimFrame) -> Result<(), &'static str> {
         self.cmd_tx
@@ -240,10 +266,10 @@ impl ClaimRuntimeHandle {
     /// Whether `display` is currently armed for activity claims.
     #[must_use]
     pub fn is_armed(&self, display: &DisplayId) -> bool {
-        self.armed
-            .lock()
-            .map(|map| map.contains_key(display))
-            .unwrap_or(false)
+        let Ok(map) = self.armed.lock() else {
+            return false;
+        };
+        map.contains_key(display)
     }
 
     /// Resolve the `claim_capable_displays` set and the
@@ -314,6 +340,7 @@ pub struct ClaimRuntimeDeps {
 /// Spawn the claim runtime driver. The returned handle is the
 /// orchestrator's integration point (IPC, F10 queries, snapshot
 /// status).
+#[must_use = "the claim-runtime handle is the orchestrator's integration point"]
 pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RuntimeEvent>(32);
     let (owner_event_tx, owner_event_rx) = mpsc::channel::<(DisplayId, String, OwnerEvent)>(64);
@@ -424,7 +451,7 @@ impl Driver {
                 () = self.cancel.cancelled() => break,
                 maybe = self.cmd_rx.recv() => {
                     let Some(event) = maybe else { break };
-                    self.handle_event(event).await;
+                    self.handle_event(event);
                 }
                 maybe = self.owner_event_rx.recv() => {
                     let Some((display, nonce, event)) = maybe else { break };
@@ -439,14 +466,6 @@ impl Driver {
                         .get(&display)
                         .map(|f| f.nonce.clone());
                     if current_nonce.as_deref() != Some(nonce.as_str()) {
-                        if let Some(display) = self.contexts.get(&display) {
-                            // F10 lift for the dropped
-                            // completion's nonce: the
-                            // timeout or terminalisation
-                            // already fired; nothing to do
-                            // here.
-                            let _ = display;
-                        }
                         continue;
                     }
                     let actions = self.feed_owner_event(&display, event);
@@ -467,22 +486,24 @@ impl Driver {
         }
     }
 
-    async fn handle_event(&mut self, event: RuntimeEvent) {
+    fn handle_event(&mut self, event: RuntimeEvent) {
         match event {
-            RuntimeEvent::Inbound(frame) => self.handle_inbound(frame).await,
+            RuntimeEvent::Inbound(frame) => {
+                self.handle_inbound(frame);
+            }
             RuntimeEvent::ClaimShared { display, reply } => {
-                self.handle_claim_shared(&display, reply).await;
+                self.handle_claim_shared(&display, reply);
             }
             RuntimeEvent::ClaimArm { display, reply } => {
-                self.handle_claim_arm(&display, reply).await;
+                self.handle_claim_arm(&display, reply);
             }
             RuntimeEvent::DisplayRemoved(display) => {
-                self.handle_display_removed(&display).await;
+                self.handle_display_removed(&display);
             }
         }
     }
 
-    async fn handle_inbound(&mut self, frame: ClaimFrame) {
+    fn handle_inbound(&mut self, frame: ClaimFrame) {
         let ClaimFrame {
             sender_instance_id,
             nonce,
@@ -491,8 +512,7 @@ impl Driver {
         } = frame;
         match message {
             ClaimMessage::ClaimRequest(request) => {
-                self.handle_inbound_request(sender_instance_id, nonce, request)
-                    .await;
+                self.handle_inbound_request(sender_instance_id, nonce, request);
             }
             ClaimMessage::ClaimAbort(_abort) => {
                 // Nonce correlate against active owner flights.
@@ -565,7 +585,7 @@ impl Driver {
         }
     }
 
-    async fn handle_inbound_request(
+    fn handle_inbound_request(
         &mut self,
         sender_instance_id: String,
         nonce: String,
@@ -642,17 +662,14 @@ impl Driver {
         self.dispatch_actions(&display, &actions);
     }
 
-    async fn handle_claim_shared(
+    fn handle_claim_shared(
         &mut self,
         display: &DisplayId,
         reply: oneshot::Sender<ClaimSharedResult>,
     ) {
-        let ctx = match self.contexts.get(display).cloned() {
-            Some(c) => c,
-            None => {
-                let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
-                return;
-            }
+        let Some(ctx) = self.contexts.get(display).cloned() else {
+            let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
+            return;
         };
         if !ctx.writable {
             let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
@@ -681,12 +698,35 @@ impl Driver {
             let _ = reply.send(ClaimSharedResult::Busy);
             return;
         }
-        // Build + fanout a request frame. The transport carries
-        // the per-peer resolution and bounded dial.
-        if let Some(frame) = self.build_claim_request(display, &nonce) {
-            self.transport.fanout_request(frame).await;
+        // The outbound fanout and the F10 publication are
+        // both async channel sends — spawn one-shot tasks so
+        // the dispatch loop returns to its `select!` without
+        // paying the bounded-send round-trip latency. The
+        // Accepted verdict is sent synchronously below.
+        let transport = self.transport.clone();
+        let front_ctl_tx = self.front_ctl_tx.clone();
+        let local_input_code = ctx.local_input_code.unwrap_or(0);
+        let suppressed_until = now + claim_timeout;
+        if let Ok(mut map) = self.handle.suppressed.lock() {
+            map.insert(display.clone(), suppressed_until);
         }
-        // Advance to AwaitingAck. Also record the flight
+        let display_for_fanout = display.clone();
+        if let Some(frame) = self.build_claim_request(display, &nonce) {
+            tokio::spawn(async move {
+                transport.fanout_request(frame).await;
+            });
+        }
+        // F10: publish the suppression deadline to the rules
+        // engine (consumed by `feed_ownership`).
+        tokio::spawn(async move {
+            let _ = front_ctl_tx
+                .send(dormant_core::rules::ControlMsg::SetClaimSuppression {
+                    display: display_for_fanout,
+                    until: Some(suppressed_until),
+                })
+                .await;
+        });
+        // Advance to AwaitingAck and record the flight
         // (the requester is the local side; the peer is the
         // first known peer — the Accepted-verdict sender will
         // overwrite this). The fallback path's direct write
@@ -697,7 +737,7 @@ impl Driver {
             ActiveFlight {
                 nonce: nonce.clone(),
                 peer_instance_id: String::new(),
-                write_code: ctx.local_input_code.unwrap_or(0),
+                write_code: local_input_code,
             },
         );
         let _ = self
@@ -705,28 +745,12 @@ impl Driver {
             .get_mut(display)
             .expect("engine present")
             .requester_event(display, RequesterEvent::FanoutSent, now);
-        // F10: register the requester flight's deadline on the
-        // suppression side-table (local handle for direct
-        // queries), AND publish `ControlMsg::SetClaimSuppression`
-        // to the front control channel so the rules engine's
-        // `feed_ownership` consults it.
-        let suppressed_until = now + claim_timeout;
-        if let Ok(mut map) = self.handle.suppressed.lock() {
-            map.insert(display.clone(), suppressed_until);
-        }
-        let _ = self
-            .front_ctl_tx
-            .send(dormant_core::rules::ControlMsg::SetClaimSuppression {
-                display: display.clone(),
-                until: Some(suppressed_until),
-            })
-            .await;
         let _ = reply.send(ClaimSharedResult::Accepted {
-            deadline: now + claim_timeout,
+            deadline: suppressed_until,
         });
     }
 
-    async fn handle_claim_arm(
+    fn handle_claim_arm(
         &mut self,
         display: &DisplayId,
         reply: oneshot::Sender<Result<Instant, ArmFailure>>,
@@ -747,7 +771,7 @@ impl Driver {
         let _ = reply.send(Ok(deadline));
     }
 
-    async fn handle_display_removed(&mut self, display: &DisplayId) {
+    fn handle_display_removed(&mut self, display: &DisplayId) {
         if let Some(engine) = self.engines.get_mut(display) {
             let stage = engine.requester_stage(display);
             let actions = if stage.is_some() {
@@ -914,7 +938,6 @@ impl Driver {
         match action {
             Action::SendAbort => {
                 let display = display.clone();
-                let owner_event_tx = self.owner_event_tx.clone();
                 let mut flight = self.flights.get(&display).cloned();
                 let peer = self.transport.snapshot_peers();
                 let transport = self.transport.clone();
@@ -924,12 +947,12 @@ impl Driver {
                 let outbound_counter = self.outbound_counter;
                 tokio::spawn(async move {
                     let Some(flight) = flight.take() else { return };
-                    let peer_instance_id = if !flight.peer_instance_id.is_empty() {
-                        flight.peer_instance_id
-                    } else {
+                    let peer_instance_id = if flight.peer_instance_id.is_empty() {
                         peer.first()
                             .map(|p| p.instance_id.clone())
                             .unwrap_or_default()
+                    } else {
+                        flight.peer_instance_id
                     };
                     if peer_instance_id.is_empty() {
                         return;
@@ -941,15 +964,13 @@ impl Driver {
                         peer_instance_id.clone(),
                         boot_epoch,
                         counter,
-                        format!("abort-{nonce}", nonce = flight.nonce),
+                        format!("abort-{}", flight.nonce),
                         ClaimMessage::ClaimAbort(ClaimAbort {
                             nonce: flight.nonce,
                         }),
                     ) {
                         transport.send_abort(&peer_instance_id, &frame).await;
                     }
-                    let _ = display;
-                    let _ = owner_event_tx;
                 });
                 Vec::new()
             }
@@ -1006,8 +1027,9 @@ impl Driver {
                 self.send_release_failed_to_requester(display);
                 Vec::new()
             }
-            Action::EnterDeferred => Vec::new(),
-            Action::Trace(_) | Action::Terminal(_) | Action::BusyLocal => Vec::new(),
+            Action::EnterDeferred | Action::Trace(_) | Action::Terminal(_) | Action::BusyLocal => {
+                Vec::new()
+            }
         }
     }
 
@@ -1018,9 +1040,8 @@ impl Driver {
         phase: Phase,
         aborted: bool,
     ) -> Vec<Action> {
-        let ctx = match self.contexts.get(display).cloned() {
-            Some(c) => c,
-            None => return self.feed_owner_event_after_slot(display, phase),
+        let Some(ctx) = self.contexts.get(display).cloned() else {
+            return self.feed_owner_event_after_slot(display, phase);
         };
         let hook_actions = ctx.hooks.slot_for(direction, phase).to_vec();
         if hook_actions.is_empty() {
@@ -1111,13 +1132,13 @@ impl Driver {
             .get(display)
             .map(|f| f.write_code)
             .or_else(|| self.contexts.get(display).and_then(|c| c.local_input_code));
-        let Some((sink, _local_code)) = self.lookup_executor(display) else {
+        let Some((sink, local_code)) = self.lookup_executor(display) else {
             return self.feed_owner_event(
                 display,
                 OwnerEvent::WriteFailed("E_DISPLAY_IO: no executor".to_owned()),
             );
         };
-        let target = write_code.unwrap_or(_local_code);
+        let target = write_code.unwrap_or(local_code);
         let display_for_task = display.clone();
         // F2: capture the flight nonce so the spawned task
         // can tag its completion.
@@ -1307,16 +1328,13 @@ impl Driver {
         self.record_event("claim_fallback_direct");
         let event_log = self.event_log.clone();
         tokio::spawn(async move {
-            let observed = match sink.read_input_source_sampled().await {
-                Ok(Some(v)) => v,
-                Ok(None) | Err(_) => {
-                    if let Some(log) = &event_log {
-                        if let Ok(mut g) = log.lock() {
-                            g.push("claim_failed:identity_unavailable".to_string());
-                        }
+            let Ok(Some(observed)) = sink.read_input_source_sampled().await else {
+                if let Some(log) = &event_log {
+                    if let Ok(mut g) = log.lock() {
+                        g.push("claim_failed:identity_unavailable".to_string());
                     }
-                    return;
                 }
+                return;
             };
             if observed == target_code {
                 // The hardware is already on the local code:
@@ -1367,7 +1385,7 @@ impl Driver {
         if let Some(log) = &self.event_log {
             if let Ok(mut g) = log.lock() {
                 g.push(format!("claim_failed:{}", display.0));
-                g.push(format!("reason:{:?}", failure));
+                g.push(format!("reason:{failure:?}"));
             }
         }
     }
@@ -1483,7 +1501,7 @@ impl Driver {
 
     fn build_claim_request(&self, display: &DisplayId, nonce: &str) -> Option<ClaimFrame> {
         let ctx = self.contexts.get(display)?;
-        let local_code = ctx.local_input_code? as u16;
+        let local_code = u16::from(ctx.local_input_code?);
         let request = ClaimRequest {
             display_identity: ctx.claim_identity.clone()?,
             requester_instance_id: self.local_instance_id.clone(),
@@ -1510,10 +1528,10 @@ impl Driver {
     }
 
     fn next_nonce(&mut self) -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos(),
+            Err(_) => 0,
+        };
         let nonce = format!("req-{nanos}-{}", self.outbound_counter);
         self.outbound_nonces.push_back(nonce.clone());
         if self.outbound_nonces.len() > 64 {
@@ -1547,9 +1565,8 @@ fn sum_blocking_before_release(hooks: &HookSlots) -> Duration {
 /// without an I/O error; any real write attempt is rolled back by
 /// re-writing the observed code).
 pub async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> bool {
-    let observed = match sink.read_input_source_sampled().await {
-        Ok(Some(v)) => v,
-        _ => return false,
+    let Ok(Some(observed)) = sink.read_input_source_sampled().await else {
+        return false;
     };
     match sink.write_input_source(observed).await {
         Ok(()) => true,

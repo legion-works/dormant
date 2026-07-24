@@ -3349,7 +3349,7 @@ mod tests {
         assert_eq!(d.1.phase, "active");
     }
 
-    /// KvmStatus: SetKvmStatus replaces the snapshot fold.
+    /// `KvmStatus`: `SetKvmStatus` replaces the snapshot fold.
     #[tokio::test]
     async fn kvm_status_set_replaces_snapshot_fold() {
         use crate::config::ActivityClaimPolicy;

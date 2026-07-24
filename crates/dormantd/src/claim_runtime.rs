@@ -131,6 +131,10 @@ struct ActiveFlight {
     clippy::large_enum_variant,
     reason = "Inbound carries the signed ClaimFrame (~hundreds of bytes); the other arms are the cheap IPC reply oneshots."
 )]
+#[allow(
+    dead_code,
+    reason = "Inbound is constructed in claim_listener.rs, which is #[cfg(any(test, feature = \"test-util\"))] for now."
+)]
 #[derive(Debug)]
 enum RuntimeEvent {
     Inbound(ClaimFrame),

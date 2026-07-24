@@ -41,6 +41,12 @@ pub mod action_table;
 /// Pure action planning and injected platform I/O execution.
 #[cfg(unix)]
 pub mod dispatch;
+/// Platform-neutral hotkey registrar contract and lifecycle manager.
+/// Platform-neutral hotkey registrar contract and lifecycle manager.
+pub mod hotkey;
+/// Linux global hotkey registration via D-Bus.
+#[cfg(target_os = "linux")]
+pub mod hotkey_linux;
 pub mod icon;
 pub mod menu;
 pub mod state;

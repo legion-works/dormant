@@ -101,6 +101,10 @@ pub enum Action {
         /// The TCP port to open.
         port: u16,
     },
+    /// Claim ownership of a shared display (KVM switch).
+    ClaimOne(String),
+    /// Arm a shared display for activity-based claim.
+    ArmClaim(String),
     /// Quit the tray.
     Quit,
 }
@@ -112,9 +116,9 @@ pub enum Action {
 fn glyph_for(action: &Action) -> Glyph {
     match action {
         Action::Pause(_) | Action::Separator => Glyph::Pause,
-        Action::Resume => Glyph::Play,
+        Action::Resume | Action::ArmClaim(_) => Glyph::Play,
         Action::BlankAll | Action::BlankOne(_) => Glyph::DisplayOff,
-        Action::WakeAll | Action::WakeOne(_) => Glyph::DisplayOn,
+        Action::WakeAll | Action::WakeOne(_) | Action::ClaimOne(_) => Glyph::DisplayOn,
         Action::OpenWebUi { .. } => Glyph::Web,
         Action::Quit => Glyph::Exit,
     }
@@ -194,6 +198,7 @@ fn any_paused(snapshot: Option<&StateSnapshot>) -> bool {
 ///   Resume to restore"` is inserted above the Pause items, and Resume
 ///   becomes the only enabled pause-row item.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_menu(
     snapshot: Option<&StateSnapshot>,
     unreachable: bool,
@@ -277,26 +282,68 @@ pub fn build_menu(
             } else {
                 "Blank now"
             };
+            // Whether the display is claim-capable (KVM shared-panel
+            // claim).  The snapshot's `kvm.claim_capable_displays`
+            // is the authority — not every shared display can be
+            // claimed (it also needs write capability + identity).
+            let claim_capable = snapshot.is_some_and(|s| {
+                s.kvm
+                    .as_ref()
+                    .is_some_and(|k| k.claim_capable_displays.iter().any(|did| did.0 == *id))
+            });
+
+            let mut sub_entries = vec![
+                MenuEntry::Action {
+                    label: blank_label.into(),
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::BlankOne(id.clone())),
+                    action: Action::BlankOne(id.clone()),
+                },
+                MenuEntry::Action {
+                    label: "Wake now".into(),
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::WakeOne(id.clone())),
+                    action: Action::WakeOne(id.clone()),
+                },
+            ];
+
+            // KVM claim actions — only for claim-capable shared displays.
+            if claim_capable {
+                let arm_label = snapshot
+                    .and_then(|s| {
+                        s.kvm.as_ref().and_then(|k| {
+                            k.claim_armed_remaining
+                                .iter()
+                                .find(|(did, _)| did.0 == *id)
+                                .map(|(_, ms)| {
+                                    format!("Arm claim ({}s remaining)", ms.div_ceil(1000))
+                                })
+                        })
+                    })
+                    .unwrap_or_else(|| "Arm claim".into());
+
+                sub_entries.push(MenuEntry::Separator);
+                sub_entries.push(MenuEntry::Action {
+                    label: "Claim panel".into(),
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::ClaimOne(id.clone())),
+                    action: Action::ClaimOne(id.clone()),
+                });
+                sub_entries.push(MenuEntry::Action {
+                    label: arm_label,
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::ArmClaim(id.clone())),
+                    action: Action::ArmClaim(id.clone()),
+                });
+            }
+
             // Submenu shell stays openable regardless of reachability
             // so the operator can still inspect what's inside; the
             // children carry the disabled state.
             entries.push(MenuEntry::Submenu {
                 label,
                 enabled: true,
-                entries: vec![
-                    MenuEntry::Action {
-                        label: blank_label.into(),
-                        enabled: !unreachable,
-                        icon: glyph_for(&Action::BlankOne(id.clone())),
-                        action: Action::BlankOne(id.clone()),
-                    },
-                    MenuEntry::Action {
-                        label: "Wake now".into(),
-                        enabled: !unreachable,
-                        icon: glyph_for(&Action::WakeOne(id.clone())),
-                        action: Action::WakeOne(id.clone()),
-                    },
-                ],
+                entries: sub_entries,
             });
         }
     }
@@ -413,12 +460,23 @@ mod tests {
         out
     }
 
-    /// Locate the action entry with the given label substring (linear scan).
+    /// Locate the action entry with the given label substring (linear scan,
+    /// recurses into submenus).
     fn find_action<'a>(entries: &'a [MenuEntry], needle: &str) -> Option<&'a MenuEntry> {
-        entries.iter().find(|e| match e {
-            MenuEntry::Action { label, .. } => label.contains(needle),
-            _ => false,
-        })
+        for entry in entries {
+            match entry {
+                MenuEntry::Action { label, .. } if label.contains(needle) => {
+                    return Some(entry);
+                }
+                MenuEntry::Submenu { entries: sub, .. } => {
+                    if let Some(found) = find_action(sub, needle) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     // ── Top-level layout ─────────────────────────────────────────────────
@@ -1054,6 +1112,132 @@ mod tests {
                 }
             }
             _ => unreachable!(),
+        }
+    }
+
+    // ── KVM claim menu items ──────────────────────────────────────────────
+
+    fn kvm_snap(
+        claim_capable: &[&str],
+        hotkey: Option<&str>,
+        armed_ms: Option<(&str, u64)>,
+    ) -> StateSnapshot {
+        use dormant_core::config::{ActivityClaimPolicy, KeymapConfig};
+        use dormant_core::types::DisplayId;
+
+        let kvm = dormant_core::rules::KvmStatus {
+            keymap: KeymapConfig {
+                claim_hotkey: hotkey.map(String::from),
+            },
+            claim_capable_displays: claim_capable
+                .iter()
+                .map(|d| DisplayId((*d).into()))
+                .collect(),
+            activity_claim: ActivityClaimPolicy::Off,
+            claim_armed_remaining: armed_ms
+                .into_iter()
+                .map(|(d, ms)| (DisplayId(d.into()), ms))
+                .collect(),
+        };
+
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "monitor".into(),
+                DisplaySnapshot {
+                    phase: "active".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    scope: DisplayScope::Shared,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
+                    controllers: vec![],
+                    wake_attempts: 0,
+                    last_blank_failed: false,
+                    stage: None,
+                    claim_armed_remaining_ms: None,
+                },
+            )],
+            pending_reload: None,
+            rollback: None,
+            kvm: Some(kvm),
+        }
+    }
+
+    #[test]
+    fn claim_capable_shared_display_has_claim_panel_and_arm_entries() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        // Find the "Claim panel" action inside a submenu.
+        let claim = find_action(&menu, "Claim panel");
+        assert!(
+            claim.is_some(),
+            "Claim panel action should exist in the menu"
+        );
+        match claim.unwrap() {
+            MenuEntry::Action {
+                action, enabled, ..
+            } => {
+                assert!(matches!(action, Action::ClaimOne(id) if id == "monitor"));
+                assert!(*enabled, "Claim panel should be enabled when reachable");
+            }
+            _ => panic!("Claim panel is not an Action"),
+        }
+
+        // Arm claim entry should exist.
+        let arm = find_action(&menu, "Arm claim");
+        assert!(arm.is_some(), "Arm claim action should exist in the menu");
+        match arm.unwrap() {
+            MenuEntry::Action { action, .. } => {
+                assert!(matches!(action, Action::ArmClaim(id) if id == "monitor"));
+            }
+            _ => panic!("Arm claim is not an Action"),
+        }
+    }
+
+    #[test]
+    fn armed_remaining_is_shown_in_arm_label() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), Some(("monitor", 30_000)));
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        let arm = find_action(&menu, "Arm claim (30s remaining)");
+        assert!(
+            arm.is_some(),
+            "Arm claim should show remaining seconds when armed"
+        );
+    }
+
+    #[test]
+    fn non_claim_capable_display_omits_claim_entries() {
+        // Shared but NOT in claim_capable_displays — no claim entries.
+        let snapshot = kvm_snap(&[], Some("Meta+F12"), None);
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        assert!(
+            find_action(&menu, "Claim panel").is_none(),
+            "non-claim-capable display should not show Claim panel"
+        );
+        assert!(
+            find_action(&menu, "Arm claim").is_none(),
+            "non-claim-capable display should not show Arm claim"
+        );
+    }
+
+    #[test]
+    fn claim_entries_disabled_when_unreachable() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
+        let menu = build_menu(Some(&snapshot), true, 8137);
+
+        let claim = find_action(&menu, "Claim panel").expect("Claim panel present");
+        match claim {
+            MenuEntry::Action { enabled, .. } => {
+                assert!(!enabled, "Claim panel should be disabled when unreachable");
+            }
+            _ => panic!("Claim panel is not an Action"),
         }
     }
 }

@@ -1108,6 +1108,7 @@ dependencies = [
  "dormant-core",
  "dormantctl",
  "dormantd",
+ "futures-util",
  "ksni",
  "objc2",
  "objc2-app-kit",
@@ -1120,6 +1121,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]

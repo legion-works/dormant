@@ -2441,6 +2441,7 @@ impl Runner {
     }
 
     #[cfg(not(any(test, feature = "test-util")))]
+    #[allow(clippy::unused_self)]
     fn record_reload_lifecycle_stage(&self, _stage: &'static str) {}
 
     #[cfg(any(test, feature = "test-util"))]
@@ -2449,6 +2450,7 @@ impl Runner {
     }
 
     #[cfg(not(any(test, feature = "test-util")))]
+    #[allow(clippy::unused_self)]
     fn force_generation_barrier_timeout_for_test(&self) -> bool {
         false
     }

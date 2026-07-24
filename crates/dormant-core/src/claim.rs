@@ -181,6 +181,9 @@ pub enum ClaimFrameError {
     /// A pre-auth string exceeds the listener's bounded claim field size.
     #[error("claim frame contains an oversized pre-auth field")]
     OversizedPreauthField,
+    /// An epoch is empty, all-zero, or not the fixed random-wire length.
+    #[error("claim epoch must be a non-zero 16-byte value")]
+    InvalidEpoch,
     /// The signature field is not valid standard base64.
     #[error("claim signature is not valid base64")]
     InvalidSignatureEncoding,
@@ -217,6 +220,7 @@ impl ClaimFrame {
             message,
             signature: String::new(),
         };
+        frame.validate_pre_auth_fields()?;
         let payload = frame.canonical_signed_payload()?;
         frame.signature = STANDARD.encode(identity.signing_key.sign(&payload).to_bytes());
         Ok(frame)
@@ -309,6 +313,12 @@ impl ClaimFrame {
         .any(|field| field.len() > MAX_PREAUTH_FIELD_BYTES)
         {
             return Err(ClaimFrameError::OversizedPreauthField);
+        }
+        if [&self.sender_epoch, &self.recipient_epoch]
+            .iter()
+            .any(|epoch| epoch.len() != 16 || epoch.as_bytes().iter().all(|byte| *byte == 0))
+        {
+            return Err(ClaimFrameError::InvalidEpoch);
         }
         Ok(())
     }
@@ -493,9 +503,9 @@ mod tests {
         let signer = identity(7);
         ClaimFrame::sign(
             &signer,
-            "sender-epoch".to_owned(),
+            "sender-epoch-000".to_owned(),
             "recipient-id".to_owned(),
-            "recipient-epoch".to_owned(),
+            "recipient-epoch-".to_owned(),
             9,
             "frame-nonce".to_owned(),
             message,
@@ -549,9 +559,9 @@ mod tests {
         let signer = identity(7);
         let frame = ClaimFrame::sign(
             &signer,
-            "sender-epoch".to_owned(),
+            "sender-epoch-000".to_owned(),
             "recipient-id".to_owned(),
-            "recipient-epoch".to_owned(),
+            "recipient-epoch-".to_owned(),
             10,
             "response-frame-nonce".to_owned(),
             ClaimMessage::ClaimResponse(ClaimResponse {
@@ -564,7 +574,7 @@ mod tests {
         let decoded: ClaimFrame = serde_json::from_str(&wire).unwrap();
 
         decoded
-            .verify(&peer(&signer), "recipient-id", "recipient-epoch")
+            .verify(&peer(&signer), "recipient-id", "recipient-epoch-")
             .unwrap();
         assert_eq!(decoded, frame);
     }
@@ -579,7 +589,7 @@ mod tests {
         sender.sender_instance_id.push('x');
         assert!(
             sender
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -587,7 +597,7 @@ mod tests {
         counter.counter += 1;
         assert!(
             counter
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -595,7 +605,7 @@ mod tests {
         nonce.nonce.push('x');
         assert!(
             nonce
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -606,7 +616,7 @@ mod tests {
         request.display_identity.push('x');
         assert!(
             display_identity
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -617,7 +627,7 @@ mod tests {
         request.requester_instance_id.push('x');
         assert!(
             requester_instance_id
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -628,7 +638,7 @@ mod tests {
         request.requester_input_code += 1;
         assert!(
             input_code
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -639,7 +649,7 @@ mod tests {
         request.counter += 1;
         assert!(
             request_counter
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
 
@@ -650,7 +660,7 @@ mod tests {
         request.nonce.push('x');
         assert!(
             request_nonce
-                .verify(&peer, "recipient-id", "recipient-epoch")
+                .verify(&peer, "recipient-id", "recipient-epoch-")
                 .is_err()
         );
     }
@@ -672,7 +682,7 @@ mod tests {
         let frame = signed(request());
 
         assert_eq!(
-            frame.verify(&peer, "third-machine", "recipient-epoch"),
+            frame.verify(&peer, "third-machine", "recipient-epoch-"),
             Err(ClaimFrameError::RecipientMismatch)
         );
 
@@ -685,7 +695,7 @@ mod tests {
         mismatched_requester.signature =
             STANDARD.encode(signer.signing_key.sign(&payload).to_bytes());
         assert_eq!(
-            mismatched_requester.verify(&peer, "recipient-id", "recipient-epoch"),
+            mismatched_requester.verify(&peer, "recipient-id", "recipient-epoch-"),
             Err(ClaimFrameError::RequesterMismatch)
         );
     }
@@ -786,15 +796,15 @@ mod tests {
                 .map(|frame| &frame.signature)
                 .collect::<Vec<_>>(),
             [
-                "gBj1fRh+nSnlsTVJODqpoXDzzSFuJFm41zGTOqCB2fHZFuNS0+6q26UfzgaJaJxUxRWK/6wa0x3lW48Hq8/SAQ==",
-                "LdKinZ0JQCj4dxIJ/DRdUkH43QtTQb3WvP1XygZk1VJNTXk2CempC2GwuE0AZaGUhiJpkbEvgw9mqdMH/VhrDw==",
-                "jeHijtAxrWMOG2cALzJINyiossMniDQh+fLYyqplpb+6L/k849AHPStaUZQL+QQJnHt5QSpEr3vuvVTNiDUPDQ==",
-                "xzMqPHAHrCVnzmunzs7bBqyRrrBHMm5lJDQcqSvC+dlJnJ9JXzU8ZjX7+l7oCDToiZOBCOUktKgLsM01pzLKDQ==",
-                "ihXx4JrEDt/fe8vTS5gdGNU3kxVlFcI3+3WL21WLtfx4yUI4gM1yPKvdf9vnROqlnl/bVXgw4uRNxhLgEMvwDA==",
-                "uXB1fdYdQNa/K7KcMh/yeS3ZvgEiiC6xlQUGFvEwhpte+8idpLxhJGF4qZHrgKLQlyjvgVhKcl91o0Uf7lNCCw==",
-                "HrV4PvN/Sb/M5l9fPLvQoAJaXXCrRX1kJd2zE10J2fDXPWub79T21V6lGEnBJBUWMSrnc/b6JusxD5FbrMlWCw==",
-                "5+eyLQynEiI+jWlpBTt1r5UHbqgLFdxREReIyvs5efArbJ6cn3f64YcB/eW6IQjHuiIbmIoGKpx01XfP47dLDw==",
-                "71vCtEq2AD9sGevj8QytEK03aIu6TnrLvrP15PaKSOhZ6DwixPS6gV/VnsbXp4uilT39IzPODKB+VFcYMIt+DA==",
+                "CMMg1TaFtlxJTS7iUoHLw0GxF4neBpGzKxTKLedoBoEBLgdEU9G96FI5QWlkZfhNGsKTpCinBSK0zgjFIUylAg==",
+                "wpkub160jizA9HSRD9tm78JKObPeq7ruBFjUpvU08IHm9+SE3R9DnPWpCcz/hznpb21bV+hURE6M1fpeWDGiAw==",
+                "w1uj02q0zbPF15kbD+YOJWez9ud4u9fmSRhhzjN72CHrUZKP4O1kniwsAUtTR1oO+YhYfBRR7qfYZUBa0xRzDg==",
+                "CLHXYe50oomzpjMezwi/VJ2w6YD2nUNoaqlgqVoplO50zWmAdJSYH9TOpfdthH5GfFpqa0OvZRv0xHC3E6mKCA==",
+                "tJsdQ4ofC3KY1vLdnxmHQkwcrBFunExJKrczS8qg2xGCDjl/SowHKWC6o7DwnFlfvFWe1XR8ILZeJgX95FgnAg==",
+                "xOcWQ7IGrP1gCe/ckgZ9FF6f7UlFiW9kqZm1HIKMiIuHVGtWMycFnATSEtaPAmvQqvajxnoUWc0BAEOVbOrcBg==",
+                "cJZBlF87wO9/4vdpIZ/n47sowSg/e+1aBUf7VfMvmkcsXVvF6L8XnDa5XY6mENyBp8JDNzhPuSnuDyDyrK10AQ==",
+                "kQlKq6Y+fymxSe0ehFugJYYjlxlVVmfB1xYpdTv8JPz/N0ZUMJtuA523bKXbRPPAYVDFkYSKU7KIgzXFidRCCA==",
+                "fklUu0IRcPhTVwYV+fPDXoQ686MUsBhDF14w1g4hm0rOYitWyZiTsjyuHQxG0A2mlNydIG/ItN+FNW3qi/nKAg==",
             ]
         );
         assert_eq!(signed_payloads.len(), 9);

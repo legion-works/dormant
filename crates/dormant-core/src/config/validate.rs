@@ -923,6 +923,7 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             });
         }
     }
+    validate_release_deadline_cap(coordination, errors);
     if coordination.activity_claim != ActivityClaimPolicy::Off && !coordination.enabled {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
@@ -943,6 +944,25 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!("keymap claim_hotkey {hotkey:?} is not a valid accelerator"),
+        });
+    }
+}
+
+fn validate_release_deadline_cap(
+    coordination: &super::schema::CoordinationConfig,
+    errors: &mut Vec<ValidationError>,
+) {
+    let release_floor = coordination
+        .poll_interval
+        .saturating_mul(2)
+        .saturating_add(Duration::from_secs(1));
+    if coordination.release_deadline_cap < release_floor {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination release_deadline_cap {:?} must be >= 2 * poll_interval + 1s ({release_floor:?})",
+                coordination.release_deadline_cap
+            ),
         });
     }
 }

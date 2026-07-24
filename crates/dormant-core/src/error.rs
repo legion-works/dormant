@@ -177,7 +177,7 @@ pub enum DormantError {
     /// A KVM hook action exceeded its per-entry timeout.
     #[error("E_HOOK_TIMEOUT: {detail}")]
     HookTimeout {
-        /// Description of the timed-out hook (argv[0], topic, etc.).
+        /// Description of the timed-out hook (`argv[0]`, topic, etc.).
         detail: String,
     },
 }

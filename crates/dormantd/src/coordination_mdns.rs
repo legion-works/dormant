@@ -12,6 +12,20 @@ use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 /// DNS-SD service type used exclusively for dormant instance pairing.
 pub const PAIR_SERVICE_TYPE: &str = "_dormant._tcp.local.";
 
+/// DNS-SD service type used for paired peers' always-on claim endpoints.
+pub const CLAIM_SERVICE_TYPE: &str = "_dormant-claim._tcp.local.";
+
+/// Privacy-minimal claim endpoint announcement carried by the presence service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimPresenceAnnounce {
+    /// Claim protocol version advertised by the endpoint.
+    pub protocol_version: u16,
+    /// Stable identity of the paired instance.
+    pub instance_id: String,
+    /// TCP port on which the authenticated claim listener is bound.
+    pub port: u16,
+}
+
 /// One validated discovery update from a browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowseEvent {
@@ -57,6 +71,133 @@ pub trait MdnsBackend: Send + Sync {
     ///
     /// Returns an error when the mDNS daemon cannot start the browse.
     fn browse(&self) -> Result<Box<dyn BrowseStream>>;
+}
+
+/// Discovery update from the always-on claim-presence browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimPresenceEvent {
+    /// A paired claim endpoint became resolvable.
+    Resolved {
+        /// Validated, privacy-minimal endpoint announcement.
+        peer: ClaimPresenceAnnounce,
+        /// Resolver-reported endpoint addresses.
+        addresses: BTreeSet<SocketAddr>,
+    },
+}
+
+/// Narrow mDNS seam for the always-on claim-presence service.
+pub trait ClaimPresenceBackend: Send + Sync {
+    /// Publish a live claim endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mDNS daemon cannot register the service.
+    fn advertise_claim(
+        &self,
+        service: ClaimPresenceAnnounce,
+    ) -> Result<Box<dyn AdvertisementHandle>>;
+
+    /// Browse claim endpoints advertised by paired peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mDNS daemon cannot start the browse.
+    fn browse_claim(&self) -> Result<Box<dyn ClaimPresenceStream>>;
+}
+
+/// Delivers passive claim-presence updates.
+pub trait ClaimPresenceStream: Send + Sync {
+    /// Return an immediately available update, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing mDNS receiver cannot provide an update.
+    fn try_next(&mut self) -> Result<Option<ClaimPresenceEvent>>;
+}
+
+/// Listener-coupled advertisement and known-peer-only address refresh state.
+pub struct ClaimPresence<B> {
+    local_instance_id: String,
+    advertise: bool,
+    known_peers: BTreeSet<String>,
+    advertised_port: Option<u16>,
+    advertisement: Option<Box<dyn AdvertisementHandle>>,
+    browse: Option<Box<dyn ClaimPresenceStream>>,
+    backend: B,
+}
+
+impl<B: ClaimPresenceBackend> ClaimPresence<B> {
+    /// Create an idle service. It starts no LAN activity until reconciled.
+    #[must_use]
+    pub fn new(backend: B, local_instance_id: String, advertise: bool) -> Self {
+        Self {
+            local_instance_id,
+            advertise,
+            known_peers: BTreeSet::new(),
+            advertised_port: None,
+            advertisement: None,
+            browse: None,
+            backend,
+        }
+    }
+
+    /// Align advertisement and browsing with the listener and paired-peer snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot advertise or browse.
+    pub fn reconcile<I>(&mut self, listener_port: Option<u16>, peers: I) -> Result<()>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.known_peers = peers.into_iter().collect();
+        if self.advertise && listener_port != self.advertised_port {
+            self.advertisement = None;
+            self.advertised_port = None;
+            if let Some(port) = listener_port {
+                self.advertisement = Some(self.backend.advertise_claim(ClaimPresenceAnnounce {
+                    protocol_version: PAIR_PROTOCOL_VERSION,
+                    instance_id: self.local_instance_id.clone(),
+                    port,
+                })?);
+                self.advertised_port = Some(port);
+                tracing::info!(event = "claim_presence_registered", port);
+            } else {
+                tracing::info!(event = "claim_presence_unregistered");
+            }
+        }
+        if self.known_peers.is_empty() {
+            self.browse = None;
+        } else if self.browse.is_none() {
+            self.browse = Some(self.backend.browse_claim()?);
+        }
+        Ok(())
+    }
+
+    /// Refresh known peers from pending browser events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the active browse stream fails while receiving updates.
+    pub fn drain_browse(&mut self, on_peer_addr: impl FnMut(String, SocketAddr)) -> Result<()> {
+        let Some(browse) = self.browse.as_mut() else {
+            return Ok(());
+        };
+        let mut on_peer_addr = on_peer_addr;
+        while let Some(ClaimPresenceEvent::Resolved { peer, addresses }) = browse.try_next()? {
+            if peer.instance_id == self.local_instance_id
+                || !self.known_peers.contains(&peer.instance_id)
+            {
+                tracing::debug!(event = "claim_presence_unknown_peer", peer = %peer.instance_id);
+                continue;
+            }
+            if let Some(address) = select_resolved_addr(&addresses, peer.port) {
+                tracing::info!(event = "claim_presence_peer_refreshed", peer = %peer.instance_id, %address);
+                on_peer_addr(peer.instance_id, address);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Window-gated mDNS pairing discovery state.
@@ -237,6 +378,16 @@ pub fn txt_records(service: &DiscoverAnnounce) -> BTreeMap<String, String> {
     ])
 }
 
+/// Translate a claim endpoint into its deliberately minimal TXT surface.
+#[must_use]
+pub fn claim_txt_records(service: &ClaimPresenceAnnounce) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("v".to_owned(), service.protocol_version.to_string()),
+        ("instance_id".to_owned(), service.instance_id.clone()),
+        ("port".to_owned(), service.port.to_string()),
+    ])
+}
+
 fn valid_announce(service: &DiscoverAnnounce) -> bool {
     service.protocol_version == PAIR_PROTOCOL_VERSION
         && service.pairing_port != 0
@@ -245,6 +396,34 @@ fn valid_announce(service: &DiscoverAnnounce) -> bool {
             .is_ok_and(|bytes| bytes.len() == 32)
         && !service.window_id.is_empty()
         && !service.display_name.is_empty()
+}
+
+fn valid_claim_announce(service: &ClaimPresenceAnnounce) -> bool {
+    service.protocol_version == PAIR_PROTOCOL_VERSION
+        && service.port != 0
+        && base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&service.instance_id)
+            .is_ok_and(|bytes| bytes.len() == 32)
+}
+
+fn announce_from_txt(records: &BTreeMap<String, String>) -> Option<DiscoverAnnounce> {
+    let announcement = DiscoverAnnounce {
+        protocol_version: records.get("v")?.parse().ok()?,
+        instance_id: records.get("instance_id")?.to_owned(),
+        display_name: records.get("display_name")?.to_owned(),
+        pairing_port: records.get("pairing_port")?.parse().ok()?,
+        window_id: records.get("window_id")?.to_owned(),
+    };
+    valid_announce(&announcement).then_some(announcement)
+}
+
+fn claim_announce_from_txt(records: &BTreeMap<String, String>) -> Option<ClaimPresenceAnnounce> {
+    let announcement = ClaimPresenceAnnounce {
+        protocol_version: records.get("v")?.parse().ok()?,
+        instance_id: records.get("instance_id")?.to_owned(),
+        port: records.get("port")?.parse().ok()?,
+    };
+    valid_claim_announce(&announcement).then_some(announcement)
 }
 
 /// Production backend backed by `mdns-sd`'s daemon thread.
@@ -309,6 +488,44 @@ impl MdnsBackend for MdnsSdBackend {
     }
 }
 
+impl ClaimPresenceBackend for MdnsSdBackend {
+    fn advertise_claim(
+        &self,
+        service: ClaimPresenceAnnounce,
+    ) -> Result<Box<dyn AdvertisementHandle>> {
+        let instance_name = format!("dormant-claim-{}", &service.instance_id[..8]);
+        let service_info = ServiceInfo::new(
+            CLAIM_SERVICE_TYPE,
+            &instance_name,
+            "dormant.local.",
+            (),
+            service.port,
+            HashMap::from_iter(claim_txt_records(&service)),
+        )
+        .context("build mDNS claim-presence service")?
+        .enable_addr_auto();
+        let fullname = service_info.get_fullname().to_owned();
+        self.daemon
+            .register(service_info)
+            .context("register mDNS claim-presence service")?;
+        Ok(Box::new(MdnsSdAdvertisement {
+            daemon: self.daemon.clone(),
+            fullname,
+        }))
+    }
+
+    fn browse_claim(&self) -> Result<Box<dyn ClaimPresenceStream>> {
+        let receiver = self
+            .daemon
+            .browse(CLAIM_SERVICE_TYPE)
+            .context("browse mDNS claim-presence services")?;
+        Ok(Box::new(MdnsSdClaimBrowse {
+            daemon: self.daemon.clone(),
+            receiver,
+        }))
+    }
+}
+
 struct MdnsSdAdvertisement {
     daemon: ServiceDaemon,
     fullname: String,
@@ -328,6 +545,51 @@ struct MdnsSdBrowse {
     daemon: ServiceDaemon,
     receiver: mdns_sd::Receiver<ServiceEvent>,
     fullname_to_instance: BTreeMap<String, String>,
+}
+
+struct MdnsSdClaimBrowse {
+    daemon: ServiceDaemon,
+    receiver: mdns_sd::Receiver<ServiceEvent>,
+}
+
+impl ClaimPresenceStream for MdnsSdClaimBrowse {
+    fn try_next(&mut self) -> Result<Option<ClaimPresenceEvent>> {
+        let Ok(event) = self.receiver.try_recv() else {
+            return Ok(None);
+        };
+        let ServiceEvent::ServiceResolved(resolved) = event else {
+            return Ok(None);
+        };
+        let records = ["v", "instance_id", "port"]
+            .into_iter()
+            .map(|key| {
+                Some((
+                    key.to_owned(),
+                    resolved.get_property_val_str(key)?.to_owned(),
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>();
+        let Some(peer) = records.as_ref().and_then(claim_announce_from_txt) else {
+            return Ok(None);
+        };
+        Ok(Some(ClaimPresenceEvent::Resolved {
+            peer,
+            addresses: resolved
+                .get_addresses()
+                .iter()
+                .map(mdns_sd::ScopedIp::to_ip_addr)
+                .map(|address| SocketAddr::new(address, resolved.get_port()))
+                .collect(),
+        }))
+    }
+}
+
+impl Drop for MdnsSdClaimBrowse {
+    fn drop(&mut self) {
+        if let Err(error) = self.daemon.stop_browse(CLAIM_SERVICE_TYPE) {
+            tracing::warn!(event = "mdns_stop_browse_failed", %error);
+        }
+    }
 }
 
 impl BrowseStream for MdnsSdBrowse {
@@ -367,26 +629,31 @@ impl Drop for MdnsSdBrowse {
 fn announce_from_resolved(
     service: &ResolvedService,
 ) -> Option<(DiscoverAnnounce, BTreeSet<SocketAddr>)> {
-    let protocol_version = service.get_property_val_str("v")?.parse().ok()?;
-    let pairing_port = service.get_property_val_str("pairing_port")?.parse().ok()?;
-    let announcement = DiscoverAnnounce {
-        protocol_version,
-        instance_id: service.get_property_val_str("instance_id")?.to_owned(),
-        display_name: service.get_property_val_str("display_name")?.to_owned(),
-        pairing_port,
-        window_id: service.get_property_val_str("window_id")?.to_owned(),
-    };
-    valid_announce(&announcement).then(|| {
-        (
-            announcement,
-            service
-                .get_addresses()
-                .iter()
-                .map(mdns_sd::ScopedIp::to_ip_addr)
-                .map(|address| SocketAddr::new(address, service.get_port()))
-                .collect(),
-        )
+    let records = [
+        "v",
+        "instance_id",
+        "display_name",
+        "pairing_port",
+        "window_id",
+    ]
+    .into_iter()
+    .map(|key| {
+        Some((
+            key.to_owned(),
+            service.get_property_val_str(key)?.to_owned(),
+        ))
     })
+    .collect::<Option<BTreeMap<_, _>>>()?;
+    let announcement = announce_from_txt(&records)?;
+    Some((
+        announcement,
+        service
+            .get_addresses()
+            .iter()
+            .map(mdns_sd::ScopedIp::to_ip_addr)
+            .map(|address| SocketAddr::new(address, service.get_port()))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -401,8 +668,10 @@ mod tests {
     use dormant_core::types::DisplayId;
 
     use super::{
-        AdvertisementHandle, BrowseEvent, BrowseStream, MdnsBackend, PairDiscovery,
-        primary_lan_bind_ip, resolve_bind_ip,
+        AdvertisementHandle, BrowseEvent, BrowseStream, ClaimPresence, ClaimPresenceAnnounce,
+        ClaimPresenceBackend, ClaimPresenceEvent, ClaimPresenceStream, MdnsBackend, PairDiscovery,
+        claim_announce_from_txt, claim_txt_records, primary_lan_bind_ip, resolve_bind_ip,
+        txt_records,
     };
 
     #[derive(Clone, Default)]
@@ -415,6 +684,8 @@ mod tests {
         advertisements: Vec<DiscoverAnnounce>,
         events: VecDeque<BrowseEvent>,
         browse_calls: usize,
+        claim_advertisements: Vec<ClaimPresenceAnnounce>,
+        claim_events: VecDeque<ClaimPresenceEvent>,
     }
 
     struct FakeAdvertisement;
@@ -423,6 +694,21 @@ mod tests {
 
     struct FakeBrowse {
         state: Arc<Mutex<FakeState>>,
+    }
+
+    struct FakeClaimBrowse {
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    impl ClaimPresenceStream for FakeClaimBrowse {
+        fn try_next(&mut self) -> anyhow::Result<Option<ClaimPresenceEvent>> {
+            Ok(self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .claim_events
+                .pop_front())
+        }
     }
 
     impl BrowseStream for FakeBrowse {
@@ -462,6 +748,26 @@ mod tests {
         }
     }
 
+    impl ClaimPresenceBackend for FakeBackend {
+        fn advertise_claim(
+            &self,
+            service: ClaimPresenceAnnounce,
+        ) -> anyhow::Result<Box<dyn AdvertisementHandle>> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .claim_advertisements
+                .push(service);
+            Ok(Box::new(FakeAdvertisement))
+        }
+
+        fn browse_claim(&self) -> anyhow::Result<Box<dyn ClaimPresenceStream>> {
+            Ok(Box::new(FakeClaimBrowse {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
     fn instance_id(seed: u8) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([seed; 32])
     }
@@ -474,6 +780,94 @@ mod tests {
             pairing_port: 42_000,
             window_id: format!("window-{seed}"),
         }
+    }
+
+    #[test]
+    fn claim_presence_txt_contains_only_the_privacy_ratified_keys() {
+        let announcement = ClaimPresenceAnnounce {
+            protocol_version: 1,
+            instance_id: instance_id(1),
+            port: 42_001,
+        };
+
+        assert_eq!(
+            claim_txt_records(&announcement).keys().collect::<Vec<_>>(),
+            vec!["instance_id", "port", "v"]
+        );
+    }
+
+    #[test]
+    fn pairing_and_presence_txt_records_are_disjoint() {
+        let pairing = txt_records(&service(1));
+        let presence = claim_txt_records(&ClaimPresenceAnnounce {
+            protocol_version: 1,
+            instance_id: instance_id(2),
+            port: 42_001,
+        });
+
+        assert!(claim_announce_from_txt(&pairing).is_none());
+        assert!(super::announce_from_txt(&presence).is_none());
+    }
+
+    #[test]
+    fn presence_browser_refreshes_only_known_paired_peers() {
+        let backend = FakeBackend::default();
+        let known = instance_id(1);
+        let stranger = instance_id(2);
+        backend
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim_events
+            .extend([
+                ClaimPresenceEvent::Resolved {
+                    peer: ClaimPresenceAnnounce {
+                        protocol_version: 1,
+                        instance_id: stranger,
+                        port: 42_001,
+                    },
+                    addresses: BTreeSet::from([SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 9))]),
+                },
+                ClaimPresenceEvent::Resolved {
+                    peer: ClaimPresenceAnnounce {
+                        protocol_version: 1,
+                        instance_id: known.clone(),
+                        port: 42_001,
+                    },
+                    addresses: BTreeSet::from([SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 9))]),
+                },
+            ]);
+        let mut presence = ClaimPresence::new(backend, instance_id(3), false);
+        presence.reconcile(Some(42_000), [known.clone()]).unwrap();
+        let mut refreshed = Vec::new();
+        presence
+            .drain_browse(|peer, address| refreshed.push((peer, address)))
+            .unwrap();
+
+        assert_eq!(
+            refreshed,
+            vec![(
+                known,
+                SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 42_001))
+            )]
+        );
+    }
+
+    #[test]
+    fn disabled_presence_advertisement_never_registers() {
+        let backend = FakeBackend::default();
+        let mut presence = ClaimPresence::new(backend.clone(), instance_id(1), false);
+
+        presence.reconcile(Some(42_000), [instance_id(2)]).unwrap();
+
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .claim_advertisements
+                .is_empty()
+        );
     }
 
     fn resolved(peer: DiscoverAnnounce) -> BrowseEvent {

@@ -153,6 +153,7 @@ pub struct ClaimTransportHandle {
     commands: mpsc::Sender<Command>,
     inbound: Mutex<Option<mpsc::Receiver<ClaimFrame>>>,
     port: Arc<AtomicU16>,
+    listener_port: watch::Receiver<Option<u16>>,
     peers: Arc<RwLock<Vec<ClaimPeer>>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -178,6 +179,7 @@ struct Supervisor {
     provisional_hold: bool,
     listener: Option<TcpListener>,
     port: Arc<AtomicU16>,
+    listener_port: watch::Sender<Option<u16>>,
     commands: mpsc::Receiver<Command>,
     inbound: mpsc::Sender<ClaimFrame>,
     on_peer_addr: Arc<dyn Fn(String, SocketAddr) + Send + Sync>,
@@ -190,6 +192,7 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
     let initial_peers = deps.peers.borrow().clone();
     let peers = Arc::new(RwLock::new(initial_peers));
     let port = Arc::new(AtomicU16::new(0));
+    let (listener_port, listener_port_rx) = watch::channel(None);
     let (command_tx, command_rx) = mpsc::channel(16);
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
     let supervisor = Supervisor {
@@ -202,6 +205,7 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
         provisional_hold: false,
         listener: None,
         port: Arc::clone(&port),
+        listener_port,
         commands: command_rx,
         inbound: inbound_tx,
         on_peer_addr: Arc::from(deps.on_peer_addr),
@@ -212,6 +216,7 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
         commands: command_tx,
         inbound: Mutex::new(Some(inbound_rx)),
         port,
+        listener_port: listener_port_rx,
         peers,
         task: Mutex::new(Some(task)),
     }
@@ -244,6 +249,12 @@ impl ClaimTransportHandle {
             0 => None,
             port => Some(port),
         }
+    }
+
+    /// Subscribe to bound-listener transitions for lifecycle-coupled services.
+    #[must_use]
+    pub fn subscribe_listener_port(&self) -> watch::Receiver<Option<u16>> {
+        self.listener_port.clone()
     }
 
     /// Rebind using provisional-bind, swap, then close-old ordering.
@@ -464,6 +475,7 @@ impl Supervisor {
         let port = listener.local_addr()?.port();
         self.listener = Some(listener);
         self.port.store(port, Ordering::Release);
+        self.listener_port.send_replace(Some(port));
         tracing::info!(event = "claim_listener_started", port);
         Ok(port)
     }
@@ -477,6 +489,7 @@ impl Supervisor {
             let replacement_port = replacement.local_addr()?.port();
             self.listener = Some(replacement);
             self.port.store(replacement_port, Ordering::Release);
+            self.listener_port.send_replace(Some(replacement_port));
             tracing::info!(event = "claim_listener_started", port = replacement_port);
         }
         self.bind_address = address;
@@ -487,6 +500,7 @@ impl Supervisor {
     fn stop_listener(&mut self) {
         if self.listener.take().is_some() {
             self.port.store(0, Ordering::Release);
+            self.listener_port.send_replace(None);
             tracing::info!(event = "claim_listener_stopped");
         }
     }

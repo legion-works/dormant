@@ -89,7 +89,7 @@ use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_claim::{
     ClaimTransportDeps, ClaimTransportHandle, PeerStoreFeed, spawn as spawn_claim_transport,
 };
-use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery, resolve_bind_ip};
+use crate::coordination_mdns::{ClaimPresence, MdnsSdBackend, PairDiscovery, resolve_bind_ip};
 use crate::coordination_pairing::{ClaimPortProvider, PairingManager, PairingTransport};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
@@ -878,6 +878,25 @@ impl App {
         } else {
             None
         };
+        let claim_presence_handle = match (&claim_transport, &peer_store) {
+            (Some(transport), Some(peer_store)) => {
+                let identity = load_or_create_identity(&self.state_dir)
+                    .context("load persistent instance identity for claim presence")?;
+                let presence = ClaimPresence::new(
+                    MdnsSdBackend::new()?,
+                    identity.instance_id,
+                    cfg_clone.coordination.claim_advertise_mdns,
+                );
+                Some(spawn_claim_presence(
+                    presence,
+                    transport.subscribe_listener_port(),
+                    peer_store.subscribe(),
+                    Arc::clone(peer_store),
+                    root.clone(),
+                ))
+            }
+            _ => None,
+        };
         let pairing_manager = Arc::new(
             match (&claim_transport, &peer_store) {
                 (Some(transport), Some(peer_store)) => {
@@ -1173,6 +1192,7 @@ impl App {
             coordination: coordination.clone(),
             _coordination_mdns: None,
             claim_transport: claim_transport.clone(),
+            claim_presence_handle,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1479,6 +1499,8 @@ struct Runner {
     _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
     /// Daemon-lifetime authenticated claim listener; it survives generation swaps.
     claim_transport: Option<Arc<ClaimTransportHandle>>,
+    /// Daemon-lifetime passive claim-presence browser and advertisement loop.
+    claim_presence_handle: Option<JoinHandle<()>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,
@@ -2644,6 +2666,48 @@ fn reset_candidate_on_probe_failure(candidate: &mut Option<LkgCandidate>, now: I
     }
 }
 
+fn spawn_claim_presence(
+    mut presence: ClaimPresence<MdnsSdBackend>,
+    mut listener_port: watch::Receiver<Option<u16>>,
+    mut peers: watch::Receiver<Vec<crate::coordination_claim::ClaimPeer>>,
+    peer_store: Arc<PeerStoreFeed>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            let peer_ids: Vec<_> = peers
+                .borrow()
+                .iter()
+                .map(|peer| peer.instance_id.clone())
+                .collect();
+            if let Err(error) = presence.reconcile(*listener_port.borrow(), peer_ids) {
+                tracing::warn!(event = "claim_presence_reconcile_failed", %error);
+            }
+            if let Err(error) = presence.drain_browse(|instance_id, address| {
+                if let Err(error) = peer_store.refresh_address(&instance_id, address) {
+                    tracing::warn!(event = "claim_peer_address_persist_failed", peer = %instance_id, %error);
+                }
+            }) {
+                tracing::warn!(event = "claim_presence_browse_failed", %error);
+            }
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    let _ = presence.reconcile(None, std::iter::empty());
+                    break;
+                }
+                changed = listener_port.changed() => {
+                    if changed.is_err() { break; }
+                }
+                changed = peers.changed() => {
+                    if changed.is_err() { break; }
+                }
+                _ = interval.tick() => {}
+            }
+        }
+    })
+}
+
 /// The run loop: reload triggers (watcher / SIGHUP / IPC) and shutdown
 /// signals, then a bounded graceful teardown.
 ///
@@ -2789,11 +2853,17 @@ async fn run_loop(
             transport.shutdown().await;
         }
     };
+    let claim_presence_teardown = async {
+        if let Some(handle) = runner.claim_presence_handle {
+            let _ = handle.await;
+        }
+    };
     tokio::join!(
         generation_teardown,
         wear_teardown,
         front_teardown,
-        claim_teardown
+        claim_teardown,
+        claim_presence_teardown
     );
     tracing::info!(event = "daemon_stopped");
 }

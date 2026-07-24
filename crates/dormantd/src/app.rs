@@ -3383,6 +3383,8 @@ mod audio_rules_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -4425,6 +4427,7 @@ mod render_tests {
         dormant_core::config::schema::DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: Vec::new(),
             blank_mode: None,
             degraded_mode: None,
@@ -4517,6 +4520,7 @@ mod render_tests {
                     dormant_core::config::schema::DisplayConfig {
                         scope: dormant_core::config::DisplayScope::default(),
                         shared_input_code: None,
+                        hooks: dormant_core::config::HookSlots::default(),
                         controllers: vec!["command".into()],
                         blank_mode: None,
                         degraded_mode: None,
@@ -4567,6 +4571,8 @@ mod render_tests {
                 );
                 m
             },
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let recording = RecordingRenderSink::new();
@@ -4664,6 +4670,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let captured_ss: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -4738,6 +4746,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let captured_shift: Arc<Mutex<Option<dormant_render::ShiftSettings>>> =
@@ -4823,6 +4833,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         // Capture the `ScreensaverSettings` the factory receives so the
@@ -4918,6 +4930,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -5016,6 +5030,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -5110,6 +5126,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -5473,6 +5491,7 @@ mod macos_gamma_black_assembly_tests {
         let display = DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: vec!["command".into()],
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -5514,6 +5533,8 @@ mod macos_gamma_black_assembly_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         let creds = Credentials::default();
         let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
@@ -5697,6 +5718,7 @@ mod gamma_reload_tests {
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: vec![controller.into()],
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
@@ -5758,6 +5780,8 @@ mod gamma_reload_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 

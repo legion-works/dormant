@@ -17,7 +17,10 @@ use std::time::Duration;
 use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
 
-use super::schema::{Config, Credentials, DisplayConfig, DisplayScope, ValidationError};
+use super::schema::{
+    ActivityClaimPolicy, Config, Credentials, DisplayConfig, DisplayScope, HookAction,
+    ValidationError,
+};
 
 /// A single unknown-key finding from the TOML tree walk.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +29,23 @@ pub struct UnknownKey {
     pub key_path: String,
     /// The unrecognized key name.
     pub detail: String,
+}
+
+/// Runtime facts used to refine claim-related configuration diagnostics.
+///
+/// The static configuration deliberately does not infer peer-store, evdev, or
+/// post-probe identity state; callers provide the facts observed in their own
+/// lifecycle phase instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimValidationContext {
+    /// Number of paired peers visible to the daemon.
+    pub peer_count: usize,
+    /// Whether at least one `/dev/input/event*` device is readable.
+    pub readable_input_devices: bool,
+    /// Controller types that can write an input-source value.
+    pub controller_capabilities: HashSet<String>,
+    /// Display ids with a post-probe claim identity.
+    pub probed_claim_identities: HashSet<String>,
 }
 
 // ── Known-key tree ──────────────────────────────────────────────────────────────
@@ -56,6 +76,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "watchdog",
             "audio",
             "coordination",
+            "keymap",
+            "input_filter",
         ],
     ),
     (
@@ -67,8 +89,18 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "pairing_port",
             "pairing_window",
             "pairing_bind_address",
+            "activity_claim",
+            "owner_idle_window",
+            "armed_window",
+            "claim_timeout",
+            "release_deadline_cap",
+            "claim_port",
+            "claim_bind_address",
+            "claim_advertise_mdns",
         ],
     ),
+    ("keymap", &["claim_hotkey"]),
+    ("input_filter", &["ignore_devices"]),
     // ── audio ───────────────────────────────────────────────────────────────
     (
         "audio",
@@ -202,6 +234,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "samsung_restore_backlight",
             "treat_unreachable_as_blanked",
             "panel_type",
+            "hooks",
         ],
     ),
     // ── rules.<id> ─────────────────────────────────────────────────────────
@@ -223,6 +256,35 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     // ── displays.<id>.ladder (array-of-tables entries) ─────────────────────
     ("displays..ladder", &["kind", "dwell"]),
+    (
+        "displays..hooks",
+        &[
+            "before_release",
+            "after_release",
+            "before_acquire",
+            "after_acquire",
+        ],
+    ),
+    (
+        "displays..hooks.before_release",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    (
+        "displays..hooks.after_release",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    (
+        "displays..hooks.before_acquire",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    (
+        "displays..hooks.after_acquire",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    ("displays..hooks.before_release.mqtt", &["topic", "payload"]),
+    ("displays..hooks.after_release.mqtt", &["topic", "payload"]),
+    ("displays..hooks.before_acquire.mqtt", &["topic", "payload"]),
+    ("displays..hooks.after_acquire.mqtt", &["topic", "payload"]),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
         "displays..screensaver",
@@ -492,8 +554,23 @@ pub fn validate_with_input_source_readers(
             capabilities,
             input_source_readers,
             creds,
+            cfg.sensors
+                .values()
+                .any(|sensor| matches!(sensor, crate::config::SensorConfig::Mqtt(_))),
             &mut errors,
         );
+    }
+    let mut shared_input_codes = HashSet::new();
+    for (display_id, display) in &cfg.displays {
+        if display.scope == DisplayScope::Shared
+            && let Some(code) = display.shared_input_code
+            && !shared_input_codes.insert(code)
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!("display '{display_id}' duplicates a local shared_input_code"),
+            });
+        }
     }
 
     // ── Rule validation ──────────────────────────────────────────────────
@@ -827,6 +904,72 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             });
         }
     }
+    let coordination = &cfg.coordination;
+    for (name, value, minimum) in [
+        (
+            "claim_timeout",
+            coordination.claim_timeout,
+            Duration::from_secs(1),
+        ),
+        (
+            "release_deadline_cap",
+            coordination.release_deadline_cap,
+            Duration::from_secs(15),
+        ),
+        (
+            "armed_window",
+            coordination.armed_window,
+            Duration::from_secs(5),
+        ),
+        (
+            "owner_idle_window",
+            coordination.owner_idle_window,
+            Duration::from_secs(5),
+        ),
+    ] {
+        if value < minimum {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "coordination {name} {value:?} is below the minimum of {minimum:?}"
+                ),
+            });
+        }
+    }
+    if coordination.activity_claim != ActivityClaimPolicy::Off && !coordination.enabled {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: "coordination activity_claim requires coordination enabled".into(),
+        });
+    }
+    if !coordination.claim_advertise_mdns && coordination.claim_port == 0 {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail:
+                "coordination claim_advertise_mdns = false requires a fixed non-zero claim_port"
+                    .into(),
+        });
+    }
+    if let Some(hotkey) = cfg.keymap.claim_hotkey.as_deref()
+        && !is_conservative_accelerator(hotkey)
+    {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("keymap claim_hotkey {hotkey:?} is not a valid accelerator"),
+        });
+    }
+}
+
+fn is_conservative_accelerator(value: &str) -> bool {
+    let mut tokens = value.split('+').peekable();
+    let Some(key) = tokens.next_back() else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        && tokens.all(|modifier| matches!(modifier, "Alt" | "Control" | "Meta" | "Shift" | "Super"))
 }
 
 fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
@@ -1110,6 +1253,7 @@ fn validate_display(
         capabilities,
         &HashSet::new(),
         creds,
+        false,
         errors,
     );
 }
@@ -1121,6 +1265,7 @@ fn validate_display_with_input_source_readers(
     capabilities: &HashMap<String, Vec<BlankMode>>,
     input_source_readers: &HashSet<String>,
     creds: &Credentials,
+    has_mqtt_broker: bool,
     errors: &mut Vec<ValidationError>,
 ) {
     // controllers must be non-empty.
@@ -1159,6 +1304,8 @@ fn validate_display_with_input_source_readers(
         }
         DisplayScope::Private => {}
     }
+
+    validate_hooks(display_id, dc, has_mqtt_broker, errors);
 
     // Build the union of supported modes across all controllers.
     let mut union_caps: HashSet<BlankMode> = HashSet::new();
@@ -1672,6 +1819,67 @@ fn validate_display_with_input_source_readers(
                 "display '{display_id}' restore_brightness is 0 — \
                  a zero restore level would wake to a dark panel; minimum is 1"
             ),
+        });
+    }
+}
+
+fn validate_hooks(
+    display_id: &str,
+    display: &DisplayConfig,
+    has_mqtt_broker: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    let slots = [
+        ("before_release", &display.hooks.before_release),
+        ("after_release", &display.hooks.after_release),
+        ("before_acquire", &display.hooks.before_acquire),
+        ("after_acquire", &display.hooks.after_acquire),
+    ];
+    for (slot, actions) in slots {
+        if display.scope != DisplayScope::Shared && !actions.is_empty() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!("display '{display_id}' has hooks but is not shared"),
+            });
+        }
+        for (index, action) in actions.iter().enumerate() {
+            validate_hook_action(display_id, slot, index, action, has_mqtt_broker, errors);
+        }
+    }
+}
+
+fn validate_hook_action(
+    display_id: &str,
+    slot: &str,
+    index: usize,
+    action: &HookAction,
+    has_mqtt_broker: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if action.command.is_some() == action.mqtt.is_some() {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' hooks.{slot}[{index}] must set exactly one of command or mqtt"),
+        });
+    }
+    if action.command.as_ref().is_some_and(Vec::is_empty) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' hooks.{slot}[{index}] command argv must not be empty"
+            ),
+        });
+    }
+    if action.mqtt.is_some() && !has_mqtt_broker {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' hooks.{slot}[{index}] mqtt action requires a configured MQTT broker"),
+        });
+    }
+    if action.timeout < Duration::from_millis(100) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' hooks.{slot}[{index}] timeout {:?} is below the minimum of 100ms", action.timeout),
         });
     }
 }
@@ -2657,6 +2865,7 @@ gracee_period = "60s"
             controllers: Vec::new(),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            hooks: crate::config::HookSlots::default(),
             blank_mode: None,
             degraded_mode: None,
             ladder: Vec::new(),
@@ -2946,6 +3155,8 @@ gracee_period = "60s"
             watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
             coordination: super::super::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         }
     }
 
@@ -3071,6 +3282,8 @@ gracee_period = "60s"
             watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
             coordination: super::super::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         }
     }
 
@@ -3442,6 +3655,7 @@ password = "test-pass"
                     controllers: vec!["kwin-dpms".into(), "ddcci".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
+                    hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
                     ladder: vec![],
@@ -3471,6 +3685,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -3501,6 +3717,7 @@ password = "test-pass"
                     controllers: vec!["command".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
+                    hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
                     ladder: vec![],
@@ -3531,6 +3748,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -3639,6 +3858,7 @@ password = "test-pass"
             blank_mode: Some(BlankMode::PowerOff),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
             screensaver: None,
@@ -3711,6 +3931,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3737,6 +3959,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3772,6 +3996,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let samsung_errors: Vec<_> = errors
@@ -3806,6 +4032,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3832,6 +4060,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let restore_errors: Vec<_> = errors
@@ -3862,6 +4092,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3888,6 +4120,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4555,6 +4789,7 @@ kind = "power_off"
             blank_mode: None,
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
             screensaver: None,

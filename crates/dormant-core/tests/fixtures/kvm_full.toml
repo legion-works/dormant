@@ -1,0 +1,34 @@
+config_version = 1
+
+[keymap]
+claim_hotkey = "Meta+F12"
+
+[input_filter]
+ignore_devices = ["*jiggler*"]
+
+[coordination]
+activity_claim = "off"
+owner_idle_window = "5s"
+armed_window = "5s"
+claim_timeout = "1s"
+release_deadline_cap = "15s"
+claim_port = 32123
+claim_bind_address = ""
+claim_advertise_mdns = false
+
+[displays.monitor]
+controllers = ["ddcci"]
+scope = "shared"
+shared_input_code = 17
+blank_mode = "power_off"
+
+[displays.monitor.hooks]
+before_release = [
+  { command = [
+    "printf",
+    "release",
+  ], timeout = "100ms", blocking = true, abort_on_failure = false },
+]
+after_release = []
+before_acquire = []
+after_acquire = []

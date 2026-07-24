@@ -431,6 +431,41 @@ export interface CoordinationConfig {
   pairing_port?: number;
   pairing_window?: string;
   pairing_bind_address?: string | null;
+  activity_claim?: "off" | "owner-idle" | "edge" | "armed";
+  owner_idle_window?: string;
+  armed_window?: string;
+  claim_timeout?: string;
+  release_deadline_cap?: string;
+  claim_port?: number;
+  claim_bind_address?: string | null;
+  claim_advertise_mdns?: boolean;
+}
+
+/** rust: config/schema.rs KeymapConfig */
+export interface KeymapConfig {
+  claim_hotkey?: string | null;
+}
+
+/** rust: config/schema.rs InputFilterConfig */
+export interface InputFilterConfig {
+  ignore_devices?: string[];
+}
+
+/** rust: config/schema.rs HookAction */
+export interface HookAction {
+  command?: string[];
+  mqtt?: { topic: string; payload: string };
+  timeout?: string;
+  blocking?: boolean;
+  abort_on_failure?: boolean;
+}
+
+/** rust: config/schema.rs HookSlots */
+export interface HookSlots {
+  before_release?: HookAction[];
+  after_release?: HookAction[];
+  before_acquire?: HookAction[];
+  after_acquire?: HookAction[];
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */
@@ -536,6 +571,7 @@ export interface DisplayConfig {
   controllers: string[];
   scope?: "private" | "shared";
   shared_input_code?: number;
+  hooks?: HookSlots;
   blank_mode?: BlankMode;
   degraded_mode?: BlankMode;
   ladder?: LadderStage[];

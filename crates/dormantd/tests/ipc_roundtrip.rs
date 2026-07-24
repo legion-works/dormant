@@ -134,6 +134,8 @@ fn fake_doctor(ctl_tx: mpsc::Sender<ControlMsg>) -> DoctorService {
         zones: IndexMap::default(),
         displays: IndexMap::default(),
         rules: IndexMap::default(),
+        keymap: dormant_core::config::KeymapConfig::default(),
+        input_filter: dormant_core::config::InputFilterConfig::default(),
     }));
     let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
     drop(config_tx);

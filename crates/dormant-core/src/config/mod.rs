@@ -20,12 +20,14 @@ pub mod schema;
 pub mod validate;
 
 pub use schema::{
-    Config, CoordinationConfig, Credentials, DaemonConfig, DisplayConfig, DisplayScope, IdleSource,
-    IdleTimeUnit, MqttCredential, RuleConfig, SensorConfig, SensorKind, Strictness,
-    ValidationError, Warning, ZoneConfig,
+    ActivityClaimPolicy, Config, CoordinationConfig, Credentials, DaemonConfig, DisplayConfig,
+    DisplayScope, HookAction, HookCommand, HookMqtt, HookSlots, IdleSource, IdleTimeUnit,
+    InputFilterConfig, KeymapConfig, MqttCredential, RuleConfig, SensorConfig, SensorKind,
+    Strictness, ValidationError, Warning, ZoneConfig,
 };
 pub use validate::{
-    STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate, validate_with_input_source_readers,
+    ClaimValidationContext, STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate,
+    validate_with_input_source_readers,
 };
 
 use std::path::Path;

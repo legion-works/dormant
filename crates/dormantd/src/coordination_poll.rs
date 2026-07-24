@@ -284,6 +284,7 @@ mod tests {
                 samsung_restore_backlight: 50,
                 treat_unreachable_as_blanked: true,
                 panel_type: PanelType::Unknown,
+                hooks: dormant_core::config::HookSlots::default(),
             },
         );
         Config {
@@ -302,6 +303,8 @@ mod tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 

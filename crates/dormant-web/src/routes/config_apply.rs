@@ -587,6 +587,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -633,6 +635,8 @@ mod tests {
             zones,
             displays: IndexMap::default(),
             rules,
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         (cfg, "myrule")
     }
@@ -874,6 +878,8 @@ field = "/val"
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         let state = test_state(dir.path(), cfg, 8080);
         let fingerprint = get_fingerprint(&state);

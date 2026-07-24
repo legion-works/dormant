@@ -103,6 +103,45 @@ pub struct Config {
     /// Multi-machine coordination configuration.
     #[serde(default)]
     pub coordination: CoordinationConfig,
+
+    /// Global KVM claim hotkey settings.
+    #[serde(default)]
+    pub keymap: KeymapConfig,
+
+    /// Local input-device filtering for activity claims.
+    #[serde(default)]
+    pub input_filter: InputFilterConfig,
+}
+
+/// Global KVM claim hotkey settings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeymapConfig {
+    /// Accelerator registered by the tray, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_hotkey: Option<String>,
+}
+
+/// Input-device filtering settings for activity claims.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InputFilterConfig {
+    /// Case-insensitive device-name globs that do not count as local activity.
+    #[serde(default)]
+    pub ignore_devices: Vec<String>,
+}
+
+/// Policy that may initiate a claim from local activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivityClaimPolicy {
+    /// Never initiate claims from activity.
+    #[default]
+    Off,
+    /// Claim only after the current owner is idle.
+    OwnerIdle,
+    /// Claim on a local input edge.
+    Edge,
+    /// Claim while an explicit local arm window is active.
+    Armed,
 }
 
 /// Multi-machine coordination settings.
@@ -153,6 +192,38 @@ pub struct CoordinationConfig {
     /// auto-detect the primary non-loopback LAN address.
     #[serde(default)]
     pub pairing_bind_address: Option<String>,
+
+    /// Activity policy that may initiate a shared-display claim.
+    #[serde(default)]
+    pub activity_claim: ActivityClaimPolicy,
+
+    /// Required owner-idle duration before an owner-idle claim.
+    #[serde(default = "default_owner_idle_window", with = "humantime_serde")]
+    pub owner_idle_window: Duration,
+
+    /// Duration before an armed claim automatically disarms.
+    #[serde(default = "default_armed_window", with = "humantime_serde")]
+    pub armed_window: Duration,
+
+    /// Request/ack round-trip bound for a claim.
+    #[serde(default = "default_claim_timeout", with = "humantime_serde")]
+    pub claim_timeout: Duration,
+
+    /// Upper cap on a computed release deadline.
+    #[serde(default = "default_release_deadline_cap", with = "humantime_serde")]
+    pub release_deadline_cap: Duration,
+
+    /// Always-on claim listener port; zero requests an OS-assigned port.
+    #[serde(default = "default_claim_port")]
+    pub claim_port: u16,
+
+    /// LAN address for the claim listener; an empty TOML string means auto-detect.
+    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+    pub claim_bind_address: Option<String>,
+
+    /// Whether the claim listener advertises its port through mDNS.
+    #[serde(default = "default_claim_advertise_mdns")]
+    pub claim_advertise_mdns: bool,
 }
 
 impl Default for CoordinationConfig {
@@ -164,6 +235,14 @@ impl Default for CoordinationConfig {
             pairing_port: defaults::COORDINATION_PAIRING_PORT,
             pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
             pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
+            activity_claim: ActivityClaimPolicy::Off,
+            owner_idle_window: defaults::OWNER_IDLE_WINDOW,
+            armed_window: defaults::ARMED_WINDOW,
+            claim_timeout: defaults::CLAIM_TIMEOUT,
+            release_deadline_cap: defaults::RELEASE_DEADLINE_CAP,
+            claim_port: defaults::CLAIM_PORT,
+            claim_bind_address: None,
+            claim_advertise_mdns: defaults::CLAIM_ADVERTISE_MDNS,
         }
     }
 }
@@ -987,6 +1066,10 @@ pub struct DisplayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_input_code: Option<u8>,
 
+    /// KVM hand-off actions run around release and acquire transitions.
+    #[serde(default)]
+    pub hooks: HookSlots,
+
     /// Primary blank mode to use.  Must be set unless `ladder` is provided.
     /// When `ladder` is present this field is ignored — the first
     /// `Controller(_)` stage in the ladder serves as the primary mode.
@@ -1091,6 +1174,62 @@ pub struct DisplayConfig {
     /// blocks wear tracking.
     #[serde(default)]
     pub panel_type: PanelType,
+}
+
+/// The four KVM hand-off hook slots available on a shared display.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HookSlots {
+    /// Actions run before releasing a display to another machine.
+    #[serde(default)]
+    pub before_release: Vec<HookAction>,
+    /// Actions run after releasing a display to another machine.
+    #[serde(default)]
+    pub after_release: Vec<HookAction>,
+    /// Actions run before acquiring a display from another machine.
+    #[serde(default)]
+    pub before_acquire: Vec<HookAction>,
+    /// Actions run after acquiring a display from another machine.
+    #[serde(default)]
+    pub after_acquire: Vec<HookAction>,
+}
+
+/// Command argv used by a KVM hook.
+pub type HookCommand = Vec<String>;
+
+/// MQTT publish payload used by a KVM hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookMqtt {
+    /// MQTT topic to publish.
+    pub topic: String,
+    /// Payload sent to the MQTT topic.
+    pub payload: String,
+}
+
+/// One action in a KVM hand-off hook slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookAction {
+    /// Command argv; mutually exclusive with [`Self::mqtt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<HookCommand>,
+    /// MQTT publish; mutually exclusive with [`Self::command`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt: Option<HookMqtt>,
+    /// Maximum time an action may run.
+    #[serde(default = "default_hook_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    /// Explicit scheduling override; absent resolves from the containing slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<bool>,
+    /// Whether a failure aborts the enclosing KVM transition.
+    #[serde(default)]
+    pub abort_on_failure: bool,
+}
+
+fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| value.filter(|value| !value.is_empty()))
 }
 
 impl DisplayConfig {
@@ -1325,6 +1464,34 @@ fn default_coordination_pairing_port() -> u16 {
 }
 fn default_coordination_pairing_window() -> Duration {
     defaults::COORDINATION_PAIRING_WINDOW
+}
+
+fn default_claim_timeout() -> Duration {
+    defaults::CLAIM_TIMEOUT
+}
+
+fn default_release_deadline_cap() -> Duration {
+    defaults::RELEASE_DEADLINE_CAP
+}
+
+fn default_armed_window() -> Duration {
+    defaults::ARMED_WINDOW
+}
+
+fn default_owner_idle_window() -> Duration {
+    defaults::OWNER_IDLE_WINDOW
+}
+
+fn default_claim_port() -> u16 {
+    defaults::CLAIM_PORT
+}
+
+fn default_claim_advertise_mdns() -> bool {
+    defaults::CLAIM_ADVERTISE_MDNS
+}
+
+fn default_hook_timeout() -> Duration {
+    defaults::HOOK_TIMEOUT
 }
 fn default_pair_timeout() -> Duration {
     defaults::PAIR_TIMEOUT
@@ -2137,5 +2304,32 @@ idle_source = "macos"
             cfg.coordination.effective_state_poll_interval(),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn kvm_sections_parse_additively_in_strict_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kvm_full.toml");
+        std::fs::write(&path, include_str!("../../tests/fixtures/kvm_full.toml")).unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        assert_eq!(cfg.coordination.activity_claim, ActivityClaimPolicy::Off);
+        assert_eq!(cfg.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
+        assert_eq!(cfg.input_filter.ignore_devices, vec!["*jiggler*"]);
+        assert_eq!(cfg.displays["monitor"].hooks.before_release.len(), 1);
+    }
+
+    #[test]
+    fn strict_mode_rejects_unknown_nested_hook_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kvm_typo.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nbefore_releasee = []\n",
+                include_str!("../../tests/fixtures/kvm_full.toml")
+            ),
+        )
+        .unwrap();
+        assert!(crate::config::load_config(&path, Strictness::Strict).is_err());
     }
 }

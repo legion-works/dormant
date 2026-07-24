@@ -125,6 +125,27 @@ pub const COORDINATION_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 /// address from the operating system's route table.
 pub const COORDINATION_PAIRING_BIND_ADDRESS: Option<&str> = None;
 
+/// Request/ack round-trip bound for a shared-display claim.
+pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Upper cap on a computed shared-display release deadline.
+pub const RELEASE_DEADLINE_CAP: Duration = Duration::from_secs(45);
+
+/// Auto-disarm window for an armed activity claim.
+pub const ARMED_WINDOW: Duration = Duration::from_secs(60);
+
+/// Idle window used by the owner-idle activity-claim policy.
+pub const OWNER_IDLE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Requested port for the always-on claim listener; zero requests an ephemeral port.
+pub const CLAIM_PORT: u16 = 0;
+
+/// Whether the claim listener advertises its assigned port through mDNS.
+pub const CLAIM_ADVERTISE_MDNS: bool = true;
+
+/// Timeout for one shared-display hook action.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);

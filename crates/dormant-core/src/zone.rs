@@ -1305,6 +1305,8 @@ mod tests {
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
 
         let hazards = absent_mqtt_hazards(&cfg);

@@ -600,6 +600,7 @@ mod tests {
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: controllers.into_iter().map(String::from).collect(),
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -638,6 +639,8 @@ mod tests {
             zones: IndexMap::default(),
             displays,
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 

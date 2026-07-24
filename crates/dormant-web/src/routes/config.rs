@@ -428,6 +428,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -464,6 +466,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules,
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let map = build_display_rules(&cfg);
@@ -550,6 +554,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         redact_config_secrets(&mut cfg);
         let SensorConfig::Ha(ha) = cfg.sensors.get("living").unwrap() else {
@@ -608,6 +614,7 @@ mod tests {
             DisplayConfig {
                 scope: dormant_core::config::DisplayScope::default(),
                 shared_input_code: None,
+                hooks: dormant_core::config::HookSlots::default(),
                 controllers: vec!["kwin-dpms".into()],
                 blank_mode: None,
                 degraded_mode: None,
@@ -645,6 +652,8 @@ mod tests {
             zones: IndexMap::default(),
             displays,
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let paths = redact_config_secrets(&mut cfg);
@@ -695,6 +704,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         let paths = redact_config_secrets(&mut cfg);
         assert!(paths.is_empty());
@@ -814,6 +825,8 @@ entity = "binary_sensor.motion"
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         let state = test_config_state(path, cfg);
         let result = get_config(State(state)).await.unwrap();
@@ -855,6 +868,8 @@ entity = "binary_sensor.motion"
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules,
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         let state = test_config_state(path, cfg);
         let result = get_config(State(state)).await.unwrap();
@@ -943,6 +958,7 @@ field = "/val"
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: vec![controller.into()],
             blank_mode: None,
             degraded_mode: None,
@@ -1017,6 +1033,8 @@ field = "/val"
             zones: IndexMap::default(),
             displays,
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 

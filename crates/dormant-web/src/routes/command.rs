@@ -282,6 +282,14 @@ pub(super) async fn validate_display_exists(
 /// for HTTP-level tests via `oneshot`.
 #[cfg(test)]
 fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
+    command_test_router_at(ctl_tx, None)
+}
+
+#[cfg(test)]
+fn command_test_router_at(
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    socket: Option<std::path::PathBuf>,
+) -> axum::Router {
     use crate::state::{WebStateInner, WebStateInnerParams};
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use indexmap::IndexMap;
@@ -296,7 +304,10 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     let config = Arc::new(Config {
         coordination: dormant_core::config::CoordinationConfig::default(),
         config_version: 1,
-        daemon: DaemonConfig::default(),
+        daemon: DaemonConfig {
+            socket_path: socket,
+            ..DaemonConfig::default()
+        },
         wear: dormant_core::config::schema::WearConfig::default(),
         notifications: dormant_core::config::schema::NotificationsConfig::default(),
         watchdog: dormant_core::config::schema::WatchdogConfig::default(),
@@ -582,6 +593,45 @@ mod tests {
             Err(WebError::UnknownDisplay(name)) => assert_eq!(name, "bogus"),
             other => panic!("expected UnknownDisplay, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn switch_router_round_trips_claim_verdict() {
+        let snap = snapshot_with_displays(&["shared"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("claim_shared"));
+            stream.write_all(b"{\"ok\":true,\"claim_shared\":{\"verdict\":\"accepted\",\"deadline_ms\":123}}\n").unwrap();
+        });
+        let router = command_test_router_at(ctl_tx, Some(socket));
+        tokio::task::yield_now().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/switch")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"shared"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["verdict"], "accepted");
+        server.await.unwrap();
     }
 
     // ── Pause / Resume tests ──────────────────────────────────────────────

@@ -1,6 +1,7 @@
 //! `dormantctl switch` — request or arm a shared-panel claim.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use dormant_core::ipc_proto::{ClaimSharedResultWire, IpcRequest};
@@ -21,6 +22,16 @@ pub(crate) fn request_for(display: &str, arm: bool) -> IpcRequest {
     }
 }
 
+fn format_deadline(deadline_ms: u64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let seconds = deadline_ms.saturating_sub(now_ms).div_ceil(1_000);
+    format!("in {seconds}s")
+}
+
 /// Run the `switch` command.
 ///
 /// # Errors
@@ -35,7 +46,7 @@ pub fn run(socket_path: &Path, display: &str, arm: bool) -> Result<()> {
             .claim_arm
             .ok_or_else(|| anyhow::anyhow!("daemon returned no arm result"))?;
         if result.armed {
-            println!("armed until {}", result.deadline_ms);
+            println!("armed {}", format_deadline(result.deadline_ms));
             Ok(())
         } else {
             anyhow::bail!(result.reason.unwrap_or_else(|| "arm rejected".to_string()))
@@ -46,7 +57,7 @@ pub fn run(socket_path: &Path, display: &str, arm: bool) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("daemon returned no claim result"))?
         {
             ClaimSharedResultWire::Accepted { deadline_ms } => {
-                println!("accepted until {deadline_ms}");
+                println!("accepted {}", format_deadline(deadline_ms));
                 Ok(())
             }
             ClaimSharedResultWire::Busy => anyhow::bail!("busy"),
@@ -67,6 +78,18 @@ mod tests {
             request_for("monitor", true),
             IpcRequest::ClaimArm { display } if display == "monitor"
         ));
+    }
+
+    #[test]
+    fn deadline_is_humanized_relative_to_now() {
+        let now_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let rendered = format_deadline(now_ms + 5_000);
+        assert!(rendered == "in 5s" || rendered == "in 6s", "{rendered}");
     }
 
     #[test]

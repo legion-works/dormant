@@ -368,6 +368,13 @@ describe("Displays", () => {
     fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
     expect(await screen.findByText("unsupported")).toBeInTheDocument();
   });
+
+  it("renders a denied claim verdict reason", async () => {
+    mocks.postSwitch.mockResolvedValueOnce({ verdict: "denied", reason: "identity_unavailable" });
+    renderDisplayCard("shared-tv", sharedDisplay());
+    fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
+    expect(await screen.findByText("identity_unavailable")).toBeInTheDocument();
+  });
 });
 
   it("renders stage detail when a display is in the staged phase", async () => {

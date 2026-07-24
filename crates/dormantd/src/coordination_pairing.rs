@@ -41,6 +41,20 @@ const NONCE_BYTES: usize = 32;
 const MAC_BYTES: usize = 32;
 const CROCKFORD_BASE32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+/// Supplies the claim-listener port that pairing authenticates for this daemon.
+pub(crate) trait ClaimPortProvider: Send + Sync {
+    /// Return the currently reachable claim-listener port, when one exists.
+    fn claim_port(&self) -> Option<u16>;
+}
+
+struct NoClaimPortProvider;
+
+impl ClaimPortProvider for NoClaimPortProvider {
+    fn claim_port(&self) -> Option<u16> {
+        None
+    }
+}
+
 #[allow(
     dead_code,
     reason = "Task 14's TCP adapter invokes the SPAKE2 state machine."
@@ -136,6 +150,7 @@ pub(crate) struct LocalPeer {
     state_dir: PathBuf,
     display_name: String,
     identity: dormant_core::peers::InstanceIdentity,
+    claim_port: Option<u16>,
 }
 
 #[allow(
@@ -144,12 +159,21 @@ pub(crate) struct LocalPeer {
 )]
 impl LocalPeer {
     fn load(state_dir: PathBuf, display_name: String) -> Result<Self, PairSessionError> {
+        Self::load_with_claim_port(state_dir, display_name, None)
+    }
+
+    fn load_with_claim_port(
+        state_dir: PathBuf,
+        display_name: String,
+        claim_port: Option<u16>,
+    ) -> Result<Self, PairSessionError> {
         let identity = load_or_create_identity(&state_dir)
             .map_err(|error| PairSessionError::Local(error.to_string()))?;
         Ok(Self {
             state_dir,
             display_name,
             identity,
+            claim_port,
         })
     }
 
@@ -166,8 +190,8 @@ impl LocalPeer {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
             display_name: peer.display_name.clone(),
             paired_at,
-            last_addr: None,
-            claim_port: None,
+            last_addr: peer.last_addr,
+            claim_port: peer.claim_port,
         };
         upsert_peer(&self.state_dir.join("peers.json"), record)
             .map_err(|error| PairSessionError::Local(error.to_string()))
@@ -184,6 +208,8 @@ struct PeerIdentity {
     display_name: String,
     public_key: [u8; 32],
     nonce: [u8; NONCE_BYTES],
+    claim_port: Option<u16>,
+    last_addr: Option<SocketAddr>,
 }
 
 /// A bounded responder pairing window.
@@ -211,6 +237,7 @@ pub(crate) struct PairingManager {
     identity: Option<dormant_core::peers::InstanceIdentity>,
     enabled: bool,
     pairing_window: Duration,
+    claim_port_provider: Arc<dyn ClaimPortProvider>,
     windows: Mutex<HashMap<String, PairingWindow>>,
 }
 
@@ -221,6 +248,21 @@ impl PairingManager {
         enabled: bool,
         pairing_window: Duration,
     ) -> Result<Self, PairSessionError> {
+        Self::new_with_claim_port_provider(
+            state_dir,
+            enabled,
+            pairing_window,
+            Arc::new(NoClaimPortProvider),
+        )
+    }
+
+    /// Construct a pairing manager with an injectable claim-port source.
+    pub(crate) fn new_with_claim_port_provider(
+        state_dir: &Path,
+        enabled: bool,
+        pairing_window: Duration,
+        claim_port_provider: Arc<dyn ClaimPortProvider>,
+    ) -> Result<Self, PairSessionError> {
         let identity = enabled
             .then(|| load_or_create_identity(state_dir))
             .transpose()
@@ -230,12 +272,19 @@ impl PairingManager {
             identity,
             enabled,
             pairing_window,
+            claim_port_provider,
             windows: Mutex::new(HashMap::new()),
         })
     }
 
     pub(crate) fn local_peer(&self, display_name: String) -> Result<LocalPeer, PairSessionError> {
-        LocalPeer::load(self.state_dir.clone(), display_name)
+        LocalPeer::load_with_claim_port(
+            self.state_dir.clone(),
+            display_name,
+            self.claim_port_provider
+                .claim_port()
+                .filter(|port| *port != 0),
+        )
     }
 
     /// Open one responder window. Transport advertisement is attached by Task 14.
@@ -771,6 +820,8 @@ where
         nonce: state
             .remote_nonce
             .ok_or(PairSessionError::Wire(PairError::InvalidFrame))?,
+        claim_port: state.remote_claim_port,
+        last_addr: None,
     };
     local.persist(&remote)
 }
@@ -1018,6 +1069,7 @@ struct InitiatorState {
     remote_display_name: Option<String>,
     remote_nonce: Option<[u8; NONCE_BYTES]>,
     remote_public_key: Option<[u8; 32]>,
+    remote_claim_port: Option<u16>,
     key: Option<Zeroizing<Vec<u8>>>,
 }
 
@@ -1057,6 +1109,8 @@ fn begin_initiator(
         display_name: local.display_name.clone(),
         public_key: local.public_key(),
         nonce,
+        claim_port: local.claim_port,
+        last_addr: None,
     };
     let frames = vec![
         PairFrame::PairHello {
@@ -1080,6 +1134,7 @@ fn begin_initiator(
             remote_display_name: None,
             remote_nonce: None,
             remote_public_key: None,
+            remote_claim_port: None,
             key: None,
         },
         frames_to_wire(&frames),
@@ -1127,6 +1182,8 @@ fn accept_hello(
         display_name,
         public_key: instance_bytes,
         nonce,
+        claim_port: None,
+        last_addr: None,
     })
 }
 
@@ -1159,6 +1216,8 @@ fn responder_receive_msg1(
         display_name: responder.display_name.clone(),
         public_key: responder.public_key(),
         nonce,
+        claim_port: responder.claim_port,
+        last_addr: None,
     };
     let frames = vec![
         PairFrame::PairHello {
@@ -1174,7 +1233,7 @@ fn responder_receive_msg1(
         },
         PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(local.public_key),
-            claim_port: None,
+            claim_port: local.claim_port,
         },
     ];
     Ok((
@@ -1234,11 +1293,14 @@ fn initiator_receive_responder(
     let identity = wire_to_frame(&frames[2])?;
     let PairFrame::IdentityExchange {
         ed25519_pub,
-        claim_port: _,
+        claim_port,
     } = identity
     else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
+    if claim_port == Some(0) {
+        return Err(PairSessionError::Wire(PairError::InvalidFrame));
+    }
     let remote_public_key = decode_exact(&ed25519_pub)?;
     if remote_public_key != expected_public_key
         || instance_id_from_public_key(&remote_public_key) != state.remote_instance_id
@@ -1249,6 +1311,7 @@ fn initiator_receive_responder(
     state.remote_public_key = Some(remote_public_key);
     state.remote_nonce = Some(remote_nonce);
     state.remote_display_name = Some(display_name);
+    state.remote_claim_port = claim_port;
     state.key = Some(Zeroizing::new(key));
 
     let transcript = transcript_for_initiator(state)?;
@@ -1260,7 +1323,7 @@ fn initiator_receive_responder(
     Ok(frames_to_wire(&[
         PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(state.local.public_key),
-            claim_port: None,
+            claim_port: state.local.claim_port,
         },
         PairFrame::KeyConfirm {
             mac: base64::engine::general_purpose::STANDARD.encode(mac),
@@ -1279,17 +1342,21 @@ fn responder_receive_initiator(
     let identity = wire_to_frame(&frames[0])?;
     let PairFrame::IdentityExchange {
         ed25519_pub,
-        claim_port: _,
+        claim_port,
     } = identity
     else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
+    if claim_port == Some(0) {
+        return Err(PairSessionError::Wire(PairError::InvalidFrame));
+    }
     let key = decode_exact(&ed25519_pub)?;
     if key != state.remote.public_key
         || instance_id_from_public_key(&key) != state.remote.instance_id
     {
         return Err(PairSessionError::Wire(PairError::InstanceIdConflict));
     }
+    state.remote.claim_port = claim_port;
     let confirm = wire_to_frame(&frames[1])?;
     verify_confirmation(&state.key, &transcript_for_responder(state)?, confirm)?;
     state.confirmation_seen = true;
@@ -1347,14 +1414,22 @@ fn responder_receive_result(
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
+enum PairingTamper {
+    None,
+    Identity,
+    Nonce,
+    ClaimPort,
+    ReplayConfirmation,
+}
+
+#[cfg(test)]
 fn run_in_process_pairing(
     initiator: &LocalPeer,
     responder: &LocalPeer,
     window: &mut PairingWindow,
     code: &[u8],
-    tamper_responder_identity: bool,
-    tamper_responder_nonce: bool,
-    replay_confirmation: bool,
+    tamper: PairingTamper,
 ) -> Result<(), PairSessionError> {
     let _flight = window.begin()?;
     let (mut initiator_state, initiator_start) = begin_initiator(
@@ -1371,50 +1446,10 @@ fn run_in_process_pairing(
         wire_to_frame(&initiator_start[1])?,
     )?;
     let mut responder_start = responder_start;
-    if tamper_responder_nonce {
-        let PairFrame::PairHello { nonce, .. } = wire_to_frame(&responder_start[0])? else {
-            unreachable!("responder emits PairHello");
-        };
-        let mut nonce: [u8; NONCE_BYTES] = decode_exact(&nonce)?;
-        nonce[0] ^= 1;
-        let PairFrame::PairHello {
-            protocol_version,
-            role,
-            instance_id,
-            display_name,
-            window_id,
-            ..
-        } = wire_to_frame(&responder_start[0])?
-        else {
-            unreachable!("responder emits PairHello");
-        };
-        responder_start[0] = frame_for_wire(&PairFrame::PairHello {
-            protocol_version,
-            role,
-            instance_id,
-            display_name,
-            window_id,
-            nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
-        });
-    }
-    if tamper_responder_identity {
-        let PairFrame::IdentityExchange {
-            ed25519_pub,
-            claim_port: _,
-        } = wire_to_frame(&responder_start[2])?
-        else {
-            unreachable!("responder emits identity exchange");
-        };
-        let mut public_key: [u8; 32] = decode_exact(&ed25519_pub)?;
-        public_key[0] ^= 1;
-        responder_start[2] = frame_for_wire(&PairFrame::IdentityExchange {
-            ed25519_pub: base64::engine::general_purpose::STANDARD.encode(public_key),
-            claim_port: None,
-        });
-    }
+    tamper_responder_start(&mut responder_start, tamper)?;
     let initiator_confirm = initiator_receive_responder(&mut initiator_state, &responder_start)?;
     let responder_confirm = responder_receive_initiator(&mut responder_state, &initiator_confirm)?;
-    if replay_confirmation {
+    if matches!(tamper, PairingTamper::ReplayConfirmation) {
         let mut replay = initiator_confirm.clone();
         replay[0].clone_from(&responder_confirm[0]);
         return responder_receive_initiator(&mut responder_state, &replay).map(|_| ());
@@ -1434,6 +1469,8 @@ fn run_in_process_pairing(
         display_name: responder.display_name.clone(),
         public_key: responder.public_key(),
         nonce: responder_state.local.nonce,
+        claim_port: responder_state.local.claim_port,
+        last_addr: None,
     };
     initiator.persist(&responder_identity)?;
     initiator_state.key.take();
@@ -1442,6 +1479,71 @@ fn run_in_process_pairing(
     window.state = PairingState::Paired;
     window.peer_instance_id = Some(initiator.identity.instance_id.clone());
     tracing::info!(event = "pairing_confirmed");
+    Ok(())
+}
+
+#[cfg(test)]
+fn tamper_responder_start(
+    responder_start: &mut [Vec<u8>],
+    tamper: PairingTamper,
+) -> Result<(), PairSessionError> {
+    match tamper {
+        PairingTamper::None | PairingTamper::ReplayConfirmation => {}
+        PairingTamper::Nonce => {
+            let PairFrame::PairHello { nonce, .. } = wire_to_frame(&responder_start[0])? else {
+                unreachable!("responder emits PairHello");
+            };
+            let mut nonce: [u8; NONCE_BYTES] = decode_exact(&nonce)?;
+            nonce[0] ^= 1;
+            let PairFrame::PairHello {
+                protocol_version,
+                role,
+                instance_id,
+                display_name,
+                window_id,
+                ..
+            } = wire_to_frame(&responder_start[0])?
+            else {
+                unreachable!("responder emits PairHello");
+            };
+            responder_start[0] = frame_for_wire(&PairFrame::PairHello {
+                protocol_version,
+                role,
+                instance_id,
+                display_name,
+                window_id,
+                nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
+            });
+        }
+        PairingTamper::Identity => {
+            let PairFrame::IdentityExchange {
+                ed25519_pub,
+                claim_port: _,
+            } = wire_to_frame(&responder_start[2])?
+            else {
+                unreachable!("responder emits identity exchange");
+            };
+            let mut public_key: [u8; 32] = decode_exact(&ed25519_pub)?;
+            public_key[0] ^= 1;
+            responder_start[2] = frame_for_wire(&PairFrame::IdentityExchange {
+                ed25519_pub: base64::engine::general_purpose::STANDARD.encode(public_key),
+                claim_port: None,
+            });
+        }
+        PairingTamper::ClaimPort => {
+            let PairFrame::IdentityExchange {
+                ed25519_pub,
+                claim_port,
+            } = wire_to_frame(&responder_start[2])?
+            else {
+                unreachable!("responder emits identity exchange");
+            };
+            responder_start[2] = frame_for_wire(&PairFrame::IdentityExchange {
+                ed25519_pub,
+                claim_port: claim_port.map(|port| port ^ 1),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1469,6 +1571,8 @@ fn transcript_for_initiator(state: &InitiatorState) -> Result<Vec<u8>, PairSessi
         &responder_public_key,
         &state.local.nonce,
         &responder_nonce,
+        state.local.claim_port,
+        state.remote_claim_port,
     )
     .map_err(|error| PairSessionError::Local(error.to_string()))
 }
@@ -1488,6 +1592,8 @@ fn transcript_for_responder(state: &ResponderState) -> Result<Vec<u8>, PairSessi
         &state.local.public_key,
         &state.remote.nonce,
         &state.local.nonce,
+        state.remote.claim_port,
+        state.local.claim_port,
     )
     .map_err(|error| PairSessionError::Local(error.to_string()))
 }
@@ -1632,6 +1738,17 @@ struct PairingHarness {
     window: PairingWindow,
     tamper_identity: bool,
     tamper_nonce: bool,
+    tamper_claim_port: bool,
+}
+
+#[cfg(test)]
+struct FixedClaimPortProvider(Option<u16>);
+
+#[cfg(test)]
+impl ClaimPortProvider for FixedClaimPortProvider {
+    fn claim_port(&self) -> Option<u16> {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -1675,10 +1792,25 @@ impl tracing::field::Visit for EventVisitor {
 #[cfg(test)]
 impl PairingHarness {
     fn new() -> Result<Self, PairSessionError> {
+        Self::new_with_claim_ports(None, None)
+    }
+
+    fn new_with_claim_ports(
+        initiator_claim_port: Option<u16>,
+        responder_claim_port: Option<u16>,
+    ) -> Result<Self, PairSessionError> {
         let root =
             tempfile::tempdir().map_err(|error| PairSessionError::Local(error.to_string()))?;
-        let initiator = LocalPeer::load(root.path().join("initiator"), "Office Mac".to_owned())?;
-        let responder = LocalPeer::load(root.path().join("responder"), "Living room".to_owned())?;
+        let initiator = LocalPeer::load_with_claim_port(
+            root.path().join("initiator"),
+            "Office Mac".to_owned(),
+            initiator_claim_port,
+        )?;
+        let responder = LocalPeer::load_with_claim_port(
+            root.path().join("responder"),
+            "Living room".to_owned(),
+            responder_claim_port,
+        )?;
         let (window, _) = PairingWindow::open(Duration::from_secs(300))?;
         Ok(Self {
             _root: root,
@@ -1687,6 +1819,7 @@ impl PairingHarness {
             window,
             tamper_identity: false,
             tamper_nonce: false,
+            tamper_claim_port: false,
         })
     }
 
@@ -1695,14 +1828,13 @@ impl PairingHarness {
     }
 
     fn complete_with_code(&mut self, code: &str) -> Result<(), PairSessionError> {
+        let tamper = self.tamper();
         run_in_process_pairing(
             &self.initiator,
             &self.responder,
             &mut self.window,
             code.as_bytes(),
-            self.tamper_identity,
-            self.tamper_nonce,
-            false,
+            tamper,
         )
     }
 
@@ -1714,16 +1846,30 @@ impl PairingHarness {
         self.tamper_nonce = true;
     }
 
+    fn tamper_next_responder_claim_port(&mut self) {
+        self.tamper_claim_port = true;
+    }
+
     fn replay_confirmation(&mut self, code: &str) -> Result<(), PairSessionError> {
         run_in_process_pairing(
             &self.initiator,
             &self.responder,
             &mut self.window,
             code.as_bytes(),
-            self.tamper_identity,
-            self.tamper_nonce,
-            true,
+            PairingTamper::ReplayConfirmation,
         )
+    }
+
+    fn tamper(&self) -> PairingTamper {
+        if self.tamper_identity {
+            PairingTamper::Identity
+        } else if self.tamper_nonce {
+            PairingTamper::Nonce
+        } else if self.tamper_claim_port {
+            PairingTamper::ClaimPort
+        } else {
+            PairingTamper::None
+        }
     }
 
     fn expire_window(&mut self) {
@@ -1856,6 +2002,22 @@ impl PairingHarness {
             responder.peers[0].instance_id,
             self.initiator.identity.instance_id
         );
+    }
+
+    fn peer_store_write_count(&self) -> usize {
+        usize::from(self.initiator.state_dir.join("peers.json").exists())
+            + usize::from(self.responder.state_dir.join("peers.json").exists())
+    }
+
+    fn assert_persisted_claim_ports(&self) {
+        let initiator =
+            dormant_core::peers::load_peer_store(&self.initiator.state_dir.join("peers.json"))
+                .expect("initiator peer store");
+        let responder =
+            dormant_core::peers::load_peer_store(&self.responder.state_dir.join("peers.json"))
+                .expect("responder peer store");
+        assert_eq!(initiator.peers[0].claim_port, self.responder.claim_port);
+        assert_eq!(responder.peers[0].claim_port, self.initiator.claim_port);
     }
 
     fn assert_nothing_persisted(&self) {
@@ -2491,6 +2653,38 @@ mod tests {
         pairing.complete_with_code(&code).unwrap();
 
         pairing.assert_mutual_persistence();
+        pairing.assert_persisted_claim_ports();
+    }
+
+    #[test]
+    fn claim_port_provider_supplies_the_local_pairing_port() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = PairingManager::new_with_claim_port_provider(
+            root.path(),
+            true,
+            Duration::from_secs(300),
+            Arc::new(FixedClaimPortProvider(Some(49152))),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .local_peer("Office Mac".to_owned())
+                .unwrap()
+                .claim_port,
+            Some(49152)
+        );
+    }
+
+    #[test]
+    fn claim_ports_pair_and_persist_after_key_confirmation() {
+        let mut pairing = PairingHarness::new_with_claim_ports(Some(49152), Some(49153)).unwrap();
+
+        let code = pairing.code().to_owned();
+        pairing.complete_with_code(&code).unwrap();
+
+        pairing.assert_mutual_persistence();
+        pairing.assert_persisted_claim_ports();
     }
 
     #[test]
@@ -2532,6 +2726,20 @@ mod tests {
         );
 
         pairing.assert_nothing_persisted();
+    }
+
+    #[test]
+    fn tampered_claim_port_fails_key_confirmation_without_persisting() {
+        let mut pairing = PairingHarness::new_with_claim_ports(Some(49152), Some(49153)).unwrap();
+        pairing.tamper_next_responder_claim_port();
+
+        let code = pairing.code().to_owned();
+        assert_wire_error!(
+            pairing.complete_with_code(&code),
+            PairError::KeyConfirmation
+        );
+
+        assert_eq!(pairing.peer_store_write_count(), 0);
     }
 
     #[test]

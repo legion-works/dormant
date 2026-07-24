@@ -356,6 +356,8 @@ pub fn build_pairing_transcript(
     responder_public_key: &[u8; 32],
     initiator_nonce: &[u8; 32],
     responder_nonce: &[u8; 32],
+    initiator_claim_port: Option<u16>,
+    responder_claim_port: Option<u16>,
 ) -> Result<Vec<u8>, PeerStoreError> {
     let mut transcript = Vec::with_capacity(
         2 + 4 * 2
@@ -394,6 +396,22 @@ pub fn build_pairing_transcript(
     transcript.extend_from_slice(responder_public_key);
     transcript.extend_from_slice(initiator_nonce);
     transcript.extend_from_slice(responder_nonce);
+    if initiator_claim_port.is_some() || responder_claim_port.is_some() {
+        append_length_prefixed(&mut transcript, "initiator", "initiator claim role")?;
+        append_length_prefixed(
+            &mut transcript,
+            initiator_instance_id,
+            "initiator claim instance_id",
+        )?;
+        append_claim_port(&mut transcript, initiator_claim_port);
+        append_length_prefixed(&mut transcript, "responder", "responder claim role")?;
+        append_length_prefixed(
+            &mut transcript,
+            responder_instance_id,
+            "responder claim instance_id",
+        )?;
+        append_claim_port(&mut transcript, responder_claim_port);
+    }
     Ok(transcript)
 }
 
@@ -462,6 +480,16 @@ fn append_length_prefixed(
     transcript.extend_from_slice(&length.to_be_bytes());
     transcript.extend_from_slice(value.as_bytes());
     Ok(())
+}
+
+fn append_claim_port(transcript: &mut Vec<u8>, claim_port: Option<u16>) {
+    match claim_port {
+        Some(port) => {
+            transcript.extend_from_slice(&2_u16.to_be_bytes());
+            transcript.extend_from_slice(&port.to_be_bytes());
+        }
+        None => transcript.extend_from_slice(&0_u16.to_be_bytes()),
+    }
 }
 
 fn atomic_write<F>(path: &Path, write: F) -> Result<(), PeerStoreError>
@@ -895,6 +923,8 @@ mod tests {
         responder_public_key: [u8; 32],
         initiator_nonce: [u8; 32],
         responder_nonce: [u8; 32],
+        initiator_claim_port: Option<u16>,
+        responder_claim_port: Option<u16>,
     }
 
     impl TranscriptInputs {
@@ -909,6 +939,8 @@ mod tests {
                 responder_public_key: [2; 32],
                 initiator_nonce: [3; 32],
                 responder_nonce: [4; 32],
+                initiator_claim_port: None,
+                responder_claim_port: None,
             }
         }
 
@@ -923,6 +955,8 @@ mod tests {
                 &self.responder_public_key,
                 &self.initiator_nonce,
                 &self.responder_nonce,
+                self.initiator_claim_port,
+                self.responder_claim_port,
             )
             .unwrap()
         }
@@ -963,6 +997,33 @@ mod tests {
     }
 
     #[test]
+    fn transcript_binds_role_labelled_claim_ports() {
+        let mut input = TranscriptInputs::canonical();
+        input.initiator_claim_port = Some(49152);
+        input.responder_claim_port = Some(49153);
+
+        let transcript = input.bytes();
+        assert_ne!(transcript, TranscriptInputs::canonical().bytes());
+        let expected_suffix = [
+            &[0, 9],
+            b"initiator".as_slice(),
+            &[0, 12],
+            b"initiator-id".as_slice(),
+            &[0, 2, 192, 0],
+            &[0, 9],
+            b"responder".as_slice(),
+            &[0, 12],
+            b"responder-id".as_slice(),
+            &[0, 2, 192, 1],
+        ]
+        .concat();
+        assert!(transcript.ends_with(&expected_suffix));
+
+        input.responder_claim_port = None;
+        assert!(input.bytes().ends_with(&[0, 0]));
+    }
+
+    #[test]
     fn transcript_binds_each_field() {
         let input = TranscriptInputs::canonical();
         let original = input.bytes();
@@ -992,8 +1053,14 @@ mod tests {
         let mut variant = input.clone();
         variant.initiator_nonce = [7; 32];
         changed.push(variant.bytes());
-        let mut variant = input;
+        let mut variant = input.clone();
         variant.responder_nonce = [8; 32];
+        changed.push(variant.bytes());
+        let mut variant = input.clone();
+        variant.initiator_claim_port = Some(49152);
+        changed.push(variant.bytes());
+        let mut variant = input;
+        variant.responder_claim_port = Some(49153);
         changed.push(variant.bytes());
 
         for changed in changed {

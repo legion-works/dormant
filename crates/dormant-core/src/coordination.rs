@@ -25,6 +25,10 @@ pub struct CoordRecord {
     pub panel_state: Option<PanelState>,
     /// Number of consecutive failed input-source reads since the last success.
     pub consecutive_failures: u32,
+    /// Instance ID of the peer that last claimed ownership of this display.
+    /// `None` when this instance owns the display or the owner is unknown.
+    /// Populated by the claim runtime on ownership transitions.
+    pub owner_instance_id: Option<String>,
 }
 
 impl CoordRecord {
@@ -35,6 +39,7 @@ impl CoordRecord {
             input_code: None,
             panel_state: None,
             consecutive_failures: 0,
+            owner_instance_id: None,
         }
     }
 }
@@ -115,6 +120,16 @@ impl CoordinationHandle {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Record which remote peer currently owns a shared display.
+    /// Called by the claim runtime when the local instance loses ownership
+    /// (a remote peer claimed it) or when ownership is observed via polling.
+    pub fn set_owner(&self, display: &DisplayId, instance_id: Option<String>) {
+        let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(record) = records.get_mut(display) {
+            record.owner_instance_id = instance_id;
+        }
     }
 
     /// Record an mDNS-discovered pairing peer independently of display ownership.

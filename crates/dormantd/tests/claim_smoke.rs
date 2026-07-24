@@ -418,6 +418,10 @@ struct ClaimHarness {
     _config_tx: watch::Sender<Arc<Config>>,
     _executors_tx: watch::Sender<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     local_identity: InstanceIdentity,
+    /// Coordination handle (daemon-lifetime, cloned before
+    /// passing to `ClaimRuntimeDeps`).  Tests access it to
+    /// set owner identity for the `IdleReport` sender gate.
+    coord: CoordinationHandle,
 }
 
 impl ClaimHarness {
@@ -473,7 +477,7 @@ impl ClaimHarness {
             executors: executors_rx,
             config: config_rx,
             hooks: hook_engine,
-            coordination: Some(coord),
+            coordination: Some(coord.clone()),
             front_ctl_tx,
             cancel: cancel.clone(),
             event_log: Some(log.clone()),
@@ -501,6 +505,7 @@ impl ClaimHarness {
             _config_tx: config_tx,
             _executors_tx: executors_tx,
             local_identity,
+            coord,
         }
     }
 
@@ -1462,6 +1467,191 @@ async fn owner_idle_policy_times_out_without_claim() {
     assert!(
         !harness.log_events().iter().any(|e| e == "claim_requested"),
         "OwnerIdle should NOT fire a claim when no IdleReport arrives; log = {:?}",
+        harness.log_events()
+    );
+}
+
+/// `IdleReport` from a non-owner peer must be REJECTED — the pending
+/// query must NOT resolve, and no `try_claim` fires.
+#[tokio::test]
+async fn non_owner_idle_report_is_rejected_by_handler() {
+    let display = "idle_owner_gate";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    // Set the coordination snapshot's expected owner to a specific
+    // instance ID so the IdleReport handler can gate on it.
+    let expected_owner = "owner-peer-1";
+    harness.coord.set_owner(
+        &DisplayId(display.to_owned()),
+        Some(expected_owner.to_owned()),
+    );
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+    let owner_idle_window = Duration::from_millis(500);
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::OwnerIdle,
+        owner_idle_window,
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    let found = harness
+        .wait_for_log_prefix("idle_query_sent", Duration::from_secs(3))
+        .await;
+    assert!(found, "runtime should log idle_query_sent");
+
+    let nonce = harness
+        .log_events()
+        .iter()
+        .find_map(|e| e.strip_prefix("idle_query_sent nonce=").map(str::to_owned))
+        .expect("idle_query_sent log entry must contain a nonce");
+
+    // Build a signed IdleReport from a NON-OWNER (different instance_id).
+    let attacker_signing = SigningKey::from_bytes(&[99; 32]);
+    let attacker_identity = InstanceIdentity {
+        instance_id: "attacker".to_owned(),
+        signing_key: attacker_signing.clone(),
+        verifying_key: attacker_signing.verifying_key(),
+    };
+    let fake_report = dormant_core::claim::IdleReport {
+        idle_ms: u64::try_from(owner_idle_window.as_millis() + 500).unwrap(),
+        counter: 1,
+        nonce: nonce.clone(),
+    };
+    let frame = ClaimFrame::sign(
+        &attacker_identity,
+        "attacker-epoch01".to_owned(),
+        harness.local_identity.instance_id.clone(),
+        "attacker-epoch01".to_owned(),
+        1,
+        nonce.clone(),
+        ClaimMessage::IdleReport(fake_report),
+    )
+    .expect("sign IdleReport frame");
+
+    // Inject via the signed-frame inbound path — this exercises the
+    // full handler, including the sender_instance_id gate.
+    harness
+        .handle
+        .inject_inbound_for_test(frame)
+        .await
+        .expect("inject_inbound_for_test must succeed");
+
+    // Give the evaluator time to process.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    evaluator_cancel.cancel();
+
+    assert!(
+        !harness.log_events().iter().any(|e| e == "claim_requested"),
+        "Non-owner IdleReport must be REJECTED; log = {:?}",
+        harness.log_events()
+    );
+}
+
+/// `IdleReport` from the EXPECTED owner must be ACCEPTED and
+/// resolve the pending query → `try_claim` fires.
+#[tokio::test]
+async fn matching_owner_idle_report_is_accepted() {
+    let display = "idle_owner_match";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    // Set the expected owner to match the IdleReport sender.
+    let expected_owner = "owner-peer-2";
+    harness.coord.set_owner(
+        &DisplayId(display.to_owned()),
+        Some(expected_owner.to_owned()),
+    );
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+    let owner_idle_window = Duration::from_millis(500);
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::OwnerIdle,
+        owner_idle_window,
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    let found = harness
+        .wait_for_log_prefix("idle_query_sent", Duration::from_secs(3))
+        .await;
+    assert!(found);
+
+    let nonce = harness
+        .log_events()
+        .iter()
+        .find_map(|e| e.strip_prefix("idle_query_sent nonce=").map(str::to_owned))
+        .expect("idle_query_sent log entry must contain a nonce");
+
+    // Build a signed IdleReport from the MATCHING owner.
+    let owner_signing = SigningKey::from_bytes(&[77; 32]);
+    let owner_identity = InstanceIdentity {
+        instance_id: expected_owner.to_owned(),
+        signing_key: owner_signing.clone(),
+        verifying_key: owner_signing.verifying_key(),
+    };
+    let real_report = dormant_core::claim::IdleReport {
+        idle_ms: u64::try_from(owner_idle_window.as_millis() + 500).unwrap(),
+        counter: 1,
+        nonce: nonce.clone(),
+    };
+    let frame = ClaimFrame::sign(
+        &owner_identity,
+        "00wner-epoch-001".to_owned(),
+        harness.local_identity.instance_id.clone(),
+        "00wner-epoch-001".to_owned(),
+        1,
+        nonce.clone(),
+        ClaimMessage::IdleReport(real_report),
+    )
+    .expect("sign IdleReport frame");
+
+    harness
+        .handle
+        .inject_inbound_for_test(frame)
+        .await
+        .expect("inject_inbound_for_test must succeed");
+
+    let claimed = harness
+        .wait_for_log("claim_requested", Duration::from_secs(3))
+        .await;
+    evaluator_cancel.cancel();
+    assert!(
+        claimed,
+        "Matching-owner IdleReport must fire a claim; log = {:?}",
         harness.log_events()
     );
 }

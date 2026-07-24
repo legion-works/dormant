@@ -605,10 +605,10 @@ struct Driver {
     /// with the local idle duration.
     #[allow(dead_code, reason = "consumed by IdleQuery handler")]
     idle_rx: Option<crate::idle_observation::IdleObservationRx>,
-    /// Pending idle queries keyed by nonce. The requester inserts a
-    /// oneshot sender when sending an `IdleQuery`; the inbound
-    /// `IdleReport` handler resolves it with the reported `idle_ms`.
-    pending_idle_queries: HashMap<String, tokio::sync::oneshot::Sender<u64>>,
+    /// Pending idle queries keyed by nonce.  Each entry carries the
+    /// queried display so the `IdleReport` handler can verify the
+    /// sender is the expected owner.
+    pending_idle_queries: HashMap<String, (DisplayId, tokio::sync::oneshot::Sender<u64>)>,
 }
 
 impl Driver {
@@ -679,7 +679,9 @@ impl Driver {
             }
             #[cfg(any(test, feature = "test-util"))]
             RuntimeEvent::InjectIdleReport { nonce, idle_ms } => {
-                if let Some(tx) = self.pending_idle_queries.remove(&nonce) {
+                // Test seam: directly resolve a pending idle query
+                // without the signed-frame transport.
+                if let Some((_display, tx)) = self.pending_idle_queries.remove(&nonce) {
                     let _ = tx.send(idle_ms);
                 }
             }
@@ -838,10 +840,18 @@ impl Driver {
                 self.record_event("idle_report_sent");
             }
             ClaimMessage::IdleReport(report) => {
-                // Requester side: the report only arrives from a peer who
-                // passed the ownership gate above — accept it.
-                if let Some(tx) = self.pending_idle_queries.remove(&report.nonce) {
-                    let _ = tx.send(report.idle_ms);
+                // Requester side: resolve the pending query only if the
+                // sender is the expected owner of the queried display.
+                if let Some((display, tx)) = self.pending_idle_queries.remove(&report.nonce) {
+                    let sender_is_expected_owner = self
+                        .coordination
+                        .as_ref()
+                        .and_then(|c| c.snapshot().get(&display).cloned())
+                        .and_then(|r| r.owner_instance_id)
+                        .is_none_or(|oid| oid == sender_instance_id);
+                    if sender_is_expected_owner {
+                        let _ = tx.send(report.idle_ms);
+                    }
                 }
             }
         }
@@ -1096,8 +1106,10 @@ impl Driver {
         // SEC-4: prune stale entries before inserting — a timed-out
         // query leaves a dead sender in the map.  Sweep before every insert
         // to keep the map bounded.
-        self.pending_idle_queries.retain(|_k, v| !v.is_closed());
-        self.pending_idle_queries.insert(nonce.clone(), resp_tx);
+        self.pending_idle_queries
+            .retain(|_k, (_display, tx)| !tx.is_closed());
+        self.pending_idle_queries
+            .insert(nonce.clone(), (display.clone(), resp_tx));
         // Log the nonce so tests can observe it and inject a matching
         // IdleReport via the test seam.
         {

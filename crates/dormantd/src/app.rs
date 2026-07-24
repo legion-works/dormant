@@ -958,6 +958,11 @@ impl App {
         let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
         let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
 
+        // Daemon-lifetime idle-observation channel — the stock idle source
+        // publishes real activity timestamps into the tx half; the
+        // activity-claim policy evaluator consumes the rx half.
+        let (idle_obs_tx, _idle_obs_rx) = crate::idle_observation::idle_observation_channel();
+
         // KVM claim runtime — daemon-lifetime. Spawned BESIDE the
         // claim transport (both survive reload). The driver
         // composes the transport / hook engine / executor /
@@ -1010,6 +1015,7 @@ impl App {
             executors_rx.clone(),
             GenerationId(0),
             Some(self.observations.clone()),
+            Some(idle_obs_tx.clone()),
         )?;
         self.observations
             .emit(DaemonObservation::GenerationStarted {
@@ -1254,6 +1260,7 @@ impl App {
             _coordination_mdns: None,
             claim_transport: claim_transport.clone(),
             claim_runtime: claim_runtime.clone(),
+            idle_obs_tx: Some(idle_obs_tx.clone()),
             coordination_enabled_tx,
             claim_presence_handle,
             sd: self.sd_notify,
@@ -1591,6 +1598,10 @@ struct Runner {
     /// install to republish the resolved `KvmStatus` and to
     /// fan the post-install `DaemonEvent::ConfigReloaded`.
     claim_runtime: Option<ClaimRuntimeHandle>,
+    /// Daemon-lifetime idle-observation tx — the stock idle source
+    /// publishes into this channel; carried across reloads so
+    /// the activity-claim policy evaluator always sees current data.
+    idle_obs_tx: Option<crate::idle_observation::IdleObservationTx>,
     coordination_enabled_tx: watch::Sender<bool>,
     /// Daemon-lifetime passive claim-presence browser and advertisement loop.
     claim_presence_handle: Option<JoinHandle<()>>,
@@ -2201,6 +2212,7 @@ impl Runner {
             self.executors_tx.subscribe(),
             next_generation,
             Some(self.observations.clone()),
+            self.idle_obs_tx.clone(),
         );
         // Test seam (F1): see `App::force_reload_spawn_failure` doc — no
         // config-only path reaches an `Err` here, so a test that needs to
@@ -2516,6 +2528,7 @@ impl Runner {
             self.executors_tx.subscribe(),
             self.generation_id,
             Some(self.observations.clone()),
+            self.idle_obs_tx.clone(),
         );
         #[cfg(any(test, feature = "test-util"))]
         let spawn_result = if self.force_rebuild_old_spawn_failure {
@@ -3970,6 +3983,7 @@ fn spawn_generation(
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
 ) -> Result<GenSpawn> {
     let engine_token = root.child_token();
     let engine_cancel = engine_token.clone();
@@ -4071,6 +4085,7 @@ fn spawn_generation(
         idle_source,
         idle_unit,
         macos_guard_cfg,
+        idle_tx,
         ctl_tx.clone(),
         producer_token.clone(),
     ) {
@@ -4214,6 +4229,7 @@ fn spawn_generation_for_reload(
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
 ) -> Result<GenSpawn> {
     #[cfg(any(test, feature = "test-util"))]
     record_reload_spawn_rollback_for_test(state_dir, rollback.as_ref());
@@ -4232,6 +4248,7 @@ fn spawn_generation_for_reload(
         executors_rx,
         generation_id,
         observations,
+        idle_tx,
     )
 }
 
@@ -5618,6 +5635,7 @@ mod restore_tests {
             owned: true,
             observed_input_code: None,
             panel_state: None,
+            claim_armed_remaining_ms: None,
         }
     }
 
@@ -6148,6 +6166,7 @@ mod gamma_reload_tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
+                    claim_armed_remaining_ms: None,
                 },
             )],
             pending_reload: None,

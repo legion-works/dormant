@@ -254,6 +254,7 @@ pub(crate) async fn macos_run<C: MacosIdleClock>(
     rules: Vec<ActivityRule>,
     poll_interval: Duration,
     mut guard: MacosIdleGuard,
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) {
@@ -268,6 +269,15 @@ pub(crate) async fn macos_run<C: MacosIdleClock>(
                         tracing::info!(event = "idle_source_recovered");
                     }
                     let idle_dur = Duration::from_secs_f64(idle);
+                    if let Some(ref tx) = idle_tx {
+                        let now = Instant::now();
+                        let last_activity = now.checked_sub(idle_dur);
+                        let _ = tx.send(crate::idle_observation::IdleObservation {
+                            last_activity,
+                            observed_at: now,
+                            available: true,
+                        });
+                    }
                     for r in &rules {
                         let inhibited = idle_dur < r.idle_threshold;
                         publish(&ctl, &mut last_sent, &r.rule, inhibited);
@@ -285,6 +295,13 @@ pub(crate) async fn macos_run<C: MacosIdleClock>(
                         );
                     }
                     set_all_inactive(&ctl, &mut last_sent, &rules);
+                    if let Some(ref tx) = idle_tx {
+                        let _ = tx.send(crate::idle_observation::IdleObservation {
+                            last_activity: None,
+                            observed_at: Instant::now(),
+                            available: false,
+                        });
+                    }
                 }
             },
             Err(e) => {
@@ -294,6 +311,13 @@ pub(crate) async fn macos_run<C: MacosIdleClock>(
                     "macos idle probe failed; treating user as inactive",
                 );
                 set_all_inactive(&ctl, &mut last_sent, &rules);
+                if let Some(ref tx) = idle_tx {
+                    let _ = tx.send(crate::idle_observation::IdleObservation {
+                        last_activity: None,
+                        observed_at: Instant::now(),
+                        available: false,
+                    });
+                }
             }
         }
 
@@ -355,6 +379,8 @@ pub struct MacosIdleSource {
     rules: Vec<ActivityRule>,
     poll_interval: Duration,
     guard_cfg: MacosIdleGuardConfig,
+    /// Daemon-lifetime idle-observation channel for the activity-claim policy.
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
 }
 
 #[cfg(target_os = "macos")]
@@ -365,11 +391,13 @@ impl MacosIdleSource {
         rules: Vec<ActivityRule>,
         poll_interval: Duration,
         guard_cfg: MacosIdleGuardConfig,
+        idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     ) -> Self {
         Self {
             rules,
             poll_interval,
             guard_cfg,
+            idle_tx,
         }
     }
 }
@@ -388,6 +416,7 @@ impl crate::idle_source::IdleSource for MacosIdleSource {
             self.rules,
             self.poll_interval,
             guard,
+            self.idle_tx,
             ctl,
             cancel,
         )
@@ -511,6 +540,7 @@ mod tests {
                 rules,
                 Duration::from_millis(5),
                 guard,
+                None,
                 ctl,
                 cancel_clone,
             )
@@ -686,6 +716,7 @@ mod tests {
                 rules,
                 Duration::from_millis(5),
                 guard,
+                None,
                 ctl,
                 cancel_clone,
             )
@@ -723,6 +754,7 @@ mod tests {
                     rules,
                     Duration::from_millis(5),
                     guard,
+                    None,
                     ctl,
                     cancel_clone,
                 )

@@ -1,10 +1,14 @@
 //! Signed peer-claim messages, replay protection, and deadline policy.
 
+use crate::config::ActivityClaimPolicy;
 use crate::peers::{InstanceIdentity, PeerRecord};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer as _, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 /// Validated fixed-width boot epoch used by the claim protocol.
@@ -848,5 +852,376 @@ mod tests {
             json.iter()
                 .all(|frame| frame.contains("recipient_instance_id"))
         );
+    }
+}
+
+// ── Activity-claim policy logic ────────────────────────────────────────────────
+
+/// Decision from the activity-claim policy for one activity edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityClaimDecision {
+    /// No claim — the policy conditions are not met.
+    Ignore,
+    /// Initiate a direct claim.
+    Claim,
+    /// Query the owner's idle state before deciding.
+    QueryOwnerIdle,
+}
+
+/// Pure state machine for the activity-claim policy layer.
+///
+/// Timing is injected by the caller — no real clocks in pure logic.
+/// The caller supplies `now` for every decision point and maintains
+/// the arm deadline across generation reloads.
+#[derive(Debug, Clone)]
+#[allow(dead_code, reason = "windows are read by integration layer")]
+pub struct ActivityClaimState {
+    policy: ActivityClaimPolicy,
+    owner_idle_window: Duration,
+    armed_window: Duration,
+}
+
+impl ActivityClaimState {
+    /// Create a fresh policy state from config values.
+    #[must_use]
+    pub fn new(
+        policy: ActivityClaimPolicy,
+        owner_idle_window: Duration,
+        armed_window: Duration,
+    ) -> Self {
+        Self {
+            policy,
+            owner_idle_window,
+            armed_window,
+        }
+    }
+
+    /// Evaluate the policy for a non-owner activity edge.
+    ///
+    /// `owner_idle` — whether the observed owner-idle state meets the window.
+    /// `armed_until` — the arm deadline; `None` when not armed or expired.
+    #[must_use]
+    pub fn decide(
+        &self,
+        owner_idle: bool,
+        armed_until: Option<Instant>,
+        now: Instant,
+    ) -> ActivityClaimDecision {
+        match self.policy {
+            ActivityClaimPolicy::Off => ActivityClaimDecision::Ignore,
+            ActivityClaimPolicy::Edge => ActivityClaimDecision::Claim,
+            ActivityClaimPolicy::OwnerIdle => {
+                if owner_idle {
+                    ActivityClaimDecision::Claim
+                } else {
+                    ActivityClaimDecision::QueryOwnerIdle
+                }
+            }
+            ActivityClaimPolicy::Armed => {
+                if Self::is_armed(armed_until, now) {
+                    ActivityClaimDecision::Claim
+                } else {
+                    ActivityClaimDecision::Ignore
+                }
+            }
+        }
+    }
+
+    /// Whether the arm window is still open at `now`.
+    #[must_use]
+    pub fn is_armed(armed_until: Option<Instant>, now: Instant) -> bool {
+        armed_until.is_some_and(|d| now < d)
+    }
+
+    /// Remaining arm duration as milliseconds, serialisable for the snapshot.
+    #[must_use]
+    pub fn armed_remaining_ms(armed_until: Option<Instant>, now: Instant) -> Option<u64> {
+        let deadline = armed_until?;
+        if now >= deadline {
+            return None;
+        }
+        let ms = deadline.saturating_duration_since(now).as_millis();
+        // Saturate at u64::MAX — arm windows are minutes at most.
+        Some(u64::try_from(ms).unwrap_or(u64::MAX))
+    }
+
+    /// The configured policy. Useful for snapshot / status consumers.
+    #[must_use]
+    pub fn policy(&self) -> ActivityClaimPolicy {
+        self.policy
+    }
+
+    /// The owner-idle window threshold.
+    #[must_use]
+    pub fn owner_idle_window(&self) -> Duration {
+        self.owner_idle_window
+    }
+
+    /// Compute the owner-idle deadline for the arm.
+    #[must_use]
+    #[allow(unused_variables)]
+    pub fn arm_deadline(now: Instant) -> Option<Instant> {
+        // The arm deadline is set by the claim runtime when arming.
+        // In the pure logic, we only check it; the caller sets it.
+        None
+    }
+}
+
+#[cfg(test)]
+mod activity_claim_tests {
+    use super::*;
+    use crate::config::ActivityClaimPolicy;
+
+    // ── Policy transition table ───────────────────────────────────────────
+
+    #[test]
+    fn activity_policy_matrix() {
+        let cases = [
+            (ActivityClaimPolicy::Off, false, false, false),
+            (ActivityClaimPolicy::Off, false, true, false),
+            (ActivityClaimPolicy::Off, true, false, false),
+            (ActivityClaimPolicy::Off, true, true, false),
+            (ActivityClaimPolicy::Edge, false, false, true),
+            (ActivityClaimPolicy::Edge, false, true, true),
+            (ActivityClaimPolicy::Edge, true, false, true),
+            (ActivityClaimPolicy::Edge, true, true, true),
+            (ActivityClaimPolicy::OwnerIdle, true, false, true),
+            (ActivityClaimPolicy::OwnerIdle, true, true, true),
+            (ActivityClaimPolicy::OwnerIdle, false, false, false),
+            (ActivityClaimPolicy::OwnerIdle, false, true, false),
+            (ActivityClaimPolicy::Armed, false, true, true),
+            (ActivityClaimPolicy::Armed, true, true, true),
+            (ActivityClaimPolicy::Armed, false, false, false),
+            (ActivityClaimPolicy::Armed, true, false, false),
+        ];
+
+        let now = Instant::now();
+        for (policy, owner_idle, armed, expected_claims) in cases {
+            let state =
+                ActivityClaimState::new(policy, Duration::from_secs(30), Duration::from_secs(60));
+            let armed_until = if armed {
+                Some(now + Duration::from_secs(30))
+            } else {
+                None
+            };
+            let decision = state.decide(owner_idle, armed_until, now);
+            let claims = matches!(decision, ActivityClaimDecision::Claim);
+            assert_eq!(
+                claims, expected_claims,
+                "policy={policy:?} owner_idle={owner_idle} armed={armed}"
+            );
+        }
+    }
+
+    // ── Armed-window expiry ───────────────────────────────────────────────
+
+    #[test]
+    fn armed_does_not_claim_after_expiry() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::Armed,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let now = Instant::now();
+        let armed_until = Some(now + Duration::from_secs(1));
+
+        // Before expiry — claims.
+        assert_eq!(
+            state.decide(false, armed_until, now),
+            ActivityClaimDecision::Claim
+        );
+
+        // After expiry — no claim.
+        assert_eq!(
+            state.decide(false, armed_until, now + Duration::from_secs(2)),
+            ActivityClaimDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn armed_does_not_one_shot_consume() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::Armed,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let now = Instant::now();
+        let armed_until = Some(now + Duration::from_secs(300));
+
+        // Multiple edges all claim while armed.
+        for i in 0..5 {
+            assert_eq!(
+                state.decide(false, armed_until, now + Duration::from_secs(i * 10)),
+                ActivityClaimDecision::Claim,
+                "edge {i}"
+            );
+        }
+    }
+
+    // ── Armed survival across generation reload ───────────────────────────
+
+    #[test]
+    fn armed_state_survives_reload() {
+        // The armed_until Instant is daemon-lifetime (held in
+        // ClaimRuntimeHandle::armed).  A generation reload creates a new
+        // ActivityClaimState from config but the armed_until survives.
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::Armed,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let now = Instant::now();
+        let armed_until = Some(now + Duration::from_secs(300));
+
+        // Old generation would claim.
+        assert_eq!(
+            state.decide(false, armed_until, now + Duration::from_secs(10)),
+            ActivityClaimDecision::Claim
+        );
+
+        // Reload: new state, same armed_until (carried forward by the daemon).
+        let reloaded = ActivityClaimState::new(
+            ActivityClaimPolicy::Armed,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            reloaded.decide(false, armed_until, now + Duration::from_secs(10)),
+            ActivityClaimDecision::Claim
+        );
+
+        // Still armed after another 30s.
+        assert_eq!(
+            reloaded.decide(false, armed_until, now + Duration::from_secs(40)),
+            ActivityClaimDecision::Claim
+        );
+    }
+
+    // ── Owner-idle threshold ──────────────────────────────────────────────
+
+    #[test]
+    fn owner_idle_policy_queries_when_owner_not_known_idle() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::OwnerIdle,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        // owner_idle=false → must query first.
+        assert_eq!(
+            state.decide(false, None, Instant::now()),
+            ActivityClaimDecision::QueryOwnerIdle
+        );
+    }
+
+    #[test]
+    fn owner_idle_policy_claims_when_owner_known_idle() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::OwnerIdle,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            state.decide(true, None, Instant::now()),
+            ActivityClaimDecision::Claim
+        );
+    }
+
+    #[test]
+    fn off_policy_never_claims() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::Off,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let now = Instant::now();
+        for (owner_idle, armed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let armed_until = if armed {
+                Some(now + Duration::from_secs(30))
+            } else {
+                None
+            };
+            assert_eq!(
+                state.decide(owner_idle, armed_until, now),
+                ActivityClaimDecision::Ignore,
+                "owner_idle={owner_idle} armed={armed}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_policy_always_claims_regardless_of_flags() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::Edge,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let now = Instant::now();
+        for (owner_idle, armed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let armed_until = if armed {
+                Some(now + Duration::from_secs(30))
+            } else {
+                None
+            };
+            assert_eq!(
+                state.decide(owner_idle, armed_until, now),
+                ActivityClaimDecision::Claim,
+                "owner_idle={owner_idle} armed={armed}"
+            );
+        }
+    }
+
+    // ── armed_remaining_ms ────────────────────────────────────────────────
+
+    #[test]
+    fn armed_remaining_ms_is_serialisable() {
+        let now = Instant::now();
+        let armed_until = Some(now + Duration::from_secs(45));
+
+        let remaining = ActivityClaimState::armed_remaining_ms(armed_until, now);
+        // 45s in ms, within ±1s of precision.
+        assert!(remaining.is_some());
+        let ms = remaining.unwrap();
+        assert!((44_000..=45_000).contains(&ms), "remaining={ms}");
+
+        // After expiry → None.
+        let after = now + Duration::from_secs(46);
+        assert_eq!(
+            ActivityClaimState::armed_remaining_ms(armed_until, after),
+            None
+        );
+
+        // Not armed → None.
+        assert_eq!(ActivityClaimState::armed_remaining_ms(None, now), None);
+    }
+
+    #[test]
+    fn is_armed_respects_deadline() {
+        let now = Instant::now();
+        let armed_until = Some(now + Duration::from_secs(1));
+        assert!(ActivityClaimState::is_armed(armed_until, now));
+        assert!(!ActivityClaimState::is_armed(
+            armed_until,
+            now + Duration::from_secs(2)
+        ));
+        assert!(!ActivityClaimState::is_armed(None, now));
+    }
+
+    #[test]
+    fn duplicate_edges_all_claim_under_edge_policy() {
+        let state = ActivityClaimState::new(
+            ActivityClaimPolicy::Edge,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let now = Instant::now();
+        // Ten edges in rapid succession — policy only dictates yes/no;
+        // daemon-layer single-flight (F10) deduplicates.
+        for i in 0..10 {
+            assert_eq!(
+                state.decide(false, None, now + Duration::from_millis(i * 10)),
+                ActivityClaimDecision::Claim,
+                "edge {i}"
+            );
+        }
     }
 }

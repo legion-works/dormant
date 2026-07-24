@@ -600,6 +600,7 @@ mod tests {
                                     wake_attempts: 0,
                                     last_blank_failed: false,
                                     stage: None,
+                                    claim_armed_remaining_ms: None,
                                 },
                             )],
                             pending_reload: None,

@@ -552,6 +552,11 @@ pub struct DisplaySnapshot {
     /// omitted when `None`, byte-identical to a pre-stage snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<StageInfo>,
+    /// Remaining arm window in milliseconds for the `armed` activity-claim
+    /// policy. `None` when not armed or the display has no claim capability.
+    /// Computed from the monotonic expiry at snapshot time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_armed_remaining_ms: Option<u64>,
 }
 
 const fn default_owned() -> bool {
@@ -1841,6 +1846,7 @@ impl RulesEngine {
                         wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
                         last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
                         stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
+                        claim_armed_remaining_ms: None,
                     },
                 ));
             }
@@ -2997,6 +3003,7 @@ mod tests {
             wake_attempts: 0,
             last_blank_failed: false,
             stage: None,
+            claim_armed_remaining_ms: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("stage"));
@@ -3021,6 +3028,7 @@ mod tests {
                 idx: 1,
                 kind: StageKind::RenderBlack,
             }),
+            claim_armed_remaining_ms: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         // Wire shape: idx=1, kind="render_black"

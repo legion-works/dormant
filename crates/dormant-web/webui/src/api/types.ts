@@ -131,6 +131,9 @@ export interface DisplaySnapshot {
   last_blank_failed?: boolean;
   /** Present only when the display is in the `staged` phase. */
   stage?: { idx: number; kind: StageKind } | null;
+  /** Remaining arm window in milliseconds for the `armed` activity-claim
+   * policy. Absent when not armed or on legacy wire. */
+  claim_armed_remaining_ms?: number;
 }
 
 /** rust: rules.rs RollbackStatus */

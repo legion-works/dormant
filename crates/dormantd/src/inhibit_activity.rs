@@ -26,16 +26,24 @@ pub use crate::idle_source::ActivityRule;
 ///
 /// Returns `None` (spawning nothing) when no rule declares `user-activity`.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     rules: Vec<ActivityRule>,
     poll_interval: Duration,
     idlesrc: dormant_core::config::IdleSource,
     unit: IdleTimeUnit,
     macos_guard_cfg: crate::macos_idle::MacosIdleGuardConfig,
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let source =
-        crate::idle_source::create_source(idlesrc, rules, poll_interval, unit, macos_guard_cfg)?;
+    let source = crate::idle_source::create_source(
+        idlesrc,
+        rules,
+        poll_interval,
+        unit,
+        macos_guard_cfg,
+        idle_tx,
+    )?;
     Some(tokio::spawn(async move { source.run(ctl, cancel).await }))
 }

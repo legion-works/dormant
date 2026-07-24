@@ -7,6 +7,29 @@ use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, time::Duration};
 use thiserror::Error;
 
+/// Validated fixed-width boot epoch used by the claim protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Epoch(String);
+
+impl Epoch {
+    /// Return the epoch's canonical wire representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for Epoch {
+    type Error = ClaimFrameError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.len() != 16 || value.as_bytes().iter().all(|byte| *byte == 0) {
+            return Err(ClaimFrameError::InvalidEpoch);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
 /// Claim protocol version bound into every signature.
 pub const CLAIM_PROTOCOL_VERSION: u16 = 1;
 
@@ -460,7 +483,7 @@ fn append_string(
 mod tests {
     use super::{
         ClaimAbort, ClaimDeniedReason, ClaimFrame, ClaimFrameError, ClaimMessage, ClaimRequest,
-        ClaimResponse, ClaimVerdict, IdleQuery, IdleReport, ReleaseFailed, ReplayWindow,
+        ClaimResponse, ClaimVerdict, Epoch, IdleQuery, IdleReport, ReleaseFailed, ReplayWindow,
         release_deadline,
     };
     use crate::peers::{InstanceIdentity, PeerRecord, instance_id_from_public_key};
@@ -520,6 +543,19 @@ mod tests {
         assert!(!seen.accept(7));
         assert!(!seen.accept(6));
         assert!(seen.accept(8));
+    }
+
+    #[test]
+    fn epoch_accepts_only_nonzero_fixed_width_values() {
+        assert_eq!(
+            Epoch::try_from("valid-epoch-0001").unwrap().as_str(),
+            "valid-epoch-0001"
+        );
+        assert_eq!(Epoch::try_from("short"), Err(ClaimFrameError::InvalidEpoch));
+        assert_eq!(
+            Epoch::try_from("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+            Err(ClaimFrameError::InvalidEpoch)
+        );
     }
 
     #[test]

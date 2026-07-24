@@ -1,0 +1,857 @@
+//! Authenticated claim-protocol transport over bounded TCP connections.
+//!
+//! A connection carries exactly one signed frame and may carry at most one response. The
+//! supervisor authenticates inbound frames before handing them to application code; callers send
+//! best-effort responses through the single-peer methods.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use dormant_core::{
+    claim::{ClaimFrame, Epoch, ReplayWindow},
+    peers::{InstanceIdentity, PeerRecord},
+};
+use ed25519_dalek::VerifyingKey;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{Semaphore, mpsc, oneshot, watch},
+    task::{JoinHandle, JoinSet},
+};
+
+use crate::coordination_frame::{read_frame, write_frame};
+
+const MAX_PREAUTH_CONNECTIONS: usize = 4;
+const MAX_CONNECTIONS_PER_IP_MINUTE: usize = 10;
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Paired identity and last known claim endpoint used by the transport.
+#[derive(Debug, Clone)]
+pub struct ClaimPeer {
+    /// Stable instance ID derived from the peer's verifying key.
+    pub instance_id: String,
+    /// Ed25519 key ratified by pairing.
+    pub verifying_key: VerifyingKey,
+    /// Last observed peer address; only its IP is used for claim dialing.
+    pub last_addr: Option<SocketAddr>,
+    /// Claim listener port advertised by the peer.
+    pub claim_port: Option<u16>,
+}
+
+/// Fully injected dependencies for a claim transport supervisor.
+pub struct ClaimTransportDeps {
+    /// Local paired-instance identity.
+    pub identity: Arc<InstanceIdentity>,
+    /// Validated epoch for this daemon run.
+    pub boot_epoch: Epoch,
+    /// Live paired-peer snapshot.
+    pub peers: watch::Receiver<Vec<ClaimPeer>>,
+    /// Address used for listener binds.
+    pub bind_address: IpAddr,
+    /// Requested listener port; `None` or zero requests an ephemeral port.
+    pub fixed_port: Option<u16>,
+    /// Persists an authenticated peer's freshly observed remote address.
+    pub on_peer_addr: Box<dyn Fn(String, SocketAddr) + Send + Sync>,
+}
+
+/// Control surface for the claim listener supervisor.
+pub struct ClaimTransportHandle {
+    commands: mpsc::Sender<Command>,
+    inbound: Mutex<Option<mpsc::Receiver<ClaimFrame>>>,
+    port: Arc<AtomicU16>,
+    peers: Arc<RwLock<Vec<ClaimPeer>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+enum Command {
+    Ensure(oneshot::Sender<io::Result<u16>>),
+    Release,
+    Update {
+        address: IpAddr,
+        port: Option<u16>,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+    Shutdown(oneshot::Sender<()>),
+}
+
+struct Supervisor {
+    identity: Arc<InstanceIdentity>,
+    boot_epoch: Epoch,
+    peer_watch: watch::Receiver<Vec<ClaimPeer>>,
+    peers: Arc<RwLock<Vec<ClaimPeer>>>,
+    bind_address: IpAddr,
+    fixed_port: Option<u16>,
+    provisional_hold: bool,
+    listener: Option<TcpListener>,
+    port: Arc<AtomicU16>,
+    commands: mpsc::Receiver<Command>,
+    inbound: mpsc::Sender<ClaimFrame>,
+    on_peer_addr: Arc<dyn Fn(String, SocketAddr) + Send + Sync>,
+    replay: Arc<Mutex<HashMap<String, ReplayWindow>>>,
+}
+
+/// Spawn a parked claim transport supervisor.
+#[must_use]
+pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
+    let initial_peers = deps.peers.borrow().clone();
+    let peers = Arc::new(RwLock::new(initial_peers));
+    let port = Arc::new(AtomicU16::new(0));
+    let (command_tx, command_rx) = mpsc::channel(16);
+    let (inbound_tx, inbound_rx) = mpsc::channel(32);
+    let supervisor = Supervisor {
+        identity: deps.identity,
+        boot_epoch: deps.boot_epoch,
+        peer_watch: deps.peers,
+        peers: Arc::clone(&peers),
+        bind_address: deps.bind_address,
+        fixed_port: normalize_port(deps.fixed_port),
+        provisional_hold: false,
+        listener: None,
+        port: Arc::clone(&port),
+        commands: command_rx,
+        inbound: inbound_tx,
+        on_peer_addr: Arc::from(deps.on_peer_addr),
+        replay: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let task = tokio::spawn(supervisor.run());
+    ClaimTransportHandle {
+        commands: command_tx,
+        inbound: Mutex::new(Some(inbound_rx)),
+        port,
+        peers,
+        task: Mutex::new(Some(task)),
+    }
+}
+
+impl ClaimTransportHandle {
+    /// Bind the listener if parked and retain it independently of peer count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the socket bind error or [`io::ErrorKind::BrokenPipe`] if the supervisor stopped.
+    pub async fn ensure_provisional_listener(&self) -> io::Result<u16> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Ensure(reply_tx))
+            .await
+            .map_err(|_| supervisor_stopped())?;
+        reply_rx.await.map_err(|_| supervisor_stopped())?
+    }
+
+    /// Release the provisional hold, parking only when the peer snapshot is empty.
+    pub async fn release_provisional(&self) {
+        let _ = self.commands.send(Command::Release).await;
+    }
+
+    /// Return the active listener port, or `None` while parked.
+    #[must_use]
+    pub fn provisional_port(&self) -> Option<u16> {
+        match self.port.load(Ordering::Acquire) {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    /// Rebind using provisional-bind, swap, then close-old ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bind error without disturbing the active listener.
+    pub async fn update_bind(&self, address: IpAddr, port: Option<u16>) -> io::Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Update {
+                address,
+                port: normalize_port(port),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| supervisor_stopped())?;
+        reply_rx.await.map_err(|_| supervisor_stopped())?
+    }
+
+    /// Take the sole receiver for authenticated inbound frames.
+    #[must_use]
+    pub fn inbound(&self) -> mpsc::Receiver<ClaimFrame> {
+        self.inbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| mpsc::channel(1).1)
+    }
+
+    /// Concurrently send one signed request to every peer with a usable endpoint.
+    pub async fn fanout_request(&self, frame: ClaimFrame) {
+        let peers = self.peer_snapshot();
+        let mut dials = JoinSet::new();
+        for peer in peers {
+            let Some(address) = peer_endpoint(&peer) else {
+                tracing::info!(event = "claim_peer_no_port", peer = %peer.instance_id);
+                continue;
+            };
+            let frame = frame.clone();
+            dials.spawn(async move {
+                let _ = send_frame(address, &frame).await;
+            });
+        }
+        while dials.join_next().await.is_some() {}
+    }
+
+    /// Best-effort delivery of a signed claim-abort frame to one peer.
+    pub async fn send_abort(&self, peer_instance_id: &str, frame: &ClaimFrame) {
+        self.send_to_peer(peer_instance_id, frame).await;
+    }
+
+    /// Best-effort delivery of a signed release-failed frame to one peer.
+    pub async fn send_release_failed(&self, peer_instance_id: &str, frame: &ClaimFrame) {
+        self.send_to_peer(peer_instance_id, frame).await;
+    }
+
+    /// Stop the supervisor and close its listener and channels.
+    pub async fn shutdown(&self) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::Shutdown(reply_tx))
+            .await
+            .is_ok()
+        {
+            let _ = reply_rx.await;
+        }
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
+    fn peer_snapshot(&self) -> Vec<ClaimPeer> {
+        self.peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    async fn send_to_peer(&self, peer_instance_id: &str, frame: &ClaimFrame) {
+        let endpoint = self
+            .peer_snapshot()
+            .iter()
+            .find(|peer| peer.instance_id == peer_instance_id)
+            .and_then(peer_endpoint);
+        if let Some(endpoint) = endpoint {
+            let _ = send_frame(endpoint, frame).await;
+        }
+    }
+}
+
+impl Supervisor {
+    async fn run(mut self) {
+        let semaphore = Arc::new(Semaphore::new(MAX_PREAUTH_CONNECTIONS));
+        let mut tasks = JoinSet::new();
+        let mut rates = HashMap::<IpAddr, VecDeque<Instant>>::new();
+        let _ = self.reconcile_listener().await;
+        loop {
+            tokio::select! {
+                command = self.commands.recv() => {
+                    if self.handle_command(command).await {
+                        break;
+                    }
+                }
+                changed = self.peer_watch.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    self.refresh_peers();
+                    let _ = self.reconcile_listener().await;
+                }
+                accepted = accept_if_bound(self.listener.as_ref()) => {
+                    if let Some((stream, address)) = accepted {
+                        self.accept_connection(stream, address, &semaphore, &mut rates, &mut tasks);
+                    }
+                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+        self.stop_listener();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    async fn handle_command(&mut self, command: Option<Command>) -> bool {
+        match command {
+            Some(Command::Ensure(reply)) => {
+                self.provisional_hold = true;
+                let result = self.ensure_bound().await;
+                let _ = reply.send(result);
+                false
+            }
+            Some(Command::Release) => {
+                self.provisional_hold = false;
+                let _ = self.reconcile_listener().await;
+                false
+            }
+            Some(Command::Update {
+                address,
+                port,
+                reply,
+            }) => {
+                let result = self.update_listener(address, port).await;
+                let _ = reply.send(result);
+                false
+            }
+            Some(Command::Shutdown(reply)) => {
+                let _ = reply.send(());
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn accept_connection(
+        &self,
+        stream: TcpStream,
+        address: SocketAddr,
+        semaphore: &Arc<Semaphore>,
+        rates: &mut HashMap<IpAddr, VecDeque<Instant>>,
+        tasks: &mut JoinSet<()>,
+    ) {
+        if !allow_ip(rates, address.ip()) {
+            return;
+        }
+        let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
+            return;
+        };
+        let context = ConnectionContext {
+            identity: Arc::clone(&self.identity),
+            boot_epoch: self.boot_epoch.clone(),
+            peers: Arc::clone(&self.peers),
+            inbound: self.inbound.clone(),
+            on_peer_addr: Arc::clone(&self.on_peer_addr),
+            replay: Arc::clone(&self.replay),
+        };
+        tasks.spawn(async move {
+            let _permit = permit;
+            authenticate_connection(stream, address, context).await;
+        });
+    }
+
+    fn refresh_peers(&self) {
+        self.peers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone_from(&self.peer_watch.borrow());
+    }
+
+    fn has_peers(&self) -> bool {
+        !self
+            .peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    async fn reconcile_listener(&mut self) -> io::Result<()> {
+        if self.has_peers() || self.provisional_hold {
+            self.ensure_bound().await.map(|_| ())
+        } else {
+            self.stop_listener();
+            Ok(())
+        }
+    }
+
+    async fn ensure_bound(&mut self) -> io::Result<u16> {
+        if let Some(listener) = &self.listener {
+            return listener.local_addr().map(|address| address.port());
+        }
+        let listener = bind_listener(self.bind_address, self.fixed_port).await?;
+        let port = listener.local_addr()?.port();
+        self.listener = Some(listener);
+        self.port.store(port, Ordering::Release);
+        tracing::info!(event = "claim_listener_started", port);
+        Ok(port)
+    }
+
+    async fn update_listener(&mut self, address: IpAddr, port: Option<u16>) -> io::Result<()> {
+        if self.bind_address == address && self.fixed_port == port {
+            return Ok(());
+        }
+        if self.listener.is_some() {
+            let replacement = bind_listener(address, port).await?;
+            let replacement_port = replacement.local_addr()?.port();
+            self.listener = Some(replacement);
+            self.port.store(replacement_port, Ordering::Release);
+            tracing::info!(event = "claim_listener_started", port = replacement_port);
+        }
+        self.bind_address = address;
+        self.fixed_port = port;
+        Ok(())
+    }
+
+    fn stop_listener(&mut self) {
+        if self.listener.take().is_some() {
+            self.port.store(0, Ordering::Release);
+            tracing::info!(event = "claim_listener_stopped");
+        }
+    }
+}
+
+struct ConnectionContext {
+    identity: Arc<InstanceIdentity>,
+    boot_epoch: Epoch,
+    peers: Arc<RwLock<Vec<ClaimPeer>>>,
+    inbound: mpsc::Sender<ClaimFrame>,
+    on_peer_addr: Arc<dyn Fn(String, SocketAddr) + Send + Sync>,
+    replay: Arc<Mutex<HashMap<String, ReplayWindow>>>,
+}
+
+async fn authenticate_connection(
+    mut stream: TcpStream,
+    address: SocketAddr,
+    context: ConnectionContext,
+) {
+    let frame =
+        match tokio::time::timeout(READ_TIMEOUT, read_frame::<ClaimFrame, _>(&mut stream)).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(_)) => {
+                reject("invalid_frame");
+                return;
+            }
+            Err(_) => {
+                reject("read_timeout");
+                return;
+            }
+        };
+    let peer = {
+        context
+            .peers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|peer| peer.instance_id == frame.sender_instance_id)
+            .cloned()
+    };
+    let Some(peer) = peer else {
+        reject("unknown_peer");
+        return;
+    };
+    let record = peer_record(&peer);
+    if let Err(error) = frame.verify(
+        &record,
+        &context.identity.instance_id,
+        context.boot_epoch.as_str(),
+    ) {
+        tracing::warn!(event = "claim_frame_rejected", reason = %error);
+        return;
+    }
+    let fresh = context
+        .replay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(peer.instance_id.clone())
+        .or_insert_with(|| ReplayWindow::new(64))
+        .accept_frame(frame.counter, &frame.nonce);
+    if !fresh {
+        reject("stale_counter_or_nonce");
+        return;
+    }
+    (context.on_peer_addr)(peer.instance_id, address);
+    let _ = context.inbound.send(frame).await;
+}
+
+fn reject(reason: &'static str) {
+    tracing::warn!(event = "claim_frame_rejected", reason);
+}
+
+fn peer_record(peer: &ClaimPeer) -> PeerRecord {
+    PeerRecord {
+        instance_id: peer.instance_id.clone(),
+        ed25519_pub: STANDARD.encode(peer.verifying_key.as_bytes()),
+        display_name: String::new(),
+        paired_at: String::new(),
+        last_addr: peer.last_addr,
+        claim_port: peer.claim_port,
+    }
+}
+
+fn normalize_port(port: Option<u16>) -> Option<u16> {
+    port.filter(|port| *port != 0)
+}
+
+async fn bind_listener(address: IpAddr, port: Option<u16>) -> io::Result<TcpListener> {
+    TcpListener::bind(SocketAddr::new(address, port.unwrap_or(0))).await
+}
+
+async fn accept_if_bound(listener: Option<&TcpListener>) -> Option<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+fn allow_ip(rates: &mut HashMap<IpAddr, VecDeque<Instant>>, ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let entries = rates.entry(ip).or_default();
+    while entries
+        .front()
+        .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
+    {
+        entries.pop_front();
+    }
+    if entries.len() >= MAX_CONNECTIONS_PER_IP_MINUTE {
+        return false;
+    }
+    entries.push_back(now);
+    true
+}
+
+fn peer_endpoint(peer: &ClaimPeer) -> Option<SocketAddr> {
+    Some(SocketAddr::new(peer.last_addr?.ip(), peer.claim_port?))
+}
+
+async fn send_frame(address: SocketAddr, frame: &ClaimFrame) -> io::Result<()> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "claim peer connect timed out"))??;
+    write_frame(&mut stream, frame)
+        .await
+        .map_err(|error| io::Error::other(format!("claim frame write failed: {error:?}")))
+}
+
+fn supervisor_stopped() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "claim transport supervisor stopped",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use dormant_core::{
+        claim::{ClaimAbort, ClaimFrame, ClaimMessage, Epoch},
+        peers::{InstanceIdentity, instance_id_from_public_key},
+    };
+    use ed25519_dalek::SigningKey;
+    use tokio::{
+        io::AsyncReadExt as _,
+        net::{TcpListener, TcpStream},
+        sync::watch,
+    };
+
+    use crate::coordination_frame::write_frame;
+
+    use super::{ClaimPeer, ClaimTransportDeps, spawn};
+
+    const LOCAL_EPOCH: &str = "local-epoch-0001";
+    const REMOTE_EPOCH: &str = "remote-epoch-001";
+
+    fn identity(seed: u8) -> Arc<InstanceIdentity> {
+        let signing_key = SigningKey::from_bytes(&[seed; 32]);
+        let verifying_key = signing_key.verifying_key();
+        Arc::new(InstanceIdentity {
+            instance_id: instance_id_from_public_key(&verifying_key.to_bytes()),
+            signing_key,
+            verifying_key,
+        })
+    }
+
+    fn peer(identity: &InstanceIdentity, port: Option<u16>) -> ClaimPeer {
+        ClaimPeer {
+            instance_id: identity.instance_id.clone(),
+            verifying_key: identity.verifying_key,
+            last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            claim_port: port,
+        }
+    }
+
+    fn signed_frame(
+        sender: &InstanceIdentity,
+        recipient: &InstanceIdentity,
+        counter: u64,
+    ) -> ClaimFrame {
+        ClaimFrame::sign(
+            sender,
+            REMOTE_EPOCH.to_owned(),
+            recipient.instance_id.clone(),
+            LOCAL_EPOCH.to_owned(),
+            counter,
+            format!("nonce-{counter}"),
+            ClaimMessage::ClaimAbort(ClaimAbort {
+                nonce: format!("request-{counter}"),
+            }),
+        )
+        .unwrap()
+    }
+
+    fn deps(
+        identity: Arc<InstanceIdentity>,
+        peers: watch::Receiver<Vec<ClaimPeer>>,
+        calls: Arc<AtomicUsize>,
+    ) -> ClaimTransportDeps {
+        ClaimTransportDeps {
+            identity,
+            boot_epoch: Epoch::try_from(LOCAL_EPOCH).unwrap(),
+            peers,
+            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            fixed_port: None,
+            on_peer_addr: Box::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }),
+        }
+    }
+
+    async fn wait_for_port(handle: &super::ClaimTransportHandle) -> u16 {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(port) = handle.provisional_port() {
+                    return port;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn wait_for_parked(handle: &super::ClaimTransportHandle) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.provisional_port().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_or_unsigned_peer_cannot_touch_handler_state() {
+        let local = identity(1);
+        let stranger = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(vec![peer(&stranger, None)]);
+        let handle = spawn(deps(local.clone(), peers_rx, Arc::clone(&calls)));
+        let mut inbound = handle.inbound();
+        let port = wait_for_port(&handle).await;
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let unknown = identity(3);
+        write_frame(&mut stream, &signed_frame(&unknown, &local, 1))
+            .await
+            .unwrap();
+        let mut unsigned = signed_frame(&stranger, &local, 2);
+        unsigned.signature.clear();
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        write_frame(&mut stream, &unsigned).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbound.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parked_when_empty_and_binds_on_first_peer() {
+        let local = identity(1);
+        let remote = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (peers_tx, peers_rx) = watch::channel(Vec::new());
+        let handle = spawn(deps(local, peers_rx, calls));
+        assert_eq!(handle.provisional_port(), None);
+        peers_tx.send(vec![peer(&remote, None)]).unwrap();
+        let port = wait_for_port(&handle).await;
+        assert!(
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_ok()
+        );
+        peers_tx.send(Vec::new()).unwrap();
+        wait_for_parked(&handle).await;
+        assert_eq!(handle.provisional_port(), None);
+        assert!(
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_err()
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ensure_and_release_provisional_obey_empty_peer_snapshot() {
+        let local = identity(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(Vec::new());
+        let handle = spawn(deps(local, peers_rx, calls));
+        let port = handle.ensure_provisional_listener().await.unwrap();
+        assert_eq!(handle.ensure_provisional_listener().await.unwrap(), port);
+        handle.release_provisional().await;
+        wait_for_parked(&handle).await;
+        assert_eq!(handle.provisional_port(), None);
+        assert!(
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_err()
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn releasing_provisional_keeps_listener_for_existing_peer() {
+        let local = identity(1);
+        let remote = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(vec![peer(&remote, None)]);
+        let handle = spawn(deps(local, peers_rx, calls));
+        let port = handle.ensure_provisional_listener().await.unwrap();
+        handle.release_provisional().await;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.provisional_port(), Some(port));
+        assert!(
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_ok()
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn update_bind_swaps_listener_atomically() {
+        let local = identity(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(Vec::new());
+        let handle = spawn(deps(local, peers_rx, calls));
+        let old_port = handle.ensure_provisional_listener().await.unwrap();
+        let reservation = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let requested_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        handle
+            .update_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(requested_port))
+            .await
+            .unwrap();
+        let new_port = handle.provisional_port().unwrap();
+        assert_ne!(old_port, new_port);
+        assert!(
+            TcpStream::connect((Ipv4Addr::LOCALHOST, old_port))
+                .await
+                .is_err()
+        );
+        assert!(
+            TcpStream::connect((Ipv4Addr::LOCALHOST, new_port))
+                .await
+                .is_ok()
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fifth_concurrent_pre_auth_connection_is_rejected() {
+        let local = identity(1);
+        let remote = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(vec![peer(&remote, None)]);
+        let handle = spawn(deps(local, peers_rx, calls));
+        let port = wait_for_port(&handle).await;
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut fifth = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), fifth.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
+        drop(held);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_inbound_reaches_channel_and_refreshes_real_remote_addr() {
+        let local = identity(1);
+        let remote = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let (_peers_tx, peers_rx) = watch::channel(vec![peer(&remote, None)]);
+        let observed_callback = Arc::clone(&observed);
+        let calls_callback = Arc::clone(&calls);
+        let handle = spawn(ClaimTransportDeps {
+            identity: local.clone(),
+            boot_epoch: Epoch::try_from(LOCAL_EPOCH).unwrap(),
+            peers: peers_rx,
+            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            fixed_port: None,
+            on_peer_addr: Box::new(move |_, address| {
+                calls_callback.fetch_add(1, Ordering::SeqCst);
+                *observed_callback.lock().unwrap() = Some(address);
+            }),
+        });
+        let mut inbound = handle.inbound();
+        let port = wait_for_port(&handle).await;
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let local_addr = stream.local_addr().unwrap();
+        write_frame(&mut stream, &signed_frame(&remote, &local, 1))
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(1), inbound.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.sender_instance_id, remote.instance_id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*observed.lock().unwrap(), Some(local_addr));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unreachable_peer_dial_is_bounded() {
+        let local = identity(1);
+        let remote = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(vec![ClaimPeer {
+            instance_id: remote.instance_id.clone(),
+            verifying_key: remote.verifying_key,
+            last_addr: Some(SocketAddr::from(([192, 0, 2, 1], 9))),
+            claim_port: Some(65_000),
+        }]);
+        let handle = spawn(deps(local.clone(), peers_rx, calls));
+        let started = tokio::time::Instant::now();
+        handle
+            .fanout_request(signed_frame(&local, &remote, 1))
+            .await;
+        assert!(started.elapsed() <= Duration::from_millis(700));
+        handle.shutdown().await;
+    }
+}

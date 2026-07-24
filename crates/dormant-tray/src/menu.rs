@@ -286,11 +286,12 @@ pub fn build_menu(
             // claim).  The snapshot's `kvm.claim_capable_displays`
             // is the authority — not every shared display can be
             // claimed (it also needs write capability + identity).
-            let claim_capable = snapshot.is_some_and(|s| {
-                s.kvm
-                    .as_ref()
-                    .is_some_and(|k| k.claim_capable_displays.iter().any(|did| did.0 == *id))
-            });
+            let claim_capable = d.scope == DisplayScope::Shared
+                && snapshot.is_some_and(|s| {
+                    s.kvm
+                        .as_ref()
+                        .is_some_and(|k| k.claim_capable_displays.iter().any(|did| did.0 == *id))
+                });
 
             let mut sub_entries = vec![
                 MenuEntry::Action {
@@ -1225,6 +1226,16 @@ mod tests {
             find_action(&menu, "Arm claim").is_none(),
             "non-claim-capable display should not show Arm claim"
         );
+    }
+
+    #[test]
+    fn private_display_is_excluded_even_if_capability_list_is_inconsistent() {
+        let mut snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
+        snapshot.displays[0].1.scope = DisplayScope::Private;
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        assert_eq!(find_action(&menu, "Claim panel"), None);
+        assert_eq!(find_action(&menu, "Arm claim"), None);
     }
 
     #[test]

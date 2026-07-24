@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::StateSnapshot;
 use dormantctl::client;
 use tracing::info;
@@ -122,19 +122,36 @@ pub trait DispatchCapabilities: Send + Sync + 'static {
 /// Concrete capabilities used by the Linux tray frontend.
 pub struct SystemCapabilities {
     request_quit: Arc<dyn Fn() + Send + Sync>,
+    send_request: Arc<IpcSender>,
 }
+
+type IpcSender = dyn Fn(&Path, &IpcRequest) -> Result<IpcResponse> + Send + Sync;
 
 impl SystemCapabilities {
     /// Create capabilities whose quit operation calls `request_quit`.
     #[must_use]
     pub fn new(request_quit: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { request_quit }
+        Self {
+            request_quit,
+            send_request: Arc::new(client::send_request),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_sender(
+        request_quit: Arc<dyn Fn() + Send + Sync>,
+        send_request: Arc<IpcSender>,
+    ) -> Self {
+        Self {
+            request_quit,
+            send_request,
+        }
     }
 }
 
 impl DispatchCapabilities for SystemCapabilities {
     fn send_ipc(&self, socket: &Path, request: &IpcRequest) -> Result<()> {
-        let response = client::send_request(socket, request)?;
+        let response = (self.send_request)(socket, request)?;
         if !response.ok {
             anyhow::bail!(
                 "daemon returned error: {}",
@@ -149,7 +166,7 @@ impl DispatchCapabilities for SystemCapabilities {
         socket: &Path,
         display: &str,
     ) -> Result<dormant_core::ipc_proto::ClaimSharedResultWire> {
-        let response = client::send_request(
+        let response = (self.send_request)(
             socket,
             &IpcRequest::ClaimShared {
                 display: display.into(),
@@ -166,7 +183,7 @@ impl DispatchCapabilities for SystemCapabilities {
         socket: &Path,
         display: &str,
     ) -> Result<dormant_core::ipc_proto::ClaimArmResultWire> {
-        let response = client::send_request(
+        let response = (self.send_request)(
             socket,
             &IpcRequest::ClaimArm {
                 display: display.into(),
@@ -266,7 +283,9 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use super::{DispatchCapabilities, DispatchPlan, execute_plan, plan_action};
+    use super::{
+        DispatchCapabilities, DispatchPlan, SystemCapabilities, execute_plan, plan_action,
+    };
     use crate::menu::Action;
     use dormant_core::ipc_proto::IpcRequest;
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
@@ -420,5 +439,59 @@ mod tests {
         );
         assert_eq!(*capabilities.ports.lock().unwrap(), vec![8137]);
         assert_eq!(*capabilities.quits.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn system_capabilities_maps_claim_plans_to_exact_ipc_requests() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let capabilities = Arc::new(SystemCapabilities::with_sender(
+            Arc::new(|| {}),
+            Arc::new(move |_socket, request| {
+                recorded.lock().unwrap().push(request.clone());
+                match request {
+                    IpcRequest::ClaimShared { .. } => {
+                        Ok(dormant_core::ipc_proto::IpcResponse::claim_shared(
+                            dormant_core::ipc_proto::ClaimSharedResultWire::Accepted {
+                                deadline_ms: 1,
+                            },
+                        ))
+                    }
+                    IpcRequest::ClaimArm { .. } => {
+                        Ok(dormant_core::ipc_proto::IpcResponse::claim_arm(
+                            dormant_core::ipc_proto::ClaimArmResultWire {
+                                armed: true,
+                                deadline_ms: 1,
+                                reason: None,
+                            },
+                        ))
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }),
+        ));
+
+        execute_plan(
+            DispatchPlan::ClaimOne("shared".into()),
+            "/tmp/dormant.sock".into(),
+            capabilities.clone(),
+        )
+        .await
+        .unwrap();
+        execute_plan(
+            DispatchPlan::ArmClaim("armed".into()),
+            "/tmp/dormant.sock".into(),
+            capabilities,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(requests.lock().unwrap().as_slice()).unwrap(),
+            serde_json::json!([
+                {"req": "claim_shared", "display": "shared"},
+                {"req": "claim_arm", "display": "armed"}
+            ])
+        );
     }
 }

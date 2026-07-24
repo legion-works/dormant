@@ -1,5 +1,4 @@
 //! Platform-neutral hotkey registrar contract and lifecycle manager.
-#![allow(missing_docs)]
 //!
 //! The `HotkeyRegistrar` trait abstracts OS-level global shortcut
 //! registration so the `HotkeyManager` can be unit-tested against a
@@ -38,6 +37,7 @@ use crate::tray_state::TrayState;
 /// A parsed OS accelerator string from the config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accelerator {
+    /// Accelerator in dormant's platform-neutral config syntax.
     pub raw: String,
 }
 
@@ -48,6 +48,7 @@ impl fmt::Display for Accelerator {
 }
 
 impl Accelerator {
+    /// Parse a non-empty configured accelerator.
     #[must_use]
     pub fn parse(raw: impl Into<String>) -> Option<Self> {
         let raw = raw.into();
@@ -61,8 +62,14 @@ impl Accelerator {
 /// Errors that can occur during hotkey registration.
 #[derive(Debug, Clone)]
 pub enum HotkeyError {
+    /// A session D-Bus backend failed.
     DbusError(String),
-    AmbiguousTarget { count: usize },
+    /// The snapshot does not identify exactly one claim target.
+    AmbiguousTarget {
+        /// Number of claim-capable displays in the snapshot.
+        count: usize,
+    },
+    /// The active backend cannot represent the configured accelerator.
     InvalidAccelerator(String),
 }
 
@@ -86,6 +93,11 @@ impl fmt::Display for HotkeyError {
 /// Contract for OS-level global hotkey registration.
 #[async_trait]
 pub trait HotkeyRegistrar: Send + Sync {
+    /// Register the claim accelerator and route activations to `tx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the accelerator is invalid or registration fails.
     async fn register_claim(
         &mut self,
         accelerator: &Accelerator,
@@ -94,12 +106,14 @@ pub trait HotkeyRegistrar: Send + Sync {
         tx: UnboundedSender<Action>,
     ) -> Result<(), HotkeyError>;
 
+    /// Remove the currently registered claim accelerator, if any.
     async fn unregister_claim(&mut self);
 }
 
 /// Sends user-visible notifications (e.g. `notify-send` on Linux).
 /// Injected so the manager can be tested without a desktop.
 pub trait Notifier: Send + Sync {
+    /// Present a user-visible notification.
     fn notify(&self, summary: &str, body: &str);
 }
 
@@ -122,6 +136,7 @@ pub struct HotkeyManager {
 }
 
 impl HotkeyManager {
+    /// Create a manager over the shared tray snapshot and refresh stream.
     #[must_use]
     pub fn new(
         state: Arc<tokio::sync::Mutex<TrayState>>,
@@ -292,6 +307,7 @@ impl HotkeyManager {
 mod tests {
     use super::*;
     use crate::dispatch::DispatchCapabilities;
+    use crate::menu::{MenuEntry, build_menu};
     use dormant_core::config::{ActivityClaimPolicy, KeymapConfig};
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
     use dormant_core::types::DisplayId;
@@ -339,6 +355,14 @@ mod tests {
             activity_claim: policy,
             claim_armed_remaining: vec![],
         }
+    }
+
+    fn has_enabled_claim(entries: &[MenuEntry]) -> bool {
+        entries.iter().any(|entry| match entry {
+            MenuEntry::Action { label, enabled, .. } => label == "Claim panel" && *enabled,
+            MenuEntry::Submenu { entries, .. } => has_enabled_claim(entries),
+            MenuEntry::Separator | MenuEntry::Info { .. } => false,
+        })
     }
 
     struct FakeRegistrar {
@@ -546,70 +570,6 @@ mod tests {
         );
     }
 
-    /// The plan's required stale-cache discriminator: the manager must
-    /// see the NEW status after a `ConfigReloaded` event (i.e. after a
-    /// snapshot republish), unregister the old hotkey, and register the
-    /// new one.  An implementation that caches the old status forever
-    /// stays on the old accelerator and fails this test.
-    #[tokio::test]
-    async fn config_reload_refetches_status_before_reregistering_hotkey() {
-        let state = Arc::new(tokio::sync::Mutex::new(TrayState::new(
-            "/tmp/dormant.sock".into(),
-        )));
-        {
-            let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
-            s.unreachable = false;
-        }
-
-        let (_handle, cancel, refresh_tx, calls) =
-            start_manager(state.clone(), FakeRegistrar::new(false)).await;
-
-        // Daemon replaces its status (simulating a config reload).
-        {
-            let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F11",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
-        }
-        // Publish the new snapshot — mirrors what ipc_loop does after
-        // a ConfigReloaded event + status refetch.
-        refresh_tx.send_replace(());
-        // Yield to let the manager process.
-        tokio::task::yield_now().await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            let done = {
-                let r = calls.lock().unwrap();
-                r.len() >= 3
-            };
-            if done {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-
-        cancel.cancel();
-        let recorded = calls.lock().unwrap();
-        assert!(
-            recorded.len() >= 3,
-            "expected at least Register(F12) → Unregister → Register(F11), got: {recorded:?}"
-        );
-        assert!(
-            matches!(&recorded[0], RegistrarCall::Register { accel, .. } if accel == "Meta+F12")
-        );
-        assert!(matches!(&recorded[1], RegistrarCall::Unregister));
-        assert!(
-            matches!(&recorded[2], RegistrarCall::Register { accel, .. } if accel == "Meta+F11")
-        );
-    }
-
     #[tokio::test]
     async fn unchanged_kvm_skips_reregistration() {
         let state = Arc::new(tokio::sync::Mutex::new(TrayState::new(
@@ -775,7 +735,7 @@ mod tests {
         let registrar = FakeRegistrar::new(true);
         let (refresh_tx, refresh_rx) = watch::channel(());
         let manager = HotkeyManager::new(
-            state,
+            state.clone(),
             refresh_rx,
             Some(Box::new(registrar)),
             Some(Box::new(notifier)),
@@ -797,10 +757,15 @@ mod tests {
 
         // Manager is still alive (didn't crash), and a notification
         // about the failure was emitted.
-        let notifications = notif_rec.lock().unwrap();
         assert!(
-            !notifications.is_empty(),
+            !notif_rec.lock().unwrap().is_empty(),
             "registrar failure must notify user"
+        );
+        let tray = state.lock().await;
+        let menu = build_menu(tray.snapshot.as_ref(), tray.unreachable, 8137);
+        assert!(
+            has_enabled_claim(&menu),
+            "registrar failure must leave the manual Claim panel action enabled"
         );
     }
 

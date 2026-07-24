@@ -1,160 +1,74 @@
-//! Linux global hotkey registration via XDG Desktop Portal
-//! [`GlobalShortcuts`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html).
-//!
-//! The portal bridges to the desktop's native shortcut daemon
-//! (`KGlobalAccel` on KDE, GNOME Shell on GNOME) — no desktop-specific
-//! D-Bus API is called directly.  If the portal or session bus is
-//! unavailable, registration returns
-//! [`HotkeyError::DbusError`](crate::hotkey::HotkeyError::DbusError) and
-//! the tray keeps the manual "Claim panel" menu path.
+//! Linux global hotkeys through `KGlobalAccel`, with the XDG portal fallback.
 
 #![cfg(target_os = "linux")]
-#![allow(missing_docs)]
 
-use std::collections::HashMap;
+mod kglobalaccel;
+mod portal;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use tracing::debug;
 
+use self::kglobalaccel::KGlobalAccelHotkeyRegistrar;
+use self::portal::PortalHotkeyRegistrar;
 use crate::hotkey::{Accelerator, HotkeyError, HotkeyRegistrar};
 use crate::menu::Action;
 
-const PORTAL_SERVICE: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
-const PORTAL_IFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
-const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+fn accelerator_tokens(accelerator: &Accelerator) -> Result<(Vec<&str>, &str), HotkeyError> {
+    let mut tokens: Vec<_> = accelerator.raw.split('+').collect();
+    let key = tokens
+        .pop()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| HotkeyError::InvalidAccelerator(accelerator.raw.clone()))?;
+    if tokens
+        .iter()
+        .any(|modifier| !matches!(*modifier, "Alt" | "Control" | "Meta" | "Shift" | "Super"))
+    {
+        return Err(HotkeyError::InvalidAccelerator(accelerator.raw.clone()));
+    }
+    let mut unique = tokens.clone();
+    unique.sort_unstable();
+    if unique.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(HotkeyError::InvalidAccelerator(accelerator.raw.clone()));
+    }
+    Ok((tokens, key))
+}
 
-/// The portal returns a request object path from method calls; the
-/// actual response arrives via the `Response` signal on that object.
-/// `response == 0` means success; `1` is user-cancelled; `2` is error.
-async fn await_portal_response(
-    conn: &zbus::Connection,
-    request_path: &ObjectPath<'_>,
-) -> Result<HashMap<String, OwnedValue>, HotkeyError> {
-    let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, request_path, REQUEST_IFACE)
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("request proxy: {e}")))?;
-
-    let mut stream = proxy
-        .receive_signal("Response")
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("signal subscribe: {e}")))?;
-
-    let signal = stream.next().await.ok_or_else(|| {
-        HotkeyError::DbusError("portal request stream ended before response".into())
-    })?;
-
-    let body = signal.body();
-    let (response, results): (u32, HashMap<String, OwnedValue>) = body
-        .deserialize()
-        .map_err(|e| HotkeyError::DbusError(format!("deserialize Response: {e}")))?;
-
-    match response {
-        0 => Ok(results),
-        1 => Err(HotkeyError::DbusError("user cancelled".into())),
-        _ => Err(HotkeyError::DbusError(format!(
-            "portal request failed: response={response}"
-        ))),
+fn claim_action(target: &str, arm: bool) -> Action {
+    if arm {
+        Action::ArmClaim(target.to_string())
+    } else {
+        Action::ClaimOne(target.to_string())
     }
 }
 
-/// Create a `GlobalShortcuts` session.  The returned object path is an
-/// opaque session handle passed to `BindShortcuts`.
-async fn create_session(conn: &zbus::Connection) -> Result<OwnedObjectPath, HotkeyError> {
-    let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, PORTAL_IFACE)
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("portal proxy: {e}")))?;
-
-    // Pass a session_handle_token so we can identify our session.
-    let mut opts = HashMap::new();
-    opts.insert(
-        "session_handle_token".to_string(),
-        Value::Str("dormant_tray_claim".into()),
-    );
-
-    let request_path: OwnedObjectPath = proxy
-        .call("CreateSession", &(opts,))
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("CreateSession: {e}")))?;
-
-    let results = await_portal_response(conn, &request_path).await?;
-
-    let session: OwnedObjectPath = results
-        .get("session_handle")
-        .and_then(|v| v.downcast_ref::<ObjectPath<'_>>().ok())
-        .map(OwnedObjectPath::from)
-        .ok_or_else(|| HotkeyError::DbusError("portal did not return session_handle".into()))?;
-
-    debug!(%session, "portal session created");
-    Ok(session)
+/// Registrar that tries `KGlobalAccel` before the portal fallback.
+pub struct FallbackHotkeyRegistrar {
+    primary: Box<dyn HotkeyRegistrar>,
+    fallback: Box<dyn HotkeyRegistrar>,
+    active: Option<ActiveBackend>,
 }
 
-/// Bind a claim shortcut to the session.  The portal validates the
-/// accelerator syntax; an unsupported string returns an error.
-async fn bind_shortcut(
-    conn: &zbus::Connection,
-    session: &ObjectPath<'_>,
-    shortcut_str: &str,
-) -> Result<(), HotkeyError> {
-    let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, PORTAL_IFACE)
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("portal proxy: {e}")))?;
-
-    let mut props = HashMap::new();
-    props.insert("shortcut".to_string(), Value::Str(shortcut_str.into()));
-    props.insert("description".to_string(), Value::Str("Claim Panel".into()));
-
-    let shortcuts = vec![("claim_panel".to_string(), props)];
-
-    let request_path: OwnedObjectPath = proxy
-        .call(
-            "BindShortcuts",
-            &(session, shortcuts, "", &HashMap::<&str, Value>::new()),
-        )
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("shortcut") || e.to_string().contains("invalid") {
-                HotkeyError::InvalidAccelerator(shortcut_str.into())
-            } else {
-                HotkeyError::DbusError(format!("BindShortcuts: {e}"))
-            }
-        })?;
-
-    let _results = await_portal_response(conn, &request_path).await?;
-    debug!(%shortcut_str, "shortcut bound");
-    Ok(())
+#[derive(Clone, Copy)]
+enum ActiveBackend {
+    Primary,
+    Fallback,
 }
 
-/// Linux [`HotkeyRegistrar`] backed by the XDG Desktop Portal
-/// `GlobalShortcuts` interface.
-pub struct ZbusHotkeyRegistrar {
-    conn: Option<zbus::Connection>,
-    session: Option<OwnedObjectPath>,
-    signal_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl ZbusHotkeyRegistrar {
+impl FallbackHotkeyRegistrar {
+    /// Build a registrar from injectable primary and fallback backends.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(primary: Box<dyn HotkeyRegistrar>, fallback: Box<dyn HotkeyRegistrar>) -> Self {
         Self {
-            conn: None,
-            session: None,
-            signal_task: None,
+            primary,
+            fallback,
+            active: None,
         }
     }
 }
 
-impl Default for ZbusHotkeyRegistrar {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
-impl HotkeyRegistrar for ZbusHotkeyRegistrar {
+impl HotkeyRegistrar for FallbackHotkeyRegistrar {
     async fn register_claim(
         &mut self,
         accelerator: &Accelerator,
@@ -163,132 +77,138 @@ impl HotkeyRegistrar for ZbusHotkeyRegistrar {
         tx: UnboundedSender<Action>,
     ) -> Result<(), HotkeyError> {
         self.unregister_claim().await;
-
-        let conn = zbus::Connection::session()
+        match self
+            .primary
+            .register_claim(accelerator, target, arm, tx.clone())
             .await
-            .map_err(|e| HotkeyError::DbusError(format!("session bus: {e}")))?;
-
-        // 1. Create a GlobalShortcuts session.
-        let session = create_session(&conn).await?;
-
-        // 2. Bind the claim shortcut.
-        bind_shortcut(&conn, &session, &accelerator.raw).await?;
-
-        // 3. Spawn a signal listener that watches for Activated.
-        let target_owned = target.to_string();
-        let conn_clone = conn.clone();
-        let session_clone = session.clone();
-        let signal_task = tokio::spawn(async move {
-            if let Err(e) =
-                listen_for_activation(conn_clone, session_clone.into(), &target_owned, arm, tx)
-                    .await
-            {
-                warn!(error = %e, "portal activation listener exited");
+        {
+            Ok(()) => {
+                self.active = Some(ActiveBackend::Primary);
+                Ok(())
             }
-        });
-
-        self.conn = Some(conn);
-        self.session = Some(session);
-        self.signal_task = Some(signal_task);
-        Ok(())
+            Err(primary_error) => {
+                self.primary.unregister_claim().await;
+                debug!(error = %primary_error, "KGlobalAccel unavailable; trying portal");
+                match self
+                    .fallback
+                    .register_claim(accelerator, target, arm, tx)
+                    .await
+                {
+                    Ok(()) => {
+                        self.active = Some(ActiveBackend::Fallback);
+                        Ok(())
+                    }
+                    Err(fallback_error) => {
+                        self.fallback.unregister_claim().await;
+                        Err(HotkeyError::DbusError(format!(
+                            "KGlobalAccel: {primary_error}; portal: {fallback_error}"
+                        )))
+                    }
+                }
+            }
+        }
     }
 
     async fn unregister_claim(&mut self) {
-        if let Some(task) = self.signal_task.take() {
-            task.abort();
+        match self.active.take() {
+            Some(ActiveBackend::Primary) => self.primary.unregister_claim().await,
+            Some(ActiveBackend::Fallback) => self.fallback.unregister_claim().await,
+            None => {}
         }
-        // Dropping the connection closes the session implicitly;
-        // the portal cleans up shortcuts when the requesting
-        // D-Bus client disconnects.
-        self.conn = None;
-        self.session = None;
     }
 }
 
-/// Listen for `Activated` signals on the portal interface.  The
-/// signature is `osta{sv}` — session handle (o), shortcut id (s),
-/// timestamp (t), options (a{sv}).
-async fn listen_for_activation(
-    conn: zbus::Connection,
-    session: ObjectPath<'static>,
-    target: &str,
-    arm: bool,
-    tx: UnboundedSender<Action>,
-) -> Result<(), HotkeyError> {
-    let proxy = zbus::Proxy::new(&conn, PORTAL_SERVICE, PORTAL_PATH, PORTAL_IFACE)
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("portal proxy: {e}")))?;
-
-    let mut stream = proxy
-        .receive_signal("Activated")
-        .await
-        .map_err(|e| HotkeyError::DbusError(format!("signal subscribe: {e}")))?;
-
-    while let Some(signal) = stream.next().await {
-        let body = signal.body();
-        // Portal <= 1.18: Activated(session_handle, shortcut_id, timestamp, options)
-        // signature osta{sv} → ObjectPath, String, u64, HashMap
-        let (msg_session, shortcut_id, _timestamp, _options): (
-            ObjectPath<'_>,
-            String,
-            u64,
-            HashMap<String, Value>,
-        ) = match body.deserialize() {
-            Ok(v) => v,
-            // Try the v2 signature oa{sv} (session_handle, options)
-            Err(_) => {
-                // The shortcut_id is in the options dict for v2
-                if let Ok((msg_session, options)) =
-                    body.deserialize::<(ObjectPath<'_>, HashMap<String, Value>)>()
-                {
-                    let id = options
-                        .get("shortcut_id")
-                        .and_then(|v| v.downcast_ref::<&str>().ok())
-                        .unwrap_or("");
-                    (msg_session, id.to_string(), 0, options)
-                } else {
-                    continue;
-                }
-            }
-        };
-
-        if msg_session.as_str() != session.as_str() || shortcut_id != "claim_panel" {
-            continue;
-        }
-
-        let action = if arm {
-            Action::ArmClaim(target.to_string())
-        } else {
-            Action::ClaimOne(target.to_string())
-        };
-        if tx.send(action).is_err() {
-            break;
-        }
-        debug!(%target, arm, "claim hotkey activated via portal");
-    }
-
-    Ok(())
-}
-
-/// Create a new Linux registrar for the XDG Desktop Portal path.
+/// Create a Linux registrar with `KGlobalAccel` first and the portal fallback.
 #[must_use]
 pub fn create_linux_registrar() -> Box<dyn HotkeyRegistrar> {
-    Box::new(ZbusHotkeyRegistrar::new())
+    Box::new(FallbackHotkeyRegistrar::new(
+        Box::new(KGlobalAccelHotkeyRegistrar::new()),
+        Box::new(PortalHotkeyRegistrar::new()),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     #[test]
-    fn create_linux_registrar_returns_valid_object() {
-        let registrar = create_linux_registrar();
-        drop(registrar);
+    fn activity_claim_policy_flag_selects_shared_or_arm_action() {
+        assert_eq!(
+            claim_action("monitor", false),
+            Action::ClaimOne("monitor".into())
+        );
+        assert_eq!(
+            claim_action("monitor", true),
+            Action::ArmClaim("monitor".into())
+        );
+    }
+
+    struct FakeBackend {
+        name: &'static str,
+        fail: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl HotkeyRegistrar for FakeBackend {
+        async fn register_claim(
+            &mut self,
+            _accelerator: &Accelerator,
+            _target: &str,
+            _arm: bool,
+            _tx: UnboundedSender<Action>,
+        ) -> Result<(), HotkeyError> {
+            self.calls.lock().unwrap().push(self.name.to_string());
+            if self.fail {
+                Err(HotkeyError::DbusError(format!("{} unavailable", self.name)))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn unregister_claim(&mut self) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:unregister", self.name));
+        }
+    }
+
+    #[tokio::test]
+    async fn kglobalaccel_is_tried_before_portal_fallback() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = FakeBackend {
+            name: "kglobalaccel",
+            fail: true,
+            calls: Arc::clone(&calls),
+        };
+        let fallback = FakeBackend {
+            name: "portal",
+            fail: false,
+            calls: Arc::clone(&calls),
+        };
+        let mut registrar = FallbackHotkeyRegistrar::new(Box::new(primary), Box::new(fallback));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        registrar
+            .register_claim(
+                &Accelerator::parse("Meta+F12").unwrap(),
+                "monitor",
+                false,
+                tx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["kglobalaccel", "kglobalaccel:unregister", "portal"]
+        );
     }
 
     #[test]
-    fn drop_without_registration_does_not_panic() {
-        let registrar = ZbusHotkeyRegistrar::new();
-        drop(registrar);
+    fn create_linux_registrar_returns_valid_object() {
+        drop(create_linux_registrar());
     }
 }

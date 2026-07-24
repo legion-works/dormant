@@ -42,7 +42,6 @@ pub mod action_table;
 #[cfg(unix)]
 pub mod dispatch;
 /// Platform-neutral hotkey registrar contract and lifecycle manager.
-/// Platform-neutral hotkey registrar contract and lifecycle manager.
 pub mod hotkey;
 /// Linux global hotkey registration via D-Bus.
 #[cfg(target_os = "linux")]

@@ -476,4 +476,203 @@ mod tests {
 
         server.await.unwrap();
     }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RefetchRegistrarCall {
+        Register(String),
+        Unregister,
+    }
+
+    struct RefetchRegistrar {
+        calls: Arc<std::sync::Mutex<Vec<RefetchRegistrarCall>>>,
+        registered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hotkey::HotkeyRegistrar for RefetchRegistrar {
+        async fn register_claim(
+            &mut self,
+            accelerator: &crate::hotkey::Accelerator,
+            _target: &str,
+            _arm: bool,
+            _tx: tokio::sync::mpsc::UnboundedSender<crate::menu::Action>,
+        ) -> Result<(), crate::hotkey::HotkeyError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RefetchRegistrarCall::Register(accelerator.raw.clone()));
+            self.registered.notify_one();
+            Ok(())
+        }
+
+        async fn unregister_claim(&mut self) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(RefetchRegistrarCall::Unregister);
+        }
+    }
+
+    struct RefetchCapabilities;
+
+    impl crate::dispatch::DispatchCapabilities for RefetchCapabilities {
+        fn send_ipc(
+            &self,
+            _socket: &std::path::Path,
+            _request: &dormant_core::ipc_proto::IpcRequest,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn claim_shared(
+            &self,
+            _socket: &std::path::Path,
+            _display: &str,
+        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimSharedResultWire> {
+            anyhow::bail!("not used")
+        }
+
+        fn claim_arm(
+            &self,
+            _socket: &std::path::Path,
+            _display: &str,
+        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimArmResultWire> {
+            anyhow::bail!("not used")
+        }
+
+        fn open_web(&self, _port: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn request_quit(&self) {}
+    }
+
+    fn hotkey_snapshot(accelerator: &str) -> StateSnapshot {
+        use dormant_core::config::{ActivityClaimPolicy, KeymapConfig};
+        use dormant_core::rules::KvmStatus;
+        use dormant_core::types::DisplayId;
+
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![],
+            pending_reload: None,
+            rollback: None,
+            kvm: Some(KvmStatus {
+                keymap: KeymapConfig {
+                    claim_hotkey: Some(accelerator.into()),
+                },
+                claim_capable_displays: vec![DisplayId("monitor".into())],
+                activity_claim: ActivityClaimPolicy::Off,
+                claim_armed_remaining: vec![],
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_reload_refetches_status_before_reregistering_hotkey() {
+        use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+        use dormant_core::rules::DaemonEvent;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let registered = Arc::new(tokio::sync::Notify::new());
+        let server_registered = Arc::clone(&registered);
+        let server = tokio::spawn(async move {
+            let mut status_count = 0;
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = TokioBufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                match serde_json::from_str::<IpcRequest>(line.trim()).unwrap() {
+                    IpcRequest::Status => {
+                        let accelerator = if status_count == 0 {
+                            "Meta+F12"
+                        } else {
+                            "Meta+F11"
+                        };
+                        status_count += 1;
+                        let response = IpcResponse::ok(Some(hotkey_snapshot(accelerator)));
+                        writer
+                            .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                            .await
+                            .unwrap();
+                        writer.write_all(b"\n").await.unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    IpcRequest::Events => {
+                        writer
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    serde_json::to_string(&DaemonEvent::Subscribed).unwrap()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        writer.flush().await.unwrap();
+                        server_registered.notified().await;
+                        writer
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    serde_json::to_string(&DaemonEvent::ConfigReloaded).unwrap()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+        });
+
+        let state = Arc::new(Mutex::new(TrayState::new(socket.clone())));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registrar = RefetchRegistrar {
+            calls: Arc::clone(&calls),
+            registered: Arc::clone(&registered),
+        };
+        let (refresh, changed) = refresh_channel();
+        let manager = crate::hotkey::HotkeyManager::new(
+            Arc::clone(&state),
+            changed,
+            Some(Box::new(registrar)),
+            None,
+        );
+        let manager_cancel = tokio_util::sync::CancellationToken::new();
+        let manager_task = tokio::spawn(manager.run(
+            manager_cancel.clone(),
+            socket.clone(),
+            Arc::new(RefetchCapabilities),
+        ));
+        let tick_cancel = tokio_util::sync::CancellationToken::new();
+
+        let outcome = tick(&socket, &state, &tick_cancel, &refresh).await;
+        assert!(matches!(outcome, TickOutcome::Closed));
+        tokio::time::timeout(Duration::from_secs(2), registered.notified())
+            .await
+            .expect("second registration after ConfigReloaded");
+
+        manager_cancel.cancel();
+        manager_task.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                RefetchRegistrarCall::Register("Meta+F12".into()),
+                RefetchRegistrarCall::Unregister,
+                RefetchRegistrarCall::Register("Meta+F11".into()),
+                RefetchRegistrarCall::Unregister,
+            ]
+        );
+    }
 }

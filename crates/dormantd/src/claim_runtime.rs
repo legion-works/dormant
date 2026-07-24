@@ -290,20 +290,11 @@ impl ClaimRuntimeHandle {
     }
 }
 
-/// Snapshot payload the tray consumes.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub struct KvmStatus {
-    /// Resolved keymap (keymap.claim_hotkey etc).
-    #[serde(default)]
-    pub keymap: KeymapConfig,
-    /// Post-probe claim-capable display set (shared scope AND
-    /// input-source write capable AND claim_identity present).
-    #[serde(default)]
-    pub claim_capable_displays: Vec<DisplayId>,
-    /// Resolved activity-claim policy.
-    #[serde(default)]
-    pub activity_claim: ActivityClaimPolicy,
-}
+/// Snapshot payload the tray consumes. Re-exported as
+/// `dormant_core::rules::KvmStatus` for the wire/snapshot fold;
+/// the runtime's `kvm_status()` method returns the canonical
+/// type.
+pub use dormant_core::rules::KvmStatus;
 
 /// Full dependencies for the claim runtime driver.
 pub struct ClaimRuntimeDeps {
@@ -312,7 +303,11 @@ pub struct ClaimRuntimeDeps {
     pub executors: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     pub config: watch::Receiver<Arc<Config>>,
     pub hooks: Arc<HookEngine>,
-    pub coordination: Option<Arc<CoordinationHandle>>,
+    pub coordination: Option<CoordinationHandle>,
+    /// Daemon-front control channel (forwarded to the engine).
+    /// Used to publish `ControlMsg::SetClaimSuppression` so the
+    /// rules engine can gate ownership-loss reactions (F10).
+    pub front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
     pub cancel: CancellationToken,
     /// Test seam — an append-only log of emitted anchors.
     pub event_log: Option<Arc<Mutex<Vec<String>>>>,
@@ -355,6 +350,7 @@ pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
         cmd_rx,
         owner_event_rx,
         owner_event_tx: owner_event_tx.clone(),
+        front_ctl_tx: deps.front_ctl_tx,
         cancel: deps.cancel,
         event_log: deps.event_log,
         outbound_counter: 0,
@@ -387,7 +383,7 @@ struct Driver {
     executors: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     config: watch::Receiver<Arc<Config>>,
     hooks: Arc<HookEngine>,
-    coordination: Option<Arc<CoordinationHandle>>,
+    coordination: Option<CoordinationHandle>,
     cmd_rx: mpsc::Receiver<RuntimeEvent>,
     /// Inbound channel for asynchronous owner-event completions
     /// from hook slots and write/wake tasks. Cloned into each
@@ -399,6 +395,10 @@ struct Driver {
     /// each spawned task; the original is dropped after spawn
     /// so the channel closes cleanly when no work is pending.
     owner_event_tx: mpsc::Sender<(DisplayId, OwnerEvent)>,
+    /// Daemon-front control channel (forwarded to the engine).
+    /// Used to publish `ControlMsg::SetClaimSuppression` so the
+    /// rules engine can gate ownership-loss reactions (F10).
+    front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
     cancel: CancellationToken,
     event_log: Option<Arc<Mutex<Vec<String>>>>,
     outbound_counter: u64,
@@ -506,6 +506,15 @@ impl Driver {
                         Instant::now(),
                     );
                 self.dispatch_actions(&display, &actions).await;
+                if self
+                    .engines
+                    .get(&display)
+                    .and_then(|e| e.requester_stage(&display))
+                    .is_none()
+                {
+                    self.flights.remove(&display);
+                    self.clear_claim_suppression(&display);
+                }
             }
             ClaimMessage::ClaimResponse(response) => {
                 let Some(display) = self.find_display_by_requester_nonce(&response.nonce) else {
@@ -524,6 +533,15 @@ impl Driver {
                         Instant::now(),
                     );
                 self.dispatch_actions(&display, &actions).await;
+                if self
+                    .engines
+                    .get(&display)
+                    .and_then(|e| e.requester_stage(&display))
+                    .is_none()
+                {
+                    self.flights.remove(&display);
+                    self.clear_claim_suppression(&display);
+                }
             }
             ClaimMessage::IdleQuery(_) | ClaimMessage::IdleReport(_) => {
                 // T10b: idle frames are out of scope (the tray
@@ -701,11 +719,21 @@ impl Driver {
             .expect("engine present")
             .requester_event(display, RequesterEvent::FanoutSent, now);
         // F10: register the requester flight's deadline on the
-        // suppression side-table.
+        // suppression side-table (local handle for direct
+        // queries), AND publish `ControlMsg::SetClaimSuppression`
+        // to the front control channel so the rules engine's
+        // `feed_ownership` consults it.
         let suppressed_until = now + claim_timeout;
         if let Ok(mut map) = self.handle.suppressed.lock() {
             map.insert(display.clone(), suppressed_until);
         }
+        let _ = self
+            .front_ctl_tx
+            .send(dormant_core::rules::ControlMsg::SetClaimSuppression {
+                display: display.clone(),
+                until: Some(suppressed_until),
+            })
+            .await;
         let _ = reply.send(ClaimSharedResult::Accepted {
             deadline: now + claim_timeout,
         });
@@ -781,6 +809,7 @@ impl Driver {
     fn sweep_deadlines(&mut self) {
         let now = Instant::now();
         let displays: Vec<DisplayId> = self.engines.keys().cloned().collect();
+        let mut lift_displays = Vec::new();
         for display in displays {
             let Some(engine) = self.engines.get_mut(&display) else {
                 continue;
@@ -798,6 +827,7 @@ impl Driver {
                 if let Ok(mut map) = self.handle.suppressed.lock() {
                     map.remove(&display);
                 }
+                lift_displays.push(display.clone());
             }
             for action in &actions {
                 self.record_action(action);
@@ -805,6 +835,20 @@ impl Driver {
             if actions.iter().any(|a| matches!(a, Action::Terminal(_))) {
                 self.flights.remove(&display);
             }
+        }
+        // Publish a clear to the rules engine for any display
+        // whose suppression just lifted (F10 lift). Spawn a
+        // task so the driver's main loop stays responsive.
+        for display in lift_displays {
+            let tx = self.front_ctl_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(dormant_core::rules::ControlMsg::SetClaimSuppression {
+                        display,
+                        until: None,
+                    })
+                    .await;
+            });
         }
     }
 
@@ -845,6 +889,25 @@ impl Driver {
                 queue.push_back(action);
             }
         }
+    }
+
+    /// Clear the F10 suppression for `display` — both the local
+    /// handle side-table and the rules engine's copy via
+    /// `ControlMsg::SetClaimSuppression`.
+    fn clear_claim_suppression(&self, display: &DisplayId) {
+        if let Ok(mut map) = self.handle.suppressed.lock() {
+            map.remove(display);
+        }
+        let front_ctl_tx = self.front_ctl_tx.clone();
+        let display_for_task = display.clone();
+        tokio::spawn(async move {
+            let _ = front_ctl_tx
+                .send(dormant_core::rules::ControlMsg::SetClaimSuppression {
+                    display: display_for_task,
+                    until: None,
+                })
+                .await;
+        });
     }
 
     fn execute_action(&mut self, display: &DisplayId, action: Action) -> Vec<Action> {
@@ -1074,6 +1137,8 @@ impl Driver {
             .is_none()
         {
             self.flights.remove(display);
+            // Owner flight terminal: lift F10 suppression.
+            self.clear_claim_suppression(display);
         }
         actions
     }
@@ -1461,7 +1526,7 @@ fn sum_blocking_before_release(hooks: &HookSlots) -> Duration {
 /// `INPUT_SOURCE_WRITE_UNSUPPORTED` for unsupported controllers
 /// without an I/O error; any real write attempt is rolled back by
 /// re-writing the observed code).
-async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> bool {
+pub async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> bool {
     let observed = match sink.read_input_source_sampled().await {
         Ok(Some(v)) => v,
         _ => return false,
@@ -1471,6 +1536,16 @@ async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> bool {
         Err(failure) if failure.error.contains("unsupported input-source write") => false,
         Err(_) => false,
     }
+}
+
+/// Synchronous claim-capable check (suitable for snapshot-time
+/// fold). Returns `true` when the sink exposes a F5 claim identity
+/// (the strongest static signal without I/O — the runtime's own
+/// per-display engine does a real probe before driving claims).
+/// `writability` is the runtime's view; this helper covers the
+/// identity side.
+pub fn sink_claim_capable(sink: &Arc<dyn CommandSink>) -> bool {
+    sink.claim_identity().is_some()
 }
 
 /// `HookSlots` direction/phase accessor for the runtime.
@@ -1493,6 +1568,7 @@ impl HookSlotsExt for HookSlots {
 mod tests {
     use super::*;
     use crate::hooks::{HookRunner, ScriptedHookRunner};
+    use dormant_core::claim_engine::Terminal;
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
@@ -1595,6 +1671,165 @@ mod tests {
         assert_eq!(
             recorded[0],
             vec!["notify-send".to_string(), "released".to_string()]
+        );
+    }
+
+    /// Pure-engine fallback contract: when the requester
+    /// deadline elapses with no peer accepted, the engine
+    /// emits `SendAbort` + `Trace("claim_fallback_direct")` +
+    /// `AttemptFallback`. The driver routes the fallback's
+    /// fresh read + write decision. This test pins the
+    /// engine's action sequence so the dispatch contract is
+    /// stable.
+    #[test]
+    fn fallback_action_sequence_is_sendabort_trace_attempt() {
+        let mut engine = ClaimEngine::default();
+        let now = Instant::now();
+        engine.begin_requester(
+            DisplayId("mon".into()),
+            "n",
+            1,
+            now,
+            Duration::from_millis(50),
+        );
+        engine.requester_event(&DisplayId("mon".into()), RequesterEvent::FanoutSent, now);
+        // Deadline expires in AwaitingAck → RequesterUnaccepted fallback.
+        let actions = engine.on_deadline(&DisplayId("mon".into()), now + Duration::from_secs(60));
+        let has_send_abort = actions.iter().any(|a| matches!(a, Action::SendAbort));
+        let has_attempt = actions.iter().any(|a| matches!(a, Action::AttemptFallback));
+        let has_trace = actions
+            .iter()
+            .any(|a| matches!(a, Action::Trace("claim_fallback_direct")));
+        assert!(has_send_abort, "fallback must include SendAbort");
+        assert!(has_attempt, "fallback must include AttemptFallback");
+        assert!(
+            has_trace,
+            "fallback must include claim_fallback_direct trace"
+        );
+    }
+
+    /// Pure-engine Busy on concurrent local trigger: a second
+    /// `begin_requester` while the first is in flight emits
+    /// `claim_busy` + `BusyLocal`.
+    #[test]
+    fn concurrent_local_trigger_emits_busy() {
+        let mut engine = ClaimEngine::default();
+        let now = Instant::now();
+        let first = engine.begin_requester(
+            DisplayId("mon".into()),
+            "first",
+            1,
+            now,
+            Duration::from_secs(3),
+        );
+        assert!(
+            first
+                .iter()
+                .any(|a| matches!(a, Action::Trace("claim_requested")))
+        );
+        let second = engine.begin_requester(
+            DisplayId("mon".into()),
+            "second",
+            1,
+            now,
+            Duration::from_secs(3),
+        );
+        assert!(second.iter().any(|a| matches!(a, Action::BusyLocal)));
+        assert!(
+            second
+                .iter()
+                .any(|a| matches!(a, Action::Trace("claim_busy")))
+        );
+    }
+
+    /// Display-removed mid-claim lifts the requester flight
+    /// with `claim_failed` + `Terminal::Removed` and clears
+    /// the F10 suppression.
+    #[test]
+    fn display_removed_lifts_requester_flight() {
+        let mut engine = ClaimEngine::default();
+        let now = Instant::now();
+        engine.begin_requester(DisplayId("mon".into()), "n", 1, now, Duration::from_secs(3));
+        engine.requester_event(&DisplayId("mon".into()), RequesterEvent::FanoutSent, now);
+        engine.requester_event(
+            &DisplayId("mon".into()),
+            RequesterEvent::Response {
+                nonce: "n".to_owned(),
+                verdict: ClaimVerdict::Accepted { eta_ms: 5_000 },
+            },
+            now,
+        );
+        // Requester is in Watching. DisplayRemoved terminalises.
+        let actions = engine.requester_event(
+            &DisplayId("mon".into()),
+            RequesterEvent::DisplayRemoved,
+            now,
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Terminal(Terminal::Removed)))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace("claim_failed")))
+        );
+        // F10 lifts: the requester flight is gone.
+        assert!(!engine.is_suppressed(&DisplayId("mon".into()), now));
+    }
+
+    /// Owner side: a hook-aborted `before_release` lifts
+    /// the flight with `claim_release_aborted` + a
+    /// `ReleaseFailed` best-effort notification.
+    #[test]
+    fn owner_hook_aborted_lifts_with_release_aborted() {
+        let mut engine = ClaimEngine::default();
+        let now = Instant::now();
+        let request = OwnerRequest {
+            display: DisplayId("mon".into()),
+            requested_identity: "id".to_owned(),
+            local_identity: Some("id".to_owned()),
+            requester_input_code: 0x11,
+            local_input_code: 0x0f,
+            capability: ClaimCapability::Writable,
+            disposition: OwnerDisposition::Ready { standby: false },
+            eta: Duration::from_secs(1),
+        };
+        let actions = engine.begin_owner(request, "n", now, Duration::from_secs(45));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace("claim_accepted")))
+        );
+        // Drive the engine through AckSent → BeforeRelease.
+        // (The real driver would SendVerdict first; here we
+        // collapse to the action sequence the engine cares
+        // about.)
+        let _ack_actions = engine.owner_event(&DisplayId("mon".into()), OwnerEvent::AckDelivered);
+        // The engine's BeforeRelease slot now expects the
+        // hook outcome. The hook aborted.
+        let actions = engine.owner_event(
+            &DisplayId("mon".into()),
+            OwnerEvent::BeforeRelease(HookResult::Aborted),
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Trace("claim_release_aborted"))),
+            "hook-aborted owner emits claim_release_aborted; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SendReleaseFailed)),
+            "hook-aborted owner emits SendReleaseFailed; got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Terminal(Terminal::ReleaseAborted))),
+            "hook-aborted owner reaches Terminal::ReleaseAborted; got: {actions:?}"
         );
     }
 }

@@ -64,8 +64,8 @@ use dormant_core::observation::{
 use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
 use dormant_core::peers::load_or_create_identity;
 use dormant_core::rules::{
-    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
-    RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
+    ControlMsg, DaemonEvent, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg,
+    RulesEngine, RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
@@ -86,6 +86,7 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
+use crate::claim_runtime::{self, ClaimRuntimeDeps, ClaimRuntimeHandle, sink_claim_capable};
 use crate::coordination_claim::{
     ClaimTransportDeps, ClaimTransportHandle, PeerStoreFeed, spawn as spawn_claim_transport,
 };
@@ -950,6 +951,44 @@ impl App {
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
         let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
+        let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
+
+        // KVM claim runtime — daemon-lifetime. Spawned BESIDE the
+        // claim transport (both survive reload). The driver
+        // composes the transport / hook engine / executor /
+        // rules engine into a single per-display single-flight
+        // state machine. Holds a reference to the front control
+        // channel so it can publish `SetClaimSuppression` (F10)
+        // to the rules engine as flights begin and end.
+        let claim_runtime: Option<ClaimRuntimeHandle> = if cfg_clone.coordination.enabled {
+            // The hook engine requires a real `MqttPublisher` even
+            // when the operator hasn't configured any `mqtt` hook
+            // action (the publisher stays idle until `publish` is
+            // called). The empty broker URL keeps the connect-on-
+            // first-use path dormant.
+            let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
+            let hook_engine = Arc::new(crate::hooks::HookEngine::new(publisher));
+            let identity = Arc::new(
+                load_or_create_identity(&self.state_dir)
+                    .context("load persistent instance identity for claim runtime")?,
+            );
+            Some(claim_runtime::spawn(ClaimRuntimeDeps {
+                identity,
+                transport: claim_transport
+                    .as_ref()
+                    .expect("claim transport present when coordination enabled")
+                    .clone(),
+                executors: executors_rx.clone(),
+                config: config_rx.clone(),
+                hooks: hook_engine,
+                coordination: coordination.clone(),
+                front_ctl_tx: front_ctl_tx.clone(),
+                cancel: root.clone(),
+                event_log: None,
+            }))
+        } else {
+            None
+        };
 
         let spawn = spawn_generation(
             &root,
@@ -994,7 +1033,6 @@ impl App {
         // no delivery can race behind the generation barrier.
         let ctl_router = Arc::new(GenerationRouter::new(spawn.ctl_tx.clone()));
         let events_router = Arc::new(GenerationRouter::new(spawn.events_tx.clone()));
-        let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
         let (front_events_tx, front_events_rx) = mpsc::channel::<PresenceEvent>(256);
 
         let front_ctl_handle =
@@ -1067,13 +1105,14 @@ impl App {
             None
         } else {
             Some(
-                crate::ipc::spawn_with_pairing(
+                crate::ipc::spawn_with_claim_runtime(
                     &socket_path,
                     front_ctl_tx.clone(),
                     reload_requester.clone(),
                     doctor_service.clone(),
                     Arc::clone(&pairing_manager),
                     pairing_transport.clone(),
+                    claim_runtime.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -1208,6 +1247,7 @@ impl App {
             coordination: coordination.clone(),
             _coordination_mdns: None,
             claim_transport: claim_transport.clone(),
+            claim_runtime: claim_runtime.clone(),
             coordination_enabled_tx,
             claim_presence_handle,
             sd: self.sd_notify,
@@ -1258,6 +1298,7 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             coordination,
             claim_transport,
+            claim_runtime,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
@@ -1313,6 +1354,12 @@ pub struct AppHandle {
     #[cfg(any(test, feature = "test-util"))]
     coordination: Option<CoordinationHandle>,
     claim_transport: Option<Arc<ClaimTransportHandle>>,
+    /// KVM claim runtime handle (daemon-lifetime when coordination
+    /// is enabled). `None` when coordination is disabled. Tests
+    /// and orchestrator callers use this to read the resolved
+    /// `KvmStatus` (the `StateSnapshot.kvm` fold) and to
+    /// trigger local claims.
+    claim_runtime: Option<ClaimRuntimeHandle>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
     /// Test-only LKG-candidate observation seam — see
@@ -1326,6 +1373,15 @@ impl AppHandle {
     #[must_use]
     pub fn claim_transport(&self) -> Option<&ClaimTransportHandle> {
         self.claim_transport.as_deref()
+    }
+    /// Return the KVM claim runtime handle when coordination is
+    /// configured. Use [`ClaimRuntimeHandle::kvm_status`] for the
+    /// snapshot fold, [`ClaimRuntimeHandle::try_claim`] for a
+    /// local claim trigger, and [`ClaimRuntimeHandle::is_suppressed`]
+    /// for the F10 ownership-loss gate.
+    #[must_use]
+    pub fn claim_runtime(&self) -> Option<&ClaimRuntimeHandle> {
+        self.claim_runtime.as_ref()
     }
     /// A sender for [`ControlMsg`]s, forwarded to the current engine
     /// generation across reloads.
@@ -1523,6 +1579,12 @@ struct Runner {
     _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
     /// Daemon-lifetime authenticated claim listener; it survives generation swaps.
     claim_transport: Option<Arc<ClaimTransportHandle>>,
+    /// KVM claim runtime handle (daemon-lifetime, beside the
+    /// transport). `None` when coordination is disabled. The
+    /// orchestrator consults it on every successful generation
+    /// install to republish the resolved `KvmStatus` and to
+    /// fan the post-install `DaemonEvent::ConfigReloaded`.
+    claim_runtime: Option<ClaimRuntimeHandle>,
     coordination_enabled_tx: watch::Sender<bool>,
     /// Daemon-lifetime passive claim-presence browser and advertisement loop.
     claim_presence_handle: Option<JoinHandle<()>>,
@@ -1717,8 +1779,50 @@ impl Runner {
         self.generation_barrier_ack_timeout =
             spawn.generation.cfg.daemon.generation_barrier_ack_timeout;
         self.generation = spawn.generation;
-        self.ctl_router.install(spawn.ctl_tx).await;
-        self.events_router.install(spawn.events_tx).await;
+        self.ctl_router.install(spawn.ctl_tx.clone()).await;
+        self.events_router.install(spawn.events_tx.clone()).await;
+
+        // KVM snapshot: refresh the claim-capable display set,
+        // the resolved keymap, and the activity-claim policy on
+        // every successful generation install (fresh + reload —
+        // reload flows through `install_generation` too). The
+        // rules engine reads the value in
+        // `RulesEngine::send_snapshot`; the direct
+        // `ConfigReloaded` event broadcast on the IPC stream is
+        // the tray's refetch trigger (council 3/3 Must).
+        if let Some(claim_runtime) = &self.claim_runtime {
+            let cfg = &self.generation.cfg;
+            let executors = self.executors_tx.borrow().clone();
+            let claim_capable: Vec<DisplayId> = cfg
+                .displays
+                .iter()
+                .filter_map(|(name, display_config)| {
+                    if display_config.scope != DisplayScope::Shared {
+                        return None;
+                    }
+                    let display = DisplayId(name.clone());
+                    let sink = executors.get(&display)?;
+                    if !sink_claim_capable(sink) {
+                        return None;
+                    }
+                    Some(display)
+                })
+                .collect();
+            claim_runtime.refresh_status(
+                claim_capable,
+                cfg.keymap.clone(),
+                cfg.coordination.activity_claim,
+                cfg.coordination.release_deadline_cap,
+            );
+            let status = claim_runtime.kvm_status();
+            let _ = spawn.ctl_tx.send(ControlMsg::SetKvmStatus(status)).await;
+            // Tray refetch trigger — additive per the DaemonEvent
+            // Unknown convention.
+            let _ = spawn
+                .ctl_tx
+                .send(ControlMsg::PublishDaemonEvent(DaemonEvent::ConfigReloaded))
+                .await;
+        }
     }
 
     /// Reload the config, restarting the runtime in place. See the module
@@ -4440,6 +4544,7 @@ mod watchdog_tests {
                     displays: Vec::new(),
                     pending_reload: None,
                     rollback: None,
+                    kvm: None,
                 });
             }
         });
@@ -4506,6 +4611,7 @@ mod watchdog_tests {
             displays: Vec::new(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let sent = ping_if_healthy(&mut sd, Some(&snapshot));
 
@@ -5524,6 +5630,7 @@ mod restore_tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -6039,6 +6146,7 @@ mod gamma_reload_tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

@@ -90,8 +90,8 @@ pub enum IpcRequest {
     /// List public mDNS discoveries and persisted paired instances.
     CoordinationPeersList,
     /// Initiate a KVM claim on the named shared display (local
-    /// hotkey / CLI / tray). Replied with a [`ClaimSharedResult`]
-    /// over [`IpcResponse::claim_shared`].
+    /// hotkey / CLI / tray). Replied with a
+    /// [`ClaimSharedResultWire`] over [`IpcResponse::claim_shared`].
     ClaimShared {
         /// Display id (matches a `[displays.<id>]` key with
         /// `scope = "shared"`).

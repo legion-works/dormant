@@ -55,6 +55,10 @@ use crate::single_instance;
 /// The outcome of one [`boot`] call (spec §5.1; T1's literal interface,
 /// P12 — `BootPlan` carries no write-back intent, so `boot()` alone decides
 /// which of these three shapes the caller sees).
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Started carries the AppHandle; the other two arms are the cheap error shapes."
+)]
 pub enum BootOutcome {
     /// The daemon started. `used_config` is whichever file was actually
     /// built (the plan's chosen config, or the LKG substitute if an

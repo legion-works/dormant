@@ -1204,6 +1204,7 @@ dependencies = [
  "notify",
  "rand_core 0.10.1",
  "reqwest",
+ "rumqttc",
  "rustix 1.1.4",
  "serde",
  "serde_json",

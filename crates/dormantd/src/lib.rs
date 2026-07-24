@@ -16,6 +16,7 @@ pub mod coordination_mdns;
 pub mod coordination_pairing;
 mod coordination_poll;
 pub mod gamma_recovery;
+pub mod hooks;
 pub mod idle_source;
 pub mod inhibit_activity;
 pub mod inhibit_audio;

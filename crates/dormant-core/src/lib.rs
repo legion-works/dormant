@@ -7,6 +7,7 @@ pub mod coordination;
 pub mod doctor;
 pub mod error;
 pub mod ipc_proto;
+pub mod mqtt;
 pub mod observation;
 pub mod ownership;
 pub mod paths;

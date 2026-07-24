@@ -38,6 +38,10 @@ pub const E_RENDER_UNAVAILABLE: &str = "E_RENDER_UNAVAILABLE";
 pub const E_SCREENSAVER_SOURCE: &str = "E_SCREENSAVER_SOURCE";
 /// Inter-process communication error.
 pub const E_IPC: &str = "E_IPC";
+/// A KVM hook action (argv command or MQTT publish) failed.
+pub const E_HOOK_FAILED: &str = "E_HOOK_FAILED";
+/// A KVM hook action exceeded its per-entry timeout.
+pub const E_HOOK_TIMEOUT: &str = "E_HOOK_TIMEOUT";
 
 // ── DormantError ──────────────────────────────────────────────────────────────
 
@@ -162,6 +166,20 @@ pub enum DormantError {
         /// IPC error detail.
         detail: String,
     },
+
+    /// A KVM hook action (argv command or MQTT publish) failed.
+    #[error("E_HOOK_FAILED: {detail}")]
+    HookFailed {
+        /// Description of the failure (argv exit code, broker error, etc.).
+        detail: String,
+    },
+
+    /// A KVM hook action exceeded its per-entry timeout.
+    #[error("E_HOOK_TIMEOUT: {detail}")]
+    HookTimeout {
+        /// Description of the timed-out hook (argv[0], topic, etc.).
+        detail: String,
+    },
 }
 
 impl DormantError {
@@ -185,6 +203,8 @@ impl DormantError {
             Self::RenderUnavailable { .. } => E_RENDER_UNAVAILABLE,
             Self::ScreensaverSource { .. } => E_SCREENSAVER_SOURCE,
             Self::Ipc { .. } => E_IPC,
+            Self::HookFailed { .. } => E_HOOK_FAILED,
+            Self::HookTimeout { .. } => E_HOOK_TIMEOUT,
         }
     }
 }
@@ -247,5 +267,23 @@ mod tests {
             error: format!("{E_DISPLAY_IO}: no monitor found"),
         });
         assert!(err.to_string().starts_with(E_WAKE_FAILED));
+    }
+
+    #[test]
+    fn code_returns_matching_const_for_hook_failed() {
+        let err = DormantError::HookFailed {
+            detail: "argv[0]=/bin/false exited 1".into(),
+        };
+        assert_eq!(err.code(), E_HOOK_FAILED);
+        assert!(err.to_string().starts_with(E_HOOK_FAILED));
+    }
+
+    #[test]
+    fn code_returns_matching_const_for_hook_timeout() {
+        let err = DormantError::HookTimeout {
+            detail: "argv[0]=/bin/sleep exceeded 5s".into(),
+        };
+        assert_eq!(err.code(), E_HOOK_TIMEOUT);
+        assert!(err.to_string().starts_with(E_HOOK_TIMEOUT));
     }
 }

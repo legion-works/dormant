@@ -11,36 +11,8 @@ use tracing::debug;
 
 use self::kglobalaccel::KGlobalAccelHotkeyRegistrar;
 use self::portal::PortalHotkeyRegistrar;
-use crate::hotkey::{Accelerator, HotkeyError, HotkeyRegistrar};
+use crate::hotkey::{Accelerator, HotkeyError, HotkeyRegistrar, accelerator_tokens, claim_action};
 use crate::menu::Action;
-
-fn accelerator_tokens(accelerator: &Accelerator) -> Result<(Vec<&str>, &str), HotkeyError> {
-    let mut tokens: Vec<_> = accelerator.raw.split('+').collect();
-    let key = tokens
-        .pop()
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| HotkeyError::InvalidAccelerator(accelerator.raw.clone()))?;
-    if tokens
-        .iter()
-        .any(|modifier| !matches!(*modifier, "Alt" | "Control" | "Meta" | "Shift" | "Super"))
-    {
-        return Err(HotkeyError::InvalidAccelerator(accelerator.raw.clone()));
-    }
-    let mut unique = tokens.clone();
-    unique.sort_unstable();
-    if unique.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(HotkeyError::InvalidAccelerator(accelerator.raw.clone()));
-    }
-    Ok((tokens, key))
-}
-
-fn claim_action(target: &str, arm: bool) -> Action {
-    if arm {
-        Action::ArmClaim(target.to_string())
-    } else {
-        Action::ClaimOne(target.to_string())
-    }
-}
 
 /// Registrar that tries `KGlobalAccel` before the portal fallback.
 pub struct FallbackHotkeyRegistrar {
@@ -100,9 +72,10 @@ impl HotkeyRegistrar for FallbackHotkeyRegistrar {
                     }
                     Err(fallback_error) => {
                         self.fallback.unregister_claim().await;
-                        Err(HotkeyError::DbusError(format!(
-                            "KGlobalAccel: {primary_error}; portal: {fallback_error}"
-                        )))
+                        Err(HotkeyError::BothBackendsFailed {
+                            primary: Box::new(primary_error),
+                            fallback: Box::new(fallback_error),
+                        })
                     }
                 }
             }
@@ -205,6 +178,39 @@ mod tests {
             *calls.lock().unwrap(),
             vec!["kglobalaccel", "kglobalaccel:unregister", "portal"]
         );
+    }
+
+    #[tokio::test]
+    async fn combined_failure_preserves_each_backend_error() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = FakeBackend {
+            name: "kglobalaccel",
+            fail: true,
+            calls: Arc::clone(&calls),
+        };
+        let fallback = FakeBackend {
+            name: "portal",
+            fail: true,
+            calls,
+        };
+        let mut registrar = FallbackHotkeyRegistrar::new(Box::new(primary), Box::new(fallback));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = registrar
+            .register_claim(
+                &Accelerator::parse("Meta+F12").unwrap(),
+                "monitor",
+                false,
+                tx,
+            )
+            .await
+            .unwrap_err();
+
+        let HotkeyError::BothBackendsFailed { primary, fallback } = error else {
+            panic!("combined failure must retain backend identity");
+        };
+        assert_eq!(primary.to_string(), "D-Bus error: kglobalaccel unavailable");
+        assert_eq!(fallback.to_string(), "D-Bus error: portal unavailable");
     }
 
     #[test]

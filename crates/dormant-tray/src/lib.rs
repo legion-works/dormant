@@ -46,6 +46,11 @@ pub mod hotkey;
 /// Linux global hotkey registration via D-Bus.
 #[cfg(target_os = "linux")]
 pub mod hotkey_linux;
+/// macOS global hotkey registration through Carbon.
+#[cfg(target_os = "macos")]
+pub mod hotkey_macos;
+#[cfg(any(target_os = "macos", test))]
+mod hotkey_macos_common;
 pub mod icon;
 pub mod menu;
 pub mod state;

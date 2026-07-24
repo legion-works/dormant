@@ -177,6 +177,23 @@ fn any_paused(snapshot: Option<&StateSnapshot>) -> bool {
     snapshot.is_some_and(|s| s.displays.iter().any(|(_, d)| d.paused))
 }
 
+// Scope remains an independent guard because capability lists can be stale or
+// inconsistent during version skew and reloads.
+fn is_claim_capable(snapshot: Option<&StateSnapshot>, id: &str) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot
+            .displays
+            .iter()
+            .find(|(display_id, _)| display_id == id)
+            .is_some_and(|(_, display)| display.scope == DisplayScope::Shared)
+            && snapshot.kvm.as_ref().is_some_and(|kvm| {
+                kvm.claim_capable_displays
+                    .iter()
+                    .any(|display_id| display_id.0 == id)
+            })
+    })
+}
+
 /// Build the tray menu from the current snapshot and reachability.
 ///
 /// The top-level layout is fixed; the per-display submenus are appended
@@ -282,16 +299,7 @@ pub fn build_menu(
             } else {
                 "Blank now"
             };
-            // Whether the display is claim-capable (KVM shared-panel
-            // claim).  The snapshot's `kvm.claim_capable_displays`
-            // is the authority — not every shared display can be
-            // claimed (it also needs write capability + identity).
-            let claim_capable = d.scope == DisplayScope::Shared
-                && snapshot.is_some_and(|s| {
-                    s.kvm
-                        .as_ref()
-                        .is_some_and(|k| k.claim_capable_displays.iter().any(|did| did.0 == *id))
-                });
+            let claim_capable = is_claim_capable(snapshot, id);
 
             let mut sub_entries = vec![
                 MenuEntry::Action {
@@ -1232,6 +1240,7 @@ mod tests {
     fn private_display_is_excluded_even_if_capability_list_is_inconsistent() {
         let mut snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
         snapshot.displays[0].1.scope = DisplayScope::Private;
+        assert!(!is_claim_capable(Some(&snapshot), "monitor"));
         let menu = build_menu(Some(&snapshot), false, 8137);
 
         assert_eq!(find_action(&menu, "Claim panel"), None);

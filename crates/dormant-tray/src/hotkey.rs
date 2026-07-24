@@ -59,11 +59,55 @@ impl Accelerator {
     }
 }
 
+pub(crate) fn accelerator_tokens(
+    accelerator: &Accelerator,
+) -> Result<(Vec<&str>, &str), HotkeyError> {
+    let mut tokens: Vec<_> = accelerator.raw.split('+').collect();
+    let key = tokens
+        .pop()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| HotkeyError::InvalidAccelerator(accelerator.raw.clone()))?;
+    if tokens
+        .iter()
+        .any(|modifier| !matches!(*modifier, "Alt" | "Control" | "Meta" | "Shift" | "Super"))
+    {
+        return Err(HotkeyError::InvalidAccelerator(accelerator.raw.clone()));
+    }
+    let mut unique = tokens.clone();
+    unique.sort_unstable();
+    if unique.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(HotkeyError::InvalidAccelerator(accelerator.raw.clone()));
+    }
+    Ok((tokens, key))
+}
+
+pub(crate) fn claim_action(target: &str, arm: bool) -> Action {
+    if arm {
+        Action::ArmClaim(target.to_string())
+    } else {
+        Action::ClaimOne(target.to_string())
+    }
+}
+
 /// Errors that can occur during hotkey registration.
 #[derive(Debug, Clone)]
 pub enum HotkeyError {
     /// A session D-Bus backend failed.
     DbusError(String),
+    /// Both Linux registration backends failed.
+    BothBackendsFailed {
+        /// Failure returned by `KGlobalAccel`.
+        primary: Box<HotkeyError>,
+        /// Failure returned by the XDG portal.
+        fallback: Box<HotkeyError>,
+    },
+    /// A Carbon operation failed with an `OSStatus` code.
+    CarbonError {
+        /// Carbon function that failed.
+        operation: &'static str,
+        /// Returned `OSStatus` value.
+        status: i32,
+    },
     /// The snapshot does not identify exactly one claim target.
     AmbiguousTarget {
         /// Number of claim-capable displays in the snapshot.
@@ -77,6 +121,15 @@ impl fmt::Display for HotkeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HotkeyError::DbusError(msg) => write!(f, "D-Bus error: {msg}"),
+            HotkeyError::BothBackendsFailed { primary, fallback } => {
+                write!(
+                    f,
+                    "both hotkey backends failed: KGlobalAccel: {primary}; portal: {fallback}"
+                )
+            }
+            HotkeyError::CarbonError { operation, status } => {
+                write!(f, "Carbon {operation} failed with OSStatus {status}")
+            }
             HotkeyError::AmbiguousTarget { count } => {
                 write!(
                     f,
@@ -87,6 +140,66 @@ impl fmt::Display for HotkeyError {
                 write!(f, "invalid accelerator: {accel}")
             }
         }
+    }
+}
+
+/// A fully resolved claim-hotkey state derived from the daemon snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedHotkeyStatus {
+    /// No configured accelerator is currently active.
+    Disabled,
+    /// The configured accelerator has no unique claim target.
+    Ambiguous {
+        /// Number of claim-capable displays in the snapshot.
+        count: usize,
+    },
+    /// Register this accelerator and dispatch the resolved claim action.
+    Register {
+        /// Platform-neutral configured accelerator.
+        accelerator: Accelerator,
+        /// Sole claim-capable display.
+        target: String,
+        /// Whether activation arms rather than immediately claims.
+        arm: bool,
+    },
+}
+
+/// Coalesces unchanged KVM status and resolves registration policy once.
+#[derive(Default)]
+pub(crate) struct HotkeyStatusTracker {
+    initialized: bool,
+    last_kvm: Option<KvmStatus>,
+}
+
+impl HotkeyStatusTracker {
+    pub(crate) fn update(&mut self, kvm: Option<KvmStatus>) -> Option<ResolvedHotkeyStatus> {
+        if self.initialized && self.last_kvm.as_ref() == kvm.as_ref() {
+            return None;
+        }
+        self.initialized = true;
+        self.last_kvm.clone_from(&kvm);
+
+        let Some(kvm) = kvm else {
+            return Some(ResolvedHotkeyStatus::Disabled);
+        };
+        let Some(accelerator) =
+            Accelerator::parse(kvm.keymap.claim_hotkey.as_deref().unwrap_or(""))
+        else {
+            return Some(ResolvedHotkeyStatus::Disabled);
+        };
+        if kvm.claim_capable_displays.len() != 1 {
+            return Some(ResolvedHotkeyStatus::Ambiguous {
+                count: kvm.claim_capable_displays.len(),
+            });
+        }
+        Some(ResolvedHotkeyStatus::Register {
+            accelerator,
+            target: kvm.claim_capable_displays[0].0.clone(),
+            arm: matches!(
+                kvm.activity_claim,
+                dormant_core::config::ActivityClaimPolicy::Armed
+            ),
+        })
     }
 }
 
@@ -128,7 +241,7 @@ pub struct HotkeyManager {
     refresh_rx: watch::Receiver<()>,
     action_rx: UnboundedReceiver<Action>,
     action_tx: UnboundedSender<Action>,
-    last_kvm: Option<KvmStatus>,
+    status: HotkeyStatusTracker,
     current_accelerator: Option<Accelerator>,
     current_target: Option<String>,
     registrar: Option<Box<dyn HotkeyRegistrar>>,
@@ -150,7 +263,7 @@ impl HotkeyManager {
             refresh_rx,
             action_rx,
             action_tx,
-            last_kvm: None,
+            status: HotkeyStatusTracker::default(),
             current_accelerator: None,
             current_target: None,
             registrar,
@@ -195,48 +308,37 @@ impl HotkeyManager {
             s.snapshot.as_ref().and_then(|snap| snap.kvm.clone())
         };
 
-        if self.last_kvm.as_ref() == kvm.as_ref() {
+        let Some(resolved) = self.status.update(kvm) else {
             return;
-        }
-        self.last_kvm.clone_from(&kvm);
+        };
 
         self.unregister_current().await;
 
-        let Some(kvm) = kvm else {
-            return;
-        };
-
-        let Some(hotkey) = Accelerator::parse(kvm.keymap.claim_hotkey.as_deref().unwrap_or(""))
-        else {
-            return;
-        };
-
-        let capable = &kvm.claim_capable_displays;
-        if capable.len() != 1 {
-            let count = capable.len();
-            warn!(
-                count,
-                event = "hotkey_register_failed",
-                reason = "ambiguous_target",
-                "claim hotkey requires exactly one claim-capable shared display"
-            );
-            if let Some(ref n) = self.notifier {
-                n.notify(
-                    "dormant — hotkey not registered",
-                    &format!(
-                        "Cannot register claim hotkey: {count} claim-capable displays (need exactly 1).  Use the tray menu instead."
-                    ),
+        let (hotkey, target, arm) = match resolved {
+            ResolvedHotkeyStatus::Disabled => return,
+            ResolvedHotkeyStatus::Ambiguous { count } => {
+                warn!(
+                    count,
+                    event = "hotkey_register_failed",
+                    reason = "ambiguous_target",
+                    "claim hotkey requires exactly one claim-capable shared display"
                 );
+                if let Some(ref n) = self.notifier {
+                    n.notify(
+                        "dormant — hotkey not registered",
+                        &format!(
+                            "Cannot register claim hotkey: {count} claim-capable displays (need exactly 1).  Use the tray menu instead."
+                        ),
+                    );
+                }
+                return;
             }
-            return;
-        }
-
-        let target = capable[0].0.clone();
-
-        let arm = matches!(
-            kvm.activity_claim,
-            dormant_core::config::ActivityClaimPolicy::Armed
-        );
+            ResolvedHotkeyStatus::Register {
+                accelerator,
+                target,
+                arm,
+            } => (accelerator, target, arm),
+        };
 
         let Some(ref mut registrar) = self.registrar else {
             return;
@@ -355,6 +457,18 @@ mod tests {
             activity_claim: policy,
             claim_armed_remaining: vec![],
         }
+    }
+
+    #[test]
+    fn tracker_resolves_removed_kvm_status_to_disabled() {
+        let mut tracker = HotkeyStatusTracker::default();
+        let status = kvm_status("Meta+F12", &["monitor"], ActivityClaimPolicy::OwnerIdle);
+
+        assert!(matches!(
+            tracker.update(Some(status)),
+            Some(ResolvedHotkeyStatus::Register { .. })
+        ));
+        assert_eq!(tracker.update(None), Some(ResolvedHotkeyStatus::Disabled));
     }
 
     fn has_enabled_claim(entries: &[MenuEntry]) -> bool {

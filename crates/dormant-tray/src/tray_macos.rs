@@ -21,6 +21,10 @@ use tokio_util::sync::CancellationToken;
 use crate::DEFAULT_WEB_PORT;
 use crate::action_table::{ActionTable, TaggedMenuEntry};
 use crate::dispatch::{self, SystemCapabilities};
+#[cfg(target_os = "macos")]
+use crate::hotkey::{HotkeyStatusTracker, ResolvedHotkeyStatus};
+#[cfg(target_os = "macos")]
+use crate::hotkey_macos::CarbonHotkeyRegistrar;
 use crate::ipc_loop;
 use crate::menu::{self, Action};
 use crate::template_icon;
@@ -29,6 +33,7 @@ use crate::tray_state::TrayState;
 
 enum MainMessage {
     Refresh,
+    ReplaceHotkey(ResolvedHotkeyStatus),
     Quit,
 }
 
@@ -40,6 +45,7 @@ struct MacUiState {
 struct MainThreadState {
     receiver: Receiver<MainMessage>,
     ui: MacUiState,
+    hotkey: Option<CarbonHotkeyRegistrar>,
     cancel: CancellationToken,
 }
 
@@ -60,6 +66,9 @@ fn drain_mailbox() {
         });
         match next {
             Some(Ok(MainMessage::Refresh)) => refresh_main_state(),
+            Some(Ok(MainMessage::ReplaceHotkey(status))) => {
+                replace_main_hotkey(status);
+            }
             Some(Ok(MainMessage::Quit)) => {
                 quit_main_state();
                 break;
@@ -67,6 +76,18 @@ fn drain_mailbox() {
             Some(Err(TryRecvError::Empty | TryRecvError::Disconnected)) | None => break,
         }
     }
+}
+
+fn replace_main_hotkey(status: ResolvedHotkeyStatus) {
+    MAIN_STATE.with(|slot| {
+        if let Some(registrar) = slot
+            .borrow_mut()
+            .as_mut()
+            .and_then(|state| state.hotkey.as_mut())
+        {
+            registrar.replace(status);
+        }
+    });
 }
 
 fn refresh_main_state() {
@@ -141,6 +162,18 @@ pub fn run() -> anyhow::Result<()> {
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<Action>();
     let (main_tx, receiver) = std::sync::mpsc::channel::<MainMessage>();
     let mac_tray = MacTray::new(mtm, action_tx.clone());
+    let hotkey = match CarbonHotkeyRegistrar::new(action_tx.clone()) {
+        Ok(registrar) => Some(registrar),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                event = "hotkey_register_failed",
+                reason = "carbon_handler_install_failed",
+                "Carbon hotkey setup failed; manual menu path remains available"
+            );
+            None
+        }
+    };
     let refresh_main_tx = main_tx.clone();
     let quit_main_tx = main_tx.clone();
 
@@ -151,6 +184,7 @@ pub fn run() -> anyhow::Result<()> {
                 mac_tray,
                 state: state.clone(),
             },
+            hotkey,
             cancel: cancel.clone(),
         });
     });
@@ -177,6 +211,7 @@ pub fn run() -> anyhow::Result<()> {
                     refresh_tx.clone(),
                 ));
                 let refresh_task = tokio::spawn(async move {
+                    let mut hotkey_status = HotkeyStatusTracker::default();
                     post_main_message(&refresh_main_tx, MainMessage::Refresh);
                     loop {
                         tokio::select! {
@@ -184,6 +219,16 @@ pub fn run() -> anyhow::Result<()> {
                             changed = refresh_rx.changed() => {
                                 if changed.is_err() {
                                     break;
+                                }
+                                let kvm = {
+                                    let state = runtime_state.lock().await;
+                                    state.snapshot.as_ref().and_then(|snapshot| snapshot.kvm.clone())
+                                };
+                                if let Some(status) = hotkey_status.update(kvm) {
+                                    post_main_message(
+                                        &refresh_main_tx,
+                                        MainMessage::ReplaceHotkey(status),
+                                    );
                                 }
                                 post_main_message(&refresh_main_tx, MainMessage::Refresh);
                             }
@@ -227,7 +272,15 @@ pub fn run() -> anyhow::Result<()> {
     let runtime_result = runtime
         .join()
         .map_err(|_| anyhow::anyhow!("dormant-tray runtime thread panicked"));
-    MAIN_STATE.with(|slot| drop(slot.borrow_mut().take()));
+    MAIN_STATE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(state) = slot.as_mut()
+            && let Some(registrar) = state.hotkey.as_mut()
+        {
+            registrar.unregister();
+        }
+        drop(slot.take());
+    });
     runtime_result??;
     Ok(())
 }

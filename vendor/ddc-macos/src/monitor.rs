@@ -179,8 +179,13 @@ impl Monitor {
             // `find` yields `ItemRef<'_, *const c_void>` which has no
             // `downcast::<CFData>()` helper (and `cast::<T>()` returns a
             // raw pointer, not `Option<T>`).
+            //
+            // `IORegistryEntryCreateCFProperty` returns a `*const c_void`
+            // (the generic CFTypeRef); `wrap_under_create_rule` requires
+            // the typed CFDictionaryRef — same pattern `arm.rs` uses for
+            // `display_create_info_dictionary`'s return value.
             let typed: CFDictionary<CFString, CFType> =
-                unsafe { CFDictionary::wrap_under_create_rule(edid_ref) };
+                unsafe { CFDictionary::wrap_under_create_rule(edid_ref as *const _) };
             let Some(edid_value) = typed.find(CFString::from_static_string("EDID")) else {
                 continue;
             };

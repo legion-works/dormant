@@ -170,14 +170,18 @@ impl Monitor {
             if edid_ref.is_null() {
                 continue;
             }
-            let metadata = unsafe { CFType::wrap_under_create_rule(edid_ref) };
-            let Some(metadata) = metadata.downcast::<CFDictionary>() else {
-                continue;
-            };
-            // Match the existing arm.rs lookup pattern: `find` takes the key
-            // by value (the fork's blanket `ToVoid` impl accepts both `&K`
-            // and `K`), and `ItemRef::downcast::<T>` returns `Option<T>`.
-            let Some(edid_value) = metadata.find(CFString::from_static_string("EDID")) else {
+            // CFDictionary's default generics are both `*const c_void` (NOT
+            // `CFString`/`CFType` — see core-foundation 0.10.1's
+            // `dictionary.rs` line 25). The fork's `arm.rs` always
+            // builds `CFDictionary<CFString, CFType>` explicitly via
+            // `wrap_under_create_rule` so `find` returns `ItemRef<'_, V>`
+            // with the typed value; we must do the same here, otherwise
+            // `find` yields `ItemRef<'_, *const c_void>` which has no
+            // `downcast::<CFData>()` helper (and `cast::<T>()` returns a
+            // raw pointer, not `Option<T>`).
+            let typed: CFDictionary<CFString, CFType> =
+                unsafe { CFDictionary::wrap_under_create_rule(edid_ref) };
+            let Some(edid_value) = typed.find(CFString::from_static_string("EDID")) else {
                 continue;
             };
             let Some(edid) = edid_value.downcast::<CFData>() else {

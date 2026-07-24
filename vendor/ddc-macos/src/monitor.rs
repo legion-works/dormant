@@ -174,11 +174,13 @@ impl Monitor {
             let Some(metadata) = metadata.downcast::<CFDictionary>() else {
                 continue;
             };
-            let edid_key = CFString::from_static_string("EDID");
-            let Some(edid_value) = metadata.find(&edid_key) else {
+            // Match the existing arm.rs lookup pattern: `find` takes the key
+            // by value (the fork's blanket `ToVoid` impl accepts both `&K`
+            // and `K`), and `ItemRef::downcast::<T>` returns `Option<T>`.
+            let Some(edid_value) = metadata.find(CFString::from_static_string("EDID")) else {
                 continue;
             };
-            let Some(edid) = edid_value.cast::<CFData>() else {
+            let Some(edid) = edid_value.downcast::<CFData>() else {
                 continue;
             };
             let bytes = edid.bytes();

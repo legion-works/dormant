@@ -209,6 +209,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
 
         let ctl_tx = spawn_fake_engine(snapshot.clone());
@@ -251,6 +252,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
 
         let ctl_tx = spawn_fake_engine(snapshot);

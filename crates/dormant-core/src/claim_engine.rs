@@ -114,6 +114,12 @@ pub enum RequesterEvent {
     Response {
         /// Request correlation nonce copied by the peer.
         nonce: String,
+        /// Owner-disposition peer instance id. Required
+        /// for per-peer dedup (F1 — a single paired peer
+        /// must not be able to force a fallback by emitting
+        /// multiple signed `NotOwner` frames, each passing
+        /// T8 replay via its own counter).
+        peer_instance_id: String,
         /// Owner disposition.
         verdict: ClaimVerdict,
     },
@@ -137,9 +143,14 @@ pub enum RequesterEvent {
 impl RequesterEvent {
     /// Build a correlated response event.
     #[must_use]
-    pub fn response(nonce: impl Into<String>, verdict: ClaimVerdict) -> Self {
+    pub fn response(
+        nonce: impl Into<String>,
+        peer_instance_id: impl Into<String>,
+        verdict: ClaimVerdict,
+    ) -> Self {
         Self::Response {
             nonce: nonce.into(),
+            peer_instance_id: peer_instance_id.into(),
             verdict,
         }
     }
@@ -198,6 +209,15 @@ pub struct OwnerRequest {
     /// Locally derived claim identity, if available.
     pub local_identity: Option<String>,
     /// Input code requested by the peer.
+    ///
+    /// Carried as `u16` over the wire (the ClaimRequest
+    /// struct) but the OWNER side writes a `u8` (VCP 0x60
+    /// is an 8-bit field). A code that exceeds `u8` is
+    /// invalid input; `begin_owner` rejects it with
+    /// [`ClaimDeniedReason::Unsupported`] rather than
+    /// silently truncating to 0 (which would map to the
+    /// MAGIC_STANDBY sentinel and trigger a spurious F4
+    /// standby failure on the requester).
     pub requester_input_code: u16,
     /// This owner's configured input code.
     pub local_input_code: u16,
@@ -256,7 +276,19 @@ struct RequesterFlight {
     nonce: String,
     stage: RequesterStage,
     request_deadline: Instant,
-    responses_remaining: usize,
+    /// Peer instance ids that have already responded to this
+    /// flight's `BroadcastRequest`. Per-peer dedup (rather
+    /// than a bare counter) prevents a single paired peer
+    /// from emitting multiple `NotOwner` frames — each
+    /// passing T8 replay via its own signed counter — to
+    /// drive the count to zero and force a direct-write
+    /// fallback that skips the legitimate owner's hooks.
+    responded_peers: std::collections::HashSet<String>,
+    /// `responded_peers.len() == expected_peers` is the
+    /// terminal condition for the fan-in. Snapshot at
+    /// flight-arm time so a late peer addition doesn't
+    /// extend the wait indefinitely.
+    expected_peers: usize,
     busy_retried: bool,
     epoch_retried: bool,
     flip_observed: bool,
@@ -329,7 +361,8 @@ impl ClaimEngine {
                 nonce: nonce.to_owned(),
                 stage: RequesterStage::Broadcasting,
                 request_deadline: now + claim_timeout,
-                responses_remaining: peer_count,
+                responded_peers: std::collections::HashSet::new(),
+                expected_peers: peer_count,
                 busy_retried: false,
                 epoch_retried: false,
                 flip_observed: false,
@@ -367,6 +400,16 @@ impl ClaimEngine {
                 Action::Trace("claim_not_owner"),
                 Action::SendVerdict(ClaimVerdict::NotOwner),
             ];
+        }
+        // N2: validate the requester's input code fits the
+        // 8-bit VCP 0x60 field the OWNER will write. A
+        // value > 255 is invalid input — refusing it here
+        // keeps the OWNER's `u8` write from silently
+        // truncating to 0 (the standby sentinel) and
+        // surfacing a spurious F4 failure on the
+        // requester.
+        if request.requester_input_code > u16::from(u8::MAX) {
+            return denied(ClaimDeniedReason::Unsupported);
         }
         if request.requester_input_code == request.local_input_code {
             return denied(ClaimDeniedReason::InputCodeConflict);
@@ -500,33 +543,6 @@ impl ClaimEngine {
             ],
         }
     }
-
-    /// Expire every display whose active phase deadline has elapsed.
-    pub fn expire(&mut self, now: Instant) -> Vec<(DisplayId, Vec<Action>)> {
-        let expired = self
-            .flights
-            .iter()
-            .filter_map(|(display, flight)| {
-                let deadline = match flight {
-                    Flight::Requester(flight) => match flight.stage {
-                        RequesterStage::Watching { deadline } => deadline,
-                        RequesterStage::Broadcasting | RequesterStage::AwaitingAck => {
-                            flight.request_deadline
-                        }
-                    },
-                    Flight::Owner(flight) => flight.deadline,
-                };
-                (now >= deadline).then(|| display.clone())
-            })
-            .collect::<Vec<_>>();
-        expired
-            .into_iter()
-            .map(|display| {
-                let actions = self.on_deadline(&display, now);
-                (display, actions)
-            })
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,11 +565,22 @@ fn requester_transition(
             flight.stage = RequesterStage::AwaitingAck;
             Vec::new()
         }
-        (RequesterStage::AwaitingAck, RequesterEvent::Response { nonce, verdict })
-            if nonce == flight.nonce =>
-        {
-            requester_response(flight, verdict, now, poll_interval, release_cap, terminal)
-        }
+        (
+            RequesterStage::AwaitingAck,
+            RequesterEvent::Response {
+                nonce,
+                peer_instance_id,
+                verdict,
+            },
+        ) if nonce == flight.nonce => requester_response(
+            flight,
+            &peer_instance_id,
+            verdict,
+            now,
+            poll_interval,
+            release_cap,
+            terminal,
+        ),
         (
             RequesterStage::Broadcasting | RequesterStage::AwaitingAck,
             RequesterEvent::ClaimTimeout,
@@ -596,6 +623,7 @@ fn requester_transition(
 
 fn requester_response(
     flight: &mut RequesterFlight,
+    peer_instance_id: &str,
     verdict: ClaimVerdict,
     now: Instant,
     poll_interval: Duration,
@@ -611,8 +639,18 @@ fn requester_response(
             vec![Action::Trace("claim_accepted"), Action::WatchForFlip]
         }
         ClaimVerdict::NotOwner => {
-            flight.responses_remaining = flight.responses_remaining.saturating_sub(1);
-            if flight.responses_remaining == 0 {
+            // F1: per-peer dedup. A single paired peer that
+            // emits multiple signed `NotOwner` frames (each
+            // with its own counter, each passing T8 replay)
+            // must NOT be able to force a fallback that skips
+            // the legitimate owner's hooks. Only the first
+            // `NotOwner` from each distinct peer counts; the
+            // fan-in completes when every expected peer has
+            // spoken.
+            if !flight.responded_peers.insert(peer_instance_id.to_owned()) {
+                return Vec::new();
+            }
+            if flight.responded_peers.len() >= flight.expected_peers {
                 *terminal = Some(Terminal::TimedOut);
                 vec![
                     Action::Trace("claim_not_owner"),
@@ -794,7 +832,7 @@ mod tests {
 
         let actions = engine.requester_event(
             &display(),
-            RequesterEvent::response("nonce", ClaimVerdict::Accepted { eta_ms: 5_000 }),
+            RequesterEvent::response("nonce", "peer", ClaimVerdict::Accepted { eta_ms: 5_000 }),
             start,
         );
         assert_eq!(
@@ -829,7 +867,7 @@ mod tests {
             engine
                 .requester_event(
                     &display(),
-                    RequesterEvent::response("nonce", ClaimVerdict::NotOwner),
+                    RequesterEvent::response("nonce", "peer-a", ClaimVerdict::NotOwner),
                     start,
                 )
                 .contains(&Action::Trace("claim_not_owner"))
@@ -837,7 +875,7 @@ mod tests {
         assert_eq!(
             engine.requester_event(
                 &display(),
-                RequesterEvent::response("nonce", ClaimVerdict::NotOwner),
+                RequesterEvent::response("nonce", "peer-b", ClaimVerdict::NotOwner),
                 start,
             ),
             vec![
@@ -853,7 +891,7 @@ mod tests {
         assert_eq!(
             engine.requester_event(
                 &display(),
-                RequesterEvent::response("busy", ClaimVerdict::Busy),
+                RequesterEvent::response("busy", "peer-c", ClaimVerdict::Busy),
                 start
             ),
             vec![Action::Trace("claim_busy"), Action::RetryRequest]
@@ -861,7 +899,7 @@ mod tests {
         assert_eq!(
             engine.requester_event(
                 &display(),
-                RequesterEvent::response("busy", ClaimVerdict::Busy),
+                RequesterEvent::response("busy", "peer-c", ClaimVerdict::Busy),
                 start
             ),
             vec![Action::Trace("claim_busy")]
@@ -888,13 +926,17 @@ mod tests {
         assert_eq!(
             engine.requester_event(
                 &display(),
-                RequesterEvent::response("nonce", stale.clone()),
+                RequesterEvent::response("nonce", "peer", stale.clone()),
                 start,
             ),
             vec![Action::RetryWithEpoch("fresh-epoch-0001".into())]
         );
         assert_eq!(
-            engine.requester_event(&display(), RequesterEvent::response("nonce", stale), start,),
+            engine.requester_event(
+                &display(),
+                RequesterEvent::response("nonce", "peer", stale),
+                start,
+            ),
             vec![
                 Action::Trace("claim_denied"),
                 Action::Trace("claim_failed"),
@@ -1045,15 +1087,12 @@ mod tests {
 
         engine.begin_requester(display(), "expiry", 1, start, Duration::from_secs(3));
         assert_eq!(
-            engine.expire(start + Duration::from_secs(3)),
-            vec![(
-                display(),
-                vec![
-                    Action::SendAbort,
-                    Action::Trace("claim_fallback_direct"),
-                    Action::AttemptFallback,
-                ],
-            )]
+            engine.on_deadline(&display(), start + Duration::from_secs(3)),
+            vec![
+                Action::SendAbort,
+                Action::Trace("claim_fallback_direct"),
+                Action::AttemptFallback,
+            ]
         );
         assert!(!engine.is_suppressed(&display(), start + Duration::from_secs(3)));
     }
@@ -1068,7 +1107,11 @@ mod tests {
             engine
                 .requester_event(
                     &display(),
-                    RequesterEvent::response("stale", ClaimVerdict::Accepted { eta_ms: 1_000 },),
+                    RequesterEvent::response(
+                        "stale",
+                        "peer",
+                        ClaimVerdict::Accepted { eta_ms: 1_000 },
+                    ),
                     start,
                 )
                 .is_empty()
@@ -1102,7 +1145,7 @@ mod tests {
         engine.requester_event(&display(), RequesterEvent::FanoutSent, start);
         engine.requester_event(
             &display(),
-            RequesterEvent::response("watch", ClaimVerdict::Accepted { eta_ms: 5_000 }),
+            RequesterEvent::response("watch", "peer", ClaimVerdict::Accepted { eta_ms: 5_000 }),
             start,
         );
         let deadline = start + Duration::from_secs(5);
@@ -1169,7 +1212,7 @@ mod tests {
             engine.requester_event(&display(), RequesterEvent::FanoutSent, start);
             engine.requester_event(
                 &display(),
-                RequesterEvent::response(nonce, ClaimVerdict::Accepted { eta_ms: 5_000 }),
+                RequesterEvent::response(nonce, nonce, ClaimVerdict::Accepted { eta_ms: 5_000 }),
                 start,
             );
         }
@@ -1229,7 +1272,8 @@ mod tests {
                         nonce: "n".into(),
                         stage,
                         request_deadline: start + Duration::from_secs(3),
-                        responses_remaining: 1,
+                        responded_peers: std::collections::HashSet::new(),
+                        expected_peers: 1,
                         busy_retried: false,
                         epoch_retried: false,
                         flip_observed: event_index == 4,
@@ -1237,7 +1281,7 @@ mod tests {
                 );
                 let event = match event_index {
                     0 => RequesterEvent::FanoutSent,
-                    1 => RequesterEvent::response("n", ClaimVerdict::NotOwner),
+                    1 => RequesterEvent::response("n", "n", ClaimVerdict::NotOwner),
                     2 => RequesterEvent::ClaimTimeout,
                     3 => RequesterEvent::FlipObserved,
                     4 => RequesterEvent::AcquireCompleted,

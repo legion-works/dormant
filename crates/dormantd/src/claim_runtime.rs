@@ -33,8 +33,7 @@
     clippy::bind_instead_of_map,
     clippy::useless_conversion,
     clippy::needless_borrow,
-    clippy::needless_pass_by_value,
-    dead_code
+    clippy::needless_pass_by_value
 )]
 
 use std::collections::{HashMap, VecDeque};
@@ -47,7 +46,7 @@ use dormant_core::claim::{
 };
 use dormant_core::claim_engine::{
     Action, ClaimCapability, ClaimEngine, ClaimFailure, HookResult, OwnerDisposition, OwnerEvent,
-    OwnerRequest, RequesterEvent, RequesterStage,
+    OwnerRequest, RequesterEvent,
 };
 use dormant_core::config::Config;
 use dormant_core::config::schema::{ActivityClaimPolicy, HookAction, HookSlots, KeymapConfig};
@@ -59,7 +58,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::coordination_claim::{ClaimPeer, ClaimTransportHandle};
+use crate::coordination_claim::ClaimTransportHandle;
 use crate::hooks::{Direction, HookContext, HookEngine, HookOutcome, HookSlot, Phase};
 
 /// Literal claim lifecycle anchors. Re-exported from the pure
@@ -84,9 +83,6 @@ struct DisplayCtx {
     writable: bool,
     /// Generation-stable hook snapshot.
     hooks: Arc<HookSlots>,
-    /// Local instance id (the requester identity for outbound
-    /// frames and the `DORMANT_PEER` env value for hooks).
-    local_instance_id: String,
 }
 
 /// Per-display live flight tracking. The pure engine doesn't
@@ -103,19 +99,8 @@ struct ActiveFlight {
     /// (owner: the inbound requester; requester: the inbound
     /// Accepted verdict sender).
     peer_instance_id: String,
-    /// The peer's claimed requester input code (owner side only —
-    /// carried so the runtime can validate the inbound request
-    /// without re-deriving it from the wire frame).
-    #[allow(dead_code)]
-    peer_input_code: u16,
-    /// For the requester: the configured local input code (used
-    /// for fallback write). For the owner: the local input code
-    /// (used in the before/after release hook env and the
-    /// pre-acquire wake decision).
-    #[allow(dead_code)]
-    local_input_code: u16,
     /// The code the OWNER side must select when it writes the
-    /// input. For the requester side this is `local_input_code`
+    /// input. For the requester side this is the LOCAL code
     /// (the fallback writes the local code). Stored explicitly
     /// so the driver's `write_input_source` action can pick the
     /// right code per side without re-deriving it from the
@@ -124,14 +109,13 @@ struct ActiveFlight {
 }
 
 /// Runtime events consumed by the driver.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Inbound carries the signed ClaimFrame (~hundreds of bytes); the other arms are the cheap IPC reply oneshots."
+)]
 #[derive(Debug)]
 enum RuntimeEvent {
     Inbound(ClaimFrame),
-    OwnershipChanged {
-        display: DisplayId,
-        owned: bool,
-        observed: Option<u8>,
-    },
     ClaimShared {
         display: DisplayId,
         reply: oneshot::Sender<ClaimSharedResult>,
@@ -141,13 +125,6 @@ enum RuntimeEvent {
         reply: oneshot::Sender<Result<Instant, ArmFailure>>,
     },
     DisplayRemoved(DisplayId),
-    /// Asynchronous owner-event completion from a hook slot or
-    /// write/wake task. The driver feeds the event back into
-    /// the pure engine and re-dispatches.
-    OwnerHookOutcome {
-        display: DisplayId,
-        event: OwnerEvent,
-    },
 }
 
 /// Local verdict surfaced to the IPC caller.
@@ -249,27 +226,6 @@ impl ClaimRuntimeHandle {
             .map_err(|_| "claim runtime not available")
     }
 
-    /// **Test seam**: feed an ownership-changed observation as
-    /// the coordination poller would (the requester's
-    /// `FlipObserved` event fires when the observed code
-    /// matches the local input code).
-    #[cfg(any(test, feature = "test-util"))]
-    pub async fn inject_ownership_for_test(
-        &self,
-        display: DisplayId,
-        owned: bool,
-        observed: Option<u8>,
-    ) -> Result<(), &'static str> {
-        self.cmd_tx
-            .send(RuntimeEvent::OwnershipChanged {
-                display,
-                owned,
-                observed,
-            })
-            .await
-            .map_err(|_| "claim runtime not available")
-    }
-
     /// F10 suppression: `true` when the runtime owns an in-flight
     /// local claim/release entry for `display` whose phase
     /// deadline has not elapsed.
@@ -360,7 +316,7 @@ pub struct ClaimRuntimeDeps {
 /// status).
 pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RuntimeEvent>(32);
-    let (owner_event_tx, owner_event_rx) = mpsc::channel::<(DisplayId, OwnerEvent)>(64);
+    let (owner_event_tx, owner_event_rx) = mpsc::channel::<(DisplayId, String, OwnerEvent)>(64);
     let armed = Arc::new(Mutex::new(HashMap::<DisplayId, Instant>::new()));
     let claim_capable = Arc::new(Mutex::new(Vec::<DisplayId>::new()));
     let keymap = Arc::new(Mutex::new(KeymapConfig::default()));
@@ -432,11 +388,11 @@ struct Driver {
     /// spawned task so the spawned task's `send` is the only
     /// sender left when the dispatch loop is in a quiescent
     /// state.
-    owner_event_rx: mpsc::Receiver<(DisplayId, OwnerEvent)>,
+    owner_event_rx: mpsc::Receiver<(DisplayId, String, OwnerEvent)>,
     /// Sender half of the owner-event channel. Cloned into
     /// each spawned task; the original is dropped after spawn
     /// so the channel closes cleanly when no work is pending.
-    owner_event_tx: mpsc::Sender<(DisplayId, OwnerEvent)>,
+    owner_event_tx: mpsc::Sender<(DisplayId, String, OwnerEvent)>,
     /// Daemon-front control channel (forwarded to the engine).
     /// Used to publish `ControlMsg::SetClaimSuppression` so the
     /// rules engine can gate ownership-loss reactions (F10).
@@ -451,6 +407,13 @@ struct Driver {
 }
 
 impl Driver {
+    /// VCP 0x60 reports `0x00` for a panel in standby (the
+    /// DDC/CI standard's reserved "no active input" code).
+    /// F4 forbids the direct fallback when the read lands on
+    /// this value — the panel is powered off, the read is
+    /// honest, and the operator must wake it first.
+    const MAGIC_STANDBY: u8 = 0x00;
+
     async fn run(mut self) {
         // Prime the contexts from the current config.
         self.refresh_contexts_from_config().await;
@@ -464,7 +427,28 @@ impl Driver {
                     self.handle_event(event).await;
                 }
                 maybe = self.owner_event_rx.recv() => {
-                    let Some((display, event)) = maybe else { break };
+                    let Some((display, nonce, event)) = maybe else { break };
+                    // F2: drop stale-nonce completions. A late
+                    // hook/write/wake result from a flight that
+                    // already terminalised (timeout, removed,
+                    // mid-claim reload) must NOT advance a NEW
+                    // flight for the same display, nor wrongly
+                    // clear its F10 suppression.
+                    let current_nonce = self
+                        .flights
+                        .get(&display)
+                        .map(|f| f.nonce.clone());
+                    if current_nonce.as_deref() != Some(nonce.as_str()) {
+                        if let Some(display) = self.contexts.get(&display) {
+                            // F10 lift for the dropped
+                            // completion's nonce: the
+                            // timeout or terminalisation
+                            // already fired; nothing to do
+                            // here.
+                            let _ = display;
+                        }
+                        continue;
+                    }
                     let actions = self.feed_owner_event(&display, event);
                     self.dispatch_actions(&display, &actions);
                 }
@@ -486,14 +470,6 @@ impl Driver {
     async fn handle_event(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Inbound(frame) => self.handle_inbound(frame).await,
-            RuntimeEvent::OwnershipChanged {
-                display,
-                owned,
-                observed,
-            } => {
-                self.handle_ownership_changed(&display, owned, observed)
-                    .await;
-            }
             RuntimeEvent::ClaimShared { display, reply } => {
                 self.handle_claim_shared(&display, reply).await;
             }
@@ -502,10 +478,6 @@ impl Driver {
             }
             RuntimeEvent::DisplayRemoved(display) => {
                 self.handle_display_removed(&display).await;
-            }
-            RuntimeEvent::OwnerHookOutcome { display, event } => {
-                let actions = self.feed_owner_event(&display, event);
-                self.dispatch_actions(&display, &actions);
             }
         }
     }
@@ -570,6 +542,7 @@ impl Driver {
                         &display,
                         RequesterEvent::Response {
                             nonce: response.nonce,
+                            peer_instance_id: sender_instance_id.clone(),
                             verdict: response.verdict,
                         },
                         Instant::now(),
@@ -607,7 +580,6 @@ impl Driver {
             self.send_verdict_to_peer_now(&sender_instance_id, &nonce, ClaimVerdict::NotOwner);
             return;
         };
-        let local_input_code = ctx.local_input_code.unwrap_or(0);
         let capability = if ctx.writable {
             ClaimCapability::Writable
         } else {
@@ -641,7 +613,7 @@ impl Driver {
             requested_identity: request.display_identity.clone(),
             local_identity: ctx.claim_identity.clone(),
             requester_input_code: u16::from(request.requester_input_code),
-            local_input_code: u16::from(local_input_code),
+            local_input_code: u16::from(ctx.local_input_code.unwrap_or(0)),
             capability,
             disposition,
             eta,
@@ -664,44 +636,10 @@ impl Driver {
             ActiveFlight {
                 nonce: nonce.clone(),
                 peer_instance_id: sender_instance_id,
-                peer_input_code: u16::from(request.requester_input_code),
-                local_input_code: u16::from(local_input_code),
                 write_code: u8::try_from(request.requester_input_code).unwrap_or(0),
             },
         );
         self.dispatch_actions(&display, &actions);
-    }
-
-    async fn handle_ownership_changed(
-        &mut self,
-        display: &DisplayId,
-        _owned: bool,
-        observed: Option<u8>,
-    ) {
-        // Only the requester's Watching stage needs the flip
-        // signal; the owner side never watches (the pure
-        // engine's owner progress is owner-driven).
-        let Some(stage) = self
-            .engines
-            .get(display)
-            .and_then(|e| e.requester_stage(display))
-        else {
-            return;
-        };
-        if !matches!(stage, RequesterStage::Watching { .. }) {
-            return;
-        }
-        let Some(target_code) = self.contexts.get(display).and_then(|c| c.local_input_code) else {
-            return;
-        };
-        if observed == Some(target_code) {
-            let actions = self
-                .engines
-                .get_mut(display)
-                .expect("engine present")
-                .requester_event(display, RequesterEvent::FlipObserved, Instant::now());
-            self.dispatch_actions(display, &actions);
-        }
     }
 
     async fn handle_claim_shared(
@@ -759,8 +697,6 @@ impl Driver {
             ActiveFlight {
                 nonce: nonce.clone(),
                 peer_instance_id: String::new(),
-                peer_input_code: 0,
-                local_input_code: ctx.local_input_code.unwrap_or(0) as u16,
                 write_code: ctx.local_input_code.unwrap_or(0),
             },
         );
@@ -1104,6 +1040,16 @@ impl Driver {
         let hooks_engine = self.hooks.clone();
         let display_for_task = display.clone();
         let outcome_tx = self.owner_event_tx.clone();
+        // F2: capture the flight nonce at arm time so the
+        // spawned task can tag its completion. The driver
+        // drops completions whose nonce doesn't match the
+        // active flight (stale from a terminalised or
+        // mid-claim-reloaded flight).
+        let flight_nonce = self
+            .flights
+            .get(display)
+            .map(|f| f.nonce.clone())
+            .unwrap_or_default();
         tokio::spawn(async move {
             let context = HookContext {
                 display: &display_name,
@@ -1135,7 +1081,9 @@ impl Driver {
                     OwnerEvent::BeforeRelease(HookResult::Aborted)
                 }
             };
-            let _ = outcome_tx.send((display_for_task, event)).await;
+            let _ = outcome_tx
+                .send((display_for_task, flight_nonce, event))
+                .await;
         });
         // No immediate follow-up actions; the spawned task
         // re-enters the engine when it completes.
@@ -1171,6 +1119,13 @@ impl Driver {
         };
         let target = write_code.unwrap_or(_local_code);
         let display_for_task = display.clone();
+        // F2: capture the flight nonce so the spawned task
+        // can tag its completion.
+        let flight_nonce = self
+            .flights
+            .get(display)
+            .map(|f| f.nonce.clone())
+            .unwrap_or_default();
         let outcome_tx = self.owner_event_tx.clone();
         tokio::spawn(async move {
             let result = sink.write_input_source(target).await;
@@ -1178,7 +1133,9 @@ impl Driver {
                 Ok(()) => OwnerEvent::WriteSucceeded,
                 Err(failure) => OwnerEvent::WriteFailed(failure.error),
             };
-            let _ = outcome_tx.send((display_for_task, event)).await;
+            let _ = outcome_tx
+                .send((display_for_task, flight_nonce, event))
+                .await;
         });
         Vec::new()
     }
@@ -1188,6 +1145,13 @@ impl Driver {
             return self.feed_owner_event(display, OwnerEvent::WakeCompleted);
         };
         let display_for_task = display.clone();
+        // F2: capture the flight nonce so the spawned task
+        // can tag its completion.
+        let flight_nonce = self
+            .flights
+            .get(display)
+            .map(|f| f.nonce.clone())
+            .unwrap_or_default();
         let outcome_tx = self.owner_event_tx.clone();
         tokio::spawn(async move {
             let result = sink.wake().await;
@@ -1203,7 +1167,9 @@ impl Driver {
                     OwnerEvent::WriteFailed(failure.error)
                 }
             };
-            let _ = outcome_tx.send((display_for_task, event)).await;
+            let _ = outcome_tx
+                .send((display_for_task, flight_nonce, event))
+                .await;
         });
         Vec::new()
     }
@@ -1307,53 +1273,23 @@ impl Driver {
         });
     }
 
-    fn send_abort_to_owner(&mut self, display: &DisplayId) {
-        // The requester's owner may not have been recorded yet
-        // (the first fan-out hasn't returned a verdict). The
-        // first peer in the snapshot is a reasonable stand-in:
-        // any Accepted will overwrite this via `dispatch_actions`
-        // updating `flights.peer_instance_id`.
-        let Some(flight) = self.flights.get(&display).cloned() else {
-            return;
-        };
-        let peer = if !flight.peer_instance_id.is_empty() {
-            flight.peer_instance_id
-        } else {
-            self.transport
-                .snapshot_peers()
-                .first()
-                .map(|p: &ClaimPeer| p.instance_id.clone())
-                .unwrap_or_default()
-        };
-        if peer.is_empty() {
-            return;
-        }
-        let counter = self.next_counter();
-        let transport = self.transport.clone();
-        let identity = self.local_identity_view();
-        let sender_epoch = self.sender_epoch.clone();
-        let boot_epoch = self.transport.boot_epoch().as_str().to_owned();
-        let nonce = flight.nonce.clone();
-        let _ = display;
-        tokio::spawn(async move {
-            let Ok(frame) = ClaimFrame::sign(
-                &identity,
-                sender_epoch,
-                peer.clone(),
-                boot_epoch,
-                counter,
-                format!("abort-{nonce}"),
-                ClaimMessage::ClaimAbort(ClaimAbort {
-                    nonce: nonce.clone(),
-                }),
-            ) else {
-                return;
-            };
-            transport.send_abort(&peer, &frame).await;
-        });
-    }
-
     fn attempt_fallback(&mut self, display: &DisplayId) {
+        // The pure engine's `on_deadline` already removed the
+        // requester flight (the `RequesterUnaccepted` branch
+        // returns the `[SendAbort, Trace, AttemptFallback]`
+        // action list with NO terminal — the flight itself
+        // is gone). The fallback work that follows is
+        // fire-and-forget: the engine has nothing left to
+        // advance, and the operator's verdict is the
+        // `event_log` entry this spawned task appends.
+        //
+        // No `WriteFailed("acquired")` event is fed back to
+        // the engine: the requester flight is gone, the
+        // signal would be a no-op, and a stale completion
+        // keyed only by `DisplayId` (Must-F2) would race
+        // against any new flight that starts in the
+        // meantime. The log entry is the only state the
+        // driver surfaces.
         let Some(sink) = self.executors.borrow().get(display).cloned() else {
             self.feed_requester_failed(
                 display,
@@ -1369,8 +1305,6 @@ impl Driver {
             return;
         };
         self.record_event("claim_fallback_direct");
-        let owner_event_tx = self.owner_event_tx.clone();
-        let display_for_task = display.clone();
         let event_log = self.event_log.clone();
         tokio::spawn(async move {
             let observed = match sink.read_input_source_sampled().await {
@@ -1385,22 +1319,20 @@ impl Driver {
                 }
             };
             if observed == target_code {
+                // The hardware is already on the local code:
+                // the direct fallback was a no-op. Surface
+                // `claim_completed` so the operator's UI can
+                // distinguish "the panel flipped" from "we
+                // didn't need to flip it".
                 if let Some(log) = &event_log {
                     if let Ok(mut g) = log.lock() {
                         g.push("claim_completed".to_string());
                     }
                 }
-                let _ = owner_event_tx
-                    .send((
-                        display_for_task,
-                        OwnerEvent::WriteFailed("acquired".to_owned()),
-                    ))
-                    .await;
                 return;
             }
-            if observed == 0 {
+            if observed == Self::MAGIC_STANDBY {
                 // Standby: F4 forbids the direct fallback.
-                eprintln!("DEBUG: standby branch reached for {}", display_for_task.0);
                 if let Some(log) = &event_log {
                     if let Ok(mut g) = log.lock() {
                         g.push("claim_failed:standby".to_string());
@@ -1415,13 +1347,17 @@ impl Driver {
                     }
                 }
             } else {
-                // Wait for the next poll to observe the flip.
-                let _ = owner_event_tx
-                    .send((
-                        display_for_task,
-                        OwnerEvent::WriteFailed("acquired".to_owned()),
-                    ))
-                    .await;
+                // The direct write succeeded. The next
+                // coordination poll will observe the flip
+                // and feed `OwnershipChanged(true)` to the
+                // rules engine (the fallback's contribution
+                // ends here; the rules engine drives the
+                // post-flip state machine).
+                if let Some(log) = &event_log {
+                    if let Ok(mut g) = log.lock() {
+                        g.push("claim_fallback_direct:wrote".to_string());
+                    }
+                }
             }
         });
     }
@@ -1498,7 +1434,6 @@ impl Driver {
                 claim_identity,
                 writable,
                 hooks,
-                local_instance_id: self.local_instance_id.clone(),
             };
             self.contexts.insert(id.clone(), ctx);
             self.engines.entry(id.clone()).or_insert_with(|| {
@@ -1840,6 +1775,7 @@ mod tests {
             &DisplayId("mon".into()),
             RequesterEvent::Response {
                 nonce: "n".to_owned(),
+                peer_instance_id: "peer".to_owned(),
                 verdict: ClaimVerdict::Accepted { eta_ms: 5_000 },
             },
             now,

@@ -603,6 +603,7 @@ mod tests {
                             )],
                             pending_reload: None,
                             rollback: None,
+                            kvm: None,
                         });
                     }
                     ControlMsg::Exercise { display, reply } => {

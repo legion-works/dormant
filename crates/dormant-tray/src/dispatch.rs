@@ -201,6 +201,7 @@ mod tests {
             displays: vec![display("a"), display("b")],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

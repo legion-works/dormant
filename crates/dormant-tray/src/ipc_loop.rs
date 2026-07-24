@@ -294,6 +294,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -437,6 +438,7 @@ mod tests {
                             displays: vec![],
                             pending_reload: None,
                             rollback: None,
+                            kvm: None,
                         };
                         let json = serde_json::to_string(&IpcResponse::ok(Some(snap))).unwrap();
                         writer.write_all(json.as_bytes()).await.unwrap();

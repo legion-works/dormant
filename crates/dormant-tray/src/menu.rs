@@ -384,6 +384,7 @@ mod tests {
             displays,
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

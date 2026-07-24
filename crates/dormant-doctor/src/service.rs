@@ -306,6 +306,7 @@ fn empty_snapshot() -> StateSnapshot {
         displays: vec![],
         pending_reload: None,
         rollback: None,
+        kvm: None,
     }
 }
 
@@ -460,6 +461,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

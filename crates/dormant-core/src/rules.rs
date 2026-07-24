@@ -595,7 +595,7 @@ pub struct StateSnapshot {
 /// `ConfigReloaded` event (spec §3, IPC contract).
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct KvmStatus {
-    /// Resolved keymap (keymap.claim_hotkey).
+    /// Resolved keymap (`keymap.claim_hotkey`).
     #[serde(default)]
     pub keymap: crate::config::KeymapConfig,
     /// Post-probe claim-capable display set (shared scope AND

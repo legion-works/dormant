@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dormant_core::claim::{ClaimFrame, ClaimMessage, ClaimRequest, ClaimVerdict};
-use dormant_core::claim_engine::{
-    Action, ClaimEngine, OwnerDisposition, OwnerRequest, RequesterEvent, Terminal,
-};
+use dormant_core::claim_engine::{Action, ClaimEngine, RequesterEvent, Terminal};
 use dormant_core::config::schema::{
     ActivityClaimPolicy, AudioConfig, Config, HookAction, HookSlots, KeymapConfig,
     NotificationsConfig, WatchdogConfig, WearConfig,
@@ -549,22 +547,6 @@ impl ClaimHarness {
         )
         .unwrap()
     }
-    /// Build an inbound owner `OwnerRequest` matching the
-    /// harness's local state (the OWNER path validates via
-    /// the engine, not via the wire; this is the test seam).
-    #[allow(dead_code)]
-    fn build_owner_request(&self) -> OwnerRequest {
-        OwnerRequest {
-            display: DisplayId("mon".into()),
-            requested_identity: format!("panel-{}", "mon"),
-            local_identity: Some(format!("panel-{}", "mon")),
-            requester_input_code: 0x11,
-            local_input_code: 0x0f,
-            capability: dormant_core::claim_engine::ClaimCapability::Writable,
-            disposition: OwnerDisposition::Ready { standby: false },
-            eta: Duration::from_secs(1),
-        }
-    }
 }
 
 // ── 1. Negotiated path (OWNER side, in-process) ─────────────────
@@ -820,6 +802,78 @@ async fn fallback_unknown_state_writes_zero_times() {
     harness.shutdown();
 }
 
+// ── 2b. Fallback: powered + FOREIGN code (Must-5) ───────────────
+
+/// The F4 fallback path at 1411-1424: when the fresh read
+/// returns a powered but FOREIGN code (a different peer's
+/// input is selected), the driver MUST write the LOCAL code
+/// to take the panel, then log a
+/// `claim_fallback_direct:wrote` marker. EXACTLY ONE
+/// `write_input_source(0x0f)` (the local code). The
+/// `claim_completed` trace does NOT fire here — the
+/// completion is gated on the next coordination poll
+/// observing the flip (the rules engine's responsibility,
+/// not the fallback's).
+#[tokio::test]
+async fn fallback_foreign_code_writes_local_code_exactly_once() {
+    let harness = ClaimHarness::build("mon", 0x0f).await;
+    harness.clear_sink_writes();
+    // Foreign powered read: 0x11 is the peer's input, not
+    // ours (local is 0x0f). The fallback must write 0x0f.
+    harness.sink.script_reads(vec![
+        ScriptedRead::Powered(0x11),
+        ScriptedRead::Powered(0x11),
+    ]);
+    let _verdict = harness
+        .handle
+        .try_claim(DisplayId("mon".into()))
+        .await
+        .expect("try_claim channel");
+    assert!(
+        harness
+            .wait_for_log("claim_fallback_direct", Duration::from_secs(5))
+            .await,
+        "fallback trace must fire on foreign-code read"
+    );
+    // The spawned `attempt_fallback` task does the read +
+    // write. The event log must surface the success marker.
+    let mut found_wrote = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let events = harness.log_events();
+        if events.iter().any(|e| e == "claim_fallback_direct:wrote") {
+            found_wrote = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let writes = harness.sink_writes();
+    assert_eq!(
+        writes.len(),
+        1,
+        "foreign-code fallback must write EXACTLY once; got {writes:?}"
+    );
+    assert_eq!(
+        writes[0].arg,
+        Some(0x0f),
+        "fallback must write the LOCAL code (0x0f), not the foreign code (0x11); got {writes:?}"
+    );
+    let events = harness.log_events();
+    assert!(
+        found_wrote,
+        "foreign-code fallback must surface claim_fallback_direct:wrote; got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e == "claim_completed"),
+        "F4 path does NOT complete; the rules engine drives the post-flip state machine; got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.starts_with("claim_failed")),
+        "F4 foreign-code path is a success, not a failure; got {events:?}"
+    );
+    harness.shutdown();
+}
+
 // ── 3. Busy on concurrent trigger ───────────────────────────────
 
 /// The pure engine's single-flight invariant: a second
@@ -934,6 +988,7 @@ fn cross_claim_final_value_convergence() {
             &DisplayId("mon".into()),
             RequesterEvent::Response {
                 nonce: nonce.to_owned(),
+                peer_instance_id: nonce.to_owned(),
                 verdict: ClaimVerdict::Accepted { eta_ms: 5_000 },
             },
             now,

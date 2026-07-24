@@ -1857,6 +1857,7 @@ mod promote_tests {
                 .collect(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

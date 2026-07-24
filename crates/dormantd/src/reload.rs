@@ -380,6 +380,7 @@ mod dispatch_gate_tests {
                 .collect(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -476,6 +477,7 @@ mod dispatch_gate_tests {
             displays: Vec::new(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

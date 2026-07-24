@@ -210,13 +210,13 @@ pub struct OwnerRequest {
     pub local_identity: Option<String>,
     /// Input code requested by the peer.
     ///
-    /// Carried as `u16` over the wire (the ClaimRequest
+    /// Carried as `u16` over the wire (the `ClaimRequest`
     /// struct) but the OWNER side writes a `u8` (VCP 0x60
     /// is an 8-bit field). A code that exceeds `u8` is
     /// invalid input; `begin_owner` rejects it with
     /// [`ClaimDeniedReason::Unsupported`] rather than
     /// silently truncating to 0 (which would map to the
-    /// MAGIC_STANDBY sentinel and trigger a spurious F4
+    /// `MAGIC_STANDBY` sentinel and trigger a spurious F4
     /// standby failure on the requester).
     pub requester_input_code: u16,
     /// This owner's configured input code.

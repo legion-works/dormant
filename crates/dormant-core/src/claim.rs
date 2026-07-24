@@ -160,6 +160,9 @@ pub struct ClaimAbort {
 /// Query for the current owner's idle duration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdleQuery {
+    /// Stable display identity derived from EDID (mirrors `ClaimRequest.display_identity`).
+    /// The owner uses this to confirm it actually owns the queried display before replying.
+    pub display_identity: String,
     /// Correlation nonce for the idle query.
     pub nonce: String,
 }
@@ -441,6 +444,7 @@ fn append_message(payload: &mut Vec<u8>, message: &ClaimMessage) -> Result<(), C
         }
         ClaimMessage::IdleQuery(query) => {
             append_string(payload, "idle_query", "message_type")?;
+            append_string(payload, &query.display_identity, "display_identity")?;
             append_string(payload, &query.nonce, "idle_query_nonce")
         }
         ClaimMessage::IdleReport(report) => {
@@ -805,6 +809,7 @@ mod tests {
                 reason: "switch write failed".to_owned(),
             }),
             ClaimMessage::IdleQuery(IdleQuery {
+                display_identity: "panel-id".to_owned(),
                 nonce: "request-nonce".to_owned(),
             }),
             ClaimMessage::IdleReport(IdleReport {
@@ -843,7 +848,7 @@ mod tests {
                 "tJsdQ4ofC3KY1vLdnxmHQkwcrBFunExJKrczS8qg2xGCDjl/SowHKWC6o7DwnFlfvFWe1XR8ILZeJgX95FgnAg==",
                 "xOcWQ7IGrP1gCe/ckgZ9FF6f7UlFiW9kqZm1HIKMiIuHVGtWMycFnATSEtaPAmvQqvajxnoUWc0BAEOVbOrcBg==",
                 "cJZBlF87wO9/4vdpIZ/n47sowSg/e+1aBUf7VfMvmkcsXVvF6L8XnDa5XY6mENyBp8JDNzhPuSnuDyDyrK10AQ==",
-                "kQlKq6Y+fymxSe0ehFugJYYjlxlVVmfB1xYpdTv8JPz/N0ZUMJtuA523bKXbRPPAYVDFkYSKU7KIgzXFidRCCA==",
+                "2xvDmTYbk3hV+7azGmAT3aNFd2K/Y85L3CfrXuN5Z7UP5ytjvkt4Um/JyPzSVoLN8L06bmoAGssd9UJntFSrDw==",
                 "fklUu0IRcPhTVwYV+fPDXoQ686MUsBhDF14w1g4hm0rOYitWyZiTsjyuHQxG0A2mlNydIG/ItN+FNW3qi/nKAg==",
             ]
         );

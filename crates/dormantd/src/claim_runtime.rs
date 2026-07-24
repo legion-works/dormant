@@ -157,6 +157,14 @@ enum RuntimeEvent {
         event: OwnerEvent,
         reply: oneshot::Sender<bool>,
     },
+    #[cfg(any(test, feature = "test-util"))]
+    /// Directly resolve a pending idle query with `idle_ms`,
+    /// bypassing the signed-frame transport.  Used by the
+    /// `OwnerIdle` policy integration tests.
+    InjectIdleReport {
+        nonce: String,
+        idle_ms: u64,
+    },
 }
 
 /// Local verdict surfaced to the IPC caller.
@@ -322,6 +330,26 @@ impl ClaimRuntimeHandle {
     pub async fn inject_inbound_for_test(&self, frame: ClaimFrame) -> Result<(), &'static str> {
         self.cmd_tx
             .send(RuntimeEvent::Inbound(frame))
+            .await
+            .map_err(|_| "claim runtime not available")
+    }
+
+    /// **Test seam**: directly resolve a pending idle query, bypassing
+    /// the signed-frame transport.  Used by the `OwnerIdle` policy
+    /// integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("claim runtime not available")` if the
+    /// runtime's command channel is closed.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn inject_idle_report_for_test(
+        &self,
+        nonce: String,
+        idle_ms: u64,
+    ) -> Result<(), &'static str> {
+        self.cmd_tx
+            .send(RuntimeEvent::InjectIdleReport { nonce, idle_ms })
             .await
             .map_err(|_| "claim runtime not available")
     }
@@ -649,6 +677,12 @@ impl Driver {
                 let accepted = self.handle_owner_completion(&display, &nonce, event);
                 let _ = reply.send(accepted);
             }
+            #[cfg(any(test, feature = "test-util"))]
+            RuntimeEvent::InjectIdleReport { nonce, idle_ms } => {
+                if let Some(tx) = self.pending_idle_queries.remove(&nonce) {
+                    let _ = tx.send(idle_ms);
+                }
+            }
         }
     }
 
@@ -749,9 +783,22 @@ impl Driver {
                     self.clear_claim_suppression(&display);
                 }
             }
-            ClaimMessage::IdleQuery(_query) => {
-                // Owner side: read local idle state and reply with an
-                // IdleReport back to the requester.
+            ClaimMessage::IdleQuery(query) => {
+                // Owner side: only reply if we own the queried display.
+                // Non-owners drop silently — the spec defines IdleQuery
+                // as requester→owner, not a cross-pair idle probe.
+                let owned = self
+                    .display_by_identity(&query.display_identity)
+                    .is_some_and(|d| {
+                        self.coordination
+                            .as_ref()
+                            .is_some_and(|c| c.snapshot().get(&d).is_some_and(|r| r.owned))
+                    });
+
+                if !owned {
+                    return;
+                }
+
                 let idle_ms = self
                     .idle_rx
                     .as_ref()
@@ -768,7 +815,7 @@ impl Driver {
                     },
                     self.sender_epoch.clone(),
                     sender_instance_id.clone(),
-                    sender_epoch.clone(), // requester's epoch from the IdleQuery envelope
+                    sender_epoch.clone(),
                     self.next_counter(),
                     self.next_nonce(),
                     ClaimMessage::IdleReport(dormant_core::claim::IdleReport {
@@ -791,7 +838,8 @@ impl Driver {
                 self.record_event("idle_report_sent");
             }
             ClaimMessage::IdleReport(report) => {
-                // Requester side: resolve the pending idle query.
+                // Requester side: the report only arrives from a peer who
+                // passed the ownership gate above — accept it.
                 if let Some(tx) = self.pending_idle_queries.remove(&report.nonce) {
                     let _ = tx.send(report.idle_ms);
                 }
@@ -1002,7 +1050,21 @@ impl Driver {
         }
     }
 
+    /// Find a display by its EDID-derived claim identity.
+    fn display_by_identity(&self, identity: &str) -> Option<DisplayId> {
+        self.contexts.iter().find_map(|(display, ctx)| {
+            ctx.claim_identity
+                .as_ref()
+                .and_then(|ci| (ci == identity).then_some(display.clone()))
+        })
+    }
+
     fn handle_idle_query(&mut self, display: DisplayId, reply: oneshot::Sender<Option<u64>>) {
+        let display_identity = self
+            .contexts
+            .get(&display)
+            .and_then(|ctx| ctx.claim_identity.clone())
+            .unwrap_or_default();
         let nonce = self.next_nonce();
         let recipient_epoch = self.transport.boot_epoch().as_str().to_owned();
         let query_frame = match ClaimFrame::sign(
@@ -1018,6 +1080,7 @@ impl Driver {
             self.next_counter(),
             nonce.clone(),
             ClaimMessage::IdleQuery(dormant_core::claim::IdleQuery {
+                display_identity,
                 nonce: nonce.clone(),
             }),
         ) {
@@ -1030,14 +1093,26 @@ impl Driver {
         };
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.pending_idle_queries.insert(nonce, resp_tx);
+        // SEC-4: prune stale entries before inserting — a timed-out
+        // query leaves a dead sender in the map.  Sweep before every insert
+        // to keep the map bounded.
+        self.pending_idle_queries.retain(|_k, v| !v.is_closed());
+        self.pending_idle_queries.insert(nonce.clone(), resp_tx);
+        // Log the nonce so tests can observe it and inject a matching
+        // IdleReport via the test seam.
+        {
+            append_event(
+                self.event_log.as_ref(),
+                self.event_notify.as_ref(),
+                format!("idle_query_sent nonce={nonce}"),
+            );
+        }
 
         let timeout = self.claim_timeout();
         let transport = self.transport.clone();
         tokio::spawn(async move {
             transport.fanout_request(query_frame).await;
         });
-        let _ = display;
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, resp_rx).await;
             match result {

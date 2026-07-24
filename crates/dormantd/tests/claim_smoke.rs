@@ -1287,3 +1287,181 @@ async fn armed_policy_does_not_claim_without_arm() {
         harness.log_events()
     );
 }
+
+/// `OwnerIdle`: when the owner reports idle past the window, fire a claim.
+#[tokio::test]
+async fn owner_idle_policy_fires_claim_when_owner_idle_past_threshold() {
+    let display = "owner_idle_test";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+    let owner_idle_window = Duration::from_millis(500); // tiny for test
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::OwnerIdle,
+        owner_idle_window,
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Publish activity edge → evaluator evaluates, gets QueryOwnerIdle,
+    // spawns idle_query which sends IdleQuery to runtime.
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    // Wait for the runtime to log the idle_query_sent event.
+    let found = harness
+        .wait_for_log_prefix("idle_query_sent", Duration::from_secs(3))
+        .await;
+    assert!(found, "runtime should log idle_query_sent");
+
+    // Extract the nonce from the log.
+    let nonce = harness
+        .log_events()
+        .iter()
+        .find_map(|e| e.strip_prefix("idle_query_sent nonce=").map(str::to_owned))
+        .expect("idle_query_sent log entry must contain a nonce");
+
+    // Inject an IdleReport from the owner with idle_ms past threshold.
+    harness
+        .handle
+        .inject_idle_report_for_test(
+            nonce,
+            u64::try_from(owner_idle_window.as_millis() + 100).unwrap(),
+        )
+        .await
+        .expect("inject_idle_report_for_test must succeed");
+
+    // The evaluator's spawned task should see idle_ms >= threshold
+    // and fire try_claim → "claim_requested".
+    let claimed = harness
+        .wait_for_log("claim_requested", Duration::from_secs(3))
+        .await;
+    evaluator_cancel.cancel();
+    assert!(
+        claimed,
+        "OwnerIdle should fire a claim when owner is idle past threshold; log = {:?}",
+        harness.log_events()
+    );
+}
+
+/// `OwnerIdle`: when the owner is NOT idle (below threshold), no claim fires.
+#[tokio::test]
+async fn owner_idle_policy_does_not_claim_below_threshold() {
+    let display = "owner_idle_low";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+    let owner_idle_window = Duration::from_secs(60); // large
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::OwnerIdle,
+        owner_idle_window,
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    let found = harness
+        .wait_for_log_prefix("idle_query_sent", Duration::from_secs(3))
+        .await;
+    assert!(found, "runtime should log idle_query_sent");
+
+    let nonce = harness
+        .log_events()
+        .iter()
+        .find_map(|e| e.strip_prefix("idle_query_sent nonce=").map(str::to_owned))
+        .expect("idle_query_sent log entry must contain a nonce");
+
+    // Inject an IdleReport with idle_ms BELOW the threshold.
+    harness
+        .handle
+        .inject_idle_report_for_test(nonce, 1_000) // 1s << 60s threshold
+        .await
+        .expect("inject_idle_report_for_test must succeed");
+
+    // Give the evaluator time to process.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    evaluator_cancel.cancel();
+
+    assert!(
+        !harness.log_events().iter().any(|e| e == "claim_requested"),
+        "OwnerIdle should NOT fire a claim when owner is below threshold; log = {:?}",
+        harness.log_events()
+    );
+}
+
+/// `OwnerIdle`: when no `IdleReport` arrives (timeout), no claim fires.
+#[tokio::test]
+async fn owner_idle_policy_times_out_without_claim() {
+    let display = "owner_idle_timeout";
+    // Use the scripted transport with NO direct fallback — it will try
+    // to dial and fail, so the IdleQuery fanout produces no response.
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+
+    // Use a very small claim_timeout config so the test is fast.
+    // The harness config defaults to 3s claim_timeout — we accept that.
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::OwnerIdle,
+        owner_idle_window: Duration::from_secs(30),
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    // Wait for the timeout to expire (claim_timeout is 3s from config).
+    // Give a generous window.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    evaluator_cancel.cancel();
+
+    assert!(
+        !harness.log_events().iter().any(|e| e == "claim_requested"),
+        "OwnerIdle should NOT fire a claim when no IdleReport arrives; log = {:?}",
+        harness.log_events()
+    );
+}

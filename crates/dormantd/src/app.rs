@@ -834,7 +834,7 @@ impl App {
             || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
             |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
         );
-        let (claim_transport, peer_store) = if cfg_clone.coordination.enabled {
+        let (claim_transport, peer_store) = {
             let identity = Arc::new(
                 load_or_create_identity(&self.state_dir)
                     .context("load persistent instance identity for claims")?,
@@ -844,9 +844,12 @@ impl App {
                     .context("load persistent paired-peer store")?,
             );
             let callback_store = Arc::clone(&peer_store);
-            let bind_address =
+            let bind_address = if cfg_clone.coordination.enabled {
                 resolve_bind_ip(cfg_clone.coordination.claim_bind_address.as_deref())
-                    .context("resolve coordination claim bind address")?;
+                    .context("resolve coordination claim bind address")?
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            };
             let transport = Arc::new(spawn_claim_transport(ClaimTransportDeps {
                 identity,
                 boot_epoch: claim_epoch()?,
@@ -854,16 +857,19 @@ impl App {
                 bind_address,
                 fixed_port: (cfg_clone.coordination.claim_port != 0)
                     .then_some(cfg_clone.coordination.claim_port),
+                enabled: cfg_clone.coordination.enabled,
                 on_peer_addr: Box::new(move |instance_id, address| {
-                    if let Err(error) = callback_store.refresh_address(&instance_id, address) {
+                    if let Err(error) =
+                        callback_store.refresh_verified_address(&instance_id, address)
+                    {
                         tracing::warn!(event = "claim_peer_address_persist_failed", peer = %instance_id, %error);
                     }
                 }),
             }));
             (Some(transport), Some(peer_store))
-        } else {
-            (None, None)
         };
+        let (coordination_enabled_tx, coordination_enabled_rx) =
+            watch::channel(cfg_clone.coordination.enabled);
         let coordination_mdns = if cfg_clone.coordination.enabled {
             let identity = load_or_create_identity(&self.state_dir)
                 .context("load persistent instance identity for mDNS discovery")?;
@@ -892,6 +898,7 @@ impl App {
                     transport.subscribe_listener_port(),
                     peer_store.subscribe(),
                     Arc::clone(peer_store),
+                    coordination_enabled_rx,
                     root.clone(),
                 ))
             }
@@ -902,7 +909,7 @@ impl App {
                 (Some(transport), Some(peer_store)) => {
                     PairingManager::new_with_claim_port_provider(
                         &self.state_dir,
-                        true,
+                        cfg_clone.coordination.enabled,
                         cfg_clone.coordination.pairing_window,
                         Arc::clone(transport) as Arc<dyn ClaimPortProvider>,
                     )
@@ -1192,6 +1199,7 @@ impl App {
             coordination: coordination.clone(),
             _coordination_mdns: None,
             claim_transport: claim_transport.clone(),
+            coordination_enabled_tx,
             claim_presence_handle,
             sd: self.sd_notify,
             watchdog_interval,
@@ -1499,6 +1507,7 @@ struct Runner {
     _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
     /// Daemon-lifetime authenticated claim listener; it survives generation swaps.
     claim_transport: Option<Arc<ClaimTransportHandle>>,
+    coordination_enabled_tx: watch::Sender<bool>,
     /// Daemon-lifetime passive claim-presence browser and advertisement loop.
     claim_presence_handle: Option<JoinHandle<()>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
@@ -1881,11 +1890,17 @@ impl Runner {
         self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
 
         if let Some(transport) = &self.claim_transport
-            && (self.generation.cfg.coordination.claim_port != new_cfg.coordination.claim_port
+            && (self.generation.cfg.coordination.enabled != new_cfg.coordination.enabled
+                || self.generation.cfg.coordination.claim_port != new_cfg.coordination.claim_port
                 || self.generation.cfg.coordination.claim_bind_address
                     != new_cfg.coordination.claim_bind_address)
         {
-            let bind = match resolve_bind_ip(new_cfg.coordination.claim_bind_address.as_deref()) {
+            let bind = if new_cfg.coordination.enabled {
+                resolve_bind_ip(new_cfg.coordination.claim_bind_address.as_deref())
+            } else {
+                Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            };
+            let bind = match bind {
                 Ok(bind) => bind,
                 Err(error) => {
                     let detail = format!("resolve coordination claim bind address: {error}");
@@ -1904,7 +1919,8 @@ impl Runner {
                 }
             };
             if let Err(error) = transport
-                .update_bind(
+                .update_config(
+                    new_cfg.coordination.enabled,
                     bind,
                     (new_cfg.coordination.claim_port != 0)
                         .then_some(new_cfg.coordination.claim_port),
@@ -1925,6 +1941,8 @@ impl Runner {
                     false,
                 );
             }
+            self.coordination_enabled_tx
+                .send_replace(new_cfg.coordination.enabled);
         }
 
         // Reload does not rebind a web listener — flag port/bind changes.
@@ -2671,11 +2689,20 @@ fn spawn_claim_presence(
     mut listener_port: watch::Receiver<Option<u16>>,
     mut peers: watch::Receiver<Vec<crate::coordination_claim::ClaimPeer>>,
     peer_store: Arc<PeerStoreFeed>,
+    mut enabled: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
+            if !*enabled.borrow() {
+                let _ = presence.reconcile(None, std::iter::empty());
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    changed = enabled.changed() => if changed.is_err() { break; },
+                }
+                continue;
+            }
             let peer_ids: Vec<_> = peers
                 .borrow()
                 .iter()
@@ -2685,9 +2712,7 @@ fn spawn_claim_presence(
                 tracing::warn!(event = "claim_presence_reconcile_failed", %error);
             }
             if let Err(error) = presence.drain_browse(|instance_id, address| {
-                if let Err(error) = peer_store.refresh_address(&instance_id, address) {
-                    tracing::warn!(event = "claim_peer_address_persist_failed", peer = %instance_id, %error);
-                }
+                peer_store.refresh_dns_address(&instance_id, address);
             }) {
                 tracing::warn!(event = "claim_presence_browse_failed", %error);
             }
@@ -2700,6 +2725,9 @@ fn spawn_claim_presence(
                     if changed.is_err() { break; }
                 }
                 changed = peers.changed() => {
+                    if changed.is_err() { break; }
+                }
+                changed = enabled.changed() => {
                     if changed.is_err() { break; }
                 }
                 _ = interval.tick() => {}

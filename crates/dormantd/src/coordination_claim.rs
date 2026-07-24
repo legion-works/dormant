@@ -44,6 +44,8 @@ pub struct ClaimPeer {
     pub verifying_key: VerifyingKey,
     /// Last observed peer address; only its IP is used for claim dialing.
     pub last_addr: Option<SocketAddr>,
+    /// Advisory endpoint learned from unsigned mDNS; never persisted.
+    pub dns_addr: Option<SocketAddr>,
     /// Claim listener port advertised by the peer.
     pub claim_port: Option<u16>,
 }
@@ -51,6 +53,7 @@ pub struct ClaimPeer {
 /// Persistent paired-peer store with a live snapshot for claim transport consumers.
 pub(crate) struct PeerStoreFeed {
     path: PathBuf,
+    store: Mutex<dormant_core::peers::PeerStore>,
     sender: watch::Sender<Vec<ClaimPeer>>,
 }
 
@@ -58,9 +61,14 @@ impl PeerStoreFeed {
     /// Load the persisted peer store and create a feed seeded from its records.
     pub(crate) fn load(state_dir: &Path) -> Result<Self, PeerStoreError> {
         let path = state_dir.join("peers.json");
-        let peers = claim_peers(load_peer_store(&path)?.peers)?;
+        let store = load_peer_store(&path)?;
+        let peers = claim_peers(store.peers.clone())?;
         let (sender, _) = watch::channel(peers);
-        Ok(Self { path, sender })
+        Ok(Self {
+            path,
+            store: Mutex::new(store),
+            sender,
+        })
     }
 
     /// Subscribe to all persisted-peer changes.
@@ -70,20 +78,36 @@ impl PeerStoreFeed {
 
     /// Persist a pairing result and publish the resulting peer snapshot.
     pub(crate) fn upsert(&self, record: PeerRecord) -> Result<(), PeerStoreError> {
-        upsert_peer(&self.path, record)?;
-        self.publish()
+        upsert_peer(&self.path, record.clone())?;
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = store
+            .peers
+            .iter_mut()
+            .find(|existing| existing.instance_id == record.instance_id)
+        {
+            *existing = record;
+        } else {
+            store.peers.push(record);
+        }
+        self.publish(&store)
     }
 
-    /// Persist a newly authenticated address only when it has changed.
-    pub(crate) fn refresh_address(
+    /// Persist a signature-verified address only when it has changed.
+    pub(crate) fn refresh_verified_address(
         &self,
         instance_id: &str,
         address: SocketAddr,
     ) -> Result<(), PeerStoreError> {
-        let store = load_peer_store(&self.path)?;
-        let Some(mut record) = store
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = store
             .peers
-            .into_iter()
+            .iter_mut()
             .find(|peer| peer.instance_id == instance_id)
         else {
             return Err(PeerStoreError::Invalid {
@@ -94,12 +118,36 @@ impl PeerStoreFeed {
             return Ok(());
         }
         record.last_addr = Some(address);
-        upsert_peer(&self.path, record)?;
-        self.publish()
+        upsert_peer(&self.path, record.clone())?;
+        self.publish(&store)
     }
 
-    fn publish(&self) -> Result<(), PeerStoreError> {
-        let peers = claim_peers(load_peer_store(&self.path)?.peers)?;
+    /// Publish an advisory mDNS address without mutating the durable peer record.
+    pub(crate) fn refresh_dns_address(&self, instance_id: &str, address: SocketAddr) {
+        self.sender.send_modify(|peers| {
+            if let Some(peer) = peers
+                .iter_mut()
+                .find(|peer| peer.instance_id == instance_id)
+            {
+                peer.dns_addr = Some(address);
+            }
+        });
+    }
+
+    fn publish(&self, store: &dormant_core::peers::PeerStore) -> Result<(), PeerStoreError> {
+        let dns_addresses: HashMap<_, _> = self
+            .sender
+            .borrow()
+            .iter()
+            .filter_map(|peer| {
+                peer.dns_addr
+                    .map(|address| (peer.instance_id.clone(), address))
+            })
+            .collect();
+        let mut peers = claim_peers(store.peers.clone())?;
+        for peer in &mut peers {
+            peer.dns_addr = dns_addresses.get(&peer.instance_id).copied();
+        }
         self.sender.send_replace(peers);
         Ok(())
     }
@@ -126,6 +174,7 @@ fn claim_peers(records: Vec<PeerRecord>) -> Result<Vec<ClaimPeer>, PeerStoreErro
                 instance_id: record.instance_id,
                 verifying_key,
                 last_addr: record.last_addr,
+                dns_addr: None,
                 claim_port: record.claim_port,
             })
         })
@@ -144,6 +193,8 @@ pub struct ClaimTransportDeps {
     pub bind_address: IpAddr,
     /// Requested listener port; `None` or zero requests an ephemeral port.
     pub fixed_port: Option<u16>,
+    /// Whether coordination accepts claim traffic at startup.
+    pub enabled: bool,
     /// Persists an authenticated peer's freshly observed remote address.
     pub on_peer_addr: Box<dyn Fn(String, SocketAddr) + Send + Sync>,
 }
@@ -162,6 +213,7 @@ enum Command {
     Ensure(oneshot::Sender<io::Result<u16>>),
     Release,
     Update {
+        enabled: bool,
         address: IpAddr,
         port: Option<u16>,
         reply: oneshot::Sender<io::Result<()>>,
@@ -176,6 +228,7 @@ struct Supervisor {
     peers: Arc<RwLock<Vec<ClaimPeer>>>,
     bind_address: IpAddr,
     fixed_port: Option<u16>,
+    enabled: bool,
     provisional_hold: bool,
     listener: Option<TcpListener>,
     port: Arc<AtomicU16>,
@@ -202,6 +255,7 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
         peers: Arc::clone(&peers),
         bind_address: deps.bind_address,
         fixed_port: normalize_port(deps.fixed_port),
+        enabled: deps.enabled,
         provisional_hold: false,
         listener: None,
         port: Arc::clone(&port),
@@ -257,15 +311,21 @@ impl ClaimTransportHandle {
         self.listener_port.clone()
     }
 
-    /// Rebind using provisional-bind, swap, then close-old ordering.
+    /// Apply coordination enablement and rebind using swap-before-close ordering.
     ///
     /// # Errors
     ///
     /// Returns a bind error without disturbing the active listener.
-    pub async fn update_bind(&self, address: IpAddr, port: Option<u16>) -> io::Result<()> {
+    pub async fn update_config(
+        &self,
+        enabled: bool,
+        address: IpAddr,
+        port: Option<u16>,
+    ) -> io::Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(Command::Update {
+                enabled,
                 address,
                 port: normalize_port(port),
                 reply: reply_tx,
@@ -290,13 +350,13 @@ impl ClaimTransportHandle {
         let peers = self.peer_snapshot();
         let mut dials = JoinSet::new();
         for peer in peers {
-            let Some(address) = peer_endpoint(&peer) else {
+            if peer_endpoints(&peer).is_empty() {
                 tracing::info!(event = "claim_peer_no_port", peer = %peer.instance_id);
                 continue;
-            };
+            }
             let frame = frame.clone();
             dials.spawn(async move {
-                let _ = send_frame(address, &frame).await;
+                let _ = send_to_peer(&peer, &frame).await;
             });
         }
         while dials.join_next().await.is_some() {}
@@ -341,13 +401,13 @@ impl ClaimTransportHandle {
     }
 
     async fn send_to_peer(&self, peer_instance_id: &str, frame: &ClaimFrame) {
-        let endpoint = self
+        let peer = self
             .peer_snapshot()
             .iter()
             .find(|peer| peer.instance_id == peer_instance_id)
-            .and_then(peer_endpoint);
-        if let Some(endpoint) = endpoint {
-            let _ = send_frame(endpoint, frame).await;
+            .cloned();
+        if let Some(peer) = peer {
+            let _ = send_to_peer(&peer, frame).await;
         }
     }
 }
@@ -388,6 +448,13 @@ impl Supervisor {
     async fn handle_command(&mut self, command: Option<Command>) -> bool {
         match command {
             Some(Command::Ensure(reply)) => {
+                if !self.enabled {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "coordination is disabled",
+                    )));
+                    return false;
+                }
                 self.provisional_hold = true;
                 let result = self.ensure_bound().await;
                 let _ = reply.send(result);
@@ -399,11 +466,12 @@ impl Supervisor {
                 false
             }
             Some(Command::Update {
+                enabled,
                 address,
                 port,
                 reply,
             }) => {
-                let result = self.update_listener(address, port).await;
+                let result = self.update_config(enabled, address, port).await;
                 let _ = reply.send(result);
                 false
             }
@@ -459,7 +527,7 @@ impl Supervisor {
     }
 
     async fn reconcile_listener(&mut self) -> io::Result<()> {
-        if self.has_peers() || self.provisional_hold {
+        if self.enabled && (self.has_peers() || self.provisional_hold) {
             self.ensure_bound().await.map(|_| ())
         } else {
             self.stop_listener();
@@ -480,11 +548,16 @@ impl Supervisor {
         Ok(port)
     }
 
-    async fn update_listener(&mut self, address: IpAddr, port: Option<u16>) -> io::Result<()> {
-        if self.bind_address == address && self.fixed_port == port {
+    async fn update_config(
+        &mut self,
+        enabled: bool,
+        address: IpAddr,
+        port: Option<u16>,
+    ) -> io::Result<()> {
+        if self.enabled == enabled && self.bind_address == address && self.fixed_port == port {
             return Ok(());
         }
-        if self.listener.is_some() {
+        if enabled && self.listener.is_some() {
             let replacement = bind_listener(address, port).await?;
             let replacement_port = replacement.local_addr()?.port();
             self.listener = Some(replacement);
@@ -494,7 +567,8 @@ impl Supervisor {
         }
         self.bind_address = address;
         self.fixed_port = port;
-        Ok(())
+        self.enabled = enabled;
+        self.reconcile_listener().await
     }
 
     fn stop_listener(&mut self) {
@@ -601,13 +675,16 @@ async fn accept_if_bound(listener: Option<&TcpListener>) -> Option<(TcpStream, S
 
 fn allow_ip(rates: &mut HashMap<IpAddr, VecDeque<Instant>>, ip: IpAddr) -> bool {
     let now = Instant::now();
+    rates.retain(|_, entries| {
+        while entries
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
+        {
+            entries.pop_front();
+        }
+        !entries.is_empty()
+    });
     let entries = rates.entry(ip).or_default();
-    while entries
-        .front()
-        .is_some_and(|seen| now.duration_since(*seen) >= Duration::from_secs(60))
-    {
-        entries.pop_front();
-    }
     if entries.len() >= MAX_CONNECTIONS_PER_IP_MINUTE {
         return false;
     }
@@ -615,8 +692,27 @@ fn allow_ip(rates: &mut HashMap<IpAddr, VecDeque<Instant>>, ip: IpAddr) -> bool 
     true
 }
 
-fn peer_endpoint(peer: &ClaimPeer) -> Option<SocketAddr> {
-    Some(SocketAddr::new(peer.last_addr?.ip(), peer.claim_port?))
+fn peer_endpoints(peer: &ClaimPeer) -> Vec<SocketAddr> {
+    let Some(port) = peer.claim_port else {
+        return Vec::new();
+    };
+    [peer.last_addr, peer.dns_addr]
+        .into_iter()
+        .flatten()
+        .map(|address| SocketAddr::new(address.ip(), port))
+        .collect()
+}
+
+async fn send_to_peer(peer: &ClaimPeer, frame: &ClaimFrame) -> io::Result<()> {
+    let mut last_error = None;
+    for address in peer_endpoints(peer) {
+        match send_frame(address, frame).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "peer has no endpoint")))
 }
 
 async fn send_frame(address: SocketAddr, frame: &ClaimFrame) -> io::Result<()> {
@@ -638,12 +734,13 @@ fn supervisor_stopped() -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{HashMap, VecDeque},
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -660,7 +757,7 @@ mod tests {
 
     use crate::coordination_frame::write_frame;
 
-    use super::{ClaimPeer, ClaimTransportDeps, PeerStoreFeed, spawn};
+    use super::{ClaimPeer, ClaimTransportDeps, PeerStoreFeed, allow_ip, peer_endpoints, spawn};
 
     const LOCAL_EPOCH: &str = "local-epoch-0001";
     const REMOTE_EPOCH: &str = "remote-epoch-001";
@@ -680,6 +777,7 @@ mod tests {
             instance_id: identity.instance_id.clone(),
             verifying_key: identity.verifying_key,
             last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            dns_addr: None,
             claim_port: port,
         }
     }
@@ -714,6 +812,7 @@ mod tests {
             peers,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             fixed_port: None,
+            enabled: true,
             on_peer_addr: Box::new(move |_, _| {
                 calls.fetch_add(1, Ordering::SeqCst);
             }),
@@ -849,7 +948,7 @@ mod tests {
         let requested_port = reservation.local_addr().unwrap().port();
         drop(reservation);
         handle
-            .update_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(requested_port))
+            .update_config(true, IpAddr::V4(Ipv4Addr::LOCALHOST), Some(requested_port))
             .await
             .unwrap();
         let new_port = handle.provisional_port().unwrap();
@@ -865,6 +964,67 @@ mod tests {
                 .is_ok()
         );
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn enabled_toggle_parks_and_rebinds_a_seeded_peer_listener() {
+        let local = identity(1);
+        let remote = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_peers_tx, peers_rx) = watch::channel(vec![peer(&remote, None)]);
+        let mut deps = deps(local, peers_rx, calls);
+        deps.enabled = false;
+        let handle = spawn(deps);
+        assert_eq!(handle.provisional_port(), None);
+
+        handle
+            .update_config(true, IpAddr::V4(Ipv4Addr::LOCALHOST), None)
+            .await
+            .unwrap();
+        wait_for_port(&handle).await;
+        handle
+            .update_config(false, IpAddr::V4(Ipv4Addr::UNSPECIFIED), None)
+            .await
+            .unwrap();
+        wait_for_parked(&handle).await;
+        handle.shutdown().await;
+    }
+
+    #[test]
+    fn dns_address_is_advisory_and_verified_address_dials_first() {
+        let remote = identity(2);
+        let verified = SocketAddr::from(([127, 0, 0, 1], 10));
+        let poisoned_dns = SocketAddr::from(([192, 0, 2, 9], 20));
+        let peer = ClaimPeer {
+            instance_id: remote.instance_id.clone(),
+            verifying_key: remote.verifying_key,
+            last_addr: Some(verified),
+            dns_addr: Some(poisoned_dns),
+            claim_port: Some(1234),
+        };
+
+        assert_eq!(
+            peer_endpoints(&peer),
+            vec![
+                SocketAddr::from(([127, 0, 0, 1], 1234)),
+                SocketAddr::from(([192, 0, 2, 9], 1234)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rate_entries_expire_under_many_ip_spray() {
+        let stale = Instant::now().checked_sub(Duration::from_secs(61)).unwrap();
+        let mut rates = HashMap::new();
+        for octet in 1..=100 {
+            rates.insert(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, octet)),
+                VecDeque::from([stale]),
+            );
+        }
+
+        assert!(allow_ip(&mut rates, IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(rates.len(), 1);
     }
 
     #[tokio::test]
@@ -911,6 +1071,7 @@ mod tests {
             peers: peers_rx,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             fixed_port: None,
+            enabled: true,
             on_peer_addr: Box::new(move |_, address| {
                 calls_callback.fetch_add(1, Ordering::SeqCst);
                 *observed_callback.lock().unwrap() = Some(address);
@@ -944,6 +1105,7 @@ mod tests {
             instance_id: remote.instance_id.clone(),
             verifying_key: remote.verifying_key,
             last_addr: Some(SocketAddr::from(([192, 0, 2, 1], 9))),
+            dns_addr: None,
             claim_port: Some(65_000),
         }]);
         let handle = spawn(deps(local.clone(), peers_rx, calls));
@@ -973,13 +1135,22 @@ mod tests {
         feed.upsert(record).unwrap();
         assert!(peers.has_changed().unwrap());
         peers.borrow_and_update();
-        feed.refresh_address(&remote.instance_id, SocketAddr::from(([127, 0, 0, 1], 10)))
+        feed.refresh_verified_address(&remote.instance_id, SocketAddr::from(([127, 0, 0, 1], 10)))
             .unwrap();
 
         assert!(peers.has_changed().unwrap());
         assert_eq!(
             peers.borrow_and_update()[0].last_addr,
             Some(SocketAddr::from(([127, 0, 0, 1], 10)))
+        );
+        feed.refresh_dns_address(&remote.instance_id, SocketAddr::from(([192, 0, 2, 9], 20)));
+        assert_eq!(
+            peers.borrow_and_update()[0].last_addr,
+            Some(SocketAddr::from(([127, 0, 0, 1], 10)))
+        );
+        assert_eq!(
+            peers.borrow()[0].dns_addr,
+            Some(SocketAddr::from(([192, 0, 2, 9], 20)))
         );
     }
 }

@@ -204,6 +204,7 @@ pub struct ClaimTransportHandle {
     commands: mpsc::Sender<Command>,
     inbound: Mutex<Option<mpsc::Receiver<ClaimFrame>>>,
     port: Arc<AtomicU16>,
+    boot_epoch: Epoch,
     listener_port: watch::Receiver<Option<u16>>,
     peers: Arc<RwLock<Vec<ClaimPeer>>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -250,7 +251,7 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
     let supervisor = Supervisor {
         identity: deps.identity,
-        boot_epoch: deps.boot_epoch,
+        boot_epoch: deps.boot_epoch.clone(),
         peer_watch: deps.peers,
         peers: Arc::clone(&peers),
         bind_address: deps.bind_address,
@@ -270,6 +271,7 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
         commands: command_tx,
         inbound: Mutex::new(Some(inbound_rx)),
         port,
+        boot_epoch: deps.boot_epoch.clone(),
         listener_port: listener_port_rx,
         peers,
         task: Mutex::new(Some(task)),
@@ -303,6 +305,12 @@ impl ClaimTransportHandle {
             0 => None,
             port => Some(port),
         }
+    }
+
+    /// Return the current daemon boot epoch for authenticated claim peers.
+    #[must_use]
+    pub fn boot_epoch(&self) -> &Epoch {
+        &self.boot_epoch
     }
 
     /// Subscribe to bound-listener transitions for lifecycle-coupled services.

@@ -13,18 +13,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use dormant_core::claim::{ClaimAbort, ClaimFrame, ClaimMessage};
 use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::observation::{DaemonObservation, GenerationId, ObservationHub, ReloadSource};
+use dormant_core::peers::{
+    PeerRecord, instance_id_from_public_key, load_or_create_identity, upsert_peer,
+};
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{
     App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
 };
+use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -398,6 +405,93 @@ async fn paired_peers_survive_restart() {
 
     assert!(paths_a.state.join("peers.json").exists());
     assert!(paths_b.state.join("peers.json").exists());
+}
+
+#[tokio::test]
+async fn app_start_wires_authenticated_claim_transport() {
+    let paths = TestAppPaths::new();
+    let remote = SigningKey::from_bytes(&[7; 32]);
+    let remote_key = remote.verifying_key();
+    upsert_peer(
+        &paths.state.join("peers.json"),
+        PeerRecord {
+            instance_id: instance_id_from_public_key(&remote_key.to_bytes()),
+            ed25519_pub: base64::engine::general_purpose::STANDARD.encode(remote_key.as_bytes()),
+            display_name: "remote".to_owned(),
+            paired_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_addr: Some("127.0.0.1:1".parse().unwrap()),
+            claim_port: Some(1),
+        },
+    )
+    .unwrap();
+    let config = format!(
+        "{}\n[coordination]\nenabled = true\nclaim_bind_address = \"127.0.0.1\"\nclaim_port = 0\n",
+        one_display_config(&paths.marker, "1s")
+    );
+    fs::write(&paths.config, config).unwrap();
+    write_credentials(paths.root(), "");
+    let (handle, join) = App::build_with_sources(
+        paths.config.clone(),
+        paths.credentials.clone(),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths.state.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+    let transport = handle.claim_transport().unwrap();
+    let port = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(port) = transport.provisional_port() {
+                return port;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let local = load_or_create_identity(&paths.state).unwrap();
+    let frame = ClaimFrame::sign(
+        &dormant_core::peers::InstanceIdentity {
+            instance_id: instance_id_from_public_key(&remote_key.to_bytes()),
+            signing_key: remote,
+            verifying_key: remote_key,
+        },
+        "remote-epoch-001".to_owned(),
+        local.instance_id,
+        transport.boot_epoch().as_str().to_owned(),
+        1,
+        "claim-frame-nonce".to_owned(),
+        ClaimMessage::ClaimAbort(ClaimAbort {
+            nonce: "abort-nonce".to_owned(),
+        }),
+    )
+    .unwrap();
+    let mut inbound = transport.inbound();
+    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let encoded = serde_json::to_vec(&frame).unwrap();
+    let length = u32::try_from(encoded.len()).unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &length.to_be_bytes())
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &encoded)
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(1), inbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        received.sender_instance_id,
+        instance_id_from_public_key(&remote_key.to_bytes())
+    );
+    shutdown(handle, join).await;
 }
 
 fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {

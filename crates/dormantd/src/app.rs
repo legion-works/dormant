@@ -117,6 +117,16 @@ fn claim_epoch() -> Result<Epoch> {
         .map_err(|error| anyhow::anyhow!(error))
 }
 
+fn resolve_claim_bind_ip(config_override: Option<&str>) -> Result<std::net::IpAddr> {
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(address) = config_override {
+        return address
+            .parse()
+            .context("parse coordination claim_bind_address");
+    }
+    resolve_bind_ip(config_override).context("resolve coordination claim bind address")
+}
+
 /// Builds render sinks for a display.  Production uses
 /// [`LayerShellRenderSink`]; tests inject a factory that returns
 /// [`RecordingRenderSink`](dormant_core::fakes::RecordingRenderSink).
@@ -845,8 +855,7 @@ impl App {
             );
             let callback_store = Arc::clone(&peer_store);
             let bind_address = if cfg_clone.coordination.enabled {
-                resolve_bind_ip(cfg_clone.coordination.claim_bind_address.as_deref())
-                    .context("resolve coordination claim bind address")?
+                resolve_claim_bind_ip(cfg_clone.coordination.claim_bind_address.as_deref())?
             } else {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
             };
@@ -1248,6 +1257,7 @@ impl App {
             doctor_service,
             #[cfg(any(test, feature = "test-util"))]
             coordination,
+            claim_transport,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
@@ -1302,6 +1312,7 @@ pub struct AppHandle {
     doctor_service: DoctorService,
     #[cfg(any(test, feature = "test-util"))]
     coordination: Option<CoordinationHandle>,
+    claim_transport: Option<Arc<ClaimTransportHandle>>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
     /// Test-only LKG-candidate observation seam — see
@@ -1311,6 +1322,11 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
+    /// Return the daemon-lifetime claim transport when coordination is configured.
+    #[must_use]
+    pub fn claim_transport(&self) -> Option<&ClaimTransportHandle> {
+        self.claim_transport.as_deref()
+    }
     /// A sender for [`ControlMsg`]s, forwarded to the current engine
     /// generation across reloads.
     #[must_use]
@@ -1896,7 +1912,7 @@ impl Runner {
                     != new_cfg.coordination.claim_bind_address)
         {
             let bind = if new_cfg.coordination.enabled {
-                resolve_bind_ip(new_cfg.coordination.claim_bind_address.as_deref())
+                resolve_claim_bind_ip(new_cfg.coordination.claim_bind_address.as_deref())
             } else {
                 Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             };

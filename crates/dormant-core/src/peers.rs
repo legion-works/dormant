@@ -4,6 +4,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write as _},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -68,6 +69,12 @@ pub struct PeerRecord {
     pub display_name: String,
     /// RFC 3339 UTC timestamp when the pairing completed.
     pub paired_at: String,
+    /// Most recently observed address for direct peer coordination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_addr: Option<SocketAddr>,
+    /// Port advertised by the peer's claim listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_port: Option<u16>,
 }
 
 /// mDNS discovery data carried into a pairing attempt.
@@ -130,6 +137,9 @@ pub enum PairFrame {
     IdentityExchange {
         /// Base64-encoded Ed25519 public key.
         ed25519_pub: String,
+        /// Port advertised by the peer's claim listener after pairing completes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim_port: Option<u16>,
     },
     /// Transcript HMAC confirmation.
     KeyConfirm {
@@ -292,6 +302,34 @@ pub fn upsert_peer(path: &Path, record: PeerRecord) -> Result<(), PeerStoreError
     } else {
         store.peers.push(record);
     }
+
+    let bytes = serde_json::to_vec_pretty(&store).map_err(|error| PeerStoreError::Invalid {
+        detail: format!("cannot serialize peers.json: {error}"),
+    })?;
+    atomic_write(path, |file| file.write_all(&bytes))
+}
+
+/// Refresh the endpoint data for one known peer without changing other peer records.
+///
+/// # Errors
+///
+/// Returns an error if the peer store cannot be loaded or written, or the peer is unknown.
+pub fn refresh_peer_endpoint(
+    path: &Path,
+    instance_id: &str,
+    last_addr: SocketAddr,
+    claim_port: u16,
+) -> Result<(), PeerStoreError> {
+    let mut store = load_peer_store(path)?;
+    let peer = store
+        .peers
+        .iter_mut()
+        .find(|peer| peer.instance_id == instance_id)
+        .ok_or_else(|| PeerStoreError::Invalid {
+            detail: "cannot refresh endpoint for an unknown peer".to_owned(),
+        })?;
+    peer.last_addr = Some(last_addr);
+    peer.claim_port = Some(claim_port);
 
     let bytes = serde_json::to_vec_pretty(&store).map_err(|error| PeerStoreError::Invalid {
         detail: format!("cannot serialize peers.json: {error}"),
@@ -545,6 +583,8 @@ mod tests {
             ed25519_pub: general_purpose::STANDARD.encode(verifying_key),
             display_name: display_name.to_owned(),
             paired_at: "2026-07-21T12:00:00Z".to_owned(),
+            last_addr: None,
+            claim_port: None,
         }
     }
 
@@ -588,6 +628,59 @@ mod tests {
         assert_eq!(store.peers[0].ed25519_pub, record.ed25519_pub);
         assert_eq!(store.peers[0].display_name, record.display_name);
         assert_eq!(store.peers[0].paired_at, record.paired_at);
+    }
+
+    #[test]
+    fn legacy_peer_without_endpoint_fields_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = peers_path(dir.path());
+        let record = test_record(7, "Office Mac");
+        let legacy_store = serde_json::json!({
+            "version": PEER_STORE_VERSION,
+            "peers": [{
+                "instance_id": record.instance_id,
+                "ed25519_pub": record.ed25519_pub,
+                "display_name": record.display_name,
+                "paired_at": record.paired_at,
+            }],
+        });
+        let legacy_bytes = serde_json::to_vec(&legacy_store).unwrap();
+        write_private_peer_store(&path, &legacy_bytes);
+
+        let store = load_peer_store(&path).unwrap();
+
+        assert_eq!(store.peers[0].last_addr, None);
+        assert_eq!(store.peers[0].claim_port, None);
+    }
+
+    #[test]
+    fn refresh_peer_endpoint_preserves_unrelated_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = peers_path(dir.path());
+        let first = test_record(7, "Office Mac");
+        let second = test_record(8, "Living Room Linux");
+
+        upsert_peer(&path, first.clone()).unwrap();
+        upsert_peer(&path, second.clone()).unwrap();
+        refresh_peer_endpoint(
+            &path,
+            &first.instance_id,
+            "192.0.2.8:65123".parse().unwrap(),
+            65123,
+        )
+        .unwrap();
+
+        let store = load_peer_store(&path).unwrap();
+        assert_eq!(store.peers.len(), 2);
+        assert_eq!(store.peers[0].instance_id, first.instance_id);
+        assert_eq!(
+            store.peers[0].last_addr.unwrap().to_string(),
+            "192.0.2.8:65123"
+        );
+        assert_eq!(store.peers[0].claim_port, Some(65123));
+        assert_eq!(store.peers[1].instance_id, second.instance_id);
+        assert_eq!(store.peers[1].last_addr, None);
+        assert_eq!(store.peers[1].claim_port, None);
     }
 
     #[cfg(unix)]
@@ -737,6 +830,8 @@ mod tests {
                 ed25519_pub: "not base64".to_owned(),
                 display_name: "Office Mac".to_owned(),
                 paired_at: "2026-07-21T12:00:00Z".to_owned(),
+                last_addr: None,
+                claim_port: None,
             }],
         };
         write_private_peer_store(&path, &serde_json::to_vec(&store).unwrap());
@@ -782,6 +877,8 @@ mod tests {
             ed25519_pub: general_purpose::STANDARD.encode(identity.verifying_key.to_bytes()),
             display_name: "This machine".to_owned(),
             paired_at: "2026-07-21T12:00:00Z".to_owned(),
+            last_addr: None,
+            claim_port: None,
         };
 
         assert!(upsert_peer(&path, record).is_err());

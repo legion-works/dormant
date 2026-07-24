@@ -9,6 +9,7 @@ mod audio_policy;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;
+pub mod coordination_frame;
 pub mod coordination_mdns;
 #[cfg_attr(any(test, feature = "test-util"), allow(private_interfaces))]
 pub mod coordination_pairing;

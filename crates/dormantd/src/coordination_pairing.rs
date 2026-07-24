@@ -20,6 +20,7 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
 
+use crate::coordination_frame::{FrameError, read_frame, write_frame};
 use crate::coordination_mdns::{MdnsBackend, PairDiscovery, resolve_bind_ip};
 
 #[allow(
@@ -165,6 +166,8 @@ impl LocalPeer {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
             display_name: peer.display_name.clone(),
             paired_at,
+            last_addr: None,
+            claim_port: None,
         };
         upsert_peer(&self.state_dir.join("peers.json"), record)
             .map_err(|error| PairSessionError::Local(error.to_string()))
@@ -1171,6 +1174,7 @@ fn responder_receive_msg1(
         },
         PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(local.public_key),
+            claim_port: None,
         },
     ];
     Ok((
@@ -1228,7 +1232,11 @@ fn initiator_receive_responder(
         .finish(&inbound)
         .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
     let identity = wire_to_frame(&frames[2])?;
-    let PairFrame::IdentityExchange { ed25519_pub } = identity else {
+    let PairFrame::IdentityExchange {
+        ed25519_pub,
+        claim_port: _,
+    } = identity
+    else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
     let remote_public_key = decode_exact(&ed25519_pub)?;
@@ -1252,6 +1260,7 @@ fn initiator_receive_responder(
     Ok(frames_to_wire(&[
         PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(state.local.public_key),
+            claim_port: None,
         },
         PairFrame::KeyConfirm {
             mac: base64::engine::general_purpose::STANDARD.encode(mac),
@@ -1268,7 +1277,11 @@ fn responder_receive_initiator(
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     }
     let identity = wire_to_frame(&frames[0])?;
-    let PairFrame::IdentityExchange { ed25519_pub } = identity else {
+    let PairFrame::IdentityExchange {
+        ed25519_pub,
+        claim_port: _,
+    } = identity
+    else {
         return Err(PairSessionError::Wire(PairError::InvalidFrame));
     };
     let key = decode_exact(&ed25519_pub)?;
@@ -1385,7 +1398,10 @@ fn run_in_process_pairing(
         });
     }
     if tamper_responder_identity {
-        let PairFrame::IdentityExchange { ed25519_pub } = wire_to_frame(&responder_start[2])?
+        let PairFrame::IdentityExchange {
+            ed25519_pub,
+            claim_port: _,
+        } = wire_to_frame(&responder_start[2])?
         else {
             unreachable!("responder emits identity exchange");
         };
@@ -1393,6 +1409,7 @@ fn run_in_process_pairing(
         public_key[0] ^= 1;
         responder_start[2] = frame_for_wire(&PairFrame::IdentityExchange {
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(public_key),
+            claim_port: None,
         });
     }
     let initiator_confirm = initiator_receive_responder(&mut initiator_state, &responder_start)?;
@@ -1580,24 +1597,17 @@ async fn write_pair_frame<W>(writer: &mut W, frame: &PairFrame) -> Result<(), Pa
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt as _;
-
-    let payload = serde_json::to_vec(frame)
-        .map_err(|error| PairSessionError::Local(format!("serialize pairing frame: {error}")))?;
-    let length = u32::try_from(payload.len())
-        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
-    if !(1..=MAX_PAIR_FRAME_BYTES).contains(&length) {
-        return Err(PairSessionError::Wire(PairError::InvalidFrame));
-    }
-
-    writer
-        .write_all(&length.to_be_bytes())
+    write_frame(writer, frame)
         .await
-        .map_err(|error| PairSessionError::Local(format!("write pairing frame length: {error}")))?;
-    writer
-        .write_all(&payload)
-        .await
-        .map_err(|error| PairSessionError::Local(format!("write pairing frame payload: {error}")))
+        .map_err(|error| match error {
+            FrameError::InvalidFrame => PairSessionError::Wire(PairError::InvalidFrame),
+            FrameError::Serialize(error) => {
+                PairSessionError::Local(format!("serialize pairing frame: {error}"))
+            }
+            FrameError::Write { operation, source } => {
+                PairSessionError::Local(format!("{operation}: {source}"))
+            }
+        })
 }
 
 /// Read and deserialize exactly one bounded length-prefixed pairing frame.
@@ -1609,26 +1619,9 @@ async fn read_pair_frame<R>(reader: &mut R) -> Result<PairFrame, PairSessionErro
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt as _;
-
-    let mut length_bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut length_bytes)
+    read_frame(reader)
         .await
-        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
-    let length = u32::from_be_bytes(length_bytes);
-    if !(1..=MAX_PAIR_FRAME_BYTES).contains(&length) {
-        return Err(PairSessionError::Wire(PairError::InvalidFrame));
-    }
-
-    let payload_len =
-        usize::try_from(length).map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
-    let mut payload = vec![0_u8; payload_len];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))?;
-    serde_json::from_slice(&payload).map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))
+        .map_err(|_| PairSessionError::Wire(PairError::InvalidFrame))
 }
 
 #[cfg(test)]
@@ -1818,6 +1811,7 @@ impl PairingHarness {
             PairFrame::IdentityExchange {
                 ed25519_pub: base64::engine::general_purpose::STANDARD
                     .encode(self.initiator.public_key()),
+                claim_port: None,
             },
         )
         .map(|_| ())

@@ -610,6 +610,11 @@ pub struct KvmStatus {
     /// Resolved activity-claim policy.
     #[serde(default)]
     pub activity_claim: crate::config::ActivityClaimPolicy,
+    /// Per-display remaining arm window in milliseconds (`None` when not
+    /// armed or the display has no claim capability). Computed from the
+    /// monotonic expiry at snapshot time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_armed_remaining: Vec<(crate::types::DisplayId, u64)>,
 }
 
 // ── Per-runtime configuration shapes ─────────────────────────────────────────
@@ -1846,7 +1851,12 @@ impl RulesEngine {
                         wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
                         last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
                         stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
-                        claim_armed_remaining_ms: None,
+                        claim_armed_remaining_ms: self.kvm.as_ref().and_then(|kvm| {
+                            kvm.claim_armed_remaining
+                                .iter()
+                                .find(|(d, _)| d == &dcfg.display)
+                                .map(|(_, ms)| *ms)
+                        }),
                     },
                 ));
             }
@@ -3369,6 +3379,7 @@ mod tests {
             },
             claim_capable_displays: vec![DisplayId("mon".into())],
             activity_claim: ActivityClaimPolicy::Armed,
+            claim_armed_remaining: vec![],
         };
         engine.handle_control(ControlMsg::SetKvmStatus(status));
         let snap = snapshot_of(&mut engine);

@@ -1,1 +1,2 @@
 path	function	anchor	owner	reason	external_resource	replacement_readiness
+crates/dormantd/src/activity_claim_evaluator.rs	evaluator_processes_observations_without_panicking	tokio::time::sleep(Duration::from_millis(100))	T14-implementer	synthetic-idle-observation-needs-tick-for-observation-to-reach-evaluator-loop	none	not-replaceable-async-loop-has-no-completion-signal

@@ -961,7 +961,7 @@ impl App {
         // Daemon-lifetime idle-observation channel — the stock idle source
         // publishes real activity timestamps into the tx half; the
         // activity-claim policy evaluator consumes the rx half.
-        let (idle_obs_tx, _idle_obs_rx) = crate::idle_observation::idle_observation_channel();
+        let (idle_obs_tx, idle_obs_rx) = crate::idle_observation::idle_observation_channel();
 
         // KVM claim runtime — daemon-lifetime. Spawned BESIDE the
         // claim transport (both survive reload). The driver
@@ -1000,6 +1000,31 @@ impl App {
         } else {
             None
         };
+
+        // ── Activity-claim policy evaluator (daemon-lifetime) ─────────
+        // Spawned beside the claim runtime; survives generation reloads.
+        // Consumes the idle-observation channel and feeds claim/arm
+        // decisions into the claim runtime.
+        let activity_claim_policy_handle: Option<JoinHandle<()>> =
+            if let Some(ref cr) = claim_runtime {
+                let claim_capable = cr.kvm_status().claim_capable_displays;
+                Some(crate::activity_claim_evaluator::spawn(
+                    crate::activity_claim_evaluator::PolicyEvaluatorDeps {
+                        idle_rx: idle_obs_rx,
+                        claim_runtime: cr.clone(),
+                        ownership: ownership.clone(),
+                        activity_claim: cfg_clone.coordination.activity_claim,
+                        owner_idle_window: cfg_clone.coordination.owner_idle_window,
+                        armed_window: cfg_clone.coordination.armed_window,
+                        claim_capable_displays: claim_capable,
+                        cancel: root.clone(),
+                        event_log: None,
+                        event_notify: None,
+                    },
+                ))
+            } else {
+                None
+            };
 
         let spawn = spawn_generation(
             &root,
@@ -1263,6 +1288,7 @@ impl App {
             idle_obs_tx: Some(idle_obs_tx.clone()),
             coordination_enabled_tx,
             claim_presence_handle,
+            activity_claim_evaluator_handle: activity_claim_policy_handle,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1605,6 +1631,10 @@ struct Runner {
     coordination_enabled_tx: watch::Sender<bool>,
     /// Daemon-lifetime passive claim-presence browser and advertisement loop.
     claim_presence_handle: Option<JoinHandle<()>>,
+    /// Daemon-lifetime activity-claim policy evaluator.  Watches the idle-
+    /// observation channel and feeds claim decisions into the claim runtime.
+    #[allow(dead_code)]
+    activity_claim_evaluator_handle: Option<JoinHandle<()>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,

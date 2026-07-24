@@ -362,6 +362,7 @@ mod tests {
             },
             claim_capable_displays: vec![dormant_core::types::DisplayId("main_monitor".into())],
             activity_claim: dormant_core::config::ActivityClaimPolicy::Armed,
+            claim_armed_remaining: vec![],
         });
         let rendered = render_table(&snap);
         assert!(rendered.contains("peer"));

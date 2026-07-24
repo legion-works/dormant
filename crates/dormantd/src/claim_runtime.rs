@@ -201,6 +201,25 @@ pub struct ClaimRuntimeHandle {
 }
 
 impl ClaimRuntimeHandle {
+    /// Create a minimal handle for unit tests that only need the
+    /// public query surface (`is_armed`, `kvm_status`, etc.) without
+    /// spawning a full driver.  `try_claim` and `arm` will return
+    /// transport-level errors (no driver behind the command channel).
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test() -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<RuntimeEvent>(1);
+        Self {
+            cmd_tx,
+            armed: Arc::new(Mutex::new(HashMap::new())),
+            claim_capable: Arc::new(Mutex::new(Vec::new())),
+            keymap: Arc::new(Mutex::new(KeymapConfig::default())),
+            activity_claim: Arc::new(Mutex::new(ActivityClaimPolicy::default())),
+            release_deadline_cap: Arc::new(Mutex::new(Duration::from_secs(45))),
+            suppressed: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     /// Initiate a claim on `display` from a local trigger.
     ///
     /// # Errors
@@ -326,8 +345,9 @@ impl ClaimRuntimeHandle {
         map.contains_key(display)
     }
 
-    /// Resolve the `claim_capable_displays` set and the
-    /// keymap / policy for the snapshot.
+    /// Resolve the `claim_capable_displays` set, the
+    /// keymap / policy, and per-display armed-remaining-ms
+    /// for the snapshot.
     #[must_use]
     pub fn kvm_status(&self) -> KvmStatus {
         let keymap = self.keymap.lock().map(|g| g.clone()).unwrap_or_default();
@@ -337,10 +357,28 @@ impl ClaimRuntimeHandle {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        let now = Instant::now();
+        let claim_armed_remaining: Vec<(DisplayId, u64)> = self
+            .armed
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter_map(|(display, deadline)| {
+                        if now < *deadline {
+                            let ms = deadline.saturating_duration_since(now).as_millis();
+                            Some((display.clone(), u64::try_from(ms).unwrap_or(u64::MAX)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         KvmStatus {
             keymap,
             claim_capable_displays,
             activity_claim,
+            claim_armed_remaining,
         }
     }
 

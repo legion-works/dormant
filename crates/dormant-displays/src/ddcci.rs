@@ -602,6 +602,40 @@ impl DisplayController for DdcciController {
         }
     }
 
+    /// Select the active input source with VCP `0x60` at command priority.
+    ///
+    /// The requester polls its own `0x60` value to confirm a KVM handoff, so
+    /// this deliberately does not add a readback transaction that would
+    /// double physical DDC traffic.
+    async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
+        let (ident, lock) = {
+            let state = self.state.lock().unwrap();
+            match (&state.matched_ident, &state.panel_lock) {
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                _ => {
+                    return Err(CmdFailure {
+                        controller: Self::NAME.to_string(),
+                        error: format!("{E_DISPLAY_IO}: controller not probed"),
+                    });
+                }
+            }
+        };
+
+        self.ops
+            .set_vcp(
+                &ident,
+                VCP_INPUT_SOURCE,
+                u16::from(code),
+                &lock,
+                VcpPriority::Command,
+            )
+            .await
+            .map_err(|error| CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!("{E_DISPLAY_IO}: failed to set input source: {error}"),
+            })
+    }
+
     /// Read the panel's cumulative usage-hours counter (VCP `0xC0`,
     /// MCCS "Display Usage Time").
     ///
@@ -1959,6 +1993,76 @@ mod tests {
             fake.take_call_log(),
             vec![format!("get_vcp_raw({ident}, 0x{VCP_INPUT_SOURCE:02X})")]
         );
+    }
+
+    #[tokio::test]
+    async fn write_input_source_uses_0x60_at_command_priority() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x12, Ok(()));
+
+        ctrl.write_input_source(0x12).await.unwrap();
+
+        assert_eq!(
+            fake.set_calls(),
+            vec![(VCP_INPUT_SOURCE, 0x12, VcpPriority::Command)]
+        );
+        assert_eq!(
+            fake.take_call_log(),
+            vec![format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 18)")]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_input_source_waits_for_an_inflight_sampler() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let lock = ctrl
+            .panel_lock_for_test()
+            .expect("a probed DdcciController has resolved a panel lock");
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x12, Ok(()));
+
+        let sampler_guard = lock
+            .sampler_try()
+            .expect("the sampler must acquire an idle panel lock");
+        let write = ctrl.write_input_source(0x12);
+        tokio::pin!(write);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut write)
+                .await
+                .is_err(),
+            "a command write must wait for the in-flight sampler"
+        );
+        drop(sampler_guard);
+
+        assert_eq!(write.await, Ok(()));
     }
 
     #[test]

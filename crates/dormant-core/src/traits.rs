@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::DormantError;
 use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 
+/// Stable error detail for controllers that cannot write VCP input-source
+/// codes. Executors use this exact capability result to fall through a
+/// mixed controller chain without treating unsupported hardware as an I/O
+/// failure.
+pub const INPUT_SOURCE_WRITE_UNSUPPORTED: &str = "E_DISPLAY_IO: unsupported input-source write";
+
 /// A coarse power state observed by [`PanelState`] readback.
 ///
 /// Models the two values the control-path verification feature
@@ -156,6 +162,19 @@ pub trait DisplayController: Any + Send + Sync {
         Ok(None)
     }
 
+    /// Select the active input-source code.
+    ///
+    /// Controllers without an input-source write surface return the stable
+    /// unsupported result so a composed controller chain can try its first
+    /// capable member. DDC/CI implementations perform this as command-path
+    /// work because it changes shared-panel ownership.
+    async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+        Err(CmdFailure {
+            controller: self.name().to_string(),
+            error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
+        })
+    }
+
     /// Read the panel's cumulative usage-hours counter, if the controller
     /// exposes one (DDC/CI VCP `0xC0`).
     ///
@@ -271,6 +290,17 @@ pub trait CommandSink: Send + Sync {
     /// controller that attempted the read failed.
     async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
         Ok(None)
+    }
+
+    /// Select the active input-source code through the controller chain.
+    ///
+    /// Default returns the stable unsupported result because a bare command
+    /// sink cannot advertise a writer.
+    async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+        Err(CmdFailure {
+            controller: "command-sink".to_string(),
+            error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
+        })
     }
 
     /// Read the panel's cumulative usage-hours counter through whichever
@@ -399,6 +429,9 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(c.read_usage_hours().await, None);
+        let error = c.write_input_source(0x12).await.unwrap_err();
+        assert_eq!(error.controller, "bare");
+        assert_eq!(error.error, "E_DISPLAY_IO: unsupported input-source write");
         assert_eq!(
             c.panel_identity(),
             None,
@@ -421,6 +454,9 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(s.read_usage_hours().await, None);
+        let error = s.write_input_source(0x12).await.unwrap_err();
+        assert_eq!(error.controller, "command-sink");
+        assert_eq!(error.error, "E_DISPLAY_IO: unsupported input-source write");
         assert_eq!(
             s.panel_identity(),
             None,

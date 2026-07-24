@@ -69,7 +69,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_BLANK_FAILED, E_WAKE_FAILED};
 use dormant_core::rules::{ControllerHealth, ControllerRole};
-use dormant_core::traits::{CommandSink, DisplayController, PanelState};
+use dormant_core::traits::{
+    CommandSink, DisplayController, INPUT_SOURCE_WRITE_UNSUPPORTED, PanelState,
+};
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
 use tokio_util::sync::CancellationToken;
 
@@ -645,6 +647,25 @@ impl CommandSink for DisplayExecutor {
         }
     }
 
+    /// Select the input source through the first controller that exposes a
+    /// write surface. Unsupported controllers are skipped; an I/O failure
+    /// from the selected writer is final so claim orchestration can retain
+    /// ownership and run its failure compensation.
+    async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
+        for controller in &self.chain {
+            match controller.write_input_source(code).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.error == INPUT_SOURCE_WRITE_UNSUPPORTED => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(CmdFailure {
+            controller: "none-eligible".to_string(),
+            error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
+        })
+    }
+
     /// Walk the configured chain and return the first non-`None`
     /// usage-hours reading — mirrors [`Self::read_state`]'s chain-walk
     /// shape exactly. Used once, at wear-ledger seeding time (task T7),
@@ -738,6 +759,8 @@ mod tests {
         claim_identity: Option<String>,
         /// Scripted [`DisplayController::read_input_source_sampled`] responses.
         input_sources: VecDeque<Result<Option<u8>, String>>,
+        /// Scripted [`DisplayController::write_input_source`] responses.
+        input_source_writes: VecDeque<Result<(), CmdFailure>>,
     }
 
     impl FakeController {
@@ -787,6 +810,14 @@ mod tests {
 
         fn push_input_source(&self, result: Result<Option<u8>, String>) {
             self.inner.lock().unwrap().input_sources.push_back(result);
+        }
+
+        fn push_input_source_write(&self, result: Result<(), CmdFailure>) {
+            self.inner
+                .lock()
+                .unwrap()
+                .input_source_writes
+                .push_back(result);
         }
 
         fn count_op(&self, op: &'static str) -> usize {
@@ -885,6 +916,19 @@ mod tests {
                 .input_sources
                 .pop_front()
                 .unwrap_or(Ok(None))
+        }
+
+        async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+            let mut state = self.inner.lock().unwrap();
+            state
+                .log
+                .push((self.name.to_string(), "write_input_source"));
+            state.input_source_writes.pop_front().unwrap_or_else(|| {
+                Err(CmdFailure {
+                    controller: self.name.to_string(),
+                    error: "E_DISPLAY_IO: unsupported input-source write".to_string(),
+                })
+            })
         }
 
         fn panel_identity(&self) -> Option<String> {
@@ -1473,6 +1517,18 @@ mod tests {
         let (executor, _) = executor_with(vec![failing_reader, reader], default_retry());
 
         assert_eq!(executor.read_input_source_sampled().await, Ok(Some(0x11)));
+    }
+
+    #[tokio::test]
+    async fn write_input_source_skips_unsupported_controller_for_first_writer() {
+        let unsupported = FakeController::new("unsupported", vec![]);
+        let writer = FakeController::new("writer", vec![]);
+        writer.push_input_source_write(Ok(()));
+        let (executor, handles) = executor_with(vec![unsupported, writer], default_retry());
+
+        assert_eq!(executor.write_input_source(0x12).await, Ok(()));
+        assert_eq!(handles[0].count_op("write_input_source"), 1);
+        assert_eq!(handles[1].count_op("write_input_source"), 1);
     }
 
     // ── T7 fix M1: panel_identity chain-walk ─────────────────────────────────

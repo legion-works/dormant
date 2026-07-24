@@ -926,6 +926,10 @@ pub(crate) struct FakeVcp {
     /// (ident, code, value) triples scripted to panic on their next
     /// `set_vcp` call — one-shot, removed on use.
     set_panic: StdMutex<std::collections::HashSet<(String, u8, u16)>>,
+    /// Set-VCP calls with their lock-acquisition priority. This is separate
+    /// from the string log so tests can assert command/sampler behavior
+    /// without coupling to its diagnostic formatting.
+    set_calls: StdMutex<Vec<(u8, u16, VcpPriority)>>,
     call_log: StdMutex<Vec<String>>,
     /// Wall-clock elapsed time of the most recent delayed `get_vcp` call
     /// (measured *inside* the blocking closure, while the lock was held) —
@@ -959,6 +963,7 @@ impl FakeVcp {
             get_delay: StdMutex::new(std::collections::HashMap::new()),
             get_panic: StdMutex::new(std::collections::HashSet::new()),
             set_panic: StdMutex::new(std::collections::HashSet::new()),
+            set_calls: StdMutex::new(Vec::new()),
             call_log: StdMutex::new(Vec::new()),
             last_get_elapsed: StdMutex::new(None),
         }
@@ -1052,6 +1057,16 @@ impl FakeVcp {
         std::mem::take(&mut *log)
     }
 
+    /// Snapshot Set-VCP calls and their requested priority.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn set_calls(&self) -> Vec<(u8, u16, VcpPriority)> {
+        self.set_calls.lock().unwrap().clone()
+    }
+
     /// Take the elapsed wall-clock time of the most recent delayed
     /// `get_vcp` call, if any.
     ///
@@ -1139,6 +1154,7 @@ impl VcpOps for FakeVcp {
         lock: &Arc<PanelLock>,
         prio: VcpPriority,
     ) -> Result<(), String> {
+        self.set_calls.lock().unwrap().push((code, value, prio));
         self.call_log
             .lock()
             .unwrap()

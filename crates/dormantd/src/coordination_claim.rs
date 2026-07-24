@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU16, Ordering},
@@ -18,7 +19,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dormant_core::{
     claim::{ClaimFrame, Epoch, ReplayWindow},
-    peers::{InstanceIdentity, PeerRecord},
+    peers::{InstanceIdentity, PeerRecord, PeerStoreError, load_peer_store, upsert_peer},
 };
 use ed25519_dalek::VerifyingKey;
 use tokio::{
@@ -45,6 +46,90 @@ pub struct ClaimPeer {
     pub last_addr: Option<SocketAddr>,
     /// Claim listener port advertised by the peer.
     pub claim_port: Option<u16>,
+}
+
+/// Persistent paired-peer store with a live snapshot for claim transport consumers.
+pub(crate) struct PeerStoreFeed {
+    path: PathBuf,
+    sender: watch::Sender<Vec<ClaimPeer>>,
+}
+
+impl PeerStoreFeed {
+    /// Load the persisted peer store and create a feed seeded from its records.
+    pub(crate) fn load(state_dir: &Path) -> Result<Self, PeerStoreError> {
+        let path = state_dir.join("peers.json");
+        let peers = claim_peers(load_peer_store(&path)?.peers)?;
+        let (sender, _) = watch::channel(peers);
+        Ok(Self { path, sender })
+    }
+
+    /// Subscribe to all persisted-peer changes.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Vec<ClaimPeer>> {
+        self.sender.subscribe()
+    }
+
+    /// Persist a pairing result and publish the resulting peer snapshot.
+    pub(crate) fn upsert(&self, record: PeerRecord) -> Result<(), PeerStoreError> {
+        upsert_peer(&self.path, record)?;
+        self.publish()
+    }
+
+    /// Persist a newly authenticated address only when it has changed.
+    pub(crate) fn refresh_address(
+        &self,
+        instance_id: &str,
+        address: SocketAddr,
+    ) -> Result<(), PeerStoreError> {
+        let store = load_peer_store(&self.path)?;
+        let Some(mut record) = store
+            .peers
+            .into_iter()
+            .find(|peer| peer.instance_id == instance_id)
+        else {
+            return Err(PeerStoreError::Invalid {
+                detail: "cannot refresh endpoint for an unknown peer".to_owned(),
+            });
+        };
+        if record.last_addr == Some(address) {
+            return Ok(());
+        }
+        record.last_addr = Some(address);
+        upsert_peer(&self.path, record)?;
+        self.publish()
+    }
+
+    fn publish(&self) -> Result<(), PeerStoreError> {
+        let peers = claim_peers(load_peer_store(&self.path)?.peers)?;
+        self.sender.send_replace(peers);
+        Ok(())
+    }
+}
+
+fn claim_peers(records: Vec<PeerRecord>) -> Result<Vec<ClaimPeer>, PeerStoreError> {
+    records
+        .into_iter()
+        .map(|record| {
+            let key =
+                STANDARD
+                    .decode(&record.ed25519_pub)
+                    .map_err(|_| PeerStoreError::Invalid {
+                        detail: "paired peer public key is not valid base64".to_owned(),
+                    })?;
+            let key: [u8; 32] = key.try_into().map_err(|_| PeerStoreError::Invalid {
+                detail: "paired peer public key must be 32 bytes".to_owned(),
+            })?;
+            let verifying_key =
+                VerifyingKey::from_bytes(&key).map_err(|_| PeerStoreError::Invalid {
+                    detail: "paired peer public key is invalid".to_owned(),
+                })?;
+            Ok(ClaimPeer {
+                instance_id: record.instance_id,
+                verifying_key,
+                last_addr: record.last_addr,
+                claim_port: record.claim_port,
+            })
+        })
+        .collect()
 }
 
 /// Fully injected dependencies for a claim transport supervisor.
@@ -547,9 +632,10 @@ mod tests {
         time::Duration,
     };
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use dormant_core::{
         claim::{ClaimAbort, ClaimFrame, ClaimMessage, Epoch},
-        peers::{InstanceIdentity, instance_id_from_public_key},
+        peers::{InstanceIdentity, PeerRecord, instance_id_from_public_key},
     };
     use ed25519_dalek::SigningKey;
     use tokio::{
@@ -560,7 +646,7 @@ mod tests {
 
     use crate::coordination_frame::write_frame;
 
-    use super::{ClaimPeer, ClaimTransportDeps, spawn};
+    use super::{ClaimPeer, ClaimTransportDeps, PeerStoreFeed, spawn};
 
     const LOCAL_EPOCH: &str = "local-epoch-0001";
     const REMOTE_EPOCH: &str = "remote-epoch-001";
@@ -853,5 +939,33 @@ mod tests {
             .await;
         assert!(started.elapsed() <= Duration::from_millis(700));
         handle.shutdown().await;
+    }
+
+    #[test]
+    fn peer_store_feed_publishes_pairing_and_authenticated_endpoint_changes() {
+        let state = tempfile::tempdir().unwrap();
+        let remote = identity(2);
+        let feed = PeerStoreFeed::load(state.path()).unwrap();
+        let mut peers = feed.subscribe();
+        let record = PeerRecord {
+            instance_id: remote.instance_id.clone(),
+            ed25519_pub: STANDARD.encode(remote.verifying_key.as_bytes()),
+            display_name: "remote".to_owned(),
+            paired_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_addr: None,
+            claim_port: Some(9),
+        };
+
+        feed.upsert(record).unwrap();
+        assert!(peers.has_changed().unwrap());
+        peers.borrow_and_update();
+        feed.refresh_address(&remote.instance_id, SocketAddr::from(([127, 0, 0, 1], 10)))
+            .unwrap();
+
+        assert!(peers.has_changed().unwrap());
+        assert_eq!(
+            peers.borrow_and_update()[0].last_addr,
+            Some(SocketAddr::from(([127, 0, 0, 1], 10)))
+        );
     }
 }

@@ -20,6 +20,7 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
 
+use crate::coordination_claim::{ClaimTransportHandle, PeerStoreFeed};
 use crate::coordination_frame::{FrameError, read_frame, write_frame};
 use crate::coordination_mdns::{MdnsBackend, PairDiscovery, resolve_bind_ip};
 
@@ -52,6 +53,12 @@ struct NoClaimPortProvider;
 impl ClaimPortProvider for NoClaimPortProvider {
     fn claim_port(&self) -> Option<u16> {
         None
+    }
+}
+
+impl ClaimPortProvider for ClaimTransportHandle {
+    fn claim_port(&self) -> Option<u16> {
+        self.provisional_port()
     }
 }
 
@@ -151,6 +158,7 @@ pub(crate) struct LocalPeer {
     display_name: String,
     identity: dormant_core::peers::InstanceIdentity,
     claim_port: Option<u16>,
+    peer_store: Option<Arc<PeerStoreFeed>>,
 }
 
 #[allow(
@@ -167,6 +175,15 @@ impl LocalPeer {
         display_name: String,
         claim_port: Option<u16>,
     ) -> Result<Self, PairSessionError> {
+        Self::load_with_runtime(state_dir, display_name, claim_port, None)
+    }
+
+    fn load_with_runtime(
+        state_dir: PathBuf,
+        display_name: String,
+        claim_port: Option<u16>,
+        peer_store: Option<Arc<PeerStoreFeed>>,
+    ) -> Result<Self, PairSessionError> {
         let identity = load_or_create_identity(&state_dir)
             .map_err(|error| PairSessionError::Local(error.to_string()))?;
         Ok(Self {
@@ -174,6 +191,7 @@ impl LocalPeer {
             display_name,
             identity,
             claim_port,
+            peer_store,
         })
     }
 
@@ -193,8 +211,11 @@ impl LocalPeer {
             last_addr: peer.last_addr,
             claim_port: peer.claim_port,
         };
-        upsert_peer(&self.state_dir.join("peers.json"), record)
-            .map_err(|error| PairSessionError::Local(error.to_string()))
+        match &self.peer_store {
+            Some(peer_store) => peer_store.upsert(record),
+            None => upsert_peer(&self.state_dir.join("peers.json"), record),
+        }
+        .map_err(|error| PairSessionError::Local(error.to_string()))
     }
 }
 
@@ -238,6 +259,7 @@ pub(crate) struct PairingManager {
     enabled: bool,
     pairing_window: Duration,
     claim_port_provider: Arc<dyn ClaimPortProvider>,
+    peer_store: Option<Arc<PeerStoreFeed>>,
     windows: Mutex<HashMap<String, PairingWindow>>,
 }
 
@@ -273,18 +295,26 @@ impl PairingManager {
             enabled,
             pairing_window,
             claim_port_provider,
+            peer_store: None,
             windows: Mutex::new(HashMap::new()),
         })
     }
 
     pub(crate) fn local_peer(&self, display_name: String) -> Result<LocalPeer, PairSessionError> {
-        LocalPeer::load_with_claim_port(
+        LocalPeer::load_with_runtime(
             self.state_dir.clone(),
             display_name,
             self.claim_port_provider
                 .claim_port()
                 .filter(|port| *port != 0),
+            self.peer_store.clone(),
         )
+    }
+
+    /// Attach the process-lifetime peer feed used by pairing persistence.
+    pub(crate) fn with_peer_store(mut self, peer_store: Arc<PeerStoreFeed>) -> Self {
+        self.peer_store = Some(peer_store);
+        self
     }
 
     /// Open one responder window. Transport advertisement is attached by Task 14.
@@ -376,6 +406,7 @@ pub(crate) struct PairingTransport<B: MdnsBackend + 'static> {
     cancel: tokio_util::sync::CancellationToken,
     windows: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     browse_last_activity: Arc<Mutex<Option<Instant>>>,
+    claim_transport: Option<Arc<ClaimTransportHandle>>,
 }
 
 impl<B: MdnsBackend + 'static> PairingTransport<B> {
@@ -396,7 +427,15 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             cancel,
             windows: Arc::new(Mutex::new(HashMap::new())),
             browse_last_activity: Arc::new(Mutex::new(None)),
+            claim_transport: None,
         }
+    }
+
+    /// Attach the daemon-lifetime claim listener used while pairing is in flight.
+    #[must_use]
+    pub(crate) fn with_claim_transport(mut self, transport: Arc<ClaimTransportHandle>) -> Self {
+        self.claim_transport = Some(transport);
+        self
     }
 
     #[cfg(test)]
@@ -416,6 +455,7 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             cancel,
             windows: Arc::new(Mutex::new(HashMap::new())),
             browse_last_activity: Arc::new(Mutex::new(None)),
+            claim_transport: None,
         }
     }
 
@@ -466,26 +506,54 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
         {
             return Err(PairSessionError::Busy);
         }
+        self.ensure_claim_listener().await?;
         let bind_ip = match self.test_bind_ip {
-            Some(ip) => ip,
+            Some(ip) => Ok(ip),
             None => resolve_bind_ip(self.bind_override.as_deref()).map_err(|error| {
                 PairSessionError::Local(format!("resolve pairing bind address: {error}"))
-            })?,
+            }),
         };
-        let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, self.pairing_port))
-            .await
-            .map_err(|error| {
-                PairSessionError::Local(format!("bind pairing listener at {bind_ip}: {error}"))
-            })?;
-        let actual = listener.local_addr().map_err(|error| {
-            PairSessionError::Local(format!("read pairing listener address: {error}"))
-        })?;
-        let open = self.manager.open(display_name.clone())?;
-        let identity = self
-            .manager
-            .identity
-            .as_ref()
-            .ok_or(PairSessionError::Disabled)?;
+        let bind_ip = match bind_ip {
+            Ok(ip) => ip,
+            Err(error) => {
+                self.release_claim_listener().await;
+                return Err(error);
+            }
+        };
+        let listener = match tokio::net::TcpListener::bind(SocketAddr::new(
+            bind_ip,
+            self.pairing_port,
+        ))
+        .await
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                self.release_claim_listener().await;
+                return Err(PairSessionError::Local(format!(
+                    "bind pairing listener at {bind_ip}: {error}"
+                )));
+            }
+        };
+        let actual = match listener.local_addr() {
+            Ok(actual) => actual,
+            Err(error) => {
+                self.release_claim_listener().await;
+                return Err(PairSessionError::Local(format!(
+                    "read pairing listener address: {error}"
+                )));
+            }
+        };
+        let open = match self.manager.open(display_name.clone()) {
+            Ok(open) => open,
+            Err(error) => {
+                self.release_claim_listener().await;
+                return Err(error);
+            }
+        };
+        let Some(identity) = self.manager.identity.as_ref() else {
+            self.release_claim_listener().await;
+            return Err(PairSessionError::Disabled);
+        };
         let announce = DiscoverAnnounce {
             protocol_version: PAIR_PROTOCOL_VERSION,
             instance_id: identity.instance_id.clone(),
@@ -493,13 +561,14 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             pairing_port: actual.port(),
             window_id: open.pair_id.clone(),
         };
-        if let Err(error) = self
+        let advertise = self
             .discovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .open_pairing_window(announce)
-        {
+            .open_pairing_window(announce);
+        if let Err(error) = advertise {
             let _ = self.manager.cancel(&open.pair_id);
+            self.release_claim_listener().await;
             return Err(PairSessionError::Local(format!(
                 "advertise pairing window: {error}"
             )));
@@ -518,6 +587,7 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
             Arc::clone(&self.windows),
             open.pair_id.clone(),
             window_cancel,
+            self.claim_transport.clone(),
         ));
         Ok(open)
     }
@@ -530,6 +600,20 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
         code: String,
     ) -> Result<(), PairSessionError> {
         self.manager.join_preflight(&target_instance_id)?;
+        self.ensure_claim_listener().await?;
+        let result = self
+            .join_after_claim_listener(display_name, target_instance_id, code)
+            .await;
+        self.release_claim_listener().await;
+        result
+    }
+
+    async fn join_after_claim_listener(
+        &self,
+        display_name: String,
+        target_instance_id: String,
+        code: String,
+    ) -> Result<(), PairSessionError> {
         self.kick_browse()?;
         let deadline = Instant::now() + BROWSE_SETTLE_TIMEOUT;
         let (address, window_id) = loop {
@@ -589,7 +673,30 @@ impl<B: MdnsBackend + 'static> PairingTransport<B> {
         {
             cancel.cancel();
         }
+        if let Some(transport) = self.claim_transport.clone() {
+            tokio::spawn(async move {
+                transport.release_provisional().await;
+            });
+        }
         Ok(status)
+    }
+
+    async fn ensure_claim_listener(&self) -> Result<(), PairSessionError> {
+        if let Some(transport) = &self.claim_transport {
+            transport
+                .ensure_provisional_listener()
+                .await
+                .map_err(|error| {
+                    PairSessionError::Local(format!("bind provisional claim listener: {error}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn release_claim_listener(&self) {
+        if let Some(transport) = &self.claim_transport {
+            transport.release_provisional().await;
+        }
     }
 }
 
@@ -600,6 +707,7 @@ async fn run_listener<B: MdnsBackend + 'static>(
     windows: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     pair_id: String,
     cancel: tokio_util::sync::CancellationToken,
+    claim_transport: Option<Arc<ClaimTransportHandle>>,
 ) {
     use tokio::sync::{Semaphore, mpsc};
     use tokio::task::JoinSet;
@@ -670,6 +778,9 @@ async fn run_listener<B: MdnsBackend + 'static>(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&pair_id);
+    if let Some(transport) = claim_transport {
+        transport.release_provisional().await;
+    }
 }
 
 async fn run_managed_responder<S>(

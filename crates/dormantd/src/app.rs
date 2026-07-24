@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+use dormant_core::claim::Epoch;
 use dormant_core::config::schema::{Config, Credentials, DisplayScope, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
@@ -85,8 +86,11 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
-use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery};
-use crate::coordination_pairing::{PairingManager, PairingTransport};
+use crate::coordination_claim::{
+    ClaimTransportDeps, ClaimTransportHandle, PeerStoreFeed, spawn as spawn_claim_transport,
+};
+use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery, resolve_bind_ip};
+use crate::coordination_pairing::{ClaimPortProvider, PairingManager, PairingTransport};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
@@ -105,6 +109,13 @@ type NotifySinkBuilder = Arc<dyn Fn() -> Arc<dyn NotifySink> + Send + Sync>;
 /// registry; tests inject a factory that returns scripted fakes.
 type SourceBuilder =
     Arc<dyn Fn(&Config, &Credentials) -> Result<Vec<Box<dyn SensorSource>>> + Send + Sync>;
+
+fn claim_epoch() -> Result<Epoch> {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).context("generate claim boot epoch")?;
+    Epoch::try_from(format!("{:016x}", u64::from_be_bytes(bytes)).as_str())
+        .map_err(|error| anyhow::anyhow!(error))
+}
 
 /// Builds render sinks for a display.  Production uses
 /// [`LayerShellRenderSink`]; tests inject a factory that returns
@@ -823,6 +834,36 @@ impl App {
             || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
             |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
         );
+        let (claim_transport, peer_store) = if cfg_clone.coordination.enabled {
+            let identity = Arc::new(
+                load_or_create_identity(&self.state_dir)
+                    .context("load persistent instance identity for claims")?,
+            );
+            let peer_store = Arc::new(
+                PeerStoreFeed::load(&self.state_dir)
+                    .context("load persistent paired-peer store")?,
+            );
+            let callback_store = Arc::clone(&peer_store);
+            let bind_address =
+                resolve_bind_ip(cfg_clone.coordination.claim_bind_address.as_deref())
+                    .context("resolve coordination claim bind address")?;
+            let transport = Arc::new(spawn_claim_transport(ClaimTransportDeps {
+                identity,
+                boot_epoch: claim_epoch()?,
+                peers: peer_store.subscribe(),
+                bind_address,
+                fixed_port: (cfg_clone.coordination.claim_port != 0)
+                    .then_some(cfg_clone.coordination.claim_port),
+                on_peer_addr: Box::new(move |instance_id, address| {
+                    if let Err(error) = callback_store.refresh_address(&instance_id, address) {
+                        tracing::warn!(event = "claim_peer_address_persist_failed", peer = %instance_id, %error);
+                    }
+                }),
+            }));
+            (Some(transport), Some(peer_store))
+        } else {
+            (None, None)
+        };
         let coordination_mdns = if cfg_clone.coordination.enabled {
             let identity = load_or_create_identity(&self.state_dir)
                 .context("load persistent instance identity for mDNS discovery")?;
@@ -838,21 +879,37 @@ impl App {
             None
         };
         let pairing_manager = Arc::new(
-            PairingManager::new(
-                &self.state_dir,
-                cfg_clone.coordination.enabled,
-                cfg_clone.coordination.pairing_window,
-            )
+            match (&claim_transport, &peer_store) {
+                (Some(transport), Some(peer_store)) => {
+                    PairingManager::new_with_claim_port_provider(
+                        &self.state_dir,
+                        true,
+                        cfg_clone.coordination.pairing_window,
+                        Arc::clone(transport) as Arc<dyn ClaimPortProvider>,
+                    )
+                    .map(|manager| manager.with_peer_store(Arc::clone(peer_store)))
+                }
+                _ => PairingManager::new(
+                    &self.state_dir,
+                    cfg_clone.coordination.enabled,
+                    cfg_clone.coordination.pairing_window,
+                ),
+            }
             .context("load persistent instance identity for pairing")?,
         );
-        let pairing_transport = coordination_mdns.map(|discovery| {
-            Arc::new(PairingTransport::new(
-                Arc::clone(&pairing_manager),
-                discovery,
-                cfg_clone.coordination.pairing_port,
-                cfg_clone.coordination.pairing_bind_address.clone(),
-                root.clone(),
-            ))
+        let pairing_transport = coordination_mdns.and_then(|discovery| {
+            claim_transport.as_ref().map(|transport| {
+                Arc::new(
+                    PairingTransport::new(
+                        Arc::clone(&pairing_manager),
+                        discovery,
+                        cfg_clone.coordination.pairing_port,
+                        cfg_clone.coordination.pairing_bind_address.clone(),
+                        root.clone(),
+                    )
+                    .with_claim_transport(Arc::clone(transport)),
+                )
+            })
         });
 
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
@@ -1115,6 +1172,7 @@ impl App {
             ownership,
             coordination: coordination.clone(),
             _coordination_mdns: None,
+            claim_transport: claim_transport.clone(),
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1419,6 +1477,8 @@ struct Runner {
     /// Retained while enabled so later pairing windows can advertise or browse;
     /// construction alone does not expose a service on the LAN.
     _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
+    /// Daemon-lifetime authenticated claim listener; it survives generation swaps.
+    claim_transport: Option<Arc<ClaimTransportHandle>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,
@@ -1797,6 +1857,53 @@ impl Runner {
         let new_cfg = new_assembly.cfg.clone();
         let new_creds = new_assembly.creds.clone();
         self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
+
+        if let Some(transport) = &self.claim_transport
+            && (self.generation.cfg.coordination.claim_port != new_cfg.coordination.claim_port
+                || self.generation.cfg.coordination.claim_bind_address
+                    != new_cfg.coordination.claim_bind_address)
+        {
+            let bind = match resolve_bind_ip(new_cfg.coordination.claim_bind_address.as_deref()) {
+                Ok(bind) => bind,
+                Err(error) => {
+                    let detail = format!("resolve coordination claim bind address: {error}");
+                    let _ = old_ctl
+                        .send(ControlMsg::SetPendingReload(Some(detail.clone())))
+                        .await;
+                    let outcome = ReloadOutcome::Rejected(detail);
+                    let _ = self.reload_tx.send(outcome.clone());
+                    return self.reload_receipt(
+                        request_ids,
+                        sources,
+                        requested_revision,
+                        outcome,
+                        false,
+                    );
+                }
+            };
+            if let Err(error) = transport
+                .update_bind(
+                    bind,
+                    (new_cfg.coordination.claim_port != 0)
+                        .then_some(new_cfg.coordination.claim_port),
+                )
+                .await
+            {
+                let detail = format!("rebind coordination claim listener: {error}");
+                let _ = old_ctl
+                    .send(ControlMsg::SetPendingReload(Some(detail.clone())))
+                    .await;
+                let outcome = ReloadOutcome::Rejected(detail);
+                let _ = self.reload_tx.send(outcome.clone());
+                return self.reload_receipt(
+                    request_ids,
+                    sources,
+                    requested_revision,
+                    outcome,
+                    false,
+                );
+            }
+        }
 
         // Reload does not rebind a web listener — flag port/bind changes.
         if new_cfg.daemon.web_port != self.started_web_port
@@ -2677,7 +2784,17 @@ async fn run_loop(
         quiesce_inputs(&mut runner.generation).await;
         teardown(&mut runner.generation).await;
     };
-    tokio::join!(generation_teardown, wear_teardown, front_teardown);
+    let claim_teardown = async {
+        if let Some(transport) = runner.claim_transport {
+            transport.shutdown().await;
+        }
+    };
+    tokio::join!(
+        generation_teardown,
+        wear_teardown,
+        front_teardown,
+        claim_teardown
+    );
     tracing::info!(event = "daemon_stopped");
 }
 

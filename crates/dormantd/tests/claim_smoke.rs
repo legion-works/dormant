@@ -160,8 +160,15 @@ struct HookInner {
     outcomes: Mutex<VecDeque<HookOutcome>>,
 }
 
+#[derive(Clone)]
+struct CommandBarrier {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 pub struct RecordingHookRunner {
     inner: Arc<Mutex<HookInner>>,
+    command_barriers: Mutex<VecDeque<CommandBarrier>>,
 }
 
 impl Default for RecordingHookRunner {
@@ -174,6 +181,7 @@ impl RecordingHookRunner {
     fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HookInner::default())),
+            command_barriers: Mutex::new(VecDeque::new()),
         }
     }
     fn push_completed(&self, started: usize, failed: usize, spawned: usize) {
@@ -191,6 +199,18 @@ impl RecordingHookRunner {
     }
     fn calls(&self) -> Vec<RecordedHook> {
         self.inner.lock().unwrap().calls.clone()
+    }
+
+    fn block_next_command(&self) -> CommandBarrier {
+        let barrier = CommandBarrier {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        self.command_barriers
+            .lock()
+            .unwrap()
+            .push_back(barrier.clone());
+        barrier
     }
 }
 
@@ -219,6 +239,11 @@ impl HookRunner for RecordingHookRunner {
             index: 0,
             kind,
         });
+        let barrier = self.command_barriers.lock().unwrap().pop_front();
+        if let Some(barrier) = barrier {
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+        }
         self.inner
             .lock()
             .unwrap()
@@ -511,6 +536,7 @@ impl ClaimHarness {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
     fn shutdown(&self) {
         self.cancel.cancel();
     }
@@ -666,6 +692,50 @@ async fn negotiated_claim_order_is_release_write_flip_acquire() {
     );
     // No wakes on a powered release.
     assert_eq!(harness.sink_wakes().len(), 0, "no wake on powered release");
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn stale_nonce_owner_completion_does_not_advance_current_flight() {
+    let harness = ClaimHarness::build("mon", 0x0f).await;
+    harness.clear_sink_writes();
+    let before_release = harness.runner.block_next_command();
+    for _ in 0..4 {
+        harness.runner.push_completed(1, 0, 0);
+    }
+
+    let frame = harness.build_inbound_request("current", 0x11);
+    harness
+        .handle
+        .inject_inbound_for_test(frame)
+        .await
+        .expect("inject inbound");
+    tokio::time::timeout(Duration::from_secs(2), before_release.entered.notified())
+        .await
+        .expect("current flight must be waiting for before-release completion");
+
+    let accepted = harness
+        .handle
+        .inject_owner_completion_for_test(
+            DisplayId("mon".to_owned()),
+            "stale",
+            dormant_core::claim_engine::OwnerEvent::BeforeRelease(
+                dormant_core::claim_engine::HookResult::Completed,
+            ),
+        )
+        .await
+        .expect("inject stale owner completion");
+    assert!(!accepted, "stale completion must be dropped");
+    assert!(
+        harness.sink_writes().is_empty(),
+        "stale completion must not advance the current flight to its write"
+    );
+
+    before_release.release.notify_one();
+    assert!(
+        harness.wait_for_n_writes(1, Duration::from_secs(2)).await,
+        "the matching completion must still advance the current flight"
+    );
     harness.shutdown();
 }
 

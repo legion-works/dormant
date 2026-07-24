@@ -125,6 +125,13 @@ enum RuntimeEvent {
         reply: oneshot::Sender<Result<Instant, ArmFailure>>,
     },
     DisplayRemoved(DisplayId),
+    #[cfg(any(test, feature = "test-util"))]
+    InjectOwnerCompletion {
+        display: DisplayId,
+        nonce: String,
+        event: OwnerEvent,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Local verdict surfaced to the IPC caller.
@@ -250,6 +257,35 @@ impl ClaimRuntimeHandle {
             .send(RuntimeEvent::Inbound(frame))
             .await
             .map_err(|_| "claim runtime not available")
+    }
+
+    /// Inject an asynchronous owner completion through the driver's event loop.
+    /// Returns `true` when its nonce matches the active flight; stale completions
+    /// return `false` without reaching the engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver has exited or drops the acknowledgement.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn inject_owner_completion_for_test(
+        &self,
+        display: DisplayId,
+        nonce: impl Into<String>,
+        event: OwnerEvent,
+    ) -> Result<bool, &'static str> {
+        let (reply, acknowledged) = oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeEvent::InjectOwnerCompletion {
+                display,
+                nonce: nonce.into(),
+                event,
+                reply,
+            })
+            .await
+            .map_err(|_| "claim runtime not available")?;
+        acknowledged
+            .await
+            .map_err(|_| "claim runtime dropped acknowledgement")
     }
 
     /// F10 suppression: `true` when the runtime owns an in-flight
@@ -455,21 +491,7 @@ impl Driver {
                 }
                 maybe = self.owner_event_rx.recv() => {
                     let Some((display, nonce, event)) = maybe else { break };
-                    // F2: drop stale-nonce completions. A late
-                    // hook/write/wake result from a flight that
-                    // already terminalised (timeout, removed,
-                    // mid-claim reload) must NOT advance a NEW
-                    // flight for the same display, nor wrongly
-                    // clear its F10 suppression.
-                    let current_nonce = self
-                        .flights
-                        .get(&display)
-                        .map(|f| f.nonce.clone());
-                    if current_nonce.as_deref() != Some(nonce.as_str()) {
-                        continue;
-                    }
-                    let actions = self.feed_owner_event(&display, event);
-                    self.dispatch_actions(&display, &actions);
+                    self.handle_owner_completion(&display, &nonce, event);
                 }
                 _ = tick.tick() => {
                     self.sweep_deadlines();
@@ -500,7 +522,37 @@ impl Driver {
             RuntimeEvent::DisplayRemoved(display) => {
                 self.handle_display_removed(&display);
             }
+            #[cfg(any(test, feature = "test-util"))]
+            RuntimeEvent::InjectOwnerCompletion {
+                display,
+                nonce,
+                event,
+                reply,
+            } => {
+                let accepted = self.handle_owner_completion(&display, &nonce, event);
+                let _ = reply.send(accepted);
+            }
         }
+    }
+
+    fn handle_owner_completion(
+        &mut self,
+        display: &DisplayId,
+        nonce: &str,
+        event: OwnerEvent,
+    ) -> bool {
+        // F2: hook/write/wake completions from a terminalised flight must not
+        // advance a newer flight for the same display or lift its suppression.
+        let current_nonce = self
+            .flights
+            .get(display)
+            .map(|flight| flight.nonce.as_str());
+        if current_nonce != Some(nonce) {
+            return false;
+        }
+        let actions = self.feed_owner_event(display, event);
+        self.dispatch_actions(display, &actions);
+        true
     }
 
     fn handle_inbound(&mut self, frame: ClaimFrame) {
@@ -979,12 +1031,8 @@ impl Driver {
                 Vec::new()
             }
             Action::WatchForFlip => {
-                // The requester is now in the Watching stage.
-                // Suppression is already registered by
-                // `handle_claim_shared`; the
-                // `handle_ownership_changed` path will fire
-                // `FlipObserved` when the poll observes the
-                // local code. Nothing more to do here.
+                // Watching is engine state only. Suppression was registered when
+                // the request began, so this action dispatches no additional I/O.
                 Vec::new()
             }
             Action::BroadcastRequest | Action::RetryRequest | Action::RetryWithEpoch(_) => {

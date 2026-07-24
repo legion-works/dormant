@@ -915,6 +915,51 @@ mod tests {
     }
 
     #[test]
+    fn requester_not_owner_deduplicates_each_peer() {
+        let start = now();
+        let mut engine = ClaimEngine::default();
+        engine.begin_requester(display(), "nonce", 2, start, Duration::from_secs(3));
+        engine.requester_event(&display(), RequesterEvent::FanoutSent, start);
+
+        assert_eq!(
+            engine.requester_event(
+                &display(),
+                RequesterEvent::response("nonce", "peer-a", ClaimVerdict::NotOwner),
+                start,
+            ),
+            vec![Action::Trace("claim_not_owner")]
+        );
+        assert!(
+            engine
+                .requester_event(
+                    &display(),
+                    RequesterEvent::response("nonce", "peer-a", ClaimVerdict::NotOwner),
+                    start,
+                )
+                .is_empty(),
+            "a duplicate response from one peer must not complete fan-in"
+        );
+        assert_eq!(
+            engine.requester_stage(&display()),
+            Some(RequesterStage::AwaitingAck)
+        );
+        assert!(engine.is_suppressed(&display(), start));
+
+        assert_eq!(
+            engine.requester_event(
+                &display(),
+                RequesterEvent::response("nonce", "peer-b", ClaimVerdict::NotOwner),
+                start,
+            ),
+            vec![
+                Action::Trace("claim_not_owner"),
+                Action::Trace("claim_fallback_direct"),
+                Action::AttemptFallback,
+            ]
+        );
+    }
+
+    #[test]
     fn stale_epoch_retries_once_and_denial_fails_visibly() {
         let start = now();
         let mut engine = ClaimEngine::default();

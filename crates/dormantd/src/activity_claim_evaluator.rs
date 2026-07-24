@@ -128,22 +128,11 @@ async fn evaluator_loop(deps: PolicyEvaluatorDeps) {
             }
             let display_name = display.0.clone();
 
-            let armed_until = {
-                // is_armed returns true if the display has an unexpired arm deadline.
-                // We need the actual deadline for decide(), but ClaimRuntimeHandle
-                // only exposes is_armed(). For the pure decision, we pass a
-                // sentinel: armed_until is Some(now+1s) if armed, None otherwise.
-                if deps.claim_runtime.is_armed(display) {
-                    Some(now + deps.armed_window)
-                } else {
-                    None
-                }
-            };
+            let armed_until = deps.claim_runtime.armed_deadline(display);
 
-            // Owner-idle state: we don't have the owner's idle report cached yet.
-            // For edge/armed, owner_idle is irrelevant; for owner-idle, we need
-            // to query the owner first.  Pass false (unknown) — the policy will
-            // return QueryOwnerIdle, and the caller can send the query.
+            // Owner-idle state: unknown until we query the owner.
+            // The policy will return QueryOwnerIdle; we send the query
+            // and feed the response back into the decision.
             let owner_idle = false;
 
             let decision = policy.decide(owner_idle, armed_until, now);
@@ -189,16 +178,41 @@ async fn evaluator_loop(deps: PolicyEvaluatorDeps) {
                     }
                 }
                 ActivityClaimDecision::QueryOwnerIdle => {
-                    // The owner-idle policy requires the owner's idle report.
-                    // Sending the query and waiting for the response is a
-                    // multi-step async flow that involves the claim transport.
-                    // For now, log the intent — the full query path is wired
-                    // when the claim runtime exposes an idle-query method.
-                    tracing::debug!(
-                        event = "activity_claim_query_owner_idle",
-                        display_name = %display_name,
-                        "owner-idle policy triggered; idle query not yet wired",
-                    );
+                    // Send IdleQuery to the owner; feed the response
+                    // into a second policy decision (spec §5).
+                    let display_for_query = display.clone();
+                    let runtime = deps.claim_runtime.clone();
+                    let owner_idle_window = deps.owner_idle_window;
+                    tokio::spawn(async move {
+                        match runtime.idle_query(display_for_query.clone()).await {
+                            Ok(Some(idle_ms)) => {
+                                let owner_idle = idle_ms
+                                    >= u64::try_from(owner_idle_window.as_millis())
+                                        .unwrap_or(u64::MAX);
+                                if owner_idle {
+                                    tracing::info!(
+                                        event = "activity_claim_owner_idle_firing",
+                                        display = %display_for_query.0,
+                                        idle_ms,
+                                    );
+                                    let _ = runtime.try_claim(display_for_query).await;
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    event = "activity_claim_idle_query_timeout",
+                                    display = %display_for_query.0,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    event = "activity_claim_idle_query_error",
+                                    display = %display_for_query.0,
+                                    error = %e,
+                                );
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -236,61 +250,9 @@ fn append_log(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::idle_observation::{IdleObservation, idle_observation_channel};
-    use dormant_core::config::ActivityClaimPolicy;
-    use dormant_core::ownership::OwnershipGate;
-    use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
-
-    struct AlwaysOwned;
-    impl OwnershipGate for AlwaysOwned {
-        fn owns(&self, _display: &DisplayId) -> bool {
-            true
-        }
-    }
-
-    /// The evaluator loop processes idle observations without panicking when
-    /// all displays are locally owned (no claim actions needed).  The pure
-    /// decision logic is exercised by the `activity_claim_tests` module in
-    /// `dormant-core`; the full claim path integration is covered by
-    /// `claim_smoke.rs`.
-    #[tokio::test]
-    async fn evaluator_processes_observations_without_panicking() {
-        let cancel = CancellationToken::new();
-        let (idle_tx, idle_rx) = idle_observation_channel();
-        let display = DisplayId("shared".into());
-
-        // Publish an activity edge.
-        let _ = idle_tx.send(IdleObservation {
-            last_activity: Some(Instant::now()),
-            observed_at: Instant::now(),
-            available: true,
-        });
-
-        // All displays are locally owned, so the evaluator skips them
-        // without reaching try_claim.  The loop still processes the
-        // observation and edge detection — this test confirms it doesn't
-        // panic.
-        let placeholder_handle = crate::claim_runtime::ClaimRuntimeHandle::for_test();
-
-        let deps = PolicyEvaluatorDeps {
-            idle_rx,
-            claim_runtime: placeholder_handle,
-            ownership: Arc::new(AlwaysOwned),
-            activity_claim: ActivityClaimPolicy::Edge,
-            owner_idle_window: Duration::from_secs(30),
-            armed_window: Duration::from_secs(60),
-            claim_capable_displays: vec![display],
-            cancel: cancel.clone(),
-            event_log: None,
-            event_notify: None,
-        };
-
-        let handle = spawn(deps);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel.cancel();
-        let _ = handle.await;
-        // No assertions needed — the test verifies the evaluator doesn't panic.
-    }
+    // The evaluator's claim-firing path is exercised by the integration
+    // tests in `tests/claim_smoke.rs` (edge_policy_fires_claim_on_activity_edge,
+    // armed_policy_fires_claim_when_armed, armed_policy_does_not_claim_without_arm).
+    // The pure decision logic is tested in `dormant-core/src/claim.rs`
+    // (activity_claim_tests — 11 matrix cases).
 }

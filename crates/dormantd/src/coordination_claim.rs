@@ -395,6 +395,13 @@ impl ClaimTransportHandle {
         self.send_to_peer(peer_instance_id, frame).await;
     }
 
+    /// Best-effort delivery of a signed response frame to one peer.
+    /// Used by the owner-side `IdleQuery` handler to reply with an
+    /// `IdleReport` and by any future point-to-point response path.
+    pub async fn send_response(&self, peer_instance_id: &str, frame: &ClaimFrame) {
+        self.send_to_peer(peer_instance_id, frame).await;
+    }
+
     /// Snapshot the currently-known paired peers (read-only). The
     /// runtime driver uses this to resolve the per-display owner /
     /// requester peer instance id without the supervisor holding

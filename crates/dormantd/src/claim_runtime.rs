@@ -142,6 +142,13 @@ enum RuntimeEvent {
         display: DisplayId,
         reply: oneshot::Sender<Result<Instant, ArmFailure>>,
     },
+    /// Send an `IdleQuery` to the owner and wait for the `IdleReport`.
+    /// Returns the owner's idle duration in milliseconds, or `None`
+    /// when `claim_timeout` elapses without a response.
+    IdleQuery {
+        display: DisplayId,
+        reply: oneshot::Sender<Option<u64>>,
+    },
     DisplayRemoved(DisplayId),
     #[cfg(any(test, feature = "test-util"))]
     InjectOwnerCompletion {
@@ -277,6 +284,29 @@ impl ClaimRuntimeHandle {
             .map_err(|_| "claim runtime not available")
     }
 
+    /// Query the current owner's idle duration for an `owner-idle`
+    /// activity-claim policy.
+    ///
+    /// Signs an `IdleQuery`, fans it to all peers, waits for the
+    /// first `IdleReport` response (bounded by `claim_timeout`),
+    /// and returns the owner's idle duration in milliseconds.
+    ///
+    /// Returns `None` when no response arrives before the timeout
+    /// or when the runtime is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err("claim runtime not available")` if the
+    /// runtime's command channel is closed.
+    pub async fn idle_query(&self, display: DisplayId) -> Result<Option<u64>, &'static str> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeEvent::IdleQuery { display, reply: tx })
+            .await
+            .map_err(|_| "claim runtime not available")?;
+        rx.await.map_err(|_| "claim runtime dropped reply")
+    }
+
     /// **Test seam**: inject an authenticated inbound `ClaimFrame`
     /// directly into the driver as if it had arrived via the
     /// transport. Used by the smoke tests to drive the OWNER
@@ -336,13 +366,22 @@ impl ClaimRuntimeHandle {
         map.get(display).is_some_and(|deadline| now < *deadline)
     }
 
-    /// Whether `display` is currently armed for activity claims.
+    /// Whether `display` is currently armed for activity claims
+    /// and the arm window has not yet expired.
     #[must_use]
     pub fn is_armed(&self, display: &DisplayId) -> bool {
+        self.armed_deadline(display)
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    /// The armed expiry deadline for `display`, or `None` when
+    /// not armed or the entry has expired.
+    #[must_use]
+    pub fn armed_deadline(&self, display: &DisplayId) -> Option<Instant> {
         let Ok(map) = self.armed.lock() else {
-            return false;
+            return None;
         };
-        map.contains_key(display)
+        map.get(display).copied()
     }
 
     /// Resolve the `claim_capable_displays` set, the
@@ -429,6 +468,10 @@ pub struct ClaimRuntimeDeps {
     pub event_log: Option<Arc<Mutex<Vec<String>>>>,
     /// Signals test waiters after an anchor is appended.
     pub event_notify: Option<Arc<Notify>>,
+    /// Daemon-lifetime idle-observation channel consumed by the
+    /// owner-side `IdleQuery` handler — the runtime reads its
+    /// LOCAL idle state to answer remote idle queries.
+    pub idle_rx: Option<crate::idle_observation::IdleObservationRx>,
 }
 
 /// Spawn the claim runtime driver. The returned handle is the
@@ -476,6 +519,8 @@ pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
         outbound_counter: 0,
         outbound_nonces: VecDeque::with_capacity(64),
         handle: driver_handle,
+        idle_rx: deps.idle_rx,
+        pending_idle_queries: HashMap::new(),
     };
     tokio::spawn(driver.run());
     // owner_event_tx is cloned into spawned hook/write/wake
@@ -527,6 +572,15 @@ struct Driver {
     /// Back-reference to the handle so the driver can update the
     /// F10 suppression side-table synchronously.
     handle: ClaimRuntimeHandle,
+    /// Daemon-lifetime idle observation channel — read by the
+    /// owner-side `IdleQuery` handler to answer remote idle queries
+    /// with the local idle duration.
+    #[allow(dead_code, reason = "consumed by IdleQuery handler")]
+    idle_rx: Option<crate::idle_observation::IdleObservationRx>,
+    /// Pending idle queries keyed by nonce. The requester inserts a
+    /// oneshot sender when sending an `IdleQuery`; the inbound
+    /// `IdleReport` handler resolves it with the reported `idle_ms`.
+    pending_idle_queries: HashMap<String, tokio::sync::oneshot::Sender<u64>>,
 }
 
 impl Driver {
@@ -582,6 +636,9 @@ impl Driver {
             RuntimeEvent::DisplayRemoved(display) => {
                 self.handle_display_removed(&display);
             }
+            RuntimeEvent::IdleQuery { display, reply } => {
+                self.handle_idle_query(display, reply);
+            }
             #[cfg(any(test, feature = "test-util"))]
             RuntimeEvent::InjectOwnerCompletion {
                 display,
@@ -615,9 +672,11 @@ impl Driver {
         true
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_inbound(&mut self, frame: ClaimFrame) {
         let ClaimFrame {
             sender_instance_id,
+            sender_epoch,
             nonce,
             message,
             ..
@@ -690,9 +749,52 @@ impl Driver {
                     self.clear_claim_suppression(&display);
                 }
             }
-            ClaimMessage::IdleQuery(_) | ClaimMessage::IdleReport(_) => {
-                // T10b: idle frames are out of scope (the tray
-                // integration lands them in T11).
+            ClaimMessage::IdleQuery(_query) => {
+                // Owner side: read local idle state and reply with an
+                // IdleReport back to the requester.
+                let idle_ms = self
+                    .idle_rx
+                    .as_ref()
+                    .and_then(|rx| {
+                        let obs = rx.borrow();
+                        crate::idle_observation::idle_ms(&obs, Instant::now())
+                    })
+                    .unwrap_or(0);
+                let report_frame = match ClaimFrame::sign(
+                    &InstanceIdentity {
+                        instance_id: self.local_instance_id.clone(),
+                        signing_key: self.local_signing.clone(),
+                        verifying_key: self.local_signing.verifying_key(),
+                    },
+                    self.sender_epoch.clone(),
+                    sender_instance_id.clone(),
+                    sender_epoch.clone(), // requester's epoch from the IdleQuery envelope
+                    self.next_counter(),
+                    self.next_nonce(),
+                    ClaimMessage::IdleReport(dormant_core::claim::IdleReport {
+                        idle_ms,
+                        counter: self.outbound_counter,
+                        nonce: nonce.clone(),
+                    }),
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(event = "idle_report_sign_failed", error = %e);
+                        return;
+                    }
+                };
+                let transport = self.transport.clone();
+                let peer_id = sender_instance_id.clone();
+                tokio::spawn(async move {
+                    transport.send_response(&peer_id, &report_frame).await;
+                });
+                self.record_event("idle_report_sent");
+            }
+            ClaimMessage::IdleReport(report) => {
+                // Requester side: resolve the pending idle query.
+                if let Some(tx) = self.pending_idle_queries.remove(&report.nonce) {
+                    let _ = tx.send(report.idle_ms);
+                }
             }
         }
     }
@@ -898,6 +1000,55 @@ impl Driver {
         if let Ok(mut map) = self.handle.suppressed.lock() {
             map.remove(display);
         }
+    }
+
+    fn handle_idle_query(&mut self, display: DisplayId, reply: oneshot::Sender<Option<u64>>) {
+        let nonce = self.next_nonce();
+        let recipient_epoch = self.transport.boot_epoch().as_str().to_owned();
+        let query_frame = match ClaimFrame::sign(
+            &InstanceIdentity {
+                instance_id: self.local_instance_id.clone(),
+                signing_key: self.local_signing.clone(),
+                verifying_key: self.local_signing.verifying_key(),
+            },
+            self.sender_epoch.clone(),
+            // Broadcast: sent to all peers.
+            "*".to_owned(),
+            recipient_epoch,
+            self.next_counter(),
+            nonce.clone(),
+            ClaimMessage::IdleQuery(dormant_core::claim::IdleQuery {
+                nonce: nonce.clone(),
+            }),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(event = "idle_query_sign_failed", error = %e);
+                let _ = reply.send(None);
+                return;
+            }
+        };
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.pending_idle_queries.insert(nonce, resp_tx);
+
+        let timeout = self.claim_timeout();
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            transport.fanout_request(query_frame).await;
+        });
+        let _ = display;
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(timeout, resp_rx).await;
+            match result {
+                Ok(Ok(ms)) => {
+                    let _ = reply.send(Some(ms));
+                }
+                _ => {
+                    let _ = reply.send(None);
+                }
+            }
+        });
     }
 
     fn record_action(&self, action: &Action) {

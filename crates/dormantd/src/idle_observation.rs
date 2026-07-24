@@ -18,7 +18,7 @@ use std::time::Instant;
 pub struct IdleObservation {
     /// Last user-activity timestamp (monotonic), `None` when unavailable.
     pub last_activity: Option<Instant>,
-    /// Wall-clock time this sample was taken.
+    /// Monotonic time this sample was taken.
     pub observed_at: Instant,
     /// Whether the idle source is currently available and producing valid data.
     pub available: bool,

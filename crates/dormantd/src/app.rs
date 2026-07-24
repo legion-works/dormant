@@ -996,6 +996,7 @@ impl App {
                 cancel: root.clone(),
                 event_log: None,
                 event_notify: None,
+                idle_rx: Some(idle_obs_rx.clone()),
             }))
         } else {
             None

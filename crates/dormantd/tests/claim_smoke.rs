@@ -22,6 +22,7 @@ use dormant_core::config::schema::{
     NotificationsConfig, WatchdogConfig, WearConfig,
 };
 use dormant_core::coordination::CoordinationHandle;
+use dormant_core::ownership::OwnershipGate;
 use dormant_core::peers::{InstanceIdentity, instance_id_from_public_key};
 use dormant_core::traits::CommandSink;
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
@@ -30,8 +31,10 @@ use indexmap::IndexMap;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use dormantd::activity_claim_evaluator::{self, PolicyEvaluatorDeps};
 use dormantd::claim_runtime::{self, ClaimRuntimeDeps, ClaimRuntimeHandle, ClaimSharedResult};
 use dormantd::hooks::{Direction, HookEngine, HookOutcome, HookRunner};
+use dormantd::idle_observation::{IdleObservation, idle_observation_channel};
 
 // ── RecordingSink (test CommandSink impl) ──────────────────────────
 
@@ -475,6 +478,7 @@ impl ClaimHarness {
             cancel: cancel.clone(),
             event_log: Some(log.clone()),
             event_notify: Some(Arc::clone(&log_changed)),
+            idle_rx: None,
         });
         // The acknowledged injection cannot run until initial context refresh
         // completes, so it is also the harness's startup barrier.
@@ -1133,5 +1137,153 @@ fn cross_claim_final_value_convergence() {
             .iter()
             .any(|a| matches!(a, Action::Trace("claim_failed"))),
         "right's terminal must surface claim_failed; got {right_actions:?}"
+    );
+}
+
+// ── Activity-claim evaluator tests (T14) ──────────────────────────────
+// Prove the evaluator feeds Edge/Armed policies into the claim runtime.
+
+struct NeverOwned;
+impl OwnershipGate for NeverOwned {
+    fn owns(&self, _: &DisplayId) -> bool {
+        false
+    }
+}
+
+/// Edge policy: an activity edge on a non-owned display must fire a claim.
+#[tokio::test]
+async fn edge_policy_fires_claim_on_activity_edge() {
+    let display = "edge_test";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::Edge,
+        owner_idle_window: Duration::from_secs(30),
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    // Let the evaluator start watching the idle channel.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Publish an activity edge — user is active.
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    // The evaluator should call try_claim → runtime records "claim_requested".
+    let found = harness
+        .wait_for_log("claim_requested", Duration::from_secs(3))
+        .await;
+    evaluator_cancel.cancel();
+    assert!(
+        found,
+        "Edge policy should fire a claim on a non-owned display; log = {:?}",
+        harness.log_events()
+    );
+}
+
+/// Armed policy: a pre-armed display must fire a claim on activity.
+#[tokio::test]
+async fn armed_policy_fires_claim_when_armed() {
+    let display = "armed_test";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    // Arm the display — claim runtime records the arm deadline.
+    let _ = harness
+        .handle
+        .arm(DisplayId(display.to_owned()), ActivityClaimPolicy::Armed)
+        .await
+        .expect("arm must succeed");
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::Armed,
+        owner_idle_window: Duration::from_secs(30),
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    let found = harness
+        .wait_for_log("claim_requested", Duration::from_secs(3))
+        .await;
+    evaluator_cancel.cancel();
+    assert!(
+        found,
+        "Armed policy should fire a claim when display is armed; log = {:?}",
+        harness.log_events()
+    );
+}
+
+/// Armed policy: without pre-arming, activity must NOT fire a claim.
+#[tokio::test]
+async fn armed_policy_does_not_claim_without_arm() {
+    let display = "unarmed_test";
+    let harness = ClaimHarness::build(display, 0x0f).await;
+    let evaluator_cancel = CancellationToken::new();
+
+    // Do NOT arm — the display has no arm deadline.
+
+    let (idle_tx, idle_rx) = idle_observation_channel();
+
+    let deps = PolicyEvaluatorDeps {
+        idle_rx,
+        claim_runtime: harness.handle.clone(),
+        ownership: Arc::new(NeverOwned),
+        activity_claim: ActivityClaimPolicy::Armed,
+        owner_idle_window: Duration::from_secs(30),
+        armed_window: Duration::from_secs(60),
+        claim_capable_displays: vec![DisplayId(display.to_owned())],
+        cancel: evaluator_cancel.clone(),
+        event_log: None,
+        event_notify: None,
+    };
+
+    let _eval_handle = activity_claim_evaluator::spawn(deps);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = idle_tx.send(IdleObservation {
+        last_activity: Some(std::time::Instant::now()),
+        observed_at: std::time::Instant::now(),
+        available: true,
+    });
+
+    // Give the evaluator time to process.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    evaluator_cancel.cancel();
+
+    assert!(
+        !harness.log_events().iter().any(|e| e == "claim_requested"),
+        "Armed policy should NOT fire a claim without pre-arming; log = {:?}",
+        harness.log_events()
     );
 }

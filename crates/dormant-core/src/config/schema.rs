@@ -197,6 +197,21 @@ pub struct CoordinationConfig {
     /// [`defaults::COORDINATION_LOSS_CONFIRMATIONS`] for the default and the
     /// floor / ceiling rationale; validated to `1..=10` in
     /// [`mod@super::validate`].
+    ///
+    /// **Latency.** With defaults (`poll_interval = 2s`,
+    /// `loss_confirmations = 3`), a genuine input switch takes ~6 seconds to
+    /// commit. During that window the old owner still believes it owns the
+    /// panel and may issue a blank; the new owner reads "mine" on its next
+    /// poll and wakes eagerly. Lowering `loss_confirmations` toward `1`
+    /// shortens that window at the cost of flap-susceptibility; raising it
+    /// widens the genuine-handoff latency proportionally.
+    ///
+    /// **Limits.** The debounce reduces but does not eliminate false losses.
+    /// If cross-machine DDC collisions return the same wrong code N times in
+    /// a row, a false loss can still commit — N=3 makes a false loss ~3×
+    /// less likely than N=1, not impossible. The `coord_poll_disagreement`
+    /// signal only fires when consecutive observations *differ*; identical
+    /// wrong readings sail through the debounce as if they were genuine.
     #[serde(default = "default_coordination_loss_confirmations")]
     pub loss_confirmations: u32,
 

@@ -161,6 +161,38 @@ for configured shared displays.
   and `coord_ownership_loss_deferred` (when the pending counter is below the
   threshold) are emitted as literal anchors so the operator can see the bus is
   dirty without parsing the verdict cache.
+
+### Ownership-loss debounce — latency and honest limits
+
+`coordination.loss_confirmations` (default `3`) debounces ownership loss:
+the verdict only flips `true → false` after N consecutive agreeing "not mine"
+VCP `0x60` readings. With the defaults (`poll_interval = 2s` × N = 3), a
+genuine input switch takes ~6 seconds to commit. During that window the
+old owner still believes it owns the panel and can still issue a blank. The
+new owner reads "mine" on its next poll, commits the gain eagerly, and
+wakes the panel immediately — the panel is on, but the old owner's blank
+can still land on top of the new owner's wake, producing a short visible
+flicker if presence/absence transitions happen to align. Operators who
+cannot tolerate that window can lower `loss_confirmations` toward `1`
+(one-tick commit) at the cost of flap-susceptibility, or raise
+`poll_interval` (less responsive in both directions).
+
+The debounce reduces but does not eliminate false losses. Two daemons on one
+DDC bus can collide in ways that return the same wrong code N times in a
+row — N=3 makes a false loss ~3× less likely than N=1, not impossible. The
+`coord_poll_disagreement` signal only fires when consecutive observations
+*differ*; identical-wrong readings sail through the debounce as if they
+were genuine. This is a fundamental limitation of cross-machine arbitration
+on a single physical DDC bus: there is no out-of-band channel the daemon can
+use to distinguish "the input really switched" from "the bus returned the
+same wrong code N times". The companion defenses — hold-last-verdict on DDC
+errors, eager wake on ownership gain, and the per-process `PanelLocks`
++ `DDC_PHYSICAL_GATE` (issue #127) — narrow the window but do not change
+that limit. If a deployment sees false losses under load, the practical
+mitigations are: increase `loss_confirmations` (widens the genuine-handoff
+latency proportionally), increase `poll_interval` (less responsive in both
+directions), or disable coordination on one of the machines
+(`coordination.enabled = false`).
 - `dormantctl doctor` can report `input_source=skipped` when a controller has no
   usable input-source readback, or `input_source=unreadable` when a read was
   attempted and failed. Fix that before relying on a shared display.

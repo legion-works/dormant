@@ -73,8 +73,9 @@ async fn poll_once(
     let state_poll_interval = config.coordination.effective_state_poll_interval();
     let now = Instant::now();
     // Snapshot once per tick: displays not due for a state read preserve their
-    // last recorded panel_state, so record_success rewrites the same value and
-    // the DisplaySnapshot field stays stable between state reads.
+    // last recorded panel_state, so `record_input_observation` rewrites the
+    // same value and the DisplaySnapshot field stays stable between state
+    // reads.
     let prior_panel_state = deps.state.snapshot();
     for (name, display_config) in &config.displays {
         if display_config.scope != DisplayScope::Shared {

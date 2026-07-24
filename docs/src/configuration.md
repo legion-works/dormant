@@ -466,7 +466,7 @@ instance pairing, and their operator routes, but does not disable local DDC/CI
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable mDNS discovery, instance pairing, and instance-pairing routes. |
 | `poll_interval` | duration | `"2s"` | Shared-display ownership polling cadence; minimum `"1s"`. |
-| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached verdict flips `true → false`; `1..=10`. Defends against garbled cross-machine DDC reads — see [Multi-machine coordination](./multi-machine.md). |
+| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached verdict flips `true → false`; `1..=10`. Defends against garbled cross-machine DDC reads — see [Multi-machine coordination](./multi-machine.md). **Latency:** with the default `poll_interval = 2s`, a genuine input switch takes ~6 s to commit; during that window the old owner may still blank while the new owner eagerly wakes. **Limits:** the debounce reduces but does not eliminate false losses — if collisions return the same wrong code N times in a row, a false loss can still commit; N=3 is ~3× less likely than N=1, not zero. Setting `loss_confirmations = 1` commits loss on the next reading but is flap-susceptible. |
 | `pairing_port` | integer | `0` | Temporary pairing listener port; `0` requests an ephemeral OS port. |
 | `pairing_window` | duration | `"5m"` | Temporary listener and mDNS advertisement lifetime; `"30s"` to `"15m"`. |
 | `pairing_bind_address` | string or unset | unset | LAN address used by the temporary listener; unset auto-detects the primary non-loopback address. |

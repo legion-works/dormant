@@ -560,19 +560,6 @@ pub fn validate_with_input_source_readers(
             &mut errors,
         );
     }
-    let mut shared_input_codes = HashSet::new();
-    for (display_id, display) in &cfg.displays {
-        if display.scope == DisplayScope::Shared
-            && let Some(code) = display.shared_input_code
-            && !shared_input_codes.insert(code)
-        {
-            errors.push(ValidationError {
-                what: crate::error::E_CONFIG_INVALID.into(),
-                detail: format!("display '{display_id}' duplicates a local shared_input_code"),
-            });
-        }
-    }
-
     // ── Rule validation ──────────────────────────────────────────────────
     for (rule_id, rc) in &cfg.rules {
         validate_rule(rule_id, rc, &zone_names, &cfg.displays, &mut errors);
@@ -2333,7 +2320,7 @@ gracee_period = "60s"
     }
 
     #[test]
-    fn kvm_duplicate_shared_input_code_is_rejected_but_distinct_codes_pass() {
+    fn kvm_shared_displays_may_reuse_input_codes() {
         let displays = |second_code| {
             format!(
                 "[displays.left]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n\n[displays.right]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = {second_code}\nblank_mode = \"power_off\"\n"
@@ -2341,13 +2328,10 @@ gracee_period = "60s"
         };
         let errors = validate_str(&format!("config_version = 1\n{}", displays(1)));
         assert!(
-            errors
-                .iter()
-                .any(|error| error.what == crate::error::E_CONFIG_INVALID
-                    && error
-                        .detail
-                        .contains("duplicates a local shared_input_code")),
-            "duplicate shared input codes must be rejected: {errors:?}"
+            !errors.iter().any(|error| error
+                .detail
+                .contains("duplicates a local shared_input_code")),
+            "input codes are scoped to their display; conflicts are denied at claim time: {errors:?}"
         );
         let errors = validate_str(&format!("config_version = 1\n{}", displays(2)));
         assert!(

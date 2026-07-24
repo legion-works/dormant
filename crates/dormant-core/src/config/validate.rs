@@ -2340,6 +2340,32 @@ gracee_period = "60s"
     }
 
     #[test]
+    fn release_deadline_cap_must_cover_the_coordination_poll_floor() {
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\npoll_interval = \"10s\"\nrelease_deadline_cap = \"20s\"\n",
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("release_deadline_cap")
+                    && error.detail.contains("must be >= 2 * poll_interval + 1s")
+            }),
+            "cap below the poll floor must be rejected: {errors:?}"
+        );
+
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\npoll_interval = \"10s\"\nrelease_deadline_cap = \"21s\"\n",
+        );
+        assert!(
+            !errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("must be >= 2 * poll_interval + 1s")
+            }),
+            "cap at the poll floor must be accepted: {errors:?}"
+        );
+    }
+
+    #[test]
     fn kvm_shared_displays_may_reuse_input_codes() {
         let displays = |second_code| {
             format!(

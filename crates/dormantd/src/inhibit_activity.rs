@@ -34,9 +34,51 @@ pub fn spawn(
     unit: IdleTimeUnit,
     macos_guard_cfg: crate::macos_idle::MacosIdleGuardConfig,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
+    input_filter: &dormant_core::config::InputFilterConfig,
+    filtered_tx: crate::filtered_activity::FilteredActivityTx,
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(target_os = "linux")]
+    if !rules.is_empty()
+        && let Some(filtered) =
+            crate::idle_source::create_filtered_source(input_filter, poll_interval)
+    {
+        let stock_rules = rules.clone();
+        let stock_idle_tx = idle_tx.clone();
+        let stock_factory: crate::filtered_activity::StockIdleFactory =
+            std::sync::Arc::new(move || {
+                crate::idle_source::create_source(
+                    idlesrc,
+                    stock_rules.clone(),
+                    poll_interval,
+                    unit,
+                    macos_guard_cfg,
+                    stock_idle_tx.clone(),
+                )
+            });
+        let supervisor = crate::filtered_activity::InputAuthoritySupervisor::new(
+            filtered,
+            stock_factory,
+            rules,
+            poll_interval,
+            idle_tx,
+            filtered_tx,
+            ctl,
+        );
+        return Some(tokio::spawn(supervisor.run(cancel)));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if !input_filter.ignore_devices.is_empty() {
+        tracing::warn!(
+            event = "input_filter_unavailable",
+            reason = "input device filtering is not available on this platform",
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = filtered_tx;
+
     let source = crate::idle_source::create_source(
         idlesrc,
         rules,

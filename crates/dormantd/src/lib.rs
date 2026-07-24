@@ -17,6 +17,9 @@ pub mod coordination_mdns;
 #[cfg_attr(any(test, feature = "test-util"), allow(private_interfaces))]
 pub mod coordination_pairing;
 mod coordination_poll;
+#[cfg(target_os = "linux")]
+pub mod evdev_idle;
+pub mod filtered_activity;
 pub mod gamma_recovery;
 pub mod hooks;
 pub mod idle_observation;

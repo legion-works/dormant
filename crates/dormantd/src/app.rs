@@ -962,6 +962,8 @@ impl App {
         // publishes real activity timestamps into the tx half; the
         // activity-claim policy evaluator consumes the rx half.
         let (idle_obs_tx, idle_obs_rx) = crate::idle_observation::idle_observation_channel();
+        let (filtered_activity_tx, filtered_activity_rx) =
+            crate::filtered_activity::filtered_activity_channel();
 
         // KVM claim runtime — daemon-lifetime. Spawned BESIDE the
         // claim transport (both survive reload). The driver
@@ -1009,7 +1011,7 @@ impl App {
         let activity_claim_policy_handle: Option<JoinHandle<()>> =
             if let Some(ref cr) = claim_runtime {
                 let claim_capable = cr.kvm_status().claim_capable_displays;
-                Some(crate::activity_claim_evaluator::spawn(
+                Some(crate::activity_claim_evaluator::spawn_filtered(
                     crate::activity_claim_evaluator::PolicyEvaluatorDeps {
                         idle_rx: idle_obs_rx,
                         claim_runtime: cr.clone(),
@@ -1022,6 +1024,7 @@ impl App {
                         event_log: None,
                         event_notify: None,
                     },
+                    filtered_activity_rx,
                 ))
             } else {
                 None
@@ -1042,6 +1045,7 @@ impl App {
             GenerationId(0),
             Some(self.observations.clone()),
             Some(idle_obs_tx.clone()),
+            filtered_activity_tx.clone(),
         )?;
         self.observations
             .emit(DaemonObservation::GenerationStarted {
@@ -1287,6 +1291,7 @@ impl App {
             claim_transport: claim_transport.clone(),
             claim_runtime: claim_runtime.clone(),
             idle_obs_tx: Some(idle_obs_tx.clone()),
+            filtered_activity_tx,
             coordination_enabled_tx,
             claim_presence_handle,
             activity_claim_evaluator_handle: activity_claim_policy_handle,
@@ -1629,6 +1634,8 @@ struct Runner {
     /// publishes into this channel; carried across reloads so
     /// the activity-claim policy evaluator always sees current data.
     idle_obs_tx: Option<crate::idle_observation::IdleObservationTx>,
+    /// Daemon-lifetime filtered activity fan-out retained across reloads.
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
     coordination_enabled_tx: watch::Sender<bool>,
     /// Daemon-lifetime passive claim-presence browser and advertisement loop.
     claim_presence_handle: Option<JoinHandle<()>>,
@@ -2244,6 +2251,7 @@ impl Runner {
             next_generation,
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
+            self.filtered_activity_tx.clone(),
         );
         // Test seam (F1): see `App::force_reload_spawn_failure` doc — no
         // config-only path reaches an `Err` here, so a test that needs to
@@ -2562,6 +2570,7 @@ impl Runner {
             self.generation_id,
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
+            self.filtered_activity_tx.clone(),
         );
         #[cfg(any(test, feature = "test-util"))]
         let spawn_result = if self.force_rebuild_old_spawn_failure {
@@ -4017,6 +4026,7 @@ fn spawn_generation(
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
 ) -> Result<GenSpawn> {
     let engine_token = root.child_token();
     let engine_cancel = engine_token.clone();
@@ -4119,6 +4129,8 @@ fn spawn_generation(
         idle_unit,
         macos_guard_cfg,
         idle_tx,
+        &assembly.cfg.input_filter,
+        filtered_activity_tx,
         ctl_tx.clone(),
         producer_token.clone(),
     ) {
@@ -4263,6 +4275,7 @@ fn spawn_generation_for_reload(
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
 ) -> Result<GenSpawn> {
     #[cfg(any(test, feature = "test-util"))]
     record_reload_spawn_rollback_for_test(state_dir, rollback.as_ref());
@@ -4282,6 +4295,7 @@ fn spawn_generation_for_reload(
         generation_id,
         observations,
         idle_tx,
+        filtered_activity_tx,
     )
 }
 

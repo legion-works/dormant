@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::claim_runtime::ClaimRuntimeHandle;
+use crate::filtered_activity::{FilteredActivity, FilteredActivityRx};
 use crate::idle_observation::IdleObservationRx;
 
 /// Dependencies for the policy evaluator task.
@@ -54,12 +55,26 @@ pub struct PolicyEvaluatorDeps {
 #[must_use]
 pub fn spawn(deps: PolicyEvaluatorDeps) -> JoinHandle<()> {
     tokio::spawn(async move {
-        evaluator_loop(deps).await;
+        evaluator_loop(deps, None).await;
+    })
+}
+
+/// Spawn the evaluator with filtered activity as the canonical edge authority.
+///
+/// Stock observations remain available for idle reports and become the edge
+/// authority again whenever filtered input falls back.
+#[must_use]
+pub fn spawn_filtered(
+    deps: PolicyEvaluatorDeps,
+    filtered_rx: FilteredActivityRx,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        evaluator_loop(deps, Some(filtered_rx)).await;
     })
 }
 
 #[allow(clippy::too_many_lines)]
-async fn evaluator_loop(deps: PolicyEvaluatorDeps) {
+async fn evaluator_loop(deps: PolicyEvaluatorDeps, mut filtered_rx: Option<FilteredActivityRx>) {
     let policy = ActivityClaimState::new(
         deps.activity_claim,
         deps.owner_idle_window,
@@ -68,18 +83,33 @@ async fn evaluator_loop(deps: PolicyEvaluatorDeps) {
 
     let mut idle_rx = deps.idle_rx;
     let mut last_activity: Option<Instant> = None;
+    let mut last_filtered_edge_seq = 0;
+    let mut filtered_was_available = false;
     let mut warned_owner_idle_no_source = false;
     let mut warned_no_peers = false;
 
     loop {
-        tokio::select! {
+        let update = tokio::select! {
             () = deps.cancel.cancelled() => return,
             changed = idle_rx.changed() => {
                 if changed.is_err() {
                     return;
                 }
+                ActivityUpdate::Stock
             }
-        }
+            changed = async {
+                match filtered_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    filtered_rx = None;
+                    continue;
+                }
+                ActivityUpdate::Filtered
+            }
+        };
 
         let observation = idle_rx.borrow_and_update().clone();
         let now = Instant::now();
@@ -97,25 +127,15 @@ async fn evaluator_loop(deps: PolicyEvaluatorDeps) {
             warned_owner_idle_no_source = true;
         }
 
-        // ── Detect an activity edge ───────────────────────────────────────
-        let edge = match (last_activity, observation.last_activity) {
-            (None, Some(la)) => {
-                last_activity = Some(la);
-                true
-            }
-            (Some(prev), Some(la)) if la > prev => {
-                last_activity = Some(la);
-                true
-            }
-            (Some(_prev), Some(_)) => {
-                // No change — keep tracking for edge detection.
-                false
-            }
-            (_, None) => {
-                last_activity = None;
-                false
-            }
-        };
+        let filtered = filtered_rx.as_ref().map(|rx| rx.borrow().clone());
+        let edge = detect_activity_edge(
+            update,
+            &observation,
+            filtered.as_ref(),
+            &mut last_activity,
+            &mut last_filtered_edge_seq,
+            &mut filtered_was_available,
+        );
 
         if !edge {
             continue;
@@ -233,6 +253,53 @@ async fn evaluator_loop(deps: PolicyEvaluatorDeps) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivityUpdate {
+    Stock,
+    Filtered,
+}
+
+fn detect_activity_edge(
+    update: ActivityUpdate,
+    stock: &crate::idle_observation::IdleObservation,
+    filtered: Option<&FilteredActivity>,
+    last_stock_activity: &mut Option<Instant>,
+    last_filtered_edge_seq: &mut u64,
+    filtered_was_available: &mut bool,
+) -> bool {
+    if let Some(filtered) = filtered
+        && filtered.available
+    {
+        *filtered_was_available = true;
+        if update == ActivityUpdate::Filtered && filtered.edge_seq > *last_filtered_edge_seq {
+            *last_filtered_edge_seq = filtered.edge_seq;
+            return true;
+        }
+        return false;
+    }
+
+    if std::mem::take(filtered_was_available) {
+        *last_stock_activity = stock.last_activity;
+        return false;
+    }
+
+    match (*last_stock_activity, stock.last_activity) {
+        (None, Some(activity)) => {
+            *last_stock_activity = Some(activity);
+            true
+        }
+        (Some(previous), Some(activity)) if activity > previous => {
+            *last_stock_activity = Some(activity);
+            true
+        }
+        (Some(_), Some(_)) => false,
+        (_, None) => {
+            *last_stock_activity = None;
+            false
+        }
+    }
+}
+
 fn append_log(
     log: Option<&Arc<std::sync::Mutex<Vec<String>>>>,
     notify: Option<&Arc<tokio::sync::Notify>>,
@@ -250,9 +317,96 @@ fn append_log(
 
 #[cfg(test)]
 mod tests {
-    // The evaluator's claim-firing path is exercised by the integration
-    // tests in `tests/claim_smoke.rs` (edge_policy_fires_claim_on_activity_edge,
-    // armed_policy_fires_claim_when_armed, armed_policy_does_not_claim_without_arm).
-    // The pure decision logic is tested in `dormant-core/src/claim.rs`
-    // (activity_claim_tests — 11 matrix cases).
+    use std::time::{Duration, Instant};
+
+    use super::{ActivityUpdate, detect_activity_edge};
+    use crate::filtered_activity::FilteredActivity;
+    use crate::idle_observation::IdleObservation;
+
+    #[test]
+    fn filtered_startup_timestamp_is_not_an_activity_edge() {
+        let now = Instant::now();
+        let stock = IdleObservation {
+            last_activity: Some(now),
+            observed_at: now,
+            available: true,
+        };
+        let filtered = FilteredActivity {
+            last_activity: Some(now),
+            observed_at: now,
+            available: true,
+            edge_seq: 0,
+        };
+        let mut last_stock = None;
+        let mut last_edge = 0;
+        let mut was_filtered = false;
+
+        assert!(!detect_activity_edge(
+            ActivityUpdate::Filtered,
+            &stock,
+            Some(&filtered),
+            &mut last_stock,
+            &mut last_edge,
+            &mut was_filtered,
+        ));
+    }
+
+    #[test]
+    fn filtered_edge_sequence_is_the_claim_edge_authority() {
+        let now = Instant::now();
+        let stock = IdleObservation {
+            last_activity: Some(now),
+            observed_at: now,
+            available: true,
+        };
+        let filtered = FilteredActivity {
+            last_activity: Some(now),
+            observed_at: now,
+            available: true,
+            edge_seq: 1,
+        };
+        let mut last_stock = None;
+        let mut last_edge = 0;
+        let mut was_filtered = true;
+
+        assert!(detect_activity_edge(
+            ActivityUpdate::Filtered,
+            &stock,
+            Some(&filtered),
+            &mut last_stock,
+            &mut last_edge,
+            &mut was_filtered,
+        ));
+        assert_eq!(last_edge, 1);
+    }
+
+    #[test]
+    fn first_stock_timestamp_after_fallback_is_only_a_baseline() {
+        let now = Instant::now();
+        let later = now.checked_add(Duration::from_secs(1)).unwrap();
+        let stock = IdleObservation {
+            last_activity: Some(later),
+            observed_at: later,
+            available: true,
+        };
+        let filtered = FilteredActivity {
+            last_activity: Some(now),
+            observed_at: later,
+            available: false,
+            edge_seq: 1,
+        };
+        let mut last_stock = Some(now);
+        let mut last_edge = 1;
+        let mut was_filtered = true;
+
+        assert!(!detect_activity_edge(
+            ActivityUpdate::Stock,
+            &stock,
+            Some(&filtered),
+            &mut last_stock,
+            &mut last_edge,
+            &mut was_filtered,
+        ));
+        assert_eq!(last_stock, Some(later));
+    }
 }

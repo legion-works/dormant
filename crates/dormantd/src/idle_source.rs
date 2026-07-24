@@ -838,6 +838,32 @@ async fn wayland_run(
 
 // ── Source detection ───────────────────────────────────────────────────────────
 
+/// Build the filtered platform source when device ignores are configured.
+#[must_use]
+pub(crate) fn create_filtered_source(
+    config: &dormant_core::config::InputFilterConfig,
+    scan_interval: Duration,
+) -> Option<std::sync::Arc<dyn crate::filtered_activity::FilteredInputSource>> {
+    if config.ignore_devices.is_empty() {
+        return None;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let matcher = crate::filtered_activity::DeviceMatcher::compile(&config.ignore_devices)
+            .unwrap_or_else(|never| match never {});
+        Some(std::sync::Arc::new(
+            crate::evdev_idle::EvdevIdleSource::new(matcher, scan_interval),
+        ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = scan_interval;
+        None
+    }
+}
+
 /// Select and create the appropriate idle source based on the configured mode
 /// and environment.
 ///
@@ -1122,6 +1148,21 @@ mod tests {
             None,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn filtered_source_selection_keeps_empty_filter_on_stock_path() {
+        let cfg = dormant_core::config::InputFilterConfig::default();
+        assert!(create_filtered_source(&cfg, Duration::from_secs(1)).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filtered_source_selection_builds_evdev_for_nonempty_filter() {
+        let cfg = dormant_core::config::InputFilterConfig {
+            ignore_devices: vec!["*jiggler*".to_owned()],
+        };
+        assert!(create_filtered_source(&cfg, Duration::from_secs(1)).is_some());
     }
 
     #[test]

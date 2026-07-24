@@ -42,6 +42,7 @@ spake2 = { workspace = true }
 time = { workspace = true }
 zeroize = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
+evdev = { workspace = true }
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = [
   "staging",
@@ -80,6 +81,7 @@ tokio = { workspace = true, features = [
   "time",
 ] }
 tempfile = { workspace = true }
+test-case = { workspace = true }
 
 [package.metadata.dist]
 dist = true

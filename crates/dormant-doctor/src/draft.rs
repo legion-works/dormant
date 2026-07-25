@@ -601,6 +601,8 @@ mod tests {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             controllers: controllers.into_iter().map(String::from).collect(),
             blank_mode: Some(BlankMode::PowerOff),

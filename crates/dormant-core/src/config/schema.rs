@@ -275,6 +275,18 @@ pub struct CoordinationConfig {
     /// Whether the claim listener advertises its port through mDNS.
     #[serde(default = "default_claim_advertise_mdns")]
     pub claim_advertise_mdns: bool,
+
+    /// Whether local activity edges automatically pull a shared display.
+    #[serde(default = "default_activity_follow")]
+    pub activity_follow: bool,
+
+    /// Grace window after a local-activity arm before the pull commits.
+    #[serde(default = "default_arm_after", with = "humantime_serde")]
+    pub arm_after: Duration,
+
+    /// Minimum interval between successive activity-driven pulls.
+    #[serde(default = "default_cooldown", with = "humantime_serde")]
+    pub cooldown: Duration,
 }
 
 impl Default for CoordinationConfig {
@@ -295,6 +307,9 @@ impl Default for CoordinationConfig {
             claim_port: defaults::CLAIM_PORT,
             claim_bind_address: None,
             claim_advertise_mdns: defaults::CLAIM_ADVERTISE_MDNS,
+            activity_follow: defaults::ACTIVITY_FOLLOW,
+            arm_after: defaults::ARM_AFTER,
+            cooldown: defaults::COOLDOWN,
         }
     }
 }
@@ -1133,6 +1148,18 @@ pub struct DisplayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_input_write_code: Option<u8>,
 
+    /// Peer DDC/CI input-source code this machine WRITES to switch away to the
+    /// peer. Absent when push is not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_peer_input_write_code: Option<u8>,
+
+    /// Peer DDC/CI input-source code this machine READS to verify the peer
+    /// wrote. Required when `shared_peer_input_write_code` is set for strong
+    /// verification; when absent write verification degrades (see
+    /// [`kvm_push_verification_degraded`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_peer_input_code: Option<u8>,
+
     /// KVM hand-off actions run around release and acquire transitions.
     #[serde(default)]
     pub hooks: HookSlots,
@@ -1558,6 +1585,18 @@ fn default_claim_port() -> u16 {
 
 fn default_claim_advertise_mdns() -> bool {
     defaults::CLAIM_ADVERTISE_MDNS
+}
+
+fn default_activity_follow() -> bool {
+    defaults::ACTIVITY_FOLLOW
+}
+
+fn default_arm_after() -> Duration {
+    defaults::ARM_AFTER
+}
+
+fn default_cooldown() -> Duration {
+    defaults::COOLDOWN
 }
 
 fn default_hook_timeout() -> Duration {

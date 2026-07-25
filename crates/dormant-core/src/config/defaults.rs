@@ -160,6 +160,15 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Whether activity-follow (automatic pull on local activity edges) is enabled.
+pub const ACTIVITY_FOLLOW: bool = false;
+
+/// Grace window after receiving a local arm before the pull is committed.
+pub const ARM_AFTER: Duration = Duration::from_secs(7);
+
+/// Minimum interval between successive activity-driven pulls.
+pub const COOLDOWN: Duration = Duration::from_secs(3);
+
 /// Default post-wake settle window for the doctor exercise's bounded
 /// retry read (validated to `100ms..=30s` — see [`mod@super::validate`]).
 /// When the exercise's first post-wake read is absent or still non-`On`,

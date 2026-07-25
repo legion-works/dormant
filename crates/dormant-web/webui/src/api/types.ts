@@ -462,6 +462,9 @@ export interface CoordinationConfig {
   claim_port?: number;
   claim_bind_address?: string | null;
   claim_advertise_mdns?: boolean;
+  activity_follow?: boolean;
+  arm_after?: string;
+  cooldown?: string;
 }
 
 /** rust: config/schema.rs KeymapConfig */
@@ -595,6 +598,8 @@ export interface DisplayConfig {
   scope?: "private" | "shared";
   shared_input_code?: number;
   shared_input_write_code?: number;
+  shared_peer_input_code?: number;
+  shared_peer_input_write_code?: number;
   hooks?: HookSlots;
   blank_mode?: BlankMode;
   degraded_mode?: BlankMode;

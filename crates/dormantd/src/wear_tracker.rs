@@ -1032,6 +1032,8 @@ mod tests {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             controllers: controllers.iter().map(|s| (*s).to_string()).collect(),
             blank_mode: None,

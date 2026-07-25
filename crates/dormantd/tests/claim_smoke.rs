@@ -332,6 +332,8 @@ fn shared_display_config_with_write_code(
             scope: dormant_core::config::DisplayScope::Shared,
             shared_input_code: Some(read_code),
             shared_input_write_code: Some(write_code),
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
             ladder: vec![],
@@ -385,6 +387,7 @@ fn shared_display_config_with_write_code(
             claim_port: 0,
             claim_bind_address: None,
             claim_advertise_mdns: true,
+            ..dormant_core::config::CoordinationConfig::default()
         },
     })
 }
@@ -398,6 +401,8 @@ fn shared_display_config(display: &str, code: u8, hooks: HookSlots) -> Arc<Confi
             scope: dormant_core::config::DisplayScope::Shared,
             shared_input_code: Some(code),
             shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
             ladder: vec![],
@@ -451,6 +456,7 @@ fn shared_display_config(display: &str, code: u8, hooks: HookSlots) -> Arc<Confi
             claim_port: 0,
             claim_bind_address: None,
             claim_advertise_mdns: true,
+            ..dormant_core::config::CoordinationConfig::default()
         },
     })
 }

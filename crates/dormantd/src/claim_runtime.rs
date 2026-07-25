@@ -3274,6 +3274,8 @@ mod tests {
                     scope: dormant_core::config::DisplayScope::Shared,
                     shared_input_code: Some(0x0f),
                     shared_input_write_code: None,
+                    shared_peer_input_code: None,
+                    shared_peer_input_write_code: None,
                     blank_mode: None,
                     degraded_mode: None,
                     ladder: vec![],
@@ -3327,6 +3329,7 @@ mod tests {
                     claim_port: 0,
                     claim_bind_address: None,
                     claim_advertise_mdns: true,
+                    ..dormant_core::config::CoordinationConfig::default()
                 },
             })
         });

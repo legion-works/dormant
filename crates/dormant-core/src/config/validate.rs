@@ -98,6 +98,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "claim_port",
             "claim_bind_address",
             "claim_advertise_mdns",
+            "activity_follow",
+            "arm_after",
+            "cooldown",
         ],
     ),
     ("keymap", &["claim_hotkey"]),
@@ -215,6 +218,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "scope",
             "shared_input_code",
             "shared_input_write_code",
+            "shared_peer_input_code",
+            "shared_peer_input_write_code",
             "blank_mode",
             "degraded_mode",
             "ladder",
@@ -1324,6 +1329,22 @@ fn validate_display_with_input_source_readers(
                     ),
                 });
             }
+            if dc.shared_peer_input_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_peer_input_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+            if dc.shared_peer_input_write_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_peer_input_write_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
         }
         DisplayScope::Shared => {
             if dc.shared_input_code.is_none() {
@@ -1351,6 +1372,41 @@ fn validate_display_with_input_source_readers(
                     what: crate::error::E_CONFIG_INVALID.into(),
                     detail: format!(
                         "display '{display_id}' is shared but no controller in its chain can read the active input"
+                    ),
+                });
+            }
+            // ── Peer (push) validation ────────────────────────────────────
+            if dc.shared_peer_input_write_code.is_some() {
+                // Peer write requires a local read code.
+                if dc.shared_input_code.is_none() {
+                    errors.push(ValidationError {
+                        what: crate::error::E_CONFIG_INVALID.into(),
+                        detail: format!(
+                            "display '{display_id}' sets shared_peer_input_write_code without shared_input_code — the local read code is required for peer push"
+                        ),
+                    });
+                }
+                // Peer write requires an input-source-capable writer.
+                let has_writer = dc
+                    .controllers
+                    .iter()
+                    .any(|controller| input_source_readers.contains(controller));
+                if !has_writer {
+                    errors.push(ValidationError {
+                        what: crate::error::E_CONFIG_INVALID.into(),
+                        detail: format!(
+                            "display '{display_id}' sets shared_peer_input_write_code but no controller in its chain can write the active input"
+                        ),
+                    });
+                }
+            }
+            // Peer read without peer write is invalid (can't verify a write
+            // you can't make).
+            if dc.shared_peer_input_code.is_some() && dc.shared_peer_input_write_code.is_none() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' sets shared_peer_input_code without shared_peer_input_write_code — the peer read code is only meaningful with a peer write"
                     ),
                 });
             }
@@ -3148,6 +3204,8 @@ gracee_period = "60s"
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
             shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             hooks: crate::config::HookSlots::default(),
             blank_mode: None,
             degraded_mode: None,
@@ -3939,6 +3997,8 @@ password = "test-pass"
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
                     shared_input_write_code: None,
+                    shared_peer_input_code: None,
+                    shared_peer_input_write_code: None,
                     hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
@@ -4002,6 +4062,8 @@ password = "test-pass"
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
                     shared_input_write_code: None,
+                    shared_peer_input_code: None,
+                    shared_peer_input_write_code: None,
                     hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
@@ -4144,6 +4206,8 @@ password = "test-pass"
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
             shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
@@ -5076,6 +5140,8 @@ kind = "power_off"
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
             shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
@@ -6582,5 +6648,197 @@ availability_payload_offline = "down"
             "config_version = 1\n[displays.desk]\ncontrollers = [\"command\", \"ddcci\"]\nblank_mode = \"power_off\"\nmodes = [\"power_off\"]\nblank_command = \"true\"\nwake_command = \"true\"\nscope = \"shared\"\nshared_input_code = 15\n",
         );
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    // ── KVM direct-write config tests ───────────────────────────────────────
+
+    #[test]
+    fn kvm_direct_write_defaults_activity_follow_arm_after_and_cooldown() {
+        // The new [coordination] keys must have literal defaults in defaults.rs.
+        // This test will FAIL on step 2 (fields not yet added to CoordinationConfig).
+        let cfg = crate::config::Config {
+            config_version: 1,
+            ..valid_full_config()
+        };
+        assert!(!cfg.coordination.activity_follow);
+        assert_eq!(cfg.coordination.arm_after, Duration::from_secs(7));
+        assert_eq!(cfg.coordination.cooldown, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_keys_accepted_in_strict_mode() {
+        // shared_peer_input_code and shared_peer_input_write_code must be known keys.
+        // This test will FAIL on step 2 (fields not yet on DisplayConfig).
+        let config = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 15\nshared_peer_input_code = 16\nshared_peer_input_write_code = 0x15\nblank_mode = \"power_off\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(
+            collect_unknown_keys(&value).is_empty(),
+            "peer keys must be known in strict mode"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_coordination_keys_accepted_in_strict_mode() {
+        // activity_follow, arm_after, cooldown must be known in [coordination].
+        let config = "config_version = 1\n[coordination]\nactivity_follow = true\narm_after = \"7s\"\ncooldown = \"3s\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(
+            collect_unknown_keys(&value).is_empty(),
+            "new coordination keys must be known in strict mode"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_requires_shared_scope() {
+        // shared_peer_input_write_code on a private display must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Private,
+                    shared_input_code: Some(15),
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("shared_peer_input")
+            }),
+            "peer write on private display must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_requires_local_read_code() {
+        // shared_peer_input_write_code without shared_input_code must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: None,
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("shared_peer_input_write_code")
+                    && error.detail.contains("shared_input_code")
+            }),
+            "peer write without local read must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_requires_input_source_writer() {
+        // A shared display with peer write but no input-source-capable controller
+        // in its chain must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["command".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: Some(15),
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    modes: Some(vec![BlankMode::PowerOff]),
+                    blank_command: Some("true".into()),
+                    wake_command: Some("true".into()),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID && error.detail.contains("peer")
+            }),
+            "peer write without input-source controller must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_read_without_peer_write_is_invalid() {
+        // shared_peer_input_code without shared_peer_input_write_code must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: Some(15),
+                    shared_peer_input_code: Some(16),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("shared_peer_input_code")
+                    && error.detail.contains("shared_peer_input_write_code")
+            }),
+            "peer read without peer write must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_without_peer_read_is_accepted() {
+        // shared_peer_input_write_code without shared_peer_input_code is
+        // accepted (degraded verification).
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: Some(15),
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            rules: IndexMap::new(),
+            ..valid_full_config()
+        };
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        );
+        assert!(
+            errors.is_empty(),
+            "peer write without peer read must be accepted: {errors:?}"
+        );
     }
 }

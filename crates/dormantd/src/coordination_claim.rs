@@ -870,7 +870,7 @@ mod tests {
         sync::watch,
     };
 
-    use crate::coordination_frame::write_frame;
+    use crate::coordination_frame::{read_frame, write_frame};
 
     use super::{
         ClaimPeer, ClaimTransportDeps, EndpointKind, PeerStoreFeed, allow_ip, peer_endpoints, spawn,
@@ -1330,6 +1330,147 @@ mod tests {
             )
             .await;
         assert!(started.elapsed() <= Duration::from_millis(700));
+        handle.shutdown().await;
+    }
+
+    /// `fanout_request` must sign each frame with the target peer's instance id
+    /// and current boot epoch — never the wildcard `"*"` or the sender's own epoch.
+    ///
+    /// **Regression guard for Bug C/D in commit `7b7f84b`:** reverting to the
+    /// old broadcast pattern (`"*"` recipient / sender epoch) must fail this test.
+    #[tokio::test]
+    async fn fanout_request_sends_per_peer_addressed_frames() {
+        let local = identity(1);
+        let peer_a = identity(2);
+        let peer_b = identity(3);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let epoch_a = "peer-a-epoch-001";
+        let epoch_b = "peer-b-epoch-002";
+
+        let listener_a = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener_b = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port_a = listener_a.local_addr().unwrap().port();
+        let port_b = listener_b.local_addr().unwrap().port();
+
+        let (_peers_tx, peers_rx) = watch::channel(vec![
+            ClaimPeer {
+                instance_id: peer_a.instance_id.clone(),
+                verifying_key: peer_a.verifying_key,
+                last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                dns_addr: None,
+                claim_port: Some(port_a),
+                dns_port: None,
+                dns_epoch: Some(Epoch::try_from(epoch_a).unwrap()),
+            },
+            ClaimPeer {
+                instance_id: peer_b.instance_id.clone(),
+                verifying_key: peer_b.verifying_key,
+                last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                dns_addr: None,
+                claim_port: Some(port_b),
+                dns_port: None,
+                dns_epoch: Some(Epoch::try_from(epoch_b).unwrap()),
+            },
+        ]);
+
+        let handle = spawn(deps(local.clone(), peers_rx, Arc::clone(&calls)));
+
+        // Accept tasks must be spawned before fanout so listeners are ready.
+        let a_task = tokio::spawn(async move {
+            let (mut stream, _) = listener_a.accept().await.unwrap();
+            read_frame::<ClaimFrame, _>(&mut stream).await.unwrap()
+        });
+        let b_task = tokio::spawn(async move {
+            let (mut stream, _) = listener_b.accept().await.unwrap();
+            read_frame::<ClaimFrame, _>(&mut stream).await.unwrap()
+        });
+
+        handle
+            .fanout_request(
+                1,
+                "nonce",
+                &ClaimMessage::ClaimAbort(ClaimAbort {
+                    nonce: "request".to_owned(),
+                }),
+            )
+            .await;
+
+        let frame_a = tokio::time::timeout(Duration::from_secs(2), a_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let frame_b = tokio::time::timeout(Duration::from_secs(2), b_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Each peer receives a frame addressed to its own identity.
+        assert_eq!(frame_a.recipient_instance_id, peer_a.instance_id);
+        assert_eq!(frame_a.recipient_epoch, epoch_a);
+        assert_eq!(frame_b.recipient_instance_id, peer_b.instance_id);
+        assert_eq!(frame_b.recipient_epoch, epoch_b);
+
+        // Neither frame carries the wildcard or the sender's own epoch.
+        assert_ne!(frame_a.recipient_instance_id, "*");
+        assert_ne!(frame_a.recipient_epoch, LOCAL_EPOCH);
+        assert_ne!(frame_b.recipient_instance_id, "*");
+        assert_ne!(frame_b.recipient_epoch, LOCAL_EPOCH);
+
+        // The two frames carry different recipient fields.
+        assert_ne!(frame_a.recipient_instance_id, frame_b.recipient_instance_id);
+        assert_ne!(frame_a.recipient_epoch, frame_b.recipient_epoch);
+
+        handle.shutdown().await;
+    }
+
+    /// A peer whose `dns_epoch` is `None` must be skipped by `fanout_request` —
+    /// no dial attempt, no frame sent. The `claim_peer_no_epoch` log anchor
+    /// covers the skip; this test proves it at the transport level.
+    ///
+    /// **Regression guard:** removing the `dns_epoch.is_none()` continue must
+    /// fail this test.
+    #[tokio::test]
+    async fn fanout_request_skips_peer_without_epoch() {
+        let local = identity(1);
+        let stale_peer = identity(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (_peers_tx, peers_rx) = watch::channel(vec![ClaimPeer {
+            instance_id: stale_peer.instance_id.clone(),
+            verifying_key: stale_peer.verifying_key,
+            last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            dns_addr: None,
+            claim_port: Some(port),
+            dns_port: None,
+            dns_epoch: None, // must be skipped
+        }]);
+
+        let handle = spawn(deps(local.clone(), peers_rx, Arc::clone(&calls)));
+
+        let accept_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+        });
+
+        handle
+            .fanout_request(
+                1,
+                "nonce",
+                &ClaimMessage::ClaimAbort(ClaimAbort {
+                    nonce: "request".to_owned(),
+                }),
+            )
+            .await;
+
+        let result = accept_task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "fanout_request must not dial a peer with dns_epoch = None"
+        );
+
         handle.shutdown().await;
     }
 

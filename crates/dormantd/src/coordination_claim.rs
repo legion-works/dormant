@@ -46,8 +46,10 @@ pub struct ClaimPeer {
     pub last_addr: Option<SocketAddr>,
     /// Advisory endpoint learned from unsigned mDNS; never persisted.
     pub dns_addr: Option<SocketAddr>,
-    /// Claim listener port advertised by the peer.
+    /// Claim listener port verified from an authenticated connection.
     pub claim_port: Option<u16>,
+    /// Claim listener port learned from unsigned mDNS; advisory — never persisted.
+    pub dns_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +139,7 @@ impl PeerStoreFeed {
         self.publish(&store)
     }
 
-    /// Publish an advisory mDNS address without mutating the durable peer record.
+    /// Publish an advisory mDNS address and port without mutating the durable peer record.
     pub(crate) fn refresh_dns_address(&self, instance_id: &str, address: SocketAddr) {
         self.sender.send_modify(|peers| {
             if let Some(peer) = peers
@@ -145,23 +147,27 @@ impl PeerStoreFeed {
                 .find(|peer| peer.instance_id == instance_id)
             {
                 peer.dns_addr = Some(address);
+                peer.dns_port = Some(address.port());
             }
         });
     }
 
     fn publish(&self, store: &dormant_core::peers::PeerStore) -> Result<(), PeerStoreError> {
-        let dns_addresses: HashMap<_, _> = self
+        let dns_info: HashMap<_, _> = self
             .sender
             .borrow()
             .iter()
             .filter_map(|peer| {
                 peer.dns_addr
-                    .map(|address| (peer.instance_id.clone(), address))
+                    .map(|address| (peer.instance_id.clone(), (address, peer.dns_port)))
             })
             .collect();
         let mut peers = claim_peers(store.peers.clone())?;
         for peer in &mut peers {
-            peer.dns_addr = dns_addresses.get(&peer.instance_id).copied();
+            if let Some((address, port)) = dns_info.get(&peer.instance_id).copied() {
+                peer.dns_addr = Some(address);
+                peer.dns_port = port;
+            }
         }
         self.sender.send_replace(peers);
         Ok(())
@@ -191,6 +197,7 @@ fn claim_peers(records: Vec<PeerRecord>) -> Result<Vec<ClaimPeer>, PeerStoreErro
                 last_addr: record.last_addr,
                 dns_addr: None,
                 claim_port: record.claim_port,
+                dns_port: None,
             })
         })
         .collect()
@@ -732,14 +739,14 @@ fn allow_ip(rates: &mut HashMap<IpAddr, VecDeque<Instant>>, ip: IpAddr) -> bool 
 }
 
 fn peer_endpoints(peer: &ClaimPeer) -> Vec<(EndpointKind, SocketAddr)> {
-    let Some(port) = peer.claim_port else {
-        return Vec::new();
-    };
     let mut endpoints = Vec::new();
-    if let Some(address) = peer.last_addr {
+    // Verified endpoint: requires BOTH verified address AND verified port.
+    if let (Some(port), Some(address)) = (peer.claim_port, peer.last_addr) {
         endpoints.push((EndpointKind::Verified, SocketAddr::new(address.ip(), port)));
     }
-    if let Some(address) = peer.dns_addr {
+    // DNS endpoint: claim_port is authoritative if present; fall back to advisory dns_port.
+    let dns_port = peer.claim_port.or(peer.dns_port);
+    if let (Some(port), Some(address)) = (dns_port, peer.dns_addr) {
         endpoints.push((EndpointKind::Dns, SocketAddr::new(address.ip(), port)));
     }
     endpoints
@@ -835,6 +842,7 @@ mod tests {
             last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
             dns_addr: None,
             claim_port: port,
+            dns_port: None,
         }
     }
 
@@ -1042,6 +1050,7 @@ mod tests {
             last_addr: Some(verified),
             dns_addr: Some(poisoned_dns),
             claim_port: Some(1234),
+            dns_port: None,
         };
 
         assert_eq!(
@@ -1052,6 +1061,102 @@ mod tests {
                     SocketAddr::from(([127, 0, 0, 1], 1234))
                 ),
                 (EndpointKind::Dns, SocketAddr::from(([192, 0, 2, 9], 1234))),
+            ]
+        );
+    }
+
+    /// A peer whose port is known only via mDNS discovery
+    /// yields a usable DNS endpoint from
+    /// `peer_endpoints` — the negotiated claim path must work
+    /// even when no authenticated connection has refreshed
+    /// the durable verified `claim_port`.
+    ///
+    /// **Mutation:** drop the discovered port → this test fails.
+    #[test]
+    fn dns_only_port_yields_dns_endpoint() {
+        let remote = identity(2);
+        let peer = ClaimPeer {
+            instance_id: remote.instance_id.clone(),
+            verifying_key: remote.verifying_key,
+            last_addr: None,
+            dns_addr: Some(SocketAddr::from(([10, 1, 1, 1], 4321))),
+            claim_port: None, // never refreshed by verified path
+            dns_port: Some(4321),
+        };
+
+        assert_eq!(
+            peer_endpoints(&peer),
+            vec![(EndpointKind::Dns, SocketAddr::from(([10, 1, 1, 1], 4321)))]
+        );
+
+        // Mutation check — drop dns_port, endpoints must be empty
+        let mut mutated = peer.clone();
+        mutated.dns_port = None;
+        assert!(
+            peer_endpoints(&mutated).is_empty(),
+            "without dns_port, peer_endpoints must be empty when claim_port is also None"
+        );
+    }
+
+    /// A peer with `last_addr` + `dns_port` (but NO `claim_port`)
+    /// must NOT produce a Verified endpoint — only
+    /// `claim_port` (authenticated) licenses the Verified kind.
+    ///
+    /// **Security invariant:** unauthenticated mDNS data
+    /// (`dns_port`) never gates a Verified endpoint.
+    #[test]
+    fn dns_port_never_yields_verified_endpoint() {
+        let remote = identity(2);
+        let peer = ClaimPeer {
+            instance_id: remote.instance_id.clone(),
+            verifying_key: remote.verifying_key,
+            last_addr: Some(SocketAddr::from(([127, 0, 0, 1], 10))),
+            dns_addr: Some(SocketAddr::from(([10, 1, 1, 1], 4321))),
+            claim_port: None,
+            dns_port: Some(4321),
+        };
+
+        let eps = peer_endpoints(&peer);
+        // Only one endpoint (DNS). No Verified — dns_port does
+        // not qualify for the verified kind.
+        assert_eq!(eps.len(), 1);
+        assert!(
+            eps.iter()
+                .all(|(kind, _)| matches!(kind, EndpointKind::Dns)),
+            "dns_port alone must not produce a Verified endpoint"
+        );
+        // The endpoint uses the DNS address with the DNS port.
+        assert_eq!(
+            eps[0],
+            (EndpointKind::Dns, SocketAddr::from(([10, 1, 1, 1], 4321)))
+        );
+    }
+
+    /// `claim_port` (verified) is authoritative — when present
+    /// it applies to BOTH `last_addr` and `dns_addr` endpoints,
+    /// shadowing the advisory `dns_port`.
+    #[test]
+    fn verified_claim_port_shadows_dns_port() {
+        let remote = identity(2);
+        let peer = ClaimPeer {
+            instance_id: remote.instance_id.clone(),
+            verifying_key: remote.verifying_key,
+            last_addr: Some(SocketAddr::from(([127, 0, 0, 1], 10))),
+            dns_addr: Some(SocketAddr::from(([10, 1, 1, 1], 4321))),
+            claim_port: Some(9999),
+            dns_port: Some(4321),
+        };
+
+        let eps = peer_endpoints(&peer);
+        // Both endpoints use claim_port (9999), not dns_port (4321).
+        assert_eq!(
+            eps,
+            vec![
+                (
+                    EndpointKind::Verified,
+                    SocketAddr::from(([127, 0, 0, 1], 9999))
+                ),
+                (EndpointKind::Dns, SocketAddr::from(([10, 1, 1, 1], 9999))),
             ]
         );
     }
@@ -1151,6 +1256,7 @@ mod tests {
             last_addr: Some(SocketAddr::from(([192, 0, 2, 1], 9))),
             dns_addr: None,
             claim_port: Some(65_000),
+            dns_port: None,
         }]);
         let handle = spawn(deps(local.clone(), peers_rx, calls));
         let started = tokio::time::Instant::now();

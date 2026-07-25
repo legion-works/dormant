@@ -1754,53 +1754,95 @@ impl Driver {
         self.record_event("claim_fallback_direct");
         let event_log = self.event_log.clone();
         let event_notify = self.event_notify.clone();
-        tokio::spawn(async move {
-            let Ok(Some(observed)) = sink.read_input_source_sampled().await else {
-                append_event(
-                    event_log.as_ref(),
-                    event_notify.as_ref(),
-                    "claim_failed:identity_unavailable",
-                );
-                return;
-            };
-            if observed == target_code {
-                // The hardware is already on the local code:
-                // the direct fallback was a no-op. Surface
-                // `claim_completed` so the operator's UI can
-                // distinguish "the panel flipped" from "we
-                // didn't need to flip it".
-                append_event(event_log.as_ref(), event_notify.as_ref(), "claim_completed");
-                return;
-            }
-            if observed == Self::MAGIC_STANDBY {
-                // Standby: F4 forbids the direct fallback.
-                append_event(
-                    event_log.as_ref(),
-                    event_notify.as_ref(),
-                    "claim_failed:standby",
-                );
-                return;
-            }
-            if let Err(_failure) = sink.write_input_source(target_code).await {
-                append_event(
-                    event_log.as_ref(),
-                    event_notify.as_ref(),
-                    "claim_failed:write",
-                );
-            } else {
-                // The direct write succeeded. The next
-                // coordination poll will observe the flip
-                // and feed `OwnershipChanged(true)` to the
-                // rules engine (the fallback's contribution
-                // ends here; the rules engine drives the
-                // post-flip state machine).
-                append_event(
-                    event_log.as_ref(),
-                    event_notify.as_ref(),
-                    "claim_fallback_direct:wrote",
-                );
-            }
-        });
+        let display_label = display.0.clone();
+        let task =
+            Self::run_direct_fallback(sink, target_code, display_label, event_log, event_notify);
+        tokio::spawn(task);
+    }
+
+    /// Terminal fallback outcome task — extracted so each outcome's
+    /// `tracing::info!` anchor can be proved by a subscriber test.
+    ///
+    /// Called by [`Driver::attempt_fallback`] via `tokio::spawn`.
+    pub(crate) async fn run_direct_fallback(
+        sink: Arc<dyn CommandSink>,
+        target_code: u8,
+        display_label: String,
+        event_log: Option<Arc<Mutex<Vec<String>>>>,
+        event_notify: Option<Arc<Notify>>,
+    ) {
+        let Ok(Some(observed)) = sink.read_input_source_sampled().await else {
+            append_event(
+                event_log.as_ref(),
+                event_notify.as_ref(),
+                "claim_failed:identity_unavailable",
+            );
+            tracing::info!(
+                event = "claim_failed",
+                display_id = %display_label,
+                reason = "identity_unavailable",
+            );
+            return;
+        };
+        if observed == target_code {
+            // The hardware is already on the local code:
+            // the direct fallback was a no-op. Surface
+            // `claim_completed` so the operator's UI can
+            // distinguish "the panel flipped" from "we
+            // didn't need to flip it".
+            append_event(event_log.as_ref(), event_notify.as_ref(), "claim_completed");
+            tracing::info!(
+                event = "claim_completed",
+                display_id = %display_label,
+                reason = "already_on_target",
+            );
+            return;
+        }
+        // VCP 0x60 reports 0x00 for a panel in standby
+        // (the DDC/CI standard's reserved "no active
+        // input" code). F4 forbids the direct fallback.
+        if observed == Self::MAGIC_STANDBY {
+            append_event(
+                event_log.as_ref(),
+                event_notify.as_ref(),
+                "claim_failed:standby",
+            );
+            tracing::info!(
+                event = "claim_failed",
+                display_id = %display_label,
+                reason = "standby",
+            );
+            return;
+        }
+        if let Err(_failure) = sink.write_input_source(target_code).await {
+            append_event(
+                event_log.as_ref(),
+                event_notify.as_ref(),
+                "claim_failed:write",
+            );
+            tracing::info!(
+                event = "claim_failed",
+                display_id = %display_label,
+                reason = "write",
+            );
+        } else {
+            // The direct write succeeded. The next
+            // coordination poll will observe the flip
+            // and feed `OwnershipChanged(true)` to the
+            // rules engine (the fallback's contribution
+            // ends here; the rules engine drives the
+            // post-flip state machine).
+            append_event(
+                event_log.as_ref(),
+                event_notify.as_ref(),
+                "claim_fallback_direct:wrote",
+            );
+            tracing::info!(
+                event = "claim_fallback_direct",
+                display_id = %display_label,
+                result = "wrote",
+            );
+        }
     }
 
     fn feed_requester_failed(&mut self, display: &DisplayId, failure: ClaimFailure) {
@@ -2550,5 +2592,109 @@ mod tests {
             "transient write error must be Unknown"
         );
         assert!(verdict.is_not_incapable());
+    }
+
+    // ── Bug B: terminal outcome tracing emissions ───────────────────
+
+    /// Every terminal outcome in the fallback path emits its
+    /// literal anchor to `tracing`.  Uses `tracing_subscriber`
+    /// `fmt` collector with a shared buffer so we can inspect
+    /// the actual output.
+    ///
+    /// **Mutation:** remove a `tracing::info!` from
+    /// `run_direct_fallback` → this test fails because the
+    /// captured output no longer contains the anchor.
+    #[tokio::test]
+    async fn terminal_fallback_outcomes_emit_tracing_anchors() {
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = MakeTestWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Test the "already on target" path (claim_completed).
+        {
+            let sink: Arc<dyn CommandSink> = Arc::new(ProbeSink::with_read(Ok(Some(0x11))));
+            let notify = Arc::new(Notify::new());
+            super::Driver::run_direct_fallback(
+                sink,
+                0x11, // target == observed → already_on_target
+                "test-display".into(),
+                Some(Arc::new(Mutex::new(Vec::<String>::new()))),
+                Some(notify),
+            )
+            .await;
+            let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            assert!(
+                output.contains("claim_completed"),
+                "claim_completed tracing anchor missing; output: {output}"
+            );
+            assert!(
+                output.contains("already_on_target"),
+                "already_on_target reason missing; output: {output}"
+            );
+            buffer.lock().unwrap().clear();
+        }
+
+        // Test the write path (claim_failed:write → claim_failed).
+        {
+            let sink: Arc<dyn CommandSink> = Arc::new(ProbeSink::with_read_and_write(
+                Ok(Some(0x22)),
+                Err(CmdFailure {
+                    controller: "test".into(),
+                    error: "fail".into(),
+                }),
+            ));
+            let notify = Arc::new(Notify::new());
+            super::Driver::run_direct_fallback(
+                sink,
+                0x99, // target != observed
+                "test-display".into(),
+                Some(Arc::new(Mutex::new(Vec::<String>::new()))),
+                Some(notify),
+            )
+            .await;
+            let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+            assert!(
+                output.contains("claim_failed"),
+                "claim_failed tracing anchor missing; output: {output}"
+            );
+            assert!(
+                output.contains("write"),
+                "reason=write missing; output: {output}"
+            );
+        }
+    }
+
+    /// `MakeWriter` implementation that writes to a shared buffer.
+    struct MakeTestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeTestWriter {
+        type Writer = TestWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            TestWriter {
+                buffer: Arc::clone(&self.0),
+            }
+        }
+    }
+
+    struct TestWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for TestWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut b) = self.buffer.lock() {
+                b.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

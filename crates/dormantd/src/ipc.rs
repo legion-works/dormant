@@ -271,8 +271,10 @@ async fn handle_connection(
             | IpcRequest::CoordinationPeersList
             | IpcRequest::ClaimShared { .. }
             | IpcRequest::ClaimArm { .. } => {
-                let resp =
-                    IpcResponse::error("coordination disabled — see dormant v0.2 release notes");
+                let resp = IpcResponse::error(
+                    "instance pairing and claim negotiation were removed; \
+                     shared displays now switch by direct local input write",
+                );
                 let _ = write_json(&mut writer, &resp).await;
             }
         }

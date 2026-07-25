@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dormant_core::config::{Config, DisplayScope};
-use dormant_core::coordination::{COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle};
+use dormant_core::coordination::{
+    COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle, InputCodeAliases, InputSourceObservation,
+};
 use dormant_core::rules::ControlMsg;
 use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
@@ -58,6 +60,7 @@ fn new_interval(period: Duration) -> tokio::time::Interval {
     interval
 }
 
+#[allow(clippy::too_many_lines)]
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
@@ -89,6 +92,13 @@ async fn poll_once(
             continue;
         };
 
+        let aliases = InputCodeAliases {
+            local_read: expected,
+            local_write: display_config.shared_input_write_code.unwrap_or(expected),
+            peer_read: display_config.shared_peer_input_code,
+            peer_write: display_config.shared_peer_input_write_code,
+        };
+
         // Ownership arbitration (VCP 0x60) runs every tick; panel-state cosmetics
         // (brightness/power) refresh only at the slower state_poll cadence to
         // cut per-transaction i2c traffic on cached-fd NVIDIA nodes. Hardware
@@ -111,7 +121,7 @@ async fn poll_once(
             let outcome = deps.state.record_input_observation(
                 &display_id,
                 observed,
-                expected,
+                &aliases,
                 config.coordination.loss_confirmations,
                 panel_state,
             );
@@ -146,9 +156,19 @@ async fn poll_once(
                     observed,
                 );
             }
+            // A potential ownership gain is held pending further confirmations
+            // (symmetric debounce). Surfacing the deferred count mirrors the
+            // loss-deferred log so operators can see the gain in flight.
+            if let Some(pending_count) = outcome.deferred_gain_count {
+                tracing::info!(
+                    event = "coord_ownership_gain_deferred",
+                    display = %display_id,
+                    pending_count,
+                    observed,
+                );
+            }
             if let Some(previous_owned) = outcome.committed_prior_owned {
-                let owned = observed == expected;
-                deps.state.set_owner(&display_id, None);
+                let owned = matches!(aliases.classify(observed), InputSourceObservation::Local);
                 tracing::info!(event = "coord_ownership_changed", display = %display_id, previous_owned, owned);
                 let _ = deps
                     .ctl_tx
@@ -390,9 +410,7 @@ mod tests {
             Ok(Some(0x12)),
             Ok(Some(0x12)),
         ]));
-        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
-        let display = DisplayId("shared".to_owned());
-        state.set_owner(&display, Some("prior-owner".to_owned()));
+        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
         tick().await;
         tick().await;
         tick().await;
@@ -401,13 +419,6 @@ mod tests {
             Some(ControlMsg::OwnershipPoll { .. })
         ));
         assert!(ctl_rx.try_recv().is_err());
-        assert_eq!(
-            state
-                .snapshot()
-                .get(&display)
-                .and_then(|record| record.owner_instance_id.as_deref()),
-            None
-        );
         cancel.cancel();
     }
 

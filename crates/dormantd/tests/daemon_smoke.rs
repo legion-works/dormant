@@ -5960,3 +5960,51 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
 
     shutdown(handle, join).await;
 }
+
+/// Issue #137: on a fresh boot (no reload), the snapshot's `kvm` field
+/// must be populated — not `None`. The old code only published
+/// `SetKvmStatus` from `install_generation`, which only the reload
+/// paths called; the first generation was constructed directly in
+/// `App::start` and never triggered the publish.
+#[tokio::test]
+async fn first_boot_publishes_kvm_status_in_snapshot() {
+    let paths = TestAppPaths::new();
+    // Shared display + coordination enabled — creates the
+    // claim_runtime, which is the gate for SetKvmStatus delivery.
+    let config = format!(
+        "{}\n[coordination]\nenabled = true\nclaim_bind_address = \"127.0.0.1\"\nclaim_port = 0\n",
+        shared_display_config(&paths.marker)
+    );
+    fs::write(&paths.config, config).unwrap();
+    write_credentials(paths.root(), "");
+
+    let (handle, join) = App::build_with_sources(
+        paths.config.clone(),
+        paths.credentials.clone(),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths.state.clone())
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+
+    let snap = snapshot_with_retry(&handle.control_sender()).await;
+    assert!(
+        snap.kvm.is_some(),
+        "kvm must be Some on first boot with coordination enabled (#137)"
+    );
+    let kvm = snap.kvm.unwrap();
+    // `command` controller has no claim identity, so the set is empty.
+    assert_eq!(kvm.claim_capable_displays, vec![]);
+    // Policy default: `Off` when the config has no explicit override.
+    assert_eq!(
+        kvm.activity_claim,
+        dormant_core::config::ActivityClaimPolicy::Off
+    );
+
+    shutdown(handle, join).await;
+}

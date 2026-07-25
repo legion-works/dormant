@@ -1323,6 +1323,14 @@ impl App {
             reload_lifecycle_capture: self.reload_lifecycle_capture,
         };
 
+        // First-boot KVM publish: the initial generation is
+        // constructed directly here (not via `install_generation`),
+        // so we must explicitly refresh the claim-capable display
+        // set and keymap before the run loop starts — otherwise
+        // the snapshot's `kvm` field stays `None` until the first
+        // config-changing reload (#137).
+        runner.publish_kvm_status_and_event().await;
+
         let join = tokio::spawn(run_loop(
             runner,
             watcher,
@@ -1838,14 +1846,17 @@ impl Runner {
         self.ctl_router.install(spawn.ctl_tx.clone()).await;
         self.events_router.install(spawn.events_tx.clone()).await;
 
-        // KVM snapshot: refresh the claim-capable display set,
-        // the resolved keymap, and the activity-claim policy on
-        // every successful generation install (fresh + reload —
-        // reload flows through `install_generation` too). The
-        // rules engine reads the value in
-        // `RulesEngine::send_snapshot`; the direct
-        // `ConfigReloaded` event broadcast on the IPC stream is
-        // the tray's refetch trigger (council 3/3 Must).
+        self.publish_kvm_status_and_event().await;
+    }
+
+    /// Publish the KVM claim status to the current engine generation.
+    ///
+    /// Called on every generation install — fresh boot (via
+    /// [`App::start`]) and reload (via [`Self::install_generation`]) —
+    /// so the rules engine's snapshot fold reflects the current
+    /// claim-capable display set, keymap, and activity-claim policy.
+    /// The `ConfigReloaded` broadcast is the tray's refetch trigger.
+    async fn publish_kvm_status_and_event(&self) {
         if let Some(claim_runtime) = &self.claim_runtime {
             let cfg = &self.generation.cfg;
             let executors = self.executors_tx.borrow().clone();
@@ -1871,13 +1882,12 @@ impl Runner {
                 cfg.coordination.release_deadline_cap,
             );
             let status = claim_runtime.kvm_status();
-            let _ = spawn.ctl_tx.send(ControlMsg::SetKvmStatus(status)).await;
-            // Tray refetch trigger — additive per the DaemonEvent
-            // Unknown convention.
-            let _ = spawn
-                .ctl_tx
-                .send(ControlMsg::PublishDaemonEvent(DaemonEvent::ConfigReloaded))
-                .await;
+            if let Some(ctl_tx) = self.ctl_router.current().await {
+                let _ = ctl_tx.send(ControlMsg::SetKvmStatus(status)).await;
+                let _ = ctl_tx
+                    .send(ControlMsg::PublishDaemonEvent(DaemonEvent::ConfigReloaded))
+                    .await;
+            }
         }
     }
 

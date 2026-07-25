@@ -5,6 +5,7 @@
 //! `dormantd` binary is a thin wrapper over [`app::App`].
 
 pub mod activity_claim_evaluator;
+pub mod activity_follow;
 pub mod app;
 mod audio_policy;
 pub mod audio_source;

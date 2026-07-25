@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
+use dormant_core::claim::Epoch;
 use dormant_core::coordination::CoordinationHandle;
 use dormant_core::peers::{DiscoverAnnounce, PAIR_PROTOCOL_VERSION};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -24,6 +25,14 @@ pub struct ClaimPresenceAnnounce {
     pub instance_id: String,
     /// TCP port on which the authenticated claim listener is bound.
     pub port: u16,
+    /// Daemon boot epoch so peers can address frames to this instance.
+    /// Unset in mDNS records from older daemons that predate the per-peer
+    /// addressing fix (Bug C/D).
+    ///
+    /// Advisory-only — carried over unauthenticated mDNS, never a credential.
+    /// A wrong epoch from a hostile advertiser causes a rejected frame at
+    /// the recipient, not an accepted one.
+    pub boot_epoch: Option<String>,
 }
 
 /// One validated discovery update from a browser.
@@ -118,6 +127,7 @@ pub trait ClaimPresenceStream: Send + Sync {
 /// Listener-coupled advertisement and known-peer-only address refresh state.
 pub struct ClaimPresence<B> {
     local_instance_id: String,
+    boot_epoch: String,
     advertise: bool,
     known_peers: BTreeSet<String>,
     advertised_port: Option<u16>,
@@ -129,9 +139,10 @@ pub struct ClaimPresence<B> {
 impl<B: ClaimPresenceBackend> ClaimPresence<B> {
     /// Create an idle service. It starts no LAN activity until reconciled.
     #[must_use]
-    pub fn new(backend: B, local_instance_id: String, advertise: bool) -> Self {
+    pub fn new(backend: B, local_instance_id: String, boot_epoch: String, advertise: bool) -> Self {
         Self {
             local_instance_id,
+            boot_epoch,
             advertise,
             known_peers: BTreeSet::new(),
             advertised_port: None,
@@ -159,6 +170,7 @@ impl<B: ClaimPresenceBackend> ClaimPresence<B> {
                     protocol_version: PAIR_PROTOCOL_VERSION,
                     instance_id: self.local_instance_id.clone(),
                     port,
+                    boot_epoch: Some(self.boot_epoch.clone()),
                 })?);
                 self.advertised_port = Some(port);
                 tracing::info!(event = "claim_presence_registered", port);
@@ -176,10 +188,16 @@ impl<B: ClaimPresenceBackend> ClaimPresence<B> {
 
     /// Refresh known peers from pending browser events.
     ///
+    /// The callback receives the peer's validated boot epoch when the
+    /// remote advertised it — unvalidated mDNS data, purely advisory.
+    ///
     /// # Errors
     ///
     /// Returns an error when the active browse stream fails while receiving updates.
-    pub fn drain_browse(&mut self, on_peer_addr: impl FnMut(String, SocketAddr)) -> Result<()> {
+    pub fn drain_browse(
+        &mut self,
+        on_peer_addr: impl FnMut(String, SocketAddr, Option<Epoch>),
+    ) -> Result<()> {
         let Some(browse) = self.browse.as_mut() else {
             return Ok(());
         };
@@ -192,8 +210,12 @@ impl<B: ClaimPresenceBackend> ClaimPresence<B> {
                 continue;
             }
             if let Some(address) = select_resolved_addr(&addresses, peer.port) {
+                let epoch = peer
+                    .boot_epoch
+                    .as_deref()
+                    .and_then(|raw| Epoch::try_from(raw).ok());
                 tracing::info!(event = "claim_presence_peer_refreshed", peer = %peer.instance_id, %address);
-                on_peer_addr(peer.instance_id, address);
+                on_peer_addr(peer.instance_id, address, epoch);
             }
         }
         Ok(())
@@ -381,11 +403,15 @@ pub fn txt_records(service: &DiscoverAnnounce) -> BTreeMap<String, String> {
 /// Translate a claim endpoint into its deliberately minimal TXT surface.
 #[must_use]
 pub fn claim_txt_records(service: &ClaimPresenceAnnounce) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut records = BTreeMap::from([
         ("v".to_owned(), service.protocol_version.to_string()),
         ("instance_id".to_owned(), service.instance_id.clone()),
         ("port".to_owned(), service.port.to_string()),
-    ])
+    ]);
+    if let Some(ref epoch) = service.boot_epoch {
+        records.insert("boot_epoch".to_owned(), epoch.clone());
+    }
+    records
 }
 
 fn valid_announce(service: &DiscoverAnnounce) -> bool {
@@ -422,6 +448,7 @@ fn claim_announce_from_txt(records: &BTreeMap<String, String>) -> Option<ClaimPr
         protocol_version: records.get("v")?.parse().ok()?,
         instance_id: records.get("instance_id")?.to_owned(),
         port: records.get("port")?.parse().ok()?,
+        boot_epoch: records.get("boot_epoch").cloned(),
     };
     valid_claim_announce(&announcement).then_some(announcement)
 }
@@ -788,12 +815,15 @@ mod tests {
             protocol_version: 1,
             instance_id: instance_id(1),
             port: 42_001,
+            boot_epoch: None,
         };
 
-        assert_eq!(
-            claim_txt_records(&announcement).keys().collect::<Vec<_>>(),
-            vec!["instance_id", "port", "v"]
-        );
+        let keys: Vec<_> = claim_txt_records(&announcement).keys().cloned().collect();
+        assert!(keys.contains(&"instance_id".to_owned()));
+        assert!(keys.contains(&"port".to_owned()));
+        assert!(keys.contains(&"v".to_owned()));
+        // boot_epoch is only included when Some — privacy-ratified default.
+        assert!(!keys.contains(&"boot_epoch".to_owned()));
     }
 
     #[test]
@@ -803,6 +833,7 @@ mod tests {
             protocol_version: 1,
             instance_id: instance_id(2),
             port: 42_001,
+            boot_epoch: None,
         });
 
         assert!(claim_announce_from_txt(&pairing).is_none());
@@ -825,6 +856,7 @@ mod tests {
                         protocol_version: 1,
                         instance_id: stranger,
                         port: 42_001,
+                        boot_epoch: None,
                     },
                     addresses: BTreeSet::from([SocketAddr::from((Ipv4Addr::new(192, 0, 2, 2), 9))]),
                 },
@@ -833,15 +865,21 @@ mod tests {
                         protocol_version: 1,
                         instance_id: known.clone(),
                         port: 42_001,
+                        boot_epoch: None,
                     },
                     addresses: BTreeSet::from([SocketAddr::from((Ipv4Addr::new(192, 0, 2, 3), 9))]),
                 },
             ]);
-        let mut presence = ClaimPresence::new(backend, instance_id(3), false);
+        let mut presence = ClaimPresence::new(
+            backend,
+            instance_id(3),
+            "epoch-000000000000".to_owned(),
+            false,
+        );
         presence.reconcile(Some(42_000), [known.clone()]).unwrap();
         let mut refreshed = Vec::new();
         presence
-            .drain_browse(|peer, address| refreshed.push((peer, address)))
+            .drain_browse(|peer, address, _epoch| refreshed.push((peer, address)))
             .unwrap();
 
         assert_eq!(
@@ -856,7 +894,12 @@ mod tests {
     #[test]
     fn disabled_presence_advertisement_never_registers() {
         let backend = FakeBackend::default();
-        let mut presence = ClaimPresence::new(backend.clone(), instance_id(1), false);
+        let mut presence = ClaimPresence::new(
+            backend.clone(),
+            instance_id(1),
+            "epoch-000000000000".to_owned(),
+            false,
+        );
 
         presence.reconcile(Some(42_000), [instance_id(2)]).unwrap();
 

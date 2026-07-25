@@ -1065,9 +1065,11 @@ impl Driver {
             map.insert(display.clone(), suppressed_until);
         }
         let display_for_fanout = display.clone();
-        if let Some(frame) = self.build_claim_request(display, &nonce) {
+        if let Some((counter, frame_nonce, message)) = self.build_claim_request(display, &nonce) {
             tokio::spawn(async move {
-                transport.fanout_request(frame).await;
+                transport
+                    .fanout_request(counter, &frame_nonce, &message)
+                    .await;
             });
         }
         // F10: publish the suppression deadline to the rules
@@ -1158,31 +1160,11 @@ impl Driver {
             .and_then(|ctx| ctx.claim_identity.clone())
             .unwrap_or_default();
         let nonce = self.next_nonce();
-        let recipient_epoch = self.transport.boot_epoch().as_str().to_owned();
-        let query_frame = match ClaimFrame::sign(
-            &InstanceIdentity {
-                instance_id: self.local_instance_id.clone(),
-                signing_key: self.local_signing.clone(),
-                verifying_key: self.local_signing.verifying_key(),
-            },
-            self.sender_epoch.clone(),
-            // Broadcast: sent to all peers.
-            "*".to_owned(),
-            recipient_epoch,
-            self.next_counter(),
-            nonce.clone(),
-            ClaimMessage::IdleQuery(dormant_core::claim::IdleQuery {
-                display_identity,
-                nonce: nonce.clone(),
-            }),
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(event = "idle_query_sign_failed", error = %e);
-                let _ = reply.send(None);
-                return;
-            }
-        };
+        let counter = self.next_counter();
+        let message = ClaimMessage::IdleQuery(dormant_core::claim::IdleQuery {
+            display_identity,
+            nonce: nonce.clone(),
+        });
 
         let (resp_tx, resp_rx) = oneshot::channel();
         // SEC-4: prune stale entries before inserting — a timed-out
@@ -1205,7 +1187,7 @@ impl Driver {
         let timeout = self.claim_timeout();
         let transport = self.transport.clone();
         tokio::spawn(async move {
-            transport.fanout_request(query_frame).await;
+            transport.fanout_request(counter, &nonce, &message).await;
         });
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, resp_rx).await;
@@ -1418,10 +1400,14 @@ impl Driver {
                 // same nonce; epoch retry re-uses the
                 // requester instance + code with a refreshed
                 // epoch).
-                if let Some(frame) = self.build_claim_request(display, &self.nonce_of(display)) {
+                if let Some((counter, frame_nonce, message)) =
+                    self.build_claim_request(display, &self.nonce_of(display))
+                {
                     let transport = self.transport.clone();
                     tokio::spawn(async move {
-                        transport.fanout_request(frame).await;
+                        transport
+                            .fanout_request(counter, &frame_nonce, &message)
+                            .await;
                     });
                 }
                 Vec::new()
@@ -1968,7 +1954,11 @@ impl Driver {
         self.config.borrow().coordination.armed_window
     }
 
-    fn build_claim_request(&self, display: &DisplayId, nonce: &str) -> Option<ClaimFrame> {
+    fn build_claim_request(
+        &self,
+        display: &DisplayId,
+        nonce: &str,
+    ) -> Option<(u64, String, ClaimMessage)> {
         let ctx = self.contexts.get(display)?;
         let local_code = u16::from(ctx.local_input_code?);
         let request = ClaimRequest {
@@ -1978,17 +1968,11 @@ impl Driver {
             counter: self.outbound_counter,
             nonce: nonce.to_owned(),
         };
-        let identity = self.local_identity_view();
-        ClaimFrame::sign(
-            &identity,
-            self.sender_epoch.clone(),
-            "*".to_owned(),
-            self.transport.boot_epoch().as_str().to_owned(),
+        Some((
             self.outbound_counter,
             format!("req-{nonce}"),
             ClaimMessage::ClaimRequest(request),
-        )
-        .ok()
+        ))
     }
 
     fn next_counter(&mut self) -> u64 {

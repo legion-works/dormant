@@ -18,7 +18,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dormant_core::{
-    claim::{ClaimFrame, Epoch, ReplayWindow},
+    claim::{ClaimFrame, ClaimMessage, Epoch, ReplayWindow},
     peers::{InstanceIdentity, PeerRecord, PeerStoreError, load_peer_store, upsert_peer},
 };
 use ed25519_dalek::VerifyingKey;
@@ -50,6 +50,15 @@ pub struct ClaimPeer {
     pub claim_port: Option<u16>,
     /// Claim listener port learned from unsigned mDNS; advisory — never persisted.
     pub dns_port: Option<u16>,
+    /// Peer boot epoch learned from unsigned mDNS; advisory — never persisted.
+    /// `None` when the remote predates the per-peer addressing fix or when
+    /// mDNS has not yet resolved the peer.
+    ///
+    /// Same advisory-only security boundary as `dns_addr` / `dns_port`:
+    /// unauthenticated mDNS data must not overwrite durable verified state.
+    /// A wrong epoch from a hostile advertiser yields a rejected frame
+    /// (`DoS` at worst), never an accepted one.
+    pub dns_epoch: Option<Epoch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,8 +148,14 @@ impl PeerStoreFeed {
         self.publish(&store)
     }
 
-    /// Publish an advisory mDNS address and port without mutating the durable peer record.
-    pub(crate) fn refresh_dns_address(&self, instance_id: &str, address: SocketAddr) {
+    /// Publish an advisory mDNS address, port, and boot epoch without
+    /// mutating the durable peer record.
+    pub(crate) fn refresh_dns_address(
+        &self,
+        instance_id: &str,
+        address: SocketAddr,
+        epoch: Option<Epoch>,
+    ) {
         self.sender.send_modify(|peers| {
             if let Some(peer) = peers
                 .iter_mut()
@@ -148,6 +163,7 @@ impl PeerStoreFeed {
             {
                 peer.dns_addr = Some(address);
                 peer.dns_port = Some(address.port());
+                peer.dns_epoch = epoch;
             }
         });
     }
@@ -158,15 +174,20 @@ impl PeerStoreFeed {
             .borrow()
             .iter()
             .filter_map(|peer| {
-                peer.dns_addr
-                    .map(|address| (peer.instance_id.clone(), (address, peer.dns_port)))
+                peer.dns_addr.map(|address| {
+                    (
+                        peer.instance_id.clone(),
+                        (address, peer.dns_port, peer.dns_epoch.clone()),
+                    )
+                })
             })
             .collect();
         let mut peers = claim_peers(store.peers.clone())?;
         for peer in &mut peers {
-            if let Some((address, port)) = dns_info.get(&peer.instance_id).copied() {
+            if let Some((address, port, epoch)) = dns_info.get(&peer.instance_id).cloned() {
                 peer.dns_addr = Some(address);
                 peer.dns_port = port;
+                peer.dns_epoch = epoch;
             }
         }
         self.sender.send_replace(peers);
@@ -198,6 +219,7 @@ fn claim_peers(records: Vec<PeerRecord>) -> Result<Vec<ClaimPeer>, PeerStoreErro
                 dns_addr: None,
                 claim_port: record.claim_port,
                 dns_port: None,
+                dns_epoch: None,
             })
         })
         .collect()
@@ -226,7 +248,9 @@ pub struct ClaimTransportHandle {
     commands: mpsc::Sender<Command>,
     inbound: Mutex<Option<mpsc::Receiver<ClaimFrame>>>,
     port: Arc<AtomicU16>,
+    identity: Arc<InstanceIdentity>,
     boot_epoch: Epoch,
+    sender_epoch: String,
     listener_port: watch::Receiver<Option<u16>>,
     peers: Arc<RwLock<Vec<ClaimPeer>>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -271,6 +295,8 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
     let (listener_port, listener_port_rx) = watch::channel(None);
     let (command_tx, command_rx) = mpsc::channel(16);
     let (inbound_tx, inbound_rx) = mpsc::channel(32);
+    let sender_epoch = deps.boot_epoch.as_str().to_owned();
+    let identity = Arc::clone(&deps.identity);
     let supervisor = Supervisor {
         identity: deps.identity,
         boot_epoch: deps.boot_epoch.clone(),
@@ -293,7 +319,9 @@ pub fn spawn(deps: ClaimTransportDeps) -> ClaimTransportHandle {
         commands: command_tx,
         inbound: Mutex::new(Some(inbound_rx)),
         port,
+        identity,
         boot_epoch: deps.boot_epoch.clone(),
+        sender_epoch,
         listener_port: listener_port_rx,
         peers,
         task: Mutex::new(Some(task)),
@@ -375,8 +403,16 @@ impl ClaimTransportHandle {
             .unwrap_or_else(|| mpsc::channel(1).1)
     }
 
-    /// Concurrently send one signed request to every peer with a usable endpoint.
-    pub async fn fanout_request(&self, frame: ClaimFrame) {
+    /// Concurrently send one signed request to every peer with a usable
+    /// endpoint and a known boot epoch.
+    ///
+    /// Each peer receives its own frame — signed with the peer's instance id
+    /// and current boot epoch (from the mDNS presence record). Peers whose
+    /// epoch is unknown are skipped with a `claim_peer_no_epoch` log anchor.
+    /// This replaces the pre-Bug-C/D broadcast pattern: every frame is now
+    /// addressed to a specific recipient, preserving the anti-relay binding
+    /// on the signed envelope.
+    pub async fn fanout_request(&self, counter: u64, nonce: &str, message: &ClaimMessage) {
         let peers = self.peer_snapshot();
         let mut dials = JoinSet::new();
         for peer in peers {
@@ -384,7 +420,25 @@ impl ClaimTransportHandle {
                 tracing::info!(event = "claim_peer_no_port", peer = %peer.instance_id);
                 continue;
             }
-            let frame = frame.clone();
+            let Some(ref recipient_epoch) = peer.dns_epoch else {
+                tracing::info!(event = "claim_peer_no_epoch", peer = %peer.instance_id);
+                continue;
+            };
+            let frame = match ClaimFrame::sign(
+                &self.identity,
+                self.sender_epoch.clone(),
+                peer.instance_id.clone(),
+                recipient_epoch.as_str().to_owned(),
+                counter,
+                nonce.to_owned(),
+                message.clone(),
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(event = "claim_frame_sign_failed", error = %e);
+                    continue;
+                }
+            };
             dials.spawn(async move {
                 let _ = send_to_peer(&peer, &frame).await;
             });
@@ -843,6 +897,7 @@ mod tests {
             dns_addr: None,
             claim_port: port,
             dns_port: None,
+            dns_epoch: None,
         }
     }
 
@@ -1051,6 +1106,7 @@ mod tests {
             dns_addr: Some(poisoned_dns),
             claim_port: Some(1234),
             dns_port: None,
+            dns_epoch: None,
         };
 
         assert_eq!(
@@ -1082,6 +1138,7 @@ mod tests {
             dns_addr: Some(SocketAddr::from(([10, 1, 1, 1], 4321))),
             claim_port: None, // never refreshed by verified path
             dns_port: Some(4321),
+            dns_epoch: None,
         };
 
         assert_eq!(
@@ -1114,6 +1171,7 @@ mod tests {
             dns_addr: Some(SocketAddr::from(([10, 1, 1, 1], 4321))),
             claim_port: None,
             dns_port: Some(4321),
+            dns_epoch: None,
         };
 
         let eps = peer_endpoints(&peer);
@@ -1145,6 +1203,7 @@ mod tests {
             dns_addr: Some(SocketAddr::from(([10, 1, 1, 1], 4321))),
             claim_port: Some(9999),
             dns_port: Some(4321),
+            dns_epoch: None,
         };
 
         let eps = peer_endpoints(&peer);
@@ -1257,11 +1316,18 @@ mod tests {
             dns_addr: None,
             claim_port: Some(65_000),
             dns_port: None,
+            dns_epoch: Some(Epoch::try_from(REMOTE_EPOCH).unwrap()),
         }]);
         let handle = spawn(deps(local.clone(), peers_rx, calls));
         let started = tokio::time::Instant::now();
         handle
-            .fanout_request(signed_frame(&local, &remote, 1))
+            .fanout_request(
+                1,
+                "nonce-1",
+                &ClaimMessage::ClaimAbort(ClaimAbort {
+                    nonce: "request-1".to_owned(),
+                }),
+            )
             .await;
         assert!(started.elapsed() <= Duration::from_millis(700));
         handle.shutdown().await;
@@ -1293,7 +1359,11 @@ mod tests {
             peers.borrow_and_update()[0].last_addr,
             Some(SocketAddr::from(([127, 0, 0, 1], 10)))
         );
-        feed.refresh_dns_address(&remote.instance_id, SocketAddr::from(([192, 0, 2, 9], 20)));
+        feed.refresh_dns_address(
+            &remote.instance_id,
+            SocketAddr::from(([192, 0, 2, 9], 20)),
+            None,
+        );
         assert_eq!(
             peers.borrow_and_update()[0].last_addr,
             Some(SocketAddr::from(([127, 0, 0, 1], 10)))

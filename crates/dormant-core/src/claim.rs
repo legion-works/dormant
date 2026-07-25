@@ -770,6 +770,52 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_recipient_instance_id_is_rejected() {
+        // Bug C — broadcast address vs unicast verifier.
+        // The verifier performs a plain equality check with no wildcard
+        // exemption, so a frame addressed to "*" must be rejected.
+        let signer = identity(7);
+        let peer = peer(&signer);
+        let frame = ClaimFrame::sign(
+            &signer,
+            "sender-epoch-000".to_owned(),
+            "*".to_owned(),
+            "recipient-epoch-".to_owned(),
+            8,
+            "frame-nonce".to_owned(),
+            request(),
+        )
+        .unwrap();
+        assert_eq!(
+            frame.verify(&peer, "recipient-id", "recipient-epoch-"),
+            Err(ClaimFrameError::RecipientMismatch)
+        );
+    }
+
+    #[test]
+    fn sender_epoch_as_recipient_epoch_is_rejected() {
+        // Bug D — the recipient_epoch field is the sender's own epoch.
+        // The verifier compares it against the recipient's local epoch,
+        // which never matches the sender's epoch.
+        let signer = identity(7);
+        let peer = peer(&signer);
+        let frame = ClaimFrame::sign(
+            &signer,
+            "sender-epoch-000".to_owned(),
+            "recipient-id".to_owned(),
+            "sender-epoch-000".to_owned(),
+            8,
+            "frame-nonce".to_owned(),
+            request(),
+        )
+        .unwrap();
+        assert_eq!(
+            frame.verify(&peer, "recipient-id", "actual-recipient-epoch"),
+            Err(ClaimFrameError::StaleRecipientEpoch)
+        );
+    }
+
+    #[test]
     fn denied_reason_accepts_unknown_future_wire_value() {
         let response: ClaimResponse = serde_json::from_str(
             r#"{"nonce":"request-nonce","verdict":{"verdict":"denied","reason":"future_reason"}}"#,

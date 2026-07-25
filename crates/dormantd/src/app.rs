@@ -906,6 +906,7 @@ impl App {
                 let presence = ClaimPresence::new(
                     MdnsSdBackend::new()?,
                     identity.instance_id,
+                    transport.boot_epoch().as_str().to_owned(),
                     cfg_clone.coordination.claim_advertise_mdns,
                 );
                 Some(spawn_claim_presence(
@@ -2892,8 +2893,8 @@ fn spawn_claim_presence(
             if let Err(error) = presence.reconcile(*listener_port.borrow(), peer_ids) {
                 tracing::warn!(event = "claim_presence_reconcile_failed", %error);
             }
-            if let Err(error) = presence.drain_browse(|instance_id, address| {
-                peer_store.refresh_dns_address(&instance_id, address);
+            if let Err(error) = presence.drain_browse(|instance_id, address, epoch| {
+                peer_store.refresh_dns_address(&instance_id, address, epoch);
             }) {
                 tracing::warn!(event = "claim_presence_browse_failed", %error);
             }

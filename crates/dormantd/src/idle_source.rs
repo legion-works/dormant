@@ -857,7 +857,17 @@ pub(crate) fn create_filtered_source(
         ))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = scan_interval;
+        let matcher = crate::filtered_activity::DeviceMatcher::compile(&config.ignore_devices)
+            .unwrap_or_else(|never| match never {});
+        Some(std::sync::Arc::new(
+            crate::macos_input_filter::MacosInputFilterSource::new(matcher),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = scan_interval;
         None

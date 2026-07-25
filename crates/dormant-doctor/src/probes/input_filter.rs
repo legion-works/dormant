@@ -137,14 +137,73 @@ fn live_enumerator() -> NodeList {
     nodes
 }
 
-// ── Non-Linux stub ──────────────────────────────────────────────────────────
+// ── macOS stub (CGEventTap / Accessibility check) ──────────────────────────
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn live_enumerator() -> NodeList {
     Vec::new()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn probe_event_nodes(globs: &[String], _enumerator: EventEnumerator) -> ProbeResult {
+    // On macOS, input filtering uses a listen-only CGEventTap, which
+    // requires Accessibility permission (`AXIsProcessTrusted`).
+    probe_macos_accessibility(globs)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn probe_node_list(globs: &[String], _nodes: &NodeList) -> ProbeResult {
+    probe_macos_accessibility(globs)
+}
+
+/// Check whether Accessibility permission has been granted for macOS
+/// CGEventTap filtering.
+#[cfg(target_os = "macos")]
+fn probe_macos_accessibility(globs: &[String]) -> ProbeResult {
+    let trusted = macos_check_accessibility();
+    if trusted {
+        ProbeResult::pass(
+            "input-filter",
+            format!(
+                "Accessibility permission granted; input filter with ignore list {globs:?} is ready"
+            ),
+        )
+    } else {
+        ProbeResult::fail(
+            "input-filter",
+            format!(
+                "Accessibility permission denied — input filter with ignore list {globs:?} \
+                 requires Accessibility. Grant it in System Settings → \
+                 Privacy & Security → Accessibility, then restart dormantd."
+            ),
+        )
+    }
+}
+
+// Thin FFI wrapper over `AXIsProcessTrusted`.
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    // Returns non-zero iff the calling process holds Accessibility permission.
+    fn AXIsProcessTrusted() -> u8;
+}
+
+/// Safe wrapper for the accessibility check.
+#[cfg(target_os = "macos")]
+fn macos_check_accessibility() -> bool {
+    // Safety: AXIsProcessTrusted is a simple getter with no failure path.
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+// ── Non-Linux, non-macOS stub ──────────────────────────────────────────────
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn live_enumerator() -> NodeList {
+    Vec::new()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn probe_event_nodes(globs: &[String], _enumerator: EventEnumerator) -> ProbeResult {
     ProbeResult::not_supported(
         "input-filter",
@@ -155,7 +214,7 @@ fn probe_event_nodes(globs: &[String], _enumerator: EventEnumerator) -> ProbeRes
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn probe_node_list(globs: &[String], _nodes: &NodeList) -> ProbeResult {
     ProbeResult::not_supported(
         "input-filter",
@@ -195,15 +254,28 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn non_linux_reports_not_supported() {
+    fn non_linux_non_macos_reports_not_supported() {
         let result = probe_input_filter(Some(&["*jiggler*".to_string()]));
         assert_eq!(result.status, ProbeStatus::NotSupported);
         assert!(
             result.detail.contains("Linux-only"),
             "detail should mention platform limitation: {}",
             result.detail
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reports_pass_or_fail() {
+        let result = probe_input_filter(Some(&["*jiggler*".to_string()]));
+        assert!(
+            matches!(result.status, ProbeStatus::Pass | ProbeStatus::Fail),
+            "macOS input-filter probe must report Pass or Fail based on \
+             Accessibility permission, got {:?} with detail: {}",
+            result.status,
+            result.detail,
         );
     }
 

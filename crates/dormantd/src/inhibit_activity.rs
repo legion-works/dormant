@@ -39,7 +39,7 @@ pub fn spawn(
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if !rules.is_empty()
         && let Some(filtered) =
             crate::idle_source::create_filtered_source(input_filter, poll_interval)
@@ -69,14 +69,14 @@ pub fn spawn(
         return Some(tokio::spawn(supervisor.run(cancel)));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if !input_filter.ignore_devices.is_empty() {
         tracing::warn!(
             event = "input_filter_unavailable",
             reason = "input device filtering is not available on this platform",
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = filtered_tx;
 
     let source = crate::idle_source::create_source(

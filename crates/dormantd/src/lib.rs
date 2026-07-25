@@ -29,6 +29,9 @@ pub mod inhibit_audio;
 #[cfg(unix)]
 pub mod ipc;
 pub mod logging;
+#[cfg(target_os = "macos")]
+pub mod macos_input_filter;
+
 pub mod macos_idle;
 pub mod notifier;
 pub mod reload;

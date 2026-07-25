@@ -87,6 +87,33 @@ fn append_event(
     }
 }
 
+/// Outcome of an input-source writability probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputWritability {
+    /// The controller successfully read and wrote the input source —
+    /// it is definitively writable.
+    Capable,
+    /// The controller's chain-walk returned
+    /// `INPUT_SOURCE_WRITE_UNSUPPORTED` — the display cannot
+    /// participate in input-source claims.
+    Incapable,
+    /// The probe could not complete: a sampler-priority read skipped
+    /// (yielded to a concurrent command-path transaction), a transient
+    /// I/O error, or no controller reported a code. The capability is
+    /// not known — re-probe when the next generation refreshes (the
+    /// real claim path uses command priority and completes even when
+    /// this probe is inconclusive).
+    Unknown,
+}
+
+impl InputWritability {
+    /// `true` when the display is NOT definitively incapable —
+    /// i.e. claims should be attempted (`Capable` or `Unknown`).
+    fn is_not_incapable(self) -> bool {
+        !matches!(self, Self::Incapable)
+    }
+}
+
 /// Per-display generation-stable facts.
 #[derive(Clone)]
 struct DisplayCtx {
@@ -97,7 +124,9 @@ struct DisplayCtx {
     /// Cross-machine claim identity (F5: `manufacturer:model[:serial]`).
     claim_identity: Option<String>,
     /// Whether the chained controller exposes an input-source
-    /// write surface.
+    /// write surface. `true` for `Capable` or `Unknown`;
+    /// `false` only when the controller definitively returned
+    /// `INPUT_SOURCE_WRITE_UNSUPPORTED`.
     writable: bool,
     /// Generation-stable hook snapshot.
     hooks: Arc<HookSlots>,
@@ -1842,7 +1871,7 @@ impl Driver {
             let Some(sink) = executors.get(&id) else {
                 continue;
             };
-            let writable = sink_input_writable(sink.clone()).await;
+            let writable = sink_input_writable(sink.clone()).await.is_not_incapable();
             let claim_identity = sink.claim_identity();
             let hooks = Arc::new(display_config.hooks.clone());
             let ctx = DisplayCtx {
@@ -1957,19 +1986,104 @@ fn sum_blocking_before_release(hooks: &HookSlots) -> Duration {
         .sum()
 }
 
-/// Probe-time writability check: read the current input code, try
-/// writing it back (the executor's chain-walk returns
-/// `INPUT_SOURCE_WRITE_UNSUPPORTED` for unsupported controllers
-/// without an I/O error; any real write attempt is rolled back by
-/// re-writing the observed code).
-pub async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> bool {
-    let Ok(Some(observed)) = sink.read_input_source_sampled().await else {
-        return false;
+/// Probe-time writability check with three-way outcome.
+///
+/// Reads the current input-source code at sampler priority, then
+/// writes it back (a no-op that exercises the write surface). A
+/// sampler-priority skip (`INPUT_SOURCE_SKIPPED` — the coordination
+/// poller held the panel lock) is **not** a capability signal:
+/// it means the probe could not run, not that the display lacks
+/// writability. The real claim path uses command priority and
+/// completes even when this probe is inconclusive.
+///
+/// # Return
+///
+/// * [`InputWritability::Capable`] — read succeeded, write succeeded.
+/// * [`InputWritability::Incapable`] — the controller definitively
+///   returned `INPUT_SOURCE_WRITE_UNSUPPORTED`.
+/// * [`InputWritability::Unknown`] — sampler skipped, transient I/O
+///   error, or no controller reported an input-source code.
+pub(crate) async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> InputWritability {
+    // Use the display name from the claim identity for logging.
+    let display_label = sink
+        .claim_identity()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let observed = match sink.read_input_source_sampled().await {
+        Ok(Some(code)) => code,
+        Ok(None) => {
+            // No controller in the chain reports an input-source
+            // code. This is structural (e.g. command-only chain),
+            // not transient — but it is not definitive for
+            // writability either (the executor may have a fallback
+            // controller that does not support readback). Treat
+            // as unknown so the display is not permanently excluded.
+            info!(
+                event = "claim_capability_probed",
+                display = %display_label,
+                writable = "unknown",
+                reason = "no controller reports input-source code",
+            );
+            return InputWritability::Unknown;
+        }
+        Err(ref e) if e.contains("command holds panel lock") => {
+            // Sampler priority yielded to a concurrent
+            // command-path transaction (coordination poller or
+            // another caller). The display IS DDC-capable — we
+            // just lost the race. Mark unknown, not incapable.
+            info!(
+                event = "claim_capability_probed",
+                display = %display_label,
+                writable = "unknown",
+                reason = "sampler skipped: command holds panel lock",
+            );
+            return InputWritability::Unknown;
+        }
+        Err(ref e) => {
+            // Transient I/O error (display disconnected, DDC bus
+            // flaky, etc.). Unknown — re-probe next generation.
+            info!(
+                event = "claim_capability_probed",
+                display = %display_label,
+                writable = "unknown",
+                reason = %e,
+            );
+            return InputWritability::Unknown;
+        }
     };
+
+    // Read succeeded — now probe the write surface.
     match sink.write_input_source(observed).await {
-        Ok(()) => true,
-        Err(failure) if failure.error.contains("unsupported input-source write") => false,
-        Err(_) => false,
+        Ok(()) => {
+            info!(
+                event = "claim_capability_probed",
+                display = %display_label,
+                writable = "capable",
+                observed_input_code = observed,
+            );
+            InputWritability::Capable
+        }
+        Err(ref failure) if failure.error.contains("unsupported input-source write") => {
+            info!(
+                event = "claim_input_source_not_writable",
+                display = %display_label,
+                reason = "controller returned unsupported input-source write",
+            );
+            InputWritability::Incapable
+        }
+        Err(ref failure) => {
+            // Write failed with an I/O error (not "unsupported").
+            // Sampler already confirmed the display is reachable;
+            // this is likely transient — mark unknown.
+            info!(
+                event = "claim_capability_probed",
+                display = %display_label,
+                writable = "unknown",
+                reason = %failure.error,
+                observed_input_code = observed,
+            );
+            InputWritability::Unknown
+        }
     }
 }
 
@@ -2004,6 +2118,8 @@ mod tests {
     use super::*;
     use crate::hooks::{HookRunner, ScriptedHookRunner};
     use dormant_core::claim_engine::Terminal;
+    use dormant_core::rules::ControllerHealth;
+    use dormant_core::types::{BlankMode, CmdFailure};
     use std::collections::HashMap;
     use tokio::sync::mpsc;
 
@@ -2267,5 +2383,172 @@ mod tests {
                 .any(|a| matches!(a, Action::Terminal(Terminal::ReleaseAborted))),
             "hook-aborted owner reaches Terminal::ReleaseAborted; got: {actions:?}"
         );
+    }
+
+    // ── InputWritability probe tests ─────────────────────────────────────
+
+    /// Minimal [`CommandSink`] double that serves scripted
+    /// input-source read and write results for testing
+    /// [`sink_input_writable`].
+    struct ProbeSink {
+        claim_id: Option<String>,
+        read_result: Result<Option<u8>, String>,
+        write_result: Result<(), CmdFailure>,
+    }
+
+    impl ProbeSink {
+        fn with_read(v: Result<Option<u8>, String>) -> Self {
+            Self {
+                claim_id: Some("MFG:MODEL:SN".into()),
+                read_result: v,
+                write_result: Ok(()),
+            }
+        }
+
+        fn with_read_and_write(r: Result<Option<u8>, String>, w: Result<(), CmdFailure>) -> Self {
+            Self {
+                claim_id: Some("MFG:MODEL:SN".into()),
+                read_result: r,
+                write_result: w,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandSink for ProbeSink {
+        async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+
+        async fn wake(&self) -> Result<(), CmdFailure> {
+            Ok(())
+        }
+
+        fn controller_health(&self) -> Vec<ControllerHealth> {
+            Vec::new()
+        }
+
+        fn claim_identity(&self) -> Option<String> {
+            self.claim_id.clone()
+        }
+
+        async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+            self.read_result.clone()
+        }
+
+        async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+            self.write_result.clone()
+        }
+    }
+
+    /// Sampler lock skip (`INPUT_SOURCE_SKIPPED`) → `Unknown`,
+    /// NOT `Incapable`. The display is DDC-capable; we just lost
+    /// the race for the panel lock.
+    ///
+    /// Mutation: if this test passes and a later change collapses
+    /// `Unknown` back to `Incapable`, `is_not_incapable()` would
+    /// return `false` and claims would be permanently denied.
+    #[tokio::test]
+    async fn sampler_skip_does_not_mark_display_incapable() {
+        let skip_err = "skipped: command holds panel lock".to_string();
+        let sink = Arc::new(ProbeSink::with_read(Err(skip_err)));
+        let verdict = sink_input_writable(sink).await;
+        assert_eq!(
+            verdict,
+            InputWritability::Unknown,
+            "sampler skip must be Unknown, not Incapable"
+        );
+        assert!(
+            verdict.is_not_incapable(),
+            "Unknown.is_not_incapable() must be true; claims must not be blocked"
+        );
+    }
+
+    /// Genuine `INPUT_SOURCE_WRITE_UNSUPPORTED` → `Incapable`.
+    /// This path must still work: a controller that cannot write
+    /// input source is definitively incapable.
+    #[tokio::test]
+    async fn unsupported_write_marks_display_incapable() {
+        let sink = Arc::new(ProbeSink::with_read_and_write(
+            Ok(Some(0x0f)),
+            Err(CmdFailure {
+                controller: "ddcci".into(),
+                error: "E_DISPLAY_IO: unsupported input-source write".into(),
+            }),
+        ));
+        let verdict = sink_input_writable(sink).await;
+        assert_eq!(
+            verdict,
+            InputWritability::Incapable,
+            "unsupported write must be Incapable"
+        );
+        assert!(
+            !verdict.is_not_incapable(),
+            "Incapable.is_not_incapable() must be false"
+        );
+    }
+
+    /// Successful read + write → `Capable`.
+    #[tokio::test]
+    async fn successful_read_and_write_returns_capable() {
+        let sink = Arc::new(ProbeSink::with_read(Ok(Some(0x0f))));
+        let verdict = sink_input_writable(sink).await;
+        assert_eq!(
+            verdict,
+            InputWritability::Capable,
+            "successful read+write must be Capable"
+        );
+        assert!(verdict.is_not_incapable());
+    }
+
+    /// Transient I/O error on read → `Unknown`, not `Incapable`.
+    #[tokio::test]
+    async fn transient_io_error_on_read_returns_unknown() {
+        let sink = Arc::new(ProbeSink::with_read(
+            Err("E_DISPLAY_IO: read failed".into()),
+        ));
+        let verdict = sink_input_writable(sink).await;
+        assert_eq!(
+            verdict,
+            InputWritability::Unknown,
+            "transient I/O error must be Unknown"
+        );
+        assert!(verdict.is_not_incapable());
+    }
+
+    /// `Ok(None)` (no input-source readback) → `Unknown`.
+    /// See the comment in `sink_input_writable` — a controller
+    /// chain without readback is not definitive for writability.
+    #[tokio::test]
+    async fn no_input_source_readback_returns_unknown() {
+        let sink = Arc::new(ProbeSink::with_read(Ok(None)));
+        let verdict = sink_input_writable(sink).await;
+        assert_eq!(
+            verdict,
+            InputWritability::Unknown,
+            "no readback must be Unknown"
+        );
+        assert!(verdict.is_not_incapable());
+    }
+
+    /// Write fails with transient I/O error (not "unsupported")
+    /// → `Unknown`. The sampler already confirmed the display is
+    /// reachable; the write failure is likely transient.
+    #[tokio::test]
+    async fn transient_write_error_returns_unknown() {
+        let sink = Arc::new(ProbeSink::with_read_and_write(
+            Ok(Some(0x0f)),
+            Err(CmdFailure {
+                controller: "ddcci".into(),
+                error: "E_DISPLAY_IO: i2c timeout".into(),
+            }),
+        ));
+        let verdict = sink_input_writable(sink).await;
+        assert_eq!(
+            verdict,
+            InputWritability::Unknown,
+            "transient write error must be Unknown"
+        );
+        assert!(verdict.is_not_incapable());
     }
 }

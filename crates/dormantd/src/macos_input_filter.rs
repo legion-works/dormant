@@ -341,6 +341,22 @@ fn run_event_loop(
     Ok(())
 }
 
+// ── Per-event decision (pure, testable) ───────────────────────────────────
+
+/// Whether the event should be discarded (NOT published as activity).
+///
+/// **Fail-safe direction:** an unresolvable process name (`None`) is
+/// treated as real input — unknown ≠ jiggler, and suppressing unknown
+/// input blanks the screen on a present user (AGENTS.md rule 6).  Only
+/// a name that resolves AND matches an ignore glob may be discarded.
+#[must_use]
+pub fn should_discard_event(name: Option<&str>, matcher: &DeviceMatcher) -> bool {
+    let Some(name) = name else {
+        return false;
+    };
+    matcher.is_ignored(name)
+}
+
 // ── Tap callback ───────────────────────────────────────────────────────────
 
 /// CoreGraphics event tap callback — called for every HID event on the
@@ -349,28 +365,40 @@ fn run_event_loop(
 /// Returns the event unmodified (listen-only: `kCGEventTapOptionListenOnly`
 /// guarantees propagation regardless of the return value, but returning
 /// the event is idiomatic for listen-only taps).
+///
+/// # Panic safety
+///
+/// Panicking across an `extern "C"` boundary is undefined behaviour.
+/// The body is wrapped in [`std::panic::catch_unwind`]; a panic logs a
+/// warning and returns the event unmodified — the user's input is never
+/// swallowed by a Rust panic.
 unsafe extern "C" fn tap_callback(
     _proxy: CGEventTapProxy,
     _type_: CGEventType,
     event: CGEventRef,
     user_info: *mut c_void,
 ) -> CGEventRef {
-    let state = unsafe { &*(user_info as *const TapState) };
-
-    let process_name = match process_name_for_event(event) {
-        Some(name) => name,
-        None => return event,
-    };
-
-    // Check against the ignore globs.
-    if state.matcher.is_ignored(&process_name) {
-        return event;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &*(user_info as *const TapState) };
+        let process_name = process_name_for_event(event);
+        if should_discard_event(process_name.as_deref(), &state.matcher) {
+            return;
+        }
+        publish_accepted_event(&state.activity, &state.activity_tx);
+    }));
+    if let Err(panic) = result {
+        let msg: &str = panic.downcast_ref::<&str>().copied().unwrap_or_else(|| {
+            panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or("<non-string panic payload>")
+        });
+        tracing::warn!(
+            event = "input_filter_callback_panicked",
+            payload = %msg,
+            "tap callback panicked; event propagated unmodified"
+        );
     }
-
-    // Accepted — publish via the shared helper so this decision is
-    // independently testable.
-    publish_accepted_event(&state.activity, &state.activity_tx);
-
     event
 }
 
@@ -379,18 +407,19 @@ const MAX_PROCESS_NAME_LEN: usize = 256;
 
 /// Extract the process name for a CoreGraphics event.
 ///
-/// Uses `CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID)`
+/// Uses `CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID)`
 /// to retrieve the source PID, then `proc_name(pid)` to get the name.
-/// Both `CGEventCopyProcessName` and `CGEventGetProcessName` were removed
-/// from the macOS SDK linker-visible symbols in recent toolchains.
+/// `CGEventCopyProcessName` and `CGEventGetProcessName` were removed from
+/// the macOS SDK linker-visible symbols in recent toolchains.
 ///
-/// Returns `None` when the event is NULL, the source PID is 0, or the
-/// process name lookup fails.
+/// Returns `None` when the event is NULL, the source PID is ≤ 0, or the
+/// process name lookup fails.  Callers must treat `None` as a real event
+/// (unresolvable ≠ jiggler — suppressing it blanks on a present user).
 fn process_name_for_event(event: CGEventRef) -> Option<String> {
     if event.is_null() {
         return None;
     }
-    let pid = unsafe { CGEventGetIntegerValueField(event, kCGEventTargetUnixProcessID) } as i32;
+    let pid = unsafe { CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID) } as i32;
     if pid <= 0 {
         return None;
     }
@@ -483,8 +512,11 @@ const kCGEventScrollWheel: CGEventType = 22;
 const kCGEventTabletPointer: CGEventType = 23;
 const kCGEventTabletProximity: CGEventType = 24;
 
-/// `kCGEventTargetUnixProcessID` — field key for the source process PID.
-const kCGEventTargetUnixProcessID: CGEventField = 55;
+/// `kCGEventSourceUnixProcessID` — field key for the PID of the process
+/// that *generated* the event (the jiggler we want to detect).
+/// Value confirmed against Apple's CGEvent docs and three independent
+/// Rust bindings: core-graphics (0.24), core-graphics2, objc2-core-graphics.
+const kCGEventSourceUnixProcessID: CGEventField = 41;
 
 // ── FFI declarations ───────────────────────────────────────────────────────
 
@@ -854,6 +886,45 @@ mod tests {
             after_accepted.last_activity.is_some_and(|ts| ts > now),
             "accepted event must advance last_activity"
         );
+    }
+
+    // ── should_discard_event (pure decision, fail-safe direction) ───────
+
+    #[test]
+    fn unresolvable_name_publishes_not_discards() {
+        let matcher = DeviceMatcher::compile(&["*jiggler*".to_string()]).unwrap();
+        // None = unresolvable name → must treat as real input (fail-safe).
+        assert!(
+            !should_discard_event(None, &matcher),
+            "unresolvable name must NOT be discarded — unknown ≠ jiggler"
+        );
+    }
+
+    #[test]
+    fn resolved_and_matching_name_is_discarded() {
+        let matcher = DeviceMatcher::compile(&["*jiggler*".to_string()]).unwrap();
+        assert!(
+            should_discard_event(Some("USB Jiggler"), &matcher),
+            "matched name must be discarded"
+        );
+    }
+
+    #[test]
+    fn resolved_and_non_matching_name_is_not_discarded() {
+        let matcher = DeviceMatcher::compile(&["*jiggler*".to_string()]).unwrap();
+        assert!(
+            !should_discard_event(Some("Terminal"), &matcher),
+            "non-matching name must NOT be discarded"
+        );
+    }
+
+    #[test]
+    fn empty_ignore_list_never_discards() {
+        let empty: &[&str] = &[];
+        let matcher = DeviceMatcher::compile(empty).unwrap();
+        assert!(!should_discard_event(None, &matcher));
+        assert!(!should_discard_event(Some("USB Jiggler"), &matcher));
+        assert!(!should_discard_event(Some("Terminal"), &matcher));
     }
 
     // ── Cancellation terminates the run loop ─────────────────────────────

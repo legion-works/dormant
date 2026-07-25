@@ -4095,9 +4095,14 @@ fn spawn_generation(
     // that fence.
     #[cfg(feature = "render")]
     if let Some(input_wake_rx) = assembly.input_wake_rx {
+        let filter_active = !assembly.cfg.input_filter.ignore_devices.is_empty();
+        let filtered_activity_rx = Some(filtered_activity_tx.subscribe());
         producer_handles.push(spawn_input_wake_drain(
             input_wake_rx,
             ctl_tx.clone(),
+            filter_active,
+            filtered_activity_rx,
+            assembly.render_sinks.clone(),
             producer_token.clone(),
         ));
     }
@@ -4803,6 +4808,9 @@ mod transient_tests {
 fn spawn_input_wake_drain(
     input_wake_rx: tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
     ctl_tx: mpsc::Sender<ControlMsg>,
+    filter_active: bool,
+    filtered_activity_rx: Option<crate::filtered_activity::FilteredActivityRx>,
+    render_sinks: std::collections::HashMap<DisplayId, std::sync::Arc<dyn RenderSink>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -4811,6 +4819,34 @@ fn spawn_input_wake_drain(
             () = async {
                 let mut rx = input_wake_rx;
                 while let Some(display) = rx.recv().await {
+                    // Gate: when the input filter is active, the filtered
+                    // source is available, and no accepted device was
+                    // recently active, reject this wake — the ignored
+                    // device (e.g. a mouse jiggler) should not tear down
+                    // the overlay.  Instead, reassert the current overlay
+                    // surface so the latch resets and a genuine input will
+                    // still fire.
+                    //
+                    // FAIL-SAFE: if the filtered source is UNAVAILABLE or
+                    // the watch is closed, every wake is FORWARDED —
+                    // never silently swallow all input.  A user must
+                    // always be able to wake their screen by touching
+                    // the keyboard.
+                    let should_reject = filter_active
+                        && filtered_activity_rx.as_ref().is_some_and(|activity_rx| {
+                            let observation = activity_rx.borrow();
+                            observation.available
+                                && !observation.is_recent(
+                                    Instant::now(),
+                                    Duration::from_millis(500),
+                                )
+                        });
+                    if should_reject {
+                        if let Some(sink) = render_sinks.get(&display) {
+                            let _ = sink.show_current_overlay().await;
+                        }
+                        continue;
+                    }
                     if ctl_tx.send(ControlMsg::InputWake(display)).await.is_err() {
                         break; // engine channel closed — shutdown in progress
                     }
@@ -4869,7 +4905,14 @@ mod render_tests {
         let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
         let cancel = CancellationToken::new();
 
-        spawn_input_wake_drain(input_wake_rx, ctl_tx, cancel.clone());
+        spawn_input_wake_drain(
+            input_wake_rx,
+            ctl_tx,
+            false, // filter not active — passthrough
+            None,  // no filtered activity receiver
+            HashMap::new(),
+            cancel.clone(),
+        );
 
         // Push three displays through the wake channel.
         input_wake_tx.send(DisplayId("dp-1".into())).unwrap();
@@ -4894,6 +4937,261 @@ mod render_tests {
         cancel.cancel();
         // Drop the wake-side sender so the drain recv() returns None.
         drop(input_wake_tx);
+    }
+
+    // ── InputWake gate tests (T16) ──
+
+    use dormant_core::fakes::RenderCmd;
+
+    struct InputWakeHarness {
+        input_wake_tx: tokio::sync::mpsc::UnboundedSender<DisplayId>,
+        ctl_rx: mpsc::Receiver<ControlMsg>,
+        cancel: CancellationToken,
+        sink: dormant_core::fakes::RecordingRenderSink,
+        #[allow(dead_code)]
+        handle: JoinHandle<()>,
+    }
+
+    impl InputWakeHarness {
+        /// No filter active — every wake is forwarded.
+        fn without_filter() -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                false, // filter not active
+                None,  // no filtered activity receiver
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        /// Filter active, filtered source is available but no activity
+        /// edge has been recorded — behaves like a fresh source before
+        /// any accepted-device input arrives.
+        fn filtered_without_recent_activity() -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+
+            // Source is available, heartbeat is fresh, but no accepted
+            // device has produced an activity edge yet.
+            let (filtered_tx, filtered_rx) = crate::filtered_activity::filtered_activity_channel();
+            filtered_tx.send_replace(crate::filtered_activity::FilteredActivity {
+                last_activity: None,
+                observed_at: Instant::now(),
+                available: true,
+                edge_seq: 0,
+            });
+
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                true, // filter active
+                Some(filtered_rx),
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        /// Filter active, filtered activity at the given age for both
+        /// `last_activity` and `observed_at` (simulating an edge that
+        /// happened `age` ago and was observed at the same time).
+        fn filtered_with_activity_age(age: Duration) -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+
+            let (filtered_tx, filtered_rx) = crate::filtered_activity::filtered_activity_channel();
+            let now = Instant::now();
+            // Both the heartbeat (`observed_at`) and the activity edge
+            // (`last_activity`) are aged by the same duration.  This
+            // matches the real-world case where a source publishes both
+            // timestamps in the same snapshot.
+            let when = now.checked_sub(age).unwrap_or(now);
+            filtered_tx.send_replace(crate::filtered_activity::FilteredActivity {
+                last_activity: Some(when),
+                observed_at: when,
+                available: true,
+                edge_seq: 1,
+            });
+
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                true, // filter active
+                Some(filtered_rx),
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        /// Filter active, closed watch (tx dropped).  The real
+        /// `InputAuthoritySupervisor` publishes `available: false` before
+        /// the source exits; we replicate that here so the drain sees
+        /// the same unavailable state and fails open toward waking.
+        fn filtered_with_closed_watch() -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+
+            // Simulate the supervisor's publish_unavailable → drop flow.
+            let (filtered_tx, filtered_rx) = crate::filtered_activity::filtered_activity_channel();
+            filtered_tx.send_replace(crate::filtered_activity::FilteredActivity {
+                last_activity: None,
+                observed_at: Instant::now(),
+                available: false, // unavailable → forward (fail-safe)
+                edge_seq: 0,
+            });
+            drop(filtered_tx); // close the watch
+
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                true, // filter active
+                Some(filtered_rx),
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        async fn send_render_wake(&self, display: &str) {
+            self.input_wake_tx
+                .send(DisplayId(display.to_string()))
+                .unwrap();
+            // Yield so the drain task processes the message.
+            tokio::task::yield_now().await;
+        }
+
+        /// Drain all forwarded wakes from the control channel (non-blocking).
+        fn forwarded_wakes(&mut self) -> Vec<DisplayId> {
+            let mut wakes = Vec::new();
+            while let Ok(msg) = self.ctl_rx.try_recv() {
+                if let ControlMsg::InputWake(d) = msg {
+                    wakes.push(d);
+                }
+            }
+            wakes
+        }
+
+        /// Snapshots the render sink log and returns the display ids for
+        /// which an overlay reassert was issued.  Since each harness uses
+        /// a single sink for "monitor", every `OverlayReassert` entry in the
+        /// log means the daemon reasserted that display's overlay.
+        fn overlay_reassertions(&self) -> Vec<String> {
+            let mut ids = Vec::new();
+            for (_ts, cmd) in self.sink.log() {
+                if matches!(cmd, RenderCmd::OverlayReassert) {
+                    ids.push("monitor".to_string());
+                }
+            }
+            ids
+        }
+
+        fn cancel(&self) {
+            self.cancel.cancel();
+        }
+    }
+
+    impl Drop for InputWakeHarness {
+        fn drop(&mut self) {
+            self.cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn ignored_render_wake_is_not_forwarded_and_overlay_is_reasserted() {
+        let mut harness = InputWakeHarness::filtered_without_recent_activity();
+        harness.send_render_wake("monitor").await;
+        assert_eq!(harness.forwarded_wakes(), Vec::<DisplayId>::new());
+        assert_eq!(harness.overlay_reassertions(), vec!["monitor"]);
+    }
+
+    #[tokio::test]
+    async fn recent_filtered_edge_forwards_input_wake() {
+        // 100 ms is well within the 500 ms gate — the activity is
+        // recent enough that the drain must forward the wake.
+        let mut harness = InputWakeHarness::filtered_with_activity_age(Duration::from_millis(100));
+        harness.send_render_wake("monitor").await;
+        assert_eq!(
+            harness.forwarded_wakes(),
+            vec![DisplayId("monitor".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_filtered_edge_is_rejected_and_overlay_is_reasserted() {
+        // Activity 3 s ago is well past the 500 ms gate — the drain
+        // must reject the wake and reassert the overlay.
+        let mut harness = InputWakeHarness::filtered_with_activity_age(Duration::from_secs(3));
+        harness.send_render_wake("monitor").await;
+        assert_eq!(harness.forwarded_wakes(), Vec::<DisplayId>::new());
+        assert_eq!(harness.overlay_reassertions(), vec!["monitor"]);
+    }
+
+    #[tokio::test]
+    async fn inactive_filter_always_forwards_input_wake() {
+        let mut harness = InputWakeHarness::without_filter();
+        harness.send_render_wake("monitor").await;
+        assert_eq!(
+            harness.forwarded_wakes(),
+            vec![DisplayId("monitor".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_filtered_watch_fails_open_toward_waking() {
+        // The FAIL-SAFE: when the filter watch is closed, the daemon must
+        // fall back to forwarding every wake (never to silently swallowing
+        // all InputWake — a user must still be able to wake their screen).
+        let mut harness = InputWakeHarness::filtered_with_closed_watch();
+        harness.send_render_wake("monitor").await;
+        assert_eq!(
+            harness.forwarded_wakes(),
+            vec![DisplayId("monitor".to_string())]
+        );
     }
 
     /// `build_render_sinks` returns a render sink for every render-eligible

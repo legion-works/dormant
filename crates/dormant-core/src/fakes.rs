@@ -241,6 +241,9 @@ pub enum RenderCmd {
         /// Stage generation counter.
         r#gen: u64,
     },
+    /// A reassert-current-overlay command — sent by the daemon after
+    /// rejecting a filtered input wake to reset the one-shot latch.
+    OverlayReassert,
 }
 
 /// A [`RenderSink`] that records every call (with the virtual time at which
@@ -336,6 +339,16 @@ impl RenderSink for RecordingRenderSink {
             .expect("RecordingRenderSink lock poisoned");
         let now = tokio::time::Instant::now().duration_since(g.created_at);
         g.log.push((now, RenderCmd::Teardown { r#gen }));
+    }
+
+    async fn show_current_overlay(&self) -> Result<(), CmdFailure> {
+        let mut g = self
+            .inner
+            .lock()
+            .expect("RecordingRenderSink lock poisoned");
+        let now = tokio::time::Instant::now().duration_since(g.created_at);
+        g.log.push((now, RenderCmd::OverlayReassert));
+        Ok(())
     }
 }
 

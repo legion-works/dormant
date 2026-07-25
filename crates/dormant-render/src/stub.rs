@@ -102,6 +102,12 @@ impl RenderSink for LayerShellRenderSink {
     async fn teardown(&self, _gen: u64) {
         // Infallible no-op — the contract is explicit.
     }
+
+    async fn show_current_overlay(&self) -> Result<(), CmdFailure> {
+        // No compositor → no surface to reassert. Reset semantics
+        // are meaningless without a physical display.
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -26,6 +26,7 @@ pub use probes::config::probe_config_inner;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use probes::ddcci::probe_ddcci;
 pub use probes::ha::probe_ha_all;
+pub use probes::input_filter::probe_input_filter;
 #[cfg(target_os = "macos")]
 pub use probes::macos_display_catalog::probe_macos_display_catalog;
 #[cfg(target_os = "macos")]

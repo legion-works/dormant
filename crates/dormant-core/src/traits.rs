@@ -360,6 +360,16 @@ pub trait RenderSink: Send + Sync {
     /// Infallible: the method has no failure mode — the engine always
     /// considers the surface gone after this call returns.
     async fn teardown(&self, r#gen: u64);
+
+    /// Reassert the current render surface without altering content.
+    ///
+    /// Resets the input latch so the next real input event fires a wake
+    /// edge. If no surface is currently shown, this is a no-op. The
+    /// daemon calls this after rejecting a filtered `InputWake` to ensure
+    /// an ignored device's input doesn't permanently consume the one-shot
+    /// latch — the next genuine keyboard/mouse event must still be able
+    /// to wake the panel.
+    async fn show_current_overlay(&self) -> Result<(), CmdFailure>;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

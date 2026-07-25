@@ -5,6 +5,7 @@
 pub mod config;
 pub mod ddcci;
 pub mod ha;
+pub mod input_filter;
 #[cfg(target_os = "macos")]
 pub mod macos_display_catalog;
 pub mod macos_display_sleep;

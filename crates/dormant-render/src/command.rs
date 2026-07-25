@@ -76,6 +76,14 @@ pub(crate) enum RenderCommand {
         reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
     },
 
+    /// Reassert the current render surface without altering content.
+    /// Always resets the input latch.  No-op if no surface is up.
+    ReassertOverlay {
+        /// Reply channel — resolves once the surface is reasserted
+        /// (or the no-op is confirmed).
+        reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
+    },
+
     /// Linux-only, OLED-health T10: register (or replace) the
     /// per-display pixel-shift settings.  Fire-and-forget — no reply,
     /// same non-fatal-if-thread-gone shape as `Teardown`'s send.
@@ -133,6 +141,9 @@ mod tests {
             RenderCommand::ShowScreensaver { .. } => panic!("expected Show variant"),
             #[cfg(target_os = "linux")]
             RenderCommand::SetShift { .. } => panic!("expected Show variant"),
+            RenderCommand::ReassertOverlay { .. } => {
+                panic!("expected Show variant")
+            }
         }
         let r = tokio::runtime::Runtime::new()
             .unwrap()
@@ -184,6 +195,9 @@ mod tests {
             RenderCommand::ShowScreensaver { .. } => panic!("expected Teardown variant"),
             #[cfg(target_os = "linux")]
             RenderCommand::SetShift { .. } => panic!("expected Teardown variant"),
+            RenderCommand::ReassertOverlay { .. } => {
+                panic!("expected Teardown variant")
+            }
         }
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -206,7 +220,10 @@ mod tests {
             }
             RenderCommand::Show { .. }
             | RenderCommand::Teardown { .. }
-            | RenderCommand::ShowScreensaver { .. } => panic!("expected SetShift variant"),
+            | RenderCommand::ShowScreensaver { .. }
+            | RenderCommand::ReassertOverlay { .. } => {
+                panic!("expected SetShift variant")
+            }
         }
     }
 

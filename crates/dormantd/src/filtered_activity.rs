@@ -729,6 +729,42 @@ mod tests {
         assert!(!unavailable.is_recent(now, Duration::from_secs(5)));
     }
 
+    /// 500 ms boundary: activity and heartbeat exactly 500 ms old must
+    /// still be considered recent (inclusive).
+    #[test]
+    fn is_recent_500ms_boundary_is_inclusive() {
+        let now = Instant::now();
+        let ts = now.checked_sub(Duration::from_millis(500)).unwrap();
+        let activity = FilteredActivity {
+            last_activity: Some(ts),
+            observed_at: ts,
+            available: true,
+            edge_seq: 1,
+        };
+        assert!(
+            activity.is_recent(now, Duration::from_millis(500)),
+            "500 ms must be INCLUSIVE — a wake at exactly the boundary must forward"
+        );
+    }
+
+    /// 501 ms boundary: activity and heartbeat 501 ms old must be
+    /// rejected — one millisecond past the gate is too late.
+    #[test]
+    fn is_recent_501ms_boundary_is_rejected() {
+        let now = Instant::now();
+        let ts = now.checked_sub(Duration::from_millis(501)).unwrap();
+        let activity = FilteredActivity {
+            last_activity: Some(ts),
+            observed_at: ts,
+            available: true,
+            edge_seq: 1,
+        };
+        assert!(
+            !activity.is_recent(now, Duration::from_millis(500)),
+            "501 ms must REJECT — past the gate, no forward"
+        );
+    }
+
     #[derive(Clone)]
     struct FakeDevice {
         name: String,

@@ -1,13 +1,15 @@
 //! Input-filter readiness probe — validates the runtime environment for
-//! the `ignore_devices` glob-matching evdev filter (Task 15).
+//! the `ignore_devices` glob-matching evdev filter.
 //!
 //! ## Platform coverage
 //!
 //! The probe is platform-neutral at the call-site interface. Linux
-//! enumerates `/dev/input/event*` via `std::fs::read_dir` and checks
-//! read permission; every other platform returns a `NotSupported` stub
-//! so `dormantctl doctor input-filter` reports honestly rather than
-//! panicking or silently hiding.
+//! enumerates `/dev/input/event*` via `std::fs::read_dir` and probes
+//! readability by attempting a read-only open; every other platform
+//! returns a `NotSupported` stub so `dormantctl doctor input-filter`
+//! reports honestly rather than panicking or silently hiding.
+
+use std::path::PathBuf;
 
 use crate::types::ProbeResult;
 
@@ -42,64 +44,28 @@ pub fn probe_input_filter(ignore_devices: Option<&[String]>) -> ProbeResult {
         );
     }
 
-    probe_linux_event_nodes(globs)
+    probe_event_nodes(globs, live_enumerator)
 }
 
-// ── Linux: enumerate /dev/input/event* ──────────────────────────────────────
+// ── Node list: (path, openable) — injected by tests via the enumerator ──────
 
-#[cfg(target_os = "linux")]
-fn probe_linux_event_nodes(globs: &[String]) -> ProbeResult {
-    let mut total_nodes: usize = 0;
-    let mut readable: usize = 0;
-    let mut unreadable: Vec<String> = Vec::new();
+/// Each discovered event node and whether the current process can open
+/// it read-only.  The `bool` is the result of `File::open(path).is_ok()`.
+type NodeList = Vec<(PathBuf, bool)>;
 
-    let dir = match std::fs::read_dir("/dev/input") {
-        Ok(d) => d,
-        Err(e) => {
-            return ProbeResult::fail(
-                "input-filter",
-                format!("cannot open /dev/input: {e} — input filter needs the input group or root"),
-            );
-        }
-    };
+/// A function that discovers event nodes and probes their readability.
+type EventEnumerator = fn() -> NodeList;
 
-    for entry in dir {
-        let Ok(entry) = entry else { continue };
+/// Core probe logic, separated from I/O so synthetic tests can inject
+/// a deterministic node list.
+fn probe_event_nodes(globs: &[String], enumerator: EventEnumerator) -> ProbeResult {
+    let nodes = enumerator();
+    probe_node_list(globs, &nodes)
+}
 
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Only care about event nodes — not mice, js, or by-path symlinks.
-        if !name_str.starts_with("event") {
-            continue;
-        }
-
-        total_nodes += 1;
-        let path = entry.path();
-
-        // Check readability via metadata (no open needed).
-        match std::fs::metadata(&path) {
-            Ok(meta) => {
-                // On Unix we can check the mode bits directly.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if meta.permissions().mode() & 0o400 != 0 {
-                        readable += 1;
-                    } else {
-                        unreadable.push(path.display().to_string());
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    // Non-Unix: metadata exists → assume readable.
-                    readable += 1;
-                }
-            }
-            Err(e) => {
-                unreadable.push(format!("{} ({e})", path.display()));
-            }
-        }
-    }
+/// Evaluate raw node list — the leaf shared by live and synthetic paths.
+fn probe_node_list(globs: &[String], nodes: &NodeList) -> ProbeResult {
+    let total_nodes = nodes.len();
 
     if total_nodes == 0 {
         return ProbeResult::fail(
@@ -110,7 +76,10 @@ fn probe_linux_event_nodes(globs: &[String]) -> ProbeResult {
         );
     }
 
-    if readable == 0 {
+    let readable: Vec<_> = nodes.iter().filter(|(_, ok)| *ok).collect();
+    let unreadable: Vec<_> = nodes.iter().filter(|(_, ok)| !*ok).collect();
+
+    if readable.is_empty() {
         return ProbeResult::fail(
             "input-filter",
             format!(
@@ -123,33 +92,74 @@ fn probe_linux_event_nodes(globs: &[String]) -> ProbeResult {
     let mut detail = format!(
         "{readable} of {total_nodes} event node{} readable",
         if total_nodes == 1 { "" } else { "s" },
+        readable = readable.len(),
     );
     if !unreadable.is_empty() {
-        use std::fmt::Write;
-        let _ = write!(
-            detail,
-            "; unreadable: {}",
-            unreadable
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        let paths: Vec<&str> = unreadable
+            .iter()
+            .map(|(path, _)| path.to_str().unwrap_or("<non-utf8>"))
+            .collect();
+        detail.push_str("; unreadable: ");
+        detail.push_str(&paths.join(", "));
     }
 
     ProbeResult::pass("input-filter", detail)
 }
 
+// ── Linux: live enumeration via File::open ──────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn live_enumerator() -> NodeList {
+    let mut nodes: NodeList = Vec::new();
+
+    let Ok(dir) = std::fs::read_dir("/dev/input") else {
+        return nodes; // unreadable directory → empty list → Fail above
+    };
+
+    for entry in dir {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("event") {
+            continue;
+        }
+        let path = entry.path();
+        // Readability is determined by the process's effective
+        // permissions — attempt a read-only open and immediately close.
+        // Mode-bit inspection (0o400, 0o440, etc.) is unreliable because
+        // ACLs, group membership, and capabilities can all change the
+        // effective permission independently of the visible mode bits.
+        let openable = std::fs::File::open(&path).is_ok();
+        nodes.push((path, openable));
+    }
+
+    nodes
+}
+
 // ── Non-Linux stub ──────────────────────────────────────────────────────────
 
 #[cfg(not(target_os = "linux"))]
-fn probe_linux_event_nodes(globs: &[String]) -> ProbeResult {
+fn live_enumerator() -> NodeList {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_event_nodes(globs: &[String], _enumerator: EventEnumerator) -> ProbeResult {
     ProbeResult::not_supported(
         "input-filter",
         format!(
-            "evdev enumeration is Linux-only — ignore list {:?} is configured but \
+            "evdev enumeration is Linux-only — ignore list {globs:?} is configured but \
              this platform does not support /dev/input/event* probing",
-            globs,
+        ),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_node_list(globs: &[String], _nodes: &NodeList) -> ProbeResult {
+    ProbeResult::not_supported(
+        "input-filter",
+        format!(
+            "evdev enumeration is Linux-only — ignore list {globs:?} is configured but \
+             this platform does not support /dev/input/event* probing",
         ),
     )
 }
@@ -192,6 +202,114 @@ mod tests {
             result.detail.contains("Linux-only"),
             "detail should mention platform limitation: {}",
             result.detail
+        );
+    }
+
+    // ── Synthetic tests (platform-independent — probe node list directly) ──
+
+    /// Prove the mandated Fail path: ignore list configured, but none of
+    /// the discovered event nodes are readable by the process.  The
+    /// detail must include the exact permission count (`0 of N`).
+    #[test]
+    fn zero_readable_nodes_is_a_fail_with_exact_counts() {
+        use crate::types::ProbeStatus;
+
+        let nodes: NodeList = [
+            "/dev/input/event0",
+            "/dev/input/event1",
+            "/dev/input/event3",
+        ]
+        .into_iter()
+        .map(|p| (PathBuf::from(p), false))
+        .collect();
+        let expected_total = nodes.len();
+
+        let result = probe_node_list(&["*jiggler*".to_string()], &nodes);
+
+        assert_eq!(
+            result.status,
+            ProbeStatus::Fail,
+            "zero readable nodes must be a hard Fail"
+        );
+        let detail = &result.detail;
+        assert!(
+            detail.contains(&format!("0 of {expected_total}")),
+            "detail must carry exact path/permission count (0 of {expected_total}); got: {detail}",
+        );
+        assert!(
+            detail.contains("Ensure the running user is in the 'input' group."),
+            "detail should include input-group hint; got: {detail}",
+        );
+    }
+
+    /// Prove all-nodes-readable returns Pass with the correct count.
+    #[test]
+    fn all_nodes_readable_is_a_pass_with_exact_counts() {
+        let nodes: NodeList = ["/dev/input/event0", "/dev/input/event3"]
+            .into_iter()
+            .map(|p| (PathBuf::from(p), true))
+            .collect();
+        let expected_total = nodes.len();
+
+        let result = probe_node_list(&["*jiggler*".to_string()], &nodes);
+
+        assert_eq!(
+            result.status,
+            ProbeStatus::Pass,
+            "all readable nodes must Pass"
+        );
+        assert!(
+            result
+                .detail
+                .contains(&format!("{expected_total} of {expected_total}")),
+            "detail must carry exact path/permission count; got: {}",
+            result.detail,
+        );
+    }
+
+    /// Prove mixed readable/unreadable nodes still Pass but list the
+    /// unreadable paths in the detail.
+    #[test]
+    fn mixed_readable_nodes_pass_with_unreadable_paths_listed() {
+        let nodes: NodeList = vec![
+            (PathBuf::from("/dev/input/event0"), true),
+            (PathBuf::from("/dev/input/event1"), false),
+            (PathBuf::from("/dev/input/event3"), true),
+        ];
+
+        let result = probe_node_list(&["*jiggler*".to_string()], &nodes);
+
+        assert_eq!(
+            result.status,
+            ProbeStatus::Pass,
+            "at least one readable node must Pass"
+        );
+        assert!(
+            result.detail.contains("2 of 3"),
+            "detail must carry exact counts (2 of 3); got: {}",
+            result.detail,
+        );
+        assert!(
+            result.detail.contains("event1"),
+            "detail must list unreadable path; got: {}",
+            result.detail,
+        );
+    }
+
+    /// Prove the empty-node-list Fail path.
+    #[test]
+    fn zero_event_nodes_is_a_fail() {
+        let nodes: NodeList = Vec::new();
+        let result = probe_node_list(&["*jiggler*".to_string()], &nodes);
+        assert_eq!(
+            result.status,
+            ProbeStatus::Fail,
+            "empty node list must Fail"
+        );
+        assert!(
+            result.detail.contains("no /dev/input/event* nodes found"),
+            "detail must mention missing nodes; got: {}",
+            result.detail,
         );
     }
 }

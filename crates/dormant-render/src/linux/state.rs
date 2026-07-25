@@ -2364,23 +2364,16 @@ impl WaylandState {
         self.shift_settings = shift;
     }
 
-    /// `ReassertOverlay`: reset the input latch and, if the surface is
-    /// up, re-commit so the compositor refreshes the overlay. Called
-    /// by the daemon after rejecting a filtered `InputWake` — the ignored
-    /// input device triggered the latch, but the daemon refused the wake;
-    /// the latch must be reset so the next genuine keyboard/mouse event
-    /// still fires.
+    /// `ReassertOverlay`: reset the first-input latch and re-commit the
+    /// surface if one is currently up.  Re-committing refreshes the overlay
+    /// against a compositor that may have torn on the last input event.
     fn handle_reassert_overlay(
         &mut self,
         reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
     ) {
-        // Reset the first-input latch so the next genuine input edge
-        // still fires — the prior input was from an ignored device
-        // and the daemon rejected the wake.
+        // Re-arm the one-shot latch so the next real input event fires.
         self.input_latch.reset();
-        // If a surface is up, re-commit so the compositor refreshes
-        // the overlay (counters the brief flicker from ignored-device
-        // input that may have torn the surface).
+        // Re-commit counters any surface tear from the last input event.
         if self.surface_up
             && let Some(ref surface) = self.layer_surface
         {

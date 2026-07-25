@@ -104,8 +104,7 @@ impl RenderSink for LayerShellRenderSink {
     }
 
     async fn show_current_overlay(&self) -> Result<(), CmdFailure> {
-        // No compositor → no surface to reassert. Reset semantics
-        // are meaningless without a physical display.
+        // Infallible no-op — no surface can exist on this platform.
         Ok(())
     }
 }

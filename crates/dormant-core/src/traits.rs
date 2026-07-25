@@ -18,6 +18,28 @@ use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 /// failure.
 pub const INPUT_SOURCE_WRITE_UNSUPPORTED: &str = "E_DISPLAY_IO: unsupported input-source write";
 
+/// Expected VCP `0x60` value after an input-source write.
+///
+/// Some panels acknowledge one source code but report a different alias for
+/// the same physical input, so verification is defined independently of the
+/// command code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSourceReadback {
+    /// The panel must report this exact input-source code.
+    Exact(u8),
+    /// The panel must report a source code other than this local code.
+    DifferentFrom(u8),
+}
+
+/// An input-source command together with its semantic readback expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputSourceTarget {
+    /// VCP `0x60` code sent to the panel.
+    pub write_code: u8,
+    /// Readback condition that verifies the command changed the panel.
+    pub expected_readback: InputSourceReadback,
+}
+
 /// A coarse power state observed by [`PanelState`] readback.
 ///
 /// Models the two values the control-path verification feature
@@ -168,7 +190,7 @@ pub trait DisplayController: Any + Send + Sync {
     /// unsupported result so a composed controller chain can try its first
     /// capable member. DDC/CI implementations perform this as command-path
     /// work because it changes shared-panel ownership.
-    async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+    async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
         Err(CmdFailure {
             controller: self.name().to_string(),
             error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
@@ -296,7 +318,7 @@ pub trait CommandSink: Send + Sync {
     ///
     /// Default returns the stable unsupported result because a bare command
     /// sink cannot advertise a writer.
-    async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+    async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
         Err(CmdFailure {
             controller: "command-sink".to_string(),
             error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
@@ -439,7 +461,13 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(c.read_usage_hours().await, None);
-        let error = c.write_input_source(0x12).await.unwrap_err();
+        let error = c
+            .write_input_source(InputSourceTarget {
+                write_code: 0x12,
+                expected_readback: InputSourceReadback::Exact(0x12),
+            })
+            .await
+            .unwrap_err();
         assert_eq!(error.controller, "bare");
         assert_eq!(error.error, "E_DISPLAY_IO: unsupported input-source write");
         assert_eq!(
@@ -464,7 +492,13 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(s.read_usage_hours().await, None);
-        let error = s.write_input_source(0x12).await.unwrap_err();
+        let error = s
+            .write_input_source(InputSourceTarget {
+                write_code: 0x12,
+                expected_readback: InputSourceReadback::Exact(0x12),
+            })
+            .await
+            .unwrap_err();
         assert_eq!(error.controller, "command-sink");
         assert_eq!(error.error, "E_DISPLAY_IO: unsupported input-source write");
         assert_eq!(

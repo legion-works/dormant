@@ -52,7 +52,7 @@ use dormant_core::config::Config;
 use dormant_core::config::schema::{ActivityClaimPolicy, HookAction, HookSlots, KeymapConfig};
 use dormant_core::coordination::CoordinationHandle;
 use dormant_core::peers::InstanceIdentity;
-use dormant_core::traits::CommandSink;
+use dormant_core::traits::{CommandSink, InputSourceReadback, InputSourceTarget};
 use dormant_core::types::DisplayId;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -1771,7 +1771,12 @@ impl Driver {
             .unwrap_or_default();
         let outcome_tx = self.owner_event_tx.clone();
         tokio::spawn(async move {
-            let result = sink.write_input_source(target).await;
+            let result = sink
+                .write_input_source(InputSourceTarget {
+                    write_code: target,
+                    expected_readback: InputSourceReadback::Exact(target),
+                })
+                .await;
             let event = match result {
                 Ok(()) => OwnerEvent::WriteSucceeded,
                 Err(failure) => OwnerEvent::WriteFailed(failure.error),
@@ -2077,7 +2082,13 @@ impl Driver {
             );
             return;
         }
-        if let Err(_failure) = sink.write_input_source(target_code).await {
+        if let Err(_failure) = sink
+            .write_input_source(InputSourceTarget {
+                write_code: target_code,
+                expected_readback: InputSourceReadback::Exact(target_code),
+            })
+            .await
+        {
             append_event(
                 event_log.as_ref(),
                 event_notify.as_ref(),
@@ -2362,7 +2373,13 @@ pub(crate) async fn sink_input_writable(sink: Arc<dyn CommandSink>) -> InputWrit
     };
 
     // Read succeeded — now probe the write surface.
-    match sink.write_input_source(observed).await {
+    match sink
+        .write_input_source(InputSourceTarget {
+            write_code: observed,
+            expected_readback: InputSourceReadback::Exact(observed),
+        })
+        .await
+    {
         Ok(()) => {
             info!(
                 event = "claim_capability_probed",
@@ -2817,7 +2834,7 @@ mod tests {
             self.read_result.clone()
         }
 
-        async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+        async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
             self.write_result.clone()
         }
     }

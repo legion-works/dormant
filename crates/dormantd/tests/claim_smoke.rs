@@ -126,11 +126,14 @@ impl CommandSink for RecordingSink {
             Some(ScriptedRead::Unknown) | None => None,
         })
     }
-    async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
+    async fn write_input_source(
+        &self,
+        target: dormant_core::traits::InputSourceTarget,
+    ) -> Result<(), CmdFailure> {
         let call = RecordedCall {
             sink: self.name.clone(),
             method: "write_input_source",
-            arg: Some(code),
+            arg: Some(target.write_code),
         };
         let mut g = self.inner.lock().unwrap();
         if g.writes_failed {

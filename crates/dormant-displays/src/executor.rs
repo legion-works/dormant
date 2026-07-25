@@ -70,7 +70,7 @@ use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_BLANK_FAILED, E_WAKE_FAILED};
 use dormant_core::rules::{ControllerHealth, ControllerRole};
 use dormant_core::traits::{
-    CommandSink, DisplayController, INPUT_SOURCE_WRITE_UNSUPPORTED, PanelState,
+    CommandSink, DisplayController, INPUT_SOURCE_WRITE_UNSUPPORTED, InputSourceTarget, PanelState,
 };
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
 use tokio_util::sync::CancellationToken;
@@ -651,9 +651,9 @@ impl CommandSink for DisplayExecutor {
     /// write surface. Unsupported controllers are skipped; an I/O failure
     /// from the selected writer is final so claim orchestration can retain
     /// ownership and run its failure compensation.
-    async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
+    async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
         for controller in &self.chain {
-            match controller.write_input_source(code).await {
+            match controller.write_input_source(target).await {
                 Ok(()) => return Ok(()),
                 Err(error) if error.error == INPUT_SOURCE_WRITE_UNSUPPORTED => {}
                 Err(error) => return Err(error),
@@ -919,7 +919,7 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
-        async fn write_input_source(&self, _code: u8) -> Result<(), CmdFailure> {
+        async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
             let mut state = self.inner.lock().unwrap();
             state
                 .log
@@ -1527,7 +1527,15 @@ mod tests {
         writer.push_input_source_write(Ok(()));
         let (executor, handles) = executor_with(vec![unsupported, writer], default_retry());
 
-        assert_eq!(executor.write_input_source(0x12).await, Ok(()));
+        assert_eq!(
+            executor
+                .write_input_source(InputSourceTarget {
+                    write_code: 0x12,
+                    expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x12),
+                })
+                .await,
+            Ok(())
+        );
         assert_eq!(handles[0].count_op("write_input_source"), 1);
         assert_eq!(handles[1].count_op("write_input_source"), 1);
     }

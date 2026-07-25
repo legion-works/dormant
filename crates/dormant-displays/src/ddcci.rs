@@ -30,7 +30,7 @@ use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_DISPLAY_IO};
-use dormant_core::traits::DisplayController;
+use dormant_core::traits::{DisplayController, InputSourceReadback, InputSourceTarget};
 use dormant_core::types::{BlankMode, CmdFailure};
 
 use crate::ddc_lock::{PanelLock, PanelLocks};
@@ -606,7 +606,7 @@ impl DisplayController for DdcciController {
     ///
     /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is
     /// therefore conditional on an immediate command-priority readback of the requested value.
-    async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
+    async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
         let (ident, lock) = {
             let state = self.state.lock().unwrap();
             match (&state.matched_ident, &state.panel_lock) {
@@ -624,7 +624,7 @@ impl DisplayController for DdcciController {
             .set_vcp(
                 &ident,
                 VCP_INPUT_SOURCE,
-                u16::from(code),
+                u16::from(target.write_code),
                 &lock,
                 VcpPriority::Command,
             )
@@ -644,11 +644,22 @@ impl DisplayController for DdcciController {
                     "{E_DISPLAY_IO}: input-source write verification read failed on {ident}: {error}"
                 ),
             })?;
-        if readback != u16::from(code) {
+        let (verified, expected) = match target.expected_readback {
+            InputSourceReadback::Exact(expected) => (
+                readback == u16::from(expected),
+                format!("Exact(0x{expected:02x})"),
+            ),
+            InputSourceReadback::DifferentFrom(local) => (
+                readback != u16::from(local),
+                format!("DifferentFrom(0x{local:02x})"),
+            ),
+        };
+        if !verified {
             return Err(CmdFailure {
                 controller: Self::NAME.to_string(),
                 error: format!(
-                    "{E_DISPLAY_IO}: input-source write verification mismatch on {ident}: wrote 0x{code:02x}, read back 0x{readback:02x}"
+                    "{E_DISPLAY_IO}: input-source write verification mismatch on {ident}: wrote 0x{write_code:02x}, expected {expected}, observed 0x{readback:02x}",
+                    write_code = target.write_code,
                 ),
             });
         }
@@ -2035,7 +2046,12 @@ mod tests {
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x12, Ok(()));
         fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x12));
 
-        ctrl.write_input_source(0x12).await.unwrap();
+        ctrl.write_input_source(InputSourceTarget {
+            write_code: 0x12,
+            expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x12),
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             fake.set_calls(),
@@ -2048,6 +2064,69 @@ mod tests {
                 format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn input_source_write_accepts_distinct_semantic_readback_alias() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x15, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x10));
+
+        ctrl.write_input_source(InputSourceTarget {
+            write_code: 0x15,
+            expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_source_write_rejects_genuine_wrong_readback() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x15, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x11));
+
+        let error = ctrl
+            .write_input_source(InputSourceTarget {
+                write_code: 0x15,
+                expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.error.contains("wrote 0x15"));
+        assert!(error.error.contains("expected Exact(0x10)"));
+        assert!(error.error.contains("observed 0x11"));
     }
 
     #[tokio::test]
@@ -2071,14 +2150,22 @@ mod tests {
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
         fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x0f));
 
-        let error = ctrl.write_input_source(0x10).await.unwrap_err();
+        let error = ctrl
+            .write_input_source(InputSourceTarget {
+                write_code: 0x10,
+                expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+            })
+            .await
+            .unwrap_err();
 
         assert!(
             error
                 .error
                 .contains("input-source write verification mismatch")
         );
-        assert!(error.error.contains("wrote 0x10, read back 0x0f"));
+        assert!(error.error.contains("wrote 0x10"));
+        assert!(error.error.contains("expected Exact(0x10)"));
+        assert!(error.error.contains("observed 0x0f"));
         assert_eq!(
             fake.take_call_log(),
             vec![
@@ -2109,7 +2196,13 @@ mod tests {
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
         fake.expect_get(ident, VCP_INPUT_SOURCE, Err("transient read error".into()));
 
-        let error = ctrl.write_input_source(0x10).await.unwrap_err();
+        let error = ctrl
+            .write_input_source(InputSourceTarget {
+                write_code: 0x10,
+                expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+            })
+            .await
+            .unwrap_err();
 
         assert!(
             error
@@ -2140,7 +2233,12 @@ mod tests {
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
         fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x10));
 
-        ctrl.write_input_source(0x10).await.unwrap();
+        ctrl.write_input_source(InputSourceTarget {
+            write_code: 0x10,
+            expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+        })
+        .await
+        .unwrap();
 
         assert_eq!(
             fake.take_call_log(),
@@ -2177,7 +2275,10 @@ mod tests {
         let sampler_guard = lock
             .sampler_try()
             .expect("the sampler must acquire an idle panel lock");
-        let write = ctrl.write_input_source(0x12);
+        let write = ctrl.write_input_source(InputSourceTarget {
+            write_code: 0x12,
+            expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x12),
+        });
         tokio::pin!(write);
         assert!(
             tokio::time::timeout(Duration::from_millis(25), &mut write)

@@ -298,7 +298,7 @@ struct Supervisor {
     commands: mpsc::Receiver<Command>,
     inbound: mpsc::Sender<ClaimFrame>,
     on_peer_addr: Arc<dyn Fn(String, SocketAddr) + Send + Sync>,
-    replay: Arc<Mutex<HashMap<String, ReplayWindow>>>,
+    replay: Arc<Mutex<HashMap<(String, String), ReplayWindow>>>,
 }
 
 /// Spawn a parked claim transport supervisor.
@@ -737,7 +737,7 @@ struct ConnectionContext {
     peers: Arc<RwLock<Vec<ClaimPeer>>>,
     inbound: mpsc::Sender<ClaimFrame>,
     on_peer_addr: Arc<dyn Fn(String, SocketAddr) + Send + Sync>,
-    replay: Arc<Mutex<HashMap<String, ReplayWindow>>>,
+    replay: Arc<Mutex<HashMap<(String, String), ReplayWindow>>>,
 }
 
 async fn authenticate_connection(
@@ -783,7 +783,7 @@ async fn authenticate_connection(
         .replay
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(peer.instance_id.clone())
+        .entry((peer.instance_id.clone(), frame.sender_epoch.clone()))
         .or_insert_with(|| ReplayWindow::new(64))
         .accept_frame(frame.counter, &frame.nonce);
     if !fresh {

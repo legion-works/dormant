@@ -293,6 +293,7 @@ mod tests {
                 controllers: vec!["ddcci".to_string()],
                 scope: DisplayScope::Shared,
                 shared_input_code: Some(0x11),
+                shared_input_write_code: None,
                 blank_mode: None,
                 degraded_mode: None,
                 ladder: Vec::new(),

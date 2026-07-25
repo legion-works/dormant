@@ -4881,6 +4881,7 @@ mod render_tests {
         dormant_core::config::schema::DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             controllers: Vec::new(),
             blank_mode: None,
@@ -5236,6 +5237,7 @@ mod render_tests {
                     dormant_core::config::schema::DisplayConfig {
                         scope: dormant_core::config::DisplayScope::default(),
                         shared_input_code: None,
+                        shared_input_write_code: None,
                         hooks: dormant_core::config::HookSlots::default(),
                         controllers: vec!["command".into()],
                         blank_mode: None,
@@ -6209,6 +6211,7 @@ mod macos_gamma_black_assembly_tests {
         let display = DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             controllers: vec!["command".into()],
             blank_mode: Some(BlankMode::PowerOff),
@@ -6436,6 +6439,7 @@ mod gamma_reload_tests {
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             controllers: vec![controller.into()],
             blank_mode: Some(BlankMode::BrightnessZero),

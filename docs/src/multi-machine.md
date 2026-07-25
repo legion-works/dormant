@@ -19,7 +19,7 @@ state, or a liveness heartbeat. MQTT is not required.
    enabled = true
    ```
 
-2. Find the input code for each machine. Select the machine's input on the
+2. Find the read-back code for each machine. Select the machine's input on the
    panel, then run:
 
    ```bash
@@ -27,10 +27,25 @@ state, or a liveness heartbeat. MQTT is not required.
    dormantctl doctor
    ```
 
-   Record the `0x60` value on that machine. Switch the monitor to the other
-   input and repeat there. Input codes are deployment-specific; do not infer
-   them from `ddcutil capabilities`, whose reported values are unreliable for
-   this purpose.
+   Record the `0x60` value on that machine — this is the READ code, what the
+   panel reports when this input is active. Switch the monitor to the other
+   input and repeat there.
+
+   **Next, verify the write code.** Most panels use the same value for both
+   read and write, but some (e.g. certain AOC AGON models) accept a different
+   code on `setvcp 60` than they report on `getvcp 60`. Test it:
+
+   ```bash
+   # Stop dormantd and any other ddcutil users first, then:
+   ddcutil setvcp 60 0x0f --bus <N>   # try the read-back value
+   ddcutil getvcp 60 --bus <N>          # did it switch?
+   ```
+
+   If the write fails silently (the panel stays on the old input), probe the
+   codes advertised in `ddcutil capabilities --bus <N>` for the VCP 60
+   feature — the panel may list an "Unrecognized value" that is actually the
+   working write code. Try each candidate; confirm with a physical check.
+   Record the working write value as `shared_input_write_code`.
 
 3. Mark the same physical display shared in both configurations. Each machine
    uses its own code:
@@ -40,7 +55,8 @@ state, or a liveness heartbeat. MQTT is not required.
    controllers = ["ddcci"]
    blank_mode = "power_off"
    scope = "shared"
-   shared_input_code = 0x0f # replace with this machine's recorded code
+   shared_input_code = 0x0f       # what getvcp 60 reports for this input
+   shared_input_write_code = 0x15 # what setvcp 60 needs (omit if same)
    ```
 
    A newly shared display starts with conservative ownership after reload. It

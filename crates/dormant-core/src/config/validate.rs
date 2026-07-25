@@ -214,6 +214,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "controllers",
             "scope",
             "shared_input_code",
+            "shared_input_write_code",
             "blank_mode",
             "degraded_mode",
             "ladder",
@@ -1306,12 +1307,24 @@ fn validate_display_with_input_source_readers(
     }
 
     match dc.scope {
-        DisplayScope::Private if dc.shared_input_code.is_some() => errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail: format!(
-                "display '{display_id}' is private but sets shared_input_code — remove it or set scope = \"shared\""
-            ),
-        }),
+        DisplayScope::Private => {
+            if dc.shared_input_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_input_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+            if dc.shared_input_write_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_input_write_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+        }
         DisplayScope::Shared => {
             if dc.shared_input_code.is_none() {
                 errors.push(ValidationError {
@@ -1321,7 +1334,19 @@ fn validate_display_with_input_source_readers(
                     ),
                 });
             }
-            if !dc.controllers.iter().any(|controller| input_source_readers.contains(controller)) {
+            if dc.shared_input_write_code.is_some() && dc.shared_input_code.is_none() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' sets shared_input_write_code without shared_input_code — the write code defaults to the read code, so set shared_input_code first"
+                    ),
+                });
+            }
+            if !dc
+                .controllers
+                .iter()
+                .any(|controller| input_source_readers.contains(controller))
+            {
                 errors.push(ValidationError {
                     what: crate::error::E_CONFIG_INVALID.into(),
                     detail: format!(
@@ -1330,7 +1355,6 @@ fn validate_display_with_input_source_readers(
                 });
             }
         }
-        DisplayScope::Private => {}
     }
 
     validate_hooks(display_id, dc, has_mqtt_broker, errors);
@@ -2513,6 +2537,50 @@ gracee_period = "60s"
     }
 
     #[test]
+    fn shared_input_code_without_write_code_is_backward_compatible() {
+        // Configs that set only `shared_input_code` (the pre-split field)
+        // must remain valid and behave identically — the write code
+        // defaults to the read code when absent.
+        let config = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 15\nblank_mode = \"power_off\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(collect_unknown_keys(&value).is_empty());
+        let cfg: crate::config::Config = toml::from_str(config).unwrap();
+        let dc = &cfg.displays["main"];
+        assert_eq!(dc.shared_input_code, Some(15));
+        assert_eq!(dc.shared_input_write_code, None);
+    }
+
+    #[test]
+    fn shared_input_write_code_without_read_code_is_invalid() {
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: indexmap::IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: None,
+                    shared_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error
+                        .detail
+                        .contains("sets shared_input_write_code without shared_input_code")),
+            "expected validation error, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn validate_accepts_valid_full_config() {
         let cfg = valid_full_config();
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
@@ -3079,6 +3147,7 @@ gracee_period = "60s"
             controllers: Vec::new(),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: crate::config::HookSlots::default(),
             blank_mode: None,
             degraded_mode: None,
@@ -3869,6 +3938,7 @@ password = "test-pass"
                     controllers: vec!["kwin-dpms".into(), "ddcci".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
+                    shared_input_write_code: None,
                     hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
@@ -3931,6 +4001,7 @@ password = "test-pass"
                     controllers: vec!["command".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
+                    shared_input_write_code: None,
                     hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
@@ -4072,6 +4143,7 @@ password = "test-pass"
             blank_mode: Some(BlankMode::PowerOff),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
@@ -5003,6 +5075,7 @@ kind = "power_off"
             blank_mode: None,
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],

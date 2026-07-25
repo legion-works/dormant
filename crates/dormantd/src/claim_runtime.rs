@@ -120,7 +120,16 @@ struct DisplayCtx {
     /// Local configured input-source code (the `0x60` value this
     /// daemon expects to see for "owned"). `None` ⇒ the display
     /// cannot participate in claims.
+    ///
+    /// This is the READ code — what the panel reports on VCP 0x60 when
+    /// this input is active.  The ownership poll compares observations
+    /// against this value.
     local_input_code: Option<u8>,
+    /// Input code to WRITE when selecting this machine's input.
+    /// Defaults to [`local_input_code`] when absent; only set when the
+    /// panel accepts a different code on the write path than it reports
+    /// on the read path.
+    local_input_write_code: Option<u8>,
     /// Cross-machine claim identity (F5: `manufacturer:model[:serial]`).
     claim_identity: Option<String>,
     /// Whether the chained controller exposes an input-source
@@ -130,6 +139,14 @@ struct DisplayCtx {
     writable: bool,
     /// Generation-stable hook snapshot.
     hooks: Arc<HookSlots>,
+}
+
+impl DisplayCtx {
+    /// Effective code to write when selecting this machine's input.
+    /// Falls back to the read code when no explicit write-override is set.
+    fn effective_write_code(&self) -> Option<u8> {
+        self.local_input_write_code.or(self.local_input_code)
+    }
 }
 
 /// Per-display live flight tracking. The pure engine doesn't
@@ -1164,6 +1181,7 @@ impl Driver {
         }
 
         let nonce = self.next_nonce();
+        self.next_counter();
         let Some((counter, frame_nonce, message)) = self.build_claim_request(display, &nonce)
         else {
             let did = display.0.as_str();
@@ -1205,7 +1223,7 @@ impl Driver {
         }
 
         let front_ctl_tx = self.front_ctl_tx.clone();
-        let local_input_code = ctx.local_input_code.unwrap_or(0);
+        let local_input_code = ctx.effective_write_code().unwrap_or(0);
         let suppressed_until = now + claim_timeout;
         if let Ok(mut map) = self.handle.suppressed.lock() {
             map.insert(display.clone(), suppressed_until);
@@ -1493,7 +1511,7 @@ impl Driver {
                 let identity = self.local_identity_view();
                 let sender_epoch = self.sender_epoch.clone();
 
-                let outbound_counter = self.outbound_counter;
+                let counter = self.next_counter();
                 tokio::spawn(async move {
                     let Some(flight) = flight.take() else { return };
                     let peer_instance_id = flight.peer_instance_id;
@@ -1501,8 +1519,6 @@ impl Driver {
                     if peer_instance_id.is_empty() || peer_epoch.is_empty() {
                         return;
                     }
-
-                    let counter = outbound_counter.wrapping_add(1);
                     if let Ok(frame) = sign_frame_for_peer(
                         &identity,
                         sender_epoch,
@@ -1672,11 +1688,11 @@ impl Driver {
         // fallback writes the local code). The flight record
         // carries the `write_code` set when the flight was
         // armed.
-        let write_code = self
-            .flights
-            .get(display)
-            .map(|f| f.write_code)
-            .or_else(|| self.contexts.get(display).and_then(|c| c.local_input_code));
+        let write_code = self.flights.get(display).map(|f| f.write_code).or_else(|| {
+            self.contexts
+                .get(display)
+                .and_then(DisplayCtx::effective_write_code)
+        });
         let Some((sink, local_code)) = self.lookup_executor(display) else {
             return self.feed_owner_event(
                 display,
@@ -1765,7 +1781,7 @@ impl Driver {
         let code = self
             .contexts
             .get(display)
-            .and_then(|c| c.local_input_code)?;
+            .and_then(DisplayCtx::effective_write_code)?;
         Some((sink, code))
     }
 
@@ -1874,7 +1890,11 @@ impl Driver {
             );
             return;
         };
-        let Some(target_code) = self.contexts.get(display).and_then(|c| c.local_input_code) else {
+        let Some(target_code) = self
+            .contexts
+            .get(display)
+            .and_then(DisplayCtx::effective_write_code)
+        else {
             self.feed_requester_failed(
                 display,
                 ClaimFailure::Denied(ClaimDeniedReason::Unsupported),
@@ -2049,6 +2069,7 @@ impl Driver {
             let hooks = Arc::new(display_config.hooks.clone());
             let ctx = DisplayCtx {
                 local_input_code: display_config.shared_input_code,
+                local_input_write_code: display_config.shared_input_write_code,
                 claim_identity,
                 writable,
                 hooks,
@@ -2105,11 +2126,15 @@ impl Driver {
         nonce: &str,
     ) -> Option<(u64, String, ClaimMessage)> {
         let ctx = self.contexts.get(display)?;
-        let local_code = u16::from(ctx.local_input_code?);
+        // Use the write code when present (some panels accept a different
+        // value on `setvcp 60` than they report on `getvcp 60`); the owner
+        // writes this code, so the requester must send the write code on
+        // the wire.
+        let write_code = u16::from(ctx.effective_write_code()?);
         let request = ClaimRequest {
             display_identity: ctx.claim_identity.clone()?,
             requester_instance_id: self.local_instance_id.clone(),
-            requester_input_code: local_code,
+            requester_input_code: write_code,
             counter: self.outbound_counter,
             nonce: nonce.to_owned(),
         };
@@ -3117,6 +3142,7 @@ mod tests {
                     controllers: vec!["cmd".to_owned()],
                     scope: dormant_core::config::DisplayScope::Shared,
                     shared_input_code: Some(0x0f),
+                    shared_input_write_code: None,
                     blank_mode: None,
                     degraded_mode: None,
                     ladder: vec![],

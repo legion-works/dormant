@@ -315,6 +315,77 @@ fn release_acquire_hooks() -> HookSlots {
     }
 }
 
+fn shared_display_config_with_write_code(
+    display: &str,
+    read_code: u8,
+    write_code: u8,
+    hooks: HookSlots,
+) -> Arc<Config> {
+    let mut displays = IndexMap::new();
+    displays.insert(
+        display.to_owned(),
+        dormant_core::config::DisplayConfig {
+            controllers: vec!["ddcci".to_owned()],
+            scope: dormant_core::config::DisplayScope::Shared,
+            shared_input_code: Some(read_code),
+            shared_input_write_code: Some(write_code),
+            blank_mode: Some(BlankMode::BrightnessZero),
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: Some(vec![BlankMode::BrightnessZero]),
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 80,
+            samsung_restore_backlight: 50,
+            treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::Unknown,
+            hooks,
+        },
+    );
+    Arc::new(Config {
+        config_version: 1,
+        daemon: dormant_core::config::DaemonConfig::default(),
+        sensors: IndexMap::new(),
+        zones: IndexMap::new(),
+        displays,
+        rules: IndexMap::new(),
+        wear: WearConfig::default(),
+        notifications: NotificationsConfig::default(),
+        watchdog: WatchdogConfig::default(),
+        audio: AudioConfig::default(),
+        keymap: KeymapConfig::default(),
+        input_filter: dormant_core::config::InputFilterConfig::default(),
+        coordination: dormant_core::config::CoordinationConfig {
+            enabled: true,
+            poll_interval: Duration::from_secs(2),
+            state_poll_interval: None,
+            loss_confirmations: 3,
+            pairing_port: 0,
+            pairing_window: Duration::from_secs(300),
+            pairing_bind_address: None,
+            activity_claim: ActivityClaimPolicy::Off,
+            owner_idle_window: Duration::from_secs(30),
+            armed_window: Duration::from_secs(60),
+            claim_timeout: Duration::from_millis(500),
+            release_deadline_cap: Duration::from_secs(45),
+            claim_port: 0,
+            claim_bind_address: None,
+            claim_advertise_mdns: true,
+        },
+    })
+}
+
 fn shared_display_config(display: &str, code: u8, hooks: HookSlots) -> Arc<Config> {
     let mut displays = IndexMap::new();
     displays.insert(
@@ -323,6 +394,7 @@ fn shared_display_config(display: &str, code: u8, hooks: HookSlots) -> Arc<Confi
             controllers: vec!["ddcci".to_owned()],
             scope: dormant_core::config::DisplayScope::Shared,
             shared_input_code: Some(code),
+            shared_input_write_code: None,
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
             ladder: vec![],
@@ -532,6 +604,92 @@ impl ClaimHarness {
 
     async fn build_without_addressable_peer(display: &str, code: u8) -> Self {
         Self::build_with_peer_mode(display, code, PeerMode::NoPeer).await
+    }
+
+    async fn build_with_custom_config(
+        display: &str,
+        config: Arc<Config>,
+        peer_mode: PeerMode,
+    ) -> Self {
+        let runner = Arc::new(RecordingHookRunner::new());
+        let hook_engine = Arc::new(HookEngine::with_runner(
+            runner.clone() as Arc<dyn HookRunner>
+        ));
+        let sink = Arc::new(RecordingSink::new(display));
+        sink.set_claim_identity(format!("panel-{display}"));
+        let code = config
+            .displays
+            .get(display)
+            .and_then(|dc| dc.shared_input_code)
+            .unwrap_or(0x0f);
+        sink.script_reads(vec![
+            ScriptedRead::Powered(code),
+            ScriptedRead::Powered(code),
+            ScriptedRead::Powered(code),
+        ]);
+        let cancel = CancellationToken::new();
+        let (config_tx, config_rx) = watch::channel(config.clone());
+        let (executors_tx, executors_rx) = watch::channel({
+            let mut map: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+            map.insert(DisplayId(display.to_owned()), sink.clone());
+            Arc::new(map)
+        });
+        let local_signing = SigningKey::from_bytes(&[42; 32]);
+        let local_identity = InstanceIdentity {
+            instance_id: instance_id_from_public_key(&local_signing.verifying_key().to_bytes()),
+            signing_key: local_signing,
+            verifying_key: SigningKey::from_bytes(&[42; 32]).verifying_key(),
+        };
+        let ScriptedTransport {
+            handle: transport,
+            peer_frames,
+            peer_frames_changed,
+            _peer_watch_tx: peer_watch_tx,
+            _peer_task: peer_task,
+        } = build_scripted_transport(local_identity.clone(), cancel.clone(), peer_mode).await;
+        let coord = CoordinationHandle::new([DisplayId(display.to_owned())]);
+        coord.record_success(&DisplayId(display.to_owned()), code, code, None);
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_changed = Arc::new(tokio::sync::Notify::new());
+        let handle = claim_runtime::spawn(ClaimRuntimeDeps {
+            identity: Arc::new(local_identity.clone()),
+            transport,
+            executors: executors_rx,
+            config: config_rx,
+            hooks: hook_engine,
+            coordination: Some(coord.clone()),
+            front_ctl_tx,
+            cancel: cancel.clone(),
+            event_log: Some(log.clone()),
+            event_notify: Some(Arc::clone(&log_changed)),
+            idle_rx: None,
+        });
+        let accepted = handle
+            .inject_owner_completion_for_test(
+                DisplayId(display.to_owned()),
+                "startup-barrier",
+                dormant_core::claim_engine::OwnerEvent::DisplayRemoved,
+            )
+            .await
+            .expect("claim runtime startup barrier");
+        assert!(!accepted, "startup barrier must not match a flight");
+        Self {
+            handle,
+            sink,
+            runner,
+            log,
+            log_changed,
+            cancel,
+            _config_tx: config_tx,
+            _executors_tx: executors_tx,
+            local_identity,
+            coord,
+            peer_frames,
+            peer_frames_changed,
+            _peer_watch_tx: peer_watch_tx,
+            _peer_task: peer_task,
+        }
     }
 
     async fn build_with_peer_mode(display: &str, code: u8, peer_mode: PeerMode) -> Self {
@@ -1191,6 +1349,99 @@ async fn fallback_foreign_code_writes_local_code_exactly_once() {
     assert!(
         !events.iter().any(|e| e.starts_with("claim_failed")),
         "F4 foreign-code path is a success, not a failure; got {events:?}"
+    );
+    harness.shutdown();
+}
+
+/// When `shared_input_write_code` differs from `shared_input_code`,
+/// the fallback direct-write must use the write code.  The ownership
+/// poll (not exercised here) must still compare against the read code.
+#[tokio::test]
+async fn fallback_uses_write_code_override_when_set() {
+    let display = "mon";
+    let hooks = release_acquire_hooks();
+    let config = shared_display_config_with_write_code(
+        display, 0x0f, // read code
+        0x15, // write code
+        hooks,
+    );
+    let harness =
+        ClaimHarness::build_with_custom_config(display, config, PeerMode::ReachableSilent).await;
+    harness.clear_sink_writes();
+    // Foreign powered read: 0x11 is the peer's input. The fallback
+    // must write the local WRITE code (0x15), not the local READ code (0x0f).
+    harness.sink.script_reads(vec![
+        ScriptedRead::Powered(0x11),
+        ScriptedRead::Powered(0x11),
+    ]);
+    let _verdict = harness
+        .handle
+        .try_claim(DisplayId(display.into()))
+        .await
+        .expect("try_claim channel");
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before fallback"
+    );
+    assert!(
+        harness
+            .wait_for_log("claim_fallback_direct", Duration::from_secs(5))
+            .await,
+        "fallback trace must fire"
+    );
+    let writes = harness.sink_writes();
+    assert_eq!(
+        writes.len(),
+        1,
+        "fallback must write exactly once; got {writes:?}"
+    );
+    assert_eq!(
+        writes[0].arg,
+        Some(0x15),
+        "fallback must write the WRITE code (0x15), not the read code (0x0f); got {writes:?}"
+    );
+    harness.shutdown();
+}
+
+/// When `shared_input_write_code` is absent, the fallback falls back
+/// to `shared_input_code` — the backward-compatible default.
+#[tokio::test]
+async fn fallback_uses_read_code_when_write_code_absent() {
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
+    harness.clear_sink_writes();
+    harness.sink.script_reads(vec![
+        ScriptedRead::Powered(0x11),
+        ScriptedRead::Powered(0x11),
+    ]);
+    let _verdict = harness
+        .handle
+        .try_claim(DisplayId("mon".into()))
+        .await
+        .expect("try_claim channel");
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request"
+    );
+    assert!(
+        harness
+            .wait_for_log("claim_fallback_direct", Duration::from_secs(5))
+            .await,
+        "fallback trace must fire"
+    );
+    let writes = harness.sink_writes();
+    assert_eq!(
+        writes.len(),
+        1,
+        "fallback must write exactly once; got {writes:?}"
+    );
+    assert_eq!(
+        writes[0].arg,
+        Some(0x0f),
+        "fallback must write the read code (0x0f) when no write-code override is set; got {writes:?}"
     );
     harness.shutdown();
 }

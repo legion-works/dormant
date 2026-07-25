@@ -594,6 +594,7 @@ export interface DisplayConfig {
   controllers: string[];
   scope?: "private" | "shared";
   shared_input_code?: number;
+  shared_input_write_code?: number;
   hooks?: HookSlots;
   blank_mode?: BlankMode;
   degraded_mode?: BlankMode;

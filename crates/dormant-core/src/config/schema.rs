@@ -1115,8 +1115,23 @@ pub struct DisplayConfig {
 
     /// DDC/CI input-source value used to identify this machine's ownership of
     /// a shared display. The doctor reports the active input in hexadecimal.
+    ///
+    /// This is the READ code — the value the panel reports on VCP 0x60 when
+    /// this input is active. Most panels use the same code for both read and
+    /// write, but some (e.g. certain AOC AGON panels) accept a different value
+    /// on the write path.  Use `shared_input_write_code` when write differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_input_code: Option<u8>,
+
+    /// DDC/CI input-source value to WRITE when selecting this machine's input.
+    ///
+    /// Defaults to `shared_input_code`; set only when the panel accepts a
+    /// different code on `setvcp 60` than it reports on `getvcp 60`.  The
+    /// ownership poll always compares observations against `shared_input_code`
+    /// (the read side).  The claim write path and the requester's on-wire code
+    /// both use this override when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_input_write_code: Option<u8>,
 
     /// KVM hand-off actions run around release and acquire transitions.
     #[serde(default)]

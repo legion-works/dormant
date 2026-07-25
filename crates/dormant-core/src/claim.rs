@@ -904,6 +904,25 @@ mod tests {
                 .all(|frame| frame.contains("recipient_instance_id"))
         );
     }
+
+    #[test]
+    fn two_successive_increasing_counters_are_both_accepted() {
+        // Regression test for a defect where the outbound counter was
+        // never incremented, so every claim request after the first
+        // was rejected by the peer's replay window.
+        let mut window = ReplayWindow::new(64);
+        assert!(window.accept_frame(1, "req-1"));
+        assert!(window.accept_frame(2, "req-2"));
+    }
+
+    #[test]
+    fn replay_window_rejects_frozen_counter_on_second_frame() {
+        // Mutation-prove the counter fix: if the counter is frozen
+        // (the old bug), the second frame is rejected.
+        let mut window = ReplayWindow::new(64);
+        assert!(window.accept_frame(1, "req-1"));
+        assert!(!window.accept_frame(1, "req-2"));
+    }
 }
 
 // ── Activity-claim policy logic ────────────────────────────────────────────────

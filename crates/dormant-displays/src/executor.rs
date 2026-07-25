@@ -836,6 +836,7 @@ mod tests {
             controllers: vec!["command".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,

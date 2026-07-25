@@ -290,6 +290,7 @@ mod dispatch_gate_tests {
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
             controllers: vec!["ddcci".into()],
             blank_mode: Some(dormant_core::types::BlankMode::PowerOff),
             degraded_mode: None,

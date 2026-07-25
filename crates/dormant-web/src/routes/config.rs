@@ -614,6 +614,7 @@ mod tests {
             DisplayConfig {
                 scope: dormant_core::config::DisplayScope::default(),
                 shared_input_code: None,
+                shared_input_write_code: None,
                 hooks: dormant_core::config::HookSlots::default(),
                 controllers: vec!["kwin-dpms".into()],
                 blank_mode: None,
@@ -958,6 +959,7 @@ field = "/val"
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
             hooks: dormant_core::config::HookSlots::default(),
             controllers: vec![controller.into()],
             blank_mode: None,

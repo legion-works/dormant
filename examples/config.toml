@@ -327,6 +327,7 @@ wake_retry_interval = "60s"
 # blank_mode = "power_off"
 # scope = "shared"
 # shared_input_code = 0x0f       # doctor prints the active input in hex
+# shared_input_write_code = 0x15 # only needed when panel write differs from read
 #
 # [displays.shared_oled.hooks]
 # # before_release — entries fire in order BEFORE releasing the panel to the

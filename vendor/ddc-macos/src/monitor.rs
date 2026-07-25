@@ -351,6 +351,48 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "changes the physical display input and must be run with the operator present"]
+    fn live_input_source_0x60_write_lands_and_restores_desktop() {
+        const DESKTOP_INPUT: u16 = 0x0f;
+        const MAC_INPUT: u16 = 0x10;
+
+        fn read_input_source(monitor: &mut Monitor) -> Option<u16> {
+            use ddc::Ddc;
+            monitor.get_vcp_feature(0x60).ok().map(|vcp| vcp.value())
+        }
+
+        fn write_and_read(monitor: &mut Monitor, value: u16) -> u16 {
+            use ddc::Ddc;
+            monitor
+                .set_vcp_feature(0x60, value)
+                .expect("input-source write should be acknowledged");
+            monitor
+                .get_vcp_feature(0x60)
+                .expect("input-source readback should succeed")
+                .value()
+        }
+
+        let mut monitor = Monitor::enumerate()
+            .expect("enumerating DDC/CI displays should succeed")
+            .into_iter()
+            .next()
+            .expect("a physical DDC/CI display should be available");
+
+        let before = read_input_source(&mut monitor)
+            .expect("input-source baseline read should succeed");
+        println!("before input source: 0x{before:02x}");
+        let written = write_and_read(&mut monitor, MAC_INPUT);
+        println!("after Mac write input source: 0x{written:02x}");
+
+        let restored = write_and_read(&mut monitor, DESKTOP_INPUT);
+        println!("after desktop restore input source: 0x{restored:02x}");
+
+        assert_eq!(written, MAC_INPUT, "the Mac-input write did not land");
+        assert_eq!(restored, DESKTOP_INPUT, "the desktop input was not restored");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "requires a physical DDC/CI display"]
     fn live_input_source_0x60_reads_current_input() {
         let mut monitor = Monitor::enumerate()

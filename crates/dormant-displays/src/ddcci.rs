@@ -604,9 +604,8 @@ impl DisplayController for DdcciController {
 
     /// Select the active input source with VCP `0x60` at command priority.
     ///
-    /// The requester polls its own `0x60` value to confirm a KVM handoff, so
-    /// this deliberately does not add a readback transaction that would
-    /// double physical DDC traffic.
+    /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is
+    /// therefore conditional on an immediate command-priority readback of the requested value.
     async fn write_input_source(&self, code: u8) -> Result<(), CmdFailure> {
         let (ident, lock) = {
             let state = self.state.lock().unwrap();
@@ -633,7 +632,27 @@ impl DisplayController for DdcciController {
             .map_err(|error| CmdFailure {
                 controller: Self::NAME.to_string(),
                 error: format!("{E_DISPLAY_IO}: failed to set input source: {error}"),
-            })
+            })?;
+
+        let readback = self
+            .ops
+            .get_vcp(&ident, VCP_INPUT_SOURCE, &lock, VcpPriority::Command)
+            .await
+            .map_err(|error| CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!(
+                    "{E_DISPLAY_IO}: input-source write verification read failed on {ident}: {error}"
+                ),
+            })?;
+        if readback != u16::from(code) {
+            return Err(CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!(
+                    "{E_DISPLAY_IO}: input-source write verification mismatch on {ident}: wrote 0x{code:02x}, read back 0x{readback:02x}"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Read the panel's cumulative usage-hours counter (VCP `0xC0`,
@@ -2014,6 +2033,7 @@ mod tests {
         ctrl.probe().await.unwrap();
         let _ = fake.take_call_log();
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x12, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x12));
 
         ctrl.write_input_source(0x12).await.unwrap();
 
@@ -2023,7 +2043,111 @@ mod tests {
         );
         assert_eq!(
             fake.take_call_log(),
-            vec![format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 18)")]
+            vec![
+                format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 18)"),
+                format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_input_source_errors_when_readback_disagrees() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x0f));
+
+        let error = ctrl.write_input_source(0x10).await.unwrap_err();
+
+        assert!(
+            error
+                .error
+                .contains("input-source write verification mismatch")
+        );
+        assert!(error.error.contains("wrote 0x10, read back 0x0f"));
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 16)"),
+                format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_input_source_errors_when_readback_fails() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Err("transient read error".into()));
+
+        let error = ctrl.write_input_source(0x10).await.unwrap_err();
+
+        assert!(
+            error
+                .error
+                .contains("input-source write verification read failed")
+        );
+        assert!(error.error.contains("transient read error"));
+    }
+
+    #[tokio::test]
+    async fn write_input_source_succeeds_when_readback_matches() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x10));
+
+        ctrl.write_input_source(0x10).await.unwrap();
+
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 16)"),
+                format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+            ]
         );
     }
 
@@ -2048,6 +2172,7 @@ mod tests {
             .panel_lock_for_test()
             .expect("a probed DdcciController has resolved a panel lock");
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x12, Ok(()));
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x12));
 
         let sampler_guard = lock
             .sampler_try()

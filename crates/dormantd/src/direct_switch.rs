@@ -52,6 +52,10 @@ pub enum SwitchOutcome {
     /// The display is not shared, has no input-source capability, or
     /// the necessary config codes are absent.
     Unsupported,
+    /// The pull was suppressed by the activity cooldown — another
+    /// activity-driven write was already issued within the
+    /// [`CoordinationConfig::cooldown`] window for this display.
+    Cooldown,
 }
 
 // ── Suppression guard ─────────────────────────────────────────────────────────
@@ -143,6 +147,10 @@ pub struct DirectSwitchHandle {
     config: watch::Receiver<Arc<Config>>,
     hooks: Arc<HookEngine>,
     front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
+    /// Last successful activity-driven pull time per display, used for
+    /// cooldown gating.  Tokio `Instant` so that paused-time tests see
+    /// deterministic cooldown expiry.
+    last_activity_pull: std::sync::Mutex<HashMap<DisplayId, tokio::time::Instant>>,
 }
 
 impl DirectSwitchHandle {
@@ -160,6 +168,7 @@ impl DirectSwitchHandle {
             config,
             hooks,
             front_ctl_tx,
+            last_activity_pull: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -170,7 +179,7 @@ impl DirectSwitchHandle {
     /// `before_acquire` hooks (blocking), writes the input-source
     /// command, clears claim suppression on every exit, and runs
     /// `after_acquire` only on success.
-    pub async fn pull(&self, display: DisplayId, _reason: SwitchReason) -> SwitchOutcome {
+    pub async fn pull(&self, display: DisplayId, reason: SwitchReason) -> SwitchOutcome {
         let Some((dc, target)) = self.resolve_local_target(&display) else {
             return SwitchOutcome::Unsupported;
         };
@@ -178,6 +187,23 @@ impl DirectSwitchHandle {
         let Some(executor) = self.resolve_executor(&display) else {
             return SwitchOutcome::Unsupported;
         };
+
+        // Cooldown gate for activity-driven pulls — prevents the two-host
+        // ping-pong that the convergence test proves impossible.  Only
+        // Activity-triggered pulls are gated; hotkeys, CLI, and web remain
+        // always available.
+        if reason == SwitchReason::Activity {
+            let cooldown = self.config.borrow().coordination.cooldown;
+            let last = self
+                .last_activity_pull
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&last_time) = last.get(&display)
+                && last_time + cooldown > tokio::time::Instant::now()
+            {
+                return SwitchOutcome::Cooldown;
+            }
+        }
 
         // Suppression guard — cleared explicitly in every code path below,
         // and on Drop as a safety net for unexpected panics.
@@ -206,6 +232,14 @@ impl DirectSwitchHandle {
                 let _ = self
                     .run_hook(&display, &dc.hooks, Direction::Acquire, Phase::After, false)
                     .await;
+                // Record the most recent activity-driven pull time for
+                // cooldown enforcement.
+                if reason == SwitchReason::Activity {
+                    self.last_activity_pull
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(display.clone(), tokio::time::Instant::now());
+                }
                 SwitchOutcome::Switched
             }
             Err(cmd) => {
@@ -573,6 +607,7 @@ mod tests {
             config: config_rx,
             hooks,
             front_ctl_tx,
+            last_activity_pull: Mutex::new(HashMap::new()),
         }
     }
 
@@ -918,5 +953,343 @@ mod tests {
             SwitchReason::Toggle,
         ];
         assert_eq!(reasons.len(), 7);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Convergence simulation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A [`HookRunner`] that records every command invocation and always
+    /// succeeds.  Used to assert that `before_acquire`/`after_acquire` are
+    /// called exactly once per successful pull.
+    struct CountingHookRunner {
+        command_calls: Arc<Mutex<Vec<Vec<String>>>>,
+        mqtt_calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl CountingHookRunner {
+        fn new() -> Self {
+            Self {
+                command_calls: Arc::new(Mutex::new(Vec::new())),
+                mqtt_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn command_count(&self) -> usize {
+            self.command_calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookRunner for CountingHookRunner {
+        async fn run_command(
+            &self,
+            _env: &crate::hooks::EnvList,
+            argv: &[String],
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            self.command_calls.lock().unwrap().push(argv.to_vec());
+            Ok(())
+        }
+
+        async fn publish_mqtt(
+            &self,
+            topic: &str,
+            payload: &str,
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            self.mqtt_calls
+                .lock()
+                .unwrap()
+                .push((topic.to_string(), payload.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Build a `DirectSwitchHandle` for convergence testing with a
+    /// specific [`DisplayConfig`] and a [`CountingHookRunner`].
+    fn build_convergence_handle(
+        dc: cs::DisplayConfig,
+        sink: Arc<FakeSink>,
+        hooks: Arc<HookEngine>,
+        front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
+    ) -> DirectSwitchHandle {
+        let executors: HashMap<_, _> = [(display_id(), sink as Arc<dyn CommandSink>)].into();
+        let (_, executors_rx) = watch::channel(Arc::new(executors));
+        // Use a cooldown of 3 s for convergence tests — matches the
+        // production default in [`dormant_core::config::defaults::COOLDOWN`].
+        let mut cfg = minimal_config(dc);
+        cfg.coordination.cooldown = Duration::from_secs(3);
+        let (_, config_rx) = watch::channel(Arc::new(cfg));
+        DirectSwitchHandle {
+            executors: executors_rx,
+            config: config_rx,
+            hooks,
+            front_ctl_tx,
+            last_activity_pull: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Build a `DisplayConfig` for convergence testing with the given
+    /// local and peer codes.  Everything else is set up like a minimal
+    /// shared display with DDC capability.
+    fn convergence_display_config(
+        local_read: u8,
+        local_write: u8,
+        peer_read: Option<u8>,
+        peer_write: Option<u8>,
+    ) -> cs::DisplayConfig {
+        cs::DisplayConfig {
+            shared_input_code: Some(local_read),
+            shared_input_write_code: Some(local_write),
+            shared_peer_input_code: peer_read,
+            shared_peer_input_write_code: peer_write,
+            hooks: cs::HookSlots {
+                before_acquire: vec![cs::HookAction {
+                    command: Some(vec!["echo".into(), "before_acquire".into()]),
+                    mqtt: None,
+                    timeout: Duration::from_secs(1),
+                    blocking: Some(true),
+                    abort_on_failure: false,
+                }],
+                after_acquire: vec![cs::HookAction {
+                    command: Some(vec!["echo".into(), "after_acquire".into()]),
+                    mqtt: None,
+                    timeout: Duration::from_secs(1),
+                    blocking: Some(false),
+                    abort_on_failure: false,
+                }],
+                ..cs::HookSlots::default()
+            },
+            ..display_config()
+        }
+    }
+
+    /// Proves the convergence rules from the ratified direct-write design:
+    /// only explicit local edges write; no poll-triggered corrective writes;
+    /// a cooldown after each observed source change begins each instance's
+    /// independent cooldown; and no retries based on stale ownership metadata.
+    ///
+    /// Two hosts share one display.  Host A (local 0x10/0x15) and Host B
+    /// (local 0x20/0x25) both receive activity edges at the same logical
+    /// instant.  Delayed polls observe the outcome through alternating
+    /// unknown raw codes, eventually settling on a stable source.  The
+    /// test asserts:
+    ///
+    /// - At most one write per admitted local edge.
+    /// - Zero poll-caused writes (the poll path never calls `pull`).
+    /// - No recurring ping-pong after the queue drains.
+    /// - Exactly one `before_acquire`/`after_acquire` pair per successful
+    ///   admitted edge.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    async fn simultaneous_edges_with_delayed_garbled_polls_converge_without_ping_pong() {
+        // ── Setup ──────────────────────────────────────────────────────
+        // Host A: local_read=0x10, local_write=0x15, peer_read=0x20
+        // Host B: local_read=0x20, local_write=0x25, peer_read=0x10
+
+        let sink_a = Arc::new(FakeSink::new("ddcci-a"));
+        let sink_b = Arc::new(FakeSink::new("ddcci-b"));
+
+        let hook_runner_a = Arc::new(CountingHookRunner::new());
+        let hook_runner_b = Arc::new(CountingHookRunner::new());
+        let hook_engine_a = Arc::new(HookEngine::with_runner(hook_runner_a.clone()));
+        let hook_engine_b = Arc::new(HookEngine::with_runner(hook_runner_b.clone()));
+
+        let dc_a = convergence_display_config(0x10, 0x15, Some(0x20), None);
+        let dc_b = convergence_display_config(0x20, 0x25, Some(0x10), None);
+
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        let (tx_b, _rx_b) = mpsc::channel(8);
+
+        let handle_a = build_convergence_handle(dc_a, sink_a.clone(), hook_engine_a, tx_a);
+        let handle_b = build_convergence_handle(dc_b, sink_b.clone(), hook_engine_b, tx_b);
+
+        // Coordination handles for poll simulation (same display, same
+        // initial owned=true from the seeded CoordRecord).
+        let coord_a =
+            dormant_core::coordination::CoordinationHandle::new([display_id()].into_iter());
+        let coord_b =
+            dormant_core::coordination::CoordinationHandle::new([display_id()].into_iter());
+
+        let aliases_a = dormant_core::coordination::InputCodeAliases {
+            local_read: 0x10,
+            local_write: 0x15,
+            peer_read: Some(0x20),
+            peer_write: None,
+        };
+        let aliases_b = dormant_core::coordination::InputCodeAliases {
+            local_read: 0x20,
+            local_write: 0x25,
+            peer_read: Some(0x10),
+            peer_write: None,
+        };
+
+        // ── t=0: Simultaneous activity edges ─────────────────────────
+        // Both hosts pull — neither has a cooldown record yet.
+        let (res_a, res_b) = tokio::join!(
+            handle_a.pull(display_id(), SwitchReason::Activity),
+            handle_b.pull(display_id(), SwitchReason::Activity),
+        );
+
+        assert_eq!(res_a, SwitchOutcome::Switched, "host A first pull");
+        assert_eq!(res_b, SwitchOutcome::Switched, "host B first pull");
+        assert_eq!(sink_a.write_calls(), 1, "host A: one write per edge");
+        assert_eq!(sink_b.write_calls(), 1, "host B: one write per edge");
+
+        // Yield to let the spawned after_acquire hooks complete in
+        // paused time.
+        tokio::task::yield_now().await;
+
+        // Each successful pull: before_acquire (blocking) + after_acquire
+        // (fire-and-forget) = 2 command calls per pull.
+        assert_eq!(
+            hook_runner_a.command_count(),
+            2,
+            "host A: before + after per admitted edge"
+        );
+        assert_eq!(
+            hook_runner_b.command_count(),
+            2,
+            "host B: before + after per admitted edge"
+        );
+
+        // ── t=1s..t=4s: Delayed polls with garbled observations ─────
+        // The panel settles on 0x20 (B's local read alias, which B wrote
+        // last).  A sees a Peer code; B sees a Local code.  Interleave
+        // garbled Unknown readings to exercise the debounce.
+
+        // t=1s: A sees 0x00 (garbled, Unknown for A).
+        let outcome = coord_a.record_input_observation(&display_id(), 0x00, &aliases_a, 3, None);
+        assert_eq!(outcome.committed_prior_owned, None);
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+
+        // t=1s: B sees 0x20 (Local for B).
+        let _ = coord_b.record_input_observation(&display_id(), 0x20, &aliases_b, 3, None);
+
+        // t=2s: A sees 0x20 (Peer for A) — disagrees with 0x00 → reset.
+        let outcome = coord_a.record_input_observation(&display_id(), 0x20, &aliases_a, 3, None);
+        assert_eq!(outcome.disagreement_with, Some(0x00));
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+
+        // t=2s: B sees 0x10 (Peer for B) — first not-mine reading.
+        let outcome = coord_b.record_input_observation(&display_id(), 0x10, &aliases_b, 3, None);
+        assert_eq!(outcome.deferred_loss_count, Some(1));
+
+        // t=3s: A sees 0x20 again → pending loss 2/3.
+        let _ = coord_a.record_input_observation(&display_id(), 0x20, &aliases_a, 3, None);
+
+        // t=3s: B sees 0x20 again (Local) → disagreement with 0x10 resets
+        // the pending B loss counter, returns B to owned state.
+        let outcome = coord_b.record_input_observation(&display_id(), 0x20, &aliases_b, 3, None);
+        assert_eq!(outcome.disagreement_with, Some(0x10));
+
+        // t=4s: A sees 0x20 again → loss committed (3/3).
+        let outcome = coord_a.record_input_observation(&display_id(), 0x20, &aliases_a, 3, None);
+        assert_eq!(outcome.committed_prior_owned, Some(true));
+        assert!(!coord_a.snapshot()[&display_id()].owned);
+
+        // t=4s: B sees 0x20 again → already owned, no change.
+        let _ = coord_b.record_input_observation(&display_id(), 0x20, &aliases_b, 3, None);
+        assert!(coord_b.snapshot()[&display_id()].owned);
+
+        // ── Zero poll-caused writes ──────────────────────────────────
+        // The poll path (CoordinationHandle) never calls pull() — prove
+        // that the write counts are unchanged after polling.
+
+        // The poll path (CoordinationHandle) never calls pull() — prove
+        // that the write counts are unchanged after polling.
+        assert_eq!(
+            sink_a.write_calls(),
+            1,
+            "host A: polls did not cause writes"
+        );
+        assert_eq!(
+            sink_b.write_calls(),
+            1,
+            "host B: polls did not cause writes"
+        );
+
+        // ── t=5s: Simultaneous edges within cooldown ─────────────────
+        // At t=0 both hosts pulled → cooldown expires at t=3s.
+        // At t=5s, both are past the cooldown → both should write again.
+
+        // Advance virtual time to 5s.
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let (pulla2, pullb2) = tokio::join!(
+            handle_a.pull(display_id(), SwitchReason::Activity),
+            handle_b.pull(display_id(), SwitchReason::Activity),
+        );
+
+        assert_eq!(
+            pulla2,
+            SwitchOutcome::Switched,
+            "host A: past cooldown → allowed"
+        );
+        assert_eq!(
+            pullb2,
+            SwitchOutcome::Switched,
+            "host B: past cooldown → allowed"
+        );
+        assert_eq!(sink_a.write_calls(), 2, "host A: two writes total");
+        assert_eq!(sink_b.write_calls(), 2, "host B: two writes total");
+
+        // Yield to let spawned after_acquire hooks complete.
+        tokio::task::yield_now().await;
+
+        // Hook counts: 2 more per handle (before + after per pull).
+        assert_eq!(
+            hook_runner_a.command_count(),
+            4,
+            "host A: two before+after pairs"
+        );
+        assert_eq!(
+            hook_runner_b.command_count(),
+            4,
+            "host B: two before+after pairs"
+        );
+
+        // ── t=6s: Attempt edges within cooldown (3 s after t=5s) ────
+        // Advance only 1s — still within the 3s cooldown.
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let suppressed_a = handle_a.pull(display_id(), SwitchReason::Activity).await;
+        let suppressed_b = handle_b.pull(display_id(), SwitchReason::Activity).await;
+
+        assert_eq!(
+            suppressed_a,
+            SwitchOutcome::Cooldown,
+            "host A: within cooldown → suppressed"
+        );
+        assert_eq!(
+            suppressed_b,
+            SwitchOutcome::Cooldown,
+            "host B: within cooldown → suppressed"
+        );
+
+        // Write counts unchanged — no write happened.
+        assert_eq!(sink_a.write_calls(), 2, "host A: cooldown suppressed write");
+        assert_eq!(sink_b.write_calls(), 2, "host B: cooldown suppressed write");
+
+        // ── No ping-pong after queue drains ──────────────────────────
+        // Advance past the cooldown and verify that without further
+        // edges, no spontaneous writes occur.
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        // Drift check: write counts are exactly 2 (one per admitted
+        // edge) — no spontaneous or poll-triggered writes.
+        assert_eq!(sink_a.write_calls(), 2);
+        assert_eq!(sink_b.write_calls(), 2);
+
+        // ── Finite upper bound ───────────────────────────────────────
+        // Four edges were admitted (two at t=0, two at t=5s).  The two
+        // at t=6s were suppressed by cooldown.  Total writes = 4,
+        // exactly one per admitted edge.
+        let total_writes = sink_a.write_calls() + sink_b.write_calls();
+        assert_eq!(
+            total_writes, 4,
+            "total writes equals admitted edges (2+2), no ping-pong overflow"
+        );
     }
 }

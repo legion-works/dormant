@@ -932,11 +932,10 @@ async fn negotiated_claim_order_is_release_write_flip_acquire() {
     let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     // Clear the startup writability probe's write.
     harness.clear_sink_writes();
-    // The owner path drives four hook slots in order:
-    // before_release, after_release, before_acquire,
-    // after_acquire. Queue four Completed outcomes so the
-    // engine progresses through to Released.
-    for _ in 0..4 {
+    // The owner path drives two hook slots before release
+    // completes: before_release and after_release.
+    // (before_acquire and after_acquire are requester-side hooks.)
+    for _ in 0..2 {
         harness
             .runner
             .push_completed(/*started*/ 1, /*failed*/ 0, /*spawned*/ 0);
@@ -969,6 +968,17 @@ async fn negotiated_claim_order_is_release_write_flip_acquire() {
         .inject_inbound_for_test(frame)
         .await
         .expect("inject inbound");
+    // The owner is now in WaitForAcquireReady. Inject the
+    // AcquireReady event so the owner proceeds to release.
+    harness
+        .handle
+        .inject_owner_completion_for_test(
+            DisplayId("mon".to_string()),
+            "release-1",
+            dormant_core::claim_engine::OwnerEvent::AcquireReady,
+        )
+        .await
+        .expect("inject AcquireReady");
     // The driver routes the inbound through the
     // OWNER-side begin → SendVerdict → RunBeforeRelease →
     // WriteInput → RunAfterRelease → terminal sequence.
@@ -1045,7 +1055,7 @@ async fn stale_nonce_owner_completion_does_not_advance_current_flight() {
     let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     let before_release = harness.runner.block_next_command();
-    for _ in 0..4 {
+    for _ in 0..2 {
         harness.runner.push_completed(1, 0, 0);
     }
 
@@ -1055,6 +1065,16 @@ async fn stale_nonce_owner_completion_does_not_advance_current_flight() {
         .inject_inbound_for_test(frame)
         .await
         .expect("inject inbound");
+    // Advance past WaitForAcquireReady so the owner reaches before_release.
+    harness
+        .handle
+        .inject_owner_completion_for_test(
+            DisplayId("mon".to_owned()),
+            "current",
+            dormant_core::claim_engine::OwnerEvent::AcquireReady,
+        )
+        .await
+        .expect("inject AcquireReady");
     tokio::time::timeout(Duration::from_secs(2), before_release.entered.notified())
         .await
         .expect("current flight must be waiting for before-release completion");
@@ -1582,24 +1602,26 @@ fn cross_claim_final_value_convergence() {
             now,
         );
     }
-    // Left side observes the flip → RunBeforeAcquire.
-    let actions = left.requester_event(&DisplayId("mon".into()), RequesterEvent::FlipObserved, now);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::RunBeforeAcquire)),
-        "left must drive the acquire sequence; got {actions:?}"
-    );
-    let acquire_completed = left.requester_event(
+    // Left side: AcquireCompleted (from before_acquire hooks) → Watching.
+    // Accepted already emitted RunBeforeAcquire; now complete the transition.
+    let acquire_actions = left.requester_event(
         &DisplayId("mon".into()),
         RequesterEvent::AcquireCompleted,
         now,
     );
     assert!(
-        acquire_completed
+        acquire_actions
+            .iter()
+            .any(|a| matches!(a, Action::WatchForFlip)),
+        "left AcquireCompleted must transition to Watching; got {acquire_actions:?}"
+    );
+    // Left side observes the flip → Success.
+    let actions = left.requester_event(&DisplayId("mon".into()), RequesterEvent::FlipObserved, now);
+    assert!(
+        actions
             .iter()
             .any(|a| matches!(a, Action::Terminal(Terminal::Success))),
-        "left wins the cross-claim; got {acquire_completed:?}"
+        "left wins the cross-claim; got {actions:?}"
     );
     // Right side's deadline elapses → TimedOut + claim_failed.
     let later = now + Duration::from_secs(60);
@@ -2134,6 +2156,10 @@ async fn accepted_claim_response_records_owner_for_idle_report_gate() {
     let display = DisplayId("owner_tracking".to_owned());
     let harness = ClaimHarness::build_with_reachable_silent_peer(&display.0, 0x0f).await;
     harness.coord.record_success(&display, 0x11, 0x0f, None);
+
+    // The requester's Waking phase fires before_acquire hooks.
+    // Queue one Completed outcome so the hook does not abort.
+    harness.runner.push_completed(1, 0, 0);
 
     let result = harness
         .handle

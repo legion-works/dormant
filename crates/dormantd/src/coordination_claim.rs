@@ -495,6 +495,11 @@ impl ClaimTransportHandle {
         self.send_to_peer(peer_instance_id, frame).await;
     }
 
+    /// Best-effort delivery of a signed acquire-ready frame to one peer.
+    pub async fn send_acquire_ready(&self, peer_instance_id: &str, frame: &ClaimFrame) {
+        self.send_to_peer(peer_instance_id, frame).await;
+    }
+
     /// Best-effort delivery of a signed response frame to one peer.
     /// Used by the owner-side `IdleQuery` handler to reply with an
     /// `IdleReport` and by any future point-to-point response path.

@@ -70,6 +70,8 @@ pub enum ClaimMessage {
     ReleaseFailed(ReleaseFailed),
     /// Cancel a request before the owner starts its release sequence.
     ClaimAbort(ClaimAbort),
+    /// Confirm the requester's `before_acquire` hooks completed and its output is live.
+    ClaimAcquireReady(ClaimAcquireReady),
     /// Ask an owner for its local idle duration.
     IdleQuery(IdleQuery),
     /// Report an owner's local idle duration.
@@ -155,6 +157,15 @@ pub struct ReleaseFailed {
 pub struct ClaimAbort {
     /// Nonce of the request to abort.
     pub nonce: String,
+}
+
+/// Requester confirmation: `before_acquire` hooks completed and the output is live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimAcquireReady {
+    /// Nonce (frame nonce, not the request nonce) for correlation.
+    pub nonce: String,
+    /// Nonce of the original claim request — the owner matches this against its active flight.
+    pub request_nonce: String,
 }
 
 /// Query for the current owner's idle duration.
@@ -441,6 +452,11 @@ fn append_message(payload: &mut Vec<u8>, message: &ClaimMessage) -> Result<(), C
         ClaimMessage::ClaimAbort(abort) => {
             append_string(payload, "claim_abort", "message_type")?;
             append_string(payload, &abort.nonce, "abort_nonce")
+        }
+        ClaimMessage::ClaimAcquireReady(ready) => {
+            append_string(payload, "claim_acquire_ready", "message_type")?;
+            append_string(payload, &ready.nonce, "acquire_ready_nonce")?;
+            append_string(payload, &ready.request_nonce, "acquire_ready_request_nonce")
         }
         ClaimMessage::IdleQuery(query) => {
             append_string(payload, "idle_query", "message_type")?;

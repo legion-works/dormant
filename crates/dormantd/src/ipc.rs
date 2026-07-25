@@ -513,6 +513,7 @@ fn failure_reason_tag(failure: &dormant_core::claim_engine::ClaimFailure) -> &'s
         ClaimFailure::StaleEpoch => "stale_epoch",
         ClaimFailure::Denied(_) => "denied",
         ClaimFailure::ReleaseFailed(_) => "release_failed",
+        ClaimFailure::AcquireFailed(_) => "acquire_failed",
     }
 }
 

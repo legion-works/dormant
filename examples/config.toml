@@ -342,3 +342,14 @@ wake_retry_interval = "60s"
 # after_acquire = [
 #   { command = ["notify-send", "panel acquired"], timeout = "5s", blocking = false },
 # ]
+# # before_acquire — entries fire BEFORE the owner writes VCP 0x60.
+# # This is the REQUIRER wake-and-verify slot: wake the machine's video
+# # output so the panel will accept the input switch (see the
+# # signal-presence law in docs/src/multi-machine.md). A blocking entry
+# # must complete before the owner releases the panel.
+# before_acquire = [
+#   # Linux: force DPMS on
+#   { command = ["xset", "dpms", "force", "on"], timeout = "5s", blocking = true },
+#   # macOS: prevent display sleep + verify CGDisplayIsAsleep returns false
+#   { command = ["caffeinate", "-u", "-t", "2"], timeout = "5s", blocking = true },
+# ]

@@ -7,7 +7,7 @@ use crate::claim::{ClaimDeniedReason, ClaimVerdict, release_deadline};
 use crate::types::DisplayId;
 
 /// Literal transition anchors emitted by the claim engine.
-pub const CLAIM_EVENTS: [&str; 10] = [
+pub const CLAIM_EVENTS: [&str; 13] = [
     "claim_requested",
     "claim_accepted",
     "claim_denied",
@@ -18,6 +18,9 @@ pub const CLAIM_EVENTS: [&str; 10] = [
     "claim_fallback_direct",
     "claim_failed",
     "claim_completed",
+    "claim_acquire_failed",
+    "claim_acquire_ready",
+    "claim_acquire_wait_expired",
 ];
 
 /// Requester-side phase for one display.
@@ -27,6 +30,11 @@ pub enum RequesterStage {
     Broadcasting,
     /// Fan-out completed and peer verdicts are being collected.
     AwaitingAck,
+    /// Wake-and-verify hooks are running before the owner writes.
+    Waking {
+        /// Release deadline computed from the owner's eta hint.
+        deadline: Instant,
+    },
     /// An owner accepted; hardware observation is authoritative from here.
     Watching {
         /// UX deadline for the negotiated release.
@@ -37,7 +45,7 @@ pub enum RequesterStage {
 /// Owner-side phase for one display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerStage {
-    /// `Accepted` was emitted before any release work.
+    /// `Accepted` was emitted; waiting for the requester's `AcquireReady`.
     AckSent,
     /// Wake, hooks, and input write are being sequenced.
     Releasing,
@@ -71,6 +79,8 @@ pub enum ClaimFailure {
     Denied(ClaimDeniedReason),
     /// The owner reported that release failed.
     ReleaseFailed(String),
+    /// The `before_acquire` hook aborted; output is not live.
+    AcquireFailed(String),
 }
 
 /// Pure interpretation of the daemon hook runner's outcome.
@@ -129,6 +139,11 @@ pub enum RequesterEvent {
     FlipObserved,
     /// The acquire hook and wake sequence completed.
     AcquireCompleted,
+    /// The `before_acquire` hook aborted; output is not live.
+    AcquireFailed {
+        /// Operator-visible hook-abort reason.
+        reason: String,
+    },
     /// An accepted owner pushed a release failure.
     ReleaseFailed {
         /// Request correlation nonce copied by the owner.
@@ -180,6 +195,8 @@ pub enum OwnerEvent {
     WriteFailed(String),
     /// The normal `after_release` slot completed.
     AfterReleaseCompleted,
+    /// The requester confirmed `before_acquire` hooks completed.
+    AcquireReady,
     /// A requester sent a best-effort abort.
     AbortReceived {
         /// Request correlation nonce copied by the requester.
@@ -267,6 +284,8 @@ pub enum Action {
     EnterDeferred,
     /// Run the requester acquire sequence after a confirmed flip.
     RunBeforeAcquire,
+    /// Send a `ClaimAcquireReady` frame to the owner.
+    SendAcquireReady,
     /// Publish a terminal result after cleanup.
     Terminal(Terminal),
 }
@@ -291,12 +310,13 @@ struct RequesterFlight {
     expected_peers: usize,
     busy_retried: bool,
     epoch_retried: bool,
-    flip_observed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerProgress {
     Ack,
+    /// Waiting for the requester to confirm `before_acquire` completion.
+    WaitForAcquireReady,
     Wake,
     BeforeRelease,
     Write,
@@ -365,7 +385,6 @@ impl ClaimEngine {
                 expected_peers: peer_count,
                 busy_retried: false,
                 epoch_retried: false,
-                flip_observed: false,
             }),
         );
         vec![Action::Trace("claim_requested"), Action::BroadcastRequest]
@@ -496,7 +515,9 @@ impl ClaimEngine {
             .get(display)
             .is_some_and(|flight| match flight {
                 Flight::Requester(flight) => match flight.stage {
-                    RequesterStage::Watching { deadline } => now < deadline,
+                    RequesterStage::Waking { deadline } | RequesterStage::Watching { deadline } => {
+                        now < deadline
+                    }
                     RequesterStage::Broadcasting | RequesterStage::AwaitingAck => {
                         now < flight.request_deadline
                     }
@@ -512,14 +533,20 @@ impl ClaimEngine {
         };
         let (deadline, role) = match flight {
             Flight::Requester(flight) => match flight.stage {
-                RequesterStage::Watching { deadline } => {
+                RequesterStage::Waking { deadline } | RequesterStage::Watching { deadline } => {
                     (deadline, DeadlineRole::RequesterAccepted)
                 }
                 RequesterStage::Broadcasting | RequesterStage::AwaitingAck => {
                     (flight.request_deadline, DeadlineRole::RequesterUnaccepted)
                 }
             },
-            Flight::Owner(flight) => (flight.deadline, DeadlineRole::Owner),
+            Flight::Owner(flight) => {
+                let role = match flight.progress {
+                    OwnerProgress::WaitForAcquireReady => DeadlineRole::OwnerWaitExpired,
+                    _ => DeadlineRole::Owner,
+                };
+                (flight.deadline, role)
+            }
         };
         if now < deadline {
             return Vec::new();
@@ -541,6 +568,11 @@ impl ClaimEngine {
                 Action::SendReleaseFailed,
                 Action::Terminal(Terminal::TimedOut),
             ],
+            DeadlineRole::OwnerWaitExpired => vec![
+                Action::Trace("claim_acquire_wait_expired"),
+                Action::SendReleaseFailed,
+                Action::Terminal(Terminal::TimedOut),
+            ],
         }
     }
 }
@@ -550,6 +582,7 @@ enum DeadlineRole {
     RequesterUnaccepted,
     RequesterAccepted,
     Owner,
+    OwnerWaitExpired,
 }
 
 fn requester_transition(
@@ -592,13 +625,24 @@ fn requester_transition(
                 Action::AttemptFallback,
             ]
         }
-        (RequesterStage::Watching { .. }, RequesterEvent::FlipObserved) => {
-            flight.flip_observed = true;
-            vec![Action::RunBeforeAcquire]
+        (RequesterStage::Waking { deadline }, RequesterEvent::AcquireCompleted) => {
+            flight.stage = RequesterStage::Watching { deadline };
+            vec![
+                Action::Trace("claim_acquire_ready"),
+                Action::SendAcquireReady,
+                Action::WatchForFlip,
+            ]
         }
-        (RequesterStage::Watching { .. }, RequesterEvent::AcquireCompleted)
-            if flight.flip_observed =>
-        {
+        (RequesterStage::Waking { .. }, RequesterEvent::AcquireFailed { reason }) => {
+            let result = Terminal::Failed(ClaimFailure::AcquireFailed(reason));
+            *terminal = Some(result.clone());
+            vec![
+                Action::Trace("claim_acquire_failed"),
+                Action::SendAbort,
+                Action::Terminal(result),
+            ]
+        }
+        (RequesterStage::Watching { .. }, RequesterEvent::FlipObserved) => {
             *terminal = Some(Terminal::Success);
             terminal_actions("claim_completed", Terminal::Success)
         }
@@ -633,10 +677,10 @@ fn requester_response(
     match verdict {
         ClaimVerdict::Accepted { eta_ms } => {
             let bound = release_deadline(Duration::from_millis(eta_ms), poll_interval, release_cap);
-            flight.stage = RequesterStage::Watching {
+            flight.stage = RequesterStage::Waking {
                 deadline: now + bound,
             };
-            vec![Action::Trace("claim_accepted"), Action::WatchForFlip]
+            vec![Action::Trace("claim_accepted"), Action::RunBeforeAcquire]
         }
         ClaimVerdict::NotOwner => {
             // F1: per-peer dedup. A single paired peer that
@@ -699,6 +743,10 @@ fn owner_transition(flight: &mut OwnerFlight, event: OwnerEvent) -> (Vec<Action>
     match (flight.progress, event) {
         (OwnerProgress::Ack, OwnerEvent::AckDelivered) => {
             flight.stage = OwnerStage::Releasing;
+            flight.progress = OwnerProgress::WaitForAcquireReady;
+            (Vec::new(), false)
+        }
+        (OwnerProgress::WaitForAcquireReady, OwnerEvent::AcquireReady) => {
             if flight.standby {
                 flight.progress = OwnerProgress::Wake;
                 (vec![Action::WakeDisplay], false)
@@ -731,6 +779,18 @@ fn owner_transition(flight: &mut OwnerFlight, event: OwnerEvent) -> (Vec<Action>
             ],
             true,
         ),
+        (OwnerProgress::WaitForAcquireReady, OwnerEvent::AbortReceived { nonce })
+            if nonce == flight.nonce =>
+        {
+            (
+                vec![
+                    Action::Trace("claim_release_aborted"),
+                    Action::SendReleaseFailed,
+                    Action::Terminal(Terminal::ReleaseAborted),
+                ],
+                true,
+            )
+        }
         (OwnerProgress::Write, OwnerEvent::WriteSucceeded) => {
             flight.progress = OwnerProgress::AfterRelease;
             (vec![Action::RunAfterRelease { aborted: false }], false)
@@ -837,18 +897,22 @@ mod tests {
         );
         assert_eq!(
             actions,
-            vec![Action::Trace("claim_accepted"), Action::WatchForFlip]
+            vec![Action::Trace("claim_accepted"), Action::RunBeforeAcquire]
         );
         assert!(matches!(
             engine.requester_stage(&display()),
-            Some(RequesterStage::Watching { .. })
+            Some(RequesterStage::Waking { .. })
         ));
         assert_eq!(
-            engine.requester_event(&display(), RequesterEvent::FlipObserved, start),
-            vec![Action::RunBeforeAcquire]
+            engine.requester_event(&display(), RequesterEvent::AcquireCompleted, start),
+            vec![
+                Action::Trace("claim_acquire_ready"),
+                Action::SendAcquireReady,
+                Action::WatchForFlip,
+            ]
         );
         assert_eq!(
-            engine.requester_event(&display(), RequesterEvent::AcquireCompleted, start),
+            engine.requester_event(&display(), RequesterEvent::FlipObserved, start),
             vec![
                 Action::Trace("claim_completed"),
                 Action::Terminal(Terminal::Success)
@@ -1003,11 +1067,17 @@ mod tests {
             ]
         );
         assert_eq!(engine.owner_stage(&display()), Some(OwnerStage::AckSent));
-        assert_eq!(
-            engine.owner_event(&display(), OwnerEvent::AckDelivered),
-            vec![Action::RunBeforeRelease]
+        assert!(
+            engine
+                .owner_event(&display(), OwnerEvent::AckDelivered)
+                .is_empty(),
+            "AckDelivered must not proceed to release before AcquireReady"
         );
         assert_eq!(engine.owner_stage(&display()), Some(OwnerStage::Releasing));
+        assert_eq!(
+            engine.owner_event(&display(), OwnerEvent::AcquireReady),
+            vec![Action::RunBeforeRelease]
+        );
         assert_eq!(
             engine.owner_event(&display(), OwnerEvent::BeforeRelease(HookResult::Completed)),
             vec![Action::WriteInput]
@@ -1039,6 +1109,7 @@ mod tests {
 
         engine.begin_owner(owner_request(), "hook", start, Duration::from_secs(45));
         engine.owner_event(&display(), OwnerEvent::AckDelivered);
+        engine.owner_event(&display(), OwnerEvent::AcquireReady);
         assert_eq!(
             engine.owner_event(&display(), OwnerEvent::BeforeRelease(HookResult::Aborted)),
             vec![
@@ -1050,6 +1121,7 @@ mod tests {
 
         engine.begin_owner(owner_request(), "write", start, Duration::from_secs(45));
         engine.owner_event(&display(), OwnerEvent::AckDelivered);
+        engine.owner_event(&display(), OwnerEvent::AcquireReady);
         engine.owner_event(&display(), OwnerEvent::BeforeRelease(HookResult::Completed));
         assert_eq!(
             engine.owner_event(&display(), OwnerEvent::WriteFailed("ddc failed".into())),
@@ -1174,12 +1246,14 @@ mod tests {
                 .is_empty()
         );
         engine.owner_event(&display(), OwnerEvent::AckDelivered);
+        // In WaitForAcquireReady, a matching abort is accepted.
         assert!(
-            engine
+            !engine
                 .owner_event(&display(), OwnerEvent::abort("owner"))
-                .is_empty()
+                .is_empty(),
+            "abort in WaitForAcquireReady must terminate the flight"
         );
-        assert_eq!(engine.owner_stage(&display()), Some(OwnerStage::Releasing));
+        assert!(engine.owner_stage(&display()).is_none());
     }
 
     #[test]
@@ -1237,8 +1311,14 @@ mod tests {
         let mut request = owner_request();
         request.disposition = OwnerDisposition::Ready { standby: true };
         engine.begin_owner(request, "standby", start, Duration::from_secs(45));
+        assert!(
+            engine
+                .owner_event(&display(), OwnerEvent::AckDelivered)
+                .is_empty(),
+            "AckDelivered must not proceed before AcquireReady"
+        );
         assert_eq!(
-            engine.owner_event(&display(), OwnerEvent::AckDelivered),
+            engine.owner_event(&display(), OwnerEvent::AcquireReady),
             vec![Action::WakeDisplay]
         );
         assert_eq!(
@@ -1261,9 +1341,14 @@ mod tests {
                 start,
             );
         }
+        // Left: Waking → AcquireCompleted → Watching → FlipObserved → Success
         assert_eq!(
-            left.requester_event(&display(), RequesterEvent::FlipObserved, start),
-            vec![Action::RunBeforeAcquire]
+            left.requester_event(&display(), RequesterEvent::AcquireCompleted, start),
+            vec![
+                Action::Trace("claim_acquire_ready"),
+                Action::SendAcquireReady,
+                Action::WatchForFlip,
+            ]
         );
         assert!(
             right
@@ -1271,7 +1356,7 @@ mod tests {
                 .contains(&Action::Trace("claim_failed"))
         );
         assert_eq!(
-            left.requester_event(&display(), RequesterEvent::AcquireCompleted, start),
+            left.requester_event(&display(), RequesterEvent::FlipObserved, start),
             vec![
                 Action::Trace("claim_completed"),
                 Action::Terminal(Terminal::Success),
@@ -1294,6 +1379,9 @@ mod tests {
                 "claim_fallback_direct",
                 "claim_failed",
                 "claim_completed",
+                "claim_acquire_failed",
+                "claim_acquire_ready",
+                "claim_acquire_wait_expired",
             ]
         );
     }
@@ -1304,12 +1392,15 @@ mod tests {
         let stages = [
             RequesterStage::Broadcasting,
             RequesterStage::AwaitingAck,
+            RequesterStage::Waking {
+                deadline: start + Duration::from_secs(5),
+            },
             RequesterStage::Watching {
                 deadline: start + Duration::from_secs(5),
             },
         ];
         for stage in stages {
-            for event_index in 0..7 {
+            for event_index in 0..8 {
                 let mut engine = ClaimEngine::default();
                 engine.flights.insert(
                     display(),
@@ -1321,7 +1412,6 @@ mod tests {
                         expected_peers: 1,
                         busy_retried: false,
                         epoch_retried: false,
-                        flip_observed: event_index == 4,
                     }),
                 );
                 let event = match event_index {
@@ -1330,17 +1420,21 @@ mod tests {
                     2 => RequesterEvent::ClaimTimeout,
                     3 => RequesterEvent::FlipObserved,
                     4 => RequesterEvent::AcquireCompleted,
-                    5 => RequesterEvent::release_failed("n", "failed"),
-                    6 => RequesterEvent::DisplayRemoved,
+                    5 => RequesterEvent::AcquireFailed {
+                        reason: "wake failed".into(),
+                    },
+                    6 => RequesterEvent::release_failed("n", "failed"),
+                    7 => RequesterEvent::DisplayRemoved,
                     _ => unreachable!(),
                 };
                 let before = engine.requester_stage(&display());
                 let actions = engine.requester_event(&display(), event, start);
                 let changed = !actions.is_empty() || engine.requester_stage(&display()) != before;
                 let legal = match stage {
-                    RequesterStage::Broadcasting => matches!(event_index, 0 | 2 | 6),
-                    RequesterStage::AwaitingAck => matches!(event_index, 1 | 2 | 6),
-                    RequesterStage::Watching { .. } => matches!(event_index, 3..=6),
+                    RequesterStage::Broadcasting => matches!(event_index, 0 | 2 | 7),
+                    RequesterStage::AwaitingAck => matches!(event_index, 1 | 2 | 7),
+                    RequesterStage::Waking { .. } => matches!(event_index, 4 | 5 | 7),
+                    RequesterStage::Watching { .. } => matches!(event_index, 3 | 6 | 7),
                 };
                 assert_eq!(changed, legal, "stage={stage:?}, event_index={event_index}");
             }
@@ -1352,23 +1446,25 @@ mod tests {
         let start = now();
         let progress_steps = [
             super::OwnerProgress::Ack,
+            super::OwnerProgress::WaitForAcquireReady,
             super::OwnerProgress::Wake,
             super::OwnerProgress::BeforeRelease,
             super::OwnerProgress::Write,
             super::OwnerProgress::AfterRelease,
         ];
         for progress in progress_steps {
-            for event_index in 0..9 {
+            for event_index in 0..10 {
                 let mut engine = ClaimEngine::default();
+                let flight_stage = if progress == super::OwnerProgress::Ack {
+                    OwnerStage::AckSent
+                } else {
+                    OwnerStage::Releasing
+                };
                 engine.flights.insert(
                     display(),
                     super::Flight::Owner(super::OwnerFlight {
                         nonce: "n".into(),
-                        stage: if progress == super::OwnerProgress::Ack {
-                            OwnerStage::AckSent
-                        } else {
-                            OwnerStage::Releasing
-                        },
+                        stage: flight_stage,
                         progress,
                         standby: progress == super::OwnerProgress::Wake,
                         deadline: start + Duration::from_secs(45),
@@ -1376,23 +1472,27 @@ mod tests {
                 );
                 let event = match event_index {
                     0 => OwnerEvent::AckDelivered,
-                    1 => OwnerEvent::WakeCompleted,
-                    2 => OwnerEvent::BeforeRelease(HookResult::Completed),
-                    3 => OwnerEvent::BeforeRelease(HookResult::Aborted),
-                    4 => OwnerEvent::WriteSucceeded,
-                    5 => OwnerEvent::WriteFailed("failed".into()),
-                    6 => OwnerEvent::AfterReleaseCompleted,
-                    7 => OwnerEvent::abort("n"),
-                    8 => OwnerEvent::DisplayRemoved,
+                    1 => OwnerEvent::AcquireReady,
+                    2 => OwnerEvent::WakeCompleted,
+                    3 => OwnerEvent::BeforeRelease(HookResult::Completed),
+                    4 => OwnerEvent::BeforeRelease(HookResult::Aborted),
+                    5 => OwnerEvent::WriteSucceeded,
+                    6 => OwnerEvent::WriteFailed("failed".into()),
+                    7 => OwnerEvent::AfterReleaseCompleted,
+                    8 => OwnerEvent::abort("n"),
+                    9 => OwnerEvent::DisplayRemoved,
                     _ => unreachable!(),
                 };
-                let changed = !engine.owner_event(&display(), event).is_empty();
+                let before_stage = engine.owner_stage(&display());
+                let actions = engine.owner_event(&display(), event);
+                let changed = !actions.is_empty() || engine.owner_stage(&display()) != before_stage;
                 let legal = match progress {
-                    super::OwnerProgress::Ack => matches!(event_index, 0 | 7 | 8),
-                    super::OwnerProgress::Wake => matches!(event_index, 1 | 8),
-                    super::OwnerProgress::BeforeRelease => matches!(event_index, 2 | 3 | 8),
-                    super::OwnerProgress::Write => matches!(event_index, 4 | 5 | 8),
-                    super::OwnerProgress::AfterRelease => matches!(event_index, 6 | 8),
+                    super::OwnerProgress::Ack => matches!(event_index, 0 | 8 | 9),
+                    super::OwnerProgress::WaitForAcquireReady => matches!(event_index, 1 | 8 | 9),
+                    super::OwnerProgress::Wake => matches!(event_index, 2 | 9),
+                    super::OwnerProgress::BeforeRelease => matches!(event_index, 3 | 4 | 9),
+                    super::OwnerProgress::Write => matches!(event_index, 5 | 6 | 9),
+                    super::OwnerProgress::AfterRelease => matches!(event_index, 7 | 9),
                 };
                 assert_eq!(
                     changed, legal,

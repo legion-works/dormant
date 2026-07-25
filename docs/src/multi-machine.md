@@ -186,10 +186,12 @@ signed `ClaimResponse`. The protocol enforces replay protection per peer
 (monotonic outbound counters) and per-peer epoch validation (stale-epoch
 responses from a restarted peer are rejected).
 
-The claim succeeds when one peer accepts and the requester reads its own VCP
-`0x60` code on the panel within the negotiated `release_deadline_cap`. A
-`Denied`, `NotOwner`, or `Busy` response from every expected peer triggers the
-fallback path.
+The claim succeeds when one peer accepts, the requester's `before_acquire`
+hooks complete and it sends an `AcquireReady` confirmation frame to the
+owner, the owner releases the panel (hooks + VCP `0x60` write), and the
+requester reads its own VCP `0x60` code on the panel within the negotiated
+`release_deadline_cap`. A `Denied`, `NotOwner`, or `Busy` response from
+every expected peer triggers the fallback path.
 
 ### Readback-verified direct fallback
 
@@ -199,13 +201,31 @@ requester attempts a direct VCP `0x60` write. This path skips the peer's
 `before_release` hooks — the requester writes its input code directly to the
 panel, waking it if it was blanked.
 
+### Signal-presence law
+
+A monitor **will not switch VCP `0x60` to an input that has no live video
+signal.** This was verified on the AOC AGON AG326UZD with both a Linux
+desktop (DisplayPort) and a macOS machine (DisplayPort). The panel ACKed
+`setvcp 60` writes to a dark input, reported them as successful, but
+readback confirmed VCP `0x60` stayed on the active input.
+
+This is symmetric: a machine cannot recover even its OWN panel by DDC
+while its own output is dark. A physical OSD joystick press was required.
+
+The implication for KVM claims: the requester's output MUST be driving
+signal before the owner writes VCP `0x60` to the requester's input code.
+If the requester's output is asleep, the write is a silent no-op and the
+panel does not move. A `before_acquire` hook on the requester wakes its
+output; the requester sends an `AcquireReady` frame once the output is
+live, and the owner waits for this confirmation before releasing the
+panel. Without this step, a claim can strand the operator with no screen.
+
 The direct fallback is recorded as `claim_fallback_direct`, but it is not a
-general substitute for negotiation. On the AOC AG326UZD, a machine connected
-to an inactive input cannot pull the panel away from the active input: the
-write transport reports success, but VCP `0x60` remains unchanged. A claim
-initiated by the inactive machine therefore requires the negotiated path so
-the current owner can push the panel to the requester's input. This behavior
-was observed on one monitor model; other panels may differ.
+general substitute for negotiation. A machine whose output is not driving
+signal cannot pull the panel to its input via DDC: the write transport
+reports success, the write-verify sees the unchanged VCP `0x60`, and the
+claim fails. This behavior was observed on one monitor model; other panels
+may differ.
 
 Every input-source write is immediately read back. If VCP `0x60` does not match
 the requested value, `write_input_source` returns `E_DISPLAY_IO`; the claim

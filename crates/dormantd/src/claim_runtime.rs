@@ -870,6 +870,29 @@ impl Driver {
         if current_nonce != Some(nonce) {
             return false;
         }
+        // Route requester-side `before_acquire` completions to the
+        // requester engine — the `owner_event` path silently drops
+        // completions for requester flights (the engine match is on
+        // `Flight::Owner`).
+        let is_requester = self
+            .engines
+            .get(display)
+            .and_then(|e| e.requester_stage(display))
+            .is_some();
+        if is_requester {
+            let requester_event = match event {
+                OwnerEvent::BeforeRelease(HookResult::Completed) => {
+                    RequesterEvent::AcquireCompleted
+                }
+                OwnerEvent::BeforeRelease(HookResult::Aborted) => RequesterEvent::AcquireFailed {
+                    reason: "hook aborted".to_owned(),
+                },
+                _ => return false,
+            };
+            let actions = self.feed_requester_event(display, requester_event);
+            self.dispatch_actions(display, &actions);
+            return true;
+        }
         let actions = self.feed_owner_event(display, event);
         self.dispatch_actions(display, &actions);
         true
@@ -898,6 +921,20 @@ impl Driver {
                     .get_mut(&display)
                     .expect("display has engine")
                     .owner_event(&display, OwnerEvent::abort(nonce));
+                self.dispatch_actions(&display, &actions);
+            }
+            ClaimMessage::ClaimAcquireReady(ready) => {
+                // Nonce-correlate against active owner flights.
+                // The owner must reject an AcquireReady whose nonce
+                // doesn't match the active flight.
+                let Some(display) = self.find_display_by_owner_nonce(&ready.request_nonce) else {
+                    return;
+                };
+                let actions = self
+                    .engines
+                    .get_mut(&display)
+                    .expect("display has engine")
+                    .owner_event(&display, OwnerEvent::AcquireReady);
                 self.dispatch_actions(&display, &actions);
             }
             ClaimMessage::ReleaseFailed(release) => {
@@ -1375,6 +1412,11 @@ impl Driver {
             "claim_fallback_direct" => info!(event = "claim_fallback_direct", "claim lifecycle"),
             "claim_failed" => info!(event = "claim_failed", "claim lifecycle"),
             "claim_completed" => info!(event = "claim_completed", "claim lifecycle"),
+            "claim_acquire_failed" => info!(event = "claim_acquire_failed", "claim lifecycle"),
+            "claim_acquire_ready" => info!(event = "claim_acquire_ready", "claim lifecycle"),
+            "claim_acquire_wait_expired" => {
+                info!(event = "claim_acquire_wait_expired", "claim lifecycle");
+            }
             _ => {}
         }
     }
@@ -1564,6 +1606,10 @@ impl Driver {
             Action::RunBeforeRelease => {
                 self.run_hook_slot(display, Direction::Release, Phase::Before, false)
             }
+            Action::SendAcquireReady => {
+                self.send_acquire_ready_to_owner(display);
+                Vec::new()
+            }
             Action::WriteInput => self.write_input_source(display),
             Action::RunAfterRelease { aborted } => {
                 self.run_hook_slot(display, Direction::Release, Phase::After, aborted)
@@ -1602,11 +1648,11 @@ impl Driver {
         aborted: bool,
     ) -> Vec<Action> {
         let Some(ctx) = self.contexts.get(display).cloned() else {
-            return self.feed_owner_event_after_slot(display, phase);
+            return self.feed_owner_event_after_slot(display, direction, phase);
         };
         let hook_actions = ctx.hooks.slot_for(direction, phase).to_vec();
         if hook_actions.is_empty() {
-            return self.feed_owner_event_after_slot(display, phase);
+            return self.feed_owner_event_after_slot(display, direction, phase);
         }
         let display_name = display.0.clone();
         let display_identity = ctx.claim_identity.clone().unwrap_or_default();
@@ -1672,12 +1718,27 @@ impl Driver {
         Vec::new()
     }
 
-    fn feed_owner_event_after_slot(&mut self, display: &DisplayId, phase: Phase) -> Vec<Action> {
-        match phase {
-            Phase::Before => {
-                self.feed_owner_event(display, OwnerEvent::BeforeRelease(HookResult::Completed))
+    fn feed_owner_event_after_slot(
+        &mut self,
+        display: &DisplayId,
+        direction: Direction,
+        phase: Phase,
+    ) -> Vec<Action> {
+        let is_requester = direction == Direction::Acquire
+            && self
+                .engines
+                .get(display)
+                .and_then(|e| e.requester_stage(display))
+                .is_some();
+        if is_requester {
+            self.feed_requester_event(display, RequesterEvent::AcquireCompleted)
+        } else {
+            match phase {
+                Phase::Before => {
+                    self.feed_owner_event(display, OwnerEvent::BeforeRelease(HookResult::Completed))
+                }
+                Phase::After => self.feed_owner_event(display, OwnerEvent::AfterReleaseCompleted),
             }
-            Phase::After => self.feed_owner_event(display, OwnerEvent::AfterReleaseCompleted),
         }
     }
 
@@ -1775,6 +1836,25 @@ impl Driver {
         actions
     }
 
+    /// Feed a requester event to the engine and clean up when the flight terminates.
+    fn feed_requester_event(&mut self, display: &DisplayId, event: RequesterEvent) -> Vec<Action> {
+        let actions = self
+            .engines
+            .get_mut(display)
+            .expect("engine present for requester event")
+            .requester_event(display, event, Instant::now());
+        if self
+            .engines
+            .get(display)
+            .and_then(|e| e.requester_stage(display))
+            .is_none()
+        {
+            self.flights.remove(display);
+            self.clear_claim_suppression(display);
+        }
+        actions
+    }
+
     fn lookup_executor(&self, display: &DisplayId) -> Option<(Arc<dyn CommandSink>, u8)> {
         let map = self.executors.borrow();
         let sink = map.get(display).cloned()?;
@@ -1830,6 +1910,39 @@ impl Driver {
                 return;
             };
             transport.send_response(&peer, &frame).await;
+        });
+    }
+
+    fn send_acquire_ready_to_owner(&mut self, display: &DisplayId) {
+        let Some(flight) = self.flights.get(display).cloned() else {
+            return;
+        };
+        if flight.peer_instance_id.is_empty() || flight.peer_epoch.is_empty() {
+            return;
+        }
+        let counter = self.next_counter();
+        let transport = self.transport.clone();
+        let identity = self.local_identity_view();
+        let sender_epoch = self.sender_epoch.clone();
+        let peer = flight.peer_instance_id;
+        let peer_epoch = flight.peer_epoch;
+        let nonce = flight.nonce;
+        tokio::spawn(async move {
+            let Ok(frame) = sign_frame_for_peer(
+                &identity,
+                sender_epoch,
+                peer.clone(),
+                peer_epoch,
+                counter,
+                format!("acq-{nonce}"),
+                ClaimMessage::ClaimAcquireReady(dormant_core::claim::ClaimAcquireReady {
+                    nonce: format!("acq-{nonce}"),
+                    request_nonce: nonce.clone(),
+                }),
+            ) else {
+                return;
+            };
+            transport.send_acquire_ready(&peer, &frame).await;
         });
     }
 
@@ -2320,7 +2433,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// Validate the literal claim lifecycle vocabulary is
-    /// exactly the ten-anchor set the spec mandates.
+    /// exactly the thirteen-anchor set the spec mandates.
     #[test]
     fn claim_events_vocabulary_is_exact() {
         assert_eq!(
@@ -2336,6 +2449,9 @@ mod tests {
                 "claim_fallback_direct",
                 "claim_failed",
                 "claim_completed",
+                "claim_acquire_failed",
+                "claim_acquire_ready",
+                "claim_acquire_wait_expired",
             ]
         );
     }
@@ -2621,11 +2737,9 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::Trace("claim_accepted")))
         );
-        // Drive the engine through AckSent → BeforeRelease.
-        // (The real driver would SendVerdict first; here we
-        // collapse to the action sequence the engine cares
-        // about.)
+        // Drive the engine through AckSent → WaitForAcquireReady → BeforeRelease.
         let _ack_actions = engine.owner_event(&DisplayId("mon".into()), OwnerEvent::AckDelivered);
+        let _ready_actions = engine.owner_event(&DisplayId("mon".into()), OwnerEvent::AcquireReady);
         // The engine's BeforeRelease slot now expects the
         // hook outcome. The hook aborted.
         let actions = engine.owner_event(

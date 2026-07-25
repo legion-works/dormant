@@ -156,3 +156,17 @@ soak_evidence = [
   "https://github.com/legion-works/dormant/actions/runs/30032324404",
 ]
 status = "fixed"
+
+[[incident]]
+id = "FLAKE-2026-07-25-CLAIM-LISTENER-PORT-RACE"
+test = "coordination_claim::tests::ensure_and_release_provisional_obey_empty_peer_snapshot"
+signature = "sha256:d5e74e97c5d35e1791e87caa5af2727c7fd44008aa2fe62c718849d12ab736d9"
+first_run_url = ""
+last_run_url = ""
+mechanism = "shared-ephemeral-port-race-under-parallel-load: three tests in coordination_claim released a TCP listener and then asserted TcpStream::connect(old_port).is_err() — under parallel load another test or process can bind the just-released ephemeral port during the window, making connect succeed and the assertion fail. The assertion intent ('my listener is gone') was already covered by the supervisor state check (provisional_port() == None, or provisional_port() != old_port) on the preceding line."
+reproduction = "cargo test -p dormant-core -p dormantd -p dormant-doctor --all-features (parallel) — failures at different test sites each run"
+root_cause = "tests probed OS kernel port-ownership rather than supervisor state; ephemeral port reuse is a kernel-level race that the test cannot prevent"
+fix_pr = ""
+proving_test = "coordination_claim::tests::parked_when_empty_and_binds_on_first_peer"
+soak_evidence = []
+status = "open"

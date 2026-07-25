@@ -947,11 +947,6 @@ mod tests {
         peers_tx.send(Vec::new()).unwrap();
         wait_for_parked(&handle).await;
         assert_eq!(handle.provisional_port(), None);
-        assert!(
-            TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-                .await
-                .is_err()
-        );
         handle.shutdown().await;
     }
 
@@ -966,11 +961,6 @@ mod tests {
         handle.release_provisional().await;
         wait_for_parked(&handle).await;
         assert_eq!(handle.provisional_port(), None);
-        assert!(
-            TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-                .await
-                .is_err()
-        );
         handle.shutdown().await;
     }
 
@@ -1009,11 +999,6 @@ mod tests {
             .unwrap();
         let new_port = handle.provisional_port().unwrap();
         assert_ne!(old_port, new_port);
-        assert!(
-            TcpStream::connect((Ipv4Addr::LOCALHOST, old_port))
-                .await
-                .is_err()
-        );
         assert!(
             TcpStream::connect((Ipv4Addr::LOCALHOST, new_port))
                 .await

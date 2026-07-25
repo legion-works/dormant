@@ -58,12 +58,14 @@ type EventEnumerator = fn() -> NodeList;
 
 /// Core probe logic, separated from I/O so synthetic tests can inject
 /// a deterministic node list.
+#[cfg(target_os = "linux")]
 fn probe_event_nodes(globs: &[String], enumerator: EventEnumerator) -> ProbeResult {
     let nodes = enumerator();
     probe_node_list(globs, &nodes)
 }
 
 /// Evaluate raw node list — the leaf shared by live and synthetic paths.
+#[cfg(target_os = "linux")]
 fn probe_node_list(globs: &[String], nodes: &NodeList) -> ProbeResult {
     let total_nodes = nodes.len();
 

@@ -788,6 +788,7 @@ impl Driver {
                 }
                 changed = self.executors.changed() => {
                     if changed.is_err() { break; }
+                    self.refresh_contexts_from_config().await;
                 }
             }
         }
@@ -1122,16 +1123,21 @@ impl Driver {
         self.dispatch_actions(&display, &actions);
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_claim_shared(
         &mut self,
         display: &DisplayId,
         reply: oneshot::Sender<ClaimSharedResult>,
     ) {
         let Some(ctx) = self.contexts.get(display).cloned() else {
+            let did = display.0.as_str();
+            info!(event = "claim_denied", reason = "no_context", display_id = %did);
             let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
             return;
         };
         if !ctx.writable {
+            let did = display.0.as_str();
+            info!(event = "claim_denied", reason = "not_writable", display_id = %did);
             let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
             return;
         }
@@ -1160,6 +1166,8 @@ impl Driver {
         let nonce = self.next_nonce();
         let Some((counter, frame_nonce, message)) = self.build_claim_request(display, &nonce)
         else {
+            let did = display.0.as_str();
+            info!(event = "claim_denied", reason = "request_build_failed", display_id = %did);
             let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
             return;
         };
@@ -2033,6 +2041,7 @@ impl Driver {
             }
             let id = DisplayId(name.clone());
             let Some(sink) = executors.get(&id) else {
+                info!(event = "claim_context_skipped", reason = "no_executor", display_id = %id.0);
                 continue;
             };
             let writable = sink_input_writable(sink.clone()).await.is_not_incapable();
@@ -2106,7 +2115,7 @@ impl Driver {
         };
         Some((
             self.outbound_counter,
-            format!("req-{nonce}"),
+            nonce.to_owned(),
             ClaimMessage::ClaimRequest(request),
         ))
     }
@@ -3011,5 +3020,235 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A signed `ClaimRequest` built with identical envelope and message
+    /// nonces must pass `ClaimFrame::verify` on the recipient side.
+    /// The mutation arm reintroduces the double-prefix so a regression
+    /// is caught immediately.
+    #[test]
+    fn claim_request_nonce_matches_envelope() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use dormant_core::peers::{PeerRecord, instance_id_from_public_key};
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[99; 32]);
+        let identity = InstanceIdentity {
+            instance_id: instance_id_from_public_key(&signing.verifying_key().to_bytes()),
+            signing_key: signing,
+            verifying_key: ed25519_dalek::SigningKey::from_bytes(&[99; 32]).verifying_key(),
+        };
+        let request = ClaimRequest {
+            display_identity: "edid:test".to_owned(),
+            requester_instance_id: identity.instance_id.clone(),
+            requester_input_code: 15,
+            counter: 42,
+            nonce: "req-123-42".to_owned(),
+        };
+        // The fixed path: envelope nonce == request.nonce (both "req-…").
+        let frame = ClaimFrame::sign(
+            &identity,
+            "sender-epoch-000".to_owned(),
+            "recipient-id".to_owned(),
+            "recipient-epoch-".to_owned(),
+            42,
+            "req-123-42".to_owned(),
+            ClaimMessage::ClaimRequest(request),
+        )
+        .unwrap();
+        let peer = PeerRecord {
+            instance_id: identity.instance_id.clone(),
+            ed25519_pub: STANDARD.encode(identity.verifying_key.as_bytes()),
+            display_name: String::new(),
+            paired_at: String::new(),
+            last_addr: None,
+            claim_port: None,
+        };
+        frame
+            .verify(&peer, "recipient-id", "recipient-epoch-")
+            .expect("verify must pass when request.nonce == frame.nonce");
+
+        // Mutation: reintroduce the double-prefix (the old bug).
+        let bad_request = ClaimRequest {
+            display_identity: "edid:test".to_owned(),
+            requester_instance_id: identity.instance_id.clone(),
+            requester_input_code: 15,
+            counter: 42,
+            nonce: "req-123-42".to_owned(),
+        };
+        let bad_frame = ClaimFrame::sign(
+            &identity,
+            "sender-epoch-000".to_owned(),
+            "recipient-id".to_owned(),
+            "recipient-epoch-".to_owned(),
+            42,
+            "req-req-123-42".to_owned(),
+            ClaimMessage::ClaimRequest(bad_request),
+        )
+        .unwrap();
+        let err = bad_frame
+            .verify(&peer, "recipient-id", "recipient-epoch-")
+            .expect_err("mismatched nonces must be rejected");
+        assert_eq!(
+            err,
+            dormant_core::claim::ClaimFrameError::RequestReplayMismatch
+        );
+    }
+
+    /// When the executor map is populated AFTER the runtime starts,
+    /// the `executors.changed()` arm must refresh contexts so a
+    /// subsequent claim can find a writable context.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn executors_changed_refreshes_contexts() {
+        use crate::coordination_claim;
+        use std::net::{IpAddr, Ipv4Addr};
+        use tokio::sync::watch;
+        use tokio_util::sync::CancellationToken;
+
+        let display = DisplayId("panel".to_owned());
+        let cancel = CancellationToken::new();
+        let (executors_tx, executors_rx) =
+            watch::channel(Arc::new(HashMap::<DisplayId, Arc<dyn CommandSink>>::new()));
+        let (_config_tx, config_rx) = watch::channel({
+            let mut displays = indexmap::IndexMap::new();
+            displays.insert(
+                "panel".to_owned(),
+                dormant_core::config::DisplayConfig {
+                    controllers: vec!["cmd".to_owned()],
+                    scope: dormant_core::config::DisplayScope::Shared,
+                    shared_input_code: Some(0x0f),
+                    blank_mode: None,
+                    degraded_mode: None,
+                    ladder: vec![],
+                    screensaver: None,
+                    output: None,
+                    ddc_display: None,
+                    host: None,
+                    wol_mac: None,
+                    blank_command: None,
+                    wake_command: None,
+                    modes: Some(vec![BlankMode::BrightnessZero]),
+                    ha_url: None,
+                    blank_service: None,
+                    blank_data: None,
+                    wake_service: None,
+                    wake_data: None,
+                    command_timeout: Duration::from_secs(5),
+                    restore_brightness: 80,
+                    samsung_restore_backlight: 50,
+                    treat_unreachable_as_blanked: true,
+                    panel_type: dormant_core::wear::PanelType::Unknown,
+                    hooks: HookSlots::default(),
+                },
+            );
+            Arc::new(Config {
+                config_version: 1,
+                daemon: dormant_core::config::DaemonConfig::default(),
+                sensors: indexmap::IndexMap::new(),
+                zones: indexmap::IndexMap::new(),
+                displays,
+                rules: indexmap::IndexMap::new(),
+                wear: dormant_core::config::schema::WearConfig::default(),
+                notifications: dormant_core::config::schema::NotificationsConfig::default(),
+                watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+                audio: dormant_core::config::schema::AudioConfig::default(),
+                keymap: KeymapConfig::default(),
+                input_filter: dormant_core::config::InputFilterConfig::default(),
+                coordination: dormant_core::config::CoordinationConfig {
+                    enabled: true,
+                    poll_interval: Duration::from_secs(2),
+                    state_poll_interval: None,
+                    loss_confirmations: 3,
+                    pairing_port: 0,
+                    pairing_window: Duration::from_secs(300),
+                    pairing_bind_address: None,
+                    activity_claim: ActivityClaimPolicy::Off,
+                    owner_idle_window: Duration::from_secs(30),
+                    armed_window: Duration::from_secs(60),
+                    claim_timeout: Duration::from_millis(500),
+                    release_deadline_cap: Duration::from_secs(45),
+                    claim_port: 0,
+                    claim_bind_address: None,
+                    claim_advertise_mdns: true,
+                },
+            })
+        });
+        let identity = {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+            InstanceIdentity {
+                instance_id: dormant_core::peers::instance_id_from_public_key(
+                    &signing.verifying_key().to_bytes(),
+                ),
+                signing_key: signing,
+                verifying_key: ed25519_dalek::SigningKey::from_bytes(&[42; 32]).verifying_key(),
+            }
+        };
+        let transport = {
+            use dormant_core::claim::Epoch;
+            let deps = coordination_claim::ClaimTransportDeps {
+                identity: Arc::new(identity.clone()),
+                boot_epoch: Epoch::try_from("0123456789abcdef").unwrap(),
+                peers: watch::channel(Vec::new()).1,
+                bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                fixed_port: None,
+                enabled: true,
+                on_peer_addr: Box::new(|_, _| {}),
+            };
+            coordination_claim::spawn(deps)
+        };
+        let coord = CoordinationHandle::new([display.clone()]);
+        coord.record_success(&display, 0x0f, 0x0f, None);
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let handle = spawn(ClaimRuntimeDeps {
+            identity: Arc::new(identity),
+            transport: transport.into(),
+            executors: executors_rx,
+            config: config_rx,
+            hooks: Arc::new(crate::hooks::HookEngine::with_runner(
+                Arc::new(ScriptedHookRunner::new()) as Arc<dyn HookRunner>,
+            )),
+            coordination: Some(coord),
+            front_ctl_tx,
+            cancel: cancel.clone(),
+            event_log: None,
+            event_notify: None,
+            idle_rx: None,
+        });
+
+        // Start with an empty executor map: the claim must be
+        // denied (no context).
+        let before = handle.try_claim(display.clone()).await.expect("try_claim");
+        assert!(
+            matches!(
+                before,
+                ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported)
+            ),
+            "empty executor map must deny; got {before:?}"
+        );
+
+        // Populate the executor map — the claim runtime's
+        // `executors.changed()` arm must refresh contexts so a
+        // subsequent claim finds a writable context.
+        let sink: Arc<dyn CommandSink> = Arc::new(ProbeSink::with_read(Ok(Some(0x0f))));
+        let mut map = HashMap::new();
+        map.insert(display.clone(), sink);
+        let _ = executors_tx.send(Arc::new(map));
+        // Give the runtime a moment to process the notification.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let after = handle
+            .try_claim(display.clone())
+            .await
+            .expect("try_claim after executors populated");
+        assert!(
+            matches!(
+                after,
+                ClaimSharedResult::Accepted { .. }
+                    | ClaimSharedResult::Denied(ClaimDeniedReason::CoordinationDisabled)
+            ),
+            "populated executor must not be Unsupported; got {after:?}"
+        );
+
+        cancel.cancel();
     }
 }

@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use dormant_core::claim::{ClaimAbort, ClaimFrame, ClaimMessage};
+use dormant_core::claim::{ClaimFrame, ClaimMessage};
 use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
@@ -408,19 +408,28 @@ async fn paired_peers_survive_restart() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the full App, transport, and runtime seam is one regression boundary"
+)]
 async fn app_start_wires_authenticated_claim_transport() {
     let paths = TestAppPaths::new();
     let remote = SigningKey::from_bytes(&[7; 32]);
     let remote_key = remote.verifying_key();
+    let remote_instance_id = instance_id_from_public_key(&remote_key.to_bytes());
+    let response_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let response_port = response_listener.local_addr().unwrap().port();
     upsert_peer(
         &paths.state.join("peers.json"),
         PeerRecord {
-            instance_id: instance_id_from_public_key(&remote_key.to_bytes()),
+            instance_id: remote_instance_id.clone(),
             ed25519_pub: base64::engine::general_purpose::STANDARD.encode(remote_key.as_bytes()),
             display_name: "remote".to_owned(),
             paired_at: "2026-01-01T00:00:00Z".to_owned(),
-            last_addr: Some("127.0.0.1:1".parse().unwrap()),
-            claim_port: Some(1),
+            last_addr: Some(format!("127.0.0.1:{response_port}").parse().unwrap()),
+            claim_port: Some(response_port),
         },
     )
     .unwrap();
@@ -455,23 +464,28 @@ async fn app_start_wires_authenticated_claim_transport() {
     .await
     .unwrap();
     let local = load_or_create_identity(&paths.state).unwrap();
+    let nonce = "claim-frame-nonce";
+    let request = dormant_core::claim::ClaimRequest {
+        display_identity: "unknown-display".to_owned(),
+        requester_instance_id: remote_instance_id.clone(),
+        requester_input_code: 0x11,
+        counter: 1,
+        nonce: nonce.to_owned(),
+    };
     let frame = ClaimFrame::sign(
         &dormant_core::peers::InstanceIdentity {
-            instance_id: instance_id_from_public_key(&remote_key.to_bytes()),
+            instance_id: remote_instance_id.clone(),
             signing_key: remote,
             verifying_key: remote_key,
         },
         "remote-epoch-001".to_owned(),
-        local.instance_id,
+        local.instance_id.clone(),
         transport.boot_epoch().as_str().to_owned(),
         1,
-        "claim-frame-nonce".to_owned(),
-        ClaimMessage::ClaimAbort(ClaimAbort {
-            nonce: "abort-nonce".to_owned(),
-        }),
+        nonce.to_owned(),
+        ClaimMessage::ClaimRequest(request),
     )
     .unwrap();
-    let mut inbound = transport.inbound();
     let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .unwrap();
@@ -483,14 +497,42 @@ async fn app_start_wires_authenticated_claim_transport() {
     tokio::io::AsyncWriteExt::write_all(&mut stream, &encoded)
         .await
         .unwrap();
-    let received = tokio::time::timeout(Duration::from_secs(1), inbound.recv())
+
+    let (mut response_stream, _) =
+        tokio::time::timeout(Duration::from_secs(1), response_listener.accept())
+            .await
+            .expect("verified request must reach the runtime handler")
+            .unwrap();
+    let mut response_length = [0_u8; 4];
+    tokio::io::AsyncReadExt::read_exact(&mut response_stream, &mut response_length)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(
-        received.sender_instance_id,
-        instance_id_from_public_key(&remote_key.to_bytes())
-    );
+    let response_length = usize::try_from(u32::from_be_bytes(response_length)).unwrap();
+    let mut response_payload = vec![0_u8; response_length];
+    tokio::io::AsyncReadExt::read_exact(&mut response_stream, &mut response_payload)
+        .await
+        .unwrap();
+    let response: ClaimFrame = serde_json::from_slice(&response_payload).unwrap();
+    let local_record = PeerRecord {
+        instance_id: local.instance_id.clone(),
+        ed25519_pub: base64::engine::general_purpose::STANDARD
+            .encode(local.verifying_key.as_bytes()),
+        display_name: "local".to_owned(),
+        paired_at: "2026-01-01T00:00:00Z".to_owned(),
+        last_addr: None,
+        claim_port: None,
+    };
+    response
+        .verify(&local_record, &remote_instance_id, "remote-epoch-001")
+        .expect("runtime reply must verify on the authenticated requester");
+    assert_eq!(response.recipient_instance_id, remote_instance_id);
+    assert!(matches!(
+        response.message,
+        ClaimMessage::ClaimResponse(dormant_core::claim::ClaimResponse {
+            nonce: response_nonce,
+            verdict: dormant_core::claim::ClaimVerdict::NotOwner,
+        }) if response_nonce == nonce
+    ));
     shutdown(handle, join).await;
 }
 

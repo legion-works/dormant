@@ -453,6 +453,19 @@ fn claim_announce_from_txt(records: &BTreeMap<String, String>) -> Option<ClaimPr
     valid_claim_announce(&announcement).then_some(announcement)
 }
 
+/// Extract the claim TXT surface, retaining the optional epoch for legacy peers.
+fn claim_announce_from_resolved(resolved: &ResolvedService) -> Option<ClaimPresenceAnnounce> {
+    let records = ["v", "instance_id", "port", "boot_epoch"]
+        .into_iter()
+        .filter_map(|key| {
+            resolved
+                .get_property_val_str(key)
+                .map(|value| (key.to_owned(), value.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    claim_announce_from_txt(&records)
+}
+
 /// Production backend backed by `mdns-sd`'s daemon thread.
 pub struct MdnsSdBackend {
     daemon: ServiceDaemon,
@@ -587,16 +600,7 @@ impl ClaimPresenceStream for MdnsSdClaimBrowse {
         let ServiceEvent::ServiceResolved(resolved) = event else {
             return Ok(None);
         };
-        let records = ["v", "instance_id", "port"]
-            .into_iter()
-            .map(|key| {
-                Some((
-                    key.to_owned(),
-                    resolved.get_property_val_str(key)?.to_owned(),
-                ))
-            })
-            .collect::<Option<BTreeMap<_, _>>>();
-        let Some(peer) = records.as_ref().and_then(claim_announce_from_txt) else {
+        let Some(peer) = claim_announce_from_resolved(&resolved) else {
             return Ok(None);
         };
         Ok(Some(ClaimPresenceEvent::Resolved {
@@ -685,7 +689,7 @@ fn announce_from_resolved(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
 
@@ -824,6 +828,30 @@ mod tests {
         assert!(keys.contains(&"v".to_owned()));
         // boot_epoch is only included when Some — privacy-ratified default.
         assert!(!keys.contains(&"boot_epoch".to_owned()));
+    }
+
+    #[test]
+    fn resolved_claim_presence_preserves_boot_epoch() {
+        let expected_epoch = "peer-boot-epoch1";
+        let service = mdns_sd::ServiceInfo::new(
+            super::CLAIM_SERVICE_TYPE,
+            "peer",
+            "peer.local.",
+            (),
+            42_001,
+            HashMap::from([
+                ("v".to_owned(), PAIR_PROTOCOL_VERSION.to_string()),
+                ("instance_id".to_owned(), instance_id(1)),
+                ("port".to_owned(), "42001".to_owned()),
+                ("boot_epoch".to_owned(), expected_epoch.to_owned()),
+            ]),
+        )
+        .expect("valid claim service")
+        .as_resolved_service();
+
+        let peer = super::claim_announce_from_resolved(&service).expect("resolved claim presence");
+
+        assert_eq!(peer.boot_epoch.as_deref(), Some(expected_epoch));
     }
 
     #[test]

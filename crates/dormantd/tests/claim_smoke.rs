@@ -5,8 +5,9 @@
 //! path (inbound `ClaimRequest` → release sequence → `before_release`
 //! hook → write → `after_release` hook → `claim_completed`, with
 //! EXACTLY ONE `write_input_source` call) and the FALLBACK path
-//! (no reachable peer → `claim_fallback_direct` → direct write on
-//! powered, ZERO writes on standby/unknown). Keeping them in
+//! (a reachable peer accepts the request but never replies →
+//! `claim_fallback_direct` → direct write on powered, ZERO writes on
+//! standby/unknown). Keeping them in
 //! separate test functions ensures one path can never
 //! accidentally satisfy the other's assertions.
 
@@ -379,29 +380,120 @@ fn shared_display_config(display: &str, code: u8, hooks: HookSlots) -> Arc<Confi
     })
 }
 
-fn build_scripted_transport() -> Arc<dormantd::coordination_claim::ClaimTransportHandle> {
-    use dormantd::coordination_claim::ClaimTransportDeps;
-    use std::net::{IpAddr, Ipv4Addr};
-    use tokio::sync::watch as tokio_watch;
-    let local_signing = SigningKey::from_bytes(&[42; 32]);
-    let verifying_key = local_signing.verifying_key();
-    let instance_id = instance_id_from_public_key(&verifying_key.to_bytes());
-    let identity = InstanceIdentity {
-        instance_id: instance_id.clone(),
-        signing_key: local_signing,
-        verifying_key,
+async fn read_claim_frame(stream: &mut tokio::net::TcpStream) -> Option<ClaimFrame> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await.ok()?;
+    let length = usize::try_from(u32::from_be_bytes(length)).ok()?;
+    if !(1..=1_048_576).contains(&length) {
+        return None;
+    }
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await.ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
+#[derive(Clone, Copy)]
+enum PeerMode {
+    ReachableSilent,
+    NoPeer,
+    Unreachable,
+}
+
+struct ScriptedTransport {
+    handle: Arc<dormantd::coordination_claim::ClaimTransportHandle>,
+    peer_frames: Arc<Mutex<Vec<ClaimFrame>>>,
+    peer_frames_changed: Arc<tokio::sync::Notify>,
+    _peer_watch_tx: watch::Sender<Vec<dormantd::coordination_claim::ClaimPeer>>,
+    _peer_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+async fn build_scripted_transport(
+    local_identity: InstanceIdentity,
+    cancel: CancellationToken,
+    peer_mode: PeerMode,
+) -> ScriptedTransport {
+    use dormant_core::claim::Epoch;
+    use dormantd::coordination_claim::{ClaimPeer, ClaimTransportDeps};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::net::TcpListener;
+
+    let peer_signing = SigningKey::from_bytes(&[7; 32]);
+    let peer = InstanceIdentity {
+        instance_id: instance_id_from_public_key(&peer_signing.verifying_key().to_bytes()),
+        verifying_key: peer_signing.verifying_key(),
+        signing_key: peer_signing,
     };
-    let (_peers_tx, peers_rx) = tokio_watch::channel(Vec::new());
-    let deps = ClaimTransportDeps {
-        identity: Arc::new(identity),
-        boot_epoch: dormant_core::claim::Epoch::try_from("0123456789abcdef").unwrap(),
+    let (listener, peer_port) = match peer_mode {
+        PeerMode::ReachableSilent => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            (Some(listener), Some(port))
+        }
+        PeerMode::NoPeer => (None, None),
+        PeerMode::Unreachable => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            (None, Some(port))
+        }
+    };
+    let peers = peer_port
+        .map(|port| {
+            vec![ClaimPeer {
+                instance_id: peer.instance_id,
+                verifying_key: peer.verifying_key,
+                last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+                dns_addr: None,
+                claim_port: Some(port),
+                dns_port: None,
+                dns_epoch: Some(Epoch::try_from("peer-epoch-00001").unwrap()),
+            }]
+        })
+        .unwrap_or_default();
+    let (peer_watch_tx, peers_rx) = watch::channel(peers);
+    let peer_frames = Arc::new(Mutex::new(Vec::new()));
+    let peer_frames_changed = Arc::new(tokio::sync::Notify::new());
+    let peer_task = listener.map(|listener| {
+        let frames = Arc::clone(&peer_frames);
+        let changed = Arc::clone(&peer_frames_changed);
+        tokio::spawn(async move {
+            loop {
+                let stream = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut stream, _)) = stream else {
+                    break;
+                };
+                let frame = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    frame = read_claim_frame(&mut stream) => frame,
+                };
+                if let Some(frame) = frame {
+                    frames.lock().unwrap().push(frame);
+                    changed.notify_one();
+                }
+            }
+        })
+    });
+    let handle = Arc::new(dormantd::coordination_claim::spawn(ClaimTransportDeps {
+        identity: Arc::new(local_identity),
+        boot_epoch: Epoch::try_from("0123456789abcdef").unwrap(),
         peers: peers_rx,
         bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         fixed_port: None,
         enabled: true,
         on_peer_addr: Box::new(|_, _| {}),
-    };
-    Arc::new(dormantd::coordination_claim::spawn(deps))
+    }));
+    ScriptedTransport {
+        handle,
+        peer_frames,
+        peer_frames_changed,
+        _peer_watch_tx: peer_watch_tx,
+        _peer_task: peer_task,
+    }
 }
 
 struct ClaimHarness {
@@ -423,23 +515,33 @@ struct ClaimHarness {
     /// passing to `ClaimRuntimeDeps`).  Tests access it to
     /// set owner identity for the `IdleReport` sender gate.
     coord: CoordinationHandle,
+    peer_frames: Arc<Mutex<Vec<ClaimFrame>>>,
+    peer_frames_changed: Arc<tokio::sync::Notify>,
+    _peer_watch_tx: watch::Sender<Vec<dormantd::coordination_claim::ClaimPeer>>,
+    _peer_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ClaimHarness {
-    async fn build(display: &str, code: u8) -> Self {
+    async fn build_with_reachable_silent_peer(display: &str, code: u8) -> Self {
+        Self::build_with_peer_mode(display, code, PeerMode::ReachableSilent).await
+    }
+
+    async fn build_with_unreachable_peer(display: &str, code: u8) -> Self {
+        Self::build_with_peer_mode(display, code, PeerMode::Unreachable).await
+    }
+
+    async fn build_without_addressable_peer(display: &str, code: u8) -> Self {
+        Self::build_with_peer_mode(display, code, PeerMode::NoPeer).await
+    }
+
+    async fn build_with_peer_mode(display: &str, code: u8, peer_mode: PeerMode) -> Self {
         let runner = Arc::new(RecordingHookRunner::new());
         let hook_engine = Arc::new(HookEngine::with_runner(
             runner.clone() as Arc<dyn HookRunner>
         ));
         let sink = Arc::new(RecordingSink::new(display));
         sink.set_claim_identity(format!("panel-{display}"));
-        // Prime the read queue with the LOCAL code so the
-        // runtime's startup writability probe (`sink_input_writable`)
-        // observes `Some(code)`, returns `Ok(())`, and the
-        // `DisplayCtx.writable` flag is `true`. The probe
-        // reads + writes one entry; we keep an extra entry
-        // in the queue for the OWNER-path tests' direct
-        // reads.
+        // The startup writability probe consumes one read and write before each test.
         sink.script_reads(vec![
             ScriptedRead::Powered(code),
             ScriptedRead::Powered(code),
@@ -462,12 +564,15 @@ impl ClaimHarness {
             signing_key: local_signing,
             verifying_key: SigningKey::from_bytes(&[42; 32]).verifying_key(),
         };
-        let transport = build_scripted_transport();
+        let ScriptedTransport {
+            handle: transport,
+            peer_frames,
+            peer_frames_changed,
+            _peer_watch_tx: peer_watch_tx,
+            _peer_task: peer_task,
+        } = build_scripted_transport(local_identity.clone(), cancel.clone(), peer_mode).await;
         let coord = CoordinationHandle::new([DisplayId(display.to_owned())]);
-        // Mark the display as owned: `record_success` sets
-        // `record.owned = (observed == expected)`. The test
-        // owns the panel with the LOCAL code, so we pass
-        // `observed = code` to make `owned = true`.
+        // Matching observed and expected input marks this fixture locally owned.
         coord.record_success(&DisplayId(display.to_owned()), code, code, None);
         let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -485,8 +590,7 @@ impl ClaimHarness {
             event_notify: Some(Arc::clone(&log_changed)),
             idle_rx: None,
         });
-        // The acknowledged injection cannot run until initial context refresh
-        // completes, so it is also the harness's startup barrier.
+        // The acknowledged command cannot run until the initial context refresh completes.
         let accepted = handle
             .inject_owner_completion_for_test(
                 DisplayId(display.to_owned()),
@@ -507,6 +611,10 @@ impl ClaimHarness {
             _executors_tx: executors_tx,
             local_identity,
             coord,
+            peer_frames,
+            peer_frames_changed,
+            _peer_watch_tx: peer_watch_tx,
+            _peer_task: peer_task,
         }
     }
 
@@ -534,6 +642,29 @@ impl ClaimHarness {
     }
     fn log_events(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
+    }
+
+    fn peer_request_count(&self) -> usize {
+        self.peer_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| matches!(&frame.message, ClaimMessage::ClaimRequest(_)))
+            .count()
+    }
+
+    async fn wait_for_peer_requests(&self, count: usize, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.peer_frames_changed.notified();
+                if self.peer_request_count() >= count {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok()
     }
     async fn wait_for_log(&self, needle: &str, timeout: Duration) -> bool {
         self.wait_for_log_matching(timeout, |event| event == needle)
@@ -614,7 +745,7 @@ impl ClaimHarness {
                 signing_key: peer_signing,
                 verifying_key: SigningKey::from_bytes(&[7; 32]).verifying_key(),
             },
-            "0123456789abcdef".to_owned(),
+            "peer-epoch-00001".to_owned(),
             self.local_identity.instance_id.clone(),
             "0123456789abcdef".to_owned(),
             1,
@@ -640,7 +771,7 @@ impl ClaimHarness {
 ///   exercised separately).
 #[tokio::test]
 async fn negotiated_claim_order_is_release_write_flip_acquire() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     // Clear the startup writability probe's write.
     harness.clear_sink_writes();
     // The owner path drives four hook slots in order:
@@ -753,7 +884,7 @@ async fn negotiated_claim_order_is_release_write_flip_acquire() {
 
 #[tokio::test]
 async fn stale_nonce_owner_completion_does_not_advance_current_flight() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     let before_release = harness.runner.block_next_command();
     for _ in 0..4 {
@@ -797,8 +928,8 @@ async fn stale_nonce_owner_completion_does_not_advance_current_flight() {
 
 // ── 2. Fallback path ─────────────────────────────────────────────
 
-/// The FALLBACK path: a local claim trigger fans out to
-/// (zero) reachable peers; the requester deadline
+/// The FALLBACK path: a local claim trigger reaches a peer
+/// that reads the frame but never replies; the requester deadline
 /// (`claim_timeout: 500ms` in the test config) elapses;
 /// the engine drives `AttemptFallback`; the driver
 /// performs a fresh bounded `read_input_source_sampled`
@@ -807,7 +938,7 @@ async fn stale_nonce_owner_completion_does_not_advance_current_flight() {
 /// fires. No `before_release` hook fires.
 #[tokio::test]
 async fn fallback_claim_order_emits_fallback_direct_then_direct_write() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     // The fallback path's first read observes the LOCAL
     // code (0x0f) — the panel is already showing the
@@ -817,10 +948,8 @@ async fn fallback_claim_order_emits_fallback_direct_then_direct_write() {
         ScriptedRead::Powered(0x0f),
         ScriptedRead::Powered(0x0f),
     ]);
-    // Trigger a local claim. No peers are in the peer
-    // store, so the fanout returns no verdicts. The
-    // requester deadline elapses; the engine emits the
-    // fallback sequence.
+    // The scripted peer accepts the request but returns no verdict,
+    // so the requester deadline drives the fallback sequence.
     let first = harness
         .handle
         .try_claim(DisplayId("mon".into()))
@@ -829,6 +958,12 @@ async fn fallback_claim_order_emits_fallback_direct_then_direct_write() {
     assert!(
         matches!(first, ClaimSharedResult::Accepted { .. }),
         "first try_claim must be Accepted; got {first:?}"
+    );
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before the flight proceeds"
     );
     assert!(
         harness
@@ -877,13 +1012,75 @@ async fn fallback_claim_order_emits_fallback_direct_then_direct_write() {
     harness.shutdown();
 }
 
+#[tokio::test]
+async fn no_addressable_peer_is_denied_without_negotiation() {
+    let harness = ClaimHarness::build_without_addressable_peer("mon", 0x0f).await;
+    harness.clear_sink_writes();
+
+    let result = harness
+        .handle
+        .try_claim(DisplayId("mon".into()))
+        .await
+        .expect("try_claim channel");
+
+    assert_eq!(
+        result,
+        ClaimSharedResult::Denied(dormant_core::claim::ClaimDeniedReason::CoordinationDisabled,)
+    );
+    assert!(
+        harness
+            .wait_for_log("claim_no_addressable_peers", Duration::from_secs(2))
+            .await,
+        "zero-peer denial must emit claim_no_addressable_peers"
+    );
+    assert_eq!(harness.peer_request_count(), 0);
+    assert!(
+        !harness
+            .log_events()
+            .iter()
+            .any(|event| event == "claim_fallback_direct")
+    );
+    harness.shutdown();
+}
+
+#[tokio::test]
+async fn unreachable_peer_is_denied_after_failed_fanout() {
+    let harness = ClaimHarness::build_with_unreachable_peer("mon", 0x0f).await;
+    harness.clear_sink_writes();
+
+    let result = harness
+        .handle
+        .try_claim(DisplayId("mon".into()))
+        .await
+        .expect("try_claim channel");
+
+    assert_eq!(
+        result,
+        ClaimSharedResult::Denied(dormant_core::claim::ClaimDeniedReason::CoordinationDisabled,)
+    );
+    assert!(
+        harness
+            .wait_for_log("claim_no_addressable_peers", Duration::from_secs(2))
+            .await,
+        "failed fanout must emit claim_no_addressable_peers"
+    );
+    assert_eq!(harness.peer_request_count(), 0);
+    assert!(
+        !harness
+            .log_events()
+            .iter()
+            .any(|event| event == "claim_fallback_direct")
+    );
+    harness.shutdown();
+}
+
 /// Unknown-fallback-state: when the fallback's fresh read
 /// returns `Standby`, the driver MUST NOT write. ZERO
 /// writes, visible `claim_failed` trace, no
 /// `claim_completed`.
 #[tokio::test]
 async fn fallback_unknown_state_writes_zero_times() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     // Standby read: the panel reports `0` (the F4 honest
     // "panel in standby" answer). The driver must NOT
@@ -896,6 +1093,12 @@ async fn fallback_unknown_state_writes_zero_times() {
         .try_claim(DisplayId("mon".into()))
         .await
         .expect("try_claim channel");
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before fallback"
+    );
     assert!(
         harness
             .wait_for_log("claim_fallback_direct", Duration::from_secs(5))
@@ -937,7 +1140,7 @@ async fn fallback_unknown_state_writes_zero_times() {
 /// not the fallback's).
 #[tokio::test]
 async fn fallback_foreign_code_writes_local_code_exactly_once() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     // Foreign powered read: 0x11 is the peer's input, not
     // ours (local is 0x0f). The fallback must write 0x0f.
@@ -950,6 +1153,12 @@ async fn fallback_foreign_code_writes_local_code_exactly_once() {
         .try_claim(DisplayId("mon".into()))
         .await
         .expect("try_claim channel");
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before fallback"
+    );
     assert!(
         harness
             .wait_for_log("claim_fallback_direct", Duration::from_secs(5))
@@ -994,7 +1203,7 @@ async fn fallback_foreign_code_writes_local_code_exactly_once() {
 /// queue.
 #[tokio::test]
 async fn concurrent_local_claim_returns_busy() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     let first = harness
         .handle
@@ -1004,6 +1213,12 @@ async fn concurrent_local_claim_returns_busy() {
     assert!(
         matches!(first, ClaimSharedResult::Accepted { .. }),
         "first try_claim must be Accepted; got {first:?}"
+    );
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before the flight proceeds"
     );
     let second = harness
         .handle
@@ -1040,13 +1255,19 @@ async fn concurrent_local_claim_returns_busy() {
 /// writes; no `claim_completed`.
 #[tokio::test]
 async fn display_removed_mid_claim_lifts_with_failed() {
-    let harness = ClaimHarness::build("mon", 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer("mon", 0x0f).await;
     harness.clear_sink_writes();
     let _first = harness
         .handle
         .try_claim(DisplayId("mon".into()))
         .await
         .expect("try_claim channel");
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before display removal"
+    );
     harness
         .handle
         .display_removed(DisplayId("mon".into()))
@@ -1160,7 +1381,7 @@ impl OwnershipGate for NeverOwned {
 #[tokio::test]
 async fn edge_policy_fires_claim_on_activity_edge() {
     let display = "edge_test";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     let (idle_tx, idle_rx) = idle_observation_channel();
@@ -1205,7 +1426,7 @@ async fn edge_policy_fires_claim_on_activity_edge() {
 #[tokio::test]
 async fn armed_policy_fires_claim_when_armed() {
     let display = "armed_test";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     // Arm the display — claim runtime records the arm deadline.
@@ -1254,7 +1475,7 @@ async fn armed_policy_fires_claim_when_armed() {
 #[tokio::test]
 async fn armed_policy_does_not_claim_without_arm() {
     let display = "unarmed_test";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     // Do NOT arm — the display has no arm deadline.
@@ -1298,7 +1519,7 @@ async fn armed_policy_does_not_claim_without_arm() {
 #[tokio::test]
 async fn owner_idle_policy_fires_claim_when_owner_idle_past_threshold() {
     let display = "owner_idle_test";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     let (idle_tx, idle_rx) = idle_observation_channel();
@@ -1368,7 +1589,7 @@ async fn owner_idle_policy_fires_claim_when_owner_idle_past_threshold() {
 #[tokio::test]
 async fn owner_idle_policy_does_not_claim_below_threshold() {
     let display = "owner_idle_low";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     let (idle_tx, idle_rx) = idle_observation_channel();
@@ -1429,9 +1650,9 @@ async fn owner_idle_policy_does_not_claim_below_threshold() {
 #[tokio::test]
 async fn owner_idle_policy_times_out_without_claim() {
     let display = "owner_idle_timeout";
-    // Use the scripted transport with NO direct fallback — it will try
-    // to dial and fail, so the IdleQuery fanout produces no response.
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    // The scripted peer accepts IdleQuery but sends no IdleReport,
+    // so the owner-idle query expires without starting a claim.
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     let (idle_tx, idle_rx) = idle_observation_channel();
@@ -1477,7 +1698,7 @@ async fn owner_idle_policy_times_out_without_claim() {
 #[tokio::test]
 async fn non_owner_idle_report_is_rejected_by_handler() {
     let display = "idle_owner_gate";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     // Set the coordination snapshot's expected owner to a specific
@@ -1540,7 +1761,7 @@ async fn non_owner_idle_report_is_rejected_by_handler() {
         &attacker_identity,
         "attacker-epoch01".to_owned(),
         harness.local_identity.instance_id.clone(),
-        "attacker-epoch01".to_owned(),
+        "0123456789abcdef".to_owned(),
         1,
         nonce.clone(),
         ClaimMessage::IdleReport(fake_report),
@@ -1571,7 +1792,7 @@ async fn non_owner_idle_report_is_rejected_by_handler() {
 #[tokio::test]
 async fn matching_owner_idle_report_is_accepted() {
     let display = "idle_owner_match";
-    let harness = ClaimHarness::build(display, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(display, 0x0f).await;
     let evaluator_cancel = CancellationToken::new();
 
     // Set the expected owner to match the IdleReport sender.
@@ -1633,7 +1854,7 @@ async fn matching_owner_idle_report_is_accepted() {
         &owner_identity,
         "00wner-epoch-001".to_owned(),
         harness.local_identity.instance_id.clone(),
-        "00wner-epoch-001".to_owned(),
+        "0123456789abcdef".to_owned(),
         1,
         nonce.clone(),
         ClaimMessage::IdleReport(real_report),
@@ -1660,7 +1881,7 @@ async fn matching_owner_idle_report_is_accepted() {
 #[tokio::test]
 async fn accepted_claim_response_records_owner_for_idle_report_gate() {
     let display = DisplayId("owner_tracking".to_owned());
-    let harness = ClaimHarness::build(&display.0, 0x0f).await;
+    let harness = ClaimHarness::build_with_reachable_silent_peer(&display.0, 0x0f).await;
     harness.coord.record_success(&display, 0x11, 0x0f, None);
 
     let result = harness
@@ -1669,6 +1890,12 @@ async fn accepted_claim_response_records_owner_for_idle_report_gate() {
         .await
         .expect("claim runtime must accept the local request");
     assert!(matches!(result, ClaimSharedResult::Accepted { .. }));
+    assert!(
+        harness
+            .wait_for_peer_requests(1, Duration::from_secs(2))
+            .await,
+        "reachable peer must receive the request before the injected response"
+    );
 
     let nonce = harness
         .handle
@@ -1688,7 +1915,7 @@ async fn accepted_claim_response_records_owner_for_idle_report_gate() {
         &owner_identity,
         "peer-epoch-00001".to_owned(),
         harness.local_identity.instance_id.clone(),
-        "recv-epoch-00001".to_owned(),
+        "0123456789abcdef".to_owned(),
         1,
         "accepted-frame-1".to_owned(),
         ClaimMessage::ClaimResponse(ClaimResponse {

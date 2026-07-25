@@ -58,7 +58,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::coordination_claim::ClaimTransportHandle;
+use crate::coordination_claim::{ClaimTransportHandle, FanoutResult};
 use crate::hooks::{Direction, HookContext, HookEngine, HookOutcome, HookSlot, Phase};
 
 /// Literal claim lifecycle anchors. Re-exported from the pure
@@ -153,6 +153,37 @@ struct ActiveFlight {
     /// right code per side without re-deriving it from the
     /// engine's `Action::WriteInput` (which is unparameterized).
     write_code: u8,
+    /// Epoch authenticated in the peer's signed frame. This is the
+    /// recipient epoch for replies; it is distinct from the local
+    /// transport epoch and from the advisory mDNS epoch.
+    peer_epoch: String,
+}
+
+/// Sign a reply for a peer using the epoch authenticated in its inbound frame.
+/// The verified peer epoch is not interchangeable with this daemon's local
+/// transport epoch or with an advisory mDNS epoch.
+fn sign_frame_for_peer(
+    identity: &InstanceIdentity,
+    sender_epoch: String,
+    peer_instance_id: String,
+    peer_epoch: String,
+    counter: u64,
+    nonce: String,
+    message: ClaimMessage,
+) -> Result<ClaimFrame, dormant_core::claim::ClaimFrameError> {
+    ClaimFrame::sign(
+        identity,
+        sender_epoch,
+        peer_instance_id,
+        peer_epoch,
+        counter,
+        nonce,
+        message,
+    )
+}
+
+fn negotiated_peer_count(result: FanoutResult) -> Option<usize> {
+    (result.contacted > 0).then_some(result.contacted)
 }
 
 /// Runtime events consumed by the driver.
@@ -560,12 +591,62 @@ pub struct ClaimRuntimeDeps {
     pub idle_rx: Option<crate::idle_observation::IdleObservationRx>,
 }
 
+fn log_inbound_forwarder_closed(reason: &'static str) {
+    warn!(
+        event = "claim_inbound_forwarder_closed_unexpectedly",
+        reason,
+    );
+}
+
+/// Forward only frames already authenticated by the transport into the runtime.
+/// Both channels are bounded (32 frames each), so a stalled runtime applies
+/// backpressure instead of growing an unbounded peer-controlled queue.
+async fn forward_verified_inbound(
+    mut inbound: mpsc::Receiver<ClaimFrame>,
+    runtime_tx: mpsc::Sender<RuntimeEvent>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            () = runtime_tx.closed() => {
+                if !cancel.is_cancelled() {
+                    log_inbound_forwarder_closed("runtime_channel_closed");
+                }
+                break;
+            }
+            frame = inbound.recv() => {
+                let Some(frame) = frame else {
+                    if !cancel.is_cancelled() {
+                        log_inbound_forwarder_closed("transport_channel_closed");
+                    }
+                    break;
+                };
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    result = runtime_tx.send(RuntimeEvent::Inbound(frame)) => {
+                        if result.is_err() {
+                            if !cancel.is_cancelled() {
+                                log_inbound_forwarder_closed("runtime_channel_closed");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Spawn the claim runtime driver. The returned handle is the
 /// orchestrator's integration point (IPC, F10 queries, snapshot
 /// status).
 #[must_use = "the claim-runtime handle is the orchestrator's integration point"]
 pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RuntimeEvent>(32);
+    let inbound = deps.transport.inbound();
+    let inbound_tx = cmd_tx.clone();
+    let inbound_cancel = deps.cancel.clone();
     let (owner_event_tx, owner_event_rx) = mpsc::channel::<(DisplayId, String, OwnerEvent)>(64);
     let armed = Arc::new(Mutex::new(HashMap::<DisplayId, Instant>::new()));
     let claim_capable = Arc::new(Mutex::new(Vec::<DisplayId>::new()));
@@ -608,6 +689,11 @@ pub fn spawn(deps: ClaimRuntimeDeps) -> ClaimRuntimeHandle {
         idle_rx: deps.idle_rx,
         pending_idle_queries: HashMap::new(),
     };
+    tokio::spawn(forward_verified_inbound(
+        inbound,
+        inbound_tx,
+        inbound_cancel,
+    ));
     tokio::spawn(driver.run());
     // owner_event_tx is cloned into spawned hook/write/wake
     // tasks. The original `owner_event_tx` clone is dropped
@@ -678,7 +764,6 @@ impl Driver {
     const MAGIC_STANDBY: u8 = 0x00;
 
     async fn run(mut self) {
-        // Prime the contexts from the current config.
         self.refresh_contexts_from_config().await;
         let mut tick = tokio::time::interval(DEADLINE_SWEEP_PERIOD);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -687,7 +772,7 @@ impl Driver {
                 () = self.cancel.cancelled() => break,
                 maybe = self.cmd_rx.recv() => {
                     let Some(event) = maybe else { break };
-                    self.handle_event(event);
+                    self.handle_event(event).await;
                 }
                 maybe = self.owner_event_rx.recv() => {
                     let Some((display, nonce, event)) = maybe else { break };
@@ -708,13 +793,13 @@ impl Driver {
         }
     }
 
-    fn handle_event(&mut self, event: RuntimeEvent) {
+    async fn handle_event(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Inbound(frame) => {
                 self.handle_inbound(frame);
             }
             RuntimeEvent::ClaimShared { display, reply } => {
-                self.handle_claim_shared(&display, reply);
+                self.handle_claim_shared(&display, reply).await;
             }
             RuntimeEvent::ClaimArm { display, reply } => {
                 self.handle_claim_arm(&display, reply);
@@ -737,8 +822,6 @@ impl Driver {
             }
             #[cfg(any(test, feature = "test-util"))]
             RuntimeEvent::InjectIdleReport { nonce, idle_ms } => {
-                // Test seam: directly resolve a pending idle query
-                // without the signed-frame transport.
                 if let Some((_display, tx)) = self.pending_idle_queries.remove(&nonce) {
                     let _ = tx.send(idle_ms);
                 }
@@ -785,7 +868,7 @@ impl Driver {
         } = frame;
         match message {
             ClaimMessage::ClaimRequest(request) => {
-                self.handle_inbound_request(sender_instance_id, nonce, request);
+                self.handle_inbound_request(sender_instance_id, sender_epoch, nonce, request);
             }
             ClaimMessage::ClaimAbort(_abort) => {
                 // Nonce correlate against active owner flights.
@@ -828,6 +911,17 @@ impl Driver {
                     return;
                 };
                 let accepted = matches!(&response.verdict, ClaimVerdict::Accepted { .. });
+                if accepted
+                    || self
+                        .flights
+                        .get(&display)
+                        .is_some_and(|flight| flight.peer_instance_id.is_empty())
+                {
+                    if let Some(flight) = self.flights.get_mut(&display) {
+                        flight.peer_instance_id.clone_from(&sender_instance_id);
+                        flight.peer_epoch.clone_from(&sender_epoch);
+                    }
+                }
                 let actions = self
                     .engines
                     .get_mut(&display)
@@ -885,7 +979,7 @@ impl Driver {
                         crate::idle_observation::idle_ms(&obs, Instant::now())
                     })
                     .unwrap_or(0);
-                let report_frame = match ClaimFrame::sign(
+                let report_frame = match sign_frame_for_peer(
                     &InstanceIdentity {
                         instance_id: self.local_instance_id.clone(),
                         signing_key: self.local_signing.clone(),
@@ -942,16 +1036,27 @@ impl Driver {
     fn handle_inbound_request(
         &mut self,
         sender_instance_id: String,
+        sender_epoch: String,
         nonce: String,
         request: ClaimRequest,
     ) {
         let Some(display) = self.find_display_by_claim_identity(&request.display_identity) else {
             // Unknown display: NotOwner verdict back.
-            self.send_verdict_to_peer_now(&sender_instance_id, &nonce, ClaimVerdict::NotOwner);
+            self.send_verdict_to_peer_now(
+                &sender_instance_id,
+                &sender_epoch,
+                &nonce,
+                ClaimVerdict::NotOwner,
+            );
             return;
         };
         let Some(ctx) = self.contexts.get(&display).cloned() else {
-            self.send_verdict_to_peer_now(&sender_instance_id, &nonce, ClaimVerdict::NotOwner);
+            self.send_verdict_to_peer_now(
+                &sender_instance_id,
+                &sender_epoch,
+                &nonce,
+                ClaimVerdict::NotOwner,
+            );
             return;
         };
         let capability = if ctx.writable {
@@ -1010,13 +1115,14 @@ impl Driver {
             ActiveFlight {
                 nonce: nonce.clone(),
                 peer_instance_id: sender_instance_id,
+                peer_epoch: sender_epoch,
                 write_code: u8::try_from(request.requester_input_code).unwrap_or(0),
             },
         );
         self.dispatch_actions(&display, &actions);
     }
 
-    fn handle_claim_shared(
+    async fn handle_claim_shared(
         &mut self,
         display: &DisplayId,
         reply: oneshot::Sender<ClaimSharedResult>,
@@ -1035,8 +1141,42 @@ impl Driver {
             ));
             return;
         }
-        let peer_count = self.transport.snapshot_peers().len();
+        let busy = self.engines.get(display).is_some_and(|engine| {
+            engine.requester_stage(display).is_some() || engine.owner_stage(display).is_some()
+        });
+        if busy {
+            self.record_event("claim_busy");
+            let _ = reply.send(ClaimSharedResult::Busy);
+            return;
+        }
+        if self.transport.addressable_peer_count() == 0 {
+            self.record_no_addressable_peers(display, "preflight", FanoutResult::default());
+            let _ = reply.send(ClaimSharedResult::Denied(
+                ClaimDeniedReason::CoordinationDisabled,
+            ));
+            return;
+        }
+
         let nonce = self.next_nonce();
+        let Some((counter, frame_nonce, message)) = self.build_claim_request(display, &nonce)
+        else {
+            let _ = reply.send(ClaimSharedResult::Denied(ClaimDeniedReason::Unsupported));
+            return;
+        };
+        // Per-peer dials are concurrent and bounded; awaiting them keeps the
+        // successful frame-write count authoritative before negotiation is promised.
+        let fanout = self
+            .transport
+            .fanout_request(counter, &frame_nonce, &message)
+            .await;
+        let Some(peer_count) = negotiated_peer_count(fanout) else {
+            self.record_no_addressable_peers(display, "fanout", fanout);
+            let _ = reply.send(ClaimSharedResult::Denied(
+                ClaimDeniedReason::CoordinationDisabled,
+            ));
+            return;
+        };
+
         let now = Instant::now();
         let claim_timeout = self.claim_timeout();
         let release_cap = self.release_deadline_cap();
@@ -1048,51 +1188,35 @@ impl Driver {
         for action in &actions {
             self.record_action(action);
         }
-        if actions.iter().any(|a| matches!(a, Action::BusyLocal)) {
+        if actions
+            .iter()
+            .any(|action| matches!(action, Action::BusyLocal))
+        {
             let _ = reply.send(ClaimSharedResult::Busy);
             return;
         }
-        // The outbound fanout and the F10 publication are
-        // both async channel sends — spawn one-shot tasks so
-        // the dispatch loop returns to its `select!` without
-        // paying the bounded-send round-trip latency. The
-        // Accepted verdict is sent synchronously below.
-        let transport = self.transport.clone();
+
         let front_ctl_tx = self.front_ctl_tx.clone();
         let local_input_code = ctx.local_input_code.unwrap_or(0);
         let suppressed_until = now + claim_timeout;
         if let Ok(mut map) = self.handle.suppressed.lock() {
             map.insert(display.clone(), suppressed_until);
         }
-        let display_for_fanout = display.clone();
-        if let Some((counter, frame_nonce, message)) = self.build_claim_request(display, &nonce) {
-            tokio::spawn(async move {
-                transport
-                    .fanout_request(counter, &frame_nonce, &message)
-                    .await;
-            });
-        }
-        // F10: publish the suppression deadline to the rules
-        // engine (consumed by `feed_ownership`).
+        let display_for_suppression = display.clone();
         tokio::spawn(async move {
             let _ = front_ctl_tx
                 .send(dormant_core::rules::ControlMsg::SetClaimSuppression {
-                    display: display_for_fanout,
+                    display: display_for_suppression,
                     until: Some(suppressed_until),
                 })
                 .await;
         });
-        // Advance to AwaitingAck and record the flight
-        // (the requester is the local side; the peer is the
-        // first known peer — the Accepted-verdict sender will
-        // overwrite this). The fallback path's direct write
-        // uses the LOCAL code, so `write_code` is the local
-        // code here.
         self.flights.insert(
             display.clone(),
             ActiveFlight {
                 nonce: nonce.clone(),
                 peer_instance_id: String::new(),
+                peer_epoch: String::new(),
                 write_code: local_input_code,
             },
         );
@@ -1229,24 +1353,36 @@ impl Driver {
         }
     }
 
+    fn record_no_addressable_peers(
+        &self,
+        display: &DisplayId,
+        phase: &'static str,
+        result: FanoutResult,
+    ) {
+        self.record_event("claim_no_addressable_peers");
+        let display_id = display.0.as_str();
+        info!(
+            event = "claim_no_addressable_peers",
+            display = display_id,
+            phase,
+            contacted = result.contacted,
+            skipped_no_endpoint = result.skipped_no_endpoint,
+            skipped_no_epoch = result.skipped_no_epoch,
+            sign_failed = result.sign_failed,
+            dial_failed = result.dial_failed,
+        );
+    }
+
     fn sweep_deadlines(&mut self) {
         let now = Instant::now();
         let displays: Vec<DisplayId> = self.engines.keys().cloned().collect();
         let mut lift_displays = Vec::new();
-        let mut to_dispatch: Vec<(DisplayId, Vec<Action>)> = Vec::new();
+        let mut to_dispatch: Vec<(DisplayId, Vec<Action>, bool)> = Vec::new();
         for display in displays {
             let Some(engine) = self.engines.get_mut(&display) else {
                 continue;
             };
-            // The pure engine's `on_deadline` is no-op when the
-            // active phase has not elapsed. We drive it for
-            // every display regardless — the cost is one
-            // `Instant` comparison.
             let actions = engine.on_deadline(&display, now);
-            // Update suppression if the deadline elapsed: the
-            // engine's `is_suppressed` already returns false on
-            // terminal, but we mirror it into the handle's
-            // side-table for the lock-free query path.
             if !engine.is_suppressed(&display, now) {
                 if let Ok(mut map) = self.handle.suppressed.lock() {
                     map.remove(&display);
@@ -1254,18 +1390,12 @@ impl Driver {
                 lift_displays.push(display.clone());
             }
             if !actions.is_empty() {
-                to_dispatch.push((display.clone(), actions));
-            }
-            if to_dispatch
-                .last()
-                .is_some_and(|(_, a)| a.iter().any(|x| matches!(x, Action::Terminal(_))))
-            {
-                self.flights.remove(&display);
+                let terminal = actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Terminal(_)));
+                to_dispatch.push((display.clone(), actions, terminal));
             }
         }
-        // Publish a clear to the rules engine for any display
-        // whose suppression just lifted (F10 lift). Spawn a
-        // task so the driver's main loop stays responsive.
         for display in lift_displays {
             let tx = self.front_ctl_tx.clone();
             tokio::spawn(async move {
@@ -1277,14 +1407,13 @@ impl Driver {
                     .await;
             });
         }
-        // Dispatch the deadline-expired actions so the
-        // `attempt_fallback` spawned task fires. The
-        // `dispatch_actions` queue iterates each action and
-        // dispatches it (e.g. `Trace` is recorded,
-        // `SendAbort` is spawned, `AttemptFallback` is
-        // dispatched).
-        for (display, actions) in to_dispatch {
+        for (display, actions, terminal) in to_dispatch {
             self.dispatch_actions(&display, &actions);
+            // Terminal sends still need the peer route stored in ActiveFlight.
+            // Cleanup only after dispatch has cloned that route into outbound tasks.
+            if terminal {
+                self.flights.remove(&display);
+            }
         }
     }
 
@@ -1351,30 +1480,26 @@ impl Driver {
             Action::SendAbort => {
                 let display = display.clone();
                 let mut flight = self.flights.get(&display).cloned();
-                let peer = self.transport.snapshot_peers();
+
                 let transport = self.transport.clone();
                 let identity = self.local_identity_view();
                 let sender_epoch = self.sender_epoch.clone();
-                let boot_epoch = self.transport.boot_epoch().as_str().to_owned();
+
                 let outbound_counter = self.outbound_counter;
                 tokio::spawn(async move {
                     let Some(flight) = flight.take() else { return };
-                    let peer_instance_id = if flight.peer_instance_id.is_empty() {
-                        peer.first()
-                            .map(|p| p.instance_id.clone())
-                            .unwrap_or_default()
-                    } else {
-                        flight.peer_instance_id
-                    };
-                    if peer_instance_id.is_empty() {
+                    let peer_instance_id = flight.peer_instance_id;
+                    let peer_epoch = flight.peer_epoch;
+                    if peer_instance_id.is_empty() || peer_epoch.is_empty() {
                         return;
                     }
+
                     let counter = outbound_counter.wrapping_add(1);
-                    if let Ok(frame) = ClaimFrame::sign(
+                    if let Ok(frame) = sign_frame_for_peer(
                         &identity,
                         sender_epoch,
                         peer_instance_id.clone(),
-                        boot_epoch,
+                        peer_epoch,
                         counter,
                         format!("abort-{}", flight.nonce),
                         ClaimMessage::ClaimAbort(ClaimAbort {
@@ -1640,26 +1765,37 @@ impl Driver {
         let Some(flight) = self.flights.get(display).cloned() else {
             return;
         };
-        if flight.peer_instance_id.is_empty() {
+        if flight.peer_instance_id.is_empty() || flight.peer_epoch.is_empty() {
             return;
         }
-        self.send_verdict_to_peer_now(&flight.peer_instance_id, &flight.nonce, verdict);
+        self.send_verdict_to_peer_now(
+            &flight.peer_instance_id,
+            &flight.peer_epoch,
+            &flight.nonce,
+            verdict,
+        );
     }
 
-    fn send_verdict_to_peer_now(&mut self, peer: &str, nonce: &str, verdict: ClaimVerdict) {
+    fn send_verdict_to_peer_now(
+        &mut self,
+        peer: &str,
+        peer_epoch: &str,
+        nonce: &str,
+        verdict: ClaimVerdict,
+    ) {
         let counter = self.next_counter();
         let transport = self.transport.clone();
         let identity = self.local_identity_view();
         let sender_epoch = self.sender_epoch.clone();
-        let boot_epoch = self.transport.boot_epoch().as_str().to_owned();
         let peer = peer.to_owned();
+        let peer_epoch = peer_epoch.to_owned();
         let nonce = nonce.to_owned();
         tokio::spawn(async move {
-            let Ok(frame) = ClaimFrame::sign(
+            let Ok(frame) = sign_frame_for_peer(
                 &identity,
                 sender_epoch,
                 peer.clone(),
-                boot_epoch,
+                peer_epoch,
                 counter,
                 format!("resp-{nonce}"),
                 ClaimMessage::ClaimResponse(ClaimResponse {
@@ -1669,30 +1805,30 @@ impl Driver {
             ) else {
                 return;
             };
-            transport.send_abort(&peer, &frame).await;
+            transport.send_response(&peer, &frame).await;
         });
     }
 
     fn send_release_failed_to_requester(&mut self, display: &DisplayId) {
-        let Some(flight) = self.flights.get(&display).cloned() else {
+        let Some(flight) = self.flights.get(display).cloned() else {
             return;
         };
-        if flight.peer_instance_id.is_empty() {
+        if flight.peer_instance_id.is_empty() || flight.peer_epoch.is_empty() {
             return;
         }
         let counter = self.next_counter();
         let transport = self.transport.clone();
         let identity = self.local_identity_view();
         let sender_epoch = self.sender_epoch.clone();
-        let boot_epoch = self.transport.boot_epoch().as_str().to_owned();
-        let peer = flight.peer_instance_id.clone();
-        let nonce = flight.nonce.clone();
+        let peer = flight.peer_instance_id;
+        let peer_epoch = flight.peer_epoch;
+        let nonce = flight.nonce;
         tokio::spawn(async move {
-            let Ok(frame) = ClaimFrame::sign(
+            let Ok(frame) = sign_frame_for_peer(
                 &identity,
                 sender_epoch,
                 peer.clone(),
-                boot_epoch,
+                peer_epoch,
                 counter,
                 format!("relfail-{nonce}"),
                 ClaimMessage::ReleaseFailed(ReleaseFailed {
@@ -2168,6 +2304,77 @@ mod tests {
                 "claim_completed",
             ]
         );
+    }
+
+    #[test]
+    fn reply_frames_verify_against_verified_peer_epoch() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use dormant_core::peers::{PeerRecord, instance_id_from_public_key};
+
+        let sender_signing = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let sender = InstanceIdentity {
+            instance_id: instance_id_from_public_key(&sender_signing.verifying_key().to_bytes()),
+            verifying_key: sender_signing.verifying_key(),
+            signing_key: sender_signing,
+        };
+        let recipient_signing = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
+        let recipient_id =
+            instance_id_from_public_key(&recipient_signing.verifying_key().to_bytes());
+        let sender_record = PeerRecord {
+            instance_id: sender.instance_id.clone(),
+            ed25519_pub: STANDARD.encode(sender.verifying_key.to_bytes()),
+            display_name: "sender".to_owned(),
+            paired_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_addr: None,
+            claim_port: None,
+        };
+        let messages = [
+            ClaimMessage::ClaimAbort(ClaimAbort {
+                nonce: "abort".to_owned(),
+            }),
+            ClaimMessage::ClaimResponse(ClaimResponse {
+                nonce: "response".to_owned(),
+                verdict: ClaimVerdict::Accepted { eta_ms: 10 },
+            }),
+            ClaimMessage::ReleaseFailed(ReleaseFailed {
+                nonce: "release".to_owned(),
+                reason: "write failed".to_owned(),
+            }),
+        ];
+
+        for (counter, message) in messages.into_iter().enumerate() {
+            let frame = sign_frame_for_peer(
+                &sender,
+                "sender-epoch-000".to_owned(),
+                recipient_id.clone(),
+                "peer-epoch-00001".to_owned(),
+                counter as u64 + 1,
+                format!("frame-{counter}"),
+                message,
+            )
+            .expect("reply frame signs");
+
+            frame
+                .verify(&sender_record, &recipient_id, "peer-epoch-00001")
+                .expect("peer accepts reply addressed to its verified epoch");
+            assert_ne!(frame.recipient_epoch, "sender-epoch-000");
+        }
+    }
+
+    #[test]
+    fn zero_contact_fanout_is_not_negotiated() {
+        let no_contact = crate::coordination_claim::FanoutResult {
+            contacted: 0,
+            dial_failed: 2,
+            ..crate::coordination_claim::FanoutResult::default()
+        };
+        let contacted = crate::coordination_claim::FanoutResult {
+            contacted: 2,
+            ..crate::coordination_claim::FanoutResult::default()
+        };
+
+        assert_eq!(negotiated_peer_count(no_contact), None);
+        assert_eq!(negotiated_peer_count(contacted), Some(2));
     }
 
     /// The driver's `KvmStatus` is the post-probe fold: an empty
@@ -2650,6 +2857,130 @@ mod tests {
                 "reason=write missing; output: {output}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transport and runtime seam is assembled in one regression test"
+    )]
+    async fn real_transport_forwards_verified_request_to_runtime() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::coordination_claim::{ClaimPeer, ClaimTransportDeps};
+        use crate::coordination_frame::{read_frame, write_frame};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use dormant_core::claim::Epoch;
+        use dormant_core::config::{Strictness, load_config_from_str};
+        use dormant_core::peers::{PeerRecord, instance_id_from_public_key};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::watch as tokio_watch;
+
+        const REQUESTER_EPOCH: &str = "request-epoch-01";
+        const OWNER_EPOCH: &str = "owner-boot-00001";
+        let identity = |seed: u8| {
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            InstanceIdentity {
+                instance_id: instance_id_from_public_key(&signing_key.verifying_key().to_bytes()),
+                verifying_key: signing_key.verifying_key(),
+                signing_key,
+            }
+        };
+        let requester = identity(31);
+        let owner = identity(32);
+        let response_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let response_port = response_listener.local_addr().unwrap().port();
+        let (_peers_tx, peers_rx) = tokio_watch::channel(vec![ClaimPeer {
+            instance_id: requester.instance_id.clone(),
+            verifying_key: requester.verifying_key,
+            last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, response_port))),
+            dns_addr: None,
+            claim_port: Some(response_port),
+            dns_port: None,
+            dns_epoch: Some(Epoch::try_from(REQUESTER_EPOCH).unwrap()),
+        }]);
+        let transport = Arc::new(crate::coordination_claim::spawn(ClaimTransportDeps {
+            identity: Arc::new(owner.clone()),
+            boot_epoch: Epoch::try_from(OWNER_EPOCH).unwrap(),
+            peers: peers_rx,
+            bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            fixed_port: None,
+            enabled: true,
+            on_peer_addr: Box::new(|_, _| {}),
+        }));
+        let owner_port = transport.ensure_provisional_listener().await.unwrap();
+
+        let (config, _) = load_config_from_str("config_version = 1\n", Strictness::Warn).unwrap();
+        let (_config_tx, config_rx) = tokio_watch::channel(Arc::new(config));
+        let (_executors_tx, executors_rx) = tokio_watch::channel(Arc::new(HashMap::new()));
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let _runtime = spawn(ClaimRuntimeDeps {
+            identity: Arc::new(owner.clone()),
+            transport: Arc::clone(&transport),
+            executors: executors_rx,
+            config: config_rx,
+            hooks: Arc::new(HookEngine::with_runner(Arc::new(ScriptedHookRunner::new()))),
+            coordination: None,
+            front_ctl_tx,
+            cancel: cancel.clone(),
+            event_log: None,
+            event_notify: None,
+            idle_rx: None,
+        });
+        let response_task = tokio::spawn(async move {
+            let (mut stream, _) = response_listener.accept().await.unwrap();
+            read_frame::<ClaimFrame, _>(&mut stream).await.unwrap()
+        });
+
+        let request_nonce = "runtime-e2e-request";
+        let request = ClaimRequest {
+            display_identity: "unknown-display".to_owned(),
+            requester_instance_id: requester.instance_id.clone(),
+            requester_input_code: 0x11,
+            counter: 1,
+            nonce: request_nonce.to_owned(),
+        };
+        let request_frame = ClaimFrame::sign(
+            &requester,
+            REQUESTER_EPOCH.to_owned(),
+            owner.instance_id.clone(),
+            OWNER_EPOCH.to_owned(),
+            1,
+            request_nonce.to_owned(),
+            ClaimMessage::ClaimRequest(request),
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, owner_port))
+            .await
+            .unwrap();
+        write_frame(&mut stream, &request_frame).await.unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(2), response_task)
+            .await
+            .expect("real transport request reaches runtime")
+            .unwrap();
+        let owner_record = PeerRecord {
+            instance_id: owner.instance_id.clone(),
+            ed25519_pub: STANDARD.encode(owner.verifying_key.to_bytes()),
+            display_name: "owner".to_owned(),
+            paired_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_addr: None,
+            claim_port: None,
+        };
+        response
+            .verify(&owner_record, &requester.instance_id, REQUESTER_EPOCH)
+            .expect("requester accepts owner reply");
+        assert!(matches!(
+            response.message,
+            ClaimMessage::ClaimResponse(ClaimResponse {
+                nonce,
+                verdict: ClaimVerdict::NotOwner,
+            }) if nonce == request_nonce
+        ));
+
+        cancel.cancel();
+        transport.shutdown().await;
     }
 
     /// `MakeWriter` implementation that writes to a shared buffer.

@@ -61,6 +61,21 @@ pub struct ClaimPeer {
     pub dns_epoch: Option<Epoch>,
 }
 
+/// Outcome of one concurrent claim fanout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FanoutResult {
+    /// Peers whose TCP connection and frame write both succeeded.
+    pub contacted: usize,
+    /// Peers skipped because no usable endpoint was known.
+    pub skipped_no_endpoint: usize,
+    /// Addressable peers skipped because no recipient epoch was known.
+    pub skipped_no_epoch: usize,
+    /// Per-peer frames that could not be signed.
+    pub sign_failed: usize,
+    /// Signed frames whose dial or frame write failed.
+    pub dial_failed: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointKind {
     Verified,
@@ -394,6 +409,7 @@ impl ClaimTransportHandle {
     }
 
     /// Take the sole receiver for authenticated inbound frames.
+    /// A second call returns an already-closed placeholder receiver.
     #[must_use]
     pub fn inbound(&self) -> mpsc::Receiver<ClaimFrame> {
         self.inbound
@@ -412,15 +428,23 @@ impl ClaimTransportHandle {
     /// This replaces the pre-Bug-C/D broadcast pattern: every frame is now
     /// addressed to a specific recipient, preserving the anti-relay binding
     /// on the signed envelope.
-    pub async fn fanout_request(&self, counter: u64, nonce: &str, message: &ClaimMessage) {
+    pub async fn fanout_request(
+        &self,
+        counter: u64,
+        nonce: &str,
+        message: &ClaimMessage,
+    ) -> FanoutResult {
         let peers = self.peer_snapshot();
         let mut dials = JoinSet::new();
+        let mut result = FanoutResult::default();
         for peer in peers {
             if peer_endpoints(&peer).is_empty() {
+                result.skipped_no_endpoint += 1;
                 tracing::info!(event = "claim_peer_no_port", peer = %peer.instance_id);
                 continue;
             }
             let Some(ref recipient_epoch) = peer.dns_epoch else {
+                result.skipped_no_epoch += 1;
                 tracing::info!(event = "claim_peer_no_epoch", peer = %peer.instance_id);
                 continue;
             };
@@ -433,17 +457,32 @@ impl ClaimTransportHandle {
                 nonce.to_owned(),
                 message.clone(),
             ) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(event = "claim_frame_sign_failed", error = %e);
+                Ok(frame) => frame,
+                Err(error) => {
+                    result.sign_failed += 1;
+                    tracing::warn!(event = "claim_frame_sign_failed", %error);
                     continue;
                 }
             };
             dials.spawn(async move {
-                let _ = send_to_peer(&peer, &frame).await;
+                let peer_id = peer.instance_id.clone();
+                (peer_id, send_to_peer(&peer, &frame).await)
             });
         }
-        while dials.join_next().await.is_some() {}
+        while let Some(task) = dials.join_next().await {
+            match task {
+                Ok((_peer, Ok(()))) => result.contacted += 1,
+                Ok((peer, Err(error))) => {
+                    result.dial_failed += 1;
+                    tracing::warn!(event = "claim_peer_send_failed", %peer, %error);
+                }
+                Err(error) => {
+                    result.dial_failed += 1;
+                    tracing::warn!(event = "claim_peer_send_task_failed", %error);
+                }
+            }
+        }
+        result
     }
 
     /// Best-effort delivery of a signed claim-abort frame to one peer.
@@ -470,6 +509,18 @@ impl ClaimTransportHandle {
     #[must_use]
     pub fn snapshot_peers(&self) -> Vec<ClaimPeer> {
         self.peer_snapshot()
+    }
+
+    /// Count peers eligible for an addressed fanout before any dial is attempted.
+    /// A peer needs both a usable endpoint and the advisory mDNS epoch used only
+    /// to address the signed request; [`FanoutResult::contacted`] remains the
+    /// authoritative post-dial count.
+    #[must_use]
+    pub fn addressable_peer_count(&self) -> usize {
+        self.peer_snapshot()
+            .iter()
+            .filter(|peer| peer.dns_epoch.is_some() && !peer_endpoints(peer).is_empty())
+            .count()
     }
 
     fn peer_snapshot(&self) -> Vec<ClaimPeer> {
@@ -1301,6 +1352,75 @@ mod tests {
         assert_eq!(received.sender_instance_id, remote.instance_id);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(*observed.lock().unwrap(), Some(local_addr));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fanout_result_counts_only_successful_frame_writes() {
+        let local = identity(1);
+        let reachable = identity(2);
+        let unreachable = identity(3);
+        let missing_epoch = identity(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let reachable_port = listener.local_addr().unwrap().port();
+        let closed_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let unreachable_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+
+        let (_peers_tx, peers_rx) = watch::channel(vec![
+            ClaimPeer {
+                instance_id: reachable.instance_id.clone(),
+                verifying_key: reachable.verifying_key,
+                last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                dns_addr: None,
+                claim_port: Some(reachable_port),
+                dns_port: None,
+                dns_epoch: Some(Epoch::try_from("peer-a-epoch-001").unwrap()),
+            },
+            ClaimPeer {
+                instance_id: unreachable.instance_id.clone(),
+                verifying_key: unreachable.verifying_key,
+                last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                dns_addr: None,
+                claim_port: Some(unreachable_port),
+                dns_port: None,
+                dns_epoch: Some(Epoch::try_from("peer-b-epoch-002").unwrap()),
+            },
+            ClaimPeer {
+                instance_id: missing_epoch.instance_id.clone(),
+                verifying_key: missing_epoch.verifying_key,
+                last_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                dns_addr: None,
+                claim_port: Some(reachable_port),
+                dns_port: None,
+                dns_epoch: None,
+            },
+        ]);
+        let handle = spawn(deps(local, peers_rx, calls));
+        let accept_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_frame::<ClaimFrame, _>(&mut stream).await.unwrap()
+        });
+
+        let result = handle
+            .fanout_request(
+                1,
+                "count-nonce",
+                &ClaimMessage::ClaimAbort(ClaimAbort {
+                    nonce: "count-request".to_owned(),
+                }),
+            )
+            .await;
+
+        assert_eq!(result.contacted, 1);
+        assert_eq!(result.dial_failed, 1);
+        assert_eq!(result.skipped_no_epoch, 1);
+        tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .expect("reachable peer receives frame")
+            .unwrap();
         handle.shutdown().await;
     }
 

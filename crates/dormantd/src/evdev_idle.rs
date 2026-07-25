@@ -32,7 +32,7 @@ impl EvdevIdleSource {
     fn open_accepted(&self) -> Vec<OpenedDevice> {
         evdev::enumerate()
             .filter_map(|(path, device)| {
-                let name = device.name().unwrap_or("<unnamed>");
+                let name = device.name().unwrap_or("_unnamed_");
                 if self.matcher.is_ignored(name) || !is_activity_device(&device) {
                     return None;
                 }
@@ -182,7 +182,7 @@ async fn run_readers(
             _ = scan.tick() => {
                 let opened: HashMap<PathBuf, evdev::EventStream> = evdev::enumerate()
                     .filter_map(|(path, device)| {
-                        let name = device.name().unwrap_or("<unnamed>");
+                        let name = device.name().unwrap_or("_unnamed_");
                         if matcher.is_ignored(name) || !is_activity_device(&device) {
                             return None;
                         }

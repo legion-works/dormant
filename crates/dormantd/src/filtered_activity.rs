@@ -270,6 +270,11 @@ impl InputAuthoritySupervisor {
                 return FilteredExit::Unavailable;
             }
         };
+        if cancel.is_cancelled() {
+            source_cancel.cancel();
+            let _ = handle.await;
+            return FilteredExit::Cancelled;
+        }
 
         self.record("publishing_filtered_started");
         self.set_authority(InputAuthority::Filtered);
@@ -488,8 +493,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use anyhow::{Result, bail};
-    use dormant_core::rules::ControlMsg;
+    use anyhow::{Result, anyhow, bail};
+    use dormant_core::rules::{ControlMsg, InhibitorKind};
     use dormant_core::types::RuleId;
     use test_case::test_case;
     use tokio::sync::{broadcast, mpsc, watch};
@@ -541,7 +546,7 @@ mod tests {
         let harness = FilteredActivityHarness::new([FakeDevice::ignored("USB Jiggler")]).await;
         harness.wait_for_authority(InputAuthority::Stock).await;
         harness.hotplug(FakeDevice::accepted("keyboard"));
-        harness.prove_recovery_with_key();
+        harness.prove_recovery_with_key().await;
         harness.wait_for_authority(InputAuthority::Filtered).await;
     }
 
@@ -549,26 +554,32 @@ mod tests {
     async fn last_accepted_device_unplug_falls_back_to_stock() {
         let harness = FilteredActivityHarness::new([FakeDevice::accepted("keyboard")]).await;
         harness.wait_for_authority(InputAuthority::Filtered).await;
+        harness.clear_control_messages().await;
         harness.unplug("keyboard");
         harness.wait_for_authority(InputAuthority::Stock).await;
+        assert!(!harness.filtered_observation().available);
         assert!(harness.stock_observation().available);
+        harness.assert_hold_awake_emitted().await;
     }
 
     #[tokio::test]
     async fn permission_revocation_is_unavailable_then_falls_back_to_stock() {
         let harness = FilteredActivityHarness::new([FakeDevice::accepted("keyboard")]).await;
+        harness.clear_control_messages().await;
         harness.revoke_permissions();
         harness.wait_for_authority(InputAuthority::Stock).await;
         assert!(!harness.filtered_observation().available);
         assert!(harness.stock_observation().available);
+        harness.assert_hold_awake_emitted().await;
     }
 
     #[tokio::test]
-    async fn ignored_only_fleet_uses_stock_fail_safe() {
+    async fn ignored_only_fleet_falls_back_to_stock_fail_safe() {
         let harness = FilteredActivityHarness::new([FakeDevice::ignored("USB Jiggler")]).await;
         harness.wait_for_authority(InputAuthority::Stock).await;
         assert!(!harness.filtered_observation().available);
         assert!(harness.stock_observation().available);
+        harness.assert_hold_awake_emitted().await;
     }
 
     #[tokio::test]
@@ -593,9 +604,12 @@ mod tests {
     #[tokio::test]
     async fn closed_filtered_watch_falls_back_to_stock() {
         let harness = FilteredActivityHarness::new([FakeDevice::accepted("keyboard")]).await;
+        harness.clear_control_messages().await;
         harness.close_reader();
         harness.wait_for_authority(InputAuthority::Stock).await;
+        assert!(!harness.filtered_observation().available);
         assert!(harness.stock_observation().available);
+        harness.assert_hold_awake_emitted().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -605,10 +619,13 @@ mod tests {
             Duration::from_secs(1),
         )
         .await;
+        harness.clear_control_messages().await;
         harness.stop_heartbeats();
         tokio::time::advance(Duration::from_secs(3)).await;
         harness.wait_for_authority(InputAuthority::Stock).await;
+        assert!(!harness.filtered_observation().available);
         assert!(harness.stock_observation().available);
+        harness.assert_hold_awake_emitted().await;
     }
 
     #[tokio::test]
@@ -621,17 +638,43 @@ mod tests {
     #[tokio::test]
     async fn recovery_probation_never_publishes_an_activity_edge() {
         let harness = FilteredActivityHarness::new([FakeDevice::ignored("USB Jiggler")]).await;
+        harness.pause_recovery_start();
         harness.hotplug(FakeDevice::accepted("keyboard"));
-        harness.prove_recovery_with_key();
-        harness.wait_for_authority(InputAuthority::Filtered).await;
+        harness.prove_recovery_with_key().await;
+        harness.wait_for_recovery_start().await;
+        assert_eq!(
+            harness.recovery_trace(),
+            [
+                "non_publishing_probe_ready",
+                "stock_cancelled",
+                "stock_joined",
+            ]
+        );
+        assert_eq!(
+            harness.current_authority().await,
+            InputAuthority::StartingFiltered
+        );
         assert_eq!(harness.filtered_observation().edge_seq, 0);
+        harness.release_recovery_start();
+        harness.wait_for_authority(InputAuthority::Filtered).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_filtered_start_never_records_filtered_authority() {
+        let harness = FilteredActivityHarness::new([FakeDevice::ignored("USB Jiggler")]).await;
+        harness.pause_recovery_start();
+        harness.hotplug(FakeDevice::accepted("keyboard"));
+        harness.prove_recovery_with_key().await;
+        harness.wait_for_recovery_start().await;
+        harness.cancel_during_pending_start().await;
+        assert_ne!(harness.current_authority().await, InputAuthority::Filtered);
     }
 
     #[tokio::test]
     async fn recovery_order_is_probe_then_stock_join_then_filtered_publish() {
         let harness = FilteredActivityHarness::new([FakeDevice::ignored("USB Jiggler")]).await;
         harness.hotplug(FakeDevice::accepted("keyboard"));
-        harness.prove_recovery_with_key();
+        harness.prove_recovery_with_key().await;
         harness.wait_for_authority(InputAuthority::Filtered).await;
         assert_eq!(
             harness.recovery_trace(),
@@ -648,7 +691,7 @@ mod tests {
     async fn stock_and_filtered_producers_are_never_live_together() {
         let harness = FilteredActivityHarness::new([FakeDevice::ignored("USB Jiggler")]).await;
         harness.hotplug(FakeDevice::accepted("keyboard"));
-        harness.prove_recovery_with_key();
+        harness.prove_recovery_with_key().await;
         harness.wait_for_authority(InputAuthority::Filtered).await;
         harness.unplug("keyboard");
         harness.wait_for_authority(InputAuthority::Stock).await;
@@ -662,7 +705,7 @@ mod tests {
         harness.unplug("keyboard");
         harness.wait_for_authority(InputAuthority::Stock).await;
         harness.hotplug(FakeDevice::accepted("keyboard"));
-        harness.prove_recovery_with_key();
+        harness.prove_recovery_with_key().await;
         harness.wait_for_authority(InputAuthority::Filtered).await;
         harness.emit_key().await;
         assert_eq!(harness.filtered_observation().edge_seq, 2);
@@ -721,8 +764,12 @@ mod tests {
         revoked: AtomicBool,
         heartbeat: AtomicBool,
         event_tx: broadcast::Sender<FakeEvent>,
-        probe_ready: AtomicBool,
+        probe_listening: AtomicBool,
         probe_notify: tokio::sync::Notify,
+        pause_start: AtomicBool,
+        start_waiting: AtomicBool,
+        start_notify: tokio::sync::Notify,
+        start_release: tokio::sync::Notify,
         open_count: AtomicUsize,
         live: Arc<AtomicUsize>,
         maximum_live: Arc<AtomicUsize>,
@@ -757,6 +804,12 @@ mod tests {
         ) -> Result<JoinHandle<Result<()>>> {
             if !self.state.can_open() {
                 bail!("no accepted fake device is readable");
+            }
+            if self.state.pause_start.load(Ordering::SeqCst) {
+                self.state.start_waiting.store(true, Ordering::SeqCst);
+                self.state.start_notify.notify_waiters();
+                self.state.start_release.notified().await;
+                self.state.start_waiting.store(false, Ordering::SeqCst);
             }
             self.state
                 .open_count
@@ -825,18 +878,48 @@ mod tests {
         }
 
         async fn probe(&self, cancel: CancellationToken) -> Result<()> {
-            loop {
-                if self.state.probe_ready.swap(false, Ordering::SeqCst) {
-                    if self.state.can_open() {
-                        return Ok(());
-                    }
-                    bail!("fake recovery probe found no readable accepted device");
-                }
-                tokio::select! {
-                    () = cancel.cancelled() => bail!("fake recovery probe cancelled"),
-                    () = self.state.probe_notify.notified() => {}
-                }
+            let mut event_rx = self.state.event_tx.subscribe();
+            if self.state.can_open() {
+                self.state.probe_listening.store(true, Ordering::SeqCst);
+                self.state.probe_notify.notify_waiters();
             }
+            let result = loop {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        break Err(anyhow!("fake recovery probe cancelled"));
+                    }
+                    event = event_rx.recv() => match event {
+                        Ok(FakeEvent::Activity(name)) => {
+                            let accepted = self.state
+                                .devices
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&name)
+                                .is_some_and(|device| !device.ignored);
+                            if accepted {
+                                break Ok(());
+                            }
+                        }
+                        Ok(FakeEvent::InventoryChanged) => {
+                            if self.state.can_open() {
+                                self.state.probe_listening.store(true, Ordering::SeqCst);
+                                self.state.probe_notify.notify_waiters();
+                            } else {
+                                self.state.probe_listening.store(false, Ordering::SeqCst);
+                            }
+                        }
+                        Ok(FakeEvent::PermissionRevoked) => {
+                            break Err(anyhow!("fake recovery probe permission revoked"));
+                        }
+                        Ok(FakeEvent::Close) | Err(broadcast::error::RecvError::Closed) => {
+                            break Err(anyhow!("fake recovery probe closed"));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    }
+                }
+            };
+            self.state.probe_listening.store(false, Ordering::SeqCst);
+            result
         }
     }
 
@@ -889,7 +972,7 @@ mod tests {
         cancel: CancellationToken,
         handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
         trace: Arc<Mutex<Vec<&'static str>>>,
-        _ctl_rx: tokio::sync::Mutex<mpsc::Receiver<ControlMsg>>,
+        ctl_rx: tokio::sync::Mutex<mpsc::Receiver<ControlMsg>>,
     }
 
     impl FilteredActivityHarness {
@@ -914,8 +997,12 @@ mod tests {
                 revoked: AtomicBool::new(false),
                 heartbeat: AtomicBool::new(true),
                 event_tx,
-                probe_ready: AtomicBool::new(false),
+                probe_listening: AtomicBool::new(false),
                 probe_notify: tokio::sync::Notify::new(),
+                pause_start: AtomicBool::new(false),
+                start_waiting: AtomicBool::new(false),
+                start_notify: tokio::sync::Notify::new(),
+                start_release: tokio::sync::Notify::new(),
                 open_count: AtomicUsize::new(0),
                 live: live.clone(),
                 maximum_live: maximum_live.clone(),
@@ -968,7 +1055,7 @@ mod tests {
                 cancel,
                 handle: tokio::sync::Mutex::new(Some(handle)),
                 trace,
-                _ctl_rx: tokio::sync::Mutex::new(ctl_rx),
+                ctl_rx: tokio::sync::Mutex::new(ctl_rx),
             };
             harness
                 .wait_for_authority(if initial_filtered {
@@ -1076,9 +1163,62 @@ mod tests {
             self.state.heartbeat.store(false, Ordering::SeqCst);
         }
 
-        fn prove_recovery_with_key(&self) {
-            self.state.probe_ready.store(true, Ordering::SeqCst);
-            self.state.probe_notify.notify_waiters();
+        async fn prove_recovery_with_key(&self) {
+            loop {
+                let notified = self.state.probe_notify.notified();
+                if self.state.probe_listening.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+            self.emit_key_without_wait();
+        }
+
+        fn pause_recovery_start(&self) {
+            self.state.pause_start.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_recovery_start(&self) {
+            loop {
+                let notified = self.state.start_notify.notified();
+                if self.state.start_waiting.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_recovery_start(&self) {
+            self.state.start_release.notify_waiters();
+        }
+
+        async fn current_authority(&self) -> InputAuthority {
+            *self.authority_rx.lock().await.borrow()
+        }
+
+        async fn clear_control_messages(&self) {
+            let _ = self.drain_control_messages().await;
+        }
+
+        async fn assert_hold_awake_emitted(&self) {
+            let messages = self.drain_control_messages().await;
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                ControlMsg::SetInhibited {
+                    kind: InhibitorKind::UserActivity,
+                    inhibited: true,
+                    ..
+                }
+            )));
+        }
+
+        async fn drain_control_messages(&self) -> Vec<ControlMsg> {
+            let mut rx = self.ctl_rx.lock().await;
+            let mut messages = Vec::new();
+            while let Ok(message) = rx.try_recv() {
+                messages.push(message);
+            }
+            messages
         }
 
         fn filtered_observation(&self) -> FilteredActivity {
@@ -1122,6 +1262,14 @@ mod tests {
 
         async fn cancel(&self) {
             self.cancel.cancel();
+            if let Some(handle) = self.handle.lock().await.take() {
+                handle.await.expect("supervisor joins");
+            }
+        }
+
+        async fn cancel_during_pending_start(&self) {
+            self.cancel.cancel();
+            self.release_recovery_start();
             if let Some(handle) = self.handle.lock().await.take() {
                 handle.await.expect("supervisor joins");
             }

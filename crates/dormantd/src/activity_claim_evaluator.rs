@@ -48,10 +48,8 @@ pub struct PolicyEvaluatorDeps {
     pub event_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
-/// Spawn the daemon-lifetime activity-claim policy evaluator.
-///
-/// Returns the join handle so the orchestrator can bound-await it during
-/// shutdown, mirroring the `wear_tracker` / `claim_runtime` pattern.
+/// Compatibility entry point for tests and callers without filtered input;
+/// production uses [`spawn_filtered`].
 #[must_use]
 pub fn spawn(deps: PolicyEvaluatorDeps) -> JoinHandle<()> {
     tokio::spawn(async move {

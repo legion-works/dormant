@@ -33,7 +33,6 @@
 // the Rust convention warning for this FFI-only module.
 #![allow(non_upper_case_globals)]
 
-use std::ffi::c_char;
 use std::os::raw::c_void;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -222,6 +221,9 @@ struct TapState {
     matcher: DeviceMatcher,
     activity: Mutex<FilteredActivity>,
     activity_tx: Mutex<FilteredActivityTx>,
+    /// The live tap port, needed by the callback to re-enable the tap
+    /// after disable-by-timeout or disable-by-user events.
+    port: CFMachPortRef,
 }
 
 // ── Tap lifecycle ─────────────────────────────────────────────────────────
@@ -251,6 +253,7 @@ fn create_tap(matcher: &DeviceMatcher, activity_tx: FilteredActivityTx) -> Resul
             edge_seq: 0,
         }),
         activity_tx: Mutex::new(activity_tx),
+        port: std::ptr::null_mut(), // filled in after CGEventTapCreate returns
     });
     let state_ptr = Box::into_raw(state);
 
@@ -274,6 +277,13 @@ fn create_tap(matcher: &DeviceMatcher, activity_tx: FilteredActivityTx) -> Resul
             drop(Box::from_raw(state_ptr));
         }
         bail!("CGEventTapCreate returned NULL — tap creation failed");
+    }
+
+    // Store the port in the TapState so the callback can re-enable the
+    // tap after disable-by-timeout / disable-by-user-input events.
+    // Safety: state_ptr is valid (non-null) and exclusively owned.
+    unsafe {
+        (*state_ptr).port = port;
     }
 
     Ok(OwnedTap {
@@ -341,7 +351,7 @@ fn run_event_loop(
     Ok(())
 }
 
-// ── Per-event decision (pure, testable) ───────────────────────────────────
+// ── Per-event decisions (pure, testable) ──────────────────────────────────
 
 /// Whether the event should be discarded (NOT published as activity).
 ///
@@ -357,6 +367,19 @@ pub fn should_discard_event(name: Option<&str>, matcher: &DeviceMatcher) -> bool
     matcher.is_ignored(name)
 }
 
+/// Whether `event_type` is a tap-disable notification that should
+/// trigger a `CGEventTapEnable(port, true)` re-enable call.
+///
+/// Source: `<CGEvent.h>:285-294` — the tap recovery protocol.
+/// `kCGEventTapDisabledByTimeout` = 0xFFFFFFFE, `*ByUserInput` = 0xFFFFFFFF.
+/// Both represent the kernel signalling that the tap has been disabled;
+/// re-enabling it restores event delivery without re-creating the port.
+#[must_use]
+pub fn should_reenable_tap(event_type: CGEventType) -> bool {
+    event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+        || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+}
+
 // ── Tap callback ───────────────────────────────────────────────────────────
 
 /// CoreGraphics event tap callback — called for every HID event on the
@@ -365,6 +388,13 @@ pub fn should_discard_event(name: Option<&str>, matcher: &DeviceMatcher) -> bool
 /// Returns the event unmodified (listen-only: `kCGEventTapOptionListenOnly`
 /// guarantees propagation regardless of the return value, but returning
 /// the event is idiomatic for listen-only taps).
+///
+/// # Disable recovery
+///
+/// When the tap is disabled (timeout or user input), this callback receives
+/// `kCGEventTapDisabledByTimeout` / `kCGEventTapDisabledByUserInput` and
+/// re-enables the tap via `CGEventTapEnable(port, true)`.  Without this
+/// the tap stays permanently dead until daemon restart.
 ///
 /// # Panic safety
 ///
@@ -380,6 +410,15 @@ unsafe extern "C" fn tap_callback(
 ) -> CGEventRef {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let state = unsafe { &*(user_info as *const TapState) };
+
+        // Disable recovery — re-enable the tap before processing the event.
+        if should_reenable_tap(_type_) {
+            // Safety: port was stored in TapState after CGEventTapCreate.
+            unsafe { CGEventTapEnable(state.port, true) };
+            tracing::info!(event = "input_filter_tap_reenabled");
+            return;
+        }
+
         let process_name = process_name_for_event(event);
         if should_discard_event(process_name.as_deref(), &state.matcher) {
             return;
@@ -402,13 +441,24 @@ unsafe extern "C" fn tap_callback(
     event
 }
 
-/// Maximum process name length in bytes (`proc_name`'s documented max).
-const MAX_PROCESS_NAME_LEN: usize = 256;
+/// Buffer size for `proc_pidpath` — `PROC_PIDPATHINFO_MAXSIZE` on macOS
+/// is 4096, but the practical maximum path length is `PATH_MAX` (1024).
+/// Use 1024 to avoid a 4 KiB stack allocation on every event.
+/// `proc_name` was not used because it caps output at 31 chars (despite
+/// requiring a ≥32-byte buffer per `man 3 proc_name`), silently truncating
+/// any process whose name exceeds 31 characters — a jiggler with "jiggler"
+/// past byte 31 would be invisible to the filter.
+const PROC_PIDPATH_BUFSIZE: usize = 1024;
 
 /// Extract the process name for a CoreGraphics event.
 ///
 /// Uses `CGEventGetIntegerValueField(event, kCGEventSourceUnixProcessID)`
-/// to retrieve the source PID, then `proc_name(pid)` to get the name.
+/// to retrieve the source PID, then `proc_pidpath(pid)` to get the full
+/// executable path, from which the basename (last path component) is
+/// extracted.  `proc_pidpath` returns the full path without truncation;
+/// `proc_name` was specifically avoided because it caps names at 31 chars,
+/// which would silently miss jiggler names exceeding that length.
+///
 /// `CGEventCopyProcessName` and `CGEventGetProcessName` were removed from
 /// the macOS SDK linker-visible symbols in recent toolchains.
 ///
@@ -423,18 +473,24 @@ fn process_name_for_event(event: CGEventRef) -> Option<String> {
     if pid <= 0 {
         return None;
     }
-    let mut buf: [u8; MAX_PROCESS_NAME_LEN] = [0u8; MAX_PROCESS_NAME_LEN];
-    // Safety: buf is a valid buffer of MAX_PROCESS_NAME_LEN bytes.
-    let result = unsafe { proc_name(pid, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) };
+    let mut buf: [u8; PROC_PIDPATH_BUFSIZE] = [0u8; PROC_PIDPATH_BUFSIZE];
+    // Safety: buf is a valid buffer of PROC_PIDPATH_BUFSIZE bytes.
+    let result = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
     if result <= 0 {
         return None;
     }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     if len == 0 {
-        None
-    } else {
-        String::from_utf8(buf[..len].to_vec()).ok()
+        return None;
     }
+    let path = String::from_utf8(buf[..len].to_vec()).ok()?;
+    // Extract the basename (last path component) — this is the process
+    // name that the ignore globs match against.
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&path);
+    Some(name.to_owned())
 }
 
 // ── Event mask ─────────────────────────────────────────────────────────────
@@ -490,11 +546,30 @@ type CGEventTapCallBack = unsafe extern "C" fn(
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
+/// `kCGHIDEventTap` — tap system-wide HID events.
+/// Source: `<CGEventTypes.h>` — `kCGHIDEventTap = 0` (the HID event tap).
 const kCGHIDEventTap: CGEventTapLocation = 0;
+
+/// `kCGHeadInsertEventTap` — insert at the head (before any other taps).
+/// Source: `<CGEventTypes.h>` — `kCGHeadInsertEventTap = 0`.
 const kCGHeadInsertEventTap: CGEventTapPlacement = 0;
-const kCGEventTapOptionListenOnly: CGEventTapOptions = 0;
+
+/// `kCGEventTapOptionListenOnly` — passive, never filters/modifies events.
+/// Source: `<CGEventTypes.h>:418-419` — `kCGEventTapOptionListenOnly = 0x00000001`.
+/// NOT `kCGEventTapOptionDefault` (0) — that is an ACTIVE tap that CAN delete events.
+const kCGEventTapOptionListenOnly: CGEventTapOptions = 1;
+
+/// `kCGEventTapDisabledByTimeout` — sent when a tap times out.
+/// Source: `<CGEvent.h>:285-294` — the recovery protocol: re-enable with
+/// `CGEventTapEnable(port, true)` on receipt.
+const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: CGEventType = 0xFFFF_FFFE;
+
+/// `kCGEventTapDisabledByUserInput` — sent when the user force-disables taps.
+/// Source: `<CGEvent.h>:285-294` — same recovery protocol as timeout.
+const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFFF;
 
 // Event types (subset — input events we listen for).
+// All sourced from `<CGEventTypes.h>`; values are stable API.
 const kCGEventLeftMouseDown: CGEventType = 1;
 const kCGEventLeftMouseUp: CGEventType = 2;
 const kCGEventRightMouseDown: CGEventType = 3;
@@ -569,11 +644,13 @@ unsafe extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
 }
 
-// `proc_name` lives in libSystem on macOS — no explicit `#[link]` needed.
+// `proc_pidpath` lives in libSystem on macOS — no explicit `#[link]` needed.
+// Unlike `proc_name` (which truncates at 31 chars regardless of buffer size),
+// `proc_pidpath` returns the full executable path without length restrictions.
 unsafe extern "C" {
-    /// Fill `buffer` with the NUL-terminated process name for `pid`.
-    /// Returns 0 on failure, the returned buffer length on success.
-    fn proc_name(pid: i32, buffer: *mut c_char, buffersize: u32) -> i32;
+    /// Fill `buffer` with the NUL-terminated executable path for `pid`.
+    /// Returns bytes written (>0) on success, or ≤0 on failure.
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -925,6 +1002,56 @@ mod tests {
         assert!(!should_discard_event(None, &matcher));
         assert!(!should_discard_event(Some("USB Jiggler"), &matcher));
         assert!(!should_discard_event(Some("Terminal"), &matcher));
+    }
+
+    // ── should_reenable_tap (pure, testable) ────────────────────────────
+
+    #[test]
+    fn timeout_disable_triggers_reenable() {
+        assert!(
+            should_reenable_tap(K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT),
+            "kCGEventTapDisabledByTimeout must trigger re-enable"
+        );
+    }
+
+    #[test]
+    fn user_input_disable_triggers_reenable() {
+        assert!(
+            should_reenable_tap(K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT),
+            "kCGEventTapDisabledByUserInput must trigger re-enable"
+        );
+    }
+
+    #[test]
+    fn normal_input_event_does_not_trigger_reenable() {
+        assert!(!should_reenable_tap(kCGEventKeyDown));
+        assert!(!should_reenable_tap(kCGEventMouseMoved));
+        assert!(!should_reenable_tap(42));
+    }
+
+    // ── proc_pidpath extraction: long names survive past 31 chars ──────
+
+    #[test]
+    fn proc_pidpath_basename_extraction_matches_past_31_chars() {
+        // proc_name caps at 31 chars; proc_pidpath returns the full path.
+        // This basename has 31 chars of padding before "jiggler".  The
+        // 31-char prefix is pure padding — no "jiggler".  proc_name would
+        // return only that prefix and silently miss the jiggler glob.
+        let basename = "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234jigglerHelper";
+        assert!(basename.len() > 31);
+        let trunc31 = &basename[..31];
+        assert_eq!(trunc31, "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234");
+        assert!(
+            !trunc31.to_lowercase().contains("jiggler"),
+            "31-char prefix must NOT contain jiggler (proc_name would miss)"
+        );
+        // proc_pidpath returns the full basename — the glob matches.
+        let matcher = DeviceMatcher::compile(&["*jiggler*".to_string()]).unwrap();
+        assert!(
+            matcher.is_ignored(basename),
+            "full basename with jiggler past char 31 must match (proc_pidpath)"
+        );
+        assert!(!matcher.is_ignored("Terminal"), "negative control");
     }
 
     // ── Cancellation terminates the run loop ─────────────────────────────

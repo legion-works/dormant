@@ -175,18 +175,27 @@ The claim succeeds when one peer accepts and the requester reads its own VCP
 `Denied`, `NotOwner`, or `Busy` response from every expected peer triggers the
 fallback path.
 
-### Powered-only direct fallback
+### Readback-verified direct fallback
 
 When every expected peer responds `NotOwner` (no peer claims to own the
 display), or when the `claim_timeout` expires without any `Accepted`, the
-requester falls back to a direct VCP `0x60` write. This path skips the peer's
+requester attempts a direct VCP `0x60` write. This path skips the peer's
 `before_release` hooks — the requester writes its input code directly to the
 panel, waking it if it was blanked.
 
-The direct fallback is recorded as `claim_fallback_direct`. It is the only
-available path when the panel is powered but no paired machine has `dormantd`
-running (e.g. a single-machine setup with a monitor that was previously
-sleeping, or a third-party device selected on the panel).
+The direct fallback is recorded as `claim_fallback_direct`, but it is not a
+general substitute for negotiation. On the AOC AG326UZD, a machine connected
+to an inactive input cannot pull the panel away from the active input: the
+write transport reports success, but VCP `0x60` remains unchanged. A claim
+initiated by the inactive machine therefore requires the negotiated path so
+the current owner can push the panel to the requester's input. This behavior
+was observed on one monitor model; other panels may differ.
+
+Every input-source write is immediately read back. If VCP `0x60` does not match
+the requested value, `write_input_source` returns `E_DISPLAY_IO`; the claim
+engine does not record ownership of a panel that did not move. A direct attempt
+can still succeed where the panel accepts the requester's write, but transport
+acknowledgement alone is not success.
 
 ### Visible-standby failure
 

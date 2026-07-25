@@ -1203,20 +1203,18 @@ impl Driver {
             self.event_notify.as_ref(),
             name.to_string(),
         );
-        if matches!(
-            name,
-            "claim_requested"
-                | "claim_accepted"
-                | "claim_denied"
-                | "claim_busy"
-                | "claim_not_owner"
-                | "claim_release_aborted"
-                | "claim_release_failed"
-                | "claim_fallback_direct"
-                | "claim_failed"
-                | "claim_completed"
-        ) {
-            info!(event = %name, "claim lifecycle");
+        match name {
+            "claim_requested" => info!(event = "claim_requested", "claim lifecycle"),
+            "claim_accepted" => info!(event = "claim_accepted", "claim lifecycle"),
+            "claim_denied" => info!(event = "claim_denied", "claim lifecycle"),
+            "claim_busy" => info!(event = "claim_busy", "claim lifecycle"),
+            "claim_not_owner" => info!(event = "claim_not_owner", "claim lifecycle"),
+            "claim_release_aborted" => info!(event = "claim_release_aborted", "claim lifecycle"),
+            "claim_release_failed" => info!(event = "claim_release_failed", "claim lifecycle"),
+            "claim_fallback_direct" => info!(event = "claim_fallback_direct", "claim lifecycle"),
+            "claim_failed" => info!(event = "claim_failed", "claim lifecycle"),
+            "claim_completed" => info!(event = "claim_completed", "claim lifecycle"),
+            _ => {}
         }
     }
 

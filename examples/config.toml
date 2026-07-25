@@ -70,24 +70,27 @@ config_version = 1
 
 # ── Multi-machine coordination ──────────────────────────────────────────────
 # Optional and off by default. Set enabled to true only to expose mDNS
-# discovery, pairing, and operator routes on the LAN.
+# discovery, pairing, and operator routes on the LAN. Every key below
+# shows its documented default — when the section is absent (or present
+# with `enabled = false`) these values are the effective defaults.
 # [coordination]
-# enabled = false               # mDNS discovery, pairing, and operator routes
-# poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
-# state_poll_interval = "30s"   # panel-state refresh cadence (unset → max(30s, poll_interval); when set, >= poll_interval)
-# pairing_port = 0               # 0 asks the OS for an ephemeral temporary listener port
-# pairing_window = "5m"          # code/listener/mDNS lifetime (30s..=15m)
+# enabled = false                 # mDNS discovery, pairing, and operator routes
+# poll_interval = "2s"            # shared-display ownership poll cadence (>= 1s)
+# state_poll_interval = "30s"     # panel-state refresh cadence (unset → max(30s, poll_interval); when set, >= poll_interval)
+# loss_confirmations = 3          # consecutive "not mine" VCP 0x60 reads before ownership flips true→false (1..=10)
+# pairing_port = 0                # 0 asks the OS for an ephemeral temporary listener port
+# pairing_window = "5m"           # code/listener/mDNS lifetime (30s..=15m)
 # pairing_bind_address = "10.0.0.5" # unset defaults to the primary non-loopback LAN address
 # claim_port = 0                  # always-on claim listener; 0 = OS-assigned port
 # claim_bind_address = "10.0.0.5"  # unset = auto-detect LAN address
-# claim_advertise_mdns = false     # advertise the claim listener via mDNS (optional)
+# claim_advertise_mdns = true     # advertise the claim listener via mDNS; false = unadvertised (accepts direct-dialled peers only)
 #
 # Claim policies triggered by local input activity:
 # activity_claim = "off"         # "off" | "owner-idle" | "edge" | "armed"
-# owner_idle_window = "2m"       # min idle before an owner-idle claim fires
+# owner_idle_window = "30s"      # min idle before an owner-idle claim fires
 # armed_window = "1m"            # arm window lifetime
-# claim_timeout = "5s"           # request/ack round-trip bound
-# release_deadline_cap = "30s"    # upper cap on a computed release deadline
+# claim_timeout = "3s"           # request/ack round-trip bound
+# release_deadline_cap = "45s"   # upper cap on a computed release deadline
 #
 # owner-idle warm-up: the policy needs one prior successful claim per display
 # before it will engage. The daemon learns the owning peer's identity from
@@ -127,6 +130,26 @@ socket_path = "/run/user/1000/dormant.sock"
 #                                 # treated as "frozen" rather than genuine idleness (>= 2)
 # macos_idle_sanity_cap = "24h"  # readings above this are treated as bogus, not real idle time (> 0)
 # macos_idle_startup_grace = "15s"  # readings are untrusted for this long after daemon startup (> 0)
+
+# ── KVM claim hotkey ──────────────────────────────────────────────────────
+#
+# Optional. The tray registers this global accelerator to fire a claim;
+# when unset, claims rely on `dormantctl switch`, an activity-claim policy,
+# or the web UI. The string syntax is the tray's native accelerator format
+# (X11 key combo on Linux, Carbon modifier+key on macOS).
+# [keymap]
+# claim_hotkey = "Meta+Ctrl+Shift+B"
+
+# ── Input-device filtering for activity claims ───────────────────────────
+#
+# Optional. Case-insensitive device-name globs that do NOT count as local
+# activity — activity on an ignored device neither inhibits blanking nor
+# triggers an `edge` claim. The filtered-input source reads evdev nodes on
+# Linux through the compositor's seat; unprivileged reads need the user in
+# the `input` group or equivalent `uaccess`/logind ACL (see
+# `dormantctl doctor input-filter` and docs/src/multi-machine.md).
+# [input_filter]
+# ignore_devices = ["*jiggler*", "MosArt *"]
 
 # ── Web UI config editor: entity CRUD + the Samsung pairing wizard ─────────
 #
@@ -304,3 +327,17 @@ wake_retry_interval = "60s"
 # blank_mode = "power_off"
 # scope = "shared"
 # shared_input_code = 0x0f       # doctor prints the active input in hex
+#
+# [displays.shared_oled.hooks]
+# # before_release — entries fire in order BEFORE releasing the panel to the
+# # peer; a blocking entry (blocking = true, the slot default) must finish
+# # before the input-source write. Use for USB-switch or KVMP transitions.
+# before_release = [
+#   { mqtt = { topic = "usbswitch/set", payload = "mac" }, timeout = "5s", blocking = true },
+# ]
+# # after_acquire — non-blocking entries fire AFTER the peer's release
+# # completes and the local input source is written.  Safe place for
+# # notification or local-state commands that must not hold the hand-off.
+# after_acquire = [
+#   { command = ["notify-send", "panel acquired"], timeout = "5s", blocking = false },
+# ]

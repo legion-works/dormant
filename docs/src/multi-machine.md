@@ -126,6 +126,230 @@ window, an attacker on the LAN can consume the attempt budget or flood/drop
 traffic. That denial of service is accepted: retrying opens a new short window,
 and no peer is persisted without completed confirmation.
 
+## Claim protocol
+
+Two paired `dormant` daemons negotiate panel ownership in one round trip,
+with optional fallback for unresponsive peers.
+
+### Identity and probe
+
+Every shared display pair requires a **claim identity**: a canonical
+`manufacturer:model` string (plus `:serial` when the EDID reports one)
+derived from the panel's EDID text fields. Both machines must agree on this
+identity — a serial mismatch or a missing required field blocks the claim.
+
+Confirm the identity on each machine:
+
+```bash
+dormantctl doctor ddcci
+```
+
+Look for `claim_identity=` in the probe output. If the string differs
+between the two hosts, check the physical display connection: a display
+connected through a different port or a different EDID path on one side
+will produce a different claim identity.
+
+The identity uses the EDID text fields only, **never** the machine-local
+`ident_string` bus prefix — machines connected through different DDC buses
+(e.g. `i2c-dev:7` vs `i2c-dev:8`) will still produce the same claim identity
+as long as the panel's EDID manufacturer, model, and serial are identical.
+
+### Paired negotiated path
+
+A hotkey press or `dormantctl switch` fires an immediate claim. The requester
+broadcasts a signed `ClaimRequest` frame to every paired peer on the LAN over
+TCP (the port announced via the `_dormant-claim._tcp.local.` mDNS service or
+reached through a previously dialled address). Each peer validates the frame,
+runs the owner-side state machine (hooks + input-source write), and returns a
+signed `ClaimResponse`. The protocol enforces replay protection per peer
+(monotonic outbound counters) and per-peer epoch validation (stale-epoch
+responses from a restarted peer are rejected).
+
+The claim succeeds when one peer accepts and the requester reads its own VCP
+`0x60` code on the panel within the negotiated `release_deadline_cap`. A
+`Denied`, `NotOwner`, or `Busy` response from every expected peer triggers the
+fallback path.
+
+### Powered-only direct fallback
+
+When every expected peer responds `NotOwner` (no peer claims to own the
+display), or when the `claim_timeout` expires without any `Accepted`, the
+requester falls back to a direct VCP `0x60` write. This path skips the peer's
+`before_release` hooks — the requester writes its input code directly to the
+panel, waking it if it was blanked.
+
+The direct fallback is recorded as `claim_fallback_direct`. It is the only
+available path when the panel is powered but no paired machine has `dormantd`
+running (e.g. a single-machine setup with a monitor that was previously
+sleeping, or a third-party device selected on the panel).
+
+### Visible-standby failure
+
+If the panel is in a low-power standby state where DDC/CI VCP writes fail
+(or where the VCP `0x60` readback is not reliable), the claim negotiation
+still proceeds — the `OwnerDisposition::Ready { standby: true }` flag tells
+the owner its `before_release` hooks and the subsequent VCP write may fail.
+The requester falls back to the direct path; the observable effect is a
+visible power-state transition on wake that did not complete in the negotiated
+phase.
+
+### Before-release fallback limitation (load-bearing)
+
+The `before_release` hook slot is the **only** mechanism that can sequence a
+USB-switch, KVMP, or other external transition ahead of the DDC input-source
+write. If the owner's `before_release` hooks fail and the owner sends
+`ReleaseFailed`, the peer's `after_release` hooks receive the abort
+compensation via `DORMANT_ABORTED=1` (see [Hook environment](#hook-environment)).
+There is no retry loop within a single flight — a failed owner transition
+terminates the flight, and the requester must retry from the beginning.
+
+## Hooks
+
+Each shared display can declare action slots for the four hand-off phases:
+`before_release`, `after_release`, `before_acquire`, and `after_acquire`.
+Actions in a slot run in declaration order. A hook action is either a command
+(argv array, no shell) or an MQTT publish (QoS 1, non-retained, separate
+client from the sensor-plane MQTT).
+
+### Scheduling and idempotence
+
+Hooks are NOT cancellable mid-run — they are bounded by their per-entry
+`timeout` instead. Entries declared as `blocking = true` (the slot default)
+run to completion and block the next phase; non-blocking entries are spawned
+and the phase continues immediately. A hook that fires after a late arrival
+(e.g. the direct-fallback path) is documented as **at-least-once**: hook
+commands MUST be idempotent. Check `DORMANT_DIRECTION`, `DORMANT_PHASE`, and
+`DORMANT_FALLBACK` in the environment to decide whether to act or skip.
+
+### Hook environment
+
+Every hook command receives:
+
+| Variable | Meaning |
+|---|---|
+| `DORMANT_DISPLAY` | Config display id |
+| `DORMANT_DISPLAY_IDENTITY` | Claim identity (F5, `manufacturer:model[:serial]`) |
+| `DORMANT_DIRECTION` | `release` or `acquire` |
+| `DORMANT_PHASE` | `before` or `after` |
+| `DORMANT_PEER` | Peer's instance id (not display name) |
+| `DORMANT_FALLBACK` | `0` (negotiated) or `1` (direct fallback) |
+| `DORMANT_ABORTED` | `0` (normal) or `1` (write-failure compensation; see below) |
+
+### Write-failure compensation
+
+When the owner's input-source write (`WriteSucceeded` / `WriteFailed`) fails,
+the owner's `after_release` slot still executes — but with `DORMANT_ABORTED=1`.
+This is the compensation channel for the foreign-owner case (spec §4 step 2):
+the requester that initiated the claim didn't get the panel, and it can use
+this signal to revert a USB-switch or KVMP transition that it performed in
+`before_release`.
+
+`DORMANT_ABORTED=1` is set for `after_release` hooks only, and only when the
+write to the panel actually failed. `after_acquire` hooks on the requester
+side never see `DORMANT_ABORTED=1` — if the claim completed, the panel was
+acquired successfully.
+
+### mDNS and claim port
+
+Paired peers announce their always-on claim listener through
+`_dormant-claim._tcp.local.` mDNS. The TXT record is deliberately minimal —
+only `v` (protocol version), `instance_id`, and `port` — no display names,
+counts, or hostnames are broadcast. Set `coordination.claim_advertise_mdns =
+false` to stop advertising the listener while still accepting inbound
+connections (requiring the peer to reach the machine through a previously
+dialled or manually configured address).
+
+The claim listener binds to a **fixed** port (`coordination.claim_port`) or an
+OS-assigned ephemeral port (`0`). When `claim_advertise_mdns` is true, the
+advertised port is the actual bound port; a changing OS-assigned port across
+restarts is broadcast automatically.
+
+## Activity policies
+
+Three activity-claim policies (`coordination.activity_claim`) fire claims
+automatically from local input, without operator action:
+
+| Policy | Behavior |
+|---|---|
+| `off` | No automatic claims (default). |
+| `edge` | Claim on any local input edge — keyboard, mouse, or tablet. The edge fires exactly once per flight; subsequent input during the same flight is ignored. |
+| `owner-idle` | Claim when the panel's current owner (the peer selected on the monitor) has been idle ≥ `owner_idle_window`. Requires a prior successful claim per display to learn the owner's identity — this warm-up runs once per daemon lifetime. |
+| `armed` | Claim while an explicit local arm window is active (opened by `dormantctl switch <display> --arm`). The arm expires after `armed_window` and must be re-armed. |
+
+`owner-idle` idle reports are authenticated by the peer: the local daemon only
+accepts `IdleReport` frames from the peer it learned from the most recent
+`ClaimResponse::Accepted`. Until that first claim completes, every
+`owner-idle` IdleReport is dropped — the daemon will not act on reports from
+an unknown peer.
+
+## Linux permissions
+
+The activity-claim path reads keyboard and mouse events from the compositor's
+input seat (evdev nodes on Linux, `CGEvent` tap on macOS). On Linux, the
+default input source is the Wayland compositor's idle-notifier protocol or
+the D-Bus screensaver idle time — neither requires elevated permissions.
+
+When `[input_filter] ignore_devices` is configured, the daemon opens evdev
+`/dev/input/event*` nodes through the compositor's seat to filter out
+named devices. The opener needs read access to those nodes, which typically
+means the user running `dormantd` must be in the `input` group, or the
+system's `uaccess` / logind ACL must grant the active seat access.
+
+Verify the backend with:
+
+```bash
+dormantctl doctor input-filter
+```
+
+The probe confirms that `/dev/input/event*` nodes are readable and reports
+which devices match the configured `ignore_devices` globs. If the probe fails
+with "permission denied", add the user to the `input` group and re-login.
+
+## macOS Accessibility
+
+On macOS, the tray hotkey (Carbon `RegisterEventHotKey`) requests **no**
+Accessibility permissions — `RegisterEventHotKey` is part of the Carbon Event
+Manager and registers directly with the HID system, bypassing the
+`AXIsProcessTrusted` gate. The Carbon path sets a system-wide hotkey that
+`dormant-tray` processes in its run loop; it does not observe or filter other
+applications' events.
+
+The macOS `CGEvent` tap (the input-filter backend for activity claims on
+macOS) **does** require Accessibility permissions. Without it, the daemon
+cannot read keyboard/mouse events from devices that are not already granted.
+The `input_filter_active` / `input_filter_unavailable` log anchors report the
+tap state — `input_filter_unavailable` means the tap could not be created and
+activity claims relying on filtered input (e.g. `activity_claim = "edge"`)
+will not fire. The stock idle source still reports activity through
+CoreGraphics idle-time queries, so the `user-activity` inhibitor is
+unaffected.
+
+## InputWake validation (F8)
+
+When `activity_claim = "edge"` or `"armed"` fires a claim and the render sink
+is the active stage, the daemon waits for the first real input event from the
+new owner — the **InputWake** (F8). This proves the input source actually
+reached the panel and that the display is now showing the active framebuffer.
+
+The validator is a 500 ms bounded window:
+
+1. After the claim's input-source write succeeds, the daemon begins watching
+   for a filtered-activity edge whose sequence number is **after** the start
+   of the current claim flight.
+2. Input events from ignored devices (matching `ignore_devices` globs) are
+   silently discarded and do not satisfy the validator.
+3. If a valid edge arrives within 500 ms, the claim completes immediately —
+   the panel was acquired and the input source is confirmed.
+4. If the 500 ms window expires or the activity source becomes unavailable,
+   the claim still completes — the validator is a best-effort proof, not a
+   gate. InputWake failure does not roll back the claim.
+
+During the 500 ms window the render overlay may flicker briefly: the daemon
+submitted the blank frame before the claim, the claim's write switched the
+input, and the new owner's first composited frame arrives asynchronously.
+This is one composited frame of black (typically <33 ms at 30 Hz), not a
+multi-second stuck state.
+
 ## `[coordination]` reference
 
 Coordination is opt-in. `enabled = false` disables mDNS, pairing, and the

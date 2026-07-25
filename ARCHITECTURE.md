@@ -52,6 +52,82 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 4. The **display executor** walks an ordered controller chain per display: tries the first controller, falls back on failure, retries wakes with bounded backoff, and escalates to the next controller if all retries are exhausted.
 5. For `scope = "shared"`, the coordination poller reads local VCP `0x60` on every `coordination.poll_interval` tick before the executor acts; it refreshes brightness/power cosmetics only at the slower effective `coordination.state_poll_interval` cadence (default `max(30s, poll_interval)`). mDNS and paired identities support instance pairing only; panel ownership, presence, and panel state are never broadcast.
 
+## Multi-machine claim flow
+
+Claim-coordination traffic — hotkey, CLI switch, and activity-claim events —
+flows through a separate path from the presence-to-blanking pipeline above.
+
+```
+  Hotkey / CLI / Activity edge
+         │
+         ▼
+  ┌─────────────────┐
+  │  dormantctl /    │
+  │  tray IPC        │──── ▶ ClaimRuntimeHandle.claim_shared(display)
+  │  activity_eval   │
+  └─────────────────┘
+         │
+         ▼
+  ┌─────────────────┐
+  │ ClaimEngine      │   one flight per display (pure, in dormant-core)
+  │ (single-flight)  │   requester_event / owner_event → Vec<Action>
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │ ClaimRuntime     │   action dispatch (dormantd)
+  │                  │   ├─ BroadcastRequest → transport (signed frames, TCP)
+  │                  │   ├─ RunBeforeRelease → hooks engine
+  │                  │   ├─ WriteInput → DDC VCP 0x60 write
+  │                  │   ├─ RunAfterRelease / AfterAcquire → hooks
+  │                  │   └─ WatchForFlip / coordination_poll
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │coordination_poll │   VCP 0x60 readback confirms ownership gain
+  │(every poll_interval) │   loss_confirmations debounce loss
+  └─────────────────┘
+```
+
+The `ClaimEngine` in `dormant-core` owns the pure state machine; `ClaimRuntime`
+in `dormantd` owns the async shell — transport (signed frames over TCP,
+dialled from the peer cache or resolved from mDNS), hook execution (in-order
+slot and per-entry timeout), DDC input-source write (`VcpPriority::Command`),
+and the coordination poll readback that confirms the flip actually landed.
+
+## Filtered-activity fan-out
+
+One physical input reader drives three consumers through a single watch
+channel:
+
+```
+  ┌──────────────────┐
+  │ InputAuthority    │   evdev nodes (Linux) or CGEventTap (macOS)
+  │ Supervisor        │   serialized stock→filtered transitions
+  └────────┬─────────┘
+           │ FilteredActivityTx (watch channel)
+           ▼
+   ┌───────┼───────────┬──────────────────┐
+   │       │           │                  │
+   ▼       ▼           ▼                  ▼
+┌──────┐ ┌────────┐ ┌──────────────┐ ┌──────────────┐
+│idle  │ │activity│ │claim-edge    │ │InputWake     │
+│src   │ │inhibit │ │(edge/armed   │ │validator     │
+│(stock│ │or      │ │ policy)      │ │(F8 ≤500ms   │
+│ cmpst│ │idle obs│ │              │ │ proof)       │
+└──────┘ └────────┘ └──────────────┘ └──────────────┘
+```
+
+The `InputAuthoritySupervisor` in `dormantd/src/filtered_activity.rs` is the
+sole producer-authority arbiter: it serializes every stock↔filtered
+transition, never grants two concurrent producer tokens, and publishes a
+single `FilteredActivity` (edge sequence + last-activity timestamp) that feeds
+all downstream consumers. The supervisor's stock fallback runs a compositor
+idle-source while the filtered source is being probed, recovered, or has
+failed — activity reporting never stops, it degrades from filtered (per-device)
+to stock (per-seat) and back.
+
 ## Where do I look for X?
 
 | Task | Where |

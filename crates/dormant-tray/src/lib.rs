@@ -39,9 +39,19 @@
 /// Tagged projection of menu actions for platform target/action callbacks.
 pub mod action_table;
 /// Pure action planning and injected platform I/O execution.
-#[cfg(unix)]
+///
+/// Gated to the same targets as the `tokio` dependency (the executor
+/// uses `tokio::task::spawn_blocking`). `cfg(unix)` would also include
+/// BSD/Solaris where tokio is not declared, producing a latent
+/// portability bug rather than a clean compile error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod dispatch;
 /// Platform-neutral hotkey registrar contract and lifecycle manager.
+///
+/// Gated to the same targets as the `tokio`/`tokio_util` dependencies
+/// the manager uses; without this the module compiles on Windows and
+/// fails to resolve those crates.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod hotkey;
 /// Linux global hotkey registration via D-Bus.
 #[cfg(target_os = "linux")]

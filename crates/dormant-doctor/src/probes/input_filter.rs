@@ -212,6 +212,11 @@ mod tests {
     /// Prove the mandated Fail path: ignore list configured, but none of
     /// the discovered event nodes are readable by the process.  The
     /// detail must include the exact permission count (`0 of N`).
+    ///
+    /// Linux-only: calls `probe_node_list` directly, which on non-Linux
+    /// resolves to the `NotSupported` stub and cannot satisfy the
+    /// `Pass`/`Fail`/count assertions below.
+    #[cfg(target_os = "linux")]
     #[test]
     fn zero_readable_nodes_is_a_fail_with_exact_counts() {
         use crate::types::ProbeStatus;
@@ -245,6 +250,9 @@ mod tests {
     }
 
     /// Prove all-nodes-readable returns Pass with the correct count.
+    ///
+    /// Linux-only: same reason as `zero_readable_nodes_is_a_fail…`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn all_nodes_readable_is_a_pass_with_exact_counts() {
         let nodes: NodeList = ["/dev/input/event0", "/dev/input/event3"]
@@ -271,6 +279,9 @@ mod tests {
 
     /// Prove mixed readable/unreadable nodes still Pass but list the
     /// unreadable paths in the detail.
+    ///
+    /// Linux-only: same reason as `zero_readable_nodes_is_a_fail…`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn mixed_readable_nodes_pass_with_unreadable_paths_listed() {
         let nodes: NodeList = vec![
@@ -299,6 +310,9 @@ mod tests {
     }
 
     /// Prove the empty-node-list Fail path.
+    ///
+    /// Linux-only: same reason as `zero_readable_nodes_is_a_fail…`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn zero_event_nodes_is_a_fail() {
         let nodes: NodeList = Vec::new();

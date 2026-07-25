@@ -83,14 +83,19 @@ whichever source is selected.
 
 ### Claim methods
 
-Shared-display claims can be initiated in four ways:
+Shared-display claims can be initiated from:
 
-- **Hotkey** — immediate claim (factory-mapped to `Meta+Ctrl+Shift+B`).
+- **Hotkey** — immediate claim, configured via `keymap.claim_hotkey`
+  (for example `Meta+Ctrl+Shift+B`). No default hotkey is registered — set
+  one in the config before the tray will register it.
 - **`dormantctl switch <display>`** — immediate claim from the CLI.
+- **`dormantctl switch <display> --arm`** — open an armed window for
+  `activity_claim = "armed"`; expires after `armed_window`.
 - **`activity_claim = "edge"`** — claims on a local input edge (keyboard,
   mouse, tablet).
 - **`activity_claim = "owner-idle"`** — claims once the current owner (the peer
   selected on the monitor) has been idle for at least `owner_idle_window`.
+- **Web UI** — `POST /api/switch` through the dashboard.
 
 `owner-idle` has a warm-up requirement: it needs one prior successful claim
 per display before it engages. The daemon learns the owner's identity from
@@ -198,7 +203,7 @@ phase.
 The `before_release` hook slot is the **only** mechanism that can sequence a
 USB-switch, KVMP, or other external transition ahead of the DDC input-source
 write. If the owner's `before_release` hooks fail and the owner sends
-`ReleaseFailed`, the peer's `after_release` hooks receive the abort
+`ReleaseFailed`, the owner's `after_release` hooks receive the abort
 compensation via `DORMANT_ABORTED=1` (see [Hook environment](#hook-environment)).
 There is no retry loop within a single flight — a failed owner transition
 terminates the flight, and the requester must retry from the beginning.
@@ -228,7 +233,7 @@ Every hook command receives:
 | Variable | Meaning |
 |---|---|
 | `DORMANT_DISPLAY` | Config display id |
-| `DORMANT_DISPLAY_IDENTITY` | Claim identity (F5, `manufacturer:model[:serial]`) |
+| `DORMANT_DISPLAY_IDENTITY` | Claim identity (`manufacturer:model[:serial]`) |
 | `DORMANT_DIRECTION` | `release` or `acquire` |
 | `DORMANT_PHASE` | `before` or `after` |
 | `DORMANT_PEER` | Peer's instance id (not display name) |
@@ -239,10 +244,9 @@ Every hook command receives:
 
 When the owner's input-source write (`WriteSucceeded` / `WriteFailed`) fails,
 the owner's `after_release` slot still executes — but with `DORMANT_ABORTED=1`.
-This is the compensation channel for the foreign-owner case (spec §4 step 2):
-the requester that initiated the claim didn't get the panel, and it can use
-this signal to revert a USB-switch or KVMP transition that it performed in
-`before_release`.
+This is the compensation channel for the write-failure case:
+the owner can use this signal to revert a USB-switch or KVMP transition that
+its `before_release` performed.
 
 `DORMANT_ABORTED=1` is set for `after_release` hooks only, and only when the
 write to the panel actually failed. `after_acquire` hooks on the requester
@@ -324,11 +328,11 @@ will not fire. The stock idle source still reports activity through
 CoreGraphics idle-time queries, so the `user-activity` inhibitor is
 unaffected.
 
-## InputWake validation (F8)
+## InputWake validation
 
 When `activity_claim = "edge"` or `"armed"` fires a claim and the render sink
 is the active stage, the daemon waits for the first real input event from the
-new owner — the **InputWake** (F8). This proves the input source actually
+new owner — the **InputWake**. This proves the input source actually
 reached the panel and that the display is now showing the active framebuffer.
 
 The validator is a 500 ms bounded window:
@@ -366,7 +370,7 @@ for configured shared displays.
 | `pairing_window` | duration | `"5m"` | Lifetime of the listener and mDNS advertisement; `"30s"` to `"15m"`. |
 | `pairing_bind_address` | string or unset | unset | LAN address for the temporary listener; unset auto-detects the primary non-loopback address. |
 | `activity_claim` | enum | `"off"` | Claim policy triggered by local input activity. `"off"` — no automatic claims. `"owner-idle"` — claim when the current owner is idle (requires one prior claim per display; see [Claim methods](#claim-methods)). `"edge"` — claim on a local input edge (keyboard/mouse/tablet). `"armed"` — claim while an explicit arm window is active. |
-| `owner_idle_window` | duration | `"2m"` | Minimum owner-idle duration before an `owner-idle` claim fires. See [`activity_claim`](#coordination-reference) for the warm-up requirement. |
+| `owner_idle_window` | duration | `"30s"` | Minimum owner-idle duration before an `owner-idle` claim fires. See [`activity_claim`](#coordination-reference) for the warm-up requirement. |
 
 ## Limits and failure behavior
 

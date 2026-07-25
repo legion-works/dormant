@@ -11,5 +11,4 @@ pub(crate) mod doctor;
 pub(crate) mod events;
 pub(crate) mod operations;
 pub(crate) mod pair;
-pub(crate) mod pair_dormant;
 pub(crate) mod wear;

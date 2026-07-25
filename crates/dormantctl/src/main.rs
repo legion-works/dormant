@@ -47,20 +47,6 @@ enum PairTarget {
         /// TV hostname or IP address.
         host: String,
     },
-    /// Pair with another dormant instance discovered on the local network.
-    Instance {
-        /// Discovered peer display name, or the local display name with --open.
-        name: String,
-        /// Pairing code read from the responding instance.
-        #[arg(long, required_unless_present = "open")]
-        code: Option<String>,
-        /// Select a specific discovered instance when names are duplicated.
-        #[arg(long)]
-        instance_id: Option<String>,
-        /// Open a local responder pairing window and print its one-time code.
-        #[arg(long, conflicts_with_all = ["code", "instance_id"])]
-        open: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -251,18 +237,6 @@ fn main() -> ExitCode {
                 credentials,
                 host,
             }),
-            PairTarget::Instance {
-                name,
-                code,
-                instance_id,
-                open,
-            } => cmd_pair::run_instance(
-                &socket_path,
-                &name,
-                code.as_deref(),
-                instance_id.as_deref(),
-                open,
-            ),
         },
         Command::Doctor {
             config,
@@ -407,40 +381,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_pair_instance_peer() {
-        let cli = Cli::try_parse_from([
-            "dormantctl",
-            "pair",
-            "instance",
-            "Office-Mac",
-            "--code",
-            "ABCD1234",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Pair {
-                target: PairTarget::Instance { name, code: Some(code), open: false, .. },
-                ..
-            } if name == "Office-Mac" && code == "ABCD1234"
-        ));
-    }
-
-    #[test]
-    fn parse_pair_instance_open() {
-        let cli = Cli::try_parse_from(["dormantctl", "pair", "instance", "Office-Mac", "--open"])
-            .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Pair {
-                target: PairTarget::Instance { name, code: None, open: true, .. },
-                ..
-            } if name == "Office-Mac"
-        ));
-    }
-
-    // ── Task 12: `launchd install` / `launchd uninstall` parsing ──────────
+    // ── `launchd install` / `launchd uninstall` parsing ──────────
     //
     // Parsing is unconditional on every platform (mirrors the
     // `doctor macos-*` arms in cmd_doctor.rs) — only the handler behind it

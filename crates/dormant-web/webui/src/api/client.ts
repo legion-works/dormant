@@ -32,9 +32,6 @@ import type {
   ExerciseReport,
   OperationsStatus,
   DaemonIdentity,
-  InstancePairOpen,
-  InstancePairStatus,
-  InstancePairPeers,
   ClaimSharedResult,
   ClaimArmResult,
 } from "./types";
@@ -182,46 +179,6 @@ export async function postPairSamsung(host: string): Promise<PairAccepted> {
  */
 export function getPairStatus(pairId: string): Promise<PairStatus> {
   return request<PairStatus>(`/pair/samsung/${encodeURIComponent(pairId)}`);
-}
-
-/** Open a local instance-pairing responder window. */
-export function postInstancePair(display_name: string): Promise<InstancePairOpen> {
-  return request<InstancePairOpen>("/pair/instance", {
-    method: "POST",
-    headers: JSON_CT,
-    body: JSON.stringify({ display_name }),
-  });
-}
-
-/** Poll non-secret local instance-pairing state. */
-export function getInstancePairStatus(pairId: string): Promise<InstancePairStatus> {
-  return request<InstancePairStatus>(`/pair/instance/${encodeURIComponent(pairId)}`);
-}
-
-/** Cancel a local instance-pairing responder window. */
-export function postCancelInstancePair(pairId: string): Promise<InstancePairStatus> {
-  return request<InstancePairStatus>(`/pair/instance/${encodeURIComponent(pairId)}/cancel`, {
-    method: "POST",
-    headers: JSON_CT,
-  });
-}
-
-/** Submit an operator-confirmed code to the selected discovered instance. */
-export function postJoinInstancePair(
-  display_name: string,
-  instance_id: string,
-  code: string,
-): Promise<InstancePairStatus> {
-  return request<InstancePairStatus>("/pair/instance/join", {
-    method: "POST",
-    headers: JSON_CT,
-    body: JSON.stringify({ display_name, instance_id, code }),
-  });
-}
-
-/** Read public discovered and paired instance inventory. */
-export function getInstancePairPeers(): Promise<InstancePairPeers> {
-  return request<InstancePairPeers>("/pair/instance/peers");
 }
 
 /** POST /api/config/apply — apply a set of patches to the live config. */

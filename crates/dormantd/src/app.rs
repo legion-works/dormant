@@ -50,7 +50,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use dormant_core::claim::Epoch;
 use dormant_core::config::schema::{Config, Credentials, DisplayScope, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
@@ -62,10 +61,9 @@ use dormant_core::observation::{
     RuntimeRevision,
 };
 use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
-use dormant_core::peers::load_or_create_identity;
 use dormant_core::rules::{
-    ControlMsg, DaemonEvent, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg,
-    RulesEngine, RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
+    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
+    RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
@@ -86,13 +84,9 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
-use crate::claim_runtime::{self, ClaimRuntimeDeps, ClaimRuntimeHandle, sink_claim_capable};
-use crate::coordination_claim::{
-    ClaimTransportDeps, ClaimTransportHandle, PeerStoreFeed, spawn as spawn_claim_transport,
-};
-use crate::coordination_mdns::{ClaimPresence, MdnsSdBackend, PairDiscovery, resolve_bind_ip};
-use crate::coordination_pairing::{ClaimPortProvider, PairingManager, PairingTransport};
 use crate::coordination_poll::{self, CoordinationPollDeps};
+use crate::direct_switch::DirectSwitchHandle;
+use crate::hooks::HookEngine;
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
@@ -110,23 +104,6 @@ type NotifySinkBuilder = Arc<dyn Fn() -> Arc<dyn NotifySink> + Send + Sync>;
 /// registry; tests inject a factory that returns scripted fakes.
 type SourceBuilder =
     Arc<dyn Fn(&Config, &Credentials) -> Result<Vec<Box<dyn SensorSource>>> + Send + Sync>;
-
-fn claim_epoch() -> Result<Epoch> {
-    let mut bytes = [0_u8; 8];
-    getrandom::fill(&mut bytes).context("generate claim boot epoch")?;
-    Epoch::try_from(format!("{:016x}", u64::from_be_bytes(bytes)).as_str())
-        .map_err(|error| anyhow::anyhow!(error))
-}
-
-fn resolve_claim_bind_ip(config_override: Option<&str>) -> Result<std::net::IpAddr> {
-    #[cfg(any(test, feature = "test-util"))]
-    if let Some(address) = config_override {
-        return address
-            .parse()
-            .context("parse coordination claim_bind_address");
-    }
-    resolve_bind_ip(config_override).context("resolve coordination claim bind address")
-}
 
 /// Builds render sinks for a display.  Production uses
 /// [`LayerShellRenderSink`]; tests inject a factory that returns
@@ -850,186 +827,30 @@ impl App {
             || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
             |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
         );
-        let (claim_transport, peer_store) = {
-            let identity = Arc::new(
-                load_or_create_identity(&self.state_dir)
-                    .context("load persistent instance identity for claims")?,
-            );
-            let peer_store = Arc::new(
-                PeerStoreFeed::load(&self.state_dir)
-                    .context("load persistent paired-peer store")?,
-            );
-            let callback_store = Arc::clone(&peer_store);
-            let bind_address = if cfg_clone.coordination.enabled {
-                resolve_claim_bind_ip(cfg_clone.coordination.claim_bind_address.as_deref())?
-            } else {
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-            };
-            let transport = Arc::new(spawn_claim_transport(ClaimTransportDeps {
-                identity,
-                boot_epoch: claim_epoch()?,
-                peers: peer_store.subscribe(),
-                bind_address,
-                fixed_port: (cfg_clone.coordination.claim_port != 0)
-                    .then_some(cfg_clone.coordination.claim_port),
-                enabled: cfg_clone.coordination.enabled,
-                on_peer_addr: Box::new(move |instance_id, address| {
-                    if let Err(error) =
-                        callback_store.refresh_verified_address(&instance_id, address)
-                    {
-                        tracing::warn!(event = "claim_peer_address_persist_failed", peer = %instance_id, %error);
-                    }
-                }),
-            }));
-            (Some(transport), Some(peer_store))
-        };
-        let (coordination_enabled_tx, coordination_enabled_rx) =
-            watch::channel(cfg_clone.coordination.enabled);
-        let coordination_mdns = if cfg_clone.coordination.enabled {
-            let identity = load_or_create_identity(&self.state_dir)
-                .context("load persistent instance identity for mDNS discovery")?;
-            let discovery_state = coordination
-                .clone()
-                .unwrap_or_else(|| CoordinationHandle::new([]));
-            Some(PairDiscovery::new(
-                MdnsSdBackend::new()?,
-                identity.instance_id,
-                discovery_state,
-            ))
-        } else {
-            None
-        };
-        let claim_presence_handle = match (&claim_transport, &peer_store) {
-            (Some(transport), Some(peer_store)) => {
-                let identity = load_or_create_identity(&self.state_dir)
-                    .context("load persistent instance identity for claim presence")?;
-                let presence = ClaimPresence::new(
-                    MdnsSdBackend::new()?,
-                    identity.instance_id,
-                    transport.boot_epoch().as_str().to_owned(),
-                    cfg_clone.coordination.claim_advertise_mdns,
-                );
-                Some(spawn_claim_presence(
-                    presence,
-                    transport.subscribe_listener_port(),
-                    peer_store.subscribe(),
-                    Arc::clone(peer_store),
-                    coordination_enabled_rx,
-                    root.clone(),
-                ))
-            }
-            _ => None,
-        };
-        let pairing_manager = Arc::new(
-            match (&claim_transport, &peer_store) {
-                (Some(transport), Some(peer_store)) => {
-                    PairingManager::new_with_claim_port_provider(
-                        &self.state_dir,
-                        cfg_clone.coordination.enabled,
-                        cfg_clone.coordination.pairing_window,
-                        Arc::clone(transport) as Arc<dyn ClaimPortProvider>,
-                    )
-                    .map(|manager| manager.with_peer_store(Arc::clone(peer_store)))
-                }
-                _ => PairingManager::new(
-                    &self.state_dir,
-                    cfg_clone.coordination.enabled,
-                    cfg_clone.coordination.pairing_window,
-                ),
-            }
-            .context("load persistent instance identity for pairing")?,
-        );
-        let pairing_transport = coordination_mdns.and_then(|discovery| {
-            claim_transport.as_ref().map(|transport| {
-                Arc::new(
-                    PairingTransport::new(
-                        Arc::clone(&pairing_manager),
-                        discovery,
-                        cfg_clone.coordination.pairing_port,
-                        cfg_clone.coordination.pairing_bind_address.clone(),
-                        root.clone(),
-                    )
-                    .with_claim_transport(Arc::clone(transport)),
-                )
-            })
-        });
-
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
         let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
         let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
 
         // Daemon-lifetime idle-observation channel — the stock idle source
-        // publishes real activity timestamps into the tx half; the
-        // activity-claim policy evaluator consumes the rx half.
-        let (idle_obs_tx, idle_obs_rx) = crate::idle_observation::idle_observation_channel();
-        let (filtered_activity_tx, filtered_activity_rx) =
+        // publishes real activity timestamps into the tx half.
+        let (idle_obs_tx, _idle_obs_rx) = crate::idle_observation::idle_observation_channel();
+        let (filtered_activity_tx, _filtered_activity_rx) =
             crate::filtered_activity::filtered_activity_channel();
 
-        // KVM claim runtime — daemon-lifetime. Spawned BESIDE the
-        // claim transport (both survive reload). The driver
-        // composes the transport / hook engine / executor /
-        // rules engine into a single per-display single-flight
-        // state machine. Holds a reference to the front control
-        // channel so it can publish `SetClaimSuppression` (F10)
-        // to the rules engine as flights begin and end.
-        let claim_runtime: Option<ClaimRuntimeHandle> = if cfg_clone.coordination.enabled {
-            // The hook engine requires a real `MqttPublisher` even
-            // when the operator hasn't configured any `mqtt` hook
-            // action (the publisher stays idle until `publish` is
-            // called). The empty broker URL keeps the connect-on-
-            // first-use path dormant.
-            let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
-            let hook_engine = Arc::new(crate::hooks::HookEngine::new(publisher));
-            let identity = Arc::new(
-                load_or_create_identity(&self.state_dir)
-                    .context("load persistent instance identity for claim runtime")?,
-            );
-            Some(claim_runtime::spawn(ClaimRuntimeDeps {
-                identity,
-                transport: claim_transport
-                    .as_ref()
-                    .expect("claim transport present when coordination enabled")
-                    .clone(),
-                executors: executors_rx.clone(),
-                config: config_rx.clone(),
-                hooks: hook_engine,
-                coordination: coordination.clone(),
-                front_ctl_tx: front_ctl_tx.clone(),
-                cancel: root.clone(),
-                event_log: None,
-                event_notify: None,
-                idle_rx: Some(idle_obs_rx.clone()),
-            }))
-        } else {
-            None
-        };
-
-        // ── Activity-claim policy evaluator (daemon-lifetime) ─────────
-        // Spawned beside the claim runtime; survives generation reloads.
-        // Consumes the idle-observation channel and feeds claim/arm
-        // decisions into the claim runtime.
-        let activity_claim_policy_handle: Option<JoinHandle<()>> =
-            if let Some(ref cr) = claim_runtime {
-                let claim_capable = cr.kvm_status().claim_capable_displays;
-                Some(crate::activity_claim_evaluator::spawn_filtered(
-                    crate::activity_claim_evaluator::PolicyEvaluatorDeps {
-                        idle_rx: idle_obs_rx,
-                        claim_runtime: cr.clone(),
-                        ownership: ownership.clone(),
-                        activity_claim: cfg_clone.coordination.activity_claim,
-                        owner_idle_window: cfg_clone.coordination.owner_idle_window,
-                        armed_window: cfg_clone.coordination.armed_window,
-                        claim_capable_displays: claim_capable,
-                        cancel: root.clone(),
-                        event_log: None,
-                        event_notify: None,
-                    },
-                    filtered_activity_rx,
-                ))
-            } else {
-                None
-            };
+        // Local direct-switch handle — replaces the owner-mediated claim
+        // protocol (mDNS discovery, SPAKE2 pairing, Ed25519 signed frames,
+        // epochs, replay windows, TCP transport, claim-engine state machine).
+        // Every write is verified against the semantic readback code; no
+        // network, no peer identity.
+        let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
+        let hook_engine = Arc::new(HookEngine::new(publisher));
+        let direct_switch = Arc::new(DirectSwitchHandle::new(
+            executors_rx.clone(),
+            config_rx.clone(),
+            hook_engine,
+            front_ctl_tx.clone(),
+        ));
 
         let spawn = spawn_generation(
             &root,
@@ -1148,14 +969,11 @@ impl App {
             None
         } else {
             Some(
-                crate::ipc::spawn_with_claim_runtime(
+                crate::ipc::spawn(
                     &socket_path,
                     front_ctl_tx.clone(),
                     reload_requester.clone(),
                     doctor_service.clone(),
-                    Arc::clone(&pairing_manager),
-                    pairing_transport.clone(),
-                    claim_runtime.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -1288,14 +1106,9 @@ impl App {
             notify_sink,
             ownership,
             coordination: coordination.clone(),
-            _coordination_mdns: None,
-            claim_transport: claim_transport.clone(),
-            claim_runtime: claim_runtime.clone(),
+            direct_switch: direct_switch.clone(),
             idle_obs_tx: Some(idle_obs_tx.clone()),
             filtered_activity_tx,
-            coordination_enabled_tx,
-            claim_presence_handle,
-            activity_claim_evaluator_handle: activity_claim_policy_handle,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1323,14 +1136,6 @@ impl App {
             reload_lifecycle_capture: self.reload_lifecycle_capture,
         };
 
-        // First-boot KVM publish: the initial generation is
-        // constructed directly here (not via `install_generation`),
-        // so we must explicitly refresh the claim-capable display
-        // set and keymap before the run loop starts — otherwise
-        // the snapshot's `kvm` field stays `None` until the first
-        // config-changing reload (#137).
-        runner.publish_kvm_status_and_event().await;
-
         let join = tokio::spawn(run_loop(
             runner,
             watcher,
@@ -1351,8 +1156,7 @@ impl App {
             doctor_service,
             #[cfg(any(test, feature = "test-util"))]
             coordination,
-            claim_transport,
-            claim_runtime,
+            direct_switch,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
@@ -1407,13 +1211,11 @@ pub struct AppHandle {
     doctor_service: DoctorService,
     #[cfg(any(test, feature = "test-util"))]
     coordination: Option<CoordinationHandle>,
-    claim_transport: Option<Arc<ClaimTransportHandle>>,
-    /// KVM claim runtime handle (daemon-lifetime when coordination
-    /// is enabled). `None` when coordination is disabled. Tests
-    /// and orchestrator callers use this to read the resolved
-    /// `KvmStatus` (the `StateSnapshot.kvm` fold) and to
-    /// trigger local claims.
-    claim_runtime: Option<ClaimRuntimeHandle>,
+    /// Local direct-switch handle — replaces the owner-mediated
+    /// claim protocol. Exposed so IPC/hotkey callers can trigger
+    /// local pull/push writes.
+    #[allow(dead_code, reason = "wired in Task 13")]
+    direct_switch: Arc<DirectSwitchHandle>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
     /// Test-only LKG-candidate observation seam — see
@@ -1423,20 +1225,6 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
-    /// Return the daemon-lifetime claim transport when coordination is configured.
-    #[must_use]
-    pub fn claim_transport(&self) -> Option<&ClaimTransportHandle> {
-        self.claim_transport.as_deref()
-    }
-    /// Return the KVM claim runtime handle when coordination is
-    /// configured. Use [`ClaimRuntimeHandle::kvm_status`] for the
-    /// snapshot fold, [`ClaimRuntimeHandle::try_claim`] for a
-    /// local claim trigger, and [`ClaimRuntimeHandle::is_suppressed`]
-    /// for the F10 ownership-loss gate.
-    #[must_use]
-    pub fn claim_runtime(&self) -> Option<&ClaimRuntimeHandle> {
-        self.claim_runtime.as_ref()
-    }
     /// A sender for [`ControlMsg`]s, forwarded to the current engine
     /// generation across reloads.
     #[must_use]
@@ -1628,30 +1416,18 @@ struct Runner {
     ownership: Arc<dyn OwnershipGate>,
     /// Shared-display cache, absent only when startup had no shared displays.
     coordination: Option<CoordinationHandle>,
-    /// Retained while enabled so later pairing windows can advertise or browse;
-    /// construction alone does not expose a service on the LAN.
-    _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
-    /// Daemon-lifetime authenticated claim listener; it survives generation swaps.
-    claim_transport: Option<Arc<ClaimTransportHandle>>,
-    /// KVM claim runtime handle (daemon-lifetime, beside the
-    /// transport). `None` when coordination is disabled. The
-    /// orchestrator consults it on every successful generation
-    /// install to republish the resolved `KvmStatus` and to
-    /// fan the post-install `DaemonEvent::ConfigReloaded`.
-    claim_runtime: Option<ClaimRuntimeHandle>,
+    /// Local direct-switch handle — replaces the owner-mediated
+    /// claim protocol. Constructed once in [`App::start`] and
+    /// carried by `Runner` across every reload so IPC/hotkey
+    /// callers can trigger local pull/push writes.
+    #[allow(dead_code, reason = "wired in Task 13")]
+    direct_switch: Arc<DirectSwitchHandle>,
     /// Daemon-lifetime idle-observation tx — the stock idle source
     /// publishes into this channel; carried across reloads so
-    /// the activity-claim policy evaluator always sees current data.
+    /// consumers always see current data.
     idle_obs_tx: Option<crate::idle_observation::IdleObservationTx>,
     /// Daemon-lifetime filtered activity fan-out retained across reloads.
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
-    coordination_enabled_tx: watch::Sender<bool>,
-    /// Daemon-lifetime passive claim-presence browser and advertisement loop.
-    claim_presence_handle: Option<JoinHandle<()>>,
-    /// Daemon-lifetime activity-claim policy evaluator.  Watches the idle-
-    /// observation channel and feeds claim decisions into the claim runtime.
-    #[allow(dead_code)]
-    activity_claim_evaluator_handle: Option<JoinHandle<()>>,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,
@@ -1845,52 +1621,10 @@ impl Runner {
         self.generation = spawn.generation;
         self.ctl_router.install(spawn.ctl_tx.clone()).await;
         self.events_router.install(spawn.events_tx.clone()).await;
-
-        self.publish_kvm_status_and_event().await;
     }
 
     /// Publish the KVM claim status to the current engine generation.
     ///
-    /// Called on every generation install — fresh boot (via
-    /// [`App::start`]) and reload (via [`Self::install_generation`]) —
-    /// so the rules engine's snapshot fold reflects the current
-    /// claim-capable display set, keymap, and activity-claim policy.
-    /// The `ConfigReloaded` broadcast is the tray's refetch trigger.
-    async fn publish_kvm_status_and_event(&self) {
-        if let Some(claim_runtime) = &self.claim_runtime {
-            let cfg = &self.generation.cfg;
-            let executors = self.executors_tx.borrow().clone();
-            let claim_capable: Vec<DisplayId> = cfg
-                .displays
-                .iter()
-                .filter_map(|(name, display_config)| {
-                    if display_config.scope != DisplayScope::Shared {
-                        return None;
-                    }
-                    let display = DisplayId(name.clone());
-                    let sink = executors.get(&display)?;
-                    if !sink_claim_capable(sink) {
-                        return None;
-                    }
-                    Some(display)
-                })
-                .collect();
-            claim_runtime.refresh_status(
-                claim_capable,
-                cfg.keymap.clone(),
-                cfg.coordination.activity_claim,
-                cfg.coordination.release_deadline_cap,
-            );
-            let status = claim_runtime.kvm_status();
-            if let Some(ctl_tx) = self.ctl_router.current().await {
-                let _ = ctl_tx.send(ControlMsg::SetKvmStatus(status)).await;
-                let _ = ctl_tx
-                    .send(ControlMsg::PublishDaemonEvent(DaemonEvent::ConfigReloaded))
-                    .await;
-            }
-        }
-    }
-
     /// Reload the config, restarting the runtime in place. See the module
     /// docs for the full state machine.
     #[allow(clippy::too_many_lines)]
@@ -2074,62 +1808,6 @@ impl Runner {
         let new_cfg = new_assembly.cfg.clone();
         let new_creds = new_assembly.creds.clone();
         self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
-
-        if let Some(transport) = &self.claim_transport
-            && (self.generation.cfg.coordination.enabled != new_cfg.coordination.enabled
-                || self.generation.cfg.coordination.claim_port != new_cfg.coordination.claim_port
-                || self.generation.cfg.coordination.claim_bind_address
-                    != new_cfg.coordination.claim_bind_address)
-        {
-            let bind = if new_cfg.coordination.enabled {
-                resolve_claim_bind_ip(new_cfg.coordination.claim_bind_address.as_deref())
-            } else {
-                Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-            };
-            let bind = match bind {
-                Ok(bind) => bind,
-                Err(error) => {
-                    let detail = format!("resolve coordination claim bind address: {error}");
-                    let _ = old_ctl
-                        .send(ControlMsg::SetPendingReload(Some(detail.clone())))
-                        .await;
-                    let outcome = ReloadOutcome::Rejected(detail);
-                    let _ = self.reload_tx.send(outcome.clone());
-                    return self.reload_receipt(
-                        request_ids,
-                        sources,
-                        requested_revision,
-                        outcome,
-                        false,
-                    );
-                }
-            };
-            if let Err(error) = transport
-                .update_config(
-                    new_cfg.coordination.enabled,
-                    bind,
-                    (new_cfg.coordination.claim_port != 0)
-                        .then_some(new_cfg.coordination.claim_port),
-                )
-                .await
-            {
-                let detail = format!("rebind coordination claim listener: {error}");
-                let _ = old_ctl
-                    .send(ControlMsg::SetPendingReload(Some(detail.clone())))
-                    .await;
-                let outcome = ReloadOutcome::Rejected(detail);
-                let _ = self.reload_tx.send(outcome.clone());
-                return self.reload_receipt(
-                    request_ids,
-                    sources,
-                    requested_revision,
-                    outcome,
-                    false,
-                );
-            }
-            self.coordination_enabled_tx
-                .send_replace(new_cfg.coordination.enabled);
-        }
 
         // Reload does not rebind a web listener — flag port/bind changes.
         if new_cfg.daemon.web_port != self.started_web_port
@@ -2876,58 +2554,6 @@ fn reset_candidate_on_probe_failure(candidate: &mut Option<LkgCandidate>, now: I
     }
 }
 
-fn spawn_claim_presence(
-    mut presence: ClaimPresence<MdnsSdBackend>,
-    mut listener_port: watch::Receiver<Option<u16>>,
-    mut peers: watch::Receiver<Vec<crate::coordination_claim::ClaimPeer>>,
-    peer_store: Arc<PeerStoreFeed>,
-    mut enabled: watch::Receiver<bool>,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            if !*enabled.borrow() {
-                let _ = presence.reconcile(None, std::iter::empty());
-                tokio::select! {
-                    () = cancel.cancelled() => break,
-                    changed = enabled.changed() => if changed.is_err() { break; },
-                }
-                continue;
-            }
-            let peer_ids: Vec<_> = peers
-                .borrow()
-                .iter()
-                .map(|peer| peer.instance_id.clone())
-                .collect();
-            if let Err(error) = presence.reconcile(*listener_port.borrow(), peer_ids) {
-                tracing::warn!(event = "claim_presence_reconcile_failed", %error);
-            }
-            if let Err(error) = presence.drain_browse(|instance_id, address, epoch| {
-                peer_store.refresh_dns_address(&instance_id, address, epoch);
-            }) {
-                tracing::warn!(event = "claim_presence_browse_failed", %error);
-            }
-            tokio::select! {
-                () = cancel.cancelled() => {
-                    let _ = presence.reconcile(None, std::iter::empty());
-                    break;
-                }
-                changed = listener_port.changed() => {
-                    if changed.is_err() { break; }
-                }
-                changed = peers.changed() => {
-                    if changed.is_err() { break; }
-                }
-                changed = enabled.changed() => {
-                    if changed.is_err() { break; }
-                }
-                _ = interval.tick() => {}
-            }
-        }
-    })
-}
-
 /// The run loop: reload triggers (watcher / SIGHUP / IPC) and shutdown
 /// signals, then a bounded graceful teardown.
 ///
@@ -3068,23 +2694,7 @@ async fn run_loop(
         quiesce_inputs(&mut runner.generation).await;
         teardown(&mut runner.generation).await;
     };
-    let claim_teardown = async {
-        if let Some(transport) = runner.claim_transport {
-            transport.shutdown().await;
-        }
-    };
-    let claim_presence_teardown = async {
-        if let Some(handle) = runner.claim_presence_handle {
-            let _ = handle.await;
-        }
-    };
-    tokio::join!(
-        generation_teardown,
-        wear_teardown,
-        front_teardown,
-        claim_teardown,
-        claim_presence_teardown
-    );
+    tokio::join!(generation_teardown, wear_teardown, front_teardown,);
     tracing::info!(event = "daemon_stopped");
 }
 

@@ -5,7 +5,6 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use crate::ownership::OwnershipGate;
-use crate::peers::DiscoverAnnounce;
 use crate::traits::PanelState;
 use crate::types::DisplayId;
 
@@ -96,11 +95,6 @@ pub struct CoordRecord {
     pub panel_state: Option<PanelState>,
     /// Number of consecutive failed input-source reads since the last success.
     pub consecutive_failures: u32,
-    /// Instance ID of the peer that last claimed ownership of this display.
-    /// `None` when this instance owns the display or the owner is unknown.
-    /// Populated by the claim runtime on ownership transitions.
-    /// **Pending removal Task 12** — no longer populated from the observation path.
-    pub owner_instance_id: Option<String>,
     /// Consecutive agreeing observations toward a pending verdict change.
     /// Tracks both gain and loss. Reset to 0 on any raw-code disagreement
     /// or on return-to-current-verdict readings.
@@ -122,7 +116,6 @@ impl CoordRecord {
             input_code: None,
             panel_state: None,
             consecutive_failures: 0,
-            owner_instance_id: None,
             pending_transition_count: 0,
             pending_transition_code: None,
             last_observed_code: None,
@@ -134,9 +127,6 @@ impl CoordRecord {
 #[derive(Clone, Debug)]
 pub struct CoordinationHandle {
     records: Arc<RwLock<HashMap<DisplayId, CoordRecord>>>,
-    /// Ephemeral mDNS discovery cache — pending removal Task 12 alongside
-    /// the claim protocol.
-    discovered_peers: Arc<RwLock<HashMap<String, DiscoverAnnounce>>>,
 }
 
 impl CoordinationHandle {
@@ -149,7 +139,6 @@ impl CoordinationHandle {
             .collect();
         Self {
             records: Arc::new(RwLock::new(records)),
-            discovered_peers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -315,45 +304,6 @@ impl CoordinationHandle {
     #[must_use]
     pub fn snapshot(&self) -> HashMap<DisplayId, CoordRecord> {
         self.records
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Record which remote peer currently owns a shared display.
-    /// Called by the claim runtime when the local instance loses ownership
-    /// (a remote peer claimed it) or when ownership is observed via polling.
-    /// **Pending removal Task 12** — no longer called from the observation path.
-    pub fn set_owner(&self, display: &DisplayId, instance_id: Option<String>) {
-        let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(record) = records.get_mut(display) {
-            record.owner_instance_id = instance_id;
-        }
-    }
-
-    /// Record an mDNS-discovered pairing peer independently of display ownership.
-    /// **Pending removal Task 12** — the discovery cache moves out of this struct.
-    pub fn upsert_discovered_peer(&self, peer: DiscoverAnnounce) {
-        self.discovered_peers
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(peer.instance_id.clone(), peer);
-    }
-
-    /// Remove an mDNS peer that is no longer advertised without changing ownership.
-    /// **Pending removal Task 12** — the discovery cache moves out of this struct.
-    pub fn expire_discovered_peer(&self, instance_id: &str) {
-        self.discovered_peers
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(instance_id);
-    }
-
-    /// Return the current non-persistent mDNS discovery snapshot.
-    /// **Pending removal Task 12** — the discovery cache moves out of this struct.
-    #[must_use]
-    pub fn discovered_peers(&self) -> HashMap<String, DiscoverAnnounce> {
-        self.discovered_peers
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()

@@ -7,29 +7,19 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{
-    ClaimArmResultWire, ClaimSharedResultWire, CoordinationDiscoveredPeer,
-    CoordinationPairOpenResponse, CoordinationPairStatus, CoordinationPairedPeer,
-    CoordinationPeers, IpcRequest, IpcResponse,
-};
+use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
-use dormant_core::types::DisplayId;
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-use crate::claim_runtime::{ArmFailure, ClaimRuntimeHandle, ClaimSharedResult};
-use crate::coordination_mdns::MdnsSdBackend;
-use crate::coordination_pairing::{PairingManager, PairingState, PairingTransport};
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -58,68 +48,6 @@ pub fn spawn(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
-    cancel: CancellationToken,
-) -> Result<JoinHandle<()>> {
-    spawn_with_pairing(
-        socket_path,
-        ctl_tx,
-        reload_requester,
-        doctor_service,
-        Arc::new(PairingManager::new(
-            &dormant_core::paths::state_dir(),
-            false,
-            Duration::from_secs(300),
-        )?),
-        None,
-        cancel,
-    )
-}
-
-/// Spawn the IPC server with the daemon-lifetime instance-pairing manager.
-pub(crate) fn spawn_with_pairing(
-    socket_path: &Path,
-    ctl_tx: mpsc::Sender<ControlMsg>,
-    reload_requester: ReloadRequester,
-    doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
-    cancel: CancellationToken,
-) -> Result<JoinHandle<()>> {
-    spawn_with_claim_runtime(
-        socket_path,
-        ctl_tx,
-        reload_requester,
-        doctor_service,
-        pairing,
-        pairing_transport,
-        None,
-        cancel,
-    )
-}
-
-/// Like the crate-internal `spawn_with_pairing` but with the KVM
-/// claim runtime handle attached (used by the production
-/// orchestrator). Not linked from the public surface — the
-/// link to the private helper is intentional.
-///
-/// # Errors
-///
-/// - Bind failure (address in use by a live daemon, permission denied, …).
-/// - Permission set failure.
-/// - Parent directory is group/world-writable or not owned by us.
-#[allow(
-    clippy::too_many_arguments,
-    private_interfaces,
-    reason = "IPC dependencies remain explicit at the daemon lifecycle boundary."
-)]
-pub fn spawn_with_claim_runtime(
-    socket_path: &Path,
-    ctl_tx: mpsc::Sender<ControlMsg>,
-    reload_requester: ReloadRequester,
-    doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
-    claim_runtime: Option<ClaimRuntimeHandle>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -201,9 +129,6 @@ pub fn spawn_with_claim_runtime(
             ctl_tx,
             reload_requester,
             doctor_service,
-            pairing,
-            pairing_transport,
-            claim_runtime,
             cancel,
             &socket_owned,
         )
@@ -223,9 +148,6 @@ async fn run(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
-    claim_runtime: Option<ClaimRuntimeHandle>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -243,10 +165,7 @@ async fn run(
                         let ctl = ctl_tx.clone();
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
-                        let pairing = Arc::clone(&pairing);
-                        let pairing_transport = pairing_transport.clone();
-                        let claim = claim_runtime.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, pairing, pairing_transport, claim));
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -270,9 +189,6 @@ async fn handle_connection(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
-    claim_runtime: Option<ClaimRuntimeHandle>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -348,207 +264,18 @@ async fn handle_connection(
                 let resp = handle_exercise(&ctl_tx, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::CoordinationPairOpen { display_name } => {
-                let result = match pairing_transport.as_ref() {
-                    Some(transport) => transport.open(display_name).await,
-                    None => pairing.open(display_name),
-                };
-                let resp = match result {
-                    Ok(open) => IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
-                        pair_id: open.pair_id,
-                        code: open.code,
-                        expires_at: open.expires_at,
-                    }),
-                    Err(error) => IpcResponse::error(error.to_string()),
-                };
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPairJoin {
-                display_name,
-                instance_id,
-                code,
-            } => {
-                let resp = match pairing_transport.as_ref() {
-                    Some(transport) => transport
-                        .join(display_name, instance_id, code)
-                        .await
-                        .map_or_else(
-                            |error| IpcResponse::error(error.to_string()),
-                            |()| IpcResponse::ok(None),
-                        ),
-                    None => {
-                        IpcResponse::error(pairing.join_preflight(&instance_id).err().map_or_else(
-                            || "peer not discovered".to_owned(),
-                            |error| error.to_string(),
-                        ))
-                    }
-                };
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPairStatus { pair_id } => {
-                let resp = pairing.status(&pair_id).map_or_else(
-                    |error| IpcResponse::error(error.to_string()),
-                    pairing_response,
-                );
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPairCancel { pair_id } => {
-                let result = pairing_transport.as_ref().map_or_else(
-                    || pairing.cancel(&pair_id),
-                    |transport| transport.cancel(&pair_id),
-                );
-                let resp = result.map_or_else(
-                    |error| IpcResponse::error(error.to_string()),
-                    pairing_response,
-                );
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPeersList => {
-                let result: Result<
-                    CoordinationPeers,
-                    crate::coordination_pairing::PairSessionError,
-                > = (|| {
-                    let paired = pairing.paired_peers()?;
-                    let discovered = match pairing_transport.as_ref() {
-                        Some(transport) => {
-                            transport.kick_browse()?;
-                            transport
-                                .discovered_peers()
-                                .into_iter()
-                                .map(|peer| CoordinationDiscoveredPeer {
-                                    instance_id: peer.instance_id,
-                                    display_name: peer.display_name,
-                                    pairing_port: peer.pairing_port,
-                                    window_id: peer.window_id,
-                                })
-                                .collect()
-                        }
-                        None => Vec::new(),
-                    };
-                    Ok(CoordinationPeers {
-                        discovered,
-                        paired: paired
-                            .into_iter()
-                            .map(|peer| CoordinationPairedPeer {
-                                instance_id: peer.instance_id,
-                                display_name: peer.display_name,
-                                paired_at: peer.paired_at,
-                            })
-                            .collect(),
-                    })
-                })();
-                let resp = result.map_or_else(
-                    |error| IpcResponse::error(error.to_string()),
-                    IpcResponse::coordination_peers,
-                );
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::ClaimShared { display } => {
-                let resp = match claim_runtime.as_ref() {
-                    Some(runtime) => match runtime.try_claim(DisplayId(display.clone())).await {
-                        Ok(verdict) => IpcResponse::claim_shared(claim_shared_wire(verdict)),
-                        Err(_) => IpcResponse::error("claim runtime not available"),
-                    },
-                    None => IpcResponse::error("coordination disabled"),
-                };
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::ClaimArm { display } => {
-                let resp = match claim_runtime.as_ref() {
-                    Some(runtime) => {
-                        let policy = runtime.kvm_status().activity_claim;
-                        match runtime.arm(DisplayId(display.clone()), policy).await {
-                            Ok(Ok(deadline)) => IpcResponse::claim_arm(ClaimArmResultWire {
-                                armed: true,
-                                deadline_ms: deadline_ms(deadline),
-                                reason: None,
-                            }),
-                            Ok(Err(failure)) => IpcResponse::claim_arm(ClaimArmResultWire {
-                                armed: false,
-                                deadline_ms: 0,
-                                reason: Some(arm_failure_reason(&failure).to_owned()),
-                            }),
-                            Err(_) => IpcResponse::error("claim runtime not available"),
-                        }
-                    }
-                    None => IpcResponse::error("coordination disabled"),
-                };
+            IpcRequest::CoordinationPairOpen { .. }
+            | IpcRequest::CoordinationPairJoin { .. }
+            | IpcRequest::CoordinationPairStatus { .. }
+            | IpcRequest::CoordinationPairCancel { .. }
+            | IpcRequest::CoordinationPeersList
+            | IpcRequest::ClaimShared { .. }
+            | IpcRequest::ClaimArm { .. } => {
+                let resp =
+                    IpcResponse::error("coordination disabled — see dormant v0.2 release notes");
                 let _ = write_json(&mut writer, &resp).await;
             }
         }
-    }
-}
-
-fn claim_shared_wire(verdict: ClaimSharedResult) -> ClaimSharedResultWire {
-    match verdict {
-        ClaimSharedResult::Accepted { deadline } => ClaimSharedResultWire::Accepted {
-            deadline_ms: deadline_ms(deadline),
-        },
-        ClaimSharedResult::Busy => ClaimSharedResultWire::Busy,
-        ClaimSharedResult::Denied(reason) => ClaimSharedResultWire::Denied {
-            reason: denied_reason_tag(&reason).to_owned(),
-        },
-        ClaimSharedResult::Failed(failure) => ClaimSharedResultWire::Failed {
-            reason: failure_reason_tag(&failure).to_owned(),
-        },
-    }
-}
-
-fn denied_reason_tag(reason: &dormant_core::claim::ClaimDeniedReason) -> &'static str {
-    use dormant_core::claim::ClaimDeniedReason;
-    match reason {
-        ClaimDeniedReason::Unsupported => "unsupported",
-        ClaimDeniedReason::IdentityUnavailable => "identity_unavailable",
-        ClaimDeniedReason::InputCodeConflict => "input_code_conflict",
-        ClaimDeniedReason::DisplayRemoved => "display_removed",
-        ClaimDeniedReason::CoordinationDisabled => "coordination_disabled",
-        ClaimDeniedReason::StaleEpoch { .. } => "stale_epoch",
-        ClaimDeniedReason::Unknown => "unknown",
-    }
-}
-
-fn failure_reason_tag(failure: &dormant_core::claim_engine::ClaimFailure) -> &'static str {
-    use dormant_core::claim_engine::ClaimFailure;
-    match failure {
-        ClaimFailure::StaleEpoch => "stale_epoch",
-        ClaimFailure::Denied(_) => "denied",
-        ClaimFailure::ReleaseFailed(_) => "release_failed",
-        ClaimFailure::AcquireFailed(_) => "acquire_failed",
-    }
-}
-
-fn arm_failure_reason(failure: &ArmFailure) -> &'static str {
-    match failure {
-        ArmFailure::CoordinationDisabled => "coordination_disabled",
-        ArmFailure::NotArmed => "not_armed",
-        ArmFailure::NotClaimCapable => "not_claim_capable",
-    }
-}
-
-fn deadline_ms(deadline: std::time::Instant) -> u64 {
-    let now = std::time::Instant::now();
-    if deadline <= now {
-        return 0;
-    }
-    let delta = deadline.duration_since(now);
-    u64::try_from(delta.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn pairing_response(status: crate::coordination_pairing::PairingStatus) -> IpcResponse {
-    IpcResponse::coordination_pair(CoordinationPairStatus {
-        pair_id: status.pair_id,
-        state: pairing_state_name(status.state).to_owned(),
-        peer_instance_id: status.peer_instance_id,
-    })
-}
-
-const fn pairing_state_name(state: PairingState) -> &'static str {
-    match state {
-        PairingState::Pairing => "pairing",
-        PairingState::Paired => "paired",
-        PairingState::Cancelled => "cancelled",
-        PairingState::Timeout => "timeout",
-        PairingState::Error => "error",
     }
 }
 

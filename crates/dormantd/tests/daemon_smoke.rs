@@ -7,31 +7,22 @@
 
 use std::fs;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use dormant_core::claim::{ClaimFrame, ClaimMessage};
 use dormant_core::config::Strictness;
 use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::fakes::FakeSensorSource;
 use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::observation::{DaemonObservation, GenerationId, ObservationHub, ReloadSource};
-use dormant_core::peers::{
-    PeerRecord, instance_id_from_public_key, load_or_create_identity, upsert_peer,
-};
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::{
     App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
 };
-use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -339,201 +330,6 @@ async fn start_coordinator_app(
     .start()
     .await
     .expect("start coordinator app")
-}
-
-#[tokio::test]
-async fn paired_peers_survive_restart() {
-    let paths_a = TestAppPaths::new();
-    let paths_b = TestAppPaths::new();
-    dormantd::coordination_pairing::pair_over_loopback_for_test(
-        paths_a.state.clone(),
-        paths_b.state.clone(),
-    )
-    .await
-    .expect("pair isolated daemon state directories over loopback TCP");
-
-    for paths in [&paths_a, &paths_b] {
-        let peers = paths.state.join("peers.json");
-        assert!(peers.exists(), "paired state should be durable");
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&peers).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    let config_a = write_file(
-        paths_a.root(),
-        "config.toml",
-        &one_display_config(&paths_a.marker, "1s"),
-    );
-    let config_b = write_file(
-        paths_b.root(),
-        "config.toml",
-        &one_display_config(&paths_b.marker, "1s"),
-    );
-    let creds_a = write_credentials(paths_a.root(), "");
-    let creds_b = write_credentials(paths_b.root(), "");
-    let app_a = App::build_with_sources(
-        config_a,
-        creds_a,
-        Strictness::Strict,
-        fake_factory("desk", Vec::new()),
-    )
-    .unwrap()
-    .with_notify_sink_builder(noop_factory)
-    .with_state_dir(paths_a.state.clone())
-    .disable_ipc()
-    .start()
-    .await
-    .expect("rebuild first daemon from paired state");
-    let app_b = App::build_with_sources(
-        config_b,
-        creds_b,
-        Strictness::Strict,
-        fake_factory("desk", Vec::new()),
-    )
-    .unwrap()
-    .with_notify_sink_builder(noop_factory)
-    .with_state_dir(paths_b.state.clone())
-    .disable_ipc()
-    .start()
-    .await
-    .expect("rebuild second daemon from paired state");
-    shutdown(app_a.0, app_a.1).await;
-    shutdown(app_b.0, app_b.1).await;
-
-    assert!(paths_a.state.join("peers.json").exists());
-    assert!(paths_b.state.join("peers.json").exists());
-}
-
-#[tokio::test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the full App, transport, and runtime seam is one regression boundary"
-)]
-async fn app_start_wires_authenticated_claim_transport() {
-    let paths = TestAppPaths::new();
-    let remote = SigningKey::from_bytes(&[7; 32]);
-    let remote_key = remote.verifying_key();
-    let remote_instance_id = instance_id_from_public_key(&remote_key.to_bytes());
-    let response_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let response_port = response_listener.local_addr().unwrap().port();
-    upsert_peer(
-        &paths.state.join("peers.json"),
-        PeerRecord {
-            instance_id: remote_instance_id.clone(),
-            ed25519_pub: base64::engine::general_purpose::STANDARD.encode(remote_key.as_bytes()),
-            display_name: "remote".to_owned(),
-            paired_at: "2026-01-01T00:00:00Z".to_owned(),
-            last_addr: Some(format!("127.0.0.1:{response_port}").parse().unwrap()),
-            claim_port: Some(response_port),
-        },
-    )
-    .unwrap();
-    let config = format!(
-        "{}\n[coordination]\nenabled = true\nclaim_bind_address = \"127.0.0.1\"\nclaim_port = 0\n",
-        one_display_config(&paths.marker, "1s")
-    );
-    fs::write(&paths.config, config).unwrap();
-    write_credentials(paths.root(), "");
-    let (handle, join) = App::build_with_sources(
-        paths.config.clone(),
-        paths.credentials.clone(),
-        Strictness::Strict,
-        fake_factory("desk", Vec::new()),
-    )
-    .unwrap()
-    .with_notify_sink_builder(noop_factory)
-    .with_state_dir(paths.state.clone())
-    .disable_ipc()
-    .start()
-    .await
-    .unwrap();
-    let transport = handle.claim_transport().unwrap();
-    let port = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if let Some(port) = transport.provisional_port() {
-                return port;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let local = load_or_create_identity(&paths.state).unwrap();
-    let nonce = "claim-frame-nonce";
-    let request = dormant_core::claim::ClaimRequest {
-        display_identity: "unknown-display".to_owned(),
-        requester_instance_id: remote_instance_id.clone(),
-        requester_input_code: 0x11,
-        counter: 1,
-        nonce: nonce.to_owned(),
-    };
-    let frame = ClaimFrame::sign(
-        &dormant_core::peers::InstanceIdentity {
-            instance_id: remote_instance_id.clone(),
-            signing_key: remote,
-            verifying_key: remote_key,
-        },
-        "remote-epoch-001".to_owned(),
-        local.instance_id.clone(),
-        transport.boot_epoch().as_str().to_owned(),
-        1,
-        nonce.to_owned(),
-        ClaimMessage::ClaimRequest(request),
-    )
-    .unwrap();
-    let mut stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
-    let encoded = serde_json::to_vec(&frame).unwrap();
-    let length = u32::try_from(encoded.len()).unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut stream, &length.to_be_bytes())
-        .await
-        .unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut stream, &encoded)
-        .await
-        .unwrap();
-
-    let (mut response_stream, _) =
-        tokio::time::timeout(Duration::from_secs(1), response_listener.accept())
-            .await
-            .expect("verified request must reach the runtime handler")
-            .unwrap();
-    let mut response_length = [0_u8; 4];
-    tokio::io::AsyncReadExt::read_exact(&mut response_stream, &mut response_length)
-        .await
-        .unwrap();
-    let response_length = usize::try_from(u32::from_be_bytes(response_length)).unwrap();
-    let mut response_payload = vec![0_u8; response_length];
-    tokio::io::AsyncReadExt::read_exact(&mut response_stream, &mut response_payload)
-        .await
-        .unwrap();
-    let response: ClaimFrame = serde_json::from_slice(&response_payload).unwrap();
-    let local_record = PeerRecord {
-        instance_id: local.instance_id.clone(),
-        ed25519_pub: base64::engine::general_purpose::STANDARD
-            .encode(local.verifying_key.as_bytes()),
-        display_name: "local".to_owned(),
-        paired_at: "2026-01-01T00:00:00Z".to_owned(),
-        last_addr: None,
-        claim_port: None,
-    };
-    response
-        .verify(&local_record, &remote_instance_id, "remote-epoch-001")
-        .expect("runtime reply must verify on the authenticated requester");
-    assert_eq!(response.recipient_instance_id, remote_instance_id);
-    assert!(matches!(
-        response.message,
-        ClaimMessage::ClaimResponse(dormant_core::claim::ClaimResponse {
-            nonce: response_nonce,
-            verdict: dormant_core::claim::ClaimVerdict::NotOwner,
-        }) if response_nonce == nonce
-    ));
-    shutdown(handle, join).await;
 }
 
 fn coordinator_config(marker: &Path, startup_holdoff: &str) -> String {
@@ -5999,54 +5795,6 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
         "fresh startup grace must inhibit the new generation before grace expires"
     );
     assert_eq!(count(&marker, 'B'), 0, "an inhibited grace must not blank");
-
-    shutdown(handle, join).await;
-}
-
-/// Issue #137: on a fresh boot (no reload), the snapshot's `kvm` field
-/// must be populated — not `None`. The old code only published
-/// `SetKvmStatus` from `install_generation`, which only the reload
-/// paths called; the first generation was constructed directly in
-/// `App::start` and never triggered the publish.
-#[tokio::test]
-async fn first_boot_publishes_kvm_status_in_snapshot() {
-    let paths = TestAppPaths::new();
-    // Shared display + coordination enabled — creates the
-    // claim_runtime, which is the gate for SetKvmStatus delivery.
-    let config = format!(
-        "{}\n[coordination]\nenabled = true\nclaim_bind_address = \"127.0.0.1\"\nclaim_port = 0\n",
-        shared_display_config(&paths.marker)
-    );
-    fs::write(&paths.config, config).unwrap();
-    write_credentials(paths.root(), "");
-
-    let (handle, join) = App::build_with_sources(
-        paths.config.clone(),
-        paths.credentials.clone(),
-        Strictness::Strict,
-        fake_factory("desk", Vec::new()),
-    )
-    .unwrap()
-    .with_notify_sink_builder(noop_factory)
-    .with_state_dir(paths.state.clone())
-    .disable_ipc()
-    .start()
-    .await
-    .unwrap();
-
-    let snap = snapshot_with_retry(&handle.control_sender()).await;
-    assert!(
-        snap.kvm.is_some(),
-        "kvm must be Some on first boot with coordination enabled (#137)"
-    );
-    let kvm = snap.kvm.unwrap();
-    // `command` controller has no claim identity, so the set is empty.
-    assert_eq!(kvm.claim_capable_displays, vec![]);
-    // Policy default: `Off` when the config has no explicit override.
-    assert_eq!(
-        kvm.activity_claim,
-        dormant_core::config::ActivityClaimPolicy::Off
-    );
 
     shutdown(handle, join).await;
 }

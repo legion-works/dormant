@@ -122,6 +122,20 @@ async fn poll_once(
                 .and_then(|record| record.panel_state.clone())
         };
         if let Ok(Some(observed)) = input {
+            // Validate against the configured code set (issue #138 part B).
+            // A read that decodes to a value which is neither the local nor
+            // peer input code is not a meaningful observation — concurrent
+            // DDC traffic garbles the byte stream, and the resulting code
+            // cannot be distinguished from the operator selecting an OSD
+            // input.  Treat it as a transport failure: hold the last verdict
+            // rather than feeding it through the debounce where it could
+            // reset a pending transition or, improbably, commit a wrong one.
+            let classification = aliases.classify(observed);
+            if matches!(classification, InputSourceObservation::Unknown(_)) {
+                deps.state.record_failure(&display_id);
+                continue; // `for` loop — skip the rest of this display's tick
+            }
+
             let before = deps.state.snapshot();
             let outcome = deps.state.record_input_observation(
                 &display_id,
@@ -325,7 +339,7 @@ mod tests {
                 scope: DisplayScope::Shared,
                 shared_input_code: Some(0x11),
                 shared_input_write_code: None,
-                shared_peer_input_code: None,
+                shared_peer_input_code: Some(0x12),
                 shared_peer_input_write_code: None,
                 blank_mode: None,
                 degraded_mode: None,
@@ -370,6 +384,35 @@ mod tests {
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
         }
+    }
+
+    /// A `Config` where the shared display has `shared_peer_input_code = Some(peer)`.
+    fn config_with_peer_read(peer: u8) -> Config {
+        let mut cfg = config();
+        if let Some(dc) = cfg.displays.get_mut("shared") {
+            dc.shared_peer_input_code = Some(peer);
+        }
+        cfg
+    }
+
+    /// Like [`setup`] but accepts an explicit [`Config`].
+    fn setup_with_config(cfg: Config, sink: Arc<ScriptedSink>) -> TestHarness {
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg));
+        let display = DisplayId("shared".to_string());
+        let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+        let (ctl_tx, ctl_rx) = mpsc::channel(8);
+        let state = CoordinationHandle::new([display]);
+        let cancel = CancellationToken::new();
+        let _task = spawn(CoordinationPollDeps {
+            config_rx,
+            ctl_tx,
+            executors_rx,
+            state: state.clone(),
+            cancel: cancel.clone(),
+            direct_switch: None,
+        });
+        (config_tx, executors_tx, ctl_rx, state, cancel)
     }
 
     fn setup(sink: Arc<ScriptedSink>) -> TestHarness {
@@ -417,12 +460,15 @@ mod tests {
     async fn successful_other_input_changes_false_and_pokes_once() {
         // Default `loss_confirmations = 3` requires three agreeing "not mine"
         // readings before the verdict commits — issue #134 debounce.
+        // peer_read = 0x12 configured so 0x12 is a known peer code (unknown
+        // codes are treated as transport failures — issue #138 Fix B).
+        let cfg = config_with_peer_read(0x12);
         let sink = Arc::new(ScriptedSink::with_inputs([
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
         ]));
-        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
+        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup_with_config(cfg, sink);
         tick().await;
         tick().await;
         tick().await;
@@ -438,13 +484,15 @@ mod tests {
     async fn second_same_verdict_success_does_not_poke_again() {
         // First transition reads as committed; second transition's already-stable
         // not-mine reading must NOT re-fire (test the "stays false" half).
+        // peer_read = 0x12 configured (unknown codes treated as failures — Fix B).
+        let cfg = config_with_peer_read(0x12);
         let sink = Arc::new(ScriptedSink::with_inputs([
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
         ]));
-        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
+        let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup_with_config(cfg, sink);
         tick().await;
         tick().await;
         tick().await; // third tick: loss confirmed, OwnershipPoll sent
@@ -724,6 +772,40 @@ mod tests {
         events.lock().unwrap().clone()
     }
 
+    /// Like [`captured_events`] but with an explicit [`Config`] for tests
+    /// that need configured peer codes.
+    async fn captured_events_with_config(
+        cfg: Config,
+        inputs: impl IntoIterator<Item = Result<Option<u8>, String>>,
+        ticks: u8,
+    ) -> Vec<String> {
+        let capture = EventCapture::default();
+        let sink = Arc::new(ScriptedSink::with_inputs(inputs));
+        let events = capture.0.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg));
+        let display = DisplayId("shared".to_string());
+        let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let deps = CoordinationPollDeps {
+            config_rx,
+            ctl_tx,
+            executors_rx,
+            state: CoordinationHandle::new([display]),
+            cancel: CancellationToken::new(),
+            direct_switch: None,
+        };
+        let mut last_failing_log = HashMap::new();
+        let mut last_state_read = HashMap::new();
+        for _ in 0..ticks {
+            tokio::time::advance(Duration::from_secs(6)).await;
+            poll_once(&deps, &mut last_failing_log, &mut last_state_read).await;
+        }
+        drop((config_tx, executors_tx));
+        events.lock().unwrap().clone()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn emits_literal_coord_poll_ok_event_field() {
         assert!(
@@ -756,13 +838,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn emits_literal_coord_poll_disagreement_event_field() {
-        // Two consecutive successful observations with different codes
+        // Two consecutive successful observations with different known codes
         // disagree; the literal `coord_poll_disagreement` event must fire so
         // the operator sees the bus returning inconsistent values.
+        // peer_read = 0x12 makes 0x12 a known not-mine code so the disagreement
+        // path engages (unknown codes are treated as transport failures —
+        // issue #138 Fix B).
         assert!(
-            captured_events([Ok(Some(0x11)), Ok(Some(0x12))], 2)
-                .await
-                .contains(&"coord_poll_disagreement".to_string())
+            captured_events_with_config(
+                config_with_peer_read(0x12),
+                [Ok(Some(0x11)), Ok(Some(0x12))],
+                2,
+            )
+            .await
+            .contains(&"coord_poll_disagreement".to_string())
         );
     }
 
@@ -771,10 +860,16 @@ mod tests {
         // One stray not-mine reading under `loss_confirmations = 3` is
         // deferred; the literal `coord_ownership_loss_deferred` event must
         // surface the pending count for operator visibility.
+        // peer_read = 0x12 configured so the not-mine code enters the
+        // debounce (unknown codes are treated as failures — Fix B).
         assert!(
-            captured_events([Ok(Some(0x11)), Ok(Some(0x12))], 2)
-                .await
-                .contains(&"coord_ownership_loss_deferred".to_string())
+            captured_events_with_config(
+                config_with_peer_read(0x12),
+                [Ok(Some(0x11)), Ok(Some(0x12))],
+                2,
+            )
+            .await
+            .contains(&"coord_ownership_loss_deferred".to_string())
         );
     }
 
@@ -802,21 +897,67 @@ mod tests {
         cancel.cancel();
     }
 
+    /// Fix B (#138): an unknown code that is neither local nor peer is treated
+    /// as a transport failure — verdict held, debounce untouched.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_code_treated_as_failure_verdict_held() {
+        // peer_read = 0x12 configured; 0x13 is unknown.
+        let cfg = config_with_peer_read(0x12);
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x11)), // tick 1: owned, mine
+            Ok(Some(0x13)), // tick 2: Unknown → failure, verdict held
+            Ok(Some(0x11)), // tick 3: mine again, consecutive_failures reset
+        ]));
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup_with_config(cfg, sink);
+        let events_layer = EventCapture::default();
+        let events = events_layer.0.clone();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events_layer));
+        for _ in 0..3 {
+            tick().await;
+        }
+        // Verdict must stay owned — the unknown code did not enter the debounce.
+        assert!(state.snapshot()[&DisplayId("shared".to_string())].owned);
+        assert!(ctl_rx.try_recv().is_err(), "no OwnershipPoll expected");
+        let captured = events.lock().unwrap().clone();
+        // No ownership-change, no loss_deferred, no disagreement — the unknown
+        // code was a transport failure, not an observation.
+        assert!(
+            !captured
+                .iter()
+                .any(|event| event == "coord_ownership_loss_deferred"),
+            "unknown code must not trigger loss deferred, got {captured:?}"
+        );
+        assert!(
+            !captured
+                .iter()
+                .any(|event| event == "coord_ownership_changed"),
+            "unknown code must not trigger ownership change, got {captured:?}"
+        );
+        cancel.cancel();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn disagreeing_not_mine_reads_hold_verdict_and_emit_disagreement() {
-        // Two different not-mine codes in a row must NOT commit a loss and
-        // must surface a disagreement signal — extending the hold-last-verdict
+        // Two different known not-mine codes in a row must NOT commit a loss
+        // and must surface a disagreement signal — extending the hold-last-verdict
         // path to successful-but-inconsistent reads (issue #134 §3.4 verdict
         // table extension). The disagreeing reading resets the pending counter
         // so the next agreeing reading stays below the 3-confirmation
         // threshold.
+        //
+        // Configure peer_read = 0x12 so that codes 0x12 and 0x13 can still
+        // be distinguished by the debounce: 0x12 is Peer, 0x13 is Unknown
+        // (treated as failure by issue #138 Fix B — validation against
+        // configured code set).
+        let cfg = config_with_peer_read(0x12);
         let sink = Arc::new(ScriptedSink::with_inputs([
             Ok(Some(0x11)), // tick 1: owned, mine
-            Ok(Some(0x12)), // tick 2: not-mine, pending=1
-            Ok(Some(0x13)), // tick 3: not-mine, disagrees with 0x12 → reset, pending=1
-            Ok(Some(0x13)), // tick 4: not-mine, agrees, pending=2 (still under N=3)
+            Ok(Some(0x12)), // tick 2: not-mine peer, pending=1
+            Ok(Some(0x13)), // tick 3: Unknown, treated as failure (hold verdict)
+            Ok(Some(0x12)), // tick 4: not-mine peer, pending=2 (still under N=3)
         ]));
-        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup_with_config(cfg, sink);
         let events_layer = EventCapture::default();
         let events = events_layer.0.clone();
         let _guard =
@@ -826,12 +967,26 @@ mod tests {
         }
         assert!(ctl_rx.try_recv().is_err(), "no loss commit expected");
         assert!(state.snapshot()[&DisplayId("shared".to_string())].owned);
+        // Fix B (#138): Unknown codes (0x13) are treated as transport
+        // failures, not as debounce observations — the pending transition
+        // from tick 2 (peer code 0x12) survives the failure intact.  Tick 4
+        // agrees with it (pending=2), still below confirmations=3.
+        // The disagreement at tick 2 (0x11→0x12) fires correctly because
+        // both codes are in the configured set.
         let captured = events.lock().unwrap().clone();
         assert!(
             captured
                 .iter()
                 .any(|event| event == "coord_poll_disagreement"),
-            "expected a coord_poll_disagreement event, got {captured:?}"
+            "disagreement must fire when 0x11→0x12 (both configured), got {captured:?}"
+        );
+        // No loss committed — tick 3 was a failure, and tick 4 only brings
+        // pending to 2 (under the 3-confirmation threshold).
+        assert!(
+            !captured
+                .iter()
+                .any(|event| event == "coord_ownership_changed"),
+            "no ownership change expected, got {captured:?}"
         );
         cancel.cancel();
     }
@@ -840,13 +995,16 @@ mod tests {
     async fn three_agreeing_not_mine_readings_commit_loss_exactly_once() {
         // Issue #134 anchor (positive case): a real sustained input switch
         // (three agreeing not-mine readings) commits exactly one loss.
+        // Configure peer_read = 0x12 so 0x12 is a known peer code — unknown
+        // codes are treated as transport failures (issue #138 Fix B).
+        let cfg = config_with_peer_read(0x12);
         let sink = Arc::new(ScriptedSink::with_inputs([
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
         ]));
-        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup_with_config(cfg, sink);
         tick().await;
         tick().await;
         tick().await; // third tick: loss confirmed, OwnershipPoll sent

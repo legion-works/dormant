@@ -126,7 +126,8 @@ impl CoordRecord {
 /// Cloneable, daemon-lifetime cache of shared-display ownership verdicts.
 #[derive(Clone, Debug)]
 pub struct CoordinationHandle {
-    records: Arc<RwLock<HashMap<DisplayId, CoordRecord>>>,
+    #[doc(hidden)]
+    pub records: Arc<RwLock<HashMap<DisplayId, CoordRecord>>>,
 }
 
 impl CoordinationHandle {
@@ -287,6 +288,31 @@ impl CoordinationHandle {
             .get_mut(display)
         {
             record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+        }
+    }
+
+    /// Immediately mark a display as owned — called after a verified-successful
+    /// local write (issue #139).  The machine has first-hand proof that it owns
+    /// the panel; waiting for the debounced poll to independently rediscover
+    /// this fact adds ~`loss_confirmations × poll_interval` of visible lag.
+    ///
+    /// The write-and-verify path is observation, not authority — the poll must
+    /// still never cause a write.  This method feeds the *result* of a write the
+    /// machine performed, which is a different category.
+    ///
+    /// Idempotent: if the display is already marked owned, this is a no-op.
+    /// Unknown displays (private, or concurrently removed) are silently ignored.
+    pub fn mark_owned_immediate(&self, display: &DisplayId) {
+        let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(record) = records.get_mut(display)
+            && !record.owned
+        {
+            record.owned = true;
+            // Clear any pending transition so the poller's subsequent
+            // agreeing reads don't double-fire or register a disagreement.
+            record.pending_transition_count = 0;
+            record.pending_transition_code = None;
+            record.consecutive_failures = 0;
         }
     }
 

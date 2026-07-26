@@ -2,23 +2,60 @@
 //! socket with a fake control loop, then connect as a client and verify
 //! request/response round-trips.
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
+use dormant_core::config::schema::{Config, Credentials, DaemonConfig, DisplayScope};
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::{
     ControlMsg, DaemonEvent, DisplaySnapshot, SensorSnapshot, StateSnapshot, ZoneSnapshot,
 };
-use dormant_core::types::{RuleId, SensorState};
+use dormant_core::traits::{CommandSink, InputSourceTarget};
+use dormant_core::types::{CmdFailure, DisplayId, RuleId, SensorState};
 use dormant_doctor::DoctorService;
 use indexmap::IndexMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
+
+// ── Fake sink for switch tests ──────────────────────────────────────────────
+
+/// A scripted [`CommandSink`] that always succeeds on [`write_input_source`](CommandSink::write_input_source).
+struct FakeSink {
+    last_target: Mutex<Option<InputSourceTarget>>,
+}
+
+impl FakeSink {
+    fn new() -> Self {
+        Self {
+            last_target: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandSink for FakeSink {
+    async fn blank(&self, _mode: dormant_core::types::BlankMode) -> Result<(), CmdFailure> {
+        Ok(())
+    }
+
+    async fn wake(&self) -> Result<(), CmdFailure> {
+        Ok(())
+    }
+
+    fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
+        vec![]
+    }
+
+    async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
+        *self.last_target.lock().unwrap() = Some(target);
+        Ok(())
+    }
+}
 
 /// Spawn a fake engine control loop that responds to Snapshot with a canned
 /// state and records all other `ControlMsg`s.
@@ -121,6 +158,86 @@ async fn send_request(socket_path: &Path, request: &IpcRequest) -> IpcResponse {
     serde_json::from_str(response_line.trim()).unwrap()
 }
 
+/// Build a throwaway [`DirectSwitchHandle`] with no displays — all
+/// switch attempts will return `Unsupported`.
+fn fake_direct_switch(
+    ctl_tx: mpsc::Sender<ControlMsg>,
+) -> Arc<dormantd::direct_switch::DirectSwitchHandle> {
+    fake_direct_switch_with(None, ctl_tx)
+}
+
+/// Build a [`DirectSwitchHandle`] with an optional shared display.
+fn fake_direct_switch_with(
+    display_name: Option<&str>,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+) -> Arc<dormantd::direct_switch::DirectSwitchHandle> {
+    let mut displays = IndexMap::new();
+    let mut executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+
+    if let Some(name) = display_name {
+        let dc = dormant_core::config::schema::DisplayConfig {
+            controllers: vec!["ddcci".into()],
+            scope: DisplayScope::Shared,
+            shared_input_code: Some(0x10),
+            shared_input_write_code: None,
+            shared_peer_input_write_code: None,
+            shared_peer_input_code: None,
+            hooks: dormant_core::config::schema::HookSlots::default(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 100,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
+        };
+        displays.insert(name.to_string(), dc);
+        let sink: Arc<dyn CommandSink> = Arc::new(FakeSink::new());
+        executors.insert(DisplayId(name.to_string()), sink);
+    }
+
+    let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+    drop(executors_tx);
+    let (config_tx, config_rx) = watch::channel(Arc::new(Config {
+        coordination: dormant_core::config::CoordinationConfig::default(),
+        config_version: 1,
+        daemon: DaemonConfig::default(),
+        wear: dormant_core::config::schema::WearConfig::default(),
+        notifications: dormant_core::config::schema::NotificationsConfig::default(),
+        watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+        audio: dormant_core::config::schema::AudioConfig::default(),
+        sensors: IndexMap::default(),
+        zones: IndexMap::default(),
+        displays,
+        rules: IndexMap::default(),
+        keymap: dormant_core::config::KeymapConfig::default(),
+        input_filter: dormant_core::config::InputFilterConfig::default(),
+    }));
+    drop(config_tx);
+    let publisher = Arc::new(dormantd::hooks::MqttPublisher::new(String::new(), None));
+    let hook_engine = Arc::new(dormantd::hooks::HookEngine::new(publisher));
+    Arc::new(dormantd::direct_switch::DirectSwitchHandle::new(
+        executors_rx,
+        config_rx,
+        hook_engine,
+        ctl_tx,
+    ))
+}
+
 /// Build a throwaway `DoctorService` for tests that don't exercise the
 /// doctor path.  The service is still constructed (so the IPC server
 /// signature is satisfied) and will not be invoked.
@@ -163,12 +280,14 @@ async fn setup_server() -> (
     let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let cancel = CancellationToken::new();
     let doctor = fake_doctor(ctl_tx.clone());
+    let ds = fake_direct_switch(ctl_tx.clone());
 
     let _handle = dormantd::ipc::spawn(
         &socket_path,
         ctl_tx.clone(),
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
+        ds,
         cancel.clone(),
     )
     .unwrap();
@@ -465,12 +584,14 @@ async fn socket_file_permissions_0600() {
     let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let cancel = CancellationToken::new();
     let doctor = fake_doctor(ctl_tx.clone());
+    let ds = fake_direct_switch(ctl_tx.clone());
 
     let _handle = dormantd::ipc::spawn(
         &socket_path,
         ctl_tx,
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
+        ds,
         cancel.clone(),
     )
     .unwrap();
@@ -501,6 +622,7 @@ async fn stale_socket_replacement() {
     let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
     let cancel = CancellationToken::new();
     let doctor = fake_doctor(ctl_tx.clone());
+    let ds = fake_direct_switch(ctl_tx.clone());
 
     // Should succeed — replaces the stale socket
     let result = dormantd::ipc::spawn(
@@ -508,6 +630,7 @@ async fn stale_socket_replacement() {
         ctl_tx,
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
+        ds,
         cancel.clone(),
     );
     assert!(result.is_ok(), "should replace stale socket: {result:?}");
@@ -566,5 +689,125 @@ async fn doctor_roundtrip_returns_report() {
         Ok(Some(other)) => panic!("unexpected forwarded control msg: {other:?}"),
     }
 
+    cancel.cancel();
+}
+
+// ── Switch roundtrip tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn switch_to_local_unsupported_display_returns_error() {
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
+
+    let resp = send_request(
+        &socket_path,
+        &IpcRequest::SwitchToLocal {
+            display: "nonexistent".into(),
+        },
+    )
+    .await;
+
+    assert!(!resp.ok, "nonexistent display should error");
+    let err = resp.error.expect("should have error");
+    assert!(
+        err.contains("nonexistent") && err.contains("not shared"),
+        "error should mention display and reason: {err}"
+    );
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn switch_to_peer_not_configured_returns_error() {
+    let (_dir, socket_path, _ctl_tx, _event_tx, _record_rx, cancel) = setup_server().await;
+
+    let resp = send_request(
+        &socket_path,
+        &IpcRequest::SwitchToPeer {
+            display: "tv".into(),
+        },
+    )
+    .await;
+
+    assert!(!resp.ok, "unconfigured peer switch should error");
+    let err = resp.error.expect("should have error");
+    assert!(
+        err.contains("tv") && err.contains("not shared"),
+        "error should mention display and reason: {err}"
+    );
+
+    cancel.cancel();
+}
+
+/// Create a tempdir with socket path and spawn the IPC server with a
+/// [`DirectSwitchHandle`] that has a configured shared display.
+async fn setup_server_with_display(
+    display: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, CancellationToken) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("dormant.sock");
+
+    let (ctl_tx, event_tx, record_rx) = spawn_fake_engine();
+    let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
+    let cancel = CancellationToken::new();
+    let doctor = fake_doctor(ctl_tx.clone());
+    let ds = fake_direct_switch_with(Some(display), ctl_tx.clone());
+
+    let _handle = dormantd::ipc::spawn(
+        &socket_path,
+        ctl_tx.clone(),
+        dormant_core::reload::ReloadRequester::new(reload_tx),
+        doctor,
+        ds,
+        cancel.clone(),
+    )
+    .unwrap();
+
+    // Suppress unused warnings.
+    drop(event_tx);
+    drop(record_rx);
+    drop(ctl_tx);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (dir, socket_path, cancel)
+}
+
+#[tokio::test]
+async fn switch_to_local_on_configured_shared_display_succeeds() {
+    let (_dir, socket_path, cancel) = setup_server_with_display("desk").await;
+
+    let resp = send_request(
+        &socket_path,
+        &IpcRequest::SwitchToLocal {
+            display: "desk".into(),
+        },
+    )
+    .await;
+
+    assert!(resp.ok, "switch to local should succeed: {resp:?}");
+    assert!(resp.error.is_none(), "unexpected error: {:?}", resp.error);
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn switch_to_peer_configured_succeeds() {
+    let (_dir, socket_path, cancel) = setup_server_with_display("desk").await;
+
+    // setup_server_with_display doesn't configure peer write code,
+    // so this should return a specific error.
+    let resp = send_request(
+        &socket_path,
+        &IpcRequest::SwitchToPeer {
+            display: "desk".into(),
+        },
+    )
+    .await;
+
+    assert!(!resp.ok, "peer switch without code should error");
+    let err = resp.error.expect("should have error");
+    assert!(
+        err.contains("desk") && err.contains("not configured"),
+        "error should mention not configured: {err}"
+    );
     cancel.cancel();
 }

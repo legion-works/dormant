@@ -974,6 +974,7 @@ impl App {
                     front_ctl_tx.clone(),
                     reload_requester.clone(),
                     doctor_service.clone(),
+                    direct_switch.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -1214,7 +1215,6 @@ pub struct AppHandle {
     /// Local direct-switch handle — replaces the owner-mediated
     /// claim protocol. Exposed so IPC/hotkey callers can trigger
     /// local pull/push writes.
-    #[allow(dead_code, reason = "wired in Task 13")]
     direct_switch: Arc<DirectSwitchHandle>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
@@ -1225,6 +1225,13 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
+    /// The daemon's local direct-switch handle — consumed by IPC and
+    /// hotkey callers to trigger pull/push writes.
+    #[must_use]
+    pub fn direct_switch(&self) -> &DirectSwitchHandle {
+        &self.direct_switch
+    }
+
     /// A sender for [`ControlMsg`]s, forwarded to the current engine
     /// generation across reloads.
     #[must_use]

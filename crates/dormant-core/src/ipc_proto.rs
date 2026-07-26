@@ -105,6 +105,21 @@ pub enum IpcRequest {
         /// Display id.
         display: String,
     },
+    /// Write the local input code to pull the display to this
+    /// machine.  Replied via ordinary [`IpcResponse::ok`] /
+    /// [`IpcResponse::error`].
+    SwitchToLocal {
+        /// Display id (matches a `[displays.<id>]` key).
+        display: String,
+    },
+    /// Write the peer input code to push the display away.
+    /// Configuration-gated on `shared_peer_input_write_code`;
+    /// returns an error when absent.
+    SwitchToPeer {
+        /// Display id (matches a `[displays.<id>]` key with
+        /// `scope = "shared"`).
+        display: String,
+    },
 }
 
 /// Non-secret state exposed for a local instance-pairing window.
@@ -582,6 +597,34 @@ mod tests {
         match back {
             IpcRequest::Exercise { display } => assert_eq!(display, "mon"),
             _ => panic!("expected Exercise"),
+        }
+    }
+
+    #[test]
+    fn request_switch_to_local_serde() {
+        let req = IpcRequest::SwitchToLocal {
+            display: "desk".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"switch_to_local","display":"desk"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::SwitchToLocal { display } => assert_eq!(display, "desk"),
+            _ => panic!("expected SwitchToLocal"),
+        }
+    }
+
+    #[test]
+    fn request_switch_to_peer_serde() {
+        let req = IpcRequest::SwitchToPeer {
+            display: "tv".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"switch_to_peer","display":"tv"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::SwitchToPeer { display } => assert_eq!(display, "tv"),
+            _ => panic!("expected SwitchToPeer"),
         }
     }
 

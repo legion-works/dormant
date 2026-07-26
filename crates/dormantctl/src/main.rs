@@ -82,13 +82,15 @@ enum Command {
         /// Display id to wake.
         display: String,
     },
-    /// Request a shared-panel switch, or arm activity claim.
+    /// Write the local input code to pull a shared display to this
+    /// machine.  Use `--to-peer` to push the display away by writing
+    /// the peer input code (requires `shared_peer_input_write_code`).
     Switch {
-        /// Shared display id to claim.
+        /// Shared display id.
         display: String,
-        /// Arm activity claim instead of switching immediately.
+        /// Write the peer input code instead of the local one.
         #[arg(long)]
-        arm: bool,
+        to_peer: bool,
     },
     /// Trigger a config reload.
     Reload,
@@ -200,7 +202,13 @@ fn main() -> ExitCode {
         Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
         Command::Blank { display } => cmd_blank::run_blank(&socket_path, &display),
         Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
-        Command::Switch { display, arm } => cmd_switch::run(&socket_path, &display, arm),
+        Command::Switch { display, to_peer } => {
+            if to_peer {
+                cmd_switch::run_peer(&socket_path, &display)
+            } else {
+                cmd_switch::run(&socket_path, &display)
+            }
+        }
         Command::Reload => {
             match dormantctl::client::send_request(&socket_path, &IpcRequest::Reload) {
                 Ok(resp) if resp.ok => {
@@ -411,11 +419,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_switch_arm() {
-        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor", "--arm"]).unwrap();
+    fn parse_switch_to_peer() {
+        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor", "--to-peer"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Switch { display, arm: true } if display == "monitor"
+            Command::Switch { display, to_peer: true } if display == "monitor"
+        ));
+    }
+
+    #[test]
+    fn parse_switch_plain() {
+        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Switch { display, to_peer: false } if display == "monitor"
         ));
     }
 }

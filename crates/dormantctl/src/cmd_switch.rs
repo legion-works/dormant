@@ -1,71 +1,46 @@
-//! `dormantctl switch` — request or arm a shared-panel claim.
+//! `dormantctl switch` — write a local or peer input code to a shared display.
+//!
+//! Each write is a direct DDC/CI command over the local machine's own bus;
+//! there is no network negotiation.  A local pull is always available on a
+//! shared display with a configured input code.  A peer push requires
+//! `shared_peer_input_write_code` to be set.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use dormant_core::ipc_proto::{ClaimSharedResultWire, IpcRequest};
+use dormant_core::ipc_proto::IpcRequest;
 
 use dormantctl::client;
 
-/// Build the IPC request for a switch command.
-#[must_use]
-pub(crate) fn request_for(display: &str, arm: bool) -> IpcRequest {
-    if arm {
-        IpcRequest::ClaimArm {
-            display: display.to_string(),
-        }
-    } else {
-        IpcRequest::ClaimShared {
-            display: display.to_string(),
-        }
-    }
-}
-
-fn format_deadline(deadline_ms: u64) -> String {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        });
-    let seconds = deadline_ms.saturating_sub(now_ms).div_ceil(1_000);
-    format!("in {seconds}s")
-}
-
-/// Run the `switch` command.
+/// Run the `switch` command — write the local input code.
 ///
 /// # Errors
 ///
 /// Propagates transport failures and daemon rejection reasons.
-pub fn run(socket_path: &Path, display: &str, arm: bool) -> Result<()> {
-    let response = client::send_request(socket_path, &request_for(display, arm))?;
+pub fn run(socket_path: &Path, display: &str) -> Result<()> {
+    let request = IpcRequest::SwitchToLocal {
+        display: display.to_string(),
+    };
+    let response = client::send_request(socket_path, &request)?;
     client::check_response(&response)?;
+    println!("switched");
+    Ok(())
+}
 
-    if arm {
-        let result = response
-            .claim_arm
-            .ok_or_else(|| anyhow::anyhow!("daemon returned no arm result"))?;
-        if result.armed {
-            println!("armed {}", format_deadline(result.deadline_ms));
-            Ok(())
-        } else {
-            anyhow::bail!(result.reason.unwrap_or_else(|| "arm rejected".to_string()))
-        }
-    } else {
-        match response
-            .claim_shared
-            .ok_or_else(|| anyhow::anyhow!("daemon returned no claim result"))?
-        {
-            ClaimSharedResultWire::Accepted { deadline_ms } => {
-                println!("accepted {}", format_deadline(deadline_ms));
-                Ok(())
-            }
-            ClaimSharedResultWire::Busy => anyhow::bail!("busy"),
-            ClaimSharedResultWire::Denied { reason } | ClaimSharedResultWire::Failed { reason } => {
-                anyhow::bail!(reason)
-            }
-        }
-    }
+/// Run the `switch --to-peer` command — write the peer input code.
+///
+/// # Errors
+///
+/// Propagates transport failures and daemon rejection reasons (including
+/// "not configured" when `shared_peer_input_write_code` is absent).
+pub fn run_peer(socket_path: &Path, display: &str) -> Result<()> {
+    let request = IpcRequest::SwitchToPeer {
+        display: display.to_string(),
+    };
+    let response = client::send_request(socket_path, &request)?;
+    client::check_response(&response)?;
+    println!("switched to peer");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -73,30 +48,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn switch_arm_maps_to_claim_arm() {
+    fn switch_to_local_maps_to_switch_to_local_request() {
+        // We test the request construction directly — the wire shape is
+        // verified by the serde roundtrip tests in dormant-core.
+        let req = IpcRequest::SwitchToLocal {
+            display: "monitor".into(),
+        };
         assert!(matches!(
-            request_for("monitor", true),
-            IpcRequest::ClaimArm { display } if display == "monitor"
+            req,
+            IpcRequest::SwitchToLocal { display } if display == "monitor"
         ));
     }
 
     #[test]
-    fn deadline_is_humanized_relative_to_now() {
-        let now_ms: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            .try_into()
-            .unwrap();
-        let rendered = format_deadline(now_ms + 5_000);
-        assert!(rendered == "in 5s" || rendered == "in 6s", "{rendered}");
-    }
-
-    #[test]
-    fn switch_plain_maps_to_claim_shared() {
+    fn switch_to_peer_maps_to_switch_to_peer_request() {
+        let req = IpcRequest::SwitchToPeer {
+            display: "monitor".into(),
+        };
         assert!(matches!(
-            request_for("monitor", false),
-            IpcRequest::ClaimShared { display } if display == "monitor"
+            req,
+            IpcRequest::SwitchToPeer { display } if display == "monitor"
         ));
     }
 }

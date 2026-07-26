@@ -1,12 +1,7 @@
 /**
  * Notifications settings section — the `[notifications]` TOML section.
  *
- * Renders each known `notifications.*` key with the appropriate widget,
- * mirroring DaemonSection/WearSection's known-field guidance pattern.
- * All four keys have defaults in the Rust schema
- * (`NotificationsConfig::default()`), so the section is only hidden when
- * `notifications` is entirely absent from the inventory (older
- * fixture/payload shape).
+ * W1-5: 230px label column + changed-field markers.
  */
 import FormSection from "./FormSection";
 import { BoolField, DurationField, NumberField, TextField } from "./fields";
@@ -21,7 +16,6 @@ interface NotificationsSectionProps {
   fieldErrors: Record<string, string | undefined>;
 }
 
-/** Known notifications keys with explicit widget choices. */
 const KNOWN_FIELDS: Record<string, { kind: "bool" | "number" | "duration" | "text" }> = {
   enabled: { kind: "bool" },
   wake_attempt_threshold: { kind: "number" },
@@ -29,7 +23,6 @@ const KNOWN_FIELDS: Record<string, { kind: "bool" | "number" | "duration" | "tex
   notify_recovery: { kind: "bool" },
 };
 
-/** Per-field help text — accurate to the real config semantics. */
 const FIELD_HELP: Record<string, string> = {
   enabled: "Enable wake-failure desktop notifications. On by default.",
   wake_attempt_threshold: "Consecutive wake-command failures before a notification fires.",
@@ -37,10 +30,7 @@ const FIELD_HELP: Record<string, string> = {
   notify_recovery: "Emit a recovery notification once a previously-failing display wakes successfully again.",
 };
 
-/** Placeholder text for empty inputs — the real default value. */
-const FIELD_PLACEHOLDER: Record<string, string> = {
-  cooldown: "15m",
-};
+const FIELD_PLACEHOLDER: Record<string, string> = { cooldown: "15m" };
 
 export default function NotificationsSection({ notifications, store, redactedPaths, onDirty, fieldErrors }: NotificationsSectionProps) {
   const inv = notifications ?? {};
@@ -54,48 +44,40 @@ export default function NotificationsSection({ notifications, store, redactedPat
           const path = ["notifications", key];
           const value = inv[key];
           const locked = store.isLocked(path, redactedPaths);
-          const lockedReason = locked ? "contains credentials — edit in the config file" : undefined;
           const known = KNOWN_FIELDS[key];
           const error = fieldErrors[path.join(".")];
+          const pending = store.getEdit(path);
+          const changed = pending !== undefined && pending !== value;
 
           const shared: FieldProps = {
-            path,
-            label: key,
-            value,
-            locked,
-            lockedReason,
-            error,
-            help: FIELD_HELP[key],
-            placeholder: FIELD_PLACEHOLDER[key],
-            onEdit: (p, v) => {
-              store.trackEdit(p, v);
-              onDirty();
-            },
+            path, label: key, value, locked,
+            lockedReason: locked ? "contains credentials — edit in the config file" : undefined,
+            error, help: FIELD_HELP[key], placeholder: FIELD_PLACEHOLDER[key],
+            onEdit: (p, v) => { store.trackEdit(p, v); onDirty(); },
           };
 
-          if (locked) {
-            return <TextField key={key} {...shared} />;
+          let widget: React.ReactNode;
+          if (locked) widget = <TextField key={key} {...shared} />;
+          else if (!known) {
+            if (typeof value === "number") widget = <NumberField key={key} {...shared} />;
+            else if (typeof value === "boolean") widget = <BoolField key={key} {...shared} />;
+            else if (typeof value === "string") widget = <TextField key={key} {...shared} />;
+            else return null;
+          } else switch (known.kind) {
+            case "bool": widget = <BoolField key={key} {...shared} />; break;
+            case "number": widget = <NumberField key={key} {...shared} />; break;
+            case "duration": widget = <DurationField key={key} {...shared} />; break;
+            case "text": widget = <TextField key={key} {...shared} />; break;
+            default: return null;
           }
 
-          if (!known) {
-            if (typeof value === "number") return <NumberField key={key} {...shared} />;
-            if (typeof value === "boolean") return <BoolField key={key} {...shared} />;
-            if (typeof value === "string") return <TextField key={key} {...shared} />;
-            return null;
-          }
-
-          switch (known.kind) {
-            case "bool":
-              return <BoolField key={key} {...shared} />;
-            case "number":
-              return <NumberField key={key} {...shared} />;
-            case "duration":
-              return <DurationField key={key} {...shared} />;
-            case "text":
-              return <TextField key={key} {...shared} />;
-            default:
-              return null;
-          }
+          const cls = `cf-field cf-field--row${changed ? " cf-field--changed" : ""}`;
+          return (
+            <div key={key} className={cls}>
+              {widget}
+              {changed && <span className="cf-field__was">changed · was {String(value ?? "")}</span>}
+            </div>
+          );
         })}
       </div>
     </FormSection>

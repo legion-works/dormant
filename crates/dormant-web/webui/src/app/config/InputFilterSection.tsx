@@ -34,6 +34,7 @@ export default function InputFilterSection({
         </div>
 
         <div className="cf-card__fields">
+          <div className="cf-field cf-field--row">
           <StringListField
             path={["input_filter", "ignore_devices"]}
             label="ignore_devices"
@@ -47,6 +48,7 @@ export default function InputFilterSection({
               onDirty();
             }}
           />
+          </div>
 
           <span className="cf-field__hint">
             {"Verify current devices: "}

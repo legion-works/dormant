@@ -52,6 +52,7 @@ export default function KeymapSection({
         </div>
 
         <div className="cf-card__fields">
+          <div className="cf-field cf-field--row">
           <TextField
             path={["keymap", "claim_hotkey"]}
             label="claim_hotkey"
@@ -65,6 +66,7 @@ export default function KeymapSection({
               onDirty();
             }}
           />
+          </div>
 
           <span className="cf-field__hint">
             <kbd style={{

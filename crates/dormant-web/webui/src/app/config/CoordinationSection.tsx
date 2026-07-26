@@ -2,9 +2,7 @@
  * Coordination section — the `[coordination]` TOML table, six keys
  * governing the soft-KVM input-switch protocol between machines.
  *
- * Rendered on the Switching tab.  Shows the derived switch-latency chip
- * under `loss_confirmations` and a live `● active / ○ inert` marker
- * when `snapshot.kvm` is present/absent.
+ * W1-5: 230px label column via cf-field--row.
  */
 import { useState } from "react";
 import type { KvmStatus, CoordinationConfig } from "../../api/types";
@@ -17,14 +15,11 @@ interface CoordinationSectionProps {
   store: PatchStore;
   onDirty: () => void;
   fieldErrors: Record<string, string | undefined>;
-  /** Live KVM state — absent → section is inert. */
   kvm?: KvmStatus | null;
 }
 
-/** Compute the derived switch-latency: poll_interval × loss_confirmations. */
 function parseDurationMs(dur?: string): number {
   if (!dur) return 0;
-  // Simple parser: <number><unit>
   const m = dur.match(/^(\d+)(ms|s|m|h)$/);
   if (!m) return 0;
   const n = Number(m[1]);
@@ -43,7 +38,6 @@ function formatMs(ms: number): string {
   return `${ms}ms`;
 }
 
-/** Guide text per key. */
 const HELP: Record<string, string> = {
   poll_interval: "How often the daemon polls the panel's input code (VCP 0x60). Minimum 1s.",
   state_poll_interval: "How often coordination state is refreshed. Defaults to max(30s, poll_interval) when unset; must be ≥ poll_interval.",
@@ -53,15 +47,8 @@ const HELP: Record<string, string> = {
   cooldown: "Cooldown after a successful pull before the next pull is accepted. Activity pulls only — hotkey/CLI/tray/web bypass this.",
 };
 
-export default function CoordinationSection({
-  coordination = {},
-  store,
-  onDirty,
-  fieldErrors,
-  kvm,
-}: CoordinationSectionProps) {
+export default function CoordinationSection({ coordination = {}, store, onDirty, fieldErrors, kvm }: CoordinationSectionProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
-
   const active = kvm != null;
 
   const pollInterval = coordination.poll_interval ?? "2s";
@@ -71,16 +58,13 @@ export default function CoordinationSection({
   const armAfter = coordination.arm_after ?? "7s";
   const cooldown = coordination.cooldown ?? "3s";
 
-  // Derived latency chip: poll_interval × loss_confirmations
   const pollMs = parseDurationMs(pollInterval);
   const confirmations = typeof lossConfirmations === "number" ? lossConfirmations : 3;
   const derivedLatency = pollMs * confirmations;
 
-  // Client-side loss_confirmations constraint (1..=10)
   const lossError = typeof coordination.loss_confirmations === "number"
     && (coordination.loss_confirmations < 1 || coordination.loss_confirmations > 10)
-    ? `must be 1–10, got ${coordination.loss_confirmations}`
-    : undefined;
+    ? `must be 1–10, got ${coordination.loss_confirmations}` : undefined;
 
   const root = ["coordination"];
 
@@ -92,7 +76,6 @@ export default function CoordinationSection({
   return (
     <FormSection title="Coordination">
       <div className="cf-card">
-        {/* Section header with activation marker */}
         <div className="cf-card__header">
           <span className="cf-card__name">[coordination]</span>
           <span className={`cf-card__type${active ? "" : " cf-card__type--inert"}`}>
@@ -101,88 +84,55 @@ export default function CoordinationSection({
         </div>
 
         <div className="cf-card__fields">
-          <DurationField
-            path={[...root, "poll_interval"]}
-            label="poll_interval"
-            value={pollInterval}
-            locked={false}
-            help={HELP.poll_interval}
-            placeholder="2s"
-            onEdit={(_, v) => edit("poll_interval", v)}
-          />
+          <div className="cf-field cf-field--row">
+            <DurationField path={[...root, "poll_interval"]} label="poll_interval"
+              value={pollInterval} locked={false} help={HELP.poll_interval} placeholder="2s"
+              onEdit={(_, v) => edit("poll_interval", v)} />
+          </div>
 
-          <NumberField
-            path={[...root, "loss_confirmations"]}
-            label="loss_confirmations"
-            value={lossConfirmations}
-            locked={false}
-            help={HELP.loss_confirmations}
-            error={lossError ?? fieldErrors["coordination.loss_confirmations"]}
-            placeholder="3"
-            onEdit={(_, v) => edit("loss_confirmations", v)}
-          />
+          <div className="cf-field cf-field--row">
+            <NumberField path={[...root, "loss_confirmations"]} label="loss_confirmations"
+              value={lossConfirmations} locked={false} help={HELP.loss_confirmations}
+              error={lossError ?? fieldErrors["coordination.loss_confirmations"]} placeholder="3"
+              onEdit={(_, v) => edit("loss_confirmations", v)} />
+            {derivedLatency > 0 && (
+              <span className="cf-field__hint" style={{ fontStyle: "italic" }}>
+                {"~"}{formatMs(derivedLatency)}{" to commit"} — poll_interval × loss_confirmations
+              </span>
+            )}
+          </div>
 
-          {derivedLatency > 0 && (
-            <span className="cf-field__hint" style={{ marginLeft: "4px", fontStyle: "italic" }}>
-              {"~"}{formatMs(derivedLatency)}{" to commit"}{" — poll_interval × loss_confirmations"}
-            </span>
-          )}
+          <div className="cf-field cf-field--row">
+            <BoolField path={[...root, "activity_follow"]} label="activity_follow"
+              value={activityFollow} locked={false} help={HELP.activity_follow}
+              onEdit={(_, v) => edit("activity_follow", v)} />
+          </div>
 
-          <BoolField
-            path={[...root, "activity_follow"]}
-            label="activity_follow"
-            value={activityFollow}
-            locked={false}
-            help={HELP.activity_follow}
-            onEdit={(_, v) => edit("activity_follow", v)}
-          />
+          <div className="cf-field cf-field--row">
+            <DurationField path={[...root, "arm_after"]} label="arm_after"
+              value={armAfter} locked={false} help={HELP.arm_after} placeholder="7s"
+              onEdit={(_, v) => edit("arm_after", v)} />
+          </div>
 
-          <DurationField
-            path={[...root, "arm_after"]}
-            label="arm_after"
-            value={armAfter}
-            locked={false}
-            help={HELP.arm_after}
-            placeholder="7s"
-            onEdit={(_, v) => edit("arm_after", v)}
-          />
+          <div className="cf-field cf-field--row">
+            <DurationField path={[...root, "cooldown"]} label="cooldown"
+              value={cooldown} locked={false} help={HELP.cooldown} placeholder="3s"
+              onEdit={(_, v) => edit("cooldown", v)} />
+          </div>
 
-          <DurationField
-            path={[...root, "cooldown"]}
-            label="cooldown"
-            value={cooldown}
-            locked={false}
-            help={HELP.cooldown}
-            placeholder="3s"
-            onEdit={(_, v) => edit("cooldown", v)}
-          />
-
-          {/* ▸ Advanced: state_poll_interval */}
-          <button
-            type="button"
-            className="cf-section__toggle"
-            style={{ marginTop: "8px" }}
-            onClick={() => setShowAdvanced((o) => !o)}
-          >
-            <span className={`cf-section__chevron${showAdvanced ? " cf-section__chevron--open" : ""}`}>
-              {"▸"}
-            </span>
-            <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-              Advanced
-            </span>
+          <button type="button" className="cf-section__toggle" style={{ marginTop: "8px" }}
+            onClick={() => setShowAdvanced((o) => !o)}>
+            <span className={`cf-section__chevron${showAdvanced ? " cf-section__chevron--open" : ""}`}>{"▸"}</span>
+            <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>Advanced</span>
           </button>
 
           {showAdvanced && (
-            <DurationField
-              path={[...root, "state_poll_interval"]}
-              label="state_poll_interval"
-              value={statePollInterval}
-              locked={false}
-              help={HELP.state_poll_interval}
-              placeholder="max(30s, poll_interval)"
-              error={fieldErrors["coordination.state_poll_interval"]}
-              onEdit={(_, v) => edit("state_poll_interval", v)}
-            />
+            <div className="cf-field cf-field--row">
+              <DurationField path={[...root, "state_poll_interval"]} label="state_poll_interval"
+                value={statePollInterval} locked={false} help={HELP.state_poll_interval}
+                placeholder="max(30s, poll_interval)" error={fieldErrors["coordination.state_poll_interval"]}
+                onEdit={(_, v) => edit("state_poll_interval", v)} />
+            </div>
           )}
         </div>
       </div>

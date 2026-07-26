@@ -225,7 +225,7 @@ export default function SensorsSection({
                     </div>
                   );
                 }
-                return <div key={key} className="cf-field--row">{widget}</div>;
+                return <div key={key} className="cf-field cf-field--row">{widget}</div>;
               })}
 
               {/* Show keys present in config but not in our known list as text-only */}
@@ -235,7 +235,7 @@ export default function SensorsSection({
                   const path = [...basePath, key];
                   const value = (cfg as unknown as Record<string, unknown>)[key];
                   return (
-                    <div key={key} className="cf-field--row">
+                    <div key={key} className="cf-field cf-field--row">
                       <TextField
                         path={path}
                         label={key}

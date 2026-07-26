@@ -386,20 +386,41 @@
 
 /* ── Density pass (W1-5): 230px label column, per-entity collapse ── */
 
-/* Use a row layout for field → label column at 230px */
-.cf-field--row {
+/* Horizontal-row layout: label (230px column) | control (1fr column). */
+.cf-field.cf-field--row {
   display: grid;
   grid-template-columns: 230px 1fr;
-  gap: 8px;
+  gap: 2px 8px;
   align-items: start;
 }
 
-.cf-field--row .cf-field__label {
+.cf-field.cf-field--row .cf-field__label {
+  grid-column: 1;
   padding-top: 6px;
-  width: 230px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.cf-field.cf-field--row .cf-field__input-row,
+.cf-field.cf-field--row > .cf-field__input,
+.cf-field.cf-field--row > .cf-field__select,
+.cf-field.cf-field--row .cf-field__multiselect,
+.cf-field.cf-field--row .cf-field__value-list,
+.cf-field.cf-field--row .cf-field__value-row {
+  grid-column: 2;
+}
+
+.cf-field.cf-field--row .cf-field__hint,
+.cf-field.cf-field--row .cf-field__error,
+.cf-field.cf-field--row .cf-field__was {
+  grid-column: 2;
+}
+
+/* Checkbox labels span both columns (label text IS the control). */
+.cf-field.cf-field--row .cf-field__label--checkbox {
+  grid-column: 1 / -1;
+  padding-top: 0;
 }
 
 /* Entity collapse toggle */

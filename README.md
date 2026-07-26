@@ -20,6 +20,18 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 
 `dormant` is a Rust daemon that reads those sensors and blanks your displays only when the room is actually empty, then wakes them the instant someone walks back in. It runs your PC monitors and your TVs, over local buses and over the network, on rules you write per display.
 
+## What it does
+
+- Blank displays when a room is empty instead of on a fixed idle timer — driven by MQTT, Home Assistant WebSocket, or USB mmWave radar sensors
+- Blank without killing audio — DDC/CI, Samsung Tizen, and gamma-table paths leave the OS output intact
+- **Soft KVM** — two machines, one monitor; pull the panel by hotkey, CLI, tray, or web.
+- Escalate through a render ladder: black Wayland overlay → muted mpv screensaver → power-off, on configurable dwell timers
+- Track brightness-weighted panel on-hours per display, stored locally — no telemetry
+- Configure and control through a loopback web dashboard with a validated config editor that preserves comments
+- Drive the daemon from a desktop tray with global hotkeys (Linux KDE · macOS menu bar)
+- Probe every sensor and display against live hardware with `dormantctl doctor`
+- Recover from a bad config boot: automatic last-known-good rollback, a systemd watchdog, and `dormantctl emergency-wake`
+
 <p align="center">
   <img src="design/screenshots/dashboard.png" alt="dormant web dashboard — displays, sensors, zones, signal flow, and panel-exposure summary" width="820">
 </p>
@@ -28,9 +40,9 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
   <img src="design/screenshots/tray.png" alt="dormant KDE tray applet — status tooltip and pause/blank/wake menu" width="620">
 </p>
 
-## Why it exists
+## Why not just DPMS?
 
-The whole point is protecting OLEDs *without* the usual trade-offs — no black bars burned into the panel, no audio cutting out when the TV screen goes dark, no three-second wait to see your desktop again. Every blank mode makes a different bargain:
+Protecting OLEDs *without* the usual trade-offs — no black bars burned into the panel, no audio cutting out when the TV screen goes dark, no three-second wait to see your desktop again. Every blank mode makes a different bargain:
 
 | Mode | OLED protection | Audio survives | Wake |
 |---|---|---|---|
@@ -78,7 +90,7 @@ GitHub issue draft, with known config and credential values redacted.
 
 Each display gets an ordered controller chain with automatic fallback and bounded wake retry. A wake that fails on one controller escalates to the next. Repeated failures surface through desktop notifications, the tray, and the web dashboard.
 
-A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. This is the way a TV joins dormant without a keep-awake dummy zone.
+A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. That lets a TV join dormant without a keep-awake dummy zone.
 
 ### Panel-wear tracking
 

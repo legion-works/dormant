@@ -8,11 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [0.7.0] - 2026-07-26
 
-### Removed
+### Breaking
 
-- The owner-mediated claim protocol (mDNS discovery, SPAKE2 pairing, Ed25519 signed frames, TCP transport, claim-engine state machine, peer store). Replaced by direct local DDC writes — each machine writes its own input code over its own DDC bus with no network protocol, peer connection, handshake, or crypto. See `docs/src/multi-machine.md`.
-- The `coordination.enabled` config key — coordination now self-activates when at least one display has `scope = "shared"`. The removed coordination keys (`enabled`, `pairing_port`, `pairing_window`, `pairing_bind_address`, `claim_port`, `claim_bind_address`, `claim_advertise_mdns`, `activity_claim`, `owner_idle_window`, `armed_window`, `claim_timeout`, `release_deadline_cap`) will fail strict unknown-key validation in existing configs. Delete them from your `config.toml` and run `dormantctl validate`.
-- The instance-pairing web routes (`/api/pair/instance`, `/api/pair/instance/join`, `/api/pair/instance/:id/cancel`). Samsung TV pairing (`/api/pair/samsung`) is unaffected.
+- `coordination.enabled` and eleven sibling keys were removed. Delete them from your `config.toml` and run `dormantctl validate` before upgrading — strict unknown-key validation rejects a config that still carries them.
+
+### Highlights
+
+**Soft KVM — share one monitor between two machines.** Press a hotkey on either machine to pull the panel to it, or use `dormantctl switch`, the tray, or the web dashboard. An opt-in mode follows local input activity. See [Multi-machine](./docs/src/multi-machine.md).
+
+### Added
+
+- The LD2410C example config exposes all 18 per-gate sensitivity thresholds (gates 0-8, moving and static), an energy-gated `desk_seated` presence template, and a tunable still-energy floor. Gates 0 and 1 have no settable static sensitivity in firmware, so a person sitting still within ~75 cm cannot be detected as a still target — per-gate tuning alone cannot fix close-range seated presence, and the energy-gated template is the mitigation. Requires reflashing the device and repointing the sensor's MQTT topic; see `docs/src/sensors.md` ([#135](https://github.com/legion-works/dormant/issues/135)).
 
 ### Changed
 
@@ -37,9 +43,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - MQTT usernames shorter than the minimum secret length are redacted in issue drafts. They are collected separately and re-injected after the length filter, so short strings in general are still not over-redacted ([#118](https://github.com/legion-works/dormant/issues/118)).
 - Draft files are created with `create_new` and a retry on collision, closing a check-then-write race where concurrent runs could overwrite each other's output ([#119](https://github.com/legion-works/dormant/issues/119)).
 
-### Added
+### Removed
 
-- The LD2410C example config exposes all 18 per-gate sensitivity thresholds (gates 0-8, moving and static), an energy-gated `desk_seated` presence template, and a tunable still-energy floor. Gates 0 and 1 have no settable static sensitivity in firmware, so a person sitting still within ~75 cm cannot be detected as a still target — per-gate tuning alone cannot fix close-range seated presence, and the energy-gated template is the mitigation. Requires reflashing the device and repointing the sensor's MQTT topic; see `docs/src/sensors.md` ([#135](https://github.com/legion-works/dormant/issues/135)).
+- The owner-mediated claim protocol (mDNS discovery, SPAKE2 pairing, Ed25519 signed frames, TCP transport, claim-engine state machine, peer store). Replaced by direct local DDC writes — each machine writes its own input code over its own DDC bus with no network protocol, peer connection, handshake, or crypto. See `docs/src/multi-machine.md`.
+- The instance-pairing web routes (`/api/pair/instance`, `/api/pair/instance/join`, `/api/pair/instance/:id/cancel`). Samsung TV pairing (`/api/pair/samsung`) is unaffected.
 
 ## [0.6.0] - 2026-07-23
 

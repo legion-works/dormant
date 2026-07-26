@@ -850,6 +850,7 @@ impl App {
             config_rx.clone(),
             hook_engine,
             front_ctl_tx.clone(),
+            coordination.clone(),
         ));
 
         let spawn = spawn_generation(

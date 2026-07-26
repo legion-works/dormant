@@ -605,6 +605,8 @@ mod tests {
     use dormant_doctor::DoctorService;
 
     use super::DirectSwitchHandle;
+    use super::switch_outcome_to_response;
+    use crate::direct_switch::SwitchOutcome;
 
     /// Minimal fake engine for unit tests.
     fn fake_engine() -> (mpsc::Sender<super::ControlMsg>, CancellationToken) {
@@ -643,6 +645,7 @@ mod tests {
             config_rx,
             hook_engine,
             ctl_tx,
+            None,
         ))
     }
 
@@ -744,5 +747,60 @@ mod tests {
             "plain tempdir should be accepted: {result:?}"
         );
         cancel.cancel();
+    }
+
+    // ── Fix C (#138): exit code stability ─────────────────────────────────
+
+    /// `SwitchOutcome::WriteFailed` → `IpcResponse::error(...)` — the error
+    /// mapping must always produce `ok: false` so the `dormantctl` CLI exits
+    /// non-zero and prints `error:` on stdout.  A missing or silent-success
+    /// mapping here is the root cause of the asymmetric exit codes.
+    #[test]
+    fn write_failed_maps_to_error_response() {
+        let outcome = SwitchOutcome::WriteFailed {
+            error: "E_DISPLAY_IO: something broke".to_string(),
+        };
+        let resp = switch_outcome_to_response(outcome, "monitor");
+        assert!(!resp.ok, "WriteFailed must produce an error response");
+        assert!(
+            resp.error
+                .as_deref()
+                .is_some_and(|e| e.contains("write failed") && e.contains("E_DISPLAY_IO")),
+            "error message must preserve the failure detail, got: {:?}",
+            resp.error
+        );
+    }
+
+    /// Every [`SwitchOutcome`] variant must map to a consistent IPC response —
+    /// `Switched` → success, everything else → error.  This test is the
+    /// exhaustive exit-code contract: a new variant that silently maps to
+    /// `ok: true` would mask a failure as success.
+    #[test]
+    fn every_switch_outcome_has_consistent_response() {
+        let outcomes = [
+            (SwitchOutcome::Switched, true),
+            (
+                SwitchOutcome::WriteFailed {
+                    error: "E_DISPLAY_IO: fail".to_string(),
+                },
+                false,
+            ),
+            (SwitchOutcome::Unsupported, false),
+            (SwitchOutcome::NotConfigured, false),
+            (
+                SwitchOutcome::HookAborted {
+                    reason: "timed out".to_string(),
+                },
+                false,
+            ),
+            (SwitchOutcome::Cooldown, false),
+        ];
+        for (outcome, expected_ok) in outcomes {
+            let resp = switch_outcome_to_response(outcome, "monitor");
+            assert_eq!(
+                resp.ok, expected_ok,
+                "SwitchOutcome variant must consistently map ok={expected_ok}"
+            );
+        }
     }
 }

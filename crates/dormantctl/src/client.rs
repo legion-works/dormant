@@ -336,6 +336,43 @@ mod tests {
         assert!(matches!(event, DaemonEvent::Unknown));
     }
 
+    // ── Fix C (#138): exit code stability ─────────────────────────────
+
+    /// `check_response` on a non-ok `IpcResponse` must return `Err` so the
+    /// CLI exits non-zero.  This is the client-side half of the exit-code
+    /// contract; the server-side asserts the mapping.
+    #[test]
+    fn check_response_errors_on_non_ok_response() {
+        let resp = IpcResponse {
+            ok: false,
+            error: Some("write failed: E_DISPLAY_IO".to_string()),
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+        };
+        let result = check_response(&resp);
+        assert!(result.is_err(), "non-ok response must produce an error");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("write failed"),
+            "error must preserve the failure detail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_response_ok_on_success_response() {
+        let resp = IpcResponse {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+        };
+        assert!(check_response(&resp).is_ok());
+    }
+
     #[test]
     fn event_stream_yields_pending_event_before_reader() {
         let lines = b"{\"event\":\"from_the_future\"}\n" as &[u8];

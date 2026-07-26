@@ -150,6 +150,11 @@ pub struct DirectSwitchHandle {
     config: watch::Receiver<Arc<Config>>,
     hooks: Arc<HookEngine>,
     front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
+    /// Daemon-lifetime coordination state — fed immediately on a
+    /// verified-successful local write so the state machine wakes the
+    /// display without waiting for the debounced poll (issue #139).
+    /// `None` in tests that don't need immediate ownership.
+    coordination: Option<dormant_core::coordination::CoordinationHandle>,
     /// Last successful activity-driven pull time per display, used for
     /// cooldown gating.  Tokio `Instant` so that paused-time tests see
     /// deterministic cooldown expiry.
@@ -158,19 +163,21 @@ pub struct DirectSwitchHandle {
 
 impl DirectSwitchHandle {
     /// Construct a handle that shares the daemon's config, executor, hook
-    /// engine, and front control channels.
+    /// engine, front control channels, and coordination state.
     #[must_use]
     pub fn new(
         executors: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
         config: watch::Receiver<Arc<Config>>,
         hooks: Arc<HookEngine>,
         front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
+        coordination: Option<dormant_core::coordination::CoordinationHandle>,
     ) -> Self {
         Self {
             executors,
             config,
             hooks,
             front_ctl_tx,
+            coordination,
             last_activity_pull: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -242,6 +249,21 @@ impl DirectSwitchHandle {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(display.clone(), tokio::time::Instant::now());
+                }
+                // Immediately mark the display as owned — the machine just
+                // wrote the input code and verified the readback.  Waiting
+                // for the debounced poll (~loss_confirmations × poll_interval)
+                // adds visible latency on the acquiring side (issue #139).
+                if let Some(ref coord) = self.coordination {
+                    coord.mark_owned_immediate(&display);
+                    // Feed ownership immediately to the rules engine so the
+                    // state machine wakes the display without waiting for the
+                    // next debounced poll confirmation.
+                    let _ = self.front_ctl_tx.try_send(
+                        dormant_core::rules::ControlMsg::OwnershipPoll {
+                            display: display.clone(),
+                        },
+                    );
                 }
                 SwitchOutcome::Switched
             }
@@ -646,6 +668,7 @@ mod tests {
             config: config_rx,
             hooks,
             front_ctl_tx,
+            coordination: None,
             last_activity_pull: Mutex::new(HashMap::new()),
         }
     }
@@ -895,6 +918,101 @@ mod tests {
             matches!(outcome, SwitchOutcome::WriteFailed { .. }),
             "expected WriteFailed, got {outcome:?}"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Fix #139 — immediate ownership on verified local write
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A successful local `pull` must mark the display as owned immediately
+    /// in the coordination handle, so the state machine wakes the display
+    /// without waiting for the debounced poll.
+    #[tokio::test]
+    async fn pull_marks_coordination_owned_immediately() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
+        let coord = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+
+        let handle = build_handle_with_coordination(
+            display_config(),
+            sink.clone(),
+            noop_hook_engine(),
+            front_ctl_tx,
+            Some(coord.clone()),
+        );
+
+        // Before pull, the coordination handle says we don't own (seeded as owned=true).
+        // Let's first set it to false to simulate the acquiring side.
+        {
+            let mut records = coord.records.write().unwrap();
+            if let Some(record) = records.get_mut(&display_id()) {
+                record.owned = false;
+            }
+        }
+        assert!(!coord.snapshot()[&display_id()].owned);
+
+        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        assert_eq!(outcome, SwitchOutcome::Switched);
+
+        // After a successful pull, the coordination handle must show owned.
+        assert!(
+            coord.snapshot()[&display_id()].owned,
+            "pull must mark ownership immediately (issue #139)"
+        );
+
+        // The OwnershipPoll control message must be sent so the rules engine
+        // re-consults the gate and wakes the display without waiting for the
+        // debounced poll.  Drain the suppression set/clear messages first.
+        {
+            let set = front_ctl_rx
+                .try_recv()
+                .expect("suppression set must arrive first");
+            assert!(
+                matches!(
+                    set,
+                    dormant_core::rules::ControlMsg::SetClaimSuppression { until: Some(_), .. }
+                ),
+                "first msg must be suppression set, got {set:?}"
+            );
+            let clear = front_ctl_rx
+                .try_recv()
+                .expect("suppression clear must arrive second");
+            assert!(
+                matches!(
+                    clear,
+                    dormant_core::rules::ControlMsg::SetClaimSuppression { until: None, .. }
+                ),
+                "second msg must be suppression clear, got {clear:?}"
+            );
+        }
+        let msg = front_ctl_rx
+            .try_recv()
+            .expect("OwnershipPoll must be sent after successful pull");
+        assert!(
+            matches!(msg, dormant_core::rules::ControlMsg::OwnershipPoll { .. }),
+            "expected OwnershipPoll, got {msg:?}"
+        );
+    }
+
+    /// A `build_handle` variant that accepts an optional [`CoordinationHandle`].
+    fn build_handle_with_coordination(
+        dc: cs::DisplayConfig,
+        sink: Arc<FakeSink>,
+        hooks: Arc<HookEngine>,
+        front_ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
+        coordination: Option<dormant_core::coordination::CoordinationHandle>,
+    ) -> DirectSwitchHandle {
+        let executors: HashMap<_, _> = [(display_id(), sink as Arc<dyn CommandSink>)].into();
+        let (_, executors_rx) = watch::channel(Arc::new(executors));
+        let (_, config_rx) = watch::channel(Arc::new(minimal_config(dc)));
+        DirectSwitchHandle {
+            executors: executors_rx,
+            config: config_rx,
+            hooks,
+            front_ctl_tx,
+            coordination,
+            last_activity_pull: Mutex::new(HashMap::new()),
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1192,6 +1310,7 @@ mod tests {
             config: config_rx,
             hooks,
             front_ctl_tx,
+            coordination: None,
             last_activity_pull: Mutex::new(HashMap::new()),
         }
     }

@@ -17,3 +17,7 @@ Cargo.lock.orig
 # Python bytecode caches (scripts/ci/*.py)
 __pycache__/
 *.pyc
+
+# Operator scratch: dropped-in archives (third-party source, reference material).
+# Never commit these — a public repo should not carry unlicensed vendor drops.
+*.zip

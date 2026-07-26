@@ -338,6 +338,24 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
             const be = ev as { display: string };
             return patchBlankFailed(prev, be.display, false);
           }
+          case "ownership": {
+            const oe = ev as { display: string; owned: boolean; observed_input_code?: number | null };
+            // Patch the display snapshot's owned/observed_input_code fields.
+            const displays = prev.displays.map(
+              ([id, d]): [string, DisplaySnapshot] =>
+                id === oe.display
+                  ? [
+                      id,
+                      {
+                        ...d,
+                        owned: oe.owned,
+                        observed_input_code: oe.observed_input_code ?? d.observed_input_code,
+                      },
+                    ]
+                  : [id, d],
+            );
+            return { ...prev, displays };
+          }
           case "wear_snapshot": {
             // Not part of StateSnapshot — patches the separate
             // wearSnapshots map as a side effect; the snapshot itself

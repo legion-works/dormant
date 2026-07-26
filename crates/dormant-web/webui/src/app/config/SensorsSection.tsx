@@ -4,8 +4,10 @@
  * Renders scalar fields per sensor type.  The `type` discriminator
  * is rendered as a read-only label (not editable in v1).
  * broker_url / url fields are locked when the path is redacted.
+ *
+ * W1-5: per-entity collapse with localStorage persistence.
  */
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import FormSection from "./FormSection";
 import { DurationField, EnumField, NumberField, TextField } from "./fields";
 import type { FieldProps } from "./fields";
@@ -56,6 +58,33 @@ const PLACEHOLDER: Record<string, string> = {
   availability_payload_offline: "offline",
 };
 
+/** Sensor summary: type + port/path. */
+function sensorSummary(cfg: SensorConfig): string {
+  const base = cfg.type;
+  if (cfg.type === "usb-ld2410" && cfg.port) return `${base} · ${cfg.port}`;
+  if (cfg.type === "mqtt" && cfg.topic) return `${base} · ${cfg.topic}`;
+  if (cfg.type === "ha" && cfg.entity) return `${base} · ${cfg.entity}`;
+  return base;
+}
+
+function storageKey(section: string, id: string): string {
+  return `dormant-config-collapse:${section}:${id}`;
+}
+
+function readExpanded(section: string, id: string): boolean {
+  try {
+    const v = localStorage.getItem(storageKey(section, id));
+    if (v === null) return true; // default: expanded
+    return v === "1";
+  } catch { return true; }
+}
+
+function writeExpanded(section: string, id: string, expanded: boolean) {
+  try {
+    localStorage.setItem(storageKey(section, id), expanded ? "1" : "0");
+  } catch { /* ignore */ }
+}
+
 export default function SensorsSection({
   sensors,
   store,
@@ -68,6 +97,21 @@ export default function SensorsSection({
   const ids = Object.keys(sensors);
   const [showCreate, setShowCreate] = useState(false);
   const { confirm, dialog } = useConfirmDialog();
+
+  // Per-entity expanded state
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
+    const out: Record<string, boolean> = {};
+    for (const id of ids) out[id] = readExpanded("sensors", id);
+    return out;
+  });
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = !prev[id];
+      writeExpanded("sensors", id, next);
+      return { ...prev, [id]: next };
+    });
+  }, []);
 
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
@@ -92,15 +136,32 @@ export default function SensorsSection({
       {ids.map((id) => {
         const cfg = sensors[id];
         const basePath = ["sensors", id];
+        const open = expanded[id] !== false; // default true
 
         return (
           <div key={id} className="cf-card">
             <div className="cf-card__header">
+              <button
+                type="button"
+                className="cf-section__toggle"
+                onClick={() => toggleExpanded(id)}
+                aria-expanded={open}
+                style={{ minWidth: 0, gap: "4px" }}
+              >
+                <span className={`cf-section__chevron${open ? " cf-section__chevron--open" : ""}`}>
+                  {"▶"}
+                </span>
+              </button>
               <span className="cf-card__name">{id}</span>
-              <span className="cf-card__type">
-                type: {cfg.type}
-                <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
-              </span>
+              {!open && (
+                <span className="cf-card__summary-type">{sensorSummary(cfg)}</span>
+              )}
+              {open && (
+                <span className="cf-card__type">
+                  type: {cfg.type}
+                  <span className="cf-field__lock" title="not editable in v1" aria-label="not editable in v1">{"🔒"}</span>
+                </span>
+              )}
               {entityCrudEnabled && (
                 <button
                   type="button"
@@ -112,6 +173,7 @@ export default function SensorsSection({
               )}
             </div>
 
+            {open && (
             <div className="cf-card__fields">
               {SENSOR_SCALAR_KEYS.filter((k) => k in cfg).map((key) => {
                 const path = [...basePath, key];
@@ -124,6 +186,8 @@ export default function SensorsSection({
                     ? "not editable in v1"
                     : undefined;
                 const error = fieldErrors[path.join(".")];
+                const pending = store.getEdit(path);
+                const changed = pending !== undefined && pending !== value;
 
                 const shared: FieldProps = {
                   path,
@@ -141,16 +205,27 @@ export default function SensorsSection({
                 };
 
                 // Widget selection by key
+                let widget: React.ReactNode;
                 if (key === "kind") {
-                  return <EnumField key={key} {...shared} options={["presence", "motion"]} />;
+                  widget = <EnumField key={key} {...shared} options={["presence", "motion"]} />;
+                } else if (key === "baud" || (typeof value === "number")) {
+                  widget = <NumberField key={key} {...shared} />;
+                } else if (key === "hold_time" || key === "stale_timeout") {
+                  widget = <DurationField key={key} {...shared} />;
+                } else {
+                  widget = <TextField key={key} {...shared} />;
                 }
-                if (key === "baud" || (typeof value === "number")) {
-                  return <NumberField key={key} {...shared} />;
+
+                if (changed) {
+                  const was = String(value ?? "");
+                  return (
+                    <div key={key} className={`cf-field cf-field--changed cf-field--row`}>
+                      {widget}
+                      <span className="cf-field__was">changed · was {was}</span>
+                    </div>
+                  );
                 }
-                if (key === "hold_time" || key === "stale_timeout") {
-                  return <DurationField key={key} {...shared} />;
-                }
-                return <TextField key={key} {...shared} />;
+                return <div key={key} className="cf-field--row">{widget}</div>;
               })}
 
               {/* Show keys present in config but not in our known list as text-only */}
@@ -160,17 +235,19 @@ export default function SensorsSection({
                   const path = [...basePath, key];
                   const value = (cfg as unknown as Record<string, unknown>)[key];
                   return (
-                    <TextField
-                      key={key}
-                      path={path}
-                      label={key}
-                      value={value}
-                      locked={false}
-                      onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
-                    />
+                    <div key={key} className="cf-field--row">
+                      <TextField
+                        path={path}
+                        label={key}
+                        value={value}
+                        locked={false}
+                        onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                      />
+                    </div>
                   );
                 })}
             </div>
+            )}
           </div>
         );
       })}

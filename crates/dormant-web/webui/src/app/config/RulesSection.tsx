@@ -5,7 +5,7 @@
  * grace_period, wake_retry_interval (durations), wake_retries (number),
  * inhibitors (read-only in T7).
  */
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import FormSection from "./FormSection";
 import { DurationField, NumberField, TextField, EnumField, MultiSelectField } from "./fields";
 import type { FieldProps } from "./fields";
@@ -14,6 +14,7 @@ import type { RuleConfig } from "../../api/types";
 import CreateEntityForm from "./CreateEntityForm";
 import { VALID_INHIBITORS } from "./entityCrud";
 import { useConfirmDialog } from "../components";
+import { readEntityExpanded, writeEntityExpanded, ruleSummary } from "./density";
 
 /** Per-key help for rule scalar fields — accurate to the real config semantics. */
 const RULE_HELP: Record<string, string> = {
@@ -51,6 +52,20 @@ export default function RulesSection({
   const ids = Object.keys(rules);
   const [showCreate, setShowCreate] = useState(false);
   const { confirm, dialog } = useConfirmDialog();
+
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
+    const out: Record<string, boolean> = {};
+    for (const id of ids) out[id] = readEntityExpanded("rules", id);
+    return out;
+  });
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = !prev[id];
+      writeEntityExpanded("rules", id, next);
+      return { ...prev, [id]: next };
+    });
+  }, []);
 
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
@@ -94,7 +109,21 @@ export default function RulesSection({
         return (
           <div key={id} className="cf-card">
             <div className="cf-card__header">
+              <button
+                type="button"
+                className="cf-section__toggle"
+                onClick={() => toggleExpanded(id)}
+                aria-expanded={expanded[id] !== false}
+                style={{ minWidth: 0, gap: "4px" }}
+              >
+                <span className={`cf-section__chevron${expanded[id] !== false ? " cf-section__chevron--open" : ""}`}>
+                  {"▶"}
+                </span>
+              </button>
               <span className="cf-card__name">{id}</span>
+              {expanded[id] === false && (
+                <span className="cf-card__summary-type">{ruleSummary(cfg)}</span>
+              )}
               {entityCrudEnabled && (
                 <button
                   type="button"

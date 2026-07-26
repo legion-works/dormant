@@ -3,8 +3,10 @@
  *
  * Scalar fields: mode (enum), unavailable_policy (enum), quorum/threshold (number).
  * members / weights are read-only in T7 (array editors are T8).
+ *
+ * W1-5: per-entity collapse with localStorage persistence, summary row.
  */
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import FormSection from "./FormSection";
 import { EnumField, NumberField, MultiSelectField } from "./fields";
 import type { FieldProps } from "./fields";
@@ -14,6 +16,7 @@ import { FUSION_MODES, UNAVAILABLE_POLICIES } from "./fields";
 import CreateEntityForm from "./CreateEntityForm";
 import { referencingEntities } from "./entityCrud";
 import { useConfirmDialog } from "../components";
+import { readEntityExpanded, writeEntityExpanded, zoneSummary } from "./density";
 
 interface ZonesSectionProps {
   zones: Record<string, ZoneConfig>;
@@ -43,6 +46,21 @@ export default function ZonesSection({
   const [showCreate, setShowCreate] = useState(false);
   const { confirm, dialog } = useConfirmDialog();
 
+  // Per-entity expanded state
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
+    const out: Record<string, boolean> = {};
+    for (const id of ids) out[id] = readEntityExpanded("zones", id);
+    return out;
+  });
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = !prev[id];
+      writeEntityExpanded("zones", id, next);
+      return { ...prev, [id]: next };
+    });
+  }, []);
+
   if (ids.length === 0 && !entityCrudEnabled) return null;
 
   async function handleDelete(id: string) {
@@ -67,6 +85,7 @@ export default function ZonesSection({
       {ids.map((id) => {
         const cfg = zones[id];
         const basePath = ["zones", id];
+        const open = expanded[id] !== false;
 
         const makeShared = (key: string, value: unknown, extra?: Partial<FieldProps>): FieldProps => ({
           path: [...basePath, key],
@@ -85,7 +104,21 @@ export default function ZonesSection({
         return (
           <div key={id} className="cf-card">
             <div className="cf-card__header">
+              <button
+                type="button"
+                className="cf-section__toggle"
+                onClick={() => toggleExpanded(id)}
+                aria-expanded={open}
+                style={{ minWidth: 0, gap: "4px" }}
+              >
+                <span className={`cf-section__chevron${open ? " cf-section__chevron--open" : ""}`}>
+                  {"▶"}
+                </span>
+              </button>
               <span className="cf-card__name">{id}</span>
+              {!open && (
+                <span className="cf-card__summary-type">{zoneSummary(cfg)}</span>
+              )}
               {entityCrudEnabled && (
                 <button
                   type="button"
@@ -97,10 +130,11 @@ export default function ZonesSection({
               )}
             </div>
 
+            {open && (
             <div className="cf-card__fields">
               <EnumField {...makeShared("mode", cfg.mode, { help: "How members combine into one presence result. any = present if any member is; all = only if every member is; quorum = at least N members; weighted = present members' weight fraction meets the threshold." })} options={FUSION_MODES} />
 
-              <EnumField {...makeShared("unavailable_policy", cfg.unavailable_policy, { help: "How an offline/stale sensor is treated. present (default) is fail-safe — never blanks a room it can't see. absent will blank when sensors drop out; use with care." })} options={UNAVAILABLE_POLICIES} />
+              <EnumField {...makeShared("unavailable_policy", cfg.unavailable_policy ?? "present", { help: "How an offline/stale sensor is treated. present (default) is fail-safe — never blanks a room it can't see. absent will blank when sensors drop out; use with care." })} options={UNAVAILABLE_POLICIES} />
 
               {/* Members — unlocked to a multi-select under entity_crud_enabled (spec §6) */}
               {entityCrudEnabled ? (
@@ -128,7 +162,7 @@ export default function ZonesSection({
               )}
 
               {/* Weights — read-only in T7 */}
-              {Object.keys(cfg.weights).length > 0 && (
+              {cfg.weights && Object.keys(cfg.weights).length > 0 && (
                 <div className="cf-field cf-field--locked">
                   <label className="cf-field__label">weights</label>
                   <div className="cf-field__value-list">
@@ -140,6 +174,7 @@ export default function ZonesSection({
                 </div>
               )}
             </div>
+            )}
           </div>
         );
       })}

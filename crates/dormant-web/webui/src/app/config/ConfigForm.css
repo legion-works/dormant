@@ -383,3 +383,68 @@
   color: var(--text-faint);
   opacity: 0.6;
 }
+
+/* ── Density pass (W1-5): 230px label column, per-entity collapse ── */
+
+/* Use a row layout for field → label column at 230px */
+.cf-field--row {
+  display: grid;
+  grid-template-columns: 230px 1fr;
+  gap: 8px;
+  align-items: start;
+}
+
+.cf-field--row .cf-field__label {
+  padding-top: 6px;
+  width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Entity collapse toggle */
+.cf-card__collapse-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  margin-left: auto;
+}
+
+.cf-card__collapse-btn:hover {
+  color: var(--text-body);
+}
+
+/* Summary row for collapsed entities */
+.cf-card__summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.cf-card__summary-type {
+  color: var(--text-faint);
+}
+
+/* Changed-field marker */
+.cf-field--changed .cf-field__input,
+.cf-field--changed .cf-field__select {
+  border-color: var(--accent-warm);
+}
+
+.cf-field__was {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--accent-warm);
+  font-style: italic;
+  margin-left: 4px;
+  white-space: nowrap;
+}

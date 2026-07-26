@@ -21,6 +21,7 @@ use dormant_core::rules::{ExerciseReport, ExerciseStep, ExerciseVerdict};
 use dormant_doctor::{DraftContext, ProbeResult, ProbeStatus};
 
 use dormantctl::client;
+use std::io;
 
 // ── DoctorOutcome ───────────────────────────────────────────────────────────────
 
@@ -341,11 +342,9 @@ async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
     } else {
         PathBuf::from(requested_path)
     };
-    let write_path = next_available_path(&base_path);
-
-    tokio::fs::write(&write_path, body)
+    let write_path = write_draft_atomically(&base_path, &body)
         .await
-        .with_context(|| format!("write draft to '{}'", write_path.display()))?;
+        .context("write draft")?;
     println!("draft written to {}", write_path.display());
 
     Ok(outcome(&results))
@@ -360,12 +359,53 @@ fn is_known_subcommand_name(name: &str) -> bool {
     <DoctorSubcommand as clap::Subcommand>::has_subcommand(name)
 }
 
+/// Write `body` to a file at `base`, atomically avoiding overwrites.
+/// If `base` already exists, suffixes are tried (`base-2`, `base-3`, …)
+/// using `create_new(true)` — no check-then-write TOCTOU.
+async fn write_draft_atomically(base: &Path, body: &str) -> Result<PathBuf> {
+    // Try the base path first.
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(base)
+        .await
+    {
+        Ok(mut file) => {
+            tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes()).await?;
+            return Ok(base.to_path_buf());
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => { /* fall through to suffix loop */ }
+        Err(e) => return Err(e.into()),
+    }
+
+    let mut n = 2;
+    loop {
+        let candidate = suffixed_path(base, n);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(mut file) => {
+                tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes()).await?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                n += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Return the first available path among `base`, `base-2`, `base-3`, … —
 /// never silently overwrite an existing draft.
 ///
 /// Suffix is inserted before the file's extension (`dormant-issue-2026-07-18.md`
 /// → `dormant-issue-2026-07-18-2.md`) when the path has one, otherwise
 /// appended directly.
+#[allow(dead_code)]
 fn next_available_path(base: &Path) -> PathBuf {
     if !base.exists() {
         return base.to_path_buf();
@@ -1101,6 +1141,44 @@ mod tests {
 
         let next = next_available_path(&base);
         assert_eq!(next, dir.join("draft-3.md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #119: when the base path already exists (concurrent write),
+    /// `write_draft_atomically` falls back to the suffixed path
+    /// using atomic create-new — no TOCTOU gap.
+    #[tokio::test]
+    async fn write_draft_atomically_falls_back_to_suffix_when_base_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "dormantctl-draft-test-atomic-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("draft.md");
+
+        // Simulate a concurrent writer that claimed the base path first.
+        std::fs::write(&base, b"concurrent-draft").unwrap();
+
+        let written = write_draft_atomically(&base, "our-draft").await.unwrap();
+
+        // Should have fallen back to draft-2.md.
+        assert_eq!(written, dir.join("draft-2.md"));
+
+        // Base still has the concurrent writer's content.
+        assert_eq!(
+            std::fs::read_to_string(&base).unwrap(),
+            "concurrent-draft",
+            "base path must not be overwritten"
+        );
+
+        // Suffixed file has our content.
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            "our-draft",
+            "suffixed path must have our content"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

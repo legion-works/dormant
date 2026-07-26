@@ -1,7 +1,10 @@
 /**
  * Switching view — shared-display KVM ownership surface.
  *
- * One block per display in `kvm.switch_capable_displays`. Assembles:
+ * One block per shared display, with full controls for switch-capable
+ * displays and a warning card for shared-but-not-switch-capable ones.
+ *
+ * Assembles:
  * - OwnershipPair (W2-1) — the ownership verdict and codes
  * - SwitchState (W2-2) — pull/push state machine
  * - How it switches rows — deep-linked to Config › Switching fields
@@ -16,22 +19,44 @@ import { useLiveState } from "../hooks/useLiveState";
 import OwnershipPair from "./OwnershipPair";
 import SwitchState from "./SwitchState";
 import HooksInspector from "../config/HooksInspector";
+import { Card } from "../components";
+import "./Switching.css";
 
 export default function Switching() {
   const { snapshot, config, displayConfigs } = useLiveState();
   const kvm = snapshot?.kvm;
-  const switchable = kvm?.switch_capable_displays ?? [];
   const coordination = config?.inventory?.coordination;
 
   // Redirect guard: if switching is not available, redirect to displays.
-  if (!kvm || switchable.length === 0) {
+  if (!kvm || (kvm.switch_capable_displays?.length ?? 0) === 0) {
     window.location.hash = "#/displays";
     return null;
   }
 
+  // Collect shared displays for the warning section.
+  const allShared = Object.entries(displayConfigs)
+    .filter(([, dc]) => dc.scope === "shared")
+    .map(([id]) => id);
+  const notSwitchable = allShared.filter(
+    (id) => !kvm.switch_capable_displays.includes(id),
+  );
+
   return (
     <div className="switching-view">
-      {switchable.map((displayId) => {
+      {/* Shared-but-not-switch-capable warnings */}
+      {notSwitchable.length > 0 && (
+        <Card className="switching-warning">
+          {notSwitchable.map((id) => (
+            <div key={id}>
+              {id} is marked shared but is not switch-capable — no controller
+              reported VCP 0x60 write support. Run{" "}
+              <a href="#/doctor">doctor ddcci</a>.
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {kvm.switch_capable_displays.map((displayId) => {
         const snap = snapshot?.displays?.find(([id]) => id === displayId)?.[1];
         const dc = displayConfigs[displayId];
         if (!snap) return null;
@@ -47,7 +72,6 @@ export default function Switching() {
               snap={snap}
               config={dc}
               coordination={coordination}
-              kvm={kvm}
               size="full"
             />
 
@@ -60,13 +84,13 @@ export default function Switching() {
               peerWriteCode={peerWrite}
               owned={snap.owned}
               observedInputCode={snap.observed_input_code}
+              coordination={coordination}
             />
 
-            {/* How it switches */}
+            {/* How it switches — deep-linked to config fields */}
             <div className="switching-how">
               <h3 className="switching-section-title">HOW IT SWITCHES</h3>
 
-              {/* Activity follow */}
               <div className="switching-row">
                 <span className="switching-row__label">Activity follow</span>
                 <span className={`switching-row__value${kvm.activity_following ? " switching-row__value--on" : ""}`}>
@@ -77,10 +101,9 @@ export default function Switching() {
                     arm {coordination.arm_after ?? "7s"} · cooldown {coordination.cooldown ?? "3s"}
                   </span>
                 )}
-                <a className="switching-row__edit" href="#/config/switching">edit</a>
+                <a className="switching-row__edit" href="#/config/switching#coordination.activity_follow">edit</a>
               </div>
 
-              {/* Claim hotkey */}
               <div className="switching-row">
                 <span className="switching-row__label">Claim hotkey</span>
                 <span className="switching-row__value">
@@ -90,29 +113,26 @@ export default function Switching() {
                     "not bound"
                   )}
                 </span>
-                <a className="switching-row__edit" href="#/config/switching">edit</a>
+                <a className="switching-row__edit" href="#/config/switching#keymap.claim_hotkey">edit</a>
               </div>
 
-              {/* Ownership poll */}
               <div className="switching-row">
                 <span className="switching-row__label">Ownership poll</span>
                 <span className="switching-row__value">
                   every {coordination?.poll_interval ?? "2s"} · {coordination?.loss_confirmations ?? 3} agreeing reads to flip
                 </span>
-                <a className="switching-row__edit" href="#/config/switching">edit</a>
+                <a className="switching-row__edit" href="#/config/switching#coordination.poll_interval">edit</a>
               </div>
 
-              {/* Panel state poll */}
               <div className="switching-row">
                 <span className="switching-row__label">Panel state poll</span>
                 <span className="switching-row__value">
                   every {coordination?.state_poll_interval ?? `max(30s, ${coordination?.poll_interval ?? "2s"})`}
                   {(coordination?.state_poll_interval == null) && " (default: max(30s, poll_interval))"}
                 </span>
-                <a className="switching-row__edit" href="#/config/switching">edit</a>
+                <a className="switching-row__edit" href="#/config/switching#coordination.state_poll_interval">edit</a>
               </div>
 
-              {/* Ignored devices */}
               <div className="switching-row">
                 <span className="switching-row__label">Ignored devices</span>
                 <span className="switching-row__value">
@@ -120,21 +140,12 @@ export default function Switching() {
                     ? `${config.inventory.input_filter.ignore_devices.length} globs`
                     : "none"}
                 </span>
-                <a className="switching-row__edit" href="#/config/switching">edit</a>
+                <a className="switching-row__edit" href="#/config/switching#input_filter.ignore_devices">edit</a>
               </div>
             </div>
 
             {/* Hooks inspector (W1-4 read-only) */}
             <HooksInspector hooks={dc?.hooks} displayId={displayId} />
-
-            {/* Shared-but-not-switch-capable warning */}
-            {dc?.scope === "shared" && !kvm.switch_capable_displays.includes(displayId) && (
-              <div className="switching-warning">
-                {displayId} is marked shared but is not switch-capable — no controller
-                reported VCP 0x60 write support. Run{" "}
-                <a href="#/doctor">doctor ddcci</a>.
-              </div>
-            )}
           </div>
         );
       })}

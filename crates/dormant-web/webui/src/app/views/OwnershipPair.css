@@ -1,0 +1,161 @@
+/**
+ * OwnershipPair — shared-display ownership verdict card.
+ *
+ * Three sizes: full (Switching view), compact (Displays detail › Sharing),
+ * marker (Overview tile).  All use DS tokens only — no hardcoded hex.
+ */
+
+/* ── Shared ──────────────────────────────────────────────────────────────── */
+
+.ownership-pair {
+  font-size: var(--text-sm);
+}
+
+/* Agreement verdict colouring */
+.op-verdict {
+  font-weight: var(--font-medium);
+}
+.op-verdict--ours {
+  color: var(--success);
+}
+.op-verdict--peer {
+  color: var(--text-muted);
+}
+.op-verdict--third {
+  color: var(--warning);
+}
+.op-verdict--unreadable {
+  color: var(--warning);
+}
+
+.op-owned {
+  color: var(--text-muted);
+}
+.op-owned--ours {
+  color: var(--success);
+}
+
+.op-observed {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* ── Marker ─────────────────────────────────────────────────────────────── */
+
+.ownership-pair--marker {
+  display: inline-flex;
+  gap: var(--space-sm);
+  align-items: center;
+}
+
+/* ── Compact ────────────────────────────────────────────────────────────── */
+
+.ownership-pair--compact {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+}
+
+.ownership-pair--compact .op-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-bottom: var(--space-sm);
+}
+
+.ownership-pair--compact .op-machines {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-sm);
+}
+
+/* ── Full ───────────────────────────────────────────────────────────────── */
+
+.ownership-pair--full {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-lg);
+}
+
+.ownership-pair--full .op-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
+}
+
+.op-display-id {
+  font-weight: var(--font-bold);
+  font-size: var(--text-lg);
+  color: var(--text-heading);
+}
+
+.ownership-pair--full .op-machines {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
+}
+
+.op-machine {
+  padding: var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+
+.op-machine__status {
+  font-weight: var(--font-semibold);
+  margin-bottom: var(--space-xs);
+  color: var(--text-muted);
+}
+
+.op-machine__status--ours {
+  color: var(--success);
+}
+
+.op-machine__status--peer {
+  color: var(--text-muted);
+}
+
+.op-machine__role {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  margin-bottom: var(--space-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.op-machine__code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-body);
+}
+
+.op-machine__hint {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* ── Panel state ────────────────────────────────────────────────────────── */
+
+.op-panel {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: var(--space-md);
+  padding-top: var(--space-sm);
+  border-top: 1px solid var(--border);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.op-panel__state {
+  font-weight: var(--font-medium);
+}
+
+.op-panel__cadence {
+  font-style: italic;
+  color: var(--text-faint);
+}

@@ -374,6 +374,8 @@ export interface OwnershipEvent {
   event: "ownership";
   display: string;
   owned: boolean;
+  /** VCP 0x60 code written (write path), absent for poll-observed events. */
+  written_code?: number | null;
   observed_input_code?: number | null;
   /** "pull" | "push" | "poll" | "activity_follow" | "hotkey" | "cli" | "tray" | "web" */
   cause: string;

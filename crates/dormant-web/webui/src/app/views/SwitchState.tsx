@@ -3,7 +3,7 @@
  * shared display.
  *
  * Six pull states (idle → writing → verified / unverified / aborted / failed)
- * and five push states (idle → writing → released / ignored / degraded).
+ * and five push states (idle → writing → released / ignored / degraded / failed).
  *
  * Uses optimistic UI during the POST flight, then reconciles against the
  * snapshot poll and the BG-1 `DaemonEvent::Ownership` stream.
@@ -11,9 +11,10 @@
  * Source: flows/kvm-pull-push.md
  */
 import { useState, useCallback, useEffect, useRef } from "react";
-import type { OwnershipEvent } from "../../api/types";
-import { useEventLog } from "../hooks/useLiveState";
+import type { OwnershipEvent, CoordinationConfig } from "../../api/types";
+import { useEventLog, useLiveState } from "../hooks/useLiveState";
 import { postSwitch, postPush } from "../../api/client";
+import "./SwitchState.css";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -45,6 +46,8 @@ export interface SwitchStateProps {
   owned: boolean | undefined;
   /** Last observed input code from the snapshot. */
   observedInputCode: number | null | undefined;
+  /** Coordination config for poll interval (optimistic fallback). */
+  coordination?: CoordinationConfig;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -52,6 +55,21 @@ export interface SwitchStateProps {
 function hexPad(code: number | undefined): string {
   if (code == null) return "??";
   return `0x${code.toString(16)}`;
+}
+
+/** Classify a fetch error into the spec's error-copy table. */
+function classifyError(err: unknown): string {
+  if (err instanceof Error) {
+    const msg = err.message;
+    // The API client wraps fetch errors in ApiError with status/body.
+    // Check for known patterns.
+    if (msg.includes("409")) return "another switch is in flight";
+    // "the daemon did not answer" — any network error from the fetch layer.
+    if (msg.includes("fetch") || msg.includes("Network") || msg.includes("Failed to fetch"))
+      return "the daemon did not answer — the panel was not touched";
+    return msg;
+  }
+  return "unknown error";
 }
 
 // ── Component ──────────────────────────────────────────────────────────────
@@ -64,73 +82,86 @@ export default function SwitchState({
   peerWriteCode,
   owned: _owned,
   observedInputCode,
+  coordination,
 }: SwitchStateProps) {
   const [pullState, setPullState] = useState<PullState>({ kind: "idle" });
   const [pushState, setPushState] = useState<PushState>({ kind: "idle" });
   const pullTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { events } = useEventLog();
+  const { snapshot } = useLiveState();
 
-  // ── BG-1 Ownership event reconciliation ────────────────────────────────
+  // ── BG-1 Ownership event reconciliation (pull + push) ──────────────────
   useEffect(() => {
     if (events.length === 0) return;
-    const latest = events[0]?.event; // newest first
-    if (!latest || latest.event !== "ownership") return;
-    const oe = latest as OwnershipEvent;
+    const latestEvent = events[0]?.event;
+    if (!latestEvent || latestEvent.event !== "ownership") return;
+    const oe = latestEvent as OwnershipEvent;
     if (oe.display !== displayId) return;
 
-    // Terminal states from the Ownership event override optimistic polling.
-    if (oe.verified === true) {
-      setPullState({ kind: "verified" });
-      if (pullTimerRef.current != null) {
-        clearTimeout(pullTimerRef.current);
-        pullTimerRef.current = null;
-      }
-    } else if (oe.verified === false) {
-      // verified: false renders "unverified", never "success"
-      setPullState({ kind: "unverified" });
-      if (pullTimerRef.current != null) {
-        clearTimeout(pullTimerRef.current);
-        pullTimerRef.current = null;
+    // Pull path
+    if (oe.cause === "pull" || oe.cause === "activity_follow" ||
+        oe.cause === "hotkey" || oe.cause === "cli" ||
+        oe.cause === "web" || oe.cause === "tray" || oe.cause === "toggle") {
+      if (oe.verified === true) {
+        setPullState({ kind: "verified" });
+        if (pullTimerRef.current != null) {
+          clearTimeout(pullTimerRef.current);
+          pullTimerRef.current = null;
+        }
+      } else if (oe.verified === false) {
+        setPullState({ kind: "unverified" });
+        if (pullTimerRef.current != null) {
+          clearTimeout(pullTimerRef.current);
+          pullTimerRef.current = null;
+        }
       }
     }
-  }, [events, displayId, pullTimerRef]);
+
+    // Push path
+    if (oe.cause === "push") {
+      if (oe.verified === true) {
+        if (oe.degraded) {
+          setPushState({ kind: "degraded" });
+        } else {
+          setPushState({ kind: "released" });
+        }
+      } else if (oe.verified === false) {
+        setPushState({ kind: "ignored" });
+      }
+    }
+  }, [events, displayId]);
 
   // ── Pull handler ────────────────────────────────────────────────────────
   const handlePull = useCallback(async () => {
     const wc = localWriteCode ?? 0x00;
     setPullState({ kind: "writing", writeCode: wc });
 
-    // Optimistic poll reconciliation: after poll_interval, check snapshot.
+    // Optimistic poll reconciliation: after 2 × poll_interval, check snapshot.
+    const pollMs = coordination?.poll_interval
+      ? parseFloat(coordination.poll_interval) * 1000
+      : 2000;
     pullTimerRef.current = setTimeout(() => {
-      // Check if the snapshot has updated ownership.
-      // If owned is now true and observed matches our code, consider verified.
-      // Otherwise, fall to unverified.
-      setPullState((prev) => {
-        if (prev.kind !== "writing") return prev;
-        // Snapshot read happens inside the callback — read latest.
-        return { kind: "unverified" };
-      });
-    }, 2500); // poll_interval ~2s, plus margin
+      const snap = snapshot;
+      const displaySnap = snap?.displays?.find(([id]) => id === displayId)?.[1];
+      if (displaySnap?.owned === true) {
+        // Snapshot confirms ownership — transition to verified.
+        setPullState({ kind: "verified" });
+      } else {
+        // After 2 × poll_interval without confirmation, fall to unverified.
+        setPullState({ kind: "unverified" });
+      }
+    }, Math.max(pollMs * 2, 2500));
 
     try {
       await postSwitch(displayId);
-      // On success, the BG-1 event or next poll will set the terminal state.
     } catch (err: unknown) {
       if (pullTimerRef.current != null) {
         clearTimeout(pullTimerRef.current);
         pullTimerRef.current = null;
       }
-      const msg = err instanceof Error ? err.message : "switch failed";
-      // Map known error codes from the spec.
-      if (msg.includes("409") || msg.includes("in flight")) {
-        setPullState({ kind: "failed", error: "another switch is in flight" });
-      } else if (msg.includes("5xx") || msg.includes("did not answer")) {
-        setPullState({ kind: "failed", error: "the daemon did not answer — the panel was not touched" });
-      } else {
-        setPullState({ kind: "failed", error: msg });
-      }
+      setPullState({ kind: "failed", error: classifyError(err) });
     }
-  }, [displayId, localWriteCode]);
+  }, [displayId, localWriteCode, coordination?.poll_interval, snapshot]);
 
   // ── Push handler ────────────────────────────────────────────────────────
   const handlePush = useCallback(async () => {
@@ -139,11 +170,10 @@ export default function SwitchState({
 
     try {
       await postPush(displayId);
-      // Optimistic: mark as released. The poll will refine to ignored if needed.
+      // Optimistic: mark as released. BG-1 event will refine to ignored/degraded.
       setPushState({ kind: "released" });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "push failed";
-      setPushState({ kind: "failed", error: msg });
+      setPushState({ kind: "failed", error: classifyError(err) });
     }
   }, [displayId, peerWriteCode]);
 
@@ -155,8 +185,9 @@ export default function SwitchState({
   }, [pullState.kind]);
 
   useEffect(() => {
-    if (pushState.kind !== "released") return;
-    const t = setTimeout(() => setPushState({ kind: "idle" }), 3000);
+    if (pushState.kind !== "released" && pushState.kind !== "ignored" &&
+        pushState.kind !== "degraded") return;
+    const t = setTimeout(() => setPushState({ kind: "idle" }), 5000);
     return () => clearTimeout(t);
   }, [pushState.kind]);
 
@@ -165,11 +196,10 @@ export default function SwitchState({
   function renderPull() {
     if (!switchCapable) return null;
 
-    const shared = pullState.kind !== "idle";
     const disabled = pullState.kind === "writing";
 
     return (
-      <div className={`switch-pull${shared ? " switch-pull--active" : ""}`}>
+      <div className={`switch-pull${pullState.kind !== "idle" ? " switch-pull--active" : ""}`}>
         <button
           type="button"
           className="switch-btn switch-btn--pull"
@@ -201,7 +231,7 @@ export default function SwitchState({
           <div className="switch-detail switch-detail--danger">
             <span>{pullState.reason}</span>
             {" · "}
-            <a href={`#/config/switching`}>Switching › Hooks</a>
+            <a href="#/config/switching">Switching › Hooks</a>
           </div>
         );
       case "failed":
@@ -233,7 +263,7 @@ export default function SwitchState({
         ) : (
           <div className="switch-push__absent">
             no shared_peer_input_write_code ·{" "}
-            <a href={`#/config/displays`}>configure</a>
+            <a href="#/config/displays">configure</a>
           </div>
         )}
         {renderPushState()}

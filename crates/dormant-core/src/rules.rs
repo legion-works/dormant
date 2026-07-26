@@ -433,9 +433,14 @@ pub enum DaemonEvent {
         display: DisplayId,
         /// Whether this machine currently owns the display.
         owned: bool,
-        /// Last observed VCP `0x60` input-source code, when available.
+        /// Last observed VCP `0x60` input-source code, when available
+        /// (populated by poll; write path sets this from readback when captured).
         #[serde(default)]
         observed_input_code: Option<u8>,
+        /// VCP `0x60` code that was written, when this event originates from a
+        /// write path (pull/push). `None` for poll-observed events.
+        #[serde(default)]
+        written_code: Option<u8>,
         /// What triggered this ownership event.
         /// `"pull"` | `"push"` | `"poll"` | `"activity_follow"` | `"hotkey"` | `"cli"` | `"tray"` | `"web"`
         cause: String,

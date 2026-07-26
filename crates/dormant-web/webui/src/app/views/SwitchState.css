@@ -1,0 +1,84 @@
+/**
+ * SwitchState — pull/push control row for shared displays.
+ *
+ * Pull button always visible on switch-capable displays; push button
+ * hidden with a reason when not push-capable.
+ */
+
+.switch-state__row {
+  display: flex;
+  gap: var(--space-md);
+  align-items: flex-start;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+
+.switch-btn {
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--text-body);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.switch-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.switch-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.switch-btn--pull {
+  border-color: color-mix(in oklab, var(--success) 35%, transparent);
+}
+
+.switch-btn--pull:hover:not(:disabled) {
+  color: var(--success);
+}
+
+.switch-btn--push {
+  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
+}
+
+.switch-btn--push:hover:not(:disabled) {
+  color: var(--accent-warm);
+}
+
+/* ── Detail lines ───────────────────────────────────────────────────────── */
+
+.switch-detail {
+  font-size: var(--text-xs);
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  margin-top: var(--space-xs);
+}
+
+.switch-detail--warning {
+  color: var(--warning);
+  border: 1px solid color-mix(in oklab, var(--warning) 25%, transparent);
+  background: color-mix(in oklab, var(--warning) 8%, transparent);
+}
+
+.switch-detail--danger {
+  color: var(--danger);
+  border: 1px solid color-mix(in oklab, var(--danger) 25%, transparent);
+  background: color-mix(in oklab, var(--danger) 8%, transparent);
+}
+
+/* ── Push absent ────────────────────────────────────────────────────────── */
+
+.switch-push__absent {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  padding: var(--space-sm) 0;
+}
+
+.switch-push__absent a {
+  color: var(--accent);
+}

@@ -84,15 +84,17 @@ it("Ownership wire shape matches BG-1 serde(tag='event', rename_all='snake_case'
     event: "ownership" as const,
     display: "shared_oled",
     owned: true,
+    written_code: 21,
     observed_input_code: 15,
     cause: "pull",
     verified: true,
     degraded: false,
   };
   expect(verified.event).toBe("ownership");
+  expect(verified.written_code).toBe(21);
   expect(verified.observed_input_code).toBe(15);
 
-  // Poll-observed loss — verified: None (read-only), no degraded flag.
+  // Poll-observed loss — no written_code, verified: None (read-only).
   const polled: OwnershipEvent = {
     event: "ownership" as const,
     display: "shared_oled",
@@ -102,17 +104,20 @@ it("Ownership wire shape matches BG-1 serde(tag='event', rename_all='snake_case'
   };
   expect(polled.cause).toBe("poll");
   expect(polled.verified).toBeUndefined();
+  expect(polled.written_code).toBeUndefined();
   expect(polled.degraded).toBeUndefined();
 
-  // Failed write — verified: false.
+  // Failed write — written_code present, verified: false.
   const failed: OwnershipEvent = {
     event: "ownership" as const,
     display: "shared_oled",
     owned: true,
+    written_code: 21,
     cause: "pull",
     verified: false,
     degraded: false,
   };
   expect(failed.verified).toBe(false);
+  expect(failed.written_code).toBe(21);
   expect(failed.observed_input_code).toBeUndefined();
 });

@@ -5,6 +5,8 @@
 //! `pull` (always available) and `push` (configuration-gated via
 //! `shared_peer_input_write_code`).
 
+#![allow(clippy::too_many_lines)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -260,6 +262,7 @@ impl DirectSwitchHandle {
                                 .as_ref()
                                 .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
                             observed_input_code: None,
+                            written_code: Some(target.write_code),
                             cause: cause.to_string(),
                             verified: None,
                             degraded: false,
@@ -305,6 +308,7 @@ impl DirectSwitchHandle {
                         display: display.clone(),
                         owned: true,
                         observed_input_code: None,
+                        written_code: Some(target.write_code),
                         cause: cause.to_string(),
                         verified: Some(true),
                         degraded: false,
@@ -323,6 +327,7 @@ impl DirectSwitchHandle {
                             .as_ref()
                             .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
                         observed_input_code: None,
+                        written_code: Some(target.write_code),
                         cause: cause.to_string(),
                         verified: Some(false),
                         degraded: false,
@@ -379,6 +384,7 @@ impl DirectSwitchHandle {
                                 .as_ref()
                                 .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
                             observed_input_code: None,
+                            written_code: Some(target.write_code),
                             cause: cause.to_string(),
                             verified: None,
                             degraded,
@@ -404,6 +410,7 @@ impl DirectSwitchHandle {
                             .as_ref()
                             .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
                         observed_input_code: None,
+                        written_code: Some(target.write_code),
                         cause: cause.to_string(),
                         verified: Some(true),
                         degraded,
@@ -420,6 +427,7 @@ impl DirectSwitchHandle {
                             .as_ref()
                             .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
                         observed_input_code: None,
+                        written_code: Some(target.write_code),
                         cause: cause.to_string(),
                         verified: Some(false),
                         degraded,
@@ -589,6 +597,7 @@ impl DirectSwitchHandle {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -1876,6 +1885,7 @@ mod tests {
                 display,
                 owned,
                 observed_input_code,
+                written_code,
                 cause,
                 verified,
                 degraded,
@@ -1883,6 +1893,8 @@ mod tests {
                 assert_eq!(*display, display_id());
                 assert!(*owned, "pull marks ownership");
                 assert!(observed_input_code.is_none(), "no readback from write path");
+                assert!(written_code.is_some(), "written code must be set");
+                assert_eq!(written_code.unwrap(), LOCAL_WRITE);
                 assert_eq!(cause, "activity_follow");
                 assert_eq!(*verified, Some(true), "verified pull");
                 assert!(!degraded, "pull is never degraded");

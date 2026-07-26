@@ -9,7 +9,8 @@
  *
  * Source: views/switching.md §3
  */
-import type { DisplayConfig, DisplaySnapshot, KvmStatus, CoordinationConfig } from "../../api/types";
+import type { DisplayConfig, DisplaySnapshot, CoordinationConfig } from "../../api/types";
+import "./OwnershipPair.css";
 
 export type OwnershipSize = "full" | "compact" | "marker";
 
@@ -18,7 +19,6 @@ export interface OwnershipPairProps {
   snap: DisplaySnapshot;
   config?: DisplayConfig;
   coordination?: CoordinationConfig;
-  kvm?: KvmStatus | null;
   size: OwnershipSize;
 }
 
@@ -60,7 +60,6 @@ export default function OwnershipPair({
   snap,
   config,
   coordination,
-  kvm: _kvm,
   size,
 }: OwnershipPairProps) {
   const observed = snap.observed_input_code;

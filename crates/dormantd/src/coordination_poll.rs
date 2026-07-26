@@ -204,6 +204,7 @@ async fn poll_once(
                         display: display_id.clone(),
                         owned,
                         observed_input_code: Some(observed),
+                        written_code: None,
                         cause: "poll".to_string(),
                         verified: None,
                         degraded: false,

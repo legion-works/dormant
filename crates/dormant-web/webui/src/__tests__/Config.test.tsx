@@ -81,12 +81,12 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-/** Switch from the default Settings tab to the Raw TOML tab. */
+/** Switch from the default Daemon tab to the Raw tab. */
 async function openRawToml() {
   await waitFor(() => {
-    expect(screen.getByText("Raw TOML")).toBeInTheDocument();
+    expect(screen.getByText("Raw")).toBeInTheDocument();
   });
-  fireEvent.click(screen.getByText("Raw TOML"));
+  fireEvent.click(screen.getByText("Raw"));
 }
 
 describe("Config", () => {

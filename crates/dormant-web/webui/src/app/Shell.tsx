@@ -44,7 +44,9 @@ const VIEW_IDS = Object.keys(VIEW_COMPONENTS) as ViewId[];
 
 function getViewFromHash(): ViewId {
   const hash = window.location.hash.replace(/^#\/?/, "");
-  return (VIEW_IDS as string[]).includes(hash) ? (hash as ViewId) : "dashboard";
+  // Support sub-routes like #/config/presence by matching the first segment only.
+  const firstSegment = hash.split("/")[0];
+  return (VIEW_IDS as string[]).includes(firstSegment) ? (firstSegment as ViewId) : "dashboard";
 }
 
 function formatClock(): string {

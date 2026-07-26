@@ -1,15 +1,16 @@
 /**
  * Config view — rendered config file + validation + inventory (Raw TOML tab)
- * + editable settings form (Settings tab, default).
+ * + editable settings form (five content tabs, one PatchStore).
  *
- * Fetches /api/config + /api/state in parallel on mount. Two-tab layout:
- * "Settings" (default) renders the editable form; "Raw TOML" shows the
- * syntax-highlighted file viewer with inventory and validation.
+ * Fetches /api/config + /api/state in parallel on mount. Six sub-tabs
+ * (daemon · presence · displays · switching · protection · raw), routed
+ * at #/config/{tab}.  One SettingsForm instance owns one PatchStore
+ * across all form tabs; the Raw tab is a separate read-only surface.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
 import type { ConfigResponse } from "../../api/types";
-import { Card, stageKindLabel, useConfirmDialog } from "../components";
+import { Card, stageKindLabel } from "../components";
 import { SettingsForm } from "../config/SettingsForm";
 import "./Config.css";
 import "../config/ConfigForm.css";
@@ -30,7 +31,29 @@ interface TomlLine {
   valColor: string;
 }
 
-type ConfigTab = "settings" | "raw";
+type ConfigTab = "daemon" | "presence" | "displays" | "switching" | "protection" | "raw";
+
+const CONFIG_TABS: ConfigTab[] = ["daemon", "presence", "displays", "switching", "protection", "raw"];
+
+const TAB_LABELS: Record<ConfigTab, string> = {
+  daemon: "Daemon",
+  presence: "Presence",
+  displays: "Displays",
+  switching: "Switching",
+  protection: "Protection",
+  raw: "Raw",
+};
+
+/** Parse #/config/{tab} → tab, defaulting to "daemon". */
+function getConfigTabFromHash(): ConfigTab {
+  const hash = window.location.hash.replace(/^#\/?/, "");
+  const parts = hash.split("/");
+  if (parts[0] === "config" && parts[1]) {
+    const candidate = parts[1] as ConfigTab;
+    if (CONFIG_TABS.includes(candidate)) return candidate;
+  }
+  return "daemon";
+}
 
 /**
  * Line-by-line TOML classifier for syntax highlighting.
@@ -286,16 +309,13 @@ export default function Config() {
     pendingReload: null,
   });
   const [reloading, setReloading] = useState(false);
-  const [tab, setTab] = useState<ConfigTab>("settings");
+  const [tab, setTab] = useState<ConfigTab>(getConfigTabFromHash);
   const mountedRef = useRef(true);
 
-  // Navigation guard state from SettingsForm
-  const [navGuard, setNavGuard] = useState<{
-    dirtyCount: number;
-    discard: () => void;
-  } | null>(null);
-
-  const { confirm, dialog } = useConfirmDialog();
+  // Navigation guard state from SettingsForm — kept for the parent
+  // (Shell) to consume in a later wave; Config internal tab switches
+  // never prompt.
+  const navGuardRef = useRef<{ dirtyCount: number; discard: () => void } | null>(null);
 
   const fetchData = useCallback(async () => {
     setState((prev) => ({ ...prev, error: null }));
@@ -325,6 +345,16 @@ export default function Config() {
     return () => { mountedRef.current = false; };
   }, [fetchData]);
 
+  // Sync tab from hash on hashchange (sidebar nav, back/forward).
+  useEffect(() => {
+    const handler = () => {
+      const nextTab = getConfigTabFromHash();
+      setTab(nextTab);
+    };
+    window.addEventListener("hashchange", handler);
+    return () => window.removeEventListener("hashchange", handler);
+  }, []);
+
   const handleReload = useCallback(async () => {
     setReloading(true);
     try {
@@ -336,22 +366,24 @@ export default function Config() {
     setReloading(false);
   }, [fetchData]);
 
-  /** Tab click handler — guards against losing dirty edits on switch. */
+  /** Tab click — switches sub-tab unconditionally; never prompts. */
   const handleTabClick = useCallback(
-    async (targetTab: ConfigTab) => {
-      if (tab === "settings" && targetTab !== "settings" && navGuard) {
-        const accepted = await confirm({
-          title: `Discard ${navGuard.dirtyCount} unsaved change${navGuard.dirtyCount === 1 ? "" : "s"}?`,
-          description: "Switching to Raw TOML discards the pending Settings edits.",
-          confirmLabel: "Discard changes",
-          tone: "danger",
-        });
-        if (!accepted) return;
-        navGuard.discard();
-      }
+    (targetTab: ConfigTab) => {
       setTab(targetTab);
+      window.location.hash = `#/config/${targetTab}`;
     },
-    [tab, navGuard, confirm],
+    [],
+  );
+
+  // Provide nav-guard callback to SettingsForm; Config does not prompt on
+  // internal tab switches but surfaces the guard to the Shell via this ref
+  // so a future Shell-level guard can use it (beforeunload is the immediate
+  // guard that still fires).
+  const handleNavGuard = useCallback(
+    (guard: { dirtyCount: number; discard: () => void } | null) => {
+      navGuardRef.current = guard;
+    },
+    [],
   );
 
   if (state.loading) {
@@ -367,33 +399,32 @@ export default function Config() {
   return (
     <div className="config">
       <div className="config-tabs">
-        <button
-          type="button"
-          className={`config-tab${tab === "settings" ? " config-tab--active" : ""}`}
-          onClick={() => handleTabClick("settings")}
-        >
-          Settings
-        </button>
-        <button
-          type="button"
-          className={`config-tab${tab === "raw" ? " config-tab--active" : ""}`}
-          onClick={() => handleTabClick("raw")}
-        >
-          Raw TOML
-        </button>
+        {CONFIG_TABS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            className={`config-tab${tab === t ? " config-tab--active" : ""}`}
+            onClick={() => handleTabClick(t)}
+          >
+            {TAB_LABELS[t]}
+          </button>
+        ))}
       </div>
 
-      {tab === "settings" ? (
-        <SettingsForm config={cfg} onNavigationGuard={setNavGuard} />
-      ) : (
+      {/* Raw tab content — always mounted but hidden when not active. */}
+      <div style={{ display: tab === "raw" ? undefined : "none" }}>
         <RawTomlTab
           config={cfg}
           pendingReload={state.pendingReload}
           reloading={reloading}
           onReload={handleReload}
         />
-      )}
-      {dialog}
+      </div>
+
+      {/* SettingsForm — always mounted so the PatchStore survives tab switches. */}
+      <div style={{ display: tab === "raw" ? "none" : undefined }}>
+        <SettingsForm config={cfg} onNavigationGuard={handleNavGuard} tab={tab} />
+      </div>
     </div>
   );
 }

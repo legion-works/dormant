@@ -3,7 +3,8 @@
  *
  * Manages a PatchStore instance, dirty tracking, and the apply
  * lifecycle (call POST /api/config/apply, handle responses and
- * errors).
+ * errors).  One instance spans all five Config form tabs; the `tab`
+ * prop selects which sections are visible.
  */
 import { useState, useRef, useCallback, useEffect } from "react";
 import type { ConfigResponse, ApplyResponse, ApplyErrorBody } from "../../api/types";
@@ -24,13 +25,18 @@ import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
 
+/** Config sub-tab — the five form-bearing tabs (raw is handled by Config.tsx, SettingsForm renders nothing for it). */
+export type ConfigFormTab = "daemon" | "presence" | "displays" | "switching" | "protection" | "raw";
+
 interface SettingsFormProps {
   config: ConfigResponse;
   /**
    * Called when the dirty state changes so the parent can guard
-   * navigation (tab-switch, route change).  Passes null when clean.
+   * navigation (route change).  Passes null when clean.
    */
   onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void } | null) => void;
+  /** Active form tab; only sections for this tab are rendered. */
+  tab: ConfigFormTab;
 }
 
 /** Extract field-level errors from a 422 ApplyErrorBody by matching detail strings. */
@@ -53,7 +59,7 @@ function extractFieldErrors(body: ApplyErrorBody): Record<string, string | undef
   return map;
 }
 
-export function SettingsForm({ config: initialConfig, onNavigationGuard }: SettingsFormProps) {
+export function SettingsForm({ config: initialConfig, onNavigationGuard, tab }: SettingsFormProps) {
   const storeRef = useRef<PatchStore>(createPatchStore());
   const store = storeRef.current;
 
@@ -218,92 +224,115 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
 
   return (
     <div className="cf-form">
-      <DaemonSection
-        daemon={inv.daemon}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Daemon tab ── */}
+      {tab === "daemon" && (
+        <DaemonSection
+          daemon={inv.daemon}
+          store={store}
+          redactedPaths={config.redacted_paths}
+          onDirty={onDirty}
+          fieldErrors={fieldErrors}
+        />
+      )}
 
-      <WearSection
-        wear={inv.wear}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Presence tab ── */}
+      {tab === "presence" && (
+        <>
+          <SensorsSection
+            sensors={inv.sensors}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            zones={inv.zones}
+          />
+          <ZonesSection
+            zones={inv.zones}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            sensorIds={sensorIds}
+            rules={inv.rules}
+          />
+          <RulesSection
+            rules={inv.rules}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            zoneIds={zoneIds}
+            displayIds={displayIds}
+          />
+          <AudioSection
+            audio={inv.audio}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+        </>
+      )}
 
-      <NotificationsSection
-        notifications={inv.notifications}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Displays tab ── */}
+      {tab === "displays" && (
+        <>
+          <DisplaysSection
+            displays={inv.displays}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            rules={inv.rules}
+            createPrefill={pairingPrefill}
+          />
+          <PairingWizard
+            pairingEnabled={pairingEnabled}
+            onDisplayCreateRequest={(prefill) => setPairingPrefill(prefill)}
+          />
+        </>
+      )}
 
-      <WatchdogSection
-        watchdog={inv.watchdog}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
-      <AudioSection
-        audio={inv.audio}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Switching tab (W1-2/3/4 sections are added in later tasks) ── */}
+      {tab === "switching" && (
+        <div className="cf-placeholder">
+          Coordination, keymap, input filter, and hooks — coming in the next tasks.
+        </div>
+      )}
 
-      <SensorsSection
-        sensors={inv.sensors}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        zones={inv.zones}
-      />
+      {/* ── Raw tab — handled by Config.tsx, SettingsForm renders nothing. ── */}
 
-      <ZonesSection
-        zones={inv.zones}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        sensorIds={sensorIds}
-        rules={inv.rules}
-      />
+      {/* ── Protection tab ── */}
+      {tab === "protection" && (
+        <>
+          <WearSection
+            wear={inv.wear}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <WatchdogSection
+            watchdog={inv.watchdog}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <NotificationsSection
+            notifications={inv.notifications}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+        </>
+      )}
 
-      <RulesSection
-        rules={inv.rules}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        zoneIds={zoneIds}
-        displayIds={displayIds}
-      />
-
-      <DisplaysSection
-        displays={inv.displays}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        rules={inv.rules}
-        createPrefill={pairingPrefill}
-      />
-
-      <PairingWizard
-        pairingEnabled={pairingEnabled}
-        onDisplayCreateRequest={(prefill) => setPairingPrefill(prefill)}
-      />
       {/* Banner-level errors not mapped to fields */}
       {bannerErrors.length > 0 && (
         <div className="cf-apply__banner cf-apply__banner--rejected">

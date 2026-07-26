@@ -21,9 +21,19 @@
 //!
 //! Command actions are run via `tokio::process::Command::new(argv[0]).args(&argv[1..])`
 //! — the existing `command` display controller's shell invocation is NOT
-//! reused (F7). The child inherits ONLY `PATH`, `HOME`, and the `DORMANT_*`
-//! set; everything else is cleared so a hook cannot read unrelated secrets
-//! out of the daemon's environment.
+//! reused (F7). The child's environment is deliberately minimal:
+//!
+//! 1. `PATH` is hard-coded to `HOOK_CHILD_PATH` — the daemon's toolchain /
+//!    Nix paths must not leak into a hook child.
+//! 2. `HOME` is inherited from the daemon so the child can resolve `~`.
+//! 3. `HOOK_SESSION_ENV_ALLOWLIST` vars (`WAYLAND_DISPLAY`,
+//!    `XDG_RUNTIME_DIR`, `DISPLAY`, `XDG_SESSION_TYPE`,
+//!    `DBUS_SESSION_BUS_ADDRESS`) are passed through when present in the
+//!    daemon's environment — compositor and session commands need these to
+//!    reach the display server and D-Bus.
+//! 4. The seven `DORMANT_*` context vars from [`HookContext::env`].
+//! 5. Everything else is cleared — a hook child cannot read unrelated
+//!    secrets or the daemon's build environment out of its parent's env.
 //!
 //! Each child is started in a fresh session via `setsid(2)` in
 //! `pre_exec` so its process-group id is itself. On timeout the engine
@@ -437,6 +447,7 @@ fn log_spawned_outcome(
             index,
             kind = %kind,
             timeout_ms,
+            reason = %reason,
         ),
         Err(reason) => warn!(
             event = "hook_failed",
@@ -486,6 +497,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             index = decision.index,
             kind = %kind,
             timeout_ms,
+            reason = %reason,
         ),
         Err(reason) => warn!(
             event = "hook_failed",
@@ -573,11 +585,20 @@ pub(crate) async fn run_argv_command(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // Minimal allowlist on top of the DORMANT_* set so the child can find
-    // its own utilities (PATH) and resolve ~ (HOME).
+    // PATH is hard-coded (daemon's toolchain paths must not leak).
     cmd.env("PATH", env_path());
+    // HOME inherited from the daemon so the child can resolve ~.
     if let Some(home) = env_home() {
         cmd.env("HOME", home);
+    }
+    // Session environment allowlist — compositor and session commands need
+    // these to reach the display server, D-Bus, and runtime directories.
+    // Only vars present in the daemon's environment are passed through;
+    // absent vars are not injected at all.
+    for var_name in HOOK_SESSION_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(var_name) {
+            cmd.env(var_name, value);
+        }
     }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -692,6 +713,33 @@ pub(crate) async fn run_argv_command(
         }
     }
 }
+
+/// Session environment variables inherited from the daemon when present.
+///
+/// A hook child receives a deliberately minimal environment — PATH is
+/// hard-coded (`HOOK_CHILD_PATH`) and HOME is inherited from the daemon.
+/// These additional vars are needed by compositor and session-aware
+/// commands that would otherwise abort or fail silently in a cleared env:
+///
+/// * `WAYLAND_DISPLAY` — Wayland compositor socket (`kscreen-doctor`,
+///   `wlr-randr`, etc.)
+/// * `XDG_RUNTIME_DIR` — per-user runtime directory (Wayland, D-Bus,
+///   `PulseAudio`, `PipeWire`)
+/// * `DISPLAY` — X11 display (legacy `XWayland` clients, `xset`, `xrandr`)
+/// * `XDG_SESSION_TYPE` — session type discriminator (`wayland` / `x11`)
+/// * `DBUS_SESSION_BUS_ADDRESS` — user D-Bus session bus (notifications,
+///   compositor IPC, `gdbus`, `dbus-send`)
+///
+/// These are the minimum set a compositor/session command needs to function.
+/// A fixed, reviewed allowlist is the safer default vs. a config key for
+/// arbitrary env injection — every addition is intentional and auditable.
+const HOOK_SESSION_ENV_ALLOWLIST: &[&str] = &[
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DISPLAY",
+    "XDG_SESSION_TYPE",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
 
 /// Fixed, minimal PATH for hook children.
 ///
@@ -1829,6 +1877,110 @@ mod tests {
         assert!(
             path_value.contains("/usr/bin") && path_value.contains("/bin"),
             "hook child PATH should be the fixed {HOOK_CHILD_PATH}, got: {path_line}"
+        );
+    }
+
+    // ── Session env allowlist ────────────────────────────────────────────
+
+    /// An allowlisted session env var present in the daemon's environment
+    /// reaches the hook child.  Routes through the production
+    /// [`run_argv_command`] path — `/usr/bin/printenv VAR` exits 0 when
+    /// VAR is set, non-zero otherwise.
+    #[tokio::test]
+    async fn allowlisted_env_var_reaches_child_via_production_path() {
+        let test_var = "WAYLAND_DISPLAY";
+        let sentinel = format!("dormant-ut-al-{}", std::process::id());
+        let saved = std::env::var_os(test_var);
+        unsafe { std::env::set_var(test_var, &sentinel) };
+
+        let env_owned: Vec<(String, String)> = ctx_for(Phase::Before, Direction::Release)
+            .env()
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+
+        let result = run_argv_command(
+            &env_owned,
+            &["/usr/bin/printenv".to_string(), test_var.to_string()],
+            Duration::from_secs(2),
+        )
+        .await;
+
+        // Restore before asserting — a panic still cleans up.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(test_var, v),
+                None => std::env::remove_var(test_var),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "{test_var} must reach child via allowlist; run_argv_command returned {result:?}"
+        );
+    }
+
+    /// A non-allowlisted env var set in the daemon does NOT leak into the
+    /// hook child.  Also exercises the allowlist loop with a second var
+    /// (`XDG_RUNTIME_DIR`) so this test is mutation-sensitive: disabling
+    /// the passthrough loop makes the allowlisted-var check fail.
+    #[tokio::test]
+    async fn non_allowlisted_env_var_does_not_leak_and_allowlisted_var_reaches_child() {
+        // --- non-allowlisted: must NOT leak ---
+        let leak_name = format!("DORMANT_UT_LEAK_{}", std::process::id());
+        let leak_sentinel = "should-not-appear";
+        unsafe { std::env::set_var(&leak_name, leak_sentinel) };
+
+        // --- allowlisted: must reach child ---
+        let al_var = "XDG_RUNTIME_DIR";
+        let al_sentinel = format!("dormant-ut-al2-{}", std::process::id());
+        let al_saved = std::env::var_os(al_var);
+        unsafe { std::env::set_var(al_var, &al_sentinel) };
+
+        let env_owned: Vec<(String, String)> = ctx_for(Phase::Before, Direction::Release)
+            .env()
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v))
+            .collect();
+
+        // Non-allowlisted var: must not appear in child (printenv exits 1).
+        let leak_result = run_argv_command(
+            &env_owned,
+            &["/usr/bin/printenv".to_string(), leak_name.clone()],
+            Duration::from_secs(2),
+        )
+        .await;
+
+        // Allowlisted var: must appear in child (printenv exits 0).
+        let al_result = run_argv_command(
+            &env_owned,
+            &["/usr/bin/printenv".to_string(), al_var.to_string()],
+            Duration::from_secs(2),
+        )
+        .await;
+
+        // Restore before asserting.
+        unsafe {
+            std::env::remove_var(&leak_name);
+            match al_saved {
+                Some(v) => std::env::set_var(al_var, v),
+                None => std::env::remove_var(al_var),
+            }
+        }
+
+        // Non-allowlisted var must NOT leak.
+        match leak_result {
+            Err(ref reason) if reason.starts_with(E_HOOK_FAILED) => {}
+            other => {
+                panic!("non-allowlisted var must not leak; expected E_HOOK_FAILED, got {other:?}")
+            }
+        }
+
+        // Allowlisted var must reach child (this is the mutation-sensitive
+        // assertion — fails when the passthrough loop is disabled).
+        assert!(
+            al_result.is_ok(),
+            "{al_var} must reach child via allowlist; run_argv_command returned {al_result:?}"
         );
     }
 }

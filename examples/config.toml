@@ -331,10 +331,16 @@ wake_retry_interval = "60s"
 # # This is the REQUIRER wake-and-verify slot: wake the machine's video
 # # output so the panel will accept the input switch (see the
 # # signal-presence law in docs/src/multi-machine.md). A blocking entry
-# # must complete before the owner releases the panel.
+# # (blocking = true, the slot default) must complete before the write
+# # proceeds; a failure aborts the switch entirely — the hook is a hard
+# # correctness gate.  Verify your commands work under the hook's minimal
+# # environment (hard-coded PATH + HOME + allowlisted session vars +
+# # DORMANT_* context; everything else is cleared — see
+# # docs/src/multi-machine.md#hook-environment).
 # before_acquire = [
-#   # Linux: force DPMS on
-#   { command = ["xset", "dpms", "force", "on"], timeout = "5s", blocking = true },
+#   # Linux: wake the display via KWin (needs WAYLAND_DISPLAY +
+#   # XDG_RUNTIME_DIR from the allowlisted session set)
+#   { command = ["kscreen-doctor", "output.DP-1.enable"], timeout = "5s", blocking = true },
 #   # macOS: prevent display sleep + verify CGDisplayIsAsleep returns false
 #   { command = ["caffeinate", "-u", "-t", "2"], timeout = "5s", blocking = true },
 # ]

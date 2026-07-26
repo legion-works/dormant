@@ -170,3 +170,17 @@ fix_pr = ""
 proving_test = "coordination_claim::tests::parked_when_empty_and_binds_on_first_peer"
 soak_evidence = []
 status = "open"
+
+[[incident]]
+id = "FLAKE-2026-07-26-COORDINATOR-BATCH-WATCHER-RACE"
+test = "daemon_smoke::coordinator_batches_watcher_and_web_apply_for_one_revision"
+signature = "sha256:1ef0f7a8190aac2fae141b7c70e2ce0df3cdac01c7edf8bb9f3eadfbd026f161"
+first_run_url = "https://github.com/legion-works/dormant/actions/runs/30206030529"
+last_run_url = "https://github.com/legion-works/dormant/actions/runs/30206030529"
+mechanism = "real `notify` filesystem watcher injected a third, uncontrolled ReloadRequest into the batch coordinator: a `fs::write` fires the real watcher, which under CI load completes its batch and advances `applied_revision` before the test's two explicit `request_reload_with_id` calls are scheduled — they then form a second batch where `requested_revision == applied_revision`, triggering the coalesced no-op path (`coalesced: true`) and failing the `!coalesced` assertion. The sibling test `coordinator_batches_watcher_and_control_for_one_revision` has the identical shape and racelands."
+reproduction = "cargo nextest run -p dormantd --test daemon_smoke --config-file .config/nextest.toml -P ci -E 'test(/coordinator_batches_/)' --retries 0"
+root_cause = "the batch coordinator tests wrote config files via `fs::write` (which fires the real `notify` file watcher) and raced two explicit reload requests against the uncontrolled watcher — the watcher's batch could complete under CI load before the explicit requests were enqueued"
+fix_pr = ""
+proving_test = "daemon_smoke::coordinator_config_watcher_suppression_is_effective"
+soak_evidence = []
+status = "open"

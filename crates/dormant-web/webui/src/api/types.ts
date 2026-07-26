@@ -426,6 +426,10 @@ export interface ConfigInventory {
   audio?: Record<string, unknown>;
   /** rust: config/schema.rs CoordinationConfig — optional for older payloads. */
   coordination?: CoordinationConfig;
+  /** rust: config/schema.rs KeymapConfig — optional for older payloads. */
+  keymap?: KeymapConfig;
+  /** rust: config/schema.rs InputFilterConfig — optional for older payloads. */
+  input_filter?: InputFilterConfig;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;

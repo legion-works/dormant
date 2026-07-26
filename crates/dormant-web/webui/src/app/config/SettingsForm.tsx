@@ -22,6 +22,8 @@ import RulesSection from "./RulesSection";
 import DisplaysSection from "./DisplaysSection";
 import PairingWizard from "./PairingWizard";
 import CoordinationSection from "./CoordinationSection";
+import KeymapSection from "./KeymapSection";
+import InputFilterSection from "./InputFilterSection";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
@@ -302,13 +304,27 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
 
       {/* ── Switching tab ── */}
       {tab === "switching" && (
-        <CoordinationSection
-          coordination={inv.coordination}
-          store={store}
-          onDirty={onDirty}
-          fieldErrors={fieldErrors}
-          kvm={kvm}
-        />
+        <>
+          <CoordinationSection
+            coordination={inv.coordination}
+            store={store}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            kvm={kvm}
+          />
+          <KeymapSection
+            keymap={inv.keymap}
+            store={store}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <InputFilterSection
+            inputFilter={inv.input_filter}
+            store={store}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+        </>
       )}
 
       {/* ── Raw tab — handled by Config.tsx, SettingsForm renders nothing. ── */}

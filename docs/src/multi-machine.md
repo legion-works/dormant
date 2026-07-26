@@ -1,33 +1,21 @@
-# Multi-machine coordination
+# Multi-machine KVM switching
 
 One physical monitor can serve two `dormant` instances through a KVM or a
 multi-input panel. Mark that display `shared` on both machines and give each
-machine its own input-source code. Only the machine selected on the monitor
-controls the panel; the other instance leaves it alone.
-
-`dormant` does not broadcast panel ownership. Each machine reads DDC/CI VCP
-`0x60` from the monitor it controls and treats that local readback as truth.
-mDNS and pairing identify nearby instances; they do not carry presence, panel
-state, or a liveness heartbeat. MQTT is not required.
+machine its own input-source code. Selection is a direct local DDC write —
+there is no network protocol, no peer transport, no pairing, no crypto.
 
 ## Set up a shared display
 
-1. Enable coordination on both machines, then restart each daemon:
-
-   ```toml
-   [coordination]
-   enabled = true
-   ```
-
-2. Find the read-back code for each machine. Select the machine's input on the
+1. Find the read-back code for each machine. Select the machine's input on the
    panel, then run:
 
    ```bash
    ddcutil --bus <N> getvcp 60
-   dormantctl doctor
+   dormantctl doctor ddcci
    ```
 
-   Record the `0x60` value on that machine — this is the READ code, what the
+   Record the `0x60` value on that machine — this is the **READ** code, what the
    panel reports when this input is active. Switch the monitor to the other
    input and repeat there.
 
@@ -47,7 +35,7 @@ state, or a liveness heartbeat. MQTT is not required.
    working write code. Try each candidate; confirm with a physical check.
    Record the working write value as `shared_input_write_code`.
 
-3. Mark the same physical display shared in both configurations. Each machine
+2. Mark the same physical display shared in both configurations. Each machine
    uses its own code:
 
    ```toml
@@ -59,217 +47,124 @@ state, or a liveness heartbeat. MQTT is not required.
    shared_input_write_code = 0x15 # what setvcp 60 needs (omit if same)
    ```
 
-   A newly shared display starts with conservative ownership after reload. It
-   must receive a local input-source observation before normal coordination
-   resumes.
+   If the peer machine sits on a different input, also configure its codes
+   so push works:
 
-4. Pair the instances. Open an instance pairing window on one machine and copy
-   its one-time code to the other. The loopback API exposes
-   `POST /api/pair/instance`, `GET /api/pair/instance/{id}`, cancellation at
-   `POST /api/pair/instance/{id}/cancel`, discovery at
-   `GET /api/pair/instance/peers`, and join at
-   `POST /api/pair/instance/join`.
-
-   The web UI's `DormantPairing.tsx` component opens the pairing window, shows
-   the one-time code and expiry, and polls pairing status.
-
-   The CLI has the same responder/initiator flow:
-
-   ```bash
-   # On the responder: opens a local window and prints the one-time code.
-   dormantctl pair instance "Office Mac" --open
-
-   # On the initiator: joins a discovered peer.
-   dormantctl pair instance "Office Mac" --code ABCD1234
+   ```toml
+   shared_peer_input_code = 0x10       # what getvcp 60 reports for the peer's input
+   shared_peer_input_write_code = 0x15 # what setvcp 60 needs for the peer (omit if same)
    ```
 
-   If discovery finds multiple peers with the same name, rerun the join command
-   with `--instance-id <id>`. A peer must be discovered before it can be joined.
+## How switching works
 
-## Ownership and operator state
+There is no network pairing, no mDNS discovery, no cryptographic handshake,
+and no cross-host protocol. Every switch is a **direct local DDC write** on the
+acting machine's own bus — the machine writes an input code and the panel
+moves.
 
-The display snapshot carries `scope`, `owned`, `observed_input_code`, and
-`panel_state`. These fields distinguish a locally owned panel from a deferred
-one and report the input/panel observation that produced the verdict.
+### PULL — write my input code
 
-Force actions remain monitor-global. The tray calls this out as **Blank shared
-panel — affects all connected machines**. Use Force wake for immediate recovery
-when a panel is dark; force blank bypasses normal presence rules and affects
-whichever source is selected.
+`dormantctl switch <display>`, the tray hotkey, the tray "Switch to here"
+menu item, the web UI "Switch to here" button, and a local activity edge
+(when `activity_follow` is on) all **pull**: they write the acting machine's
+own `shared_input_write_code` to the panel's VCP `0x60`.
 
-### Claim methods
+Pulls are always safe: the acting machine is awake, its output is driving
+signal, and the write lands.
 
-Shared-display claims can be initiated from:
+### PUSH — write the peer's input code
 
-- **Hotkey** — immediate claim, configured via `keymap.claim_hotkey`
-  (for example `Meta+Ctrl+Shift+B`). No default hotkey is registered — set
-  one in the config before the tray will register it.
-- **`dormantctl switch <display>`** — immediate claim from the CLI.
-- **`dormantctl switch <display> --arm`** — open an armed window for
-  `activity_claim = "armed"`; expires after `armed_window`.
-- **`activity_claim = "edge"`** — claims on a local input edge (keyboard,
-  mouse, tablet).
-- **`activity_claim = "owner-idle"`** — claims once the current owner (the peer
-  selected on the monitor) has been idle for at least `owner_idle_window`.
-- **Web UI** — `POST /api/switch` through the dashboard.
+`dormantctl switch <display> --to-peer` and the web UI "Send to peer" button
+**push**: they write the peer's code. This path exists **only when
+`shared_peer_input_write_code` is configured** on the display; without it the
+CLI returns "not configured" and the web affordance is absent.
 
-`owner-idle` has a warm-up requirement: it needs one prior successful claim
-per display before it engages. The daemon learns the owner's identity from
-`ClaimResponse::Accepted` — not from the config, because ownership is local
-hardware truth and is never broadcast between peers. Until the first claim
-completes (via hotkey, `dormantctl switch`, or `activity_claim = "edge"`),
-`owner-idle` will not fire. This is a one-time per-display requirement; after
-the daemon restarts, the owner identity must be relearned.
+Push is deliberately minimal — no wake, no retry. If the peer's output is
+not driving signal, the write is ACKed by the DDC bus but the panel silently
+ignores it (see [Signal-presence law](#signal-presence-law)). Push is for the
+common case: both machines are awake and the operator wants to switch away
+without reaching the other keyboard.
 
-See [`activity_claim`](#coordination-reference) and
-[`Limits and failure behavior`](#limits-and-failure-behavior) for details.
+### Semantic read/write aliases
 
-## Pairing security
+`shared_input_code` is what the panel **reports** at VCP `0x60` when this
+input is active; `shared_input_write_code` is what you **write** to select
+it. On the maintainer's AOC AG326UZD these differ: write `0x15`, read back
+`0x10`. A write is verified against the READ alias — a mismatch is a
+`write_input_source` failure.
 
-Opening a pairing window makes one machine the responder. It displays an
-eight-character, one-time Crockford Base32 code, advertises over mDNS, and
-listens only during the configured window. The initiator discovers that
-advertisement and supplies the code.
+`shared_peer_input_code` and `shared_peer_input_write_code` are the peer-side
+pair. When the peer READ alias is absent, the push verification degrades to
+"changed away from my code" and the daemon logs `kvm_push_verification_degraded`.
 
-The code is the password for SPAKE2, not a comparison string after an
-unauthenticated exchange. Both machines also have persistent Ed25519
-identities. After SPAKE2, they exchange public identities and verify the full
-transcript with HMAC-SHA256. A wrong code, active man-in-the-middle, identity
-substitution, or protocol downgrade fails confirmation and writes no peer.
+## Ownership — an observation, not authority
 
-The private identity and `peers.json` are stored with `0600` permissions. The
-code is shown once to the local opener and is never written to the peer store,
-status responses, or logs.
+Each machine reads its own VCP `0x60` every `poll_interval` (default `2s`).
+Ownership is a **local observation** of what the panel reports — the daemon
+never broadcasts "I own the panel" to a peer, and nothing consults ownership
+before writing.
 
-The listener accepts at most ten attempts, expires with the code, and closes on
-success or cancellation. There is no always-on pairing port. During a live
-window, an attacker on the LAN can consume the attempt budget or flood/drop
-traffic. That denial of service is accepted: retrying opens a new short window,
-and no peer is persisted without completed confirmation.
+The poller debounces both gain and loss through `loss_confirmations` (default
+`3`) consecutive agreeing reads. A differing garbled code resets the pending
+transition; a read failure holds the prior verdict. This defends against
+cross-machine DDC collisions returning the same wrong code N times (issue #134).
 
-## Claim protocol
+With defaults, a genuine input switch takes ~6 seconds to commit (`2s` × 3).
+During that window the old owner still believes it owns the panel and may
+issue a blank; the new owner reads "mine" on its next poll, commits the gain
+eagerly, and wakes the panel. The old owner's blank can land on top of the
+new owner's wake, producing a short visible flicker if presence/absence
+transitions happen to align. Operators who cannot tolerate that window can
+lower `loss_confirmations` toward `1` at the cost of flap-susceptibility.
 
-Two paired `dormant` daemons negotiate panel ownership in one round trip,
-with optional fallback for unresponsive peers.
+### Convergence, not mutual exclusion
 
-### Identity and probe
+There is no cross-host lock. Two genuinely simultaneous activity edges on
+different machines both write once and the panel settles to whichever write
+arrived last; both fire acquire hooks, and the loser self-corrects on its
+next poll. Guaranteed by design and test-proven: at most one write per
+admitted local edge, zero poll-caused writes, no sustained ping-pong. The
+rare double-flip is the accepted cost of a lock-free design — do not expect
+serialization we don't provide.
 
-Every shared display pair requires a **claim identity**: a canonical
-`manufacturer:model` string (plus `:serial` when the EDID reports one)
-derived from the panel's EDID text fields. Both machines must agree on this
-identity — a serial mismatch or a missing required field blocks the claim.
+## Activity follow
 
-Confirm the identity on each machine:
+When `coordination.activity_follow = true` (default `false`), a **genuine
+local activity edge** — keyboard, mouse, or tablet input — pulls the shared
+display to this machine after `arm_after` idle (default `7s`). The jiggler
+and ignored-device filter mean an ignored device produces no edge.
 
-```bash
-dormantctl doctor ddcci
-```
+`coordination.cooldown` (default `3s`) suppresses **only** activity-driven
+pulls. Hotkeys, CLI switches, tray actions, and web buttons deliberately
+bypass cooldown — an explicit operator action is never swallowed.
 
-Look for `claim_identity=` in the probe output. If the string differs
-between the two hosts, check the physical display connection: a display
-connected through a different port or a different EDID path on one side
-will produce a different claim identity.
-
-The identity uses the EDID text fields only, **never** the machine-local
-`ident_string` bus prefix — machines connected through different DDC buses
-(e.g. `i2c-dev:7` vs `i2c-dev:8`) will still produce the same claim identity
-as long as the panel's EDID manufacturer, model, and serial are identical.
-
-### Paired negotiated path
-
-A hotkey press or `dormantctl switch` fires an immediate claim. The requester
-broadcasts a signed `ClaimRequest` frame to every paired peer on the LAN over
-TCP (the port announced via the `_dormant-claim._tcp.local.` mDNS service or
-reached through a previously dialled address). Each peer validates the frame,
-runs the owner-side state machine (hooks + input-source write), and returns a
-signed `ClaimResponse`. The protocol enforces replay protection per peer
-(monotonic outbound counters) and per-peer epoch validation (stale-epoch
-responses from a restarted peer are rejected).
-
-The claim succeeds when one peer accepts, the requester's `before_acquire`
-hooks complete and it sends an `AcquireReady` confirmation frame to the
-owner, the owner releases the panel (hooks + VCP `0x60` write), and the
-requester reads its own VCP `0x60` code on the panel within the negotiated
-`release_deadline_cap`. A `Denied`, `NotOwner`, or `Busy` response from
-every expected peer triggers the fallback path.
-
-### Readback-verified direct fallback
-
-When every expected peer responds `NotOwner` (no peer claims to own the
-display), or when the `claim_timeout` expires without any `Accepted`, the
-requester attempts a direct VCP `0x60` write. This path skips the peer's
-`before_release` hooks — the requester writes its input code directly to the
-panel, waking it if it was blanked.
-
-### Signal-presence law
-
-A monitor **will not switch VCP `0x60` to an input that has no live video
-signal.** This was verified on the AOC AGON AG326UZD with both a Linux
-desktop (DisplayPort) and a macOS machine (DisplayPort). The panel ACKed
-`setvcp 60` writes to a dark input, reported them as successful, but
-readback confirmed VCP `0x60` stayed on the active input.
-
-This is symmetric: a machine cannot recover even its OWN panel by DDC
-while its own output is dark. A physical OSD joystick press was required.
-
-The implication for KVM claims: the requester's output MUST be driving
-signal before the owner writes VCP `0x60` to the requester's input code.
-If the requester's output is asleep, the write is a silent no-op and the
-panel does not move. A `before_acquire` hook on the requester wakes its
-output; the requester sends an `AcquireReady` frame once the output is
-live, and the owner waits for this confirmation before releasing the
-panel. Without this step, a claim can strand the operator with no screen.
-
-The direct fallback is recorded as `claim_fallback_direct`, but it is not a
-general substitute for negotiation. A machine whose output is not driving
-signal cannot pull the panel to its input via DDC: the write transport
-reports success, the write-verify sees the unchanged VCP `0x60`, and the
-claim fails. This behavior was observed on one monitor model; other panels
-may differ.
-
-Every input-source write is immediately read back. If VCP `0x60` does not match
-the requested value, `write_input_source` returns `E_DISPLAY_IO`; the claim
-engine does not record ownership of a panel that did not move. A direct attempt
-can still succeed where the panel accepts the requester's write, but transport
-acknowledgement alone is not success.
-
-### Visible-standby failure
-
-If the panel is in a low-power standby state where DDC/CI VCP writes fail
-(or where the VCP `0x60` readback is not reliable), the claim negotiation
-still proceeds — the `OwnerDisposition::Ready { standby: true }` flag tells
-the owner its `before_release` hooks and the subsequent VCP write may fail.
-The requester falls back to the direct path; the observable effect is a
-visible power-state transition on wake that did not complete in the negotiated
-phase.
-
-### Before-release fallback limitation (load-bearing)
-
-The `before_release` hook slot is the **only** mechanism that can sequence a
-USB-switch, KVMP, or other external transition ahead of the DDC input-source
-write. If the owner's `before_release` hooks fail and the owner sends
-`ReleaseFailed`, the owner's `after_release` hooks receive the abort
-compensation via `DORMANT_ABORTED=1` (see [Hook environment](#hook-environment)).
-There is no retry loop within a single flight — a failed owner transition
-terminates the flight, and the requester must retry from the beginning.
+Activity follow has a warm-up: a pull only fires if the input source was not
+already local (the display is either showing the peer or an unknown source).
 
 ## Hooks
 
-Each shared display can declare action slots for the four hand-off phases:
-`before_release`, `after_release`, `before_acquire`, and `after_acquire`.
-Actions in a slot run in declaration order. A hook action is either a command
-(argv array, no shell) or an MQTT publish (QoS 1, non-retained, separate
-client from the sensor-plane MQTT).
+Each shared display can declare action slots. Actions in a slot run in
+declaration order. A hook action is either a command (argv array, no shell)
+or an MQTT publish (QoS 1, non-retained).
 
-### Scheduling and idempotence
+### Hook slots and their timing
 
-Hooks are NOT cancellable mid-run — they are bounded by their per-entry
-`timeout` instead. Entries declared as `blocking = true` (the slot default)
-run to completion and block the next phase; non-blocking entries are spawned
-and the phase continues immediately. A hook that fires after a late arrival
-(e.g. the direct-fallback path) is documented as **at-least-once**: hook
-commands MUST be idempotent. Check `DORMANT_DIRECTION`, `DORMANT_PHASE`, and
-`DORMANT_FALLBACK` in the environment to decide whether to act or skip.
+| Slot | Direction | When it fires |
+|---|---|---|
+| `before_acquire` | Pull (acquire) | BEFORE the local DDC write. Blocking — a failure aborts the pull. This is the initiator's wake-and-verify slot. |
+| `after_acquire` | Pull (acquire) | AFTER a successful pull. Fire-and-forget — the pull already completed. |
+| `before_release` | Push (release) | BEFORE the peer DDC write. Blocking — a failure aborts the push. Use for USB-switch or KVMP transitions. |
+| `after_release` | Push (release) | AFTER a successful or failed push write. Fire-and-forget. |
+| `on_observed_loss` | Poll (loss) | AFTER the poller commits an ownership loss. Fire-and-forget — the poll path has no write authority and must never trigger a corrective DDC write or retry. |
+
+### Hook causality — who gets advance notice
+
+The **initiating** machine gets real `before_acquire` / `after_acquire`
+timing — blocking, local, before its own write.
+
+The machine that **loses** the panel to a peer's pull gets no advance
+notice — it learns from its own poll afterward and fires the
+`on_observed_loss` after-only slot. `before_release` never fires post-hoc.
 
 ### Hook environment
 
@@ -279,62 +174,35 @@ Every hook command receives:
 |---|---|
 | `DORMANT_DISPLAY` | Config display id |
 | `DORMANT_DISPLAY_IDENTITY` | Claim identity (`manufacturer:model[:serial]`) |
-| `DORMANT_DIRECTION` | `release` or `acquire` |
+| `DORMANT_DIRECTION` | `acquire` or `release` or `observed_loss` |
 | `DORMANT_PHASE` | `before` or `after` |
 | `DORMANT_PEER` | Peer's instance id (not display name) |
-| `DORMANT_FALLBACK` | `0` (negotiated) or `1` (direct fallback) |
-| `DORMANT_ABORTED` | `0` (normal) or `1` (write-failure compensation; see below) |
 
-### Write-failure compensation
+### Scheduling and idempotence
 
-When the owner's input-source write (`WriteSucceeded` / `WriteFailed`) fails,
-the owner's `after_release` slot still executes — but with `DORMANT_ABORTED=1`.
-This is the compensation channel for the write-failure case:
-the owner can use this signal to revert a USB-switch or KVMP transition that
-its `before_release` performed.
+Entries declared `blocking = true` (the slot default) run to completion and
+block the next phase; non-blocking entries are spawned and the phase continues
+immediately. Hooks are bounded by their per-entry `timeout` (default `5s`),
+not cancellable mid-run. Hook commands must be idempotent — check
+`DORMANT_DIRECTION` and `DORMANT_PHASE` in the environment to decide whether
+to act or skip.
 
-`DORMANT_ABORTED=1` is set for `after_release` hooks only, and only when the
-write to the panel actually failed. `after_acquire` hooks on the requester
-side never see `DORMANT_ABORTED=1` — if the claim completed, the panel was
-acquired successfully.
+## Signal-presence law
 
-### mDNS and claim port
+A monitor **will not switch VCP `0x60` to an input that has no live video
+signal.** This was verified on the AOC AGON AG326UZD with both a Linux
+desktop (DisplayPort) and a macOS machine (DisplayPort). The panel ACKed
+`setvcp 60` writes to a dark input, reported them as successful, but
+readback confirmed VCP `0x60` stayed on the active input.
 
-Paired peers announce their always-on claim listener through
-`_dormant-claim._tcp.local.` mDNS. The TXT record is deliberately minimal —
-only `v` (protocol version), `instance_id`, and `port` — no display names,
-counts, or hostnames are broadcast. Set `coordination.claim_advertise_mdns =
-false` to stop advertising the listener while still accepting inbound
-connections (requiring the peer to reach the machine through a previously
-dialled or manually configured address).
-
-The claim listener binds to a **fixed** port (`coordination.claim_port`) or an
-OS-assigned ephemeral port (`0`). When `claim_advertise_mdns` is true, the
-advertised port is the actual bound port; a changing OS-assigned port across
-restarts is broadcast automatically.
-
-## Activity policies
-
-Three activity-claim policies (`coordination.activity_claim`) fire claims
-automatically from local input, without operator action:
-
-| Policy | Behavior |
-|---|---|
-| `off` | No automatic claims (default). |
-| `edge` | Claim on any local input edge — keyboard, mouse, or tablet. The edge fires exactly once per flight; subsequent input during the same flight is ignored. |
-| `owner-idle` | Claim when the panel's current owner (the peer selected on the monitor) has been idle ≥ `owner_idle_window`. Requires a prior successful claim per display to learn the owner's identity — this warm-up runs once per daemon lifetime. |
-| `armed` | Claim while an explicit local arm window is active (opened by `dormantctl switch <display> --arm`). The arm expires after `armed_window` and must be re-armed. |
-
-`owner-idle` idle reports are authenticated by the peer: the local daemon only
-accepts `IdleReport` frames from the peer it learned from the most recent
-`ClaimResponse::Accepted`. Until that first claim completes, every
-`owner-idle` IdleReport is dropped — the daemon will not act on reports from
-an unknown peer.
+This is why push fails safe and why the daemon does not try to wake a peer:
+a machine whose output is dark cannot receive a panel pull. The initiating
+machine's own `before_acquire` hooks (wake the output, verify signal) are the
+only path to a working switch.
 
 ## Linux permissions
 
-The activity-claim path reads keyboard and mouse events from the compositor's
-input seat (evdev nodes on Linux, `CGEvent` tap on macOS). On Linux, the
+The activity-follow path reads keyboard and mouse events. On Linux, the
 default input source is the Wayland compositor's idle-notifier protocol or
 the D-Bus screensaver idle time — neither requires elevated permissions.
 
@@ -357,65 +225,64 @@ with "permission denied", add the user to the `input` group and re-login.
 ## macOS Accessibility
 
 On macOS, the tray hotkey (Carbon `RegisterEventHotKey`) requests **no**
-Accessibility permissions — `RegisterEventHotKey` is part of the Carbon Event
-Manager and registers directly with the HID system, bypassing the
-`AXIsProcessTrusted` gate. The Carbon path sets a system-wide hotkey that
-`dormant-tray` processes in its run loop; it does not observe or filter other
-applications' events.
-
-The macOS `CGEvent` tap (the input-filter backend for activity claims on
-macOS) **does** require Accessibility permissions. Without it, the daemon
-cannot read keyboard/mouse events from devices that are not already granted.
-The `input_filter_active` / `input_filter_unavailable` log anchors report the
-tap state — `input_filter_unavailable` means the tap could not be created and
-activity claims relying on filtered input (e.g. `activity_claim = "edge"`)
-will not fire. The stock idle source still reports activity through
-CoreGraphics idle-time queries, so the `user-activity` inhibitor is
-unaffected.
+Accessibility permissions. The macOS `CGEvent` tap (the input-filter backend
+for activity follow on macOS) **does** require Accessibility permissions.
 
 ## InputWake validation
 
-When `activity_claim = "edge"` or `"armed"` fires a claim and the render sink
-is the active stage, the daemon waits for the first real input event from the
-new owner — the **InputWake**. This proves the input source actually
-reached the panel and that the display is now showing the active framebuffer.
+When an activity-driven pull fires and the render sink is the active stage,
+the daemon waits for the first real input event from the new owner — the
+**InputWake**. This proves the input source actually reached the panel and
+that the display is now showing the active framebuffer.
 
-The validator is a 500 ms bounded window:
-
-1. After the claim's input-source write succeeds, the daemon begins watching
-   for a filtered-activity edge whose sequence number is **after** the start
-   of the current claim flight.
-2. Input events from ignored devices (matching `ignore_devices` globs) are
-   silently discarded and do not satisfy the validator.
-3. If a valid edge arrives within 500 ms, the claim completes immediately —
-   the panel was acquired and the input source is confirmed.
-4. If the 500 ms window expires or the activity source becomes unavailable,
-   the claim still completes — the validator is a best-effort proof, not a
-   gate. InputWake failure does not roll back the claim.
-
-During the 500 ms window the render overlay may flicker briefly: the daemon
-submitted the blank frame before the claim, the claim's write switched the
-input, and the new owner's first composited frame arrives asynchronously.
-This is one composited frame of black (typically <33 ms at 30 Hz), not a
-multi-second stuck state.
+The validator is a 500 ms bounded window: if a valid edge arrives, the pull
+completes immediately; if the window expires, the pull still completes — the
+validator is a best-effort proof, not a gate.
 
 ## `[coordination]` reference
 
-Coordination is opt-in. `enabled = false` disables mDNS, pairing, and the
-instance-pairing routes, but it never disables local `0x60` ownership polling
-for configured shared displays.
+Coordination is opt-in — it activates only when at least one display has
+`scope = "shared"`. There is no `enabled` key; the section's presence (or
+any key within it) has no effect without a shared display.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Enables mDNS discovery, pairing, and instance-pairing routes. |
 | `poll_interval` | duration | `"2s"` | Shared-display ownership poll cadence (VCP `0x60`); minimum `"1s"`. |
-| `state_poll_interval` | duration | `"30s"` | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics. When unset, defaults to `max(30s, poll_interval)`; when set, must be `>= poll_interval`. Ownership still polls at `poll_interval`; only panel state refreshes here, to cut per-transaction i2c traffic. |
-| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached ownership verdict flips `true → false` (defends against garbled reads from concurrent cross-machine DDC traffic; issue #134). Validated `1..=10`. Ownership *gain* (`false → true`) stays eager — waking on a possibly-wrong "I own" read is idempotent and the next poll re-confirms. |
-| `pairing_port` | integer | `0` | TCP port for a pairing window; `0` requests an ephemeral OS port. |
-| `pairing_window` | duration | `"5m"` | Lifetime of the listener and mDNS advertisement; `"30s"` to `"15m"`. |
-| `pairing_bind_address` | string or unset | unset | LAN address for the temporary listener; unset auto-detects the primary non-loopback address. |
-| `activity_claim` | enum | `"off"` | Claim policy triggered by local input activity. `"off"` — no automatic claims. `"owner-idle"` — claim when the current owner is idle (requires one prior claim per display; see [Claim methods](#claim-methods)). `"edge"` — claim on a local input edge (keyboard/mouse/tablet). `"armed"` — claim while an explicit arm window is active. |
-| `owner_idle_window` | duration | `"30s"` | Minimum owner-idle duration before an `owner-idle` claim fires. See [`activity_claim`](#coordination-reference) for the warm-up requirement. |
+| `state_poll_interval` | duration | unset | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics. When unset, defaults to `max(30s, poll_interval)`; when set, must be `>= poll_interval`. Ownership still polls at `poll_interval`; only panel state refreshes here, to cut per-transaction i2c traffic. |
+| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached ownership verdict flips `true → false`. Defends against garbled reads from concurrent cross-machine DDC traffic (issue #134). Validated `1..=10`. Ownership *gain* stays eager — waking on a possibly-wrong "I own" read is idempotent and the next poll re-confirms. |
+| `activity_follow` | boolean | `false` | When `true`, a genuine local activity edge (keyboard, mouse, tablet) pulls a shared display to this machine after `arm_after` idle. |
+| `arm_after` | duration | `"7s"` | Grace window after receiving a local arm before the pull commits (only meaningful when `activity_follow = true`). |
+| `cooldown` | duration | `"3s"` | Minimum interval between successive activity-driven pulls. Hotkeys, CLI, tray, and web bypass this — an explicit operator action is never swallowed. |
+
+## Example: shared display with hooks
+
+```toml
+[displays.shared_oled]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+scope = "shared"
+shared_input_code = 0x0f
+shared_input_write_code = 0x15
+shared_peer_input_code = 0x10
+shared_peer_input_write_code = 0x15
+
+[displays.shared_oled.hooks]
+before_acquire = [
+  # Wake the machine's video output so the panel will accept the switch.
+  { command = ["xset", "dpms", "force", "on"], timeout = "5s", blocking = true },
+]
+after_acquire = [
+  { command = ["notify-send", "panel acquired"], timeout = "5s", blocking = false },
+]
+before_release = [
+  # Switch the USB peripheral hub to the peer before releasing the panel.
+  { mqtt = { topic = "usbswitch/set", payload = "mac" }, timeout = "5s", blocking = true },
+]
+on_observed_loss = [
+  # The poller detected a peer pull — this machine lost the panel.
+  { command = ["notify-send", "panel released to peer"], timeout = "5s", blocking = false },
+]
+```
 
 ## Limits and failure behavior
 
@@ -434,64 +301,21 @@ for configured shared displays.
   and `coord_ownership_loss_deferred` (when the pending counter is below the
   threshold) are emitted as literal anchors so the operator can see the bus is
   dirty without parsing the verdict cache.
-
-### Ownership-loss debounce — latency and honest limits
-
-`coordination.loss_confirmations` (default `3`) debounces ownership loss:
-the verdict only flips `true → false` after N consecutive agreeing "not mine"
-VCP `0x60` readings. With the defaults (`poll_interval = 2s` × N = 3), a
-genuine input switch takes ~6 seconds to commit. During that window the
-old owner still believes it owns the panel and can still issue a blank. The
-new owner reads "mine" on its next poll, commits the gain eagerly, and
-wakes the panel immediately — the panel is on, but the old owner's blank
-can still land on top of the new owner's wake, producing a short visible
-flicker if presence/absence transitions happen to align. Operators who
-cannot tolerate that window can lower `loss_confirmations` toward `1`
-(one-tick commit) at the cost of flap-susceptibility, or raise
-`poll_interval` (less responsive in both directions).
-
-The debounce reduces but does not eliminate false losses. Two daemons on one
-DDC bus can collide in ways that return the same wrong code N times in a
-row — N=3 makes a false loss ~3× less likely than N=1, not impossible. The
-`coord_poll_disagreement` signal only fires when consecutive observations
-*differ*; identical-wrong readings sail through the debounce as if they
-were genuine. This is a fundamental limitation of cross-machine arbitration
-on a single physical DDC bus: there is no out-of-band channel the daemon can
-use to distinguish "the input really switched" from "the bus returned the
-same wrong code N times". The companion defenses — hold-last-verdict on DDC
-errors, eager wake on ownership gain, and the per-process `PanelLocks`
-+ `DDC_PHYSICAL_GATE` (issue #127) — narrow the window but do not change
-that limit. If a deployment sees false losses under load, the practical
-mitigations are: increase `loss_confirmations` (widens the genuine-handoff
-latency proportionally), increase `poll_interval` (less responsive in both
-directions), or disable coordination on one of the machines
-(`coordination.enabled = false`).
-- `dormantctl doctor` can report `input_source=skipped` when a controller has no
-  usable input-source readback, or `input_source=unreadable` when a read was
-  attempted and failed. Fix that before relying on a shared display.
-- Discovery is not a heartbeat. Losing an mDNS peer does not change local panel
-  ownership, and local presence state is never shared between instances.
-- **`owner-idle` warm-up.** The `owner-idle` activity-claim policy needs one
-  prior successful claim per display before it engages. The daemon learns the
-  owner from the first `ClaimResponse::Accepted`, which only arrives after a
-  claim initiated via hotkey, `dormantctl switch`, or `activity_claim = "edge"`.
-  Until that claim completes, `owner-idle` IdleReports are dropped (security:
-  the daemon must not accept reports from an unknown peer). After a daemon
-  restart, the owner identity must be relearned — `owner_instance_id` lives
-  in memory, not on disk.
+- The debounce reduces but does not eliminate false losses. If cross-machine
+  DDC collisions return the same wrong code N times in a row, a false loss can
+  still commit — N=3 makes a false loss ~3× less likely than N=1, not
+  impossible. The `coord_poll_disagreement` signal only fires when consecutive
+  observations *differ*; identical wrong readings sail through the debounce.
+- `dormantctl doctor` can report `input_source=skipped` when a controller has
+  no usable input-source readback, or `input_source=unreadable` when a read
+  was attempted and failed. Fix that before relying on a shared display.
 
 ### Web UI network surface
 
-The network pairing and claim protocol (mDNS discovery, SPAKE2 pairing
-listener, Ed25519 signed claim frames, TCP claim transport) was removed in
-v0.6.0. After that deletion the **web UI is the only remaining remote
-control surface** — there is no other network listener that can fire a hook
-or write a DDC command.
-
-Under default configuration the web server binds `127.0.0.1` only. Binding
-a non-loopback address is rejected at startup unless
-`daemon.web_allow_nonloopback` is explicitly set to `true`. Both live
-deployments use the default `127.0.0.1` and neither sets the opt-out.
+The only remote control surface is the **web UI**. Under default configuration
+the web server binds `127.0.0.1` only. Binding a non-loopback address is
+rejected at startup unless `daemon.web_allow_nonloopback` is explicitly set
+to `true`.
 
 **If `web_allow_nonloopback = true` is set**, the following unauthenticated
 endpoints become reachable from the LAN:
@@ -507,22 +331,27 @@ endpoints become reachable from the LAN:
 - `POST /api/pair/samsung` — pair with a Samsung TV
 
 The blank, switch, pause, and resume routes fire operator-configured hooks
-that run arbitrary commands (including MQTT publishes) — a wider surface
-than "someone can flip my monitor input." The web UI has no authentication
-layer of its own; it relies entirely on the loopback bind for access
-control. Opening the bind to the LAN removes the only barrier.
+that run arbitrary commands (including MQTT publishes) — a wider surface than
+"someone can flip my monitor input." The web UI has no authentication layer
+of its own; it relies entirely on the loopback bind for access control.
+Opening the bind to the LAN removes the only barrier.
 
-## Troubleshooting
+## Operator migration — `coordination.enabled` removed
 
-**Peer is not discovered.** Confirm `coordination.enabled = true` on both
-machines, restart the daemons, and open a pairing window on the responder.
-mDNS advertisements exist only while that window is open. Check that both
-machines can use the same LAN and that the temporary listener bind address is
-reachable.
+The `coordination.enabled` key was removed from the config schema. Prior to
+the direct-write pivot this key controlled mDNS discovery, instance pairing,
+and the claim protocol — all now deleted. Existing configs that set
+`enabled` will fail strict unknown-key validation until the key is deleted
+from the TOML file.
 
-**The code expired.** Open another responder window. Codes are one-time and
-valid only for `pairing_window`.
+```bash
+# To fix: remove the stale key from your config.
+# Run validate to confirm:
+dormantctl validate
+```
 
-**Attempt limit reached.** A window accepts ten `PairHello` attempts. Cancel or
-wait for it to expire, then open a new window. This can be caused by a wrong
-code, duplicate retries, or LAN traffic during the active window.
+If your config also carried other removed coordination keys (pairing-port,
+pairing-window, pairing-bind-address, claim-port, claim-bind-address,
+claim-advertise-mdns, activity-claim, owner-idle-window, armed-window,
+claim-timeout, release-deadline-cap), delete those as well — they no
+longer exist in the schema.

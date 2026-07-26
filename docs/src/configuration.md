@@ -458,21 +458,21 @@ The systemd watchdog interval comes from the unit, not this table. See
 
 ## `[coordination]` — multi-machine shared-display coordination
 
-This section is opt-in: `enabled = false` is the default. It disables mDNS,
-instance pairing, and their operator routes, but does not disable local DDC/CI
-`0x60` polling for displays configured with `scope = "shared"`.
+Self-activating: polls ownership only when at least one display has
+`scope = "shared"`. There is no `enabled` key — switching is a direct local
+DDC write with no network protocol, pairing, or claim transport.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Enable mDNS discovery, instance pairing, and instance-pairing routes. |
 | `poll_interval` | duration | `"2s"` | Shared-display ownership polling cadence; minimum `"1s"`. |
-| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached verdict flips `true → false`; `1..=10`. Defends against garbled cross-machine DDC reads — see [Multi-machine coordination](./multi-machine.md). **Latency:** with the default `poll_interval = 2s`, a genuine input switch takes ~6 s to commit; during that window the old owner may still blank while the new owner eagerly wakes. **Limits:** the debounce reduces but does not eliminate false losses — if collisions return the same wrong code N times in a row, a false loss can still commit; N=3 is ~3× less likely than N=1, not zero. Setting `loss_confirmations = 1` commits loss on the next reading but is flap-susceptible. |
-| `pairing_port` | integer | `0` | Temporary pairing listener port; `0` requests an ephemeral OS port. |
-| `pairing_window` | duration | `"5m"` | Temporary listener and mDNS advertisement lifetime; `"30s"` to `"15m"`. |
-| `pairing_bind_address` | string or unset | unset | LAN address used by the temporary listener; unset auto-detects the primary non-loopback address. |
+| `state_poll_interval` | duration | unset | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics. When unset, defaults to `max(30s, poll_interval)`; when set, must be `>= poll_interval`. |
+| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached verdict flips `true → false`; `1..=10`. Defends against garbled cross-machine DDC reads — see [Multi-machine KVM switching](./multi-machine.md). **Latency:** with the default `poll_interval = 2s`, a genuine input switch takes ~6 s to commit; during that window the old owner may still blank while the new owner eagerly wakes. **Limits:** the debounce reduces but does not eliminate false losses — if collisions return the same wrong code N times in a row, a false loss can still commit; N=3 is ~3× less likely than N=1, not zero. Setting `loss_confirmations = 1` commits loss on the next reading but is flap-susceptible. |
+| `activity_follow` | boolean | `false` | When `true`, a genuine local activity edge pulls a shared display to this machine. |
+| `arm_after` | duration | `"7s"` | Grace window after a local arm before the pull commits. |
+| `cooldown` | duration | `"3s"` | Minimum interval between successive activity-driven pulls; hotkey/CLI/web bypass this. |
 
-See [Multi-machine coordination](./multi-machine.md) for pairing and the
-shared-display setup procedure.
+See [Multi-machine KVM switching](./multi-machine.md) for setup and hook
+semantics.
 
 ## `[audio]` — PipeWire audio- and call-aware blanking
 

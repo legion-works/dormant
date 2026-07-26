@@ -40,13 +40,7 @@ const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 /// mounted, it is already strict by construction — there is no window
 /// where a forgotten classification decision defaults to the weaker
 /// same-origin check.
-pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &[
-    "/api/config/apply",
-    "/api/pair/samsung",
-    "/api/pair/instance",
-    "/api/pair/instance/join",
-    "/api/pair/instance/:id/cancel",
-];
+pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &["/api/config/apply", "/api/pair/samsung"];
 
 /// Full `/api`-prefixed `POST` routes that are deliberately left on the
 /// generic same-origin check (`is_same_origin`) rather than the strict

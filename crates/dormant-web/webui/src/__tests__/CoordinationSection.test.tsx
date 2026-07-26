@@ -155,3 +155,41 @@ describe("CoordinationSection", () => {
     expect(patches.some((p) => "path" in p && p.path.join(".") === "coordination.poll_interval")).toBe(true);
   });
 });
+
+  it("latency chip updates live when poll_interval is edited", () => {
+    const store = createPatchStore();
+
+    render(
+      <CoordinationSection
+        coordination={{ poll_interval: "2s", loss_confirmations: 3 }}
+        store={store}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+
+    expect(screen.getByText(/~6\.0s to commit/)).toBeInTheDocument();
+
+    const pollInput = screen.getByLabelText("poll_interval") as HTMLInputElement;
+    fireEvent.change(pollInput, { target: { value: "5s" } });
+
+    expect(screen.getByText(/~15\.0s to commit/)).toBeInTheDocument();
+  });
+
+  it("latency chip updates live when loss_confirmations is edited", () => {
+    const store = createPatchStore();
+
+    render(
+      <CoordinationSection
+        coordination={{ poll_interval: "2s", loss_confirmations: 3 }}
+        store={store}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+
+    const confInput = screen.getByLabelText("loss_confirmations") as HTMLInputElement;
+    fireEvent.change(confInput, { target: { value: "5" } });
+
+    expect(screen.getByText(/~10\.0s to commit/)).toBeInTheDocument();
+  });

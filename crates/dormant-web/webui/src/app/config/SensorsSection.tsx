@@ -16,6 +16,7 @@ import type { SensorConfig, ZoneConfig } from "../../api/types";
 import CreateEntityForm from "./CreateEntityForm";
 import { referencingEntities } from "./entityCrud";
 import { useConfirmDialog } from "../components";
+import { readEntityExpanded, writeEntityExpanded, sensorSummary } from "./density";
 
 interface SensorsSectionProps {
   sensors: Record<string, SensorConfig>;
@@ -58,32 +59,7 @@ const PLACEHOLDER: Record<string, string> = {
   availability_payload_offline: "offline",
 };
 
-/** Sensor summary: type + port/path. */
-function sensorSummary(cfg: SensorConfig): string {
-  const base = cfg.type;
-  if (cfg.type === "usb-ld2410" && cfg.port) return `${base} · ${cfg.port}`;
-  if (cfg.type === "mqtt" && cfg.topic) return `${base} · ${cfg.topic}`;
-  if (cfg.type === "ha" && cfg.entity) return `${base} · ${cfg.entity}`;
-  return base;
-}
-
-function storageKey(section: string, id: string): string {
-  return `dormant-config-collapse:${section}:${id}`;
-}
-
-function readExpanded(section: string, id: string): boolean {
-  try {
-    const v = localStorage.getItem(storageKey(section, id));
-    if (v === null) return true; // default: expanded
-    return v === "1";
-  } catch { return true; }
-}
-
-function writeExpanded(section: string, id: string, expanded: boolean) {
-  try {
-    localStorage.setItem(storageKey(section, id), expanded ? "1" : "0");
-  } catch { /* ignore */ }
-}
+/** Sensor summary: type + port/path — imported from density.ts. */
 
 export default function SensorsSection({
   sensors,
@@ -101,14 +77,14 @@ export default function SensorsSection({
   // Per-entity expanded state
   const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
     const out: Record<string, boolean> = {};
-    for (const id of ids) out[id] = readExpanded("sensors", id);
+    for (const id of ids) out[id] = readEntityExpanded("sensors", id);
     return out;
   });
 
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((prev) => {
       const next = !prev[id];
-      writeExpanded("sensors", id, next);
+      writeEntityExpanded("sensors", id, next);
       return { ...prev, [id]: next };
     });
   }, []);

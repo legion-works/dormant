@@ -12,6 +12,9 @@ import { getConfig, getState, postReload } from "../../api/client";
 import type { ConfigResponse, KvmStatus } from "../../api/types";
 import { Card, stageKindLabel } from "../components";
 import { SettingsForm } from "../config/SettingsForm";
+
+/** Global nav guard — Shell reads this before navigating away from Config. */
+export const navGuard = { current: null as { dirtyCount: number; discard: () => void; dirtySections: Set<string> } | null };
 import "./Config.css";
 import "../config/ConfigForm.css";
 
@@ -43,6 +46,22 @@ const TAB_LABELS: Record<ConfigTab, string> = {
   switching: "Switching",
   protection: "Protection",
   raw: "Raw",
+};
+
+/** Map patch prefix → Config tab for per-tab dirty dots. */
+const SECTION_TO_TAB: Record<string, ConfigTab> = {
+  daemon: "daemon",
+  sensors: "presence",
+  zones: "presence",
+  rules: "presence",
+  audio: "presence",
+  displays: "displays",
+  coordination: "switching",
+  keymap: "switching",
+  input_filter: "switching",
+  wear: "protection",
+  watchdog: "protection",
+  notifications: "protection",
 };
 
 /** Parse #/config/{tab} → tab, defaulting to "daemon". */
@@ -311,6 +330,7 @@ export default function Config() {
   });
   const [reloading, setReloading] = useState(false);
   const [tab, setTab] = useState<ConfigTab>(getConfigTabFromHash);
+  const [dirtyTabs, setDirtyTabs] = useState<Set<ConfigTab>>(new Set());
   const mountedRef = useRef(true);
 
   // Navigation guard state from SettingsForm — kept for the parent
@@ -382,8 +402,19 @@ export default function Config() {
   // so a future Shell-level guard can use it (beforeunload is the immediate
   // guard that still fires).
   const handleNavGuard = useCallback(
-    (guard: { dirtyCount: number; discard: () => void } | null) => {
+    (guard: { dirtyCount: number; discard: () => void; dirtySections: Set<string> } | null) => {
       navGuardRef.current = guard;
+      navGuard.current = guard;
+      if (guard) {
+        const tabs = new Set<ConfigTab>();
+        for (const s of guard.dirtySections) {
+          const t = SECTION_TO_TAB[s];
+          if (t) tabs.add(t);
+        }
+        setDirtyTabs(tabs);
+      } else {
+        setDirtyTabs(new Set());
+      }
     },
     [],
   );
@@ -409,6 +440,17 @@ export default function Config() {
             onClick={() => handleTabClick(t)}
           >
             {TAB_LABELS[t]}
+            {dirtyTabs.has(t) && (
+              <span style={{
+                display: "inline-block",
+                width: "6px",
+                height: "6px",
+                borderRadius: "50%",
+                background: "var(--accent-warm)",
+                marginLeft: "6px",
+                verticalAlign: "middle",
+              }} />
+            )}
           </button>
         ))}
       </div>

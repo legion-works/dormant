@@ -250,7 +250,6 @@ describe("Config", () => {
       expect(screen.getByText(/Config source: on_disk \(not yet applied\)/)).toBeInTheDocument();
     });
   });
-});
 
   it("renders ladder and screensaver summary when displays have them configured", async () => {
     render(<Config />);
@@ -303,3 +302,4 @@ describe("Config", () => {
     expect(screen.getByText(/backups\/config\.toml\.<timestamp>\.<suffix>/)).toBeInTheDocument();
     expect(screen.getByText(/filenames are not exposed by the Web API/i)).toBeInTheDocument();
   });
+});

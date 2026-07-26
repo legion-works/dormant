@@ -36,7 +36,7 @@ const SLOTS: SlotDef[] = [
 ];
 
 /** Format a single HookAction for display. */
-function formatAction(a: HookAction, slotKey: string): string {
+function formatAction(a: HookAction, slot: SlotDef): string {
   const parts: string[] = [];
   if (a.command && a.command.length > 0) {
     parts.push(a.command.join(" "));
@@ -47,7 +47,7 @@ function formatAction(a: HookAction, slotKey: string): string {
   if (a.timeout) {
     parts.push(`timeout: ${a.timeout}`);
   }
-  const blocking = a.blocking ?? (slotKey.startsWith("before_") ? true : false);
+  const blocking = a.blocking ?? slot.defaultBlocking;
   parts.push(blocking ? "blocking" : "non-blocking");
   if (a.abort_on_failure) {
     parts.push("abort on failure");
@@ -108,7 +108,7 @@ export default function HooksInspector({ hooks, displayId }: HooksInspectorProps
                             wordBreak: "break-all",
                           }}
                         >
-                          {formatAction(a, slot.key)}
+                          {formatAction(a, slot)}
                         </code>
                       </div>
                     ))}

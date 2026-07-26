@@ -4,11 +4,12 @@
  *
  * W1-5: 230px label column via cf-field--row.
  */
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import type { KvmStatus, CoordinationConfig } from "../../api/types";
 import { DurationField, NumberField, BoolField } from "./fields";
 import type { PatchStore } from "./patch";
 import FormSection from "./FormSection";
+import { readSectionAdvanced, writeSectionAdvanced } from "./density";
 
 interface CoordinationSectionProps {
   coordination?: CoordinationConfig;
@@ -48,29 +49,42 @@ const HELP: Record<string, string> = {
 };
 
 export default function CoordinationSection({ coordination = {}, store, onDirty, fieldErrors, kvm }: CoordinationSectionProps) {
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(() => readSectionAdvanced("coordination"));
+  const [, rerender] = useState(0); // re-render on dirty for live chip update
+
+  const toggleAdvanced = useCallback(() => {
+    setShowAdvanced((prev) => { writeSectionAdvanced("coordination", !prev); return !prev; });
+  }, []);
   const active = kvm != null;
 
-  const pollInterval = coordination.poll_interval ?? "2s";
-  const statePollInterval = coordination.state_poll_interval ?? "";
-  const lossConfirmations = coordination.loss_confirmations ?? 3;
-  const activityFollow = coordination.activity_follow ?? false;
-  const armAfter = coordination.arm_after ?? "7s";
-  const cooldown = coordination.cooldown ?? "3s";
+  const root = ["coordination"];
+
+  // Read live values — pending edits override fetched config.
+  const pollInterval = (store.getEdit([...root, "poll_interval"]) as string | undefined)
+    ?? coordination.poll_interval ?? "2s";
+  const statePollInterval = (store.getEdit([...root, "state_poll_interval"]) as string | undefined)
+    ?? coordination.state_poll_interval ?? "";
+  const lossConfirmations = (store.getEdit([...root, "loss_confirmations"]) as number | undefined)
+    ?? coordination.loss_confirmations ?? 3;
+  const activityFollow = (store.getEdit([...root, "activity_follow"]) as boolean | undefined)
+    ?? coordination.activity_follow ?? false;
+  const armAfter = (store.getEdit([...root, "arm_after"]) as string | undefined)
+    ?? coordination.arm_after ?? "7s";
+  const cooldown = (store.getEdit([...root, "cooldown"]) as string | undefined)
+    ?? coordination.cooldown ?? "3s";
 
   const pollMs = parseDurationMs(pollInterval);
   const confirmations = typeof lossConfirmations === "number" ? lossConfirmations : 3;
   const derivedLatency = pollMs * confirmations;
 
-  const lossError = typeof coordination.loss_confirmations === "number"
-    && (coordination.loss_confirmations < 1 || coordination.loss_confirmations > 10)
-    ? `must be 1–10, got ${coordination.loss_confirmations}` : undefined;
-
-  const root = ["coordination"];
+  const lossError = typeof lossConfirmations === "number"
+    && (lossConfirmations < 1 || lossConfirmations > 10)
+    ? `must be 1–10, got ${lossConfirmations}` : undefined;
 
   function edit(key: string, value: unknown) {
     store.trackEdit([...root, key], value);
     onDirty();
+    rerender((n) => n + 1);
   }
 
   return (
@@ -121,7 +135,7 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
           </div>
 
           <button type="button" className="cf-section__toggle" style={{ marginTop: "8px" }}
-            onClick={() => setShowAdvanced((o) => !o)}>
+            onClick={toggleAdvanced}>
             <span className={`cf-section__chevron${showAdvanced ? " cf-section__chevron--open" : ""}`}>{"▸"}</span>
             <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>Advanced</span>
           </button>

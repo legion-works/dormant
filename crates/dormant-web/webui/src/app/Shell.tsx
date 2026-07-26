@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import Dashboard from "./views/Dashboard";
 import Displays from "./views/Displays";
 import Events from "./views/Events";
-import Config from "./views/Config";
+import Config, { navGuard } from "./views/Config";
 import Doctor from "./views/Doctor";
 import { LiveStateProvider } from "./state";
 import { useLiveState } from "./hooks/useLiveState";
@@ -92,9 +92,18 @@ function ShellInner() {
   }, [connected]);
 
   const navigate = useCallback((key: ViewId) => {
+    // Check Config nav guard before leaving — data-loss prevention.
+    if (activeView === "config" && key !== "config" && navGuard.current) {
+      const g = navGuard.current;
+      const ok = window.confirm(
+        `Discard ${g.dirtyCount} unsaved change${g.dirtyCount === 1 ? "" : "s"} in Config?`,
+      );
+      if (!ok) return;
+      g.discard();
+    }
     setActiveView(key);
     window.location.hash = `#/${key}`;
-  }, []);
+  }, [activeView]);
 
   const handleReload = useCallback(async () => {
     try {

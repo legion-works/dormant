@@ -3,7 +3,7 @@
  * conflict handling, inline validation errors, and navigation guard.
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent, act } from "@testing-library/react";
 import { SettingsForm } from "../app/config/SettingsForm";
 import Config from "../app/views/Config";
 import type { ConfigResponse, ApplyResponse, StateSnapshot } from "../api/types";
@@ -681,6 +681,7 @@ describe("Config tab-switch guard", () => {
   beforeEach(() => {
     mocks.getConfig.mockResolvedValue(SAMPLE_CONFIG);
     mocks.getState.mockResolvedValue(SAMPLE_STATE);
+    window.location.hash = "";
   });
 
   afterEach(() => {
@@ -937,6 +938,61 @@ describe("Config tab-switch guard", () => {
     const holdoffInput = screen.getByLabelText("startup_holdoff") as HTMLInputElement;
     // The placeholder is set when the input is empty
     expect(holdoffInput.placeholder).toBe("30s");
+  });
+
+  it("per-tab dirty dot persists on the daemon tab after editing a daemon field", async () => {
+    window.location.hash = "#/config/daemon";
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
+    });
+
+    const logLevelSelect = screen.getByLabelText("log_level") as HTMLSelectElement;
+    fireEvent.change(logLevelSelect, { target: { value: "debug" } });
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Raw"));
+    await waitFor(() => {
+      expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Daemon"));
+    await waitFor(() => {
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
+    });
+    expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+  });
+
+  it("nav-away guard fires when leaving Config with dirty edits", async () => {
+    window.location.hash = "#/config/daemon";
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.change(
+        screen.getByLabelText("log_level") as HTMLSelectElement,
+        { target: { value: "debug" } },
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+    });
+
+    const { navGuard } = await import("../app/views/Config");
+    await waitFor(() => {
+      expect(navGuard.current).not.toBeNull();
+    });
+    expect(navGuard.current!.dirtyCount).toBe(1);
+
+    navGuard.current!.discard();
   });
 
 });

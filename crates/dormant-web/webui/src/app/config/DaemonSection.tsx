@@ -7,11 +7,12 @@
  * W1-5: 230px label column, changed-field markers, Advanced collapse
  * (macos_idle_*, generation_barrier_ack_timeout, doctor_wake_settle).
  */
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import FormSection from "./FormSection";
 import { DurationField, EnumField, NumberField, TextField, LOG_LEVELS, IDLE_TIME_UNITS, IDLE_SOURCES } from "./fields";
 import type { FieldProps } from "./fields";
 import type { PatchStore } from "./patch";
+import { readSectionAdvanced, writeSectionAdvanced } from "./density";
 
 interface DaemonSectionProps {
   daemon: Record<string, unknown>;
@@ -77,12 +78,16 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
   const advancedKeys = keys.filter((k) => ADVANCED_KEYS.has(k));
 
   const [showAdvanced, setShowAdvanced] = useState(
-    // Auto-expand if any advanced key has a non-default value
-    advancedKeys.length > 0 && advancedKeys.some((k) => {
+    // Auto-expand if any advanced key has a non-default value, otherwise restore from localStorage
+    () => advancedKeys.some((k) => {
       const v = daemon[k];
       return v !== undefined && v !== "" && v !== 0;
-    })
+    }) || readSectionAdvanced("daemon")
   );
+
+  const toggleAdvanced = useCallback(() => {
+    setShowAdvanced((prev) => { writeSectionAdvanced("daemon", !prev); return !prev; });
+  }, []);
 
   if (keys.length === 0) return null;
 
@@ -145,8 +150,13 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
         </div>
         {visibleKeys.filter((k) => ["idle_time_unit", "idle_source"].includes(k)).map(renderField)}
 
+        <div className="cf-card__summary-type" style={{ marginTop: "10px", marginBottom: "6px" }}>
+          Feature flags
+        </div>
+        {visibleKeys.filter((k) => /_enabled$/.test(k) || k === "web_allow_nonloopback" || k === "hook_edit_enabled").map(renderField)}
+
         {/* Remaining visible keys not in any group */}
-        {visibleKeys.filter((k) => !["web_port", "web_bind", "startup_holdoff", "reload_debounce", "stale_sensor_timeout", "log_level", "idle_time_unit", "idle_source"].includes(k)).map(renderField)}
+        {visibleKeys.filter((k) => !["web_port", "web_bind", "startup_holdoff", "reload_debounce", "stale_sensor_timeout", "log_level", "idle_time_unit", "idle_source"].includes(k) && !(/_enabled$/.test(k) || k === "web_allow_nonloopback" || k === "hook_edit_enabled")).map(renderField)}
 
         {/* ▸ Advanced */}
         {advancedKeys.length > 0 && (
@@ -155,7 +165,7 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
               type="button"
               className="cf-section__toggle"
               style={{ marginTop: "10px" }}
-              onClick={() => setShowAdvanced((o) => !o)}
+              onClick={toggleAdvanced}
             >
               <span className={`cf-section__chevron${showAdvanced ? " cf-section__chevron--open" : ""}`}>
                 {"▸"}

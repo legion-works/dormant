@@ -63,3 +63,14 @@ export function displaySummary(cfg: DisplayConfig): string {
   else if (cfg.ladder) parts.push("ladder");
   return parts.join(" · ");
 }
+
+/** Persist ▸ Advanced toggle state per section to localStorage. */
+export function readSectionAdvanced(section: string): boolean {
+  try { return localStorage.getItem(`dormant-config-advanced:${section}`) === "1"; }
+  catch { return false; }
+}
+
+export function writeSectionAdvanced(section: string, expanded: boolean) {
+  try { localStorage.setItem(`dormant-config-advanced:${section}`, expanded ? "1" : "0"); }
+  catch { /* ignore */ }
+}

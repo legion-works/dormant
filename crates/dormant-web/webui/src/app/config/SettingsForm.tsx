@@ -6,7 +6,7 @@
  * errors).  One instance spans all five Config form tabs; the `tab`
  * prop selects which sections are visible.
  */
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import type { ConfigResponse, ApplyResponse, ApplyErrorBody, KvmStatus } from "../../api/types";
 import { getConfig, postConfigApply, ApiError } from "../../api/client";
 import { createPatchStore } from "./patch";
@@ -38,7 +38,7 @@ interface SettingsFormProps {
    * Called when the dirty state changes so the parent can guard
    * navigation (route change).  Passes null when clean.
    */
-  onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void } | null) => void;
+  onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void; dirtySections: Set<string> } | null) => void;
   /** Active form tab; only sections for this tab are rendered. */
   tab: ConfigFormTab;
   /** Live KVM state from the state snapshot; absent → not yet loaded. */
@@ -72,7 +72,11 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
   const [config, setConfig] = useState<ConfigResponse>(initialConfig);
   const lastFingerprintRef = useRef(initialConfig.fingerprint);
   const [dirtyVersion, setDirtyVersion] = useState(0);
-  const dirtyCount = dirtyVersion === 0 ? 0 : store.buildPatches().length + 0; // force recalc on each version
+  const dirtyCount = useMemo(
+    () => (dirtyVersion === 0 ? 0 : store.buildPatches().length),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dirtyVersion],
+  );
 
   const [applying, setApplying] = useState(false);
   const [outcome, setOutcome] = useState<ApplyOutcome | null>(null);
@@ -214,12 +218,18 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
   useEffect(() => {
     if (onNavigationGuard) {
       if (dirtyCount > 0) {
-        onNavigationGuard({ dirtyCount, discard: handleDiscard });
+        // Compute which top-level sections have pending edits.
+        const dirtySections = new Set<string>(
+          store.buildPatches()
+            .filter((p) => "path" in p)
+            .map((p) => (p as { path: string[] }).path[0]),
+        );
+        onNavigationGuard({ dirtyCount, discard: handleDiscard, dirtySections });
       } else {
         onNavigationGuard(null);
       }
     }
-  }, [dirtyCount, onNavigationGuard, handleDiscard]);
+  }, [dirtyCount, onNavigationGuard, handleDiscard, store]);
 
   const inv = config.inventory;
   const entityCrudEnabled = isEntityCrudEnabled(inv.daemon);

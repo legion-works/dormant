@@ -24,6 +24,7 @@ import PairingWizard from "./PairingWizard";
 import CoordinationSection from "./CoordinationSection";
 import KeymapSection from "./KeymapSection";
 import InputFilterSection from "./InputFilterSection";
+import HooksInspector from "./HooksInspector";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
@@ -324,6 +325,13 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
             onDirty={onDirty}
             fieldErrors={fieldErrors}
           />
+
+          {/* Hooks inspector — one per shared display */}
+          {Object.entries(inv.displays ?? {})
+            .filter(([, dc]) => dc.scope === "shared")
+            .map(([id, dc]) => (
+              <HooksInspector key={id} displayId={id} hooks={dc.hooks} />
+            ))}
         </>
       )}
 

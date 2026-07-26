@@ -424,6 +424,30 @@ pub enum DaemonEvent {
         #[serde(default)]
         attempts: u64,
     },
+    /// Ownership verdict changed or was confirmed by a write — the
+    /// definitive answer to "who has the panel right now?".  Emitted by
+    /// the direct-switch path on pull/push terminal outcomes and by the
+    /// coordination poller on debounced ownership transitions.
+    Ownership {
+        /// The shared display whose ownership changed.
+        display: DisplayId,
+        /// Whether this machine currently owns the display.
+        owned: bool,
+        /// Last observed VCP `0x60` input-source code, when available.
+        #[serde(default)]
+        observed_input_code: Option<u8>,
+        /// What triggered this ownership event.
+        /// `"pull"` | `"push"` | `"poll"` | `"activity_follow"` | `"hotkey"` | `"cli"` | `"tray"` | `"web"`
+        cause: String,
+        /// When `cause` is a write path: did readback verify the panel moved?
+        /// `None` when the event is from a read-only observation (poll).
+        #[serde(default)]
+        verified: Option<bool>,
+        /// Set when the write path degraded (peer READ alias absent) —
+        /// mirrors the existing `kvm_push_verification_degraded` log anchor.
+        #[serde(default)]
+        degraded: bool,
+    },
     /// First frame emitted on a fresh event-stream connection, per-connection
     /// (never broadcast). Marks that the daemon-side broadcast receiver is
     /// registered, so events emitted after this line will be delivered.

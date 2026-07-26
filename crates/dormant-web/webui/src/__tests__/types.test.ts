@@ -50,6 +50,7 @@ describe("enum arrays match Rust serde wire strings", () => {
       "blank_failure",
       "blank_recovered",
       "wake_recovered",
+      "ownership",
     ]);
   });
 
@@ -75,4 +76,48 @@ it("mirrors additive rollback status from rules.rs", () => {
   } satisfies StateSnapshot;
 
   expect(snapshot.rollback.failed_fp).toContain("deadbeef");
+});
+
+it("Ownership wire shape matches BG-1 serde(tag='event', rename_all='snake_case')", async () => {
+  const { OwnershipEvent } = await import("../api/types");
+  // Import the interface type for `satisfies` narrowing.
+  const ev = null as unknown as OwnershipEvent;
+  void ev; // reference the type
+
+  // Verified pull — all fields present.
+  const verified = {
+    event: "ownership" as const,
+    display: "shared_oled",
+    owned: true,
+    observed_input_code: 15,
+    cause: "pull",
+    verified: true,
+    degraded: false,
+  } satisfies OwnershipEvent;
+  expect(verified.event).toBe("ownership");
+  expect(verified.observed_input_code).toBe(15);
+
+  // Poll-observed loss — verified: None (read-only), no degraded flag.
+  const polled = {
+    event: "ownership" as const,
+    display: "shared_oled",
+    owned: false,
+    observed_input_code: 16,
+    cause: "poll",
+  } satisfies OwnershipEvent;
+  expect(polled.cause).toBe("poll");
+  expect(polled.verified).toBeUndefined();
+  expect(polled.degraded).toBeUndefined();
+
+  // Failed write — verified: false.
+  const failed = {
+    event: "ownership" as const,
+    display: "shared_oled",
+    owned: true,
+    cause: "pull",
+    verified: false,
+    degraded: false,
+  } satisfies OwnershipEvent;
+  expect(failed.verified).toBe(false);
+  expect(failed.observed_input_code).toBeUndefined();
 });

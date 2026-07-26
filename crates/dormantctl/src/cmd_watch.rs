@@ -95,6 +95,27 @@ fn fmt_event(event: &DaemonEvent) -> String {
         DaemonEvent::WakeRecovered { display, attempts } => {
             format!("display {display}: wake recovered after {attempts} attempts")
         }
+        DaemonEvent::Ownership {
+            display,
+            owned,
+            cause,
+            verified,
+            degraded,
+            ..
+        } => {
+            let ver = match verified {
+                Some(true) => " ✓",
+                Some(false) => " ✗",
+                None => "",
+            };
+            let deg = if *degraded { " degraded" } else { "" };
+            format!(
+                "display {display}: {cause} → {}{}{}",
+                if *owned { "ours" } else { "peer" },
+                ver,
+                deg,
+            )
+        }
         DaemonEvent::Subscribed => "event stream subscribed".to_string(),
         DaemonEvent::Unknown => "unknown daemon event".to_string(),
     }

@@ -57,6 +57,7 @@ export const DAEMON_EVENT_TAGS = [
   "blank_failure",
   "blank_recovered",
   "wake_recovered",
+  "ownership",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -265,7 +266,8 @@ export type DaemonEvent =
   | CompensationAdvisoryEvent
   | BlankFailureEvent
   | BlankRecoveredEvent
-  | WakeRecoveredEvent;
+  | WakeRecoveredEvent
+  | OwnershipEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -362,6 +364,23 @@ export interface WakeRecoveredEvent {
   event: "wake_recovered";
   display: string;
   attempts: number;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::Ownership
+ * serde: `observed_input_code` / `verified` / `degraded` are `#[serde(default)]`.
+ */
+export interface OwnershipEvent {
+  event: "ownership";
+  display: string;
+  owned: boolean;
+  observed_input_code?: number | null;
+  /** "pull" | "push" | "poll" | "activity_follow" | "hotkey" | "cli" | "tray" | "web" */
+  cause: string;
+  /** Present when cause is a write path: did readback verify the panel moved? */
+  verified?: boolean | null;
+  /** Set when the write path degraded (peer READ alias absent). */
+  degraded?: boolean;
 }
 
 /**

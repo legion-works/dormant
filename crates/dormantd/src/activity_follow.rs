@@ -2,9 +2,9 @@
 //! activity edge and pull the shared display here via direct DDC writes.
 //!
 //! The edge detector and filtered-input precedence are ported from
-//! [`crate::activity_claim_evaluator::detect_activity_edge`]; all
-//! claim-policy branches (`OwnerIdle`, `Armed`, `IdleQuery`/`IdleReport`, peers)
-//! are gone.
+//! the deleted `activity_claim_evaluator` module's `detect_activity_edge`;
+//! the claim-policy branches (`OwnerIdle`, `Armed`, `IdleQuery`/`IdleReport`,
+//! peers) are gone.
 //!
 //! ## Split (`audio_policy` / `wear_tracker` house pattern)
 //!
@@ -65,7 +65,7 @@ enum ActivityUpdate {
 
 /// Detect a genuine local activity edge from idle observations.
 ///
-/// Ported from [`crate::activity_claim_evaluator::detect_activity_edge`].
+/// Ported from the deleted `activity_claim_evaluator` module's `detect_activity_edge`.
 /// Filtered input is the canonical edge authority when available; when the
 /// filtered source dies, the function falls back to raw stock-idle deltas
 /// after recording the current stock timestamp as a new baseline — the first

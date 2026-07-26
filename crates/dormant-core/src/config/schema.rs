@@ -1053,7 +1053,7 @@ pub struct DisplayConfig {
     /// Peer DDC/CI input-source code this machine READS to verify the peer
     /// wrote. Required when `shared_peer_input_write_code` is set for strong
     /// verification; when absent write verification degrades (see
-    /// [`kvm_push_verification_degraded`]).
+    /// `kvm_push_verification_degraded` log event in `direct_switch.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_peer_input_code: Option<u8>,
 

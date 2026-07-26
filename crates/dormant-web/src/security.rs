@@ -63,6 +63,7 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/blank",
     "/api/wake",
     "/api/switch",
+    "/api/push",
     "/api/pause",
     "/api/resume",
     "/api/reload",

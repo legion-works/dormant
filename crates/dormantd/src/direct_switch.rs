@@ -54,7 +54,7 @@ pub enum SwitchOutcome {
     Unsupported,
     /// The pull was suppressed by the activity cooldown — another
     /// activity-driven write was already issued within the
-    /// [`CoordinationConfig::cooldown`] window for this display.
+    /// [`dormant_core::config::CoordinationConfig::cooldown`] window for this display.
     Cooldown,
 }
 

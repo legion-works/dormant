@@ -110,6 +110,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = route_post!(api, "/blank", post(command::post_blank));
     let api = route_post!(api, "/wake", post(command::post_wake));
     let api = route_post!(api, "/switch", post(command::post_switch));
+    let api = route_post!(api, "/push", post(command::post_push));
     let api = route_post!(api, "/pause", post(command::post_pause));
     let api = route_post!(api, "/resume", post(command::post_resume));
     let api = route_post!(api, "/reload", post(command::post_reload));

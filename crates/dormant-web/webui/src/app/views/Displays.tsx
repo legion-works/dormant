@@ -17,7 +17,7 @@
  */
 import { useLiveState } from "../hooks/useLiveState";
 import { Card, StatusChip, HealthChip, phaseChipLabel, useConfirmDialog } from "../components";
-import { postBlank, postWake, postPause, postResume, postSwitch } from "../../api/client";
+import { postBlank, postWake, postPause, postResume, postSwitch, postPush } from "../../api/client";
 import { useCallback, useEffect, useState } from "react";
 import type { DisplaySnapshot } from "../../api/types";
 import DisplayDetail from "./DisplayDetail";
@@ -39,6 +39,7 @@ interface DisplayCardProps {
   onPause: (id: string, rule: string) => void;
   onResume: (id: string, rule: string) => void;
   onSwitch: (id: string) => void;
+  onPush: (id: string) => void;
 }
 
 function DisplayCard({
@@ -56,6 +57,7 @@ function DisplayCard({
   onPause,
   onResume,
   onSwitch,
+  onPush,
 }: DisplayCardProps) {
   const isShared = snap.scope === "shared";
   const panelLabel = (() => {
@@ -204,7 +206,7 @@ function DisplayCard({
                   <button
                     type="button"
                     className="display-action display-action--wake"
-                    onClick={() => onSwitch(id)}
+                    onClick={() => onPush(id)}
                   >
                     Send to peer
                   </button>
@@ -312,6 +314,15 @@ export default function Displays() {
     }
   }, [clearActionError]);
 
+  const handlePush = useCallback(async (id: string) => {
+    clearActionError(id);
+    try {
+      await postPush(id);
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Push failed" }));
+    }
+  }, [clearActionError]);
+
   const handlePause = useCallback(async (id: string, rule: string) => {
     const accepted = await confirm({
       title: `Pause ${rule}?`,
@@ -384,6 +395,7 @@ export default function Displays() {
             onPause={handlePause}
             onResume={handleResume}
             onSwitch={handleSwitch}
+            onPush={handlePush}
           />
         );
       })}

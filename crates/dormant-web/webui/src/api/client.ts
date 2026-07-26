@@ -6,6 +6,8 @@
  *   GET  /api/config  → ConfigResponse
  *   POST /api/blank   → JSON { display: "<id>" }
  *   POST /api/wake    → JSON { display: "<id>" }
+ *   POST /api/switch  → JSON { display: "<id>" }
+ *   POST /api/push    → JSON { display: "<id>" }
  *   POST /api/pause   → JSON { rule?: string, duration_s?: number }
  *   POST /api/resume  → JSON { rule?: string }
  *   POST /api/reload  → no body extractor; Content-Type header required by guard
@@ -102,6 +104,15 @@ export function postWake(display: string): Promise<void> {
 /** POST /api/switch — write the local input code to pull the display. */
 export function postSwitch(display: string): Promise<void> {
   return request<void>("/switch", {
+    method: "POST",
+    headers: JSON_CT,
+    body: JSON.stringify({ display }),
+  });
+}
+
+/** POST /api/push — write the peer input code to push the display away. */
+export function postPush(display: string): Promise<void> {
+  return request<void>("/push", {
     method: "POST",
     headers: JSON_CT,
     body: JSON.stringify({ display }),

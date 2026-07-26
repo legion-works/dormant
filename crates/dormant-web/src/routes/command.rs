@@ -77,6 +77,24 @@ pub(crate) async fn post_switch(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+/// `POST /api/push` — write the peer input code to push the display away.
+pub(crate) async fn post_push(
+    State(state): State<WebState>,
+    Json(body): Json<SwitchBody>,
+) -> Result<Json<serde_json::Value>, WebError> {
+    validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
+    let request = dormant_core::ipc_proto::IpcRequest::SwitchToPeer {
+        display: body.display,
+    };
+    let response = crate::request_daemon_ipc(&state, request).await?;
+    if !response.ok {
+        return Err(WebError::BadRequest(
+            response.error.unwrap_or_else(|| "push failed".to_string()),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
 /// `POST /api/blank` — validate display exists, then force-blank.
 pub(crate) async fn post_blank(
     State(state): State<WebState>,
@@ -329,6 +347,7 @@ fn command_test_router_at(
         .route("/api/blank", axum::routing::post(post_blank))
         .route("/api/wake", axum::routing::post(post_wake))
         .route("/api/switch", axum::routing::post(post_switch))
+        .route("/api/push", axum::routing::post(post_push))
         .route("/api/pause", axum::routing::post(post_pause))
         .route("/api/resume", axum::routing::post(post_resume))
         .route("/api/reload", axum::routing::post(post_reload))

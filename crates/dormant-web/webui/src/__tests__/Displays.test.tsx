@@ -17,8 +17,10 @@ const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
   const postWake = vi.fn().mockResolvedValue(undefined);
   const postPause = vi.fn().mockResolvedValue(undefined);
   const postResume = vi.fn().mockResolvedValue(undefined);
+  const postSwitch = vi.fn().mockResolvedValue({ verdict: "accepted", deadline_ms: 123 });
+  const postPush = vi.fn().mockResolvedValue(undefined);
   return {
-    mocks: { postBlank, postWake, postPause, postResume },
+    mocks: { postBlank, postWake, postPause, postResume, postSwitch, postPush },
     SAMPLE_STATE: {
       sensors: [
         { id: "desk-mmwave", state: "present" as const, last_seen_secs_ago: 3 },
@@ -107,6 +109,8 @@ vi.mock("../api/client", () => ({
   postWake: mocks.postWake,
   postPause: mocks.postPause,
   postResume: mocks.postResume,
+  postSwitch: mocks.postSwitch,
+  postPush: mocks.postPush,
   getWear: vi.fn().mockResolvedValue({ displays: [] }),
   getWearDetail: vi.fn().mockRejectedValue(new Error("unexpected wear detail request")),
   getOperations: vi.fn().mockResolvedValue({
@@ -131,6 +135,7 @@ function renderDisplayCard(id: string, display: DisplaySnapshot) {
       zones: [],
       displays: [[id, display]],
       pending_reload: null,
+      kvm: { keymap: {}, switch_capable_displays: [id], activity_following: false, push_capable_displays: [] },
     },
     displayConfigs: {
       [id]: { controllers: [], blank_mode: "power_off" } as DisplayConfig,
@@ -336,6 +341,88 @@ describe("Displays", () => {
     expect(screen.getByText("● ON")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force blank" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force wake" })).toBeInTheDocument();
+  });
+  it("switch-to-here button calls postSwitch", async () => {
+    renderDisplayCard("shared-tv", sharedDisplay());
+    fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
+    await waitFor(() => expect(mocks.postSwitch).toHaveBeenCalledWith("shared-tv"));
+  });
+
+  it("does not render send-to-peer button when peer code not configured", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
+      },
+      displayConfigs: {
+        "shared-tv": { controllers: [], blank_mode: "power_off", scope: "shared" } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
+  });
+
+  it("send-to-peer button calls postPush, not postSwitch", async () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
+      },
+      displayConfigs: {
+        "shared-tv": {
+          controllers: [],
+          blank_mode: "power_off",
+          scope: "shared",
+          shared_peer_input_write_code: 96,
+        } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    const btn = screen.getByRole("button", { name: "Send to peer" });
+    expect(btn).toBeInTheDocument();
+    fireEvent.click(btn);
+    await waitFor(() => expect(mocks.postPush).toHaveBeenCalledWith("shared-tv"));
+    expect(mocks.postSwitch).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a failed push as an error", async () => {
+    mocks.postPush.mockRejectedValueOnce(new Error("write failed: DDC bus unreachable"));
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
+      },
+      displayConfigs: {
+        "shared-tv": {
+          controllers: [],
+          blank_mode: "power_off",
+          scope: "shared",
+          shared_peer_input_write_code: 96,
+        } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    fireEvent.click(screen.getByRole("button", { name: "Send to peer" }));
+    expect(await screen.findByText("write failed: DDC bus unreachable")).toBeInTheDocument();
+  });
+
+  it("surfaces a failed switch as an error", async () => {
+    mocks.postSwitch.mockRejectedValueOnce(new Error("write failed: DDC bus unreachable"));
+    renderDisplayCard("shared-tv", sharedDisplay());
+    fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
+    expect(await screen.findByText("write failed: DDC bus unreachable")).toBeInTheDocument();
   });
 });
 

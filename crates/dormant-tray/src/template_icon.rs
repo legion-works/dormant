@@ -147,6 +147,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

@@ -45,6 +45,11 @@ ddc-hi = { workspace = true }
 # "keep the FFI layer thin" instruction.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8.7"
+# Direct access to the vendored ddc-macos fork's `Monitor::edid()` so the
+# macOS arm of `RealVcp::list_displays` can backfill the EDID identity fields
+# ddc-hi's `DisplayInfo::from_edid` leaves empty on macOS (spec F5). Resolves
+# to vendor/ddc-macos via the workspace `[patch.crates-io]`.
+ddc-macos = "0.2.2"
 
 [features]
 # Enables the rcgen-based TLS handshake integration test.

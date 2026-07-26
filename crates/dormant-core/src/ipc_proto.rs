@@ -63,89 +63,21 @@ pub enum IpcRequest {
         /// Display id to exercise.
         display: String,
     },
-    /// Open a short-lived responder window for instance pairing.
-    CoordinationPairOpen {
-        /// Local display name to bind into the pairing transcript.
-        display_name: String,
+    /// Write the local input code to pull the display to this
+    /// machine.  Replied via ordinary [`IpcResponse::ok`] /
+    /// [`IpcResponse::error`].
+    SwitchToLocal {
+        /// Display id (matches a `[displays.<id>]` key).
+        display: String,
     },
-    /// Join a discovered instance pairing window.
-    CoordinationPairJoin {
-        /// Discovered peer display name.
-        display_name: String,
-        /// Discovered peer public instance identifier.
-        instance_id: String,
-        /// Operator-entered eight-character pairing code. It is never echoed.
-        code: String,
+    /// Write the peer input code to push the display away.
+    /// Configuration-gated on `shared_peer_input_write_code`;
+    /// returns an error when absent.
+    SwitchToPeer {
+        /// Display id (matches a `[displays.<id>]` key with
+        /// `scope = "shared"`).
+        display: String,
     },
-    /// Fetch non-secret state for a local responder pairing window.
-    CoordinationPairStatus {
-        /// Opaque pairing-window identifier.
-        pair_id: String,
-    },
-    /// Cancel a local responder pairing window.
-    CoordinationPairCancel {
-        /// Opaque pairing-window identifier.
-        pair_id: String,
-    },
-    /// List public mDNS discoveries and persisted paired instances.
-    CoordinationPeersList,
-}
-
-/// Non-secret state exposed for a local instance-pairing window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinationPairStatus {
-    /// Opaque local pairing-window identifier.
-    pub pair_id: String,
-    /// Public lifecycle state (`pairing`, `paired`, `timeout`, `cancelled`, or `error`).
-    /// Consumers must validate this bounded producer vocabulary before switching on it.
-    pub state: String,
-    /// Public peer identity once pairing succeeds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_instance_id: Option<String>,
-}
-
-/// One-time secret response returned only when opening a pairing window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinationPairOpenResponse {
-    /// Opaque local pairing-window identifier.
-    pub pair_id: String,
-    /// Eight-character code shown to the local operator exactly once.
-    pub code: String,
-    /// RFC 3339 UTC expiry timestamp for the displayed code.
-    pub expires_at: String,
-}
-
-/// Public discovery information suitable for operator selection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinationDiscoveredPeer {
-    /// Public peer identity.
-    pub instance_id: String,
-    /// Operator-selected name advertised by the peer.
-    pub display_name: String,
-    /// Responder pairing port.
-    pub pairing_port: u16,
-    /// Current responder window identifier.
-    pub window_id: String,
-}
-
-/// Public persisted pairing information suitable for operator display.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinationPairedPeer {
-    /// Public peer identity.
-    pub instance_id: String,
-    /// Operator-selected peer label.
-    pub display_name: String,
-    /// RFC 3339 timestamp for the completed pairing.
-    pub paired_at: String,
-}
-
-/// Read-only public pairing inventory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoordinationPeers {
-    /// Currently discovered responder windows.
-    pub discovered: Vec<CoordinationDiscoveredPeer>,
-    /// Persisted paired peers.
-    pub paired: Vec<CoordinationPairedPeer>,
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -174,15 +106,6 @@ pub struct IpcResponse {
     /// exactly the same JSON as before this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exercise_report: Option<ExerciseReport>,
-    /// Public state for instance-pairing IPC requests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coordination_pair: Option<CoordinationPairStatus>,
-    /// One-time responder-window open result. Status responses never populate it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coordination_pair_open: Option<CoordinationPairOpenResponse>,
-    /// Read-only public pairing inventory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coordination_peers: Option<CoordinationPeers>,
 }
 
 impl IpcResponse {
@@ -196,9 +119,6 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: None,
-            coordination_pair: None,
-            coordination_pair_open: None,
-            coordination_peers: None,
         }
     }
 
@@ -212,9 +132,6 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: None,
-            coordination_pair: None,
-            coordination_pair_open: None,
-            coordination_peers: None,
         }
     }
 
@@ -228,9 +145,6 @@ impl IpcResponse {
             doctor_report: Some(report),
             emergency_report: None,
             exercise_report: None,
-            coordination_pair: None,
-            coordination_pair_open: None,
-            coordination_peers: None,
         }
     }
 
@@ -244,9 +158,6 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: Some(report),
             exercise_report: None,
-            coordination_pair: None,
-            coordination_pair_open: None,
-            coordination_peers: None,
         }
     }
 
@@ -260,57 +171,6 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: Some(report),
-            coordination_pair: None,
-            coordination_pair_open: None,
-            coordination_peers: None,
-        }
-    }
-
-    /// Build a response carrying non-secret instance-pairing status.
-    #[must_use]
-    pub fn coordination_pair(status: CoordinationPairStatus) -> Self {
-        Self {
-            ok: true,
-            error: None,
-            snapshot: None,
-            doctor_report: None,
-            emergency_report: None,
-            exercise_report: None,
-            coordination_pair: Some(status),
-            coordination_pair_open: None,
-            coordination_peers: None,
-        }
-    }
-
-    /// Build the one-time local operator response for a pairing-window open request.
-    #[must_use]
-    pub fn coordination_pair_open(open: CoordinationPairOpenResponse) -> Self {
-        Self {
-            ok: true,
-            error: None,
-            snapshot: None,
-            doctor_report: None,
-            emergency_report: None,
-            exercise_report: None,
-            coordination_pair: None,
-            coordination_pair_open: Some(open),
-            coordination_peers: None,
-        }
-    }
-
-    /// Build a response carrying the public pairing inventory.
-    #[must_use]
-    pub fn coordination_peers(peers: CoordinationPeers) -> Self {
-        Self {
-            ok: true,
-            error: None,
-            snapshot: None,
-            doctor_report: None,
-            emergency_report: None,
-            exercise_report: None,
-            coordination_pair: None,
-            coordination_pair_open: None,
-            coordination_peers: Some(peers),
         }
     }
 }
@@ -473,6 +333,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn request_switch_to_local_serde() {
+        let req = IpcRequest::SwitchToLocal {
+            display: "desk".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"switch_to_local","display":"desk"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::SwitchToLocal { display } => assert_eq!(display, "desk"),
+            _ => panic!("expected SwitchToLocal"),
+        }
+    }
+
+    #[test]
+    fn request_switch_to_peer_serde() {
+        let req = IpcRequest::SwitchToPeer {
+            display: "tv".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"switch_to_peer","display":"tv"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::SwitchToPeer { display } => assert_eq!(display, "tv"),
+            _ => panic!("expected SwitchToPeer"),
+        }
+    }
+
     // ── IpcResponse serde round-trips ──────────────────────────────────────
 
     #[test]
@@ -506,6 +394,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let resp = IpcResponse::ok(Some(snap));
         let json = serde_json::to_string(&resp).unwrap();
@@ -676,53 +565,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn coordination_pair_open_serializes_without_secret_response_fields() {
-        let request = IpcRequest::CoordinationPairOpen {
-            display_name: "Office Mac".to_owned(),
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert_eq!(
-            json,
-            r#"{"req":"coordination_pair_open","display_name":"Office Mac"}"#
-        );
-        assert!(!json.contains("code"));
-    }
-
-    #[test]
-    fn coordination_pair_open_response_carries_code_once_status_stays_secret_free() {
-        let open = IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
-            pair_id: "pair-id".to_owned(),
-            code: "ABCD1234".to_owned(),
-            expires_at: "2026-07-21T12:00:00Z".to_owned(),
-        });
-        let open_json = serde_json::to_string(&open).unwrap();
-        assert!(open_json.contains("ABCD1234"));
-        assert!(open_json.contains("expires_at"));
-
-        let status = IpcResponse::coordination_pair(CoordinationPairStatus {
-            pair_id: "pair-id".to_owned(),
-            state: "pairing".to_owned(),
-            peer_instance_id: None,
-        });
-        let status_json = serde_json::to_string(&status).unwrap();
-        assert!(!status_json.contains("ABCD1234"));
-        assert!(!status_json.contains("expires_at"));
-    }
-
-    #[test]
-    fn coordination_pair_response_is_additive_and_old_ok_shape_survives() {
-        let old = serde_json::to_string(&IpcResponse::ok(None)).unwrap();
-        assert_eq!(old, r#"{"ok":true}"#);
-
-        let response = IpcResponse::coordination_pair(CoordinationPairStatus {
-            pair_id: "pair-id".to_owned(),
-            state: "pairing".to_owned(),
-            peer_instance_id: None,
-        });
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains(r#""coordination_pair""#));
-        assert!(!json.contains("code"));
-        assert!(!json.contains("key"));
-    }
+    // (dead coordination pair tests removed — the types no longer exist)
 }

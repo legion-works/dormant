@@ -11,10 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{
-    CoordinationDiscoveredPeer, CoordinationPairOpenResponse, CoordinationPairStatus,
-    CoordinationPairedPeer, CoordinationPeers, IpcRequest, IpcResponse,
-};
+use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -25,8 +22,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::coordination_mdns::MdnsSdBackend;
-use crate::coordination_pairing::{PairingManager, PairingState, PairingTransport};
+use crate::direct_switch::{DirectSwitchHandle, SwitchReason};
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -55,31 +51,7 @@ pub fn spawn(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
-    cancel: CancellationToken,
-) -> Result<JoinHandle<()>> {
-    spawn_with_pairing(
-        socket_path,
-        ctl_tx,
-        reload_requester,
-        doctor_service,
-        Arc::new(PairingManager::new(
-            &dormant_core::paths::state_dir(),
-            false,
-            Duration::from_secs(300),
-        )?),
-        None,
-        cancel,
-    )
-}
-
-/// Spawn the IPC server with the daemon-lifetime instance-pairing manager.
-pub(crate) fn spawn_with_pairing(
-    socket_path: &Path,
-    ctl_tx: mpsc::Sender<ControlMsg>,
-    reload_requester: ReloadRequester,
-    doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    direct_switch: Arc<DirectSwitchHandle>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -161,8 +133,7 @@ pub(crate) fn spawn_with_pairing(
             ctl_tx,
             reload_requester,
             doctor_service,
-            pairing,
-            pairing_transport,
+            direct_switch,
             cancel,
             &socket_owned,
         )
@@ -182,8 +153,7 @@ async fn run(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    direct_switch: Arc<DirectSwitchHandle>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -201,9 +171,8 @@ async fn run(
                         let ctl = ctl_tx.clone();
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
-                        let pairing = Arc::clone(&pairing);
-                        let pairing_transport = pairing_transport.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, pairing, pairing_transport));
+                        let ds = direct_switch.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -227,8 +196,7 @@ async fn handle_connection(
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
-    pairing: Arc<PairingManager>,
-    pairing_transport: Option<Arc<PairingTransport<MdnsSdBackend>>>,
+    direct_switch: Arc<DirectSwitchHandle>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -304,120 +272,15 @@ async fn handle_connection(
                 let resp = handle_exercise(&ctl_tx, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::CoordinationPairOpen { display_name } => {
-                let result = match pairing_transport.as_ref() {
-                    Some(transport) => transport.open(display_name).await,
-                    None => pairing.open(display_name),
-                };
-                let resp = match result {
-                    Ok(open) => IpcResponse::coordination_pair_open(CoordinationPairOpenResponse {
-                        pair_id: open.pair_id,
-                        code: open.code,
-                        expires_at: open.expires_at,
-                    }),
-                    Err(error) => IpcResponse::error(error.to_string()),
-                };
+            IpcRequest::SwitchToLocal { display } => {
+                let resp = handle_switch_local(&direct_switch, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::CoordinationPairJoin {
-                display_name,
-                instance_id,
-                code,
-            } => {
-                let resp = match pairing_transport.as_ref() {
-                    Some(transport) => transport
-                        .join(display_name, instance_id, code)
-                        .await
-                        .map_or_else(
-                            |error| IpcResponse::error(error.to_string()),
-                            |()| IpcResponse::ok(None),
-                        ),
-                    None => {
-                        IpcResponse::error(pairing.join_preflight(&instance_id).err().map_or_else(
-                            || "peer not discovered".to_owned(),
-                            |error| error.to_string(),
-                        ))
-                    }
-                };
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPairStatus { pair_id } => {
-                let resp = pairing.status(&pair_id).map_or_else(
-                    |error| IpcResponse::error(error.to_string()),
-                    pairing_response,
-                );
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPairCancel { pair_id } => {
-                let result = pairing_transport.as_ref().map_or_else(
-                    || pairing.cancel(&pair_id),
-                    |transport| transport.cancel(&pair_id),
-                );
-                let resp = result.map_or_else(
-                    |error| IpcResponse::error(error.to_string()),
-                    pairing_response,
-                );
-                let _ = write_json(&mut writer, &resp).await;
-            }
-            IpcRequest::CoordinationPeersList => {
-                let result: Result<
-                    CoordinationPeers,
-                    crate::coordination_pairing::PairSessionError,
-                > = (|| {
-                    let paired = pairing.paired_peers()?;
-                    let discovered = match pairing_transport.as_ref() {
-                        Some(transport) => {
-                            transport.kick_browse()?;
-                            transport
-                                .discovered_peers()
-                                .into_iter()
-                                .map(|peer| CoordinationDiscoveredPeer {
-                                    instance_id: peer.instance_id,
-                                    display_name: peer.display_name,
-                                    pairing_port: peer.pairing_port,
-                                    window_id: peer.window_id,
-                                })
-                                .collect()
-                        }
-                        None => Vec::new(),
-                    };
-                    Ok(CoordinationPeers {
-                        discovered,
-                        paired: paired
-                            .into_iter()
-                            .map(|peer| CoordinationPairedPeer {
-                                instance_id: peer.instance_id,
-                                display_name: peer.display_name,
-                                paired_at: peer.paired_at,
-                            })
-                            .collect(),
-                    })
-                })();
-                let resp = result.map_or_else(
-                    |error| IpcResponse::error(error.to_string()),
-                    IpcResponse::coordination_peers,
-                );
+            IpcRequest::SwitchToPeer { display } => {
+                let resp = handle_switch_peer(&direct_switch, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
         }
-    }
-}
-
-fn pairing_response(status: crate::coordination_pairing::PairingStatus) -> IpcResponse {
-    IpcResponse::coordination_pair(CoordinationPairStatus {
-        pair_id: status.pair_id,
-        state: pairing_state_name(status.state).to_owned(),
-        peer_instance_id: status.peer_instance_id,
-    })
-}
-
-const fn pairing_state_name(state: PairingState) -> &'static str {
-    match state {
-        PairingState::Pairing => "pairing",
-        PairingState::Paired => "paired",
-        PairingState::Cancelled => "cancelled",
-        PairingState::Timeout => "timeout",
-        PairingState::Error => "error",
     }
 }
 
@@ -602,6 +465,55 @@ async fn request_snapshot(ctl_tx: &mpsc::Sender<ControlMsg>) -> Option<StateSnap
         .ok()
 }
 
+/// Handle a direct local switch — write the local input code.
+async fn handle_switch_local(direct_switch: &DirectSwitchHandle, display: &str) -> IpcResponse {
+    let outcome = direct_switch
+        .pull(
+            dormant_core::types::DisplayId(display.to_string()),
+            SwitchReason::Cli,
+        )
+        .await;
+    switch_outcome_to_response(outcome, display)
+}
+
+/// Handle a direct peer switch — write the peer input code.
+async fn handle_switch_peer(direct_switch: &DirectSwitchHandle, display: &str) -> IpcResponse {
+    let outcome = direct_switch
+        .push(
+            dormant_core::types::DisplayId(display.to_string()),
+            SwitchReason::Cli,
+        )
+        .await;
+    switch_outcome_to_response(outcome, display)
+}
+
+/// Map a [`SwitchOutcome`] to an [`IpcResponse`], with specific errors for
+/// each failure mode so the operator can distinguish "no such display" from
+/// "this display isn't shared" from "the write failed."
+fn switch_outcome_to_response(
+    outcome: crate::direct_switch::SwitchOutcome,
+    display: &str,
+) -> IpcResponse {
+    match outcome {
+        crate::direct_switch::SwitchOutcome::Switched => IpcResponse::ok(None),
+        crate::direct_switch::SwitchOutcome::NotConfigured => IpcResponse::error(format!(
+            "display '{display}' is shared but peer input write code is not configured"
+        )),
+        crate::direct_switch::SwitchOutcome::Unsupported => IpcResponse::error(format!(
+            "display '{display}' is not shared or has no input code configured"
+        )),
+        crate::direct_switch::SwitchOutcome::HookAborted { reason } => {
+            IpcResponse::error(format!("switch hook aborted: {reason}"))
+        }
+        crate::direct_switch::SwitchOutcome::WriteFailed { error } => {
+            IpcResponse::error(format!("write failed: {error}"))
+        }
+        crate::direct_switch::SwitchOutcome::Cooldown => {
+            IpcResponse::error("switch suppressed by activity cooldown")
+        }
+    }
+}
+
 /// Validate that a display name exists in the current engine snapshot.
 /// Returns `Some(error_response)` if the display is unknown.
 async fn validate_display_name(
@@ -692,6 +604,8 @@ mod tests {
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use dormant_doctor::DoctorService;
 
+    use super::DirectSwitchHandle;
+
     /// Minimal fake engine for unit tests.
     fn fake_engine() -> (mpsc::Sender<super::ControlMsg>, CancellationToken) {
         let (tx, _rx) = mpsc::channel(64);
@@ -699,6 +613,37 @@ mod tests {
         // Drop rx immediately — the IPC server will get send errors and
         // respond with "engine not available", which is fine for these tests.
         (tx, cancel)
+    }
+
+    /// Build a throwaway [`DirectSwitchHandle`] with no displays — all
+    /// switch attempts will return `Unsupported`.
+    fn fake_direct_switch(ctl_tx: mpsc::Sender<super::ControlMsg>) -> Arc<DirectSwitchHandle> {
+        use std::collections::HashMap;
+
+        let (_, executors_rx) = watch::channel(Arc::new(HashMap::new()));
+        let (_, config_rx) = watch::channel(Arc::new(Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays: IndexMap::default(),
+            rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+        }));
+        let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
+        let hook_engine = Arc::new(crate::hooks::HookEngine::new(publisher));
+        Arc::new(DirectSwitchHandle::new(
+            executors_rx,
+            config_rx,
+            hook_engine,
+            ctl_tx,
+        ))
     }
 
     /// Build a throwaway `DoctorService` wired to a dummy channel/watch
@@ -716,6 +661,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
         drop(config_tx);
@@ -756,12 +703,14 @@ mod tests {
         let (ctl_tx, cancel) = fake_engine();
         let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let doctor = fake_doctor(ctl_tx.clone());
+        let ds = fake_direct_switch(ctl_tx.clone());
 
         let result = crate::ipc::spawn(
             &socket_path,
             ctl_tx,
             dormant_core::reload::ReloadRequester::new(reload_tx),
             doctor,
+            ds,
             cancel,
         );
         assert!(result.is_err(), "group-writable parent should be rejected");
@@ -780,12 +729,14 @@ mod tests {
         let (ctl_tx, cancel) = fake_engine();
         let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
         let doctor = fake_doctor(ctl_tx.clone());
+        let ds = fake_direct_switch(ctl_tx.clone());
 
         let result = crate::ipc::spawn(
             &socket_path,
             ctl_tx,
             dormant_core::reload::ReloadRequester::new(reload_tx),
             doctor,
+            ds,
             cancel.clone(),
         );
         assert!(

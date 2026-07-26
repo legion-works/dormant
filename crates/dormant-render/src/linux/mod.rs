@@ -210,4 +210,18 @@ impl RenderSink for LayerShellRenderSink {
             let _ = reply_rx.await;
         }
     }
+
+    async fn show_current_overlay(&self) -> Result<(), CmdFailure> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Result<(), CmdFailure>>();
+        self.cmd_tx
+            .send(RenderCommand::ReassertOverlay { reply: reply_tx })
+            .map_err(|_send_err| CmdFailure {
+                controller: "render-black".into(),
+                error: format!("{E_RENDER_UNAVAILABLE}: wayland thread not running"),
+            })?;
+        reply_rx.await.map_err(|_recv_err| CmdFailure {
+            controller: "render-black".into(),
+            error: format!("{E_RENDER_UNAVAILABLE}: wayland thread dropped reply"),
+        })?
+    }
 }

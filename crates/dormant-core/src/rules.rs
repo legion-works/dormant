@@ -33,7 +33,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -140,6 +140,22 @@ pub enum ControlMsg {
     SetPendingReload(Option<String>),
     /// Set or clear boot-time rollback metadata in snapshots.
     SetRollback(Option<RollbackStatus>),
+    /// Set or clear the F10-claim-suppression deadline for `display`.
+    /// `Some(deadline)` lifts the ownership-loss reaction for the
+    /// `display` until that `Instant`; `None` clears it
+    /// immediately. Owned and consulted by the rules engine;
+    /// driven by the claim runtime in `dormantd`.
+    SetClaimSuppression {
+        /// Target display.
+        display: DisplayId,
+        /// Suppression deadline (`None` = clear).
+        until: Option<Instant>,
+    },
+    /// Replace the [`KvmStatus`] the rules engine publishes in
+    /// every [`StateSnapshot`]. Driven by the orchestrator on
+    /// every successful generation install (fresh and reload)
+    /// from the post-probe claim-capable display set.
+    SetKvmStatus(KvmStatus),
     /// Input-wake event from the render surface — route to the display
     /// machine's [`Input::InputWake`].
     InputWake(DisplayId),
@@ -567,6 +583,33 @@ pub struct StateSnapshot {
     /// Boot-time rollback metadata, omitted when no rollback is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackStatus>,
+    /// KVM-switch status payload (resolved keymap, switch-capable
+    /// display set, activity-follow state). Additive — older
+    /// clients omit the key. `#[serde(default)]` so legacy
+    /// snapshots without the key deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvm: Option<KvmStatus>,
+}
+
+/// KVM-switch snapshot payload — the tray refetches this on every
+/// `ConfigReloaded` event (spec §3, IPC contract).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvmStatus {
+    /// Resolved keymap (`keymap.claim_hotkey`).
+    #[serde(default)]
+    pub keymap: crate::config::KeymapConfig,
+    /// Post-probe switch-capable display set (shared scope AND
+    /// input-source write capable AND configured local read code).
+    /// Claim identity no longer participates.
+    #[serde(default)]
+    pub switch_capable_displays: Vec<crate::types::DisplayId>,
+    /// Whether the activity-follow task is running.
+    #[serde(default)]
+    pub activity_following: bool,
+    /// Post-probe push-capable display ids — shared scope, write capable,
+    /// with `shared_peer_input_write_code` configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub push_capable_displays: Vec<crate::types::DisplayId>,
 }
 
 // ── Per-runtime configuration shapes ─────────────────────────────────────────
@@ -809,6 +852,23 @@ pub struct RulesEngine {
     /// Drained into timer / dispatch structures at the start of
     /// [`RulesEngine::run`].
     pending_restore: Vec<(DisplayId, Vec<Effect>)>,
+    /// KVM-switch snapshot payload (keymap + claim-capable
+    /// displays + activity-claim policy). Updated by the
+    /// orchestrator on every successful generation install; the
+    /// rules engine reads it from
+    /// [`RulesEngine::send_snapshot`]. `None` until the first
+    /// orchestrator-side install completes.
+    kvm: Option<KvmStatus>,
+    /// Per-display F10 suppression deadlines (set by
+    /// [`ControlMsg::SetClaimSuppression`]). When the rules engine
+    /// receives a `ControlMsg::OwnershipPoll` for a display whose
+    /// suppression deadline is in the future, the ownership-loss
+    /// reaction is suppressed (the engine does not feed
+    /// `Input::OwnershipChanged(false)` to the state machine). The
+    /// claim runtime owns this side-table; the orchestrator wires
+    /// it through the standard control channel.
+    #[allow(clippy::type_complexity)]
+    claim_suppression: HashMap<DisplayId, Instant>,
 }
 
 impl RulesEngine {
@@ -914,6 +974,8 @@ impl RulesEngine {
             observations: None,
             pending_reload: None,
             rollback: None,
+            kvm: None,
+            claim_suppression: HashMap::new(),
             pending_restore: Vec::new(),
         })
     }
@@ -1261,6 +1323,17 @@ impl RulesEngine {
             }
             ControlMsg::SetPendingReload(detail) => self.set_pending_reload(detail),
             ControlMsg::SetRollback(status) => self.set_rollback(status),
+            ControlMsg::SetClaimSuppression { display, until } => match until {
+                Some(deadline) => {
+                    self.claim_suppression.insert(display, deadline);
+                }
+                None => {
+                    self.claim_suppression.remove(&display);
+                }
+            },
+            ControlMsg::SetKvmStatus(status) => {
+                self.kvm = Some(status);
+            }
             ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
             ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply),
             ControlMsg::GenerationBarrier(ack) => {
@@ -1677,10 +1750,27 @@ impl RulesEngine {
     ///
     /// Processes any effects the machine produced (e.g. teardown-render on
     /// ownership-yield). When the gate returns the same value as last time,
-    /// this is a no-op.
+    /// this is a no-op. F10: an in-flight claim's expected flip
+    /// (a `false`-direction verdict) is suppressed — the rules
+    /// engine does NOT feed `Input::OwnershipChanged(false)` to
+    /// the state machine while the claim suppression deadline is
+    /// in the future. `true`-direction (re-acquire) flips still
+    /// feed normally.
     fn feed_ownership(&mut self, display: &DisplayId, now: Tick) {
         let owns = self.ownership.owns(display);
         if self.last_owned.get(display) == Some(&owns) {
+            return;
+        }
+        // F10: a foreign ownership loss during an in-flight claim
+        // is the claim's expected flip. Suppress the loss reaction.
+        if !owns
+            && let Some(deadline) = self.claim_suppression.get(display).copied()
+            && now.0 < deadline
+        {
+            // Track the suppressed verdict so a later no-op
+            // doesn't refire the feed once the suppression lifts —
+            // we re-evaluate at the next non-suppressed tick.
+            self.last_owned.insert(display.clone(), true);
             return;
         }
         self.last_owned.insert(display.clone(), owns);
@@ -1766,6 +1856,7 @@ impl RulesEngine {
             displays,
             pending_reload: self.pending_reload.clone(),
             rollback: self.rollback.clone(),
+            kvm: self.kvm.clone(),
         });
     }
 
@@ -3175,6 +3266,117 @@ mod tests {
         rx.try_recv().expect("snapshot reply sent inline")
     }
 
+    /// F10: a foreign ownership-loss feed is suppressed when
+    /// the claim runtime has armed a suppression deadline. The
+    /// rules engine does NOT feed
+    /// `Input::OwnershipChanged(false)` while the deadline is
+    /// in the future. Once the deadline elapses, the next
+    /// ownership-poll feeds normally.
+    #[tokio::test]
+    async fn f10_claim_suppression_gates_ownership_loss_feed() {
+        use crate::ownership::OwnershipGate;
+        // A test ownership gate that holds a single verdict;
+        // we drive the suppression round-trip without flipping
+        // the gate (the rules engine consults the suppression
+        // gate BEFORE the ownership gate for the loss path,
+        // so the state machine never moves when suppression
+        // is armed).
+        struct HeldGate {
+            owned: std::sync::Mutex<bool>,
+        }
+        impl OwnershipGate for HeldGate {
+            fn owns(&self, _display: &DisplayId) -> bool {
+                *self.owned.lock().unwrap()
+            }
+        }
+        let gate: Arc<dyn OwnershipGate> = Arc::new(HeldGate {
+            owned: std::sync::Mutex::new(true),
+        });
+        let cfg = RulesEngineConfig {
+            rules: vec![],
+            displays: vec![DisplayRuntimeCfg {
+                display: DisplayId("mon".into()),
+                blank_mode: crate::types::BlankMode::PowerOff,
+                timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                ladder: vec![],
+            }],
+            sensors: vec![],
+            doctor_wake_settle: Duration::from_secs(3),
+        };
+        let mut engine = RulesEngine::new(
+            cfg,
+            ZoneEngine::new(vec![], &[]).expect("empty zones"),
+            HashMap::new(),
+            HashMap::new(),
+            gate.clone(),
+        )
+        .expect("valid config");
+        let display = DisplayId("mon".into());
+        // Arm a future suppression deadline (F10 active).
+        let future = Instant::now() + Duration::from_secs(60);
+        engine.handle_control(ControlMsg::SetClaimSuppression {
+            display: display.clone(),
+            until: Some(future),
+        });
+        // Drive a foreign ownership-loss feed — the loss is
+        // NOT fed (suppression lifts it). The state
+        // machine's phase for `mon` remains the seed value.
+        engine.handle_control(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        });
+        let snap = snapshot_of(&mut engine);
+        let d = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon in snapshot");
+        assert_eq!(
+            d.1.phase, "active",
+            "ownership-loss feed is suppressed by the claim deadline"
+        );
+        assert!(d.1.owned, "ownership gate still says owned=true (pre-flip)");
+
+        // Lift the suppression and re-feed — still owned, no
+        // transition expected (the gate hasn't flipped).
+        engine.handle_control(ControlMsg::SetClaimSuppression {
+            display: display.clone(),
+            until: None,
+        });
+        engine.handle_control(ControlMsg::OwnershipPoll {
+            display: display.clone(),
+        });
+        let snap = snapshot_of(&mut engine);
+        let d = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon in snapshot");
+        assert_eq!(d.1.phase, "active");
+    }
+
+    /// `KvmStatus`: `SetKvmStatus` replaces the snapshot fold.
+    #[tokio::test]
+    async fn kvm_status_set_replaces_snapshot_fold() {
+        use crate::config::KeymapConfig;
+        let mut engine = minimal_engine();
+        let status = crate::rules::KvmStatus {
+            keymap: KeymapConfig {
+                claim_hotkey: Some("Meta+F12".to_owned()),
+            },
+            switch_capable_displays: vec![DisplayId("mon".into())],
+            activity_following: true,
+            push_capable_displays: vec![],
+        };
+        engine.handle_control(ControlMsg::SetKvmStatus(status));
+        let snap = snapshot_of(&mut engine);
+        let kvm = snap
+            .kvm
+            .expect("KvmStatus populated by SetKvmStatus control message");
+        assert_eq!(kvm.switch_capable_displays, vec![DisplayId("mon".into())]);
+        assert!(kvm.activity_following);
+        assert_eq!(kvm.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
+    }
+
     #[tokio::test]
     async fn generation_barrier_drains_before_ack() {
         let (events_tx, events_rx) = mpsc::channel(4);
@@ -3736,6 +3938,8 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         observations: None,
         pending_reload: None,
         rollback: None,
+        kvm: None,
+        claim_suppression: HashMap::new(),
         pending_restore: Vec::new(),
     };
 
@@ -3838,6 +4042,8 @@ fn install_restored_never_owned_refeed_not_dropped() {
         observations: None,
         pending_reload: None,
         rollback: None,
+        kvm: None,
+        claim_suppression: HashMap::new(),
         pending_restore: Vec::new(),
     };
 

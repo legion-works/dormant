@@ -984,6 +984,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -1015,6 +1016,8 @@ mod tests {
             notifications: dormant_core::config::schema::NotificationsConfig::default(),
             watchdog: dormant_core::config::schema::WatchdogConfig::default(),
             audio: dormant_core::config::schema::AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -1027,6 +1030,10 @@ mod tests {
         dormant_core::config::schema::DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: controllers.iter().map(|s| (*s).to_string()).collect(),
             blank_mode: None,
             degraded_mode: None,

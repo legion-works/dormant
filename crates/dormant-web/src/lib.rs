@@ -30,6 +30,43 @@ use tokio::task::JoinHandle;
 
 pub use state::{WebState, WebStateInner, WebStateInnerParams};
 
+pub(crate) async fn request_daemon_ipc(
+    state: &WebState,
+    request: dormant_core::ipc_proto::IpcRequest,
+) -> Result<dormant_core::ipc_proto::IpcResponse, error::WebError> {
+    let socket = dormant_core::paths::resolve_socket_path(
+        state.inner.config_rx.borrow().daemon.socket_path.as_deref(),
+    );
+    tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixStream;
+
+            let mut stream = UnixStream::connect(socket)
+                .map_err(|_| error::WebError::CoordinationUnavailable)?;
+            let line = serde_json::to_string(&request)
+                .map_err(|_| error::WebError::CoordinationUnavailable)?;
+            writeln!(stream, "{line}").map_err(|_| error::WebError::CoordinationUnavailable)?;
+            stream
+                .flush()
+                .map_err(|_| error::WebError::CoordinationUnavailable)?;
+            let mut line = String::new();
+            BufReader::new(stream)
+                .read_line(&mut line)
+                .map_err(|_| error::WebError::CoordinationUnavailable)?;
+            serde_json::from_str(&line).map_err(|_| error::WebError::CoordinationUnavailable)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (socket, request);
+            Err(error::WebError::CoordinationUnavailable)
+        }
+    })
+    .await
+    .map_err(|_| error::WebError::CoordinationUnavailable)?
+}
+
 /// Spawn the web server on `bind`, returning a [`JoinHandle`] for the
 /// server task together with the resolved [`SocketAddr`] (useful when
 /// `bind` uses port 0 for an ephemeral assignment).
@@ -161,6 +198,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
 
@@ -207,6 +246,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
 
         let ctl_tx = spawn_fake_engine(snapshot.clone());
@@ -249,6 +289,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
 
         let ctl_tx = spawn_fake_engine(snapshot);

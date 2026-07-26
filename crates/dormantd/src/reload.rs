@@ -290,6 +290,9 @@ mod dispatch_gate_tests {
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
             controllers: vec!["ddcci".into()],
             blank_mode: Some(dormant_core::types::BlankMode::PowerOff),
             degraded_mode: None,
@@ -312,6 +315,7 @@ mod dispatch_gate_tests {
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::default(),
+            hooks: dormant_core::config::HookSlots::default(),
         }
     }
 
@@ -347,6 +351,8 @@ mod dispatch_gate_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -377,6 +383,7 @@ mod dispatch_gate_tests {
                 .collect(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -473,6 +480,7 @@ mod dispatch_gate_tests {
             displays: Vec::new(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

@@ -40,13 +40,7 @@ const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 /// mounted, it is already strict by construction — there is no window
 /// where a forgotten classification decision defaults to the weaker
 /// same-origin check.
-pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &[
-    "/api/config/apply",
-    "/api/pair/samsung",
-    "/api/pair/instance",
-    "/api/pair/instance/join",
-    "/api/pair/instance/:id/cancel",
-];
+pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &["/api/config/apply", "/api/pair/samsung"];
 
 /// Full `/api`-prefixed `POST` routes that are deliberately left on the
 /// generic same-origin check (`is_same_origin`) rather than the strict
@@ -68,6 +62,8 @@ pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &[
 pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/blank",
     "/api/wake",
+    "/api/switch",
+    "/api/push",
     "/api/pause",
     "/api/resume",
     "/api/reload",
@@ -351,6 +347,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
 

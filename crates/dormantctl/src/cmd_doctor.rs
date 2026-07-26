@@ -113,6 +113,9 @@ pub enum DoctorSubcommand {
     MacosPower,
     /// Probe Samsung Tizen displays (reachability, power state, token).
     Samsung,
+    /// Probe the evdev input-filter backend — confirms `/dev/input/event*`
+    /// nodes are readable when `ignore_devices` is configured.
+    InputFilter,
     /// Control-path verification: blank → read → wake → read → restore a
     /// single display and report whether each step demonstrably moved the
     /// panel.
@@ -142,6 +145,7 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorOutcome> {
     rt.block_on(run_async(args))
 }
 
+#[allow(clippy::too_many_lines)] // match arms are mechanical dispatches, not logic
 async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
     if args.report_issue.is_some() || args.draft_feature.is_some() {
         if args.subcommand.is_some() {
@@ -229,6 +233,18 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
                 println!("{n}");
             }
             let results = dormant_doctor::probe_samsung(&cfg, &creds).await;
+            print_table(&results);
+            Ok(outcome(&results))
+        }
+        Some(DoctorSubcommand::InputFilter) => {
+            let (cfg, _creds, note) = load_config_and_creds(args)?;
+            if let Some(n) = &note {
+                println!("{n}");
+            }
+            let ignore_devices: Option<Vec<String>> = Some(cfg.input_filter.ignore_devices.clone());
+            let results = vec![dormant_doctor::probe_input_filter(
+                ignore_devices.as_deref(),
+            )];
             print_table(&results);
             Ok(outcome(&results))
         }

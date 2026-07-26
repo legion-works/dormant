@@ -52,6 +52,7 @@ const DDCUTIL_TIMEOUT: Duration = Duration::from_secs(5);
 /// from the `ddc-hi` reads alone.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 enum DdcutilOutcome {
     /// The `ddcutil` executable is not on `PATH` (`io::ErrorKind::NotFound`).
     /// The overwhelmingly common case: `ddcutil` is an optional package most
@@ -77,6 +78,7 @@ enum DdcutilOutcome {
 /// bus. [`RealDdcutil`] is the only production implementation.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait::async_trait]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 trait DdcutilOps: Send + Sync {
     /// Run `ddcutil detect --brief`, bounded by `timeout`.
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome;
@@ -90,6 +92,7 @@ trait DdcutilOps: Send + Sync {
 /// [`format_second_opinion`]; it is never retried with different arguments
 /// or through a shell.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 struct RealDdcutil {
     /// Program name/path passed to `Command::new`. Production code always
     /// uses the default `"ddcutil"` (a bare name resolved via `PATH` at
@@ -100,6 +103,7 @@ struct RealDdcutil {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl RealDdcutil {
     /// Production constructor: resolves `ddcutil` via `PATH` at spawn time,
     /// exactly as before this seam existed.
@@ -122,6 +126,7 @@ impl RealDdcutil {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait::async_trait]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl DdcutilOps for RealDdcutil {
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome {
         let child = tokio::process::Command::new(&self.program)
@@ -149,6 +154,7 @@ impl DdcutilOps for RealDdcutil {
 /// either; it only gives the operator a second view of the bus so a
 /// phantom display (one tool sees it, the other doesn't) is easy to spot.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn format_second_opinion(outcome: &DdcutilOutcome) -> String {
     match outcome {
         DdcutilOutcome::NotInstalled => "ddcutil: not installed".to_string(),
@@ -203,6 +209,7 @@ async fn probe_ddcci_with(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 async fn probe_ddcci_with_locks(
     ops: &impl VcpOps,
     ddcutil: &impl DdcutilOps,
@@ -211,6 +218,7 @@ async fn probe_ddcci_with_locks(
 ) -> ProbeResult {
     let displays = ops.list_displays().await;
 
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let (all_ok, mut detail) = if displays.is_empty() {
         (false, "no DDC/CI displays detected".to_string())
     } else {
@@ -266,6 +274,11 @@ async fn probe_ddcci_with_locks(
                 Err(error) if error == INPUT_SOURCE_SKIPPED => line.push_str("skipped"),
                 Err(_) => line.push_str("unreadable"),
             }
+            line.push_str(", claim_identity=");
+            match display.claim_identity() {
+                Some(id) => line.push_str(&id),
+                None => line.push_str("unavailable"),
+            }
             details.push(line);
         }
 
@@ -273,14 +286,21 @@ async fn probe_ddcci_with_locks(
     };
 
     // ddcutil is advisory (see module docs): its outcome is only ever
-    // appended below, never folded into `all_ok`.
-    let outcome = ddcutil.detect_brief(ddcutil_timeout).await;
-    let second_opinion = format_second_opinion(&outcome);
-    if detail.is_empty() {
-        detail = second_opinion;
-    } else {
-        detail.push('\n');
-        detail.push_str(&second_opinion);
+    // appended below, never folded into `all_ok`. Linux-only — `ddcutil` is a
+    // Linux I²C tool with no macOS build, so consulting it on macOS would
+    // unconditionally append "ddcutil: not installed" (a Linux-only check
+    // leaking into the macOS arm). The macOS arm reports the ddc-hi detail
+    // alone.
+    #[cfg(target_os = "linux")]
+    {
+        let outcome = ddcutil.detect_brief(ddcutil_timeout).await;
+        let second_opinion = format_second_opinion(&outcome);
+        if detail.is_empty() {
+            detail = second_opinion;
+        } else {
+            detail.push('\n');
+            detail.push_str(&second_opinion);
+        }
     }
 
     if all_ok {
@@ -306,6 +326,7 @@ mod tests {
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(target_os = "linux")]
     fn ddcutil_is_on_path() -> bool {
         let Some(path) = std::env::var_os("PATH") else {
             return false;
@@ -338,6 +359,9 @@ mod tests {
             Self {
                 displays: vec![VcpDisplayInfo {
                     ident_string: ident.to_string(),
+                    manufacturer: None,
+                    model: None,
+                    serial: None,
                 }],
                 responses,
             }
@@ -354,6 +378,9 @@ mod tests {
             Self {
                 displays: vec![VcpDisplayInfo {
                     ident_string: ident.to_string(),
+                    manufacturer: None,
+                    model: None,
+                    serial: None,
                 }],
                 responses,
             }
@@ -513,9 +540,59 @@ mod tests {
         );
     }
 
+    // ── F5: claim_identity in the ddcci probe detail ─────────────────────────
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_claim_identity() {
+        let vcp = FakeVcp {
+            displays: vec![VcpDisplayInfo {
+                ident_string: "i2c-dev:7 AOC AG326UZD".into(),
+                manufacturer: Some("AOC".into()),
+                model: Some("AG326UZD".into()),
+                serial: Some("ABC123".into()),
+            }],
+            responses: {
+                let mut r = HashMap::new();
+                r.insert(("i2c-dev:7 AOC AG326UZD".to_string(), 0x10), Ok(42));
+                r.insert(("i2c-dev:7 AOC AG326UZD".to_string(), 0xD6), Ok(1));
+                r
+            },
+        };
+        let result = probe_ddcci_with(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("claim_identity=AOC:AG326UZD:ABC123"),
+            "expected claim_identity in detail: {}",
+            result.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn ddcci_probe_reports_claim_identity_unavailable_when_edid_absent() {
+        let vcp = FakeVcp::single_ok("mon-1", 42);
+        let result = probe_ddcci_with(
+            &vcp,
+            &FakeDdcutil::new(DdcutilOutcome::NotInstalled),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result.status, ProbeStatus::Pass, "{result:?}");
+        assert!(
+            result.detail.contains("claim_identity=unavailable"),
+            "expected claim_identity=unavailable when EDID fields absent: {}",
+            result.detail
+        );
+    }
+
     // ── (a) executable missing ──────────────────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_missing_executable_leaves_ddchi_result_unchanged() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::NotInstalled);
@@ -539,6 +616,7 @@ mod tests {
     /// from `PATH`; developer hosts with the optional package installed skip
     /// this environment-specific assertion while CI preserves the coverage.
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn real_ddcutil_reports_not_installed_in_this_sandbox() {
         if ddcutil_is_on_path() {
             eprintln!(
@@ -556,6 +634,7 @@ mod tests {
     // ── (b) exit 0 with brief detect output ─────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_success_appends_normalized_second_opinion() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -577,6 +656,7 @@ mod tests {
     // ── (c) exit nonzero / "Invalid display" ────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_disagreement_does_not_flip_a_passing_ddchi_result() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -600,6 +680,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_agreement_does_not_rescue_a_failing_ddchi_result() {
         let vcp = FakeVcp::single_failing("mon-1");
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -619,6 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_disagreement_surfaces_phantom_bus_when_ddchi_finds_nothing() {
         let vcp = FakeVcp::none();
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::Completed {
@@ -637,6 +719,7 @@ mod tests {
     // ── (d) timeout ──────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn ddcutil_timeout_appends_timed_out_and_never_hangs() {
         let vcp = FakeVcp::single_ok("mon-1", 42);
         let ddcutil = FakeDdcutil::new(DdcutilOutcome::TimedOut);
@@ -666,6 +749,7 @@ mod tests {
     /// process (`sleep`) so the real `tokio::time::timeout` around
     /// `Command::output()` is exercised end to end.
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn real_ddcutil_enforces_bounded_timeout_against_a_slow_process() {
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("ddcutil");

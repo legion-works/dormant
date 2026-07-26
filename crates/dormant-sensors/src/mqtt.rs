@@ -41,6 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use dormant_core::config::schema::{MqttCredential, MqttSensorCfg};
+use dormant_core::mqtt::parse_broker_url;
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
 use rumqttc::mqttbytes::v4::SubscribeReasonCode;
@@ -608,26 +609,6 @@ pub fn availability_topic(topic: &str) -> String {
 // ── Backoff helpers ───────────────────────────────────────────────────────────
 
 // `next_backoff` lives in `crate::backoff` — shared with `ha_ws`.
-
-/// Parse a broker URL into (host, port).
-///
-/// Accepts `host:port`, `tcp://host:port`, `mqtt://host:port`.
-///
-/// Falls back to `(url, 1883)` when no port can be extracted — this is a
-/// best-effort parse; callers should validate the URL at config-load time.
-fn parse_broker_url(url: &str) -> (&str, u16) {
-    // Strip tcp:// or mqtt:// prefix.
-    let rest = url
-        .strip_prefix("tcp://")
-        .or_else(|| url.strip_prefix("mqtt://"))
-        .unwrap_or(url);
-    if let Some((host, port_str)) = rest.rsplit_once(':')
-        && let Ok(port) = port_str.parse::<u16>()
-    {
-        return (host, port);
-    }
-    (rest, 1883)
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

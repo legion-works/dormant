@@ -13,6 +13,7 @@ mod cmd_launchd;
 mod cmd_pair;
 mod cmd_pause;
 mod cmd_status;
+mod cmd_switch;
 mod cmd_validate;
 mod cmd_watch;
 
@@ -45,20 +46,6 @@ enum PairTarget {
     Samsung {
         /// TV hostname or IP address.
         host: String,
-    },
-    /// Pair with another dormant instance discovered on the local network.
-    Instance {
-        /// Discovered peer display name, or the local display name with --open.
-        name: String,
-        /// Pairing code read from the responding instance.
-        #[arg(long, required_unless_present = "open")]
-        code: Option<String>,
-        /// Select a specific discovered instance when names are duplicated.
-        #[arg(long)]
-        instance_id: Option<String>,
-        /// Open a local responder pairing window and print its one-time code.
-        #[arg(long, conflicts_with_all = ["code", "instance_id"])]
-        open: bool,
     },
 }
 
@@ -94,6 +81,16 @@ enum Command {
     Wake {
         /// Display id to wake.
         display: String,
+    },
+    /// Write the local input code to pull a shared display to this
+    /// machine.  Use `--to-peer` to push the display away by writing
+    /// the peer input code (requires `shared_peer_input_write_code`).
+    Switch {
+        /// Shared display id.
+        display: String,
+        /// Write the peer input code instead of the local one.
+        #[arg(long)]
+        to_peer: bool,
     },
     /// Trigger a config reload.
     Reload,
@@ -205,6 +202,13 @@ fn main() -> ExitCode {
         Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
         Command::Blank { display } => cmd_blank::run_blank(&socket_path, &display),
         Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
+        Command::Switch { display, to_peer } => {
+            if to_peer {
+                cmd_switch::run_peer(&socket_path, &display)
+            } else {
+                cmd_switch::run(&socket_path, &display)
+            }
+        }
         Command::Reload => {
             match dormantctl::client::send_request(&socket_path, &IpcRequest::Reload) {
                 Ok(resp) if resp.ok => {
@@ -241,18 +245,6 @@ fn main() -> ExitCode {
                 credentials,
                 host,
             }),
-            PairTarget::Instance {
-                name,
-                code,
-                instance_id,
-                open,
-            } => cmd_pair::run_instance(
-                &socket_path,
-                &name,
-                code.as_deref(),
-                instance_id.as_deref(),
-                open,
-            ),
         },
         Command::Doctor {
             config,
@@ -397,40 +389,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_pair_instance_peer() {
-        let cli = Cli::try_parse_from([
-            "dormantctl",
-            "pair",
-            "instance",
-            "Office-Mac",
-            "--code",
-            "ABCD1234",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Pair {
-                target: PairTarget::Instance { name, code: Some(code), open: false, .. },
-                ..
-            } if name == "Office-Mac" && code == "ABCD1234"
-        ));
-    }
-
-    #[test]
-    fn parse_pair_instance_open() {
-        let cli = Cli::try_parse_from(["dormantctl", "pair", "instance", "Office-Mac", "--open"])
-            .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Pair {
-                target: PairTarget::Instance { name, code: None, open: true, .. },
-                ..
-            } if name == "Office-Mac"
-        ));
-    }
-
-    // ── Task 12: `launchd install` / `launchd uninstall` parsing ──────────
+    // ── `launchd install` / `launchd uninstall` parsing ──────────
     //
     // Parsing is unconditional on every platform (mirrors the
     // `doctor macos-*` arms in cmd_doctor.rs) — only the handler behind it
@@ -456,6 +415,24 @@ mod tests {
             Command::Launchd {
                 subcommand: cmd_launchd::LaunchdSubcommand::Uninstall
             }
+        ));
+    }
+
+    #[test]
+    fn parse_switch_to_peer() {
+        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor", "--to-peer"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Switch { display, to_peer: true } if display == "monitor"
+        ));
+    }
+
+    #[test]
+    fn parse_switch_plain() {
+        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Switch { display, to_peer: false } if display == "monitor"
         ));
     }
 }

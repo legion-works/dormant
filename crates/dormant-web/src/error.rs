@@ -91,9 +91,7 @@ pub(crate) enum WebError {
     /// entry (never existed, or already swept as an expired terminal
     /// entry — see `routes::pair::sweep_expired`).
     PairNotFound,
-    /// Instance coordination is disabled in the active configuration.
-    CoordinationDisabled,
-    /// The daemon IPC socket rejected an instance-pairing request.
+    /// The daemon IPC socket rejected a request.
     CoordinationUnavailable,
     /// Another web emergency-wake request is still in flight.
     EmergencyWakeInProgress,
@@ -206,13 +204,6 @@ impl IntoResponse for WebError {
             WebError::PairFeatureDisabled => (StatusCode::FORBIDDEN, "feature_disabled", None),
             WebError::PairInProgress => (StatusCode::CONFLICT, "pairing_in_progress", None),
             WebError::PairNotFound => (StatusCode::NOT_FOUND, "pair_not_found", None),
-            WebError::CoordinationDisabled => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    axum::Json(serde_json::json!({"error": "coordination_disabled"})),
-                )
-                    .into_response();
-            }
             WebError::CoordinationUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "coordination_unavailable",

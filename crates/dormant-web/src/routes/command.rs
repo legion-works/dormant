@@ -39,6 +39,11 @@ pub(crate) struct WakeBody {
 }
 
 #[derive(Deserialize, Debug)]
+pub(crate) struct SwitchBody {
+    pub(crate) display: String,
+}
+
+#[derive(Deserialize, Debug)]
 pub(crate) struct PauseBody {
     pub(crate) rule: Option<String>,
     /// Duration in seconds; `None` = indefinite.
@@ -51,6 +56,44 @@ pub(crate) struct ResumeBody {
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
+
+/// `POST /api/switch` — write the local input code to pull the display.
+pub(crate) async fn post_switch(
+    State(state): State<WebState>,
+    Json(body): Json<SwitchBody>,
+) -> Result<Json<serde_json::Value>, WebError> {
+    validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
+    let request = dormant_core::ipc_proto::IpcRequest::SwitchToLocal {
+        display: body.display,
+    };
+    let response = crate::request_daemon_ipc(&state, request).await?;
+    if !response.ok {
+        return Err(WebError::BadRequest(
+            response
+                .error
+                .unwrap_or_else(|| "switch failed".to_string()),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// `POST /api/push` — write the peer input code to push the display away.
+pub(crate) async fn post_push(
+    State(state): State<WebState>,
+    Json(body): Json<SwitchBody>,
+) -> Result<Json<serde_json::Value>, WebError> {
+    validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
+    let request = dormant_core::ipc_proto::IpcRequest::SwitchToPeer {
+        display: body.display,
+    };
+    let response = crate::request_daemon_ipc(&state, request).await?;
+    if !response.ok {
+        return Err(WebError::BadRequest(
+            response.error.unwrap_or_else(|| "push failed".to_string()),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
 
 /// `POST /api/blank` — validate display exists, then force-blank.
 pub(crate) async fn post_blank(
@@ -231,6 +274,14 @@ pub(super) async fn validate_display_exists(
 /// for HTTP-level tests via `oneshot`.
 #[cfg(test)]
 fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
+    command_test_router_at(ctl_tx, None)
+}
+
+#[cfg(test)]
+fn command_test_router_at(
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    socket: Option<std::path::PathBuf>,
+) -> axum::Router {
     use crate::state::{WebStateInner, WebStateInnerParams};
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use indexmap::IndexMap;
@@ -245,7 +296,10 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     let config = Arc::new(Config {
         coordination: dormant_core::config::CoordinationConfig::default(),
         config_version: 1,
-        daemon: DaemonConfig::default(),
+        daemon: DaemonConfig {
+            socket_path: socket,
+            ..DaemonConfig::default()
+        },
         wear: dormant_core::config::schema::WearConfig::default(),
         notifications: dormant_core::config::schema::NotificationsConfig::default(),
         watchdog: dormant_core::config::schema::WatchdogConfig::default(),
@@ -254,6 +308,8 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
         zones: IndexMap::default(),
         displays: IndexMap::default(),
         rules: IndexMap::default(),
+        keymap: dormant_core::config::KeymapConfig::default(),
+        input_filter: dormant_core::config::InputFilterConfig::default(),
     });
     let creds = Arc::new(Credentials::default());
     let (config_tx, config_rx) = watch::channel(config);
@@ -290,6 +346,8 @@ fn command_test_router(ctl_tx: mpsc::Sender<ControlMsg>) -> axum::Router {
     axum::Router::new()
         .route("/api/blank", axum::routing::post(post_blank))
         .route("/api/wake", axum::routing::post(post_wake))
+        .route("/api/switch", axum::routing::post(post_switch))
+        .route("/api/push", axum::routing::post(post_push))
         .route("/api/pause", axum::routing::post(post_pause))
         .route("/api/resume", axum::routing::post(post_resume))
         .route("/api/reload", axum::routing::post(post_reload))
@@ -359,6 +417,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
         let (config_tx, config_rx) = watch::channel(config);
@@ -417,6 +477,7 @@ mod tests {
                 .collect(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -525,6 +586,224 @@ mod tests {
             Err(WebError::UnknownDisplay(name)) => assert_eq!(name, "bogus"),
             other => panic!("expected UnknownDisplay, got {other:?}"),
         }
+    }
+
+    // ── Switch-to-local tests ──────────────────────────────────────────
+
+    /// Router-level: `POST /api/switch` with `{"display":"shared"}`
+    /// sends `SwitchToLocal` and returns `{"status":"ok"}` on success.
+    #[tokio::test]
+    async fn switch_sends_switch_to_local_and_returns_ok() {
+        let snap = snapshot_with_displays(&["shared"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            assert!(
+                request.contains("switch_to_local"),
+                "expected switch_to_local, got: {request}"
+            );
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
+        });
+        let router = command_test_router_at(ctl_tx, Some(socket));
+        tokio::task::yield_now().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/switch")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"shared"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        server.await.unwrap();
+    }
+
+    /// Router-level: `POST /api/switch` surfaces a daemon error as HTTP 400.
+    #[tokio::test]
+    async fn switch_surfaces_failed_write() {
+        let snap = snapshot_with_displays(&["shared"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            stream
+                .write_all(b"{\"ok\":false,\"error\":\"write failed: DDC bus unreachable\"}\n")
+                .unwrap();
+        });
+        let router = command_test_router_at(ctl_tx, Some(socket));
+        tokio::task::yield_now().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/switch")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"shared"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["detail"].as_str().unwrap().contains("DDC bus"));
+        server.await.unwrap();
+    }
+
+    /// Router-level: `POST /api/switch` with an unknown display returns 404.
+    #[tokio::test]
+    async fn switch_unknown_display_returns_404() {
+        let snap = snapshot_with_displays(&["main"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let router = command_test_router(ctl_tx);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/switch")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"bogus"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Push-to-peer tests ──────────────────────────────────────────
+
+    /// Router-level: `POST /api/push` with `{"display":"shared"}`
+    /// sends `SwitchToPeer` (NOT `SwitchToLocal`) and returns `{"status":"ok"}` on success.
+    #[tokio::test]
+    async fn push_sends_switch_to_peer_and_returns_ok() {
+        let snap = snapshot_with_displays(&["shared"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            assert!(
+                request.contains("switch_to_peer"),
+                "expected switch_to_peer, got: {request}"
+            );
+            assert!(
+                !request.contains("switch_to_local"),
+                "unexpected switch_to_local in push request: {request}"
+            );
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
+        });
+        let router = command_test_router_at(ctl_tx, Some(socket));
+        tokio::task::yield_now().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/push")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"shared"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        server.await.unwrap();
+    }
+
+    /// Router-level: `POST /api/push` surfaces a daemon error as HTTP 400.
+    #[tokio::test]
+    async fn push_surfaces_failed_write() {
+        let snap = snapshot_with_displays(&["shared"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            stream
+                .write_all(b"{\"ok\":false,\"error\":\"write failed: DDC bus unreachable\"}\n")
+                .unwrap();
+        });
+        let router = command_test_router_at(ctl_tx, Some(socket));
+        tokio::task::yield_now().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/push")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"shared"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["detail"].as_str().unwrap().contains("DDC bus"));
+        server.await.unwrap();
+    }
+
+    /// Router-level: `POST /api/push` with an unknown display returns 404.
+    #[tokio::test]
+    async fn push_unknown_display_returns_404() {
+        let snap = snapshot_with_displays(&["main"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let router = command_test_router(ctl_tx);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/push")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"bogus"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Pause / Resume tests ──────────────────────────────────────────────
@@ -649,6 +928,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
         let (config_tx, config_rx) = watch::channel(config);

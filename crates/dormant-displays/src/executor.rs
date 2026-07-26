@@ -69,7 +69,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_BLANK_FAILED, E_WAKE_FAILED};
 use dormant_core::rules::{ControllerHealth, ControllerRole};
-use dormant_core::traits::{CommandSink, DisplayController, PanelState};
+use dormant_core::traits::{
+    CommandSink, DisplayController, INPUT_SOURCE_WRITE_UNSUPPORTED, InputSourceTarget, PanelState,
+};
 use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
 use tokio_util::sync::CancellationToken;
 
@@ -645,6 +647,25 @@ impl CommandSink for DisplayExecutor {
         }
     }
 
+    /// Select the input source through the first controller that exposes a
+    /// write surface. Unsupported controllers are skipped; an I/O failure
+    /// from the selected writer is final so claim orchestration can retain
+    /// ownership and run its failure compensation.
+    async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
+        for controller in &self.chain {
+            match controller.write_input_source(target).await {
+                Ok(()) => return Ok(()),
+                Err(error) if error.error == INPUT_SOURCE_WRITE_UNSUPPORTED => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(CmdFailure {
+            controller: "none-eligible".to_string(),
+            error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
+        })
+    }
+
     /// Walk the configured chain and return the first non-`None`
     /// usage-hours reading — mirrors [`Self::read_state`]'s chain-walk
     /// shape exactly. Used once, at wear-ledger seeding time (task T7),
@@ -669,6 +690,21 @@ impl CommandSink for DisplayExecutor {
     fn panel_identity(&self) -> Option<String> {
         for controller in &self.chain {
             if let Some(id) = controller.panel_identity() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Walk the configured chain and return the first non-`None`
+    /// cross-machine claim identity — mirrors [`Self::panel_identity`]'s
+    /// chain-walk shape exactly (spec F5). Used by the claim broadcast to
+    /// match the same physical panel across paired machines; a chain with a
+    /// primary controller that has no EDID identity (e.g. `command`,
+    /// `kwin-dpms`) falls through to a `ddcci` fallback that does.
+    fn claim_identity(&self) -> Option<String> {
+        for controller in &self.chain {
+            if let Some(id) = controller.claim_identity() {
                 return Some(id);
             }
         }
@@ -718,8 +754,13 @@ mod tests {
         /// Scripted [`DisplayController::panel_identity`] response — used
         /// by the T7 chain-walk test.
         panel_identity: Option<String>,
+        /// Scripted [`DisplayController::claim_identity`] response — used
+        /// by the F5 chain-walk test.
+        claim_identity: Option<String>,
         /// Scripted [`DisplayController::read_input_source_sampled`] responses.
         input_sources: VecDeque<Result<Option<u8>, String>>,
+        /// Scripted [`DisplayController::write_input_source`] responses.
+        input_source_writes: VecDeque<Result<(), CmdFailure>>,
     }
 
     impl FakeController {
@@ -763,8 +804,20 @@ mod tests {
             self.inner.lock().unwrap().panel_identity = id;
         }
 
+        fn set_claim_identity(&self, id: Option<String>) {
+            self.inner.lock().unwrap().claim_identity = id;
+        }
+
         fn push_input_source(&self, result: Result<Option<u8>, String>) {
             self.inner.lock().unwrap().input_sources.push_back(result);
+        }
+
+        fn push_input_source_write(&self, result: Result<(), CmdFailure>) {
+            self.inner
+                .lock()
+                .unwrap()
+                .input_source_writes
+                .push_back(result);
         }
 
         fn count_op(&self, op: &'static str) -> usize {
@@ -783,6 +836,10 @@ mod tests {
             controllers: vec!["command".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
             ladder: vec![],
@@ -864,8 +921,25 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
+        async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
+            let mut state = self.inner.lock().unwrap();
+            state
+                .log
+                .push((self.name.to_string(), "write_input_source"));
+            state.input_source_writes.pop_front().unwrap_or_else(|| {
+                Err(CmdFailure {
+                    controller: self.name.to_string(),
+                    error: "E_DISPLAY_IO: unsupported input-source write".to_string(),
+                })
+            })
+        }
+
         fn panel_identity(&self) -> Option<String> {
             self.inner.lock().unwrap().panel_identity.clone()
+        }
+
+        fn claim_identity(&self) -> Option<String> {
+            self.inner.lock().unwrap().claim_identity.clone()
         }
     }
 
@@ -1448,6 +1522,26 @@ mod tests {
         assert_eq!(executor.read_input_source_sampled().await, Ok(Some(0x11)));
     }
 
+    #[tokio::test]
+    async fn write_input_source_skips_unsupported_controller_for_first_writer() {
+        let unsupported = FakeController::new("unsupported", vec![]);
+        let writer = FakeController::new("writer", vec![]);
+        writer.push_input_source_write(Ok(()));
+        let (executor, handles) = executor_with(vec![unsupported, writer], default_retry());
+
+        assert_eq!(
+            executor
+                .write_input_source(InputSourceTarget {
+                    write_code: 0x12,
+                    expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x12),
+                })
+                .await,
+            Ok(())
+        );
+        assert_eq!(handles[0].count_op("write_input_source"), 1);
+        assert_eq!(handles[1].count_op("write_input_source"), 1);
+    }
+
     // ── T7 fix M1: panel_identity chain-walk ─────────────────────────────────
 
     #[tokio::test]
@@ -1472,6 +1566,32 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let (exec, _) = executor_with(vec![a], default_retry());
         assert_eq!(exec.panel_identity(), None);
+    }
+
+    // ── F5: claim_identity chain-walk ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn claim_identity_chain_walk_primary_none_fallback_some() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // A has no claim identity (default None, mirroring a
+        // `kwin-dpms`/`command` primary); B does (mirroring a `ddcci`
+        // fallback that derived its EDID identity during probe).
+        b.set_claim_identity(Some("AOC:AG326UZD:ABC123".into()));
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+
+        assert_eq!(
+            exec.claim_identity().as_deref(),
+            Some("AOC:AG326UZD:ABC123"),
+            "chain-walk must fall through A's None to B's Some(..)"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_identity_none_when_no_controller_reports_it() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a], default_retry());
+        assert_eq!(exec.claim_identity(), None);
     }
 
     // ── Task 3: owner-first wake (RED-first probe; assertions extended post-impl) ──
@@ -1855,6 +1975,9 @@ mod tests {
         let fake = Arc::new({
             let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
                 ident_string: ident.into(),
+                manufacturer: None,
+                model: None,
+                serial: None,
             }]);
             f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
             f
@@ -1965,6 +2088,9 @@ mod tests {
         let fake = Arc::new({
             let f = crate::vcp_ops::FakeVcp::new(vec![crate::vcp_ops::VcpDisplayInfo {
                 ident_string: ident.into(),
+                manufacturer: None,
+                model: None,
+                serial: None,
             }]);
             f.expect_get(ident, 0xD6, Err("no".into())); // probe: D6 unsupported
             f

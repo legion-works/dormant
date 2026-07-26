@@ -163,6 +163,7 @@ export default function DisplaysSection({
                       error={fieldErrors[[...basePath, "scope"].join(".")]}
                     />
                     {scope === "shared" && (
+                      <>
                       <NumberField
                         path={[...basePath, "shared_input_code"]}
                         label="shared_input_code"
@@ -171,6 +172,31 @@ export default function DisplaysSection({
                         onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
                         error={fieldErrors[[...basePath, "shared_input_code"].join(".")]}
                       />
+                      <NumberField
+                        path={[...basePath, "shared_input_write_code"]}
+                        label="shared_input_write_code (optional)"
+                        value={cfg.shared_input_write_code ?? ""}
+                        locked={store.isLocked([...basePath, "shared_input_write_code"], redactedPaths)}
+                        onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                        error={fieldErrors[[...basePath, "shared_input_write_code"].join(".")]}
+                      />
+                      <NumberField
+                        path={[...basePath, "shared_peer_input_code"]}
+                        label="shared_peer_input_code (optional peer read code)"
+                        value={cfg.shared_peer_input_code ?? ""}
+                        locked={store.isLocked([...basePath, "shared_peer_input_code"], redactedPaths)}
+                        onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                        error={fieldErrors[[...basePath, "shared_peer_input_code"].join(".")]}
+                      />
+                      <NumberField
+                        path={[...basePath, "shared_peer_input_write_code"]}
+                        label="shared_peer_input_write_code (optional peer write code)"
+                        value={cfg.shared_peer_input_write_code ?? ""}
+                        locked={store.isLocked([...basePath, "shared_peer_input_write_code"], redactedPaths)}
+                        onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+                        error={fieldErrors[[...basePath, "shared_peer_input_write_code"].join(".")]}
+                      />
+                      </>
                     )}
                     {/* ── Mode toggle ── */}
               <div className="cf-field">

@@ -2345,6 +2345,7 @@ impl WaylandState {
             } => self.handle_show_screensaver(r#gen, idx, settings, reply),
             #[cfg(target_os = "linux")]
             RenderCommand::SetShift { shift } => self.handle_set_shift(shift),
+            RenderCommand::ReassertOverlay { reply } => self.handle_reassert_overlay(reply),
         }
     }
 
@@ -2361,6 +2362,25 @@ impl WaylandState {
             interval_ms = shift.shift_interval.as_millis(),
         );
         self.shift_settings = shift;
+    }
+
+    /// `ReassertOverlay`: reset the first-input latch and re-commit the
+    /// surface if one is currently up.  Re-committing refreshes the overlay
+    /// against a compositor that may have torn on the last input event.
+    fn handle_reassert_overlay(
+        &mut self,
+        reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
+    ) {
+        // Re-arm the one-shot latch so the next real input event fires.
+        self.input_latch.reset();
+        // Re-commit counters any surface tear from the last input event.
+        if self.surface_up
+            && let Some(ref surface) = self.layer_surface
+        {
+            let wl_surface = surface.wl_surface();
+            wl_surface.commit();
+        }
+        let _ = reply.send(Ok(()));
     }
 
     /// Show: create the layer surface, send the initial commit, store a

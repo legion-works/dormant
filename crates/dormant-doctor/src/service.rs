@@ -205,7 +205,7 @@ async fn run_inner(
     // control path); see `push_macos_platform_checks` (extracted to its own
     // function to keep this one under clippy::too_many_lines).
     #[cfg(target_os = "macos")]
-    push_macos_platform_checks(&mut checks).await;
+    push_macos_platform_checks(&mut checks, &cfg.input_filter.ignore_devices).await;
 
     // ── Non-exclusive network sensors (MQTT / HA) — active probe ──
     let mut probe_futs: Vec<std::pin::Pin<Box<dyn Future<Output = Check> + Send>>> = Vec::new();
@@ -253,16 +253,17 @@ async fn run_inner(
     DoctorReport { checks }
 }
 
-/// Append the same three read-only macOS platform probes the bare
+/// Append the same read-only macOS platform probes the bare
 /// `dormantctl doctor` runs (see `crate::probe_all_offline`) to the live
 /// daemon-backed doctor's checks — idle-clock health, display-sleep API
-/// availability + current per-display state, and active power assertions.
-/// All three are read-only diagnostics; none of them ever blanks or wakes a
+/// availability + current per-display state, active power assertions, and
+/// input-filter readiness (CGEventTap / Accessibility).
+/// All are read-only diagnostics; none of them ever blanks or wakes a
 /// display — that stays exclusively under the `Exercise` control path.
 /// Extracted out of [`run_inner`] to keep that function under
 /// `clippy::too_many_lines`.
 #[cfg(target_os = "macos")]
-async fn push_macos_platform_checks(checks: &mut Vec<Check>) {
+async fn push_macos_platform_checks(checks: &mut Vec<Check>, ignore_devices: &[String]) {
     checks.push(probe_result_to_check(
         &crate::probes::macos_idle::probe_macos_idle().await,
     ));
@@ -272,6 +273,14 @@ async fn push_macos_platform_checks(checks: &mut Vec<Check>) {
     checks.push(probe_result_to_check(
         &crate::probes::macos_power::probe_macos_power().await,
     ));
+    // Input-filter readiness: only report when ignore_devices is non-empty
+    // (the feature is inactive otherwise — matching the Linux evdev probe's
+    // Skip semantics).
+    if !ignore_devices.is_empty() {
+        checks.push(probe_result_to_check(
+            &crate::probes::input_filter::probe_input_filter(Some(ignore_devices)),
+        ));
+    }
 }
 
 /// Fetch a snapshot from the engine (bounded).  Returns an empty snapshot
@@ -306,6 +315,7 @@ fn empty_snapshot() -> StateSnapshot {
         displays: vec![],
         pending_reload: None,
         rollback: None,
+        kvm: None,
     }
 }
 
@@ -391,6 +401,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         })
     }
 
@@ -458,6 +470,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -594,6 +607,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         });
         let creds = test_creds();
         let counter = Arc::new(AtomicUsize::new(0));

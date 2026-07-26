@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Removed
+
+- The owner-mediated claim protocol (mDNS discovery, SPAKE2 pairing, Ed25519 signed frames, TCP transport, claim-engine state machine, peer store). Replaced by direct local DDC writes — each machine writes its own input code over its own DDC bus with no network protocol, peer connection, handshake, or crypto. See `docs/src/multi-machine.md`.
+- The `coordination.enabled` config key — coordination now self-activates when at least one display has `scope = "shared"`. The removed coordination keys (`enabled`, `pairing_port`, `pairing_window`, `pairing_bind_address`, `claim_port`, `claim_bind_address`, `claim_advertise_mdns`, `activity_claim`, `owner_idle_window`, `armed_window`, `claim_timeout`, `release_deadline_cap`) will fail strict unknown-key validation in existing configs. Delete them from your `config.toml` and run `dormantctl validate`.
+- The instance-pairing web routes (`/api/pair/instance`, `/api/pair/instance/join`, `/api/pair/instance/:id/cancel`). Samsung TV pairing (`/api/pair/samsung`) is unaffected.
+
+### Changed
+
+- Shared-display switching is now a direct local DDC write (`dormantctl switch` writes the local input code; `dormantctl switch --to-peer` writes the peer's code when `shared_peer_input_write_code` is configured).
+- Ownership is an observation from VCP `0x60` polling, not a claim-negotiated authority — nothing consults ownership before writing.
+- Surviving `[coordination]` keys: `poll_interval`, `state_poll_interval`, `loss_confirmations`, `activity_follow`, `arm_after`, `cooldown`.
+- New `on_observed_loss` hook slot: fires after the poller commits an ownership loss (post-hoc, fire-and-forget).
+- Activity-follow pulls are gated by `activity_follow` (default `false`), `arm_after` (default `7s`), and `cooldown` (default `3s`).
+
 ## [0.6.0] - 2026-07-23
 
 ### Added

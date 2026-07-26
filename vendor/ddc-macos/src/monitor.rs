@@ -7,11 +7,13 @@ use core_foundation::base::{CFType, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
+use core_foundation_sys::base::kCFAllocatorDefault;
 use core_graphics::display::CGDisplay;
 use ddc::{
     DdcCommand, DdcCommandMarker, DdcCommandRaw, DdcCommandRawMarker, DdcHost, Delay, ErrorCode,
     I2C_ADDRESS_DDC_CI, SUB_ADDRESS_DDC_CI,
 };
+use io_kit_sys::IORegistryEntryCreateCFProperty;
 use std::time::Duration;
 use std::{fmt, iter};
 
@@ -113,7 +115,22 @@ impl Monitor {
     }
 
     /// Returns Extended display identification data (EDID) for this [Monitor] as raw bytes data
+    ///
+    /// On Intel Macs the CoreDisplay private display-info dict exposes
+    /// `IODisplayEDIDOriginal` directly; on Apple Silicon (M1+) that key is
+    /// absent and the EDID lives on the `AppleATCDPINAdapterPort` subtree
+    /// of `AppleDisplayCrossbar` under `Metadata.EDID`. We try the Intel
+    /// path first, then fall back to the IORegistry walk so the macOS arm
+    /// of `dormantctl doctor ddcci` can derive the cross-machine
+    /// `claim_identity` (spec F5).
     pub fn edid(&self) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.edid_from_display_info_dict() {
+            return Some(bytes);
+        }
+        self.edid_from_apple_display_crossbar()
+    }
+
+    fn edid_from_display_info_dict(&self) -> Option<Vec<u8>> {
         let info: CFDictionary<CFString, CFType> = unsafe {
             CFDictionary::wrap_under_create_rule(
                 arm::display_create_info_dictionary(self.monitor.id).ok()?,
@@ -122,6 +139,64 @@ impl Monitor {
         let display_product_name_key = CFString::from_static_string("IODisplayEDIDOriginal");
         let edid_data = info.find(&display_product_name_key)?.downcast::<CFData>()?;
         Some(edid_data.bytes().into())
+    }
+
+    /// Apple Silicon fallback: locate an `IOPortTransportStateDisplayPort`
+    /// IORegistry node whose `Metadata.EDID` CFData is set, then return
+    /// those bytes. On a Mac with a single external display attached,
+    /// exactly one such transport-state node carries an EDID (the internal
+    /// LCD's transport state has empty `Metadata`), so returning the
+    /// first match is unambiguous. If the Mac ever has multiple externals,
+    /// the upstream `AvService` walk in
+    /// [`crate::arm::get_display_av_service`] would have to be extended in
+    /// tandem to disambiguate — see the module-level note.
+    ///
+    /// `for_services` (not `for_service_names`) matches by IORegistry
+    /// class — the node's *name* is `DisplayPort`, the *class* is
+    /// `IOPortTransportStateDisplayPort`; the class is what we want.
+    fn edid_from_apple_display_crossbar(&self) -> Option<Vec<u8>> {
+        let mut iter = crate::iokit::IoIterator::for_services("IOPortTransportStateDisplayPort")?;
+        while let Some(entry) = iter.next() {
+            let edid_ref = unsafe {
+                IORegistryEntryCreateCFProperty(
+                    (&entry).into(),
+                    CFString::from_static_string("Metadata").as_concrete_TypeRef(),
+                    kCFAllocatorDefault,
+                    0,
+                )
+            };
+            if edid_ref.is_null() {
+                continue;
+            }
+            // CFDictionary's default generics are both `*const c_void` (NOT
+            // `CFString`/`CFType` — see core-foundation 0.10.1's
+            // `dictionary.rs` line 25). The fork's `arm.rs` always
+            // builds `CFDictionary<CFString, CFType>` explicitly via
+            // `wrap_under_create_rule` so `find` returns `ItemRef<'_, V>`
+            // with the typed value; we must do the same here, otherwise
+            // `find` yields `ItemRef<'_, *const c_void>` which has no
+            // `downcast::<CFData>()` helper (and `cast::<T>()` returns a
+            // raw pointer, not `Option<T>`).
+            //
+            // `IORegistryEntryCreateCFProperty` returns a `*const c_void`
+            // (the generic CFTypeRef); `wrap_under_create_rule` requires
+            // the typed CFDictionaryRef — same pattern `arm.rs` uses for
+            // `display_create_info_dictionary`'s return value.
+            let typed: CFDictionary<CFString, CFType> =
+                unsafe { CFDictionary::wrap_under_create_rule(edid_ref as *const _) };
+            let Some(edid_value) = typed.find(CFString::from_static_string("EDID")) else {
+                continue;
+            };
+            let Some(edid) = edid_value.downcast::<CFData>() else {
+                continue;
+            };
+            let bytes = edid.bytes();
+            if bytes.is_empty() {
+                continue;
+            }
+            return Some(bytes.into());
+        }
+        None
     }
 
     /// CoreGraphics display handle for this monitor
@@ -272,6 +347,48 @@ mod tests {
         let expected: [u8; 5] = [0x51, 0x82, 0x01, 0x60, 0xDC];
 
         assert_eq!(encoded, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "changes the physical display input and must be run with the operator present"]
+    fn live_input_source_0x60_write_lands_and_restores_desktop() {
+        const DESKTOP_INPUT: u16 = 0x0f;
+        const MAC_INPUT: u16 = 0x10;
+
+        fn read_input_source(monitor: &mut Monitor) -> Option<u16> {
+            use ddc::Ddc;
+            monitor.get_vcp_feature(0x60).ok().map(|vcp| vcp.value())
+        }
+
+        fn write_and_read(monitor: &mut Monitor, value: u16) -> u16 {
+            use ddc::Ddc;
+            monitor
+                .set_vcp_feature(0x60, value)
+                .expect("input-source write should be acknowledged");
+            monitor
+                .get_vcp_feature(0x60)
+                .expect("input-source readback should succeed")
+                .value()
+        }
+
+        let mut monitor = Monitor::enumerate()
+            .expect("enumerating DDC/CI displays should succeed")
+            .into_iter()
+            .next()
+            .expect("a physical DDC/CI display should be available");
+
+        let before = read_input_source(&mut monitor)
+            .expect("input-source baseline read should succeed");
+        println!("before input source: 0x{before:02x}");
+        let written = write_and_read(&mut monitor, MAC_INPUT);
+        println!("after Mac write input source: 0x{written:02x}");
+
+        let restored = write_and_read(&mut monitor, DESKTOP_INPUT);
+        println!("after desktop restore input source: 0x{restored:02x}");
+
+        assert_eq!(written, MAC_INPUT, "the Mac-input write did not land");
+        assert_eq!(restored, DESKTOP_INPUT, "the desktop input was not restored");
     }
 
     #[cfg(target_os = "macos")]

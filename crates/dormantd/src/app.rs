@@ -61,7 +61,6 @@ use dormant_core::observation::{
     RuntimeRevision,
 };
 use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
-use dormant_core::peers::load_or_create_identity;
 use dormant_core::rules::{
     ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
     RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
@@ -85,9 +84,9 @@ use tokio_util::sync::CancellationToken;
 use dormant_render::LayerShellRenderSink;
 
 use crate::boot_guard::{self, PromoteVerdict};
-use crate::coordination_mdns::{MdnsSdBackend, PairDiscovery};
-use crate::coordination_pairing::{PairingManager, PairingTransport};
 use crate::coordination_poll::{self, CoordinationPollDeps};
+use crate::direct_switch::DirectSwitchHandle;
+use crate::hooks::HookEngine;
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
@@ -758,6 +757,11 @@ impl App {
     /// sources, inhibitor, and config watcher, and return a control handle plus
     /// the run-loop join handle.
     ///
+    /// # Panics
+    ///
+    /// Panics if coordination is enabled without the claim transport that
+    /// startup constructs alongside it. Those states are created in lockstep.
+    ///
     /// # Errors
     ///
     /// Fails if the initial runtime cannot be assembled (controller build,
@@ -823,41 +827,30 @@ impl App {
             || Arc::new(AlwaysOwned) as Arc<dyn OwnershipGate>,
             |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
         );
-        let coordination_mdns = if cfg_clone.coordination.enabled {
-            let identity = load_or_create_identity(&self.state_dir)
-                .context("load persistent instance identity for mDNS discovery")?;
-            let discovery_state = coordination
-                .clone()
-                .unwrap_or_else(|| CoordinationHandle::new([]));
-            Some(PairDiscovery::new(
-                MdnsSdBackend::new()?,
-                identity.instance_id,
-                discovery_state,
-            ))
-        } else {
-            None
-        };
-        let pairing_manager = Arc::new(
-            PairingManager::new(
-                &self.state_dir,
-                cfg_clone.coordination.enabled,
-                cfg_clone.coordination.pairing_window,
-            )
-            .context("load persistent instance identity for pairing")?,
-        );
-        let pairing_transport = coordination_mdns.map(|discovery| {
-            Arc::new(PairingTransport::new(
-                Arc::clone(&pairing_manager),
-                discovery,
-                cfg_clone.coordination.pairing_port,
-                cfg_clone.coordination.pairing_bind_address.clone(),
-                root.clone(),
-            ))
-        });
-
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
         let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
+        let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
+
+        // Daemon-lifetime idle-observation channel — the stock idle source
+        // publishes real activity timestamps into the tx half.
+        let (idle_obs_tx, _idle_obs_rx) = crate::idle_observation::idle_observation_channel();
+        let (filtered_activity_tx, _filtered_activity_rx) =
+            crate::filtered_activity::filtered_activity_channel();
+
+        // Local direct-switch handle — replaces the owner-mediated claim
+        // protocol (mDNS discovery, SPAKE2 pairing, Ed25519 signed frames,
+        // epochs, replay windows, TCP transport, claim-engine state machine).
+        // Every write is verified against the semantic readback code; no
+        // network, no peer identity.
+        let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
+        let hook_engine = Arc::new(HookEngine::new(publisher));
+        let direct_switch = Arc::new(DirectSwitchHandle::new(
+            executors_rx.clone(),
+            config_rx.clone(),
+            hook_engine,
+            front_ctl_tx.clone(),
+        ));
 
         let spawn = spawn_generation(
             &root,
@@ -873,6 +866,9 @@ impl App {
             executors_rx.clone(),
             GenerationId(0),
             Some(self.observations.clone()),
+            Some(idle_obs_tx.clone()),
+            filtered_activity_tx.clone(),
+            &direct_switch,
         )?;
         self.observations
             .emit(DaemonObservation::GenerationStarted {
@@ -902,7 +898,6 @@ impl App {
         // no delivery can race behind the generation barrier.
         let ctl_router = Arc::new(GenerationRouter::new(spawn.ctl_tx.clone()));
         let events_router = Arc::new(GenerationRouter::new(spawn.events_tx.clone()));
-        let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
         let (front_events_tx, front_events_rx) = mpsc::channel::<PresenceEvent>(256);
 
         let front_ctl_handle =
@@ -912,6 +907,59 @@ impl App {
             events_router.clone(),
             root.clone(),
         ));
+
+        // ── Spawn activity-follow on boot ───────────────────────────────────
+        let mut activity_follow_handle: Option<tokio::task::JoinHandle<()>> = None;
+        if cfg_clone.coordination.activity_follow {
+            let idle_rx = idle_obs_tx.subscribe();
+            let filtered_rx = filtered_activity_tx.subscribe();
+            let shared: Vec<DisplayId> = cfg_clone
+                .displays
+                .iter()
+                .filter(|(_, dc)| {
+                    dc.scope == dormant_core::config::DisplayScope::Shared
+                        && dc.shared_input_code.is_some()
+                })
+                .map(|(name, _)| DisplayId(name.clone()))
+                .collect();
+            if !shared.is_empty() {
+                let deps = crate::activity_follow::ActivityFollowDeps {
+                    idle_rx,
+                    direct_switch: Some(direct_switch.clone()),
+                    display_ids: shared.into(),
+                    arm_after: cfg_clone.coordination.arm_after,
+                    cancel: root.clone(),
+                    pull_recorder: None,
+                    clock: crate::activity_follow::production_clock,
+                };
+                activity_follow_handle = Some(crate::activity_follow::spawn(deps, filtered_rx));
+            }
+        }
+
+        // ── Publish KVM status on boot (#137 regression guard) ───────────
+        // Build and publish the initial KvmStatus before the run loop starts
+        // so the tray/web/CLI see accurate state from the first snapshot.
+        {
+            let mut switch_capable = Vec::new();
+            let mut push_capable = Vec::new();
+            for (name, dc) in &cfg_clone.displays {
+                if dc.scope == dormant_core::config::DisplayScope::Shared {
+                    if dc.shared_input_code.is_some() {
+                        switch_capable.push(DisplayId(name.clone()));
+                    }
+                    if dc.shared_peer_input_write_code.is_some() {
+                        push_capable.push(DisplayId(name.clone()));
+                    }
+                }
+            }
+            let kvm = dormant_core::rules::KvmStatus {
+                keymap: cfg_clone.keymap.clone(),
+                switch_capable_displays: switch_capable,
+                activity_following: activity_follow_handle.is_some(),
+                push_capable_displays: push_capable,
+            };
+            let _ = spawn.ctl_tx.send(ControlMsg::SetKvmStatus(kvm)).await;
+        }
 
         let (reload_tx, _) = broadcast::channel(16);
         let (reload_request_tx, reload_request_rx) = mpsc::channel::<ReloadRequest>(32);
@@ -975,13 +1023,12 @@ impl App {
             None
         } else {
             Some(
-                crate::ipc::spawn_with_pairing(
+                crate::ipc::spawn(
                     &socket_path,
                     front_ctl_tx.clone(),
                     reload_requester.clone(),
                     doctor_service.clone(),
-                    Arc::clone(&pairing_manager),
-                    pairing_transport.clone(),
+                    direct_switch.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,
@@ -1114,7 +1161,9 @@ impl App {
             notify_sink,
             ownership,
             coordination: coordination.clone(),
-            _coordination_mdns: None,
+            direct_switch: direct_switch.clone(),
+            idle_obs_tx: Some(idle_obs_tx.clone()),
+            filtered_activity_tx,
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1140,6 +1189,7 @@ impl App {
             force_generation_barrier_timeout: self.force_generation_barrier_timeout,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: self.reload_lifecycle_capture,
+            activity_follow_handle,
         };
 
         let join = tokio::spawn(run_loop(
@@ -1162,6 +1212,7 @@ impl App {
             doctor_service,
             #[cfg(any(test, feature = "test-util"))]
             coordination,
+            direct_switch,
             _ipc_handle: ipc_handle,
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
@@ -1216,6 +1267,10 @@ pub struct AppHandle {
     doctor_service: DoctorService,
     #[cfg(any(test, feature = "test-util"))]
     coordination: Option<CoordinationHandle>,
+    /// Local direct-switch handle — replaces the owner-mediated
+    /// claim protocol. Exposed so IPC/hotkey callers can trigger
+    /// local pull/push writes.
+    direct_switch: Arc<DirectSwitchHandle>,
     _ipc_handle: Option<JoinHandle<()>>,
     _web_handle: Option<JoinHandle<()>>,
     /// Test-only LKG-candidate observation seam — see
@@ -1225,6 +1280,13 @@ pub struct AppHandle {
 }
 
 impl AppHandle {
+    /// The daemon's local direct-switch handle — consumed by IPC and
+    /// hotkey callers to trigger pull/push writes.
+    #[must_use]
+    pub fn direct_switch(&self) -> &DirectSwitchHandle {
+        &self.direct_switch
+    }
+
     /// A sender for [`ControlMsg`]s, forwarded to the current engine
     /// generation across reloads.
     #[must_use]
@@ -1416,9 +1478,18 @@ struct Runner {
     ownership: Arc<dyn OwnershipGate>,
     /// Shared-display cache, absent only when startup had no shared displays.
     coordination: Option<CoordinationHandle>,
-    /// Retained while enabled so later pairing windows can advertise or browse;
-    /// construction alone does not expose a service on the LAN.
-    _coordination_mdns: Option<PairDiscovery<MdnsSdBackend>>,
+    /// Local direct-switch handle — replaces the owner-mediated
+    /// claim protocol. Constructed once in [`App::start`] and
+    /// carried by `Runner` across every reload so IPC/hotkey
+    /// callers can trigger local pull/push writes.
+    #[allow(dead_code, reason = "wired in Task 13")]
+    direct_switch: Arc<DirectSwitchHandle>,
+    /// Daemon-lifetime idle-observation tx — the stock idle source
+    /// publishes into this channel; carried across reloads so
+    /// consumers always see current data.
+    idle_obs_tx: Option<crate::idle_observation::IdleObservationTx>,
+    /// Daemon-lifetime filtered activity fan-out retained across reloads.
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
     /// The systemd watchdog sender (spec §6.2/§6.3). Injected via
     /// [`App::with_sd_notify`]; defaults to [`SdNotify::from_env`].
     sd: SdNotify,
@@ -1501,6 +1572,8 @@ struct Runner {
     force_generation_barrier_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
+    /// The activity-follow task spawned on boot and re-spawned on reload.
+    activity_follow_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
@@ -1610,10 +1683,95 @@ impl Runner {
         self.generation_barrier_ack_timeout =
             spawn.generation.cfg.daemon.generation_barrier_ack_timeout;
         self.generation = spawn.generation;
-        self.ctl_router.install(spawn.ctl_tx).await;
-        self.events_router.install(spawn.events_tx).await;
+        self.ctl_router.install(spawn.ctl_tx.clone()).await;
+        self.events_router.install(spawn.events_tx.clone()).await;
     }
 
+    /// Build a [`KvmStatus`] from the current generation's config.
+    fn build_kvm_status(&self) -> dormant_core::rules::KvmStatus {
+        use dormant_core::config::DisplayScope;
+        use dormant_core::types::DisplayId;
+
+        let cfg = &self.generation.cfg;
+        let mut switch_capable = Vec::new();
+        let mut push_capable = Vec::new();
+
+        for (name, dc) in &cfg.displays {
+            if dc.scope != DisplayScope::Shared {
+                continue;
+            }
+            if dc.shared_input_code.is_some() {
+                switch_capable.push(DisplayId(name.clone()));
+            }
+            if dc.shared_peer_input_write_code.is_some() {
+                push_capable.push(DisplayId(name.clone()));
+            }
+        }
+
+        dormant_core::rules::KvmStatus {
+            keymap: cfg.keymap.clone(),
+            switch_capable_displays: switch_capable,
+            activity_following: self.activity_follow_handle.is_some(),
+            push_capable_displays: push_capable,
+        }
+    }
+
+    /// Send the current [`KvmStatus`] to the live engine via [`ControlMsg::SetKvmStatus`].
+    ///
+    /// Called on boot (generation 0) and after every accepted reload so the
+    /// tray, web UI, and CLI always observe up-to-date KVM state — prevents
+    /// the first-boot status gap (issue #137).
+    async fn publish_kvm_status(&self) {
+        let kvm = self.build_kvm_status();
+        if let Some(ctl) = self.ctl_router.current().await {
+            let _ = ctl.send(ControlMsg::SetKvmStatus(kvm)).await;
+        }
+    }
+
+    /// Spawn (or re-spawn) the activity-follow task from the current
+    /// generation's config and daemon-lifetime channels.
+    ///
+    /// Drops any prior handle; re-spawns only when
+    /// `coordination.activity_follow` is true.
+    fn spawn_activity_follow(&mut self) {
+        if self.activity_follow_handle.is_some() {
+            self.activity_follow_handle = None;
+        }
+        if self.generation.cfg.coordination.activity_follow
+            && let Some(idle_tx) = self.idle_obs_tx.as_ref()
+        {
+            let idle_rx = idle_tx.subscribe();
+            let filtered_rx = self.filtered_activity_tx.subscribe();
+            let shared: Vec<dormant_core::types::DisplayId> = self
+                .generation
+                .cfg
+                .displays
+                .iter()
+                .filter(|(_, dc)| {
+                    dc.scope == dormant_core::config::DisplayScope::Shared
+                        && dc.shared_input_code.is_some()
+                })
+                .map(|(name, _)| dormant_core::types::DisplayId(name.clone()))
+                .collect();
+
+            if !shared.is_empty() {
+                let deps = crate::activity_follow::ActivityFollowDeps {
+                    idle_rx,
+                    direct_switch: Some(self.direct_switch.clone()),
+                    display_ids: shared.into(),
+                    arm_after: self.generation.cfg.coordination.arm_after,
+                    cancel: self.root.clone(),
+                    pull_recorder: None,
+                    clock: crate::activity_follow::production_clock,
+                };
+                self.activity_follow_handle =
+                    Some(crate::activity_follow::spawn(deps, filtered_rx));
+            }
+        }
+    }
+
+    /// Publish the KVM claim status to the current engine generation.
+    ///
     /// Reload the config, restarting the runtime in place. See the module
     /// docs for the full state machine.
     #[allow(clippy::too_many_lines)]
@@ -1928,6 +2086,9 @@ impl Runner {
             self.executors_tx.subscribe(),
             next_generation,
             Some(self.observations.clone()),
+            self.idle_obs_tx.clone(),
+            self.filtered_activity_tx.clone(),
+            &self.direct_switch,
         );
         // Test seam (F1): see `App::force_reload_spawn_failure` doc — no
         // config-only path reaches an `Err` here, so a test that needs to
@@ -1953,6 +2114,12 @@ impl Runner {
                     .emit(DaemonObservation::GenerationStarted {
                         generation: self.generation_id,
                     });
+
+                // Republish executor/config watches BEFORE activity-follow
+                // or any new edge can write — an edge that fires against a
+                // stale executor writes to the wrong panel.
+                self.spawn_activity_follow();
+                self.publish_kvm_status().await;
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a
                 // successful reload from the operator path while a
@@ -2125,6 +2292,7 @@ impl Runner {
     }
 
     #[cfg(not(any(test, feature = "test-util")))]
+    #[allow(clippy::unused_self)]
     fn record_reload_lifecycle_stage(&self, _stage: &'static str) {}
 
     #[cfg(any(test, feature = "test-util"))]
@@ -2133,6 +2301,7 @@ impl Runner {
     }
 
     #[cfg(not(any(test, feature = "test-util")))]
+    #[allow(clippy::unused_self)]
     fn force_generation_barrier_timeout_for_test(&self) -> bool {
         false
     }
@@ -2243,6 +2412,9 @@ impl Runner {
             self.executors_tx.subscribe(),
             self.generation_id,
             Some(self.observations.clone()),
+            self.idle_obs_tx.clone(),
+            self.filtered_activity_tx.clone(),
+            &self.direct_switch,
         );
         #[cfg(any(test, feature = "test-util"))]
         let spawn_result = if self.force_rebuild_old_spawn_failure {
@@ -2677,7 +2849,7 @@ async fn run_loop(
         quiesce_inputs(&mut runner.generation).await;
         teardown(&mut runner.generation).await;
     };
-    tokio::join!(generation_teardown, wear_teardown, front_teardown);
+    tokio::join!(generation_teardown, wear_teardown, front_teardown,);
     tracing::info!(event = "daemon_stopped");
 }
 
@@ -3383,6 +3555,8 @@ mod audio_rules_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -3627,6 +3801,9 @@ fn spawn_generation(
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
+    direct_switch: &Arc<DirectSwitchHandle>,
 ) -> Result<GenSpawn> {
     let engine_token = root.child_token();
     let engine_cancel = engine_token.clone();
@@ -3683,6 +3860,7 @@ fn spawn_generation(
             executors_rx,
             state,
             cancel: producer_token.clone(),
+            direct_switch: Some(Arc::clone(direct_switch)),
         }));
     }
 
@@ -3695,9 +3873,14 @@ fn spawn_generation(
     // that fence.
     #[cfg(feature = "render")]
     if let Some(input_wake_rx) = assembly.input_wake_rx {
+        let filter_active = !assembly.cfg.input_filter.ignore_devices.is_empty();
+        let filtered_activity_rx = Some(filtered_activity_tx.subscribe());
         producer_handles.push(spawn_input_wake_drain(
             input_wake_rx,
             ctl_tx.clone(),
+            filter_active,
+            filtered_activity_rx,
+            assembly.render_sinks.clone(),
             producer_token.clone(),
         ));
     }
@@ -3728,6 +3911,9 @@ fn spawn_generation(
         idle_source,
         idle_unit,
         macos_guard_cfg,
+        idle_tx,
+        &assembly.cfg.input_filter,
+        filtered_activity_tx,
         ctl_tx.clone(),
         producer_token.clone(),
     ) {
@@ -3871,6 +4057,9 @@ fn spawn_generation_for_reload(
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
     observations: Option<ObservationHub>,
+    idle_tx: Option<crate::idle_observation::IdleObservationTx>,
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
+    direct_switch: &Arc<DirectSwitchHandle>,
 ) -> Result<GenSpawn> {
     #[cfg(any(test, feature = "test-util"))]
     record_reload_spawn_rollback_for_test(state_dir, rollback.as_ref());
@@ -3889,6 +4078,9 @@ fn spawn_generation_for_reload(
         executors_rx,
         generation_id,
         observations,
+        idle_tx,
+        filtered_activity_tx,
+        direct_switch,
     )
 }
 
@@ -4207,6 +4399,7 @@ mod watchdog_tests {
                     displays: Vec::new(),
                     pending_reload: None,
                     rollback: None,
+                    kvm: None,
                 });
             }
         });
@@ -4273,6 +4466,7 @@ mod watchdog_tests {
             displays: Vec::new(),
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let sent = ping_if_healthy(&mut sd, Some(&snapshot));
 
@@ -4394,6 +4588,9 @@ mod transient_tests {
 fn spawn_input_wake_drain(
     input_wake_rx: tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
     ctl_tx: mpsc::Sender<ControlMsg>,
+    filter_active: bool,
+    filtered_activity_rx: Option<crate::filtered_activity::FilteredActivityRx>,
+    render_sinks: std::collections::HashMap<DisplayId, std::sync::Arc<dyn RenderSink>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -4402,6 +4599,34 @@ fn spawn_input_wake_drain(
             () = async {
                 let mut rx = input_wake_rx;
                 while let Some(display) = rx.recv().await {
+                    // Gate: when the input filter is active, the filtered
+                    // source is available, and no accepted device was
+                    // recently active, reject this wake — the ignored
+                    // device (e.g. a mouse jiggler) should not tear down
+                    // the overlay.  Instead, reassert the current overlay
+                    // surface so the latch resets and a genuine input will
+                    // still fire.
+                    //
+                    // FAIL-SAFE: if the filtered source is UNAVAILABLE or
+                    // the watch is closed, every wake is FORWARDED —
+                    // never silently swallow all input.  A user must
+                    // always be able to wake their screen by touching
+                    // the keyboard.
+                    let should_reject = filter_active
+                        && filtered_activity_rx.as_ref().is_some_and(|activity_rx| {
+                            let observation = activity_rx.borrow();
+                            observation.available
+                                && !observation.is_recent(
+                                    Instant::now(),
+                                    Duration::from_millis(500),
+                                )
+                        });
+                    if should_reject {
+                        if let Some(sink) = render_sinks.get(&display) {
+                            let _ = sink.show_current_overlay().await;
+                        }
+                        continue;
+                    }
                     if ctl_tx.send(ControlMsg::InputWake(display)).await.is_err() {
                         break; // engine channel closed — shutdown in progress
                     }
@@ -4425,6 +4650,10 @@ mod render_tests {
         dormant_core::config::schema::DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: Vec::new(),
             blank_mode: None,
             degraded_mode: None,
@@ -4459,7 +4688,14 @@ mod render_tests {
         let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
         let cancel = CancellationToken::new();
 
-        spawn_input_wake_drain(input_wake_rx, ctl_tx, cancel.clone());
+        spawn_input_wake_drain(
+            input_wake_rx,
+            ctl_tx,
+            false, // filter not active — passthrough
+            None,  // no filtered activity receiver
+            HashMap::new(),
+            cancel.clone(),
+        );
 
         // Push three displays through the wake channel.
         input_wake_tx.send(DisplayId("dp-1".into())).unwrap();
@@ -4484,6 +4720,261 @@ mod render_tests {
         cancel.cancel();
         // Drop the wake-side sender so the drain recv() returns None.
         drop(input_wake_tx);
+    }
+
+    // ── InputWake gate tests (T16) ──
+
+    use dormant_core::fakes::RenderCmd;
+
+    struct InputWakeHarness {
+        input_wake_tx: tokio::sync::mpsc::UnboundedSender<DisplayId>,
+        ctl_rx: mpsc::Receiver<ControlMsg>,
+        cancel: CancellationToken,
+        sink: dormant_core::fakes::RecordingRenderSink,
+        #[allow(dead_code)]
+        handle: JoinHandle<()>,
+    }
+
+    impl InputWakeHarness {
+        /// No filter active — every wake is forwarded.
+        fn without_filter() -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                false, // filter not active
+                None,  // no filtered activity receiver
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        /// Filter active, filtered source is available but no activity
+        /// edge has been recorded — behaves like a fresh source before
+        /// any accepted-device input arrives.
+        fn filtered_without_recent_activity() -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+
+            // Source is available, heartbeat is fresh, but no accepted
+            // device has produced an activity edge yet.
+            let (filtered_tx, filtered_rx) = crate::filtered_activity::filtered_activity_channel();
+            filtered_tx.send_replace(crate::filtered_activity::FilteredActivity {
+                last_activity: None,
+                observed_at: Instant::now(),
+                available: true,
+                edge_seq: 0,
+            });
+
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                true, // filter active
+                Some(filtered_rx),
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        /// Filter active, filtered activity at the given age for both
+        /// `last_activity` and `observed_at` (simulating an edge that
+        /// happened `age` ago and was observed at the same time).
+        fn filtered_with_activity_age(age: Duration) -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+
+            let (filtered_tx, filtered_rx) = crate::filtered_activity::filtered_activity_channel();
+            let now = Instant::now();
+            // Both the heartbeat (`observed_at`) and the activity edge
+            // (`last_activity`) are aged by the same duration.  This
+            // matches the real-world case where a source publishes both
+            // timestamps in the same snapshot.
+            let when = now.checked_sub(age).unwrap_or(now);
+            filtered_tx.send_replace(crate::filtered_activity::FilteredActivity {
+                last_activity: Some(when),
+                observed_at: when,
+                available: true,
+                edge_seq: 1,
+            });
+
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                true, // filter active
+                Some(filtered_rx),
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        /// Filter active, closed watch (tx dropped).  The real
+        /// `InputAuthoritySupervisor` publishes `available: false` before
+        /// the source exits; we replicate that here so the drain sees
+        /// the same unavailable state and fails open toward waking.
+        fn filtered_with_closed_watch() -> Self {
+            let (input_wake_tx, input_wake_rx) = mpsc::unbounded_channel::<DisplayId>();
+            let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>(8);
+            let cancel = CancellationToken::new();
+            let sink = dormant_core::fakes::RecordingRenderSink::new();
+            let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+            sinks.insert(DisplayId("monitor".into()), Arc::new(sink.clone()));
+
+            // Simulate the supervisor's publish_unavailable → drop flow.
+            let (filtered_tx, filtered_rx) = crate::filtered_activity::filtered_activity_channel();
+            filtered_tx.send_replace(crate::filtered_activity::FilteredActivity {
+                last_activity: None,
+                observed_at: Instant::now(),
+                available: false, // unavailable → forward (fail-safe)
+                edge_seq: 0,
+            });
+            drop(filtered_tx); // close the watch
+
+            let handle = spawn_input_wake_drain(
+                input_wake_rx,
+                ctl_tx,
+                true, // filter active
+                Some(filtered_rx),
+                sinks,
+                cancel.clone(),
+            );
+            Self {
+                input_wake_tx,
+                ctl_rx,
+                cancel,
+                sink,
+                handle,
+            }
+        }
+
+        async fn send_render_wake(&self, display: &str) {
+            self.input_wake_tx
+                .send(DisplayId(display.to_string()))
+                .unwrap();
+            // Yield so the drain task processes the message.
+            tokio::task::yield_now().await;
+        }
+
+        /// Drain all forwarded wakes from the control channel (non-blocking).
+        fn forwarded_wakes(&mut self) -> Vec<DisplayId> {
+            let mut wakes = Vec::new();
+            while let Ok(msg) = self.ctl_rx.try_recv() {
+                if let ControlMsg::InputWake(d) = msg {
+                    wakes.push(d);
+                }
+            }
+            wakes
+        }
+
+        /// Snapshots the render sink log and returns the display ids for
+        /// which an overlay reassert was issued.  Since each harness uses
+        /// a single sink for "monitor", every `OverlayReassert` entry in the
+        /// log means the daemon reasserted that display's overlay.
+        fn overlay_reassertions(&self) -> Vec<String> {
+            let mut ids = Vec::new();
+            for (_ts, cmd) in self.sink.log() {
+                if matches!(cmd, RenderCmd::OverlayReassert) {
+                    ids.push("monitor".to_string());
+                }
+            }
+            ids
+        }
+
+        fn cancel(&self) {
+            self.cancel.cancel();
+        }
+    }
+
+    impl Drop for InputWakeHarness {
+        fn drop(&mut self) {
+            self.cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn ignored_render_wake_is_not_forwarded_and_overlay_is_reasserted() {
+        let mut harness = InputWakeHarness::filtered_without_recent_activity();
+        harness.send_render_wake("monitor").await;
+        assert_eq!(harness.forwarded_wakes(), Vec::<DisplayId>::new());
+        assert_eq!(harness.overlay_reassertions(), vec!["monitor"]);
+    }
+
+    #[tokio::test]
+    async fn recent_filtered_edge_forwards_input_wake() {
+        // 100 ms is well within the 500 ms gate — the activity is
+        // recent enough that the drain must forward the wake.
+        let mut harness = InputWakeHarness::filtered_with_activity_age(Duration::from_millis(100));
+        harness.send_render_wake("monitor").await;
+        assert_eq!(
+            harness.forwarded_wakes(),
+            vec![DisplayId("monitor".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_filtered_edge_is_rejected_and_overlay_is_reasserted() {
+        // Activity 3 s ago is well past the 500 ms gate — the drain
+        // must reject the wake and reassert the overlay.
+        let mut harness = InputWakeHarness::filtered_with_activity_age(Duration::from_secs(3));
+        harness.send_render_wake("monitor").await;
+        assert_eq!(harness.forwarded_wakes(), Vec::<DisplayId>::new());
+        assert_eq!(harness.overlay_reassertions(), vec!["monitor"]);
+    }
+
+    #[tokio::test]
+    async fn inactive_filter_always_forwards_input_wake() {
+        let mut harness = InputWakeHarness::without_filter();
+        harness.send_render_wake("monitor").await;
+        assert_eq!(
+            harness.forwarded_wakes(),
+            vec![DisplayId("monitor".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_filtered_watch_fails_open_toward_waking() {
+        // The FAIL-SAFE: when the filter watch is closed, the daemon must
+        // fall back to forwarding every wake (never to silently swallowing
+        // all InputWake — a user must still be able to wake their screen).
+        let mut harness = InputWakeHarness::filtered_with_closed_watch();
+        harness.send_render_wake("monitor").await;
+        assert_eq!(
+            harness.forwarded_wakes(),
+            vec![DisplayId("monitor".to_string())]
+        );
     }
 
     /// `build_render_sinks` returns a render sink for every render-eligible
@@ -4517,6 +5008,10 @@ mod render_tests {
                     dormant_core::config::schema::DisplayConfig {
                         scope: dormant_core::config::DisplayScope::default(),
                         shared_input_code: None,
+                        shared_input_write_code: None,
+                        shared_peer_input_code: None,
+                        shared_peer_input_write_code: None,
+                        hooks: dormant_core::config::HookSlots::default(),
                         controllers: vec!["command".into()],
                         blank_mode: None,
                         degraded_mode: None,
@@ -4567,6 +5062,8 @@ mod render_tests {
                 );
                 m
             },
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let recording = RecordingRenderSink::new();
@@ -4664,6 +5161,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let captured_ss: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -4738,6 +5237,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let captured_shift: Arc<Mutex<Option<dormant_render::ShiftSettings>>> =
@@ -4823,6 +5324,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         // Capture the `ScreensaverSettings` the factory receives so the
@@ -4918,6 +5421,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -5016,6 +5521,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
 
         let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -5110,6 +5617,8 @@ mod render_tests {
                 },
             )]),
             rules: indexmap::IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -5275,6 +5784,7 @@ mod restore_tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -5473,6 +5983,10 @@ mod macos_gamma_black_assembly_tests {
         let display = DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: vec!["command".into()],
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
@@ -5514,6 +6028,8 @@ mod macos_gamma_black_assembly_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         };
         let creds = Credentials::default();
         let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
@@ -5697,6 +6213,10 @@ mod gamma_reload_tests {
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             controllers: vec![controller.into()],
             blank_mode: Some(BlankMode::BrightnessZero),
             degraded_mode: None,
@@ -5758,6 +6278,8 @@ mod gamma_reload_tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -5784,6 +6306,7 @@ mod gamma_reload_tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 

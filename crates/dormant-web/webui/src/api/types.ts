@@ -230,6 +230,13 @@ export interface DaemonIdentity {
  * serde: `displays` is `Vec<(String, DisplaySnapshot)>` → JSON array of [string, DisplaySnapshot].
  * `pending_reload` is `Option<String>` → null or string.
  */
+export interface KvmStatus {
+  keymap: { claim_hotkey?: string };
+  switch_capable_displays: string[];
+  activity_following: boolean;
+  push_capable_displays: string[];
+}
+
 export interface StateSnapshot {
   sensors: SensorSnapshot[];
   zones: ZoneSnapshot[];
@@ -237,6 +244,8 @@ export interface StateSnapshot {
   pending_reload: string | null;
   /** Omitted when the daemon is not running from a rollback. */
   rollback?: RollbackStatus;
+  /** KVM claim presentation state; absent when coordination is unavailable. */
+  kvm?: KvmStatus;
 }
 
 /**
@@ -423,14 +432,47 @@ export interface ConfigInventory {
   rules: Record<string, RuleConfig>;
 }
 
-/** rust: config/schema.rs CoordinationConfig */
+/** rust: config/schema.rs CoordinationConfig
+ *
+ * Remaining fields after the KVM direct-write pivot removed the
+ * owner-mediated claim protocol (Task 16).
+ */
 export interface CoordinationConfig {
-  enabled?: boolean;
   poll_interval?: string;
   state_poll_interval?: string;
-  pairing_port?: number;
-  pairing_window?: string;
-  pairing_bind_address?: string | null;
+  loss_confirmations?: number;
+  activity_follow?: boolean;
+  arm_after?: string;
+  cooldown?: string;
+}
+
+/** rust: config/schema.rs KeymapConfig */
+export interface KeymapConfig {
+  claim_hotkey?: string | null;
+}
+
+/** rust: config/schema.rs InputFilterConfig */
+export interface InputFilterConfig {
+  ignore_devices?: string[];
+}
+
+/** rust: config/schema.rs HookAction */
+export interface HookAction {
+  command?: string[];
+  mqtt?: { topic: string; payload: string };
+  timeout?: string;
+  blocking?: boolean;
+  abort_on_failure?: boolean;
+}
+
+/** rust: config/schema.rs HookSlots */
+export interface HookSlots {
+  before_release?: HookAction[];
+  after_release?: HookAction[];
+  before_acquire?: HookAction[];
+  after_acquire?: HookAction[];
+  /** Actions run after observing (via VCP 0x60 poll) that a peer pulled the panel. */
+  on_observed_loss?: HookAction[];
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */
@@ -536,6 +578,10 @@ export interface DisplayConfig {
   controllers: string[];
   scope?: "private" | "shared";
   shared_input_code?: number;
+  shared_input_write_code?: number;
+  shared_peer_input_code?: number;
+  shared_peer_input_write_code?: number;
+  hooks?: HookSlots;
   blank_mode?: BlankMode;
   degraded_mode?: BlankMode;
   ladder?: LadderStage[];
@@ -669,40 +715,6 @@ export interface PairAccepted {
 export interface PairStatus {
   state: "pairing" | "paired" | "timeout" | "error";
   detail?: string | null;
-}
-
-/** Public instance-pairing responder window. */
-export interface InstancePairOpen {
-  pair_id: string;
-  code: string;
-  expires_at: string;
-}
-
-/** Non-secret instance-pairing lifecycle state. */
-export interface InstancePairStatus {
-  state: "pairing" | "paired" | "timeout" | "cancelled" | "error";
-  detail: string | null;
-}
-
-/** Public mDNS discovery data. */
-export interface DiscoveredInstance {
-  instance_id: string;
-  display_name: string;
-  pairing_port: number;
-  window_id: string;
-}
-
-/** Public persisted instance-pairing data. */
-export interface PairedInstance {
-  instance_id: string;
-  display_name: string;
-  paired_at: string;
-}
-
-/** Read-only pairing inventory. */
-export interface InstancePairPeers {
-  discovered: DiscoveredInstance[];
-  paired: PairedInstance[];
 }
 
 /**

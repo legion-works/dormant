@@ -68,16 +68,19 @@ config_version = 1
 # lkg_rollback_enabled = true  # counted crash-loop rollback; disable during rapid restart debugging
 # stability_window = "5m"      # healthy runtime before a config is promoted to LKG (>= 30s)
 
-# ── Multi-machine coordination ──────────────────────────────────────────────
-# Optional and off by default. Set enabled to true only to expose mDNS
-# discovery, pairing, and operator routes on the LAN.
+# ── Multi-machine coordination (shared displays) ────────────────────────────
+# Opt-in and self-activating: polls ownership only when at least one display
+# has scope = "shared". Every key below shows its documented default.
+# There is no `enabled` key — there is no mDNS discovery, instance pairing,
+# or claim protocol to enable. Switching is a direct local DDC write.
+# See docs/src/multi-machine.md.
 # [coordination]
-# enabled = false               # mDNS discovery, pairing, and operator routes
-# poll_interval = "2s"          # shared-display ownership poll cadence (>= 1s)
-# state_poll_interval = "30s"   # panel-state refresh cadence (unset → max(30s, poll_interval); when set, >= poll_interval)
-# pairing_port = 0               # 0 asks the OS for an ephemeral temporary listener port
-# pairing_window = "5m"          # code/listener/mDNS lifetime (30s..=15m)
-# pairing_bind_address = "10.0.0.5" # unset defaults to the primary non-loopback LAN address
+# poll_interval = "2s"            # shared-display ownership poll cadence (>= 1s)
+# state_poll_interval = "30s"     # panel-state refresh cadence (unset → max(30s, poll_interval); when set, >= poll_interval)
+# loss_confirmations = 3          # consecutive "not mine" VCP 0x60 reads before ownership flips true→false (1..=10)
+# activity_follow = false         # when true, a local activity edge pulls a shared display to this machine
+# arm_after = "7s"                # grace window after a local arm before the pull commits
+# cooldown = "3s"                 # minimum interval between successive activity-driven pulls
 
 # ── Audio- and call-aware blanking (PipeWire) ───────────────────────────────
 #
@@ -112,6 +115,26 @@ socket_path = "/run/user/1000/dormant.sock"
 #                                 # treated as "frozen" rather than genuine idleness (>= 2)
 # macos_idle_sanity_cap = "24h"  # readings above this are treated as bogus, not real idle time (> 0)
 # macos_idle_startup_grace = "15s"  # readings are untrusted for this long after daemon startup (> 0)
+
+# ── KVM claim hotkey ──────────────────────────────────────────────────────
+#
+# Optional. The tray registers this global accelerator to fire a claim;
+# when unset, claims rely on `dormantctl switch`, an activity-claim policy,
+# or the web UI. The string syntax is the tray's native accelerator format
+# (X11 key combo on Linux, Carbon modifier+key on macOS).
+# [keymap]
+# claim_hotkey = "Meta+Ctrl+Shift+B"
+
+# ── Input-device filtering for activity claims ───────────────────────────
+#
+# Optional. Case-insensitive device-name globs that do NOT count as local
+# activity — activity on an ignored device neither inhibits blanking nor
+# triggers an `edge` claim. The filtered-input source reads evdev nodes on
+# Linux through the compositor's seat; unprivileged reads need the user in
+# the `input` group or equivalent `uaccess`/logind ACL (see
+# `dormantctl doctor input-filter` and docs/src/multi-machine.md).
+# [input_filter]
+# ignore_devices = ["*jiggler*", "MosArt *"]
 
 # ── Web UI config editor: entity CRUD + the Samsung pairing wizard ─────────
 #
@@ -289,3 +312,29 @@ wake_retry_interval = "60s"
 # blank_mode = "power_off"
 # scope = "shared"
 # shared_input_code = 0x0f       # doctor prints the active input in hex
+# shared_input_write_code = 0x15 # only needed when panel write differs from read
+#
+# [displays.shared_oled.hooks]
+# # before_release — entries fire in order BEFORE releasing the panel to the
+# # peer; a blocking entry (blocking = true, the slot default) must finish
+# # before the input-source write. Use for USB-switch or KVMP transitions.
+# before_release = [
+#   { mqtt = { topic = "usbswitch/set", payload = "mac" }, timeout = "5s", blocking = true },
+# ]
+# # after_acquire — non-blocking entries fire AFTER the peer's release
+# # completes and the local input source is written.  Safe place for
+# # notification or local-state commands that must not hold the hand-off.
+# after_acquire = [
+#   { command = ["notify-send", "panel acquired"], timeout = "5s", blocking = false },
+# ]
+# # before_acquire — entries fire BEFORE the owner writes VCP 0x60.
+# # This is the REQUIRER wake-and-verify slot: wake the machine's video
+# # output so the panel will accept the input switch (see the
+# # signal-presence law in docs/src/multi-machine.md). A blocking entry
+# # must complete before the owner releases the panel.
+# before_acquire = [
+#   # Linux: force DPMS on
+#   { command = ["xset", "dpms", "force", "on"], timeout = "5s", blocking = true },
+#   # macOS: prevent display sleep + verify CGDisplayIsAsleep returns false
+#   { command = ["caffeinate", "-u", "-t", "2"], timeout = "5s", blocking = true },
+# ]

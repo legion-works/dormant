@@ -1,0 +1,29 @@
+config_version = 1
+
+[keymap]
+claim_hotkey = "Meta+F12"
+
+[input_filter]
+ignore_devices = ["*jiggler*"]
+
+[coordination]
+activity_follow = true
+arm_after = "7s"
+cooldown = "3s"
+
+[displays.monitor]
+controllers = ["ddcci"]
+scope = "shared"
+shared_input_code = 17
+blank_mode = "power_off"
+
+[displays.monitor.hooks]
+before_release = [
+  { command = [
+    "printf",
+    "release",
+  ], timeout = "100ms", blocking = true, abort_on_failure = false },
+]
+after_release = []
+before_acquire = []
+after_acquire = []

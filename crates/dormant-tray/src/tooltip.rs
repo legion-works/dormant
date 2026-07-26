@@ -171,6 +171,7 @@ mod tests {
             ],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -223,6 +224,7 @@ mod tests {
             displays: vec![],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let t = build_tooltip(&TooltipInputs {
             snapshot: Some(&snap),
@@ -258,6 +260,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let t = build_tooltip(&TooltipInputs {
             snapshot: Some(&snap),
@@ -294,6 +297,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let t = build_tooltip(&TooltipInputs {
             snapshot: Some(&snap),
@@ -329,6 +333,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let t = build_tooltip(&TooltipInputs {
             snapshot: Some(&snap),
@@ -364,6 +369,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
         let t = build_tooltip(&TooltipInputs {
             snapshot: Some(&snap),

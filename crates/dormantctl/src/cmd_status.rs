@@ -91,17 +91,45 @@ fn render_table(snapshot: &StateSnapshot) -> String {
             "── Displays ──────────────────────────────────────────────"
         );
         let mut table = Table::new();
-        table.set_header(vec!["ID", "Phase", "Inhibited", "Paused"]);
+        table.set_header(vec!["ID", "Phase", "Owner", "Claim", "Inhibited", "Paused"]);
         for (id, d) in &snapshot.displays {
             let phase = phase_cell(d);
             table.add_row(vec![
                 id.as_str(),
                 phase.as_str(),
+                if d.owned { "local" } else { "peer" },
+                if snapshot.kvm.as_ref().is_some_and(|kvm| {
+                    kvm.switch_capable_displays
+                        .iter()
+                        .any(|display| display.0 == *id)
+                }) {
+                    "capable"
+                } else {
+                    "unsupported"
+                },
                 if d.inhibited { "yes" } else { "no" },
                 if d.paused { "yes" } else { "no" },
             ]);
         }
         let _ = writeln!(out, "{table}");
+    }
+
+    if let Some(kvm) = &snapshot.kvm {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "── KVM ───────────────────────────────────────────────────"
+        );
+        let _ = writeln!(
+            out,
+            "Activity follow: {}",
+            if kvm.activity_following { "on" } else { "off" }
+        );
+        let _ = writeln!(
+            out,
+            "Claim hotkey: {}",
+            kvm.keymap.claim_hotkey.as_deref().unwrap_or("—")
+        );
     }
 
     // ── Pending reload warning ────────────────────────────────────────────
@@ -191,6 +219,7 @@ mod tests {
             ],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -264,6 +293,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
 
         let d = &snap.displays[0].1;
@@ -302,6 +332,7 @@ mod tests {
             )],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         };
 
         // Must exercise the production rendering path, not a helper — a
@@ -318,5 +349,25 @@ mod tests {
             out.contains("\"render_black\""),
             "render_table output missing render_black kind: {out}"
         );
+    }
+
+    #[test]
+    fn table_surfaces_kvm_claim_state() {
+        let mut snap = canned_snapshot();
+        snap.displays[0].1.scope = dormant_core::config::DisplayScope::Shared;
+        snap.displays[0].1.owned = false;
+        snap.kvm = Some(dormant_core::rules::KvmStatus {
+            keymap: dormant_core::config::KeymapConfig {
+                claim_hotkey: Some("Ctrl+F12".into()),
+            },
+            switch_capable_displays: vec![dormant_core::types::DisplayId("main_monitor".into())],
+            activity_following: true,
+            push_capable_displays: vec![],
+        });
+        let rendered = render_table(&snap);
+        assert!(rendered.contains("peer"));
+        assert!(rendered.contains("capable"));
+        assert!(rendered.contains("Activity follow: on"));
+        assert!(rendered.contains("Ctrl+F12"));
     }
 }

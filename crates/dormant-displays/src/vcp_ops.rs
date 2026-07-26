@@ -159,10 +159,63 @@ pub const INPUT_SOURCE_SKIPPED: &str = "skipped: command holds panel lock";
 pub const VCP_PANIC: &str = "E_DISPLAY_IO: vcp operation panicked";
 
 /// Information about a detected display returned by [`VcpOps::list_displays`].
+///
+/// `ident_string` carries the machine-local bus prefix (`backend:id …`) and
+/// is the canonical panel-lock key; the EDID text fields below are the
+/// bus-independent identity used by [`VcpDisplayInfo::claim_identity`] (spec F5).
 #[derive(Debug, Clone)]
 pub struct VcpDisplayInfo {
     /// Human-readable identifier string (backend:id manufacturer `model_name`).
     pub ident_string: String,
+    /// EDID manufacturer id (e.g. `"AOC"`, `"DEL"`) — the 3-letter vendor code.
+    pub manufacturer: Option<String>,
+    /// EDID model/product name (e.g. `"AG326UZD"`, `"U2723QE"`).
+    pub model: Option<String>,
+    /// EDID serial-number string, when the descriptor is present.
+    pub serial: Option<String>,
+}
+
+impl VcpDisplayInfo {
+    /// Cross-machine claim identity (spec F5): `manufacturer:model`, plus
+    /// `:serial` when the EDID serial is present — derived ONLY from the
+    /// EDID text fields, never `ident_string` (which embeds the machine-local
+    /// bus prefix). Returns `None` when manufacturer or model is absent: a
+    /// panel that cannot be EDID-identified cannot be claim-matched, and
+    /// must never fabricate a key. EDID text is trimmed (case-preserved) so
+    /// vendor descriptor padding does not leak into the canonical key.
+    #[must_use]
+    pub fn claim_identity(&self) -> Option<String> {
+        let manufacturer = self.manufacturer.as_deref()?.trim();
+        let model = self.model.as_deref()?.trim();
+        let serial = self.serial.as_deref().map(str::trim);
+        if manufacturer.is_empty() || model.is_empty() {
+            return None;
+        }
+        match serial.filter(|s| !s.is_empty()) {
+            Some(serial) => Some(format!("{manufacturer}:{model}:{serial}")),
+            None => Some(format!("{manufacturer}:{model}")),
+        }
+    }
+
+    /// Test fixture constructor: build a [`VcpDisplayInfo`] with explicit
+    /// EDID text fields so [`Self::claim_identity`] is testable without DDC
+    /// hardware. `manufacturer`/`model` are stored verbatim (empty stays
+    /// `Some("")` so the trim/empty-handling in [`Self::claim_identity`] is
+    /// what gets exercised); `serial` is `None` when absent.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        ident_string: &str,
+        manufacturer: &str,
+        model: &str,
+        serial: Option<&str>,
+    ) -> Self {
+        Self {
+            ident_string: ident_string.to_string(),
+            manufacturer: Some(manufacturer.to_string()),
+            model: Some(model.to_string()),
+            serial: serial.map(str::to_string),
+        }
+    }
 }
 
 /// Abstract DDC/CI operations — real or fake.
@@ -585,6 +638,168 @@ fn vcp_transaction<H, T>(
     }
 }
 
+/// Map a ddc-hi [`DisplayInfo`] onto a [`VcpDisplayInfo`], copying the EDID
+/// text fields (`manufacturer_id` / `model_name` / `serial_number`) verbatim —
+/// pure, no I/O, so the EDID → claim-identity path is testable with a fixture
+/// `DisplayInfo` instead of real hardware. The `ident_string` stays ddc-hi's
+/// `Display::info` `to_string()` (the bus-prefixed panel-lock key, unchanged).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo {
+    VcpDisplayInfo {
+        ident_string: info.to_string(),
+        manufacturer: info.manufacturer_id.clone(),
+        model: info.model_name.clone(),
+        serial: info.serial_number.clone(),
+    }
+}
+
+/// Parsed EDID identity fields (spec F5) — the cross-machine-stable subset
+/// ddc-hi's `DisplayInfo::from_edid` populates on the Linux i²c path (via
+/// edid-rs) but leaves empty on macOS when the vendored `ddc-macos` fork's
+/// `edid()` bytes fail edid-rs parsing.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdidIdentity {
+    manufacturer: Option<String>,
+    model: Option<String>,
+    serial: Option<String>,
+}
+
+/// Parse the cross-machine EDID identity from raw EDID bytes: the manufacturer
+/// PNP id (header bytes 8–9), the monitor-name descriptor (0xFC), and the
+/// serial-number descriptor (0xFF).
+///
+/// Pure, no I/O, no macOS API — so the EDID → claim-identity path is testable
+/// on Linux with a fixture blob. Mirrors what ddc-hi's `DisplayInfo::from_edid`
+/// (via edid-rs) populates on the Linux i²c path: `manufacturer_id` from the
+/// header vendor bytes, `model_name` from descriptor 0xFC, `serial_number`
+/// from descriptor 0xFF. The numeric EDID serial field (bytes 12–15) is
+/// deliberately NOT used: the desktop derives `serial_number` from the 0xFF
+/// string descriptor, so a numeric fallback would diverge and break the
+/// byte-identical cross-machine match (spec F5).
+///
+/// Returns `None` only for a structurally too-short EDID (< 128 bytes); a
+/// present-but-empty descriptor yields `EdidIdentity` with `None` fields,
+/// which [`VcpDisplayInfo::claim_identity`] collapses to `None` (honest).
+#[cfg(any(target_os = "macos", test))]
+fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
+    // The base block is 128 bytes; the four 18-byte descriptor slots live at
+    // offsets 54..126. Extension blocks do not carry base identity.
+    if edid.len() < 128 {
+        return None;
+    }
+    let manufacturer = decode_pnp_manufacturer(edid[8], edid[9]);
+    let (model, serial) = parse_monitor_descriptors(&edid[54..126]);
+    Some(EdidIdentity {
+        manufacturer,
+        model,
+        serial,
+    })
+}
+
+/// Decode the 3-letter EDID manufacturer PNP id from the two header bytes
+/// (big-endian u16, three 5-bit groups, 1–26 → 'A'–'Z'). A 0 group means
+/// "unused" and is skipped rather than fabricated into a partial id.
+#[cfg(any(target_os = "macos", test))]
+fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
+    let id = u16::from_be_bytes([high, low]);
+    let groups = [(id >> 10) & 0x1F, (id >> 5) & 0x1F, id & 0x1F];
+    let mut s = String::new();
+    for g in groups {
+        if let 1..=26 = g {
+            s.push(
+                char::from_u32(u32::from(g) - 1 + u32::from(b'A'))
+                    .expect("1..=26 maps to 'A'..='Z'"),
+            );
+        }
+    }
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Walk the four 18-byte descriptor slots and pull the first monitor-name
+/// (0xFC) and serial-number (0xFF) string descriptors. A slot is a monitor
+/// descriptor (vs a detailed timing) when it starts with `0x00 0x00 0x00`;
+/// per EDID 1.4 §3.10.4 byte 3 is then the tag and bytes 5..18 the data
+/// (byte 4 is reserved zero). The AOC's panel on this Mac puts the tag at
+/// byte 3 — the previous code checked byte 2, which is always zero, and
+/// so never matched any descriptor.
+#[cfg(any(target_os = "macos", test))]
+fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut serial = None;
+    for block in slots.chunks_exact(18) {
+        // 0x00 0x00 0x00 = monitor-descriptor signature (per EDID 1.4 §3.10.4).
+        if block[0] != 0 || block[1] != 0 || block[2] != 0 {
+            continue;
+        }
+        let text = descriptor_string(&block[5..18]);
+        match (block[3], text) {
+            (0xFC, Some(t)) if model.is_none() => model = Some(t),
+            (0xFF, Some(t)) if serial.is_none() => serial = Some(t),
+            _ => {}
+        }
+    }
+    (model, serial)
+}
+
+/// Extract a null/LF-terminated, space-padded ASCII string from a descriptor
+/// data range. Trailing whitespace is trimmed; a non-UTF8 or empty result is
+/// `None`.
+#[cfg(any(target_os = "macos", test))]
+fn descriptor_string(data: &[u8]) -> Option<String> {
+    let end = data
+        .iter()
+        .position(|b| *b == 0x00 || *b == 0x0A)
+        .unwrap_or(data.len());
+    let s = std::str::from_utf8(&data[..end]).ok()?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Build a [`VcpDisplayInfo`] from a ddc-hi [`ddc_hi::Display`], deriving the
+/// EDID identity from ddc-hi's parsed `DisplayInfo` and — on macOS only —
+/// backfilling it from the vendored `ddc-macos` fork's raw EDID bytes when
+/// ddc-hi's `from_edid` left it empty (the F5 gap: `claim_identity` derived
+/// `None` on macOS). The `ident_string` is always ddc-hi's `Display::info`
+/// `to_string()`, so the panel-lock key and cache resolution are unchanged.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn vcp_display_info_from_display(d: &ddc_hi::Display) -> VcpDisplayInfo {
+    // `mut` only for the macOS backfill below; on Linux the backfill is
+    // cfg'd out, so suppress the otherwise-unused `mut` there.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut vcp = vcp_display_info_from_ddc_info(&d.info);
+    #[cfg(target_os = "macos")]
+    backfill_edid_identity_from_macos(&mut vcp, &d.handle);
+    vcp
+}
+
+/// macOS-only backfill: derive the EDID identity fields from the vendored
+/// `ddc-macos` fork's raw EDID bytes when ddc-hi's `DisplayInfo::from_edid`
+/// left them empty. ddc-hi reaches the fork's `Monitor` through its
+/// `Handle::MacOS` variant (the variant is `#[doc(hidden)]` but public; ddc-hi
+/// is pinned at 0.4). The fork's `edid()` returns the same panel-intrinsic
+/// bytes the Linux i²c path parses, so the shared panel's `claim_identity` is
+/// byte-identical across machines (spec F5).
+#[cfg(target_os = "macos")]
+fn backfill_edid_identity_from_macos(vcp: &mut VcpDisplayInfo, handle: &ddc_hi::Handle) {
+    if vcp.claim_identity().is_some() {
+        return;
+    }
+    let ddc_hi::Handle::MacOS(monitor) = handle;
+    let Some(edid) = monitor.edid() else {
+        return;
+    };
+    let Some(id) = parse_edid_identity(&edid) else {
+        return;
+    };
+    vcp.manufacturer = id.manufacturer;
+    vcp.model = id.model;
+    vcp.serial = id.serial;
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait]
 impl VcpOps for RealVcp {
@@ -597,9 +812,7 @@ impl VcpOps for RealVcp {
             let _gate = ddc_gate();
             ddc_hi::Display::enumerate()
                 .into_iter()
-                .map(|d| VcpDisplayInfo {
-                    ident_string: d.info.to_string(),
-                })
+                .map(|d| vcp_display_info_from_display(&d))
                 .collect::<Vec<_>>()
         })
         .await
@@ -713,6 +926,10 @@ pub(crate) struct FakeVcp {
     /// (ident, code, value) triples scripted to panic on their next
     /// `set_vcp` call — one-shot, removed on use.
     set_panic: StdMutex<std::collections::HashSet<(String, u8, u16)>>,
+    /// Set-VCP calls with their lock-acquisition priority. This is separate
+    /// from the string log so tests can assert command/sampler behavior
+    /// without coupling to its diagnostic formatting.
+    set_calls: StdMutex<Vec<(u8, u16, VcpPriority)>>,
     call_log: StdMutex<Vec<String>>,
     /// Wall-clock elapsed time of the most recent delayed `get_vcp` call
     /// (measured *inside* the blocking closure, while the lock was held) —
@@ -746,6 +963,7 @@ impl FakeVcp {
             get_delay: StdMutex::new(std::collections::HashMap::new()),
             get_panic: StdMutex::new(std::collections::HashSet::new()),
             set_panic: StdMutex::new(std::collections::HashSet::new()),
+            set_calls: StdMutex::new(Vec::new()),
             call_log: StdMutex::new(Vec::new()),
             last_get_elapsed: StdMutex::new(None),
         }
@@ -839,6 +1057,16 @@ impl FakeVcp {
         std::mem::take(&mut *log)
     }
 
+    /// Snapshot Set-VCP calls and their requested priority.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn set_calls(&self) -> Vec<(u8, u16, VcpPriority)> {
+        self.set_calls.lock().unwrap().clone()
+    }
+
     /// Take the elapsed wall-clock time of the most recent delayed
     /// `get_vcp` call, if any.
     ///
@@ -926,6 +1154,7 @@ impl VcpOps for FakeVcp {
         lock: &Arc<PanelLock>,
         prio: VcpPriority,
     ) -> Result<(), String> {
+        self.set_calls.lock().unwrap().push((code, value, prio));
         self.call_log
             .lock()
             .unwrap()
@@ -1009,10 +1238,276 @@ mod tests {
     fn single_display_fake() -> FakeVcp {
         FakeVcp::new(vec![VcpDisplayInfo {
             ident_string: "i2c-dev:1 TST TEST".into(),
+            manufacturer: None,
+            model: None,
+            serial: None,
         }])
     }
 
     const IDENT: &str = "i2c-dev:1 TST TEST";
+
+    // ── F5: claim_identity (EDID-derived, bus-independent) ─────────────────
+
+    /// F5: two display infos that differ ONLY in the machine-local bus
+    /// prefix (`i2c:7` vs `iokit:4`) derive the SAME claim identity — the
+    /// broadcast claim model's hard precondition (byte-identical across
+    /// machines). `ident_string` carries the bus prefix; `claim_identity`
+    /// is derived only from EDID manufacturer/model/serial.
+    #[test]
+    fn claim_identity_is_machine_local_bus_independent() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "AOC", "AG326UZD", Some("ABC123"));
+        let b = VcpDisplayInfo::for_test("iokit:4 AOC AG326UZD", "AOC", "AG326UZD", Some("ABC123"));
+        assert_eq!(a.claim_identity(), Some("AOC:AG326UZD:ABC123".into()));
+        assert_eq!(a.claim_identity(), b.claim_identity());
+    }
+
+    /// EDID text is trimmed (case-preserved) before formatting — vendors
+    /// pad descriptor strings with whitespace, which would otherwise leak
+    /// into the canonical key and break byte-identical matching.
+    #[test]
+    fn claim_identity_trims_edid_fields() {
+        let a = VcpDisplayInfo::for_test(
+            "i2c:7 AOC AG326UZD",
+            "  AOC  ",
+            " AG326UZD ",
+            Some("  ABC123  "),
+        );
+        assert_eq!(a.claim_identity(), Some("AOC:AG326UZD:ABC123".into()));
+    }
+
+    /// An absent EDID serial degrades to `manufacturer:model` (no trailing
+    /// colon) — still specific enough to claim-match, and honest about what
+    /// the panel exposed.
+    #[test]
+    fn claim_identity_absent_serial_produces_manufacturer_model() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "AOC", "AG326UZD", None);
+        assert_eq!(a.claim_identity(), Some("AOC:AG326UZD".into()));
+    }
+
+    /// Missing manufacturer → `None` (honest default): a panel that did not
+    /// expose an EDID manufacturer cannot be claim-matched, and must never
+    /// fabricate a key from model+serial alone.
+    #[test]
+    fn claim_identity_missing_manufacturer_returns_none() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "", "AG326UZD", Some("ABC123"));
+        assert_eq!(a.claim_identity(), None);
+    }
+
+    /// Missing model → `None`, symmetric with the manufacturer case.
+    #[test]
+    fn claim_identity_missing_model_returns_none() {
+        let a = VcpDisplayInfo::for_test("i2c:7 AOC AG326UZD", "AOC", "", Some("ABC123"));
+        assert_eq!(a.claim_identity(), None);
+    }
+
+    /// The production path: ddc-hi leaves `manufacturer_id` `None` when the
+    /// EDID lacks a manufacturer descriptor. `claim_identity` must treat that
+    /// the same as a missing field (not as `Some("")`).
+    #[test]
+    fn claim_identity_none_when_manufacturer_field_absent() {
+        let info = VcpDisplayInfo {
+            ident_string: "i2c:7 AOC AG326UZD".into(),
+            manufacturer: None,
+            model: Some("AG326UZD".into()),
+            serial: Some("ABC123".into()),
+        };
+        assert_eq!(info.claim_identity(), None);
+    }
+
+    /// `vcp_display_info_from_ddc_info` maps the EDID text fields a Linux
+    /// i2c-dev backend exposes onto [`VcpDisplayInfo`], so `claim_identity`
+    /// is derivable from a real enumeration without parsing `ident_string`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn vcp_display_info_from_ddc_info_maps_edid_fields_i2c() {
+        let mut info = ddc_hi::DisplayInfo::new(ddc_hi::Backend::I2cDevice, "7".into());
+        info.manufacturer_id = Some("AOC".into());
+        info.model_name = Some("AG326UZD".into());
+        info.serial_number = Some("ABC123".into());
+        let vcp = vcp_display_info_from_ddc_info(&info);
+        assert_eq!(vcp.manufacturer.as_deref(), Some("AOC"));
+        assert_eq!(vcp.model.as_deref(), Some("AG326UZD"));
+        assert_eq!(vcp.serial.as_deref(), Some("ABC123"));
+        assert_eq!(vcp.claim_identity(), Some("AOC:AG326UZD:ABC123".into()));
+    }
+
+    /// macOS `IOKit` backend: the same EDID fields produce the SAME
+    /// `claim_identity` as the Linux i2c-dev case — the bus-independence
+    /// property at the mapper level (F5 pre-implementation gate, unit form).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn vcp_display_info_from_ddc_info_maps_edid_fields_macos() {
+        let mut info = ddc_hi::DisplayInfo::new(ddc_hi::Backend::MacOS, "4".into());
+        info.manufacturer_id = Some("AOC".into());
+        info.model_name = Some("AG326UZD".into());
+        info.serial_number = Some("ABC123".into());
+        let vcp = vcp_display_info_from_ddc_info(&info);
+        assert_eq!(
+            vcp.claim_identity(),
+            Some("AOC:AG326UZD:ABC123".into()),
+            "macOS IOKit and Linux i2c must derive the same claim identity"
+        );
+    }
+
+    // ── F5 fix: EDID-byte extraction (macOS fork path), Leg 2 fixture tests ──
+
+    /// Recompute the EDID base-block checksum (byte 127) so a mutated fixture
+    /// stays descriptor-correct.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn recompute_checksum(e: &mut [u8]) {
+        let sum: u32 = e[..127].iter().copied().map(u32::from).sum();
+        e[127] = u8::try_from((256 - (sum % 256)) % 256).expect("checksum is 0..=255");
+    }
+
+    /// Build a 128-byte base EDID block for the AOC AG326UZD (serial
+    /// XK2R9JA000013) with a valid checksum — a descriptor-correct fixture for
+    /// `parse_edid_identity` (T1 fix, Leg 2).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn ag326uzd_edid() -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        // manufacturer AOC = (1<<10)|(15<<5)|3 = 0x05E3 (big-endian)
+        e[8..10].copy_from_slice(&[0x05, 0xE3]);
+        e[18] = 0x01; // EDID version
+        e[19] = 0x04; // revision
+        // descriptor 1 (offset 54): monitor name 0xFC = "AG326UZD".
+        // EDID 1.4 §3.10.4 monitor-descriptor layout: bytes 0-1 = 0x00 0x00
+        // signature, byte 2 reserved 0x00, byte 3 tag, byte 4 reserved 0x00,
+        // bytes 5..18 data. The AOC on this Mac uses the standard layout —
+        // the previous non-standard fixture (tag at byte 2) masked the bug.
+        e[54] = 0x00;
+        e[55] = 0x00;
+        e[56] = 0x00;
+        e[57] = 0xFC;
+        e[58] = 0x00;
+        let name = b"AG326UZD";
+        e[59..59 + name.len()].copy_from_slice(name);
+        e[59 + name.len()] = 0x0A; // LF terminator
+        // descriptor 2 (offset 72): serial 0xFF = "XK2R9JA000013"
+        e[72] = 0x00;
+        e[73] = 0x00;
+        e[74] = 0x00;
+        e[75] = 0xFF;
+        e[76] = 0x00;
+        let serial = b"XK2R9JA000013";
+        e[77..77 + serial.len()].copy_from_slice(serial);
+        e[77 + serial.len()] = 0x0A;
+        recompute_checksum(&mut e);
+        e
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_edid_identity_extracts_aoc_ag326uzd_serial() {
+        let id = parse_edid_identity(&ag326uzd_edid()).expect("128-byte EDID parses");
+        assert_eq!(id.manufacturer.as_deref(), Some("AOC"));
+        assert_eq!(id.model.as_deref(), Some("AG326UZD"));
+        assert_eq!(id.serial.as_deref(), Some("XK2R9JA000013"));
+    }
+
+    /// The whole point of F5: the macOS EDID-derived identity must be
+    /// byte-identical to the Linux i²c path's, so the claim broadcast matches
+    /// the same physical panel across machines.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_edid_identity_matches_linux_claim_identity_byte_for_byte() {
+        let id = parse_edid_identity(&ag326uzd_edid()).expect("128-byte EDID parses");
+        let vcp = VcpDisplayInfo {
+            ident_string: "macos:4 AOC AG326UZD".into(),
+            manufacturer: id.manufacturer,
+            model: id.model,
+            serial: id.serial,
+        };
+        assert_eq!(
+            vcp.claim_identity().as_deref(),
+            Some("AOC:AG326UZD:XK2R9JA000013"),
+            "macOS EDID-derived identity must be byte-identical to the Linux path"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_edid_identity_absent_serial_descriptor_drops_serial() {
+        let mut e = ag326uzd_edid();
+        e[72..90].fill(0); // clear the 0xFF descriptor
+        recompute_checksum(&mut e);
+        let id = parse_edid_identity(&e).expect("128-byte EDID parses");
+        assert_eq!(id.manufacturer.as_deref(), Some("AOC"));
+        assert_eq!(id.model.as_deref(), Some("AG326UZD"));
+        assert!(id.serial.is_none());
+        let vcp = VcpDisplayInfo {
+            ident_string: "x".into(),
+            manufacturer: id.manufacturer,
+            model: id.model,
+            serial: id.serial,
+        };
+        assert_eq!(vcp.claim_identity().as_deref(), Some("AOC:AG326UZD"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_edid_identity_absent_model_descriptor_yields_none_claim() {
+        let mut e = ag326uzd_edid();
+        e[54..72].fill(0); // clear the 0xFC descriptor
+        recompute_checksum(&mut e);
+        let id = parse_edid_identity(&e).expect("128-byte EDID parses");
+        assert!(id.model.is_none());
+        let vcp = VcpDisplayInfo {
+            ident_string: "x".into(),
+            manufacturer: id.manufacturer,
+            model: id.model,
+            serial: id.serial,
+        };
+        assert_eq!(
+            vcp.claim_identity(),
+            None,
+            "no model → claim_identity None (honest)"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_edid_identity_too_short_returns_none() {
+        assert!(parse_edid_identity(&[0u8; 64]).is_none());
+    }
+
+    /// Captured from a real Mac M3 Pro's `IORegistry` (`AppleDisplayCrossbar`
+    /// → `AppleATCDPINAdapterPort` → `IOPortTransportStateDisplayPort` →
+    /// `Metadata.EDID`) on the AOC AG326UZD attached via USB-C DP Alt-Mode.
+    /// 384 bytes = 128-byte base block + 256-byte CTA extension; the base
+    /// block alone is sufficient for `parse_edid_identity`. This is the
+    /// byte-exact fixture that exposed the v1 bug — the fork lookup path
+    /// surfaced a 128+256-byte EDID where the monitor descriptors put the
+    /// tag at byte 3 (EDID 1.4 §3.10.4), not byte 2 as v1's parser
+    /// assumed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parse_real_mac_arm_edid_byte_identical_to_desktop() {
+        let edid = include_bytes!("fixtures/aoc-ag326uzd-mac.edid");
+        let id = parse_edid_identity(edid).expect("Mac EDID parses");
+        assert_eq!(id.manufacturer.as_deref(), Some("AOC"));
+        assert_eq!(id.model.as_deref(), Some("AG326UZD"));
+        assert_eq!(id.serial.as_deref(), Some("XK2R9JA000013"));
+        let vcp = VcpDisplayInfo {
+            ident_string: "macos:4 AOC AG326UZD".into(),
+            manufacturer: id.manufacturer,
+            model: id.model,
+            serial: id.serial,
+        };
+        assert_eq!(
+            vcp.claim_identity().as_deref(),
+            Some("AOC:AG326UZD:XK2R9JA000013"),
+            "macOS EDID-derived identity must be byte-identical to the Linux i²c path"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn decode_pnp_manufacturer_aoc_and_del() {
+        assert_eq!(decode_pnp_manufacturer(0x05, 0xE3).as_deref(), Some("AOC"));
+        // DEL = (4<<10)|(5<<5)|12 = 0x10AC
+        assert_eq!(decode_pnp_manufacturer(0x10, 0xAC).as_deref(), Some("DEL"));
+    }
 
     #[tokio::test]
     async fn get_vcp_returns_scripted_value() {

@@ -103,19 +103,38 @@ pub struct Config {
     /// Multi-machine coordination configuration.
     #[serde(default)]
     pub coordination: CoordinationConfig,
+
+    /// Global KVM claim hotkey settings.
+    #[serde(default)]
+    pub keymap: KeymapConfig,
+
+    /// Local input-device filtering for activity claims.
+    #[serde(default)]
+    pub input_filter: InputFilterConfig,
 }
 
-/// Multi-machine coordination settings.
-///
-/// `enabled = false` disables mDNS, pairing, and operator routes at runtime;
-/// it never disables local `0x60` ownership polling for a configured shared
-/// display.
+/// Global KVM claim hotkey settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeymapConfig {
+    /// Accelerator registered by the tray, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_hotkey: Option<String>,
+}
+
+/// Input-device filtering settings for activity claims.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct InputFilterConfig {
+    /// Case-insensitive device-name globs that do not count as local activity.
+    #[serde(default)]
+    pub ignore_devices: Vec<String>,
+}
+
+/// Multi-machine coordination settings — direct local input writes
+/// replace the earlier owner-mediated claim protocol (mDNS, SPAKE2,
+/// Ed25519, TCP transport). The remaining fields govern ownership polls
+/// and activity-follow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoordinationConfig {
-    /// Whether mDNS discovery, pairing, and operator routes are available.
-    #[serde(default = "default_coordination_enabled")]
-    pub enabled: bool,
-
     /// Interval between shared-display ownership polls.
     #[serde(
         default = "default_coordination_poll_interval",
@@ -137,33 +156,57 @@ pub struct CoordinationConfig {
     )]
     pub state_poll_interval: Option<Duration>,
 
-    /// Requested TCP port for the short-lived pairing listener; zero requests
-    /// an ephemeral port from the operating system.
-    #[serde(default = "default_coordination_pairing_port")]
-    pub pairing_port: u16,
+    /// Number of consecutive agreeing "not mine" VCP `0x60` readings required
+    /// before the cached ownership verdict flips `true → false` (issue #134).
+    ///
+    /// Defends against garbled reads from concurrent cross-machine DDC
+    /// traffic on a shared panel: a single corrupted read should not blank a
+    /// panel that's still ours. Ownership **gain** (`false → true`) stays
+    /// eager — a possibly-wrong "I own" read triggers an idempotent wake that
+    /// the next poll re-confirms. See
+    /// [`defaults::COORDINATION_LOSS_CONFIRMATIONS`] for the default and the
+    /// floor / ceiling rationale; validated to `1..=10` in
+    /// [`mod@super::validate`].
+    ///
+    /// **Latency.** With defaults (`poll_interval = 2s`,
+    /// `loss_confirmations = 3`), a genuine input switch takes ~6 seconds to
+    /// commit. During that window the old owner still believes it owns the
+    /// panel and may issue a blank; the new owner reads "mine" on its next
+    /// poll and wakes eagerly. Lowering `loss_confirmations` toward `1`
+    /// shortens that window at the cost of flap-susceptibility; raising it
+    /// widens the genuine-handoff latency proportionally.
+    ///
+    /// **Limits.** The debounce reduces but does not eliminate false losses.
+    /// If cross-machine DDC collisions return the same wrong code N times in
+    /// a row, a false loss can still commit — N=3 makes a false loss ~3×
+    /// less likely than N=1, not impossible. The `coord_poll_disagreement`
+    /// signal only fires when consecutive observations *differ*; identical
+    /// wrong readings sail through the debounce as if they were genuine.
+    #[serde(default = "default_coordination_loss_confirmations")]
+    pub loss_confirmations: u32,
 
-    /// Lifetime of an operator-initiated pairing window.
-    #[serde(
-        default = "default_coordination_pairing_window",
-        with = "humantime_serde"
-    )]
-    pub pairing_window: Duration,
+    /// Whether local activity edges automatically pull a shared display.
+    #[serde(default = "default_activity_follow")]
+    pub activity_follow: bool,
 
-    /// LAN address the pairing listener binds during a pairing window; `None` =
-    /// auto-detect the primary non-loopback LAN address.
-    #[serde(default)]
-    pub pairing_bind_address: Option<String>,
+    /// Grace window after a local-activity edge before the pull commits.
+    #[serde(default = "default_arm_after", with = "humantime_serde")]
+    pub arm_after: Duration,
+
+    /// Minimum interval between successive activity-driven pulls.
+    #[serde(default = "default_cooldown", with = "humantime_serde")]
+    pub cooldown: Duration,
 }
 
 impl Default for CoordinationConfig {
     fn default() -> Self {
         Self {
-            enabled: defaults::COORDINATION_ENABLED,
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
             state_poll_interval: None,
-            pairing_port: defaults::COORDINATION_PAIRING_PORT,
-            pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
-            pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
+            loss_confirmations: defaults::COORDINATION_LOSS_CONFIRMATIONS,
+            activity_follow: defaults::ACTIVITY_FOLLOW,
+            arm_after: defaults::ARM_AFTER,
+            cooldown: defaults::COOLDOWN,
         }
     }
 }
@@ -984,8 +1027,39 @@ pub struct DisplayConfig {
 
     /// DDC/CI input-source value used to identify this machine's ownership of
     /// a shared display. The doctor reports the active input in hexadecimal.
+    ///
+    /// This is the READ code — the value the panel reports on VCP 0x60 when
+    /// this input is active. Most panels use the same code for both read and
+    /// write, but some (e.g. certain AOC AGON panels) accept a different value
+    /// on the write path.  Use `shared_input_write_code` when write differs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_input_code: Option<u8>,
+
+    /// DDC/CI input-source value to WRITE when selecting this machine's input.
+    ///
+    /// Defaults to `shared_input_code`; set only when the panel accepts a
+    /// different code on `setvcp 60` than it reports on `getvcp 60`.  The
+    /// ownership poll always compares observations against `shared_input_code`
+    /// (the read side).  The claim write path and the requester's on-wire code
+    /// both use this override when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_input_write_code: Option<u8>,
+
+    /// Peer DDC/CI input-source code this machine WRITES to switch away to the
+    /// peer. Absent when push is not configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_peer_input_write_code: Option<u8>,
+
+    /// Peer DDC/CI input-source code this machine READS to verify the peer
+    /// wrote. Required when `shared_peer_input_write_code` is set for strong
+    /// verification; when absent write verification degrades (see
+    /// `kvm_push_verification_degraded` log event in `direct_switch.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_peer_input_code: Option<u8>,
+
+    /// KVM hand-off actions run around release and acquire transitions.
+    #[serde(default)]
+    pub hooks: HookSlots,
 
     /// Primary blank mode to use.  Must be set unless `ladder` is provided.
     /// When `ladder` is present this field is ignored — the first
@@ -1091,6 +1165,62 @@ pub struct DisplayConfig {
     /// blocks wear tracking.
     #[serde(default)]
     pub panel_type: PanelType,
+}
+
+/// The KVM hand-off hook slots available on a shared display, plus the
+/// post-hoc observed-loss slot for the losing machine.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HookSlots {
+    /// Actions run before releasing a display to another machine.
+    #[serde(default)]
+    pub before_release: Vec<HookAction>,
+    /// Actions run after releasing a display to another machine.
+    #[serde(default)]
+    pub after_release: Vec<HookAction>,
+    /// Actions run before acquiring a display from another machine.
+    #[serde(default)]
+    pub before_acquire: Vec<HookAction>,
+    /// Actions run after acquiring a display from another machine.
+    #[serde(default)]
+    pub after_acquire: Vec<HookAction>,
+    /// Actions run after this machine observes (via VCP 0x60 poll) that the
+    /// panel has been pulled by a peer.  Always after-the-fact — the losing
+    /// machine has no advance notice.  Fire-and-forget; a hook failure here
+    /// must never trigger a corrective DDC write or retry.
+    #[serde(default)]
+    pub on_observed_loss: Vec<HookAction>,
+}
+
+/// Command argv used by a KVM hook.
+pub type HookCommand = Vec<String>;
+
+/// MQTT publish payload used by a KVM hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookMqtt {
+    /// MQTT topic to publish.
+    pub topic: String,
+    /// Payload sent to the MQTT topic.
+    pub payload: String,
+}
+
+/// One action in a KVM hand-off hook slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookAction {
+    /// Command argv; mutually exclusive with [`Self::mqtt`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<HookCommand>,
+    /// MQTT publish; mutually exclusive with [`Self::command`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mqtt: Option<HookMqtt>,
+    /// Maximum time an action may run.
+    #[serde(default = "default_hook_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    /// Explicit scheduling override; absent resolves from the containing slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<bool>,
+    /// Whether a failure aborts the enclosing KVM transition.
+    #[serde(default)]
+    pub abort_on_failure: bool,
 }
 
 impl DisplayConfig {
@@ -1313,18 +1443,27 @@ fn default_pairing_enabled() -> bool {
     defaults::PAIRING_ENABLED
 }
 
-fn default_coordination_enabled() -> bool {
-    defaults::COORDINATION_ENABLED
-}
-
 fn default_coordination_poll_interval() -> Duration {
     defaults::COORDINATION_POLL_INTERVAL
 }
-fn default_coordination_pairing_port() -> u16 {
-    defaults::COORDINATION_PAIRING_PORT
+fn default_coordination_loss_confirmations() -> u32 {
+    defaults::COORDINATION_LOSS_CONFIRMATIONS
 }
-fn default_coordination_pairing_window() -> Duration {
-    defaults::COORDINATION_PAIRING_WINDOW
+
+fn default_activity_follow() -> bool {
+    defaults::ACTIVITY_FOLLOW
+}
+
+fn default_arm_after() -> Duration {
+    defaults::ARM_AFTER
+}
+
+fn default_cooldown() -> Duration {
+    defaults::COOLDOWN
+}
+
+fn default_hook_timeout() -> Duration {
+    defaults::HOOK_TIMEOUT
 }
 fn default_pair_timeout() -> Duration {
     defaults::PAIR_TIMEOUT
@@ -2064,10 +2203,10 @@ idle_source = "macos"
     }
 
     #[test]
-    fn coordination_defaults_are_opt_in_with_pairing_window_settings() {
+    fn coordination_defaults_are_opt_in_with_activity_follow() {
         let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
 
-        assert!(!cfg.coordination.enabled);
+        assert!(!cfg.coordination.activity_follow);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(2));
         assert_eq!(cfg.coordination.state_poll_interval, None);
         // Absent key resolves to max(30s, poll_interval=2s) = 30s.
@@ -2075,30 +2214,27 @@ idle_source = "macos"
             cfg.coordination.effective_state_poll_interval(),
             Duration::from_secs(30)
         );
-        assert_eq!(cfg.coordination.pairing_port, 0);
-        assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(300));
-        assert_eq!(cfg.coordination.pairing_bind_address, None);
+        // loss_confirmations default — defends against issue #134 garbled reads.
+        assert_eq!(cfg.coordination.loss_confirmations, 3);
+        assert_eq!(cfg.coordination.arm_after, Duration::from_secs(7));
+        assert_eq!(cfg.coordination.cooldown, Duration::from_secs(3));
     }
 
     #[test]
-    fn coordination_enabled_false_parses_in_strict_mode() {
+    fn coordination_parses_surviving_fields() {
         let cfg: Config = toml::from_str(
-            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\npairing_port = 4567\npairing_window = \"7m\"\npairing_bind_address = \"10.1.1.5\"\n",
+            "config_version = 1\n[coordination]\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\nactivity_follow = true\narm_after = \"5s\"\ncooldown = \"10s\"\n",
         )
         .unwrap();
 
-        assert!(!cfg.coordination.enabled);
+        assert!(cfg.coordination.activity_follow);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(3));
         assert_eq!(
             cfg.coordination.state_poll_interval,
             Some(Duration::from_secs(30))
         );
-        assert_eq!(cfg.coordination.pairing_port, 4567);
-        assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(420));
-        assert_eq!(
-            cfg.coordination.pairing_bind_address.as_deref(),
-            Some("10.1.1.5")
-        );
+        assert_eq!(cfg.coordination.arm_after, Duration::from_secs(5));
+        assert_eq!(cfg.coordination.cooldown, Duration::from_secs(10));
     }
 
     #[test]
@@ -2137,5 +2273,32 @@ idle_source = "macos"
             cfg.coordination.effective_state_poll_interval(),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn kvm_sections_parse_additively_in_strict_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kvm_full.toml");
+        std::fs::write(&path, include_str!("../../tests/fixtures/kvm_full.toml")).unwrap();
+        let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
+        assert!(cfg.coordination.activity_follow);
+        assert_eq!(cfg.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
+        assert_eq!(cfg.input_filter.ignore_devices, vec!["*jiggler*"]);
+        assert_eq!(cfg.displays["monitor"].hooks.before_release.len(), 1);
+    }
+
+    #[test]
+    fn strict_mode_rejects_unknown_nested_hook_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kvm_typo.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\nbefore_releasee = []\n",
+                include_str!("../../tests/fixtures/kvm_full.toml")
+            ),
+        )
+        .unwrap();
+        assert!(crate::config::load_config(&path, Strictness::Strict).is_err());
     }
 }

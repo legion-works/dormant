@@ -2,6 +2,7 @@
 
 use crate::types::ProbeResult;
 use dormant_core::config::schema::{Credentials, MqttCredential, MqttSensorCfg};
+use dormant_core::mqtt::parse_broker_url;
 use dormant_core::types::SensorState;
 use dormant_sensors::mqtt::parse_payload;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
@@ -152,21 +153,6 @@ fn not_authorized_detail(broker_url: &str, credential: Option<&MqttCredential>) 
              — add [mqtt.\"{broker_url}\"] to credentials.toml"
         ),
     }
-}
-
-/// Parse a broker URL into (host, port).
-#[must_use]
-pub(crate) fn parse_broker_url(url: &str) -> (&str, u16) {
-    let rest = url
-        .strip_prefix("tcp://")
-        .or_else(|| url.strip_prefix("mqtt://"))
-        .unwrap_or(url);
-    if let Some((host, port_str)) = rest.rsplit_once(':')
-        && let Ok(port) = port_str.parse::<u16>()
-    {
-        return (host, port);
-    }
-    (rest, 1883)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────────

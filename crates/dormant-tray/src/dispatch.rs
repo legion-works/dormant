@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use dormant_core::ipc_proto::IpcRequest;
+use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::StateSnapshot;
 use dormantctl::client;
 use tracing::info;
@@ -18,6 +18,8 @@ pub enum DispatchPlan {
     Ignore,
     /// Send one or more IPC requests to the daemon.
     Ipc(Vec<IpcRequest>),
+    /// Write the local input code to pull a shared display to this machine.
+    SwitchToLocal(String),
     /// Open the daemon web UI on this local port.
     OpenWeb(u16),
     /// Request that the platform tray exits.
@@ -65,6 +67,7 @@ pub fn plan_action(
         Action::WakeOne(display) => DispatchPlan::Ipc(vec![IpcRequest::Wake {
             display: display.clone(),
         }]),
+        Action::SwitchToLocal(display) => DispatchPlan::SwitchToLocal(display.clone()),
         Action::OpenWebUi { port } => DispatchPlan::OpenWeb(*port),
         Action::Quit => DispatchPlan::Quit,
         Action::Separator => DispatchPlan::Ignore,
@@ -94,19 +97,25 @@ pub trait DispatchCapabilities: Send + Sync + 'static {
 /// Concrete capabilities used by the Linux tray frontend.
 pub struct SystemCapabilities {
     request_quit: Arc<dyn Fn() + Send + Sync>,
+    send_request: Arc<IpcSender>,
 }
+
+type IpcSender = dyn Fn(&Path, &IpcRequest) -> Result<IpcResponse> + Send + Sync;
 
 impl SystemCapabilities {
     /// Create capabilities whose quit operation calls `request_quit`.
     #[must_use]
     pub fn new(request_quit: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { request_quit }
+        Self {
+            request_quit,
+            send_request: Arc::new(client::send_request),
+        }
     }
 }
 
 impl DispatchCapabilities for SystemCapabilities {
     fn send_ipc(&self, socket: &Path, request: &IpcRequest) -> Result<()> {
-        let response = client::send_request(socket, request)?;
+        let response = (self.send_request)(socket, request)?;
         if !response.ok {
             anyhow::bail!(
                 "daemon returned error: {}",
@@ -156,6 +165,16 @@ pub async fn execute_plan(
             .await??;
             Ok(())
         }
+        DispatchPlan::SwitchToLocal(display_id) => {
+            let socket_clone = socket.clone();
+            let request = IpcRequest::SwitchToLocal {
+                display: display_id.clone(),
+            };
+            tokio::task::spawn_blocking(move || capabilities.send_ipc(&socket_clone, &request))
+                .await??;
+            info!(display = %display_id, "switch to local dispatched");
+            Ok(())
+        }
         DispatchPlan::OpenWeb(port) => capabilities.open_web(port),
         DispatchPlan::Quit => {
             capabilities.request_quit();
@@ -201,6 +220,7 @@ mod tests {
             displays: vec![display("a"), display("b")],
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -301,5 +321,41 @@ mod tests {
         );
         assert_eq!(*capabilities.ports.lock().unwrap(), vec![8137]);
         assert_eq!(*capabilities.quits.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn plan_action_switch_to_local_maps_to_dispatch_plan() {
+        assert!(matches!(
+            plan_action(&Action::SwitchToLocal("monitor".into()), None, false),
+            DispatchPlan::SwitchToLocal(id) if id == "monitor"
+        ));
+    }
+
+    #[test]
+    fn switch_to_local_unreachable_is_ignored() {
+        assert!(matches!(
+            plan_action(&Action::SwitchToLocal("monitor".into()), None, true),
+            DispatchPlan::Ignore
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_switch_to_local_sends_ipc_request() {
+        let capabilities = Arc::new(MockCapabilities::default());
+        let caps = capabilities.clone();
+        execute_plan(
+            DispatchPlan::SwitchToLocal("monitor".into()),
+            "/tmp/dormant.sock".into(),
+            caps,
+        )
+        .await
+        .unwrap();
+
+        let requests = capabilities.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&requests[0]).unwrap(),
+            serde_json::json!({"req": "switch_to_local", "display": "monitor"})
+        );
     }
 }

@@ -20,9 +20,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::idle_observation::{IdleObservation, IdleObservationTx};
 use dormant_core::config::IdleTimeUnit;
 use dormant_core::rules::{ControlMsg, InhibitorKind};
 use dormant_core::types::RuleId;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -173,16 +175,24 @@ pub struct DbusIdleSource {
     rules: Vec<ActivityRule>,
     poll_interval: Duration,
     unit: IdleTimeUnit,
+    /// Daemon-lifetime idle-observation channel for the activity-claim policy.
+    idle_tx: Option<IdleObservationTx>,
 }
 
 impl DbusIdleSource {
     /// Create a `DBus` idle source.
     #[must_use]
-    pub fn new(rules: Vec<ActivityRule>, poll_interval: Duration, unit: IdleTimeUnit) -> Self {
+    pub fn new(
+        rules: Vec<ActivityRule>,
+        poll_interval: Duration,
+        unit: IdleTimeUnit,
+        idle_tx: Option<IdleObservationTx>,
+    ) -> Self {
         Self {
             rules,
             poll_interval,
             unit,
+            idle_tx,
         }
     }
 }
@@ -190,16 +200,26 @@ impl DbusIdleSource {
 #[async_trait::async_trait]
 impl IdleSource for DbusIdleSource {
     async fn run(self: Box<Self>, ctl: mpsc::Sender<ControlMsg>, cancel: CancellationToken) {
-        dbus_run(self.rules, self.poll_interval, self.unit, ctl, cancel).await;
+        dbus_run(
+            self.rules,
+            self.poll_interval,
+            self.unit,
+            self.idle_tx,
+            ctl,
+            cancel,
+        )
+        .await;
     }
 }
 
 /// Run the `DBus` idle poller.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 async fn dbus_run(
     rules: Vec<ActivityRule>,
     poll_interval: Duration,
     unit: IdleTimeUnit,
+    idle_tx: Option<IdleObservationTx>,
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) {
@@ -227,6 +247,13 @@ async fn dbus_run(
                         warned_offline = true;
                     }
                     set_all_inactive(&ctl, &mut last_sent, &rules);
+                    if let Some(ref tx) = idle_tx {
+                        let _ = tx.send(IdleObservation {
+                            last_activity: None,
+                            observed_at: Instant::now(),
+                            available: false,
+                        });
+                    }
                     if sleep_or_cancel(DBUS_RECONNECT_INTERVAL, &cancel).await {
                         return;
                     }
@@ -250,6 +277,15 @@ async fn dbus_run(
                         tracing::info!(event = "idle_unit_determined", unit = ?unit);
                     }
                     let idle = Duration::from_millis(unit.to_ms(raw));
+                    if let Some(ref tx) = idle_tx {
+                        let now = Instant::now();
+                        let last_activity = now.checked_sub(idle);
+                        let _ = tx.send(IdleObservation {
+                            last_activity,
+                            observed_at: now,
+                            available: true,
+                        });
+                    }
                     for r in &rules {
                         let inhibited = idle < r.idle_threshold;
                         publish(&ctl, &mut last_sent, &r.rule, inhibited);
@@ -276,6 +312,13 @@ async fn dbus_run(
                 }
                 conn = None;
                 set_all_inactive(&ctl, &mut last_sent, &rules);
+                if let Some(ref tx) = idle_tx {
+                    let _ = tx.send(IdleObservation {
+                        last_activity: None,
+                        observed_at: Instant::now(),
+                        available: false,
+                    });
+                }
                 if sleep_or_cancel(DBUS_RECONNECT_INTERVAL, &cancel).await {
                     return;
                 }
@@ -295,6 +338,7 @@ async fn dbus_run(
     _rules: Vec<ActivityRule>,
     _poll_interval: Duration,
     _unit: IdleTimeUnit,
+    _idle_tx: Option<IdleObservationTx>,
     _ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) {
@@ -379,6 +423,8 @@ pub(crate) async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -
 pub struct WaylandIdleNotifier {
     rules: Vec<ActivityRule>,
     timeout_ms: u32,
+    /// Daemon-lifetime idle-observation channel for the activity-claim policy.
+    idle_tx: Option<IdleObservationTx>,
 }
 
 #[cfg(target_os = "linux")]
@@ -387,9 +433,17 @@ impl WaylandIdleNotifier {
     ///
     /// `timeout` is the idle threshold to register with the compositor.
     #[must_use]
-    pub fn new(rules: Vec<ActivityRule>, timeout: Duration) -> Self {
+    pub fn new(
+        rules: Vec<ActivityRule>,
+        timeout: Duration,
+        idle_tx: Option<IdleObservationTx>,
+    ) -> Self {
         let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-        Self { rules, timeout_ms }
+        Self {
+            rules,
+            timeout_ms,
+            idle_tx,
+        }
     }
 
     /// Check whether the compositor advertises `ext_idle_notifier_v1`.
@@ -556,7 +610,11 @@ pub struct WaylandIdleNotifier;
 #[cfg(not(target_os = "linux"))]
 impl WaylandIdleNotifier {
     #[must_use]
-    pub fn new(_rules: Vec<ActivityRule>, _timeout: Duration) -> Self {
+    pub fn new(
+        _rules: Vec<ActivityRule>,
+        _timeout: Duration,
+        _idle_tx: Option<IdleObservationTx>,
+    ) -> Self {
         Self
     }
 
@@ -570,7 +628,7 @@ impl WaylandIdleNotifier {
 #[cfg(target_os = "linux")]
 impl IdleSource for WaylandIdleNotifier {
     async fn run(self: Box<Self>, ctl: mpsc::Sender<ControlMsg>, cancel: CancellationToken) {
-        wayland_run(self.rules, self.timeout_ms, ctl, cancel).await;
+        wayland_run(self.rules, self.timeout_ms, self.idle_tx, ctl, cancel).await;
     }
 }
 
@@ -597,6 +655,7 @@ impl IdleSource for WaylandIdleNotifier {
 async fn wayland_run(
     rules: Vec<ActivityRule>,
     timeout_ms: u32,
+    idle_tx: Option<IdleObservationTx>,
     ctl: mpsc::Sender<ControlMsg>,
     cancel: CancellationToken,
 ) {
@@ -711,6 +770,21 @@ async fn wayland_run(
                 }
                 event = ev_rx.recv() => {
                     if let Some(idled) = event {
+                        if let Some(ref tx) = idle_tx {
+                            let now = Instant::now();
+                            let last_activity = if idled {
+                                // User became idle: last activity was timeout_ms ago.
+                                now.checked_sub(Duration::from_millis(u64::from(timeout_ms)))
+                            } else {
+                                // User resumed: last activity is now.
+                                Some(now)
+                            };
+                            let _ = tx.send(IdleObservation {
+                                last_activity,
+                                observed_at: now,
+                                available: true,
+                            });
+                        }
                         // idled = true → user is idle (inactive, not inhibited)
                         // idled = false → user resumed (active, inhibited)
                         for r in &rules {
@@ -733,6 +807,13 @@ async fn wayland_run(
                                 "Wayland idle source disconnected; treating user as inactive",
                             );
                             warned_offline = true;
+                        }
+                        if let Some(ref tx) = idle_tx {
+                            let _ = tx.send(IdleObservation {
+                                last_activity: None,
+                                observed_at: Instant::now(),
+                                available: false,
+                            });
                         }
                         // Treat as inactive (fail-toward-blanking).
                         for r in &rules {
@@ -757,6 +838,42 @@ async fn wayland_run(
 
 // ── Source detection ───────────────────────────────────────────────────────────
 
+/// Build the filtered platform source when device ignores are configured.
+#[must_use]
+pub(crate) fn create_filtered_source(
+    config: &dormant_core::config::InputFilterConfig,
+    scan_interval: Duration,
+) -> Option<std::sync::Arc<dyn crate::filtered_activity::FilteredInputSource>> {
+    if config.ignore_devices.is_empty() {
+        return None;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let matcher = crate::filtered_activity::DeviceMatcher::compile(&config.ignore_devices)
+            .unwrap_or_else(|never| match never {});
+        Some(std::sync::Arc::new(
+            crate::evdev_idle::EvdevIdleSource::new(matcher, scan_interval),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = scan_interval;
+        let matcher = crate::filtered_activity::DeviceMatcher::compile(&config.ignore_devices)
+            .unwrap_or_else(|never| match never {});
+        Some(std::sync::Arc::new(
+            crate::macos_input_filter::MacosInputFilterSource::new(matcher),
+        ))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = scan_interval;
+        None
+    }
+}
+
 /// Select and create the appropriate idle source based on the configured mode
 /// and environment.
 ///
@@ -774,6 +891,7 @@ pub fn create_source(
     poll_interval: Duration,
     idle_unit: IdleTimeUnit,
     macos_guard_cfg: crate::macos_idle::MacosIdleGuardConfig,
+    idle_tx: Option<IdleObservationTx>,
 ) -> Option<Box<dyn IdleSource>> {
     if rules.is_empty() {
         return None;
@@ -869,22 +987,28 @@ pub fn create_source(
                 .map(|r| r.idle_threshold)
                 .min()
                 .unwrap_or(Duration::from_secs(120));
-            Some(Box::new(WaylandIdleNotifier::new(rules, min_threshold)))
+            Some(Box::new(WaylandIdleNotifier::new(
+                rules,
+                min_threshold,
+                idle_tx,
+            )))
         }
         #[cfg(not(target_os = "linux"))]
         dormant_core::config::IdleSource::Wayland => Some(Box::new(DbusIdleSource::new(
             rules,
             poll_interval,
             idle_unit,
+            idle_tx,
         ))),
         dormant_core::config::IdleSource::Dbus => Some(Box::new(DbusIdleSource::new(
             rules,
             poll_interval,
             idle_unit,
+            idle_tx,
         ))),
         #[cfg(target_os = "macos")]
         dormant_core::config::IdleSource::Macos => Some(Box::new(
-            crate::macos_idle::MacosIdleSource::new(rules, poll_interval, macos_guard_cfg),
+            crate::macos_idle::MacosIdleSource::new(rules, poll_interval, macos_guard_cfg, idle_tx),
         )),
         // Auto/Macos resolved to one of the above on this platform, or
         // Macos degraded to Dbus above — unreachable in practice.
@@ -1031,8 +1155,24 @@ mod tests {
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
             crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn filtered_source_selection_keeps_empty_filter_on_stock_path() {
+        let cfg = dormant_core::config::InputFilterConfig::default();
+        assert!(create_filtered_source(&cfg, Duration::from_secs(1)).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filtered_source_selection_builds_evdev_for_nonempty_filter() {
+        let cfg = dormant_core::config::InputFilterConfig {
+            ignore_devices: vec!["*jiggler*".to_owned()],
+        };
+        assert!(create_filtered_source(&cfg, Duration::from_secs(1)).is_some());
     }
 
     #[test]
@@ -1047,6 +1187,7 @@ mod tests {
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
             crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
         );
         assert!(result.is_some());
     }
@@ -1064,6 +1205,7 @@ mod tests {
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
             crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
         );
         // Auto resolves — always returns Some when rules are non-empty.
         assert!(result.is_some());
@@ -1081,6 +1223,7 @@ mod tests {
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
             crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
         );
         // Wayland mode either succeeds or falls back to DBus — always Some.
         assert!(result.is_some());
@@ -1107,6 +1250,7 @@ mod tests {
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
             crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
         );
         // Falls back to DBus rather than returning None or panicking.
         assert!(result.is_some());
@@ -1127,6 +1271,7 @@ mod tests {
             Duration::from_secs(5),
             IdleTimeUnit::Auto,
             crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
         );
         assert!(result.is_some());
     }

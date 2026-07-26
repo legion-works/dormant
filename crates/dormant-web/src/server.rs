@@ -21,7 +21,7 @@ use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
 use crate::routes::{
-    command, config, config_apply, daemon, doctor, events, operations, pair, pair_dormant, wear,
+    command, config, config_apply, daemon, doctor, events, operations, pair, wear,
 };
 use crate::security::security_guard;
 
@@ -107,23 +107,10 @@ pub(crate) fn build_router(state: WebState) -> Router {
         "/config/apply",
         post(config_apply::post_apply).layer(DefaultBodyLimit::max(64 * 1024))
     );
-    let api = route_post!(
-        api,
-        "/pair/instance",
-        post(pair_dormant::post_pair_instance).layer(DefaultBodyLimit::max(4 * 1024))
-    );
-    let api = route_post!(
-        api,
-        "/pair/instance/join",
-        post(pair_dormant::post_join_pair_instance).layer(DefaultBodyLimit::max(4 * 1024))
-    );
-    let api = route_post!(
-        api,
-        "/pair/instance/:id/cancel",
-        post(pair_dormant::post_cancel_pair_instance).layer(DefaultBodyLimit::max(4 * 1024))
-    );
     let api = route_post!(api, "/blank", post(command::post_blank));
     let api = route_post!(api, "/wake", post(command::post_wake));
+    let api = route_post!(api, "/switch", post(command::post_switch));
+    let api = route_post!(api, "/push", post(command::post_push));
     let api = route_post!(api, "/pause", post(command::post_pause));
     let api = route_post!(api, "/resume", post(command::post_resume));
     let api = route_post!(api, "/reload", post(command::post_reload));
@@ -146,11 +133,6 @@ pub(crate) fn build_router(state: WebState) -> Router {
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
         .route("/pair/samsung/:id", get(pair::get_pair_samsung))
-        .route(
-            "/pair/instance/peers",
-            get(pair_dormant::get_pair_instance_peers),
-        )
-        .route("/pair/instance/:id", get(pair_dormant::get_pair_instance))
         // API miss → 404, never the SPA fallback.
         .fallback(api_not_found)
         .with_state(state.clone());
@@ -266,6 +248,8 @@ mod tests {
             zones: IndexMap::default(),
             displays: IndexMap::default(),
             rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
 
@@ -439,6 +423,68 @@ mod tests {
         }
     }
 
+    // ── Default-local control-plane inventory (Task 19) ───────────────────
+
+    /// Under default loopback bind, every registered POST route MUST
+    /// reject a non-loopback Host header (403).  This is the behavioural
+    /// proof for the claim that default-reachable mutating switch paths
+    /// are local-only — no write route can be reached from the LAN
+    /// without the explicit `web_allow_nonloopback` opt-out.
+    ///
+    /// The inventory is derived from real `route_post!` registrations,
+    /// not a hand-maintained list, so deleting a route without updating
+    /// this test would report a false pass — the non-empty assertion
+    /// catches that by forcing the scan to prove it would FIND a route
+    /// before it can claim none is reachable.
+    #[tokio::test]
+    async fn every_post_route_rejects_nonloopback_host_under_default_bind() {
+        // Populate the registry once.
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state1, _cancel1, _ctl_rx1) = test_web_state_with_bind(bind);
+        let _router = build_router(state1);
+
+        let post_routes = registered_post_routes();
+        assert!(
+            !post_routes.is_empty(),
+            "post-route inventory must be non-empty — otherwise this test \
+             would vacuously pass with nothing to check"
+        );
+
+        for route in &post_routes {
+            // Fresh router per route so `oneshot`-consume leaves no shared
+            // state between iterations.
+            let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
+            let router = build_router(state);
+
+            // Parameterised routes need a concrete value for the segment.
+            let uri = if route.contains(":display") {
+                route.replace(":display", "test-display")
+            } else if route.contains(":id") {
+                route.replace(":id", "test-id")
+            } else {
+                route.to_string()
+            };
+
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("Host", "evil.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "POST {route} with non-loopback Host must be rejected (403); \
+                 got {} — this write route may be reachable from the LAN \
+                 without web_allow_nonloopback",
+                resp.status()
+            );
+        }
+    }
+
     // ── Emergency-wake route (Task 2) ──────────────────────────────────────
 
     /// Exercises the endpoint through the real `build_router` (not the
@@ -601,6 +647,7 @@ mod tests {
                             )],
                             pending_reload: None,
                             rollback: None,
+                            kvm: None,
                         });
                     }
                     ControlMsg::Exercise { display, reply } => {

@@ -11,13 +11,14 @@
 //! The value is then deserialized into [`Config`] without `deny_unknown_fields`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
 
-use super::schema::{Config, Credentials, DisplayConfig, DisplayScope, ValidationError};
+use super::schema::{
+    Config, Credentials, DisplayConfig, DisplayScope, HookAction, ValidationError,
+};
 
 /// A single unknown-key finding from the TOML tree walk.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +27,23 @@ pub struct UnknownKey {
     pub key_path: String,
     /// The unrecognized key name.
     pub detail: String,
+}
+
+/// Runtime facts used to refine claim-related configuration diagnostics.
+///
+/// The static configuration deliberately does not infer peer-store, evdev, or
+/// post-probe identity state; callers provide the facts observed in their own
+/// lifecycle phase instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimValidationContext {
+    /// Number of paired peers visible to the daemon.
+    pub peer_count: usize,
+    /// Whether at least one `/dev/input/event*` device is readable.
+    pub readable_input_devices: bool,
+    /// Controller types that can write an input-source value.
+    pub controller_capabilities: HashSet<String>,
+    /// Display ids with a post-probe claim identity.
+    pub probed_claim_identities: HashSet<String>,
 }
 
 // ── Known-key tree ──────────────────────────────────────────────────────────────
@@ -56,19 +74,23 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "watchdog",
             "audio",
             "coordination",
+            "keymap",
+            "input_filter",
         ],
     ),
     (
         "coordination",
         &[
-            "enabled",
             "poll_interval",
             "state_poll_interval",
-            "pairing_port",
-            "pairing_window",
-            "pairing_bind_address",
+            "loss_confirmations",
+            "activity_follow",
+            "arm_after",
+            "cooldown",
         ],
     ),
+    ("keymap", &["claim_hotkey"]),
+    ("input_filter", &["ignore_devices"]),
     // ── audio ───────────────────────────────────────────────────────────────
     (
         "audio",
@@ -181,6 +203,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "controllers",
             "scope",
             "shared_input_code",
+            "shared_input_write_code",
+            "shared_peer_input_code",
+            "shared_peer_input_write_code",
             "blank_mode",
             "degraded_mode",
             "ladder",
@@ -202,6 +227,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "samsung_restore_backlight",
             "treat_unreachable_as_blanked",
             "panel_type",
+            "hooks",
         ],
     ),
     // ── rules.<id> ─────────────────────────────────────────────────────────
@@ -223,6 +249,35 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     // ── displays.<id>.ladder (array-of-tables entries) ─────────────────────
     ("displays..ladder", &["kind", "dwell"]),
+    (
+        "displays..hooks",
+        &[
+            "before_release",
+            "after_release",
+            "before_acquire",
+            "after_acquire",
+        ],
+    ),
+    (
+        "displays..hooks.before_release",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    (
+        "displays..hooks.after_release",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    (
+        "displays..hooks.before_acquire",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    (
+        "displays..hooks.after_acquire",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
+    ("displays..hooks.before_release.mqtt", &["topic", "payload"]),
+    ("displays..hooks.after_release.mqtt", &["topic", "payload"]),
+    ("displays..hooks.before_acquire.mqtt", &["topic", "payload"]),
+    ("displays..hooks.after_acquire.mqtt", &["topic", "payload"]),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
         "displays..screensaver",
@@ -492,10 +547,12 @@ pub fn validate_with_input_source_readers(
             capabilities,
             input_source_readers,
             creds,
+            cfg.sensors
+                .values()
+                .any(|sensor| matches!(sensor, crate::config::SensorConfig::Mqtt(_))),
             &mut errors,
         );
     }
-
     // ── Rule validation ──────────────────────────────────────────────────
     for (rule_id, rc) in &cfg.rules {
         validate_rule(rule_id, rc, &zone_names, &cfg.displays, &mut errors);
@@ -805,28 +862,46 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
             ),
         });
     }
-    let pairing_window = cfg.coordination.pairing_window;
-    if !(Duration::from_secs(30)..=Duration::from_secs(15 * 60)).contains(&pairing_window) {
+    validate_loss_confirmations(&cfg.coordination, errors);
+    if let Some(hotkey) = cfg.keymap.claim_hotkey.as_deref()
+        && !is_conservative_accelerator(hotkey)
+    {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("keymap claim_hotkey {hotkey:?} is not a valid accelerator"),
+        });
+    }
+}
+
+/// Validate `coordination.loss_confirmations` against `1..=10`. The floor
+/// protects against a misconfiguration that would commit a loss on no
+/// observation at all; the ceiling protects against a value that would
+/// deadlock a real handoff behind a 20s+ window on a 2s poll (issue #134).
+fn validate_loss_confirmations(
+    coordination: &super::schema::CoordinationConfig,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !(1..=10).contains(&coordination.loss_confirmations) {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!(
-                "coordination pairing_window {pairing_window:?} is outside the permitted 30s..=15m range"
+                "coordination loss_confirmations {} is outside the permitted 1..=10 range",
+                coordination.loss_confirmations
             ),
         });
     }
-    if let Some(address) = cfg.coordination.pairing_bind_address.as_deref() {
-        let valid_lan_address = address
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified());
-        if !valid_lan_address {
-            errors.push(ValidationError {
-                what: crate::error::E_CONFIG_INVALID.into(),
-                detail: format!(
-                    "coordination pairing_bind_address {address:?} must be a valid non-loopback, non-wildcard IP address"
-                ),
-            });
-        }
-    }
+}
+
+fn is_conservative_accelerator(value: &str) -> bool {
+    let mut tokens = value.split('+').peekable();
+    let Some(key) = tokens.next_back() else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        && tokens.all(|modifier| matches!(modifier, "Alt" | "Control" | "Meta" | "Shift" | "Super"))
 }
 
 fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
@@ -1110,6 +1185,7 @@ fn validate_display(
         capabilities,
         &HashSet::new(),
         creds,
+        false,
         errors,
     );
 }
@@ -1121,6 +1197,7 @@ fn validate_display_with_input_source_readers(
     capabilities: &HashMap<String, Vec<BlankMode>>,
     input_source_readers: &HashSet<String>,
     creds: &Credentials,
+    has_mqtt_broker: bool,
     errors: &mut Vec<ValidationError>,
 ) {
     // controllers must be non-empty.
@@ -1133,12 +1210,40 @@ fn validate_display_with_input_source_readers(
     }
 
     match dc.scope {
-        DisplayScope::Private if dc.shared_input_code.is_some() => errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail: format!(
-                "display '{display_id}' is private but sets shared_input_code — remove it or set scope = \"shared\""
-            ),
-        }),
+        DisplayScope::Private => {
+            if dc.shared_input_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_input_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+            if dc.shared_input_write_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_input_write_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+            if dc.shared_peer_input_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_peer_input_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+            if dc.shared_peer_input_write_code.is_some() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' is private but sets shared_peer_input_write_code — remove it or set scope = \"shared\""
+                    ),
+                });
+            }
+        }
         DisplayScope::Shared => {
             if dc.shared_input_code.is_none() {
                 errors.push(ValidationError {
@@ -1148,7 +1253,19 @@ fn validate_display_with_input_source_readers(
                     ),
                 });
             }
-            if !dc.controllers.iter().any(|controller| input_source_readers.contains(controller)) {
+            if dc.shared_input_write_code.is_some() && dc.shared_input_code.is_none() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' sets shared_input_write_code without shared_input_code — the write code defaults to the read code, so set shared_input_code first"
+                    ),
+                });
+            }
+            if !dc
+                .controllers
+                .iter()
+                .any(|controller| input_source_readers.contains(controller))
+            {
                 errors.push(ValidationError {
                     what: crate::error::E_CONFIG_INVALID.into(),
                     detail: format!(
@@ -1156,9 +1273,45 @@ fn validate_display_with_input_source_readers(
                     ),
                 });
             }
+            // ── Peer (push) validation ────────────────────────────────────
+            if dc.shared_peer_input_write_code.is_some() {
+                // Peer write requires a local read code.
+                if dc.shared_input_code.is_none() {
+                    errors.push(ValidationError {
+                        what: crate::error::E_CONFIG_INVALID.into(),
+                        detail: format!(
+                            "display '{display_id}' sets shared_peer_input_write_code without shared_input_code — the local read code is required for peer push"
+                        ),
+                    });
+                }
+                // Peer write requires an input-source-capable writer.
+                let has_writer = dc
+                    .controllers
+                    .iter()
+                    .any(|controller| input_source_readers.contains(controller));
+                if !has_writer {
+                    errors.push(ValidationError {
+                        what: crate::error::E_CONFIG_INVALID.into(),
+                        detail: format!(
+                            "display '{display_id}' sets shared_peer_input_write_code but no controller in its chain can write the active input"
+                        ),
+                    });
+                }
+            }
+            // Peer read without peer write is invalid (can't verify a write
+            // you can't make).
+            if dc.shared_peer_input_code.is_some() && dc.shared_peer_input_write_code.is_none() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' sets shared_peer_input_code without shared_peer_input_write_code — the peer read code is only meaningful with a peer write"
+                    ),
+                });
+            }
         }
-        DisplayScope::Private => {}
     }
+
+    validate_hooks(display_id, dc, has_mqtt_broker, errors);
 
     // Build the union of supported modes across all controllers.
     let mut union_caps: HashSet<BlankMode> = HashSet::new();
@@ -1676,6 +1829,68 @@ fn validate_display_with_input_source_readers(
     }
 }
 
+fn validate_hooks(
+    display_id: &str,
+    display: &DisplayConfig,
+    has_mqtt_broker: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    let slots = [
+        ("before_release", &display.hooks.before_release),
+        ("after_release", &display.hooks.after_release),
+        ("before_acquire", &display.hooks.before_acquire),
+        ("after_acquire", &display.hooks.after_acquire),
+        ("on_observed_loss", &display.hooks.on_observed_loss),
+    ];
+    for (slot, actions) in slots {
+        if display.scope != DisplayScope::Shared && !actions.is_empty() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!("display '{display_id}' has hooks but is not shared"),
+            });
+        }
+        for (index, action) in actions.iter().enumerate() {
+            validate_hook_action(display_id, slot, index, action, has_mqtt_broker, errors);
+        }
+    }
+}
+
+fn validate_hook_action(
+    display_id: &str,
+    slot: &str,
+    index: usize,
+    action: &HookAction,
+    has_mqtt_broker: bool,
+    errors: &mut Vec<ValidationError>,
+) {
+    if action.command.is_some() == action.mqtt.is_some() {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' hooks.{slot}[{index}] must set exactly one of command or mqtt"),
+        });
+    }
+    if action.command.as_ref().is_some_and(Vec::is_empty) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' hooks.{slot}[{index}] command argv must not be empty"
+            ),
+        });
+    }
+    if action.mqtt.is_some() && !has_mqtt_broker {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' hooks.{slot}[{index}] mqtt action requires a configured MQTT broker"),
+        });
+    }
+    if action.timeout < Duration::from_millis(100) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' hooks.{slot}[{index}] timeout {:?} is below the minimum of 100ms", action.timeout),
+        });
+    }
+}
+
 /// Validate a single rule: zone exists, displays exist, valid inhibitors, sane
 /// durations.
 fn validate_rule(
@@ -2088,6 +2303,147 @@ gracee_period = "60s"
             &HashSet::from(["ddcci".to_string()]),
             &test_creds(),
         )
+    }
+
+    // (dead test functions removed — the validated fields no longer exist)
+
+    #[test]
+    fn kvm_shared_displays_may_reuse_input_codes() {
+        let displays = |second_code| {
+            format!(
+                "[displays.left]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n\n[displays.right]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = {second_code}\nblank_mode = \"power_off\"\n"
+            )
+        };
+        let errors = validate_str(&format!("config_version = 1\n{}", displays(1)));
+        assert!(
+            !errors.iter().any(|error| error
+                .detail
+                .contains("duplicates a local shared_input_code")),
+            "input codes are scoped to their display; conflicts are denied at claim time: {errors:?}"
+        );
+        let errors = validate_str(&format!("config_version = 1\n{}", displays(2)));
+        assert!(
+            !errors.iter().any(|error| error
+                .detail
+                .contains("duplicates a local shared_input_code")),
+            "distinct shared input codes must pass: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_accelerator_grammar_rejects_invalid_hotkeys() {
+        let errors = validate_str("config_version = 1\n[keymap]\nclaim_hotkey = \"Meta++F12\"\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("claim_hotkey")
+                    && error.detail.contains("not a valid accelerator"))
+        );
+    }
+
+    #[test]
+    fn kvm_hook_fatal_rules_are_enforced() {
+        let shared = |hook| {
+            format!(
+                "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{hook}]\n"
+            )
+        };
+        for (hook, fragment) in [
+            ("{ command = [] }", "command argv must not be empty"),
+            (
+                "{ command = [\"true\"], timeout = \"99ms\" }",
+                "below the minimum of 100ms",
+            ),
+            (
+                "{ command = [\"true\"], mqtt = { topic = \"x\", payload = \"y\" } }",
+                "exactly one of command or mqtt",
+            ),
+            (
+                "{ mqtt = { topic = \"x\", payload = \"y\" } }",
+                "mqtt action requires a configured MQTT broker",
+            ),
+        ] {
+            let errors = validate_str(&shared(hook));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                        && error.detail.contains(fragment)),
+                "hook rule {fragment:?} must be rejected: {errors:?}"
+            );
+        }
+        let errors = validate_str(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"] }]\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("has hooks but is not shared"))
+        );
+    }
+
+    #[test]
+    fn kvm_hook_unknown_slot_is_rejected_in_strict_mode() {
+        let result = load_str_strict(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = []\nafter_release = []\nbefore_acquire = []\nafter_acquire = []\nafter_acquiree = []\n",
+        );
+        assert!(
+            result.is_err(),
+            "unknown hook slots must fail strict parsing"
+        );
+    }
+
+    #[test]
+    fn kvm_known_keys_accept_every_new_config_key() {
+        let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\npoll_interval = \"2s\"\nactivity_follow = false\narm_after = \"7s\"\ncooldown = \"3s\"\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(collect_unknown_keys(&value).is_empty());
+    }
+
+    #[test]
+    fn shared_input_code_without_write_code_is_backward_compatible() {
+        // Configs that set only `shared_input_code` (the pre-split field)
+        // must remain valid and behave identically — the write code
+        // defaults to the read code when absent.
+        let config = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 15\nblank_mode = \"power_off\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(collect_unknown_keys(&value).is_empty());
+        let cfg: crate::config::Config = toml::from_str(config).unwrap();
+        let dc = &cfg.displays["main"];
+        assert_eq!(dc.shared_input_code, Some(15));
+        assert_eq!(dc.shared_input_write_code, None);
+    }
+
+    #[test]
+    fn shared_input_write_code_without_read_code_is_invalid() {
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: indexmap::IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: None,
+                    shared_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error
+                        .detail
+                        .contains("sets shared_input_write_code without shared_input_code")),
+            "expected validation error, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2657,6 +3013,10 @@ gracee_period = "60s"
             controllers: Vec::new(),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: crate::config::HookSlots::default(),
             blank_mode: None,
             degraded_mode: None,
             ladder: Vec::new(),
@@ -2946,6 +3306,8 @@ gracee_period = "60s"
             watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
             coordination: super::super::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         }
     }
 
@@ -3071,6 +3433,8 @@ gracee_period = "60s"
             watchdog: super::super::schema::WatchdogConfig::default(),
             audio: super::super::schema::AudioConfig::default(),
             coordination: super::super::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         }
     }
 
@@ -3442,6 +3806,10 @@ password = "test-pass"
                     controllers: vec!["kwin-dpms".into(), "ddcci".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
+                    shared_input_write_code: None,
+                    shared_peer_input_code: None,
+                    shared_peer_input_write_code: None,
+                    hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
                     ladder: vec![],
@@ -3471,6 +3839,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -3501,6 +3871,10 @@ password = "test-pass"
                     controllers: vec!["command".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
+                    shared_input_write_code: None,
+                    shared_peer_input_code: None,
+                    shared_peer_input_write_code: None,
+                    hooks: crate::config::HookSlots::default(),
                     blank_mode: Some(BlankMode::PowerOff),
                     degraded_mode: None,
                     ladder: vec![],
@@ -3531,6 +3905,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -3639,6 +4015,10 @@ password = "test-pass"
             blank_mode: Some(BlankMode::PowerOff),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
             screensaver: None,
@@ -3711,6 +4091,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3737,6 +4119,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3772,6 +4156,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let samsung_errors: Vec<_> = errors
@@ -3806,6 +4192,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3832,6 +4220,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let restore_errors: Vec<_> = errors
@@ -3862,6 +4252,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -3888,6 +4280,8 @@ password = "test-pass"
             watchdog: crate::config::schema::WatchdogConfig::default(),
             audio: crate::config::schema::AudioConfig::default(),
             coordination: crate::config::schema::CoordinationConfig::default(),
+            keymap: crate::config::KeymapConfig::default(),
+            input_filter: crate::config::InputFilterConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4555,6 +4949,10 @@ kind = "power_off"
             blank_mode: None,
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: crate::config::HookSlots::default(),
             degraded_mode: None,
             ladder: vec![],
             screensaver: None,
@@ -5954,39 +6352,36 @@ availability_payload_offline = "down"
     }
 
     #[test]
-    fn coordination_pairing_window_outside_bounds_rejected() {
-        for pairing_window in ["29s", "15m1s"] {
+    fn coordination_loss_confirmations_outside_bounds_rejected() {
+        // Floor (0): would commit on no observation at all. Ceiling (>10): would
+        // deadlock a real handoff behind a 20s+ ceiling on a 2s poll.
+        for (value, label) in [(0u32, "zero"), (11u32, "above ceiling")] {
             let errors = validate_str(&format!(
-                "config_version = 1\n[coordination]\npairing_window = \"{pairing_window}\"\n"
+                "config_version = 1\n[coordination]\nloss_confirmations = {value}\n"
             ));
             assert!(
                 errors
                     .iter()
-                    .any(|error| error.detail.contains("pairing_window")),
-                "expected pairing_window validation error for {pairing_window}, got {errors:?}"
+                    .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                        && error.detail.contains("loss_confirmations")
+                        && error.detail.contains("1..=10")),
+                "{label} loss_confirmations={value} must be rejected, got {errors:?}"
             );
         }
-    }
-
-    #[test]
-    fn bind_address_override_parses_and_rejects_wildcard() {
-        for address in ["0.0.0.0", "127.0.0.1"] {
+        for value in [1u32, 3, 10] {
             let errors = validate_str(&format!(
-                "config_version = 1\n[coordination]\npairing_bind_address = \"{address}\"\n"
+                "config_version = 1\n[coordination]\nloss_confirmations = {value}\n"
             ));
             assert!(
-                errors
+                !errors
                     .iter()
-                    .any(|error| error.what == crate::error::E_CONFIG_INVALID),
-                "expected E_CONFIG_INVALID for {address}, got {errors:?}"
+                    .any(|error| error.detail.contains("loss_confirmations")),
+                "loss_confirmations={value} must be accepted, got {errors:?}"
             );
         }
-
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\npairing_bind_address = \"10.1.1.5\"\n",
-        );
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
+
+    // (dead pairing/bind tests removed — the validated fields no longer exist)
 
     #[test]
     fn shared_display_requires_input_code() {
@@ -6030,5 +6425,197 @@ availability_payload_offline = "down"
             "config_version = 1\n[displays.desk]\ncontrollers = [\"command\", \"ddcci\"]\nblank_mode = \"power_off\"\nmodes = [\"power_off\"]\nblank_command = \"true\"\nwake_command = \"true\"\nscope = \"shared\"\nshared_input_code = 15\n",
         );
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    // ── KVM direct-write config tests ───────────────────────────────────────
+
+    #[test]
+    fn kvm_direct_write_defaults_activity_follow_arm_after_and_cooldown() {
+        // The new [coordination] keys must have literal defaults in defaults.rs.
+        // This test will FAIL on step 2 (fields not yet added to CoordinationConfig).
+        let cfg = crate::config::Config {
+            config_version: 1,
+            ..valid_full_config()
+        };
+        assert!(!cfg.coordination.activity_follow);
+        assert_eq!(cfg.coordination.arm_after, Duration::from_secs(7));
+        assert_eq!(cfg.coordination.cooldown, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_keys_accepted_in_strict_mode() {
+        // shared_peer_input_code and shared_peer_input_write_code must be known keys.
+        // This test will FAIL on step 2 (fields not yet on DisplayConfig).
+        let config = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 15\nshared_peer_input_code = 16\nshared_peer_input_write_code = 0x15\nblank_mode = \"power_off\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(
+            collect_unknown_keys(&value).is_empty(),
+            "peer keys must be known in strict mode"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_coordination_keys_accepted_in_strict_mode() {
+        // activity_follow, arm_after, cooldown must be known in [coordination].
+        let config = "config_version = 1\n[coordination]\nactivity_follow = true\narm_after = \"7s\"\ncooldown = \"3s\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(
+            collect_unknown_keys(&value).is_empty(),
+            "new coordination keys must be known in strict mode"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_requires_shared_scope() {
+        // shared_peer_input_write_code on a private display must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Private,
+                    shared_input_code: Some(15),
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("shared_peer_input")
+            }),
+            "peer write on private display must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_requires_local_read_code() {
+        // shared_peer_input_write_code without shared_input_code must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: None,
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("shared_peer_input_write_code")
+                    && error.detail.contains("shared_input_code")
+            }),
+            "peer write without local read must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_requires_input_source_writer() {
+        // A shared display with peer write but no input-source-capable controller
+        // in its chain must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["command".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: Some(15),
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    modes: Some(vec![BlankMode::PowerOff]),
+                    blank_command: Some("true".into()),
+                    wake_command: Some("true".into()),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID && error.detail.contains("peer")
+            }),
+            "peer write without input-source controller must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_read_without_peer_write_is_invalid() {
+        // shared_peer_input_code without shared_peer_input_write_code must be rejected.
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: Some(15),
+                    shared_peer_input_code: Some(16),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            ..valid_full_config()
+        };
+        let errors = validate(&cfg, &test_capabilities(), &test_creds());
+        assert!(
+            errors.iter().any(|error| {
+                error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("shared_peer_input_code")
+                    && error.detail.contains("shared_peer_input_write_code")
+            }),
+            "peer read without peer write must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_direct_write_peer_write_without_peer_read_is_accepted() {
+        // shared_peer_input_write_code without shared_peer_input_code is
+        // accepted (degraded verification).
+        let cfg = crate::config::Config {
+            config_version: 1,
+            displays: IndexMap::from([(
+                "main".into(),
+                crate::config::DisplayConfig {
+                    controllers: vec!["ddcci".into()],
+                    scope: crate::config::DisplayScope::Shared,
+                    shared_input_code: Some(15),
+                    shared_peer_input_write_code: Some(0x15),
+                    blank_mode: Some(BlankMode::PowerOff),
+                    ..base_display_cfg()
+                },
+            )]),
+            rules: IndexMap::new(),
+            ..valid_full_config()
+        };
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        );
+        assert!(
+            errors.is_empty(),
+            "peer write without peer read must be accepted: {errors:?}"
+        );
     }
 }

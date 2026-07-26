@@ -97,9 +97,6 @@ pub const ENTITY_CRUD_ENABLED: bool = true;
 /// Whether the Samsung pairing wizard route is enabled by default.
 pub const PAIRING_ENABLED: bool = true;
 
-/// Whether multi-machine coordination services and operator routes are enabled.
-pub const COORDINATION_ENABLED: bool = false;
-
 /// Cadence for polling shared-display ownership state.
 pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -115,19 +112,31 @@ pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// `>= poll_interval` (see [`mod@super::validate`]).
 pub const COORDINATION_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Requested TCP port for a pairing listener; zero requests an ephemeral port.
-pub const COORDINATION_PAIRING_PORT: u16 = 0;
+/// Number of consecutive agreeing "not mine" `0x60` readings required before
+/// the cached ownership verdict flips `true → false`. Defends against
+/// garbled reads from concurrent cross-machine DDC traffic on a shared panel
+/// (issue #134): a single corrupted read should not blank a panel that's
+/// still ours. Ownership **gain** (`false → true`) stays eager — waking on
+/// a possibly-wrong "I own" read is idempotent and the next poll re-confirms.
+/// Validated `>= 1` (a threshold of `0` would commit on no observation at
+/// all) and `<= 10` (a defensive upper bound; production defaults are small).
+pub const COORDINATION_LOSS_CONFIRMATIONS: u32 = 3;
 
-/// Maximum lifetime of an operator-initiated pairing window.
-pub const COORDINATION_PAIRING_WINDOW: Duration = Duration::from_secs(300);
-
-/// Optional LAN address for a pairing listener; `None` selects the primary LAN
-/// address from the operating system's route table.
-pub const COORDINATION_PAIRING_BIND_ADDRESS: Option<&str> = None;
+/// Timeout for one shared-display hook action.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whether activity-follow (automatic pull on local activity edges) is enabled.
+pub const ACTIVITY_FOLLOW: bool = false;
+
+/// Grace window after receiving a local arm before the pull is committed.
+pub const ARM_AFTER: Duration = Duration::from_secs(7);
+
+/// Minimum interval between successive activity-driven pulls.
+pub const COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Default post-wake settle window for the doctor exercise's bounded
 /// retry read (validated to `100ms..=30s` — see [`mod@super::validate`]).

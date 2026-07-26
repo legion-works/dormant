@@ -6,6 +6,8 @@
  *   GET  /api/config  → ConfigResponse
  *   POST /api/blank   → JSON { display: "<id>" }
  *   POST /api/wake    → JSON { display: "<id>" }
+ *   POST /api/switch  → JSON { display: "<id>" }
+ *   POST /api/push    → JSON { display: "<id>" }
  *   POST /api/pause   → JSON { rule?: string, duration_s?: number }
  *   POST /api/resume  → JSON { rule?: string }
  *   POST /api/reload  → no body extractor; Content-Type header required by guard
@@ -32,10 +34,7 @@ import type {
   ExerciseReport,
   OperationsStatus,
   DaemonIdentity,
-  InstancePairOpen,
-  InstancePairStatus,
-  InstancePairPeers,
-} from "./types";
+}  from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
 
@@ -96,6 +95,24 @@ export function postBlank(display: string): Promise<void> {
 /** POST /api/wake — force-wake a display by id. */
 export function postWake(display: string): Promise<void> {
   return request<void>("/wake", {
+    method: "POST",
+    headers: JSON_CT,
+    body: JSON.stringify({ display }),
+  });
+}
+
+/** POST /api/switch — write the local input code to pull the display. */
+export function postSwitch(display: string): Promise<void> {
+  return request<void>("/switch", {
+    method: "POST",
+    headers: JSON_CT,
+    body: JSON.stringify({ display }),
+  });
+}
+
+/** POST /api/push — write the peer input code to push the display away. */
+export function postPush(display: string): Promise<void> {
+  return request<void>("/push", {
     method: "POST",
     headers: JSON_CT,
     body: JSON.stringify({ display }),
@@ -169,46 +186,6 @@ export async function postPairSamsung(host: string): Promise<PairAccepted> {
  */
 export function getPairStatus(pairId: string): Promise<PairStatus> {
   return request<PairStatus>(`/pair/samsung/${encodeURIComponent(pairId)}`);
-}
-
-/** Open a local instance-pairing responder window. */
-export function postInstancePair(display_name: string): Promise<InstancePairOpen> {
-  return request<InstancePairOpen>("/pair/instance", {
-    method: "POST",
-    headers: JSON_CT,
-    body: JSON.stringify({ display_name }),
-  });
-}
-
-/** Poll non-secret local instance-pairing state. */
-export function getInstancePairStatus(pairId: string): Promise<InstancePairStatus> {
-  return request<InstancePairStatus>(`/pair/instance/${encodeURIComponent(pairId)}`);
-}
-
-/** Cancel a local instance-pairing responder window. */
-export function postCancelInstancePair(pairId: string): Promise<InstancePairStatus> {
-  return request<InstancePairStatus>(`/pair/instance/${encodeURIComponent(pairId)}/cancel`, {
-    method: "POST",
-    headers: JSON_CT,
-  });
-}
-
-/** Submit an operator-confirmed code to the selected discovered instance. */
-export function postJoinInstancePair(
-  display_name: string,
-  instance_id: string,
-  code: string,
-): Promise<InstancePairStatus> {
-  return request<InstancePairStatus>("/pair/instance/join", {
-    method: "POST",
-    headers: JSON_CT,
-    body: JSON.stringify({ display_name, instance_id, code }),
-  });
-}
-
-/** Read public discovered and paired instance inventory. */
-export function getInstancePairPeers(): Promise<InstancePairPeers> {
-  return request<InstancePairPeers>("/pair/instance/peers");
 }
 
 /** POST /api/config/apply — apply a set of patches to the live config. */

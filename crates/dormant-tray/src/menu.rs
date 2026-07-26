@@ -101,6 +101,8 @@ pub enum Action {
         /// The TCP port to open.
         port: u16,
     },
+    /// Write the local input code to switch a shared display to this machine.
+    SwitchToLocal(String),
     /// Quit the tray.
     Quit,
 }
@@ -114,7 +116,7 @@ fn glyph_for(action: &Action) -> Glyph {
         Action::Pause(_) | Action::Separator => Glyph::Pause,
         Action::Resume => Glyph::Play,
         Action::BlankAll | Action::BlankOne(_) => Glyph::DisplayOff,
-        Action::WakeAll | Action::WakeOne(_) => Glyph::DisplayOn,
+        Action::WakeAll | Action::WakeOne(_) | Action::SwitchToLocal(_) => Glyph::DisplayOn,
         Action::OpenWebUi { .. } => Glyph::Web,
         Action::Quit => Glyph::Exit,
     }
@@ -173,6 +175,24 @@ fn any_paused(snapshot: Option<&StateSnapshot>) -> bool {
     snapshot.is_some_and(|s| s.displays.iter().any(|(_, d)| d.paused))
 }
 
+/// True when the snapshot confirms the display is a shared display reachable via
+/// DDC/CI input-write. Scope is checked independently so a stale capability list
+/// during version skew or reload doesn't lie.
+fn is_switch_capable(snapshot: Option<&StateSnapshot>, id: &str) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        snapshot
+            .displays
+            .iter()
+            .find(|(display_id, _)| display_id == id)
+            .is_some_and(|(_, display)| display.scope == DisplayScope::Shared)
+            && snapshot.kvm.as_ref().is_some_and(|kvm| {
+                kvm.switch_capable_displays
+                    .iter()
+                    .any(|display_id| display_id.0 == id)
+            })
+    })
+}
+
 /// Build the tray menu from the current snapshot and reachability.
 ///
 /// The top-level layout is fixed; the per-display submenus are appended
@@ -194,6 +214,7 @@ fn any_paused(snapshot: Option<&StateSnapshot>) -> bool {
 ///   Resume to restore"` is inserted above the Pause items, and Resume
 ///   becomes the only enabled pause-row item.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_menu(
     snapshot: Option<&StateSnapshot>,
     unreachable: bool,
@@ -277,26 +298,41 @@ pub fn build_menu(
             } else {
                 "Blank now"
             };
+            let switch_capable = is_switch_capable(snapshot, id);
+
+            let mut sub_entries = vec![
+                MenuEntry::Action {
+                    label: blank_label.into(),
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::BlankOne(id.clone())),
+                    action: Action::BlankOne(id.clone()),
+                },
+                MenuEntry::Action {
+                    label: "Wake now".into(),
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::WakeOne(id.clone())),
+                    action: Action::WakeOne(id.clone()),
+                },
+            ];
+
+            // Direct-write switch — only for shared displays with a configured input code.
+            if switch_capable {
+                sub_entries.push(MenuEntry::Separator);
+                sub_entries.push(MenuEntry::Action {
+                    label: "Switch to here".into(),
+                    enabled: !unreachable,
+                    icon: glyph_for(&Action::SwitchToLocal(id.clone())),
+                    action: Action::SwitchToLocal(id.clone()),
+                });
+            }
+
             // Submenu shell stays openable regardless of reachability
             // so the operator can still inspect what's inside; the
             // children carry the disabled state.
             entries.push(MenuEntry::Submenu {
                 label,
                 enabled: true,
-                entries: vec![
-                    MenuEntry::Action {
-                        label: blank_label.into(),
-                        enabled: !unreachable,
-                        icon: glyph_for(&Action::BlankOne(id.clone())),
-                        action: Action::BlankOne(id.clone()),
-                    },
-                    MenuEntry::Action {
-                        label: "Wake now".into(),
-                        enabled: !unreachable,
-                        icon: glyph_for(&Action::WakeOne(id.clone())),
-                        action: Action::WakeOne(id.clone()),
-                    },
-                ],
+                entries: sub_entries,
             });
         }
     }
@@ -384,6 +420,7 @@ mod tests {
             displays,
             pending_reload: None,
             rollback: None,
+            kvm: None,
         }
     }
 
@@ -411,12 +448,23 @@ mod tests {
         out
     }
 
-    /// Locate the action entry with the given label substring (linear scan).
+    /// Locate the action entry with the given label substring (linear scan,
+    /// recurses into submenus).
     fn find_action<'a>(entries: &'a [MenuEntry], needle: &str) -> Option<&'a MenuEntry> {
-        entries.iter().find(|e| match e {
-            MenuEntry::Action { label, .. } => label.contains(needle),
-            _ => false,
-        })
+        for entry in entries {
+            match entry {
+                MenuEntry::Action { label, .. } if label.contains(needle) => {
+                    return Some(entry);
+                }
+                MenuEntry::Submenu { entries: sub, .. } => {
+                    if let Some(found) = find_action(sub, needle) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     // ── Top-level layout ─────────────────────────────────────────────────
@@ -1053,5 +1101,189 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ── KVM switch menu items ─────────────────────────────────────────────
+
+    fn kvm_snap(switch_capable: &[&str], hotkey: Option<&str>) -> StateSnapshot {
+        use dormant_core::config::KeymapConfig;
+        use dormant_core::types::DisplayId;
+
+        let kvm = dormant_core::rules::KvmStatus {
+            keymap: KeymapConfig {
+                claim_hotkey: hotkey.map(String::from),
+            },
+            switch_capable_displays: switch_capable
+                .iter()
+                .map(|d| DisplayId((*d).into()))
+                .collect(),
+            ..Default::default()
+        };
+
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "monitor".into(),
+                DisplaySnapshot {
+                    phase: "active".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    scope: DisplayScope::Shared,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
+                    controllers: vec![],
+                    wake_attempts: 0,
+                    last_blank_failed: false,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+            rollback: None,
+            kvm: Some(kvm),
+        }
+    }
+
+    #[test]
+    fn switch_capable_shared_display_has_switch_to_here_entry() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"));
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        let switch = find_action(&menu, "Switch to here");
+        assert!(
+            switch.is_some(),
+            "Switch to here action should exist in the menu"
+        );
+        match switch.unwrap() {
+            MenuEntry::Action {
+                action, enabled, ..
+            } => {
+                assert!(matches!(action, Action::SwitchToLocal(id) if id == "monitor"));
+                assert!(*enabled, "Switch to here should be enabled when reachable");
+            }
+            _ => panic!("Switch to here is not an Action"),
+        }
+
+        // No arm entry present (arm was part of the deleted claim protocol).
+        assert!(
+            find_action(&menu, "Arm claim").is_none(),
+            "arm claim should not appear in the menu"
+        );
+    }
+
+    #[test]
+    fn non_switch_capable_display_omits_switch_entry() {
+        // Shared but NOT in switch_capable_displays — no switch entry.
+        let snapshot = kvm_snap(&[], Some("Meta+F12"));
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        assert!(
+            find_action(&menu, "Switch to here").is_none(),
+            "non-switch-capable display should not show Switch to here"
+        );
+    }
+
+    #[test]
+    fn private_display_is_excluded_even_if_capability_list_is_inconsistent() {
+        let mut snapshot = kvm_snap(&["monitor"], Some("Meta+F12"));
+        snapshot.displays[0].1.scope = DisplayScope::Private;
+        assert!(!is_switch_capable(Some(&snapshot), "monitor"));
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        assert_eq!(find_action(&menu, "Switch to here"), None);
+    }
+
+    #[test]
+    fn switch_entry_disabled_when_unreachable() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"));
+        let menu = build_menu(Some(&snapshot), true, 8137);
+
+        let switch = find_action(&menu, "Switch to here").expect("Switch to here present");
+        match switch {
+            MenuEntry::Action { enabled, .. } => {
+                assert!(
+                    !enabled,
+                    "Switch to here should be disabled when unreachable"
+                );
+            }
+            _ => panic!("Switch to here is not an Action"),
+        }
+    }
+
+    #[test]
+    fn ambiguity_two_switch_capable_displays_both_show_menu_entry() {
+        let snapshot = {
+            use dormant_core::config::KeymapConfig;
+            use dormant_core::types::DisplayId;
+            let kvm = dormant_core::rules::KvmStatus {
+                keymap: KeymapConfig {
+                    claim_hotkey: Some("Meta+F12".into()),
+                },
+                switch_capable_displays: vec![DisplayId("monitor".into()), DisplayId("tv".into())],
+                ..Default::default()
+            };
+            StateSnapshot {
+                sensors: vec![],
+                zones: vec![],
+                displays: vec![
+                    (
+                        "monitor".into(),
+                        DisplaySnapshot {
+                            phase: "active".into(),
+                            inhibited: false,
+                            paused: false,
+                            cmd_gen: 0,
+                            scope: DisplayScope::Shared,
+                            owned: true,
+                            observed_input_code: None,
+                            panel_state: None,
+                            controllers: vec![],
+                            wake_attempts: 0,
+                            last_blank_failed: false,
+                            stage: None,
+                        },
+                    ),
+                    (
+                        "tv".into(),
+                        DisplaySnapshot {
+                            phase: "active".into(),
+                            inhibited: false,
+                            paused: false,
+                            cmd_gen: 0,
+                            scope: DisplayScope::Shared,
+                            owned: false,
+                            observed_input_code: None,
+                            panel_state: None,
+                            controllers: vec![],
+                            wake_attempts: 0,
+                            last_blank_failed: false,
+                            stage: None,
+                        },
+                    ),
+                ],
+                pending_reload: None,
+                rollback: None,
+                kvm: Some(kvm),
+            }
+        };
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        // Each switch-capable display gets its own Switch to here entry.
+        let switches: Vec<_> = menu
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Submenu { entries, .. } => entries.iter().find(
+                    |c| matches!(c, MenuEntry::Action { label, .. } if label == "Switch to here"),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            2,
+            "both switch-capable displays should have Switch to here"
+        );
     }
 }

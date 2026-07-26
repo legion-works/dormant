@@ -5,13 +5,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dormant_core::config::{Config, DisplayScope};
-use dormant_core::coordination::{COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle};
+use dormant_core::coordination::{
+    COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle, InputCodeAliases, InputSourceObservation,
+};
 use dormant_core::rules::ControlMsg;
 use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+use crate::direct_switch::DirectSwitchHandle;
 
 /// Dependencies required by the shared-display ownership poller.
 pub struct CoordinationPollDeps {
@@ -25,6 +29,9 @@ pub struct CoordinationPollDeps {
     pub state: CoordinationHandle,
     /// Daemon-lifetime cancellation token.
     pub cancel: CancellationToken,
+    /// Direct switch handle for firing post-hoc observed-loss hooks.
+    /// `None` in tests that don't need hook firing.
+    pub direct_switch: Option<Arc<DirectSwitchHandle>>,
 }
 
 /// Spawn the shared-display ownership poller.
@@ -58,6 +65,7 @@ fn new_interval(period: Duration) -> tokio::time::Interval {
     interval
 }
 
+#[allow(clippy::too_many_lines)]
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
@@ -73,8 +81,9 @@ async fn poll_once(
     let state_poll_interval = config.coordination.effective_state_poll_interval();
     let now = Instant::now();
     // Snapshot once per tick: displays not due for a state read preserve their
-    // last recorded panel_state, so record_success rewrites the same value and
-    // the DisplaySnapshot field stays stable between state reads.
+    // last recorded panel_state, so `record_input_observation` rewrites the
+    // same value and the DisplaySnapshot field stays stable between state
+    // reads.
     let prior_panel_state = deps.state.snapshot();
     for (name, display_config) in &config.displays {
         if display_config.scope != DisplayScope::Shared {
@@ -86,6 +95,13 @@ async fn poll_once(
         let display_id = DisplayId(name.clone());
         let Some(executor) = executors.get(&display_id) else {
             continue;
+        };
+
+        let aliases = InputCodeAliases {
+            local_read: expected,
+            local_write: display_config.shared_input_write_code.unwrap_or(expected),
+            peer_read: display_config.shared_peer_input_code,
+            peer_write: display_config.shared_peer_input_write_code,
         };
 
         // Ownership arbitration (VCP 0x60) runs every tick; panel-state cosmetics
@@ -107,9 +123,13 @@ async fn poll_once(
         };
         if let Ok(Some(observed)) = input {
             let before = deps.state.snapshot();
-            let prior = deps
-                .state
-                .record_success(&display_id, observed, expected, panel_state);
+            let outcome = deps.state.record_input_observation(
+                &display_id,
+                observed,
+                &aliases,
+                config.coordination.loss_confirmations,
+                panel_state,
+            );
             let previous = before.get(&display_id);
             if previous.is_some_and(|record| {
                 !record.has_successful_input_read || record.consecutive_failures > 0
@@ -117,15 +137,56 @@ async fn poll_once(
                 tracing::info!(event = "coord_poll_ok", display = %display_id);
             }
             last_failing_log.remove(&display_id);
-            if let Some(previous_owned) = prior {
-                let owned = observed == expected;
+            // Observability for the issue #134 garbled-read path: a successful
+            // but inconsistent `0x60` reading (cross-machine DDC traffic) sails
+            // through the existing failure-counter path without a log line, so
+            // emit a literal anchor whenever consecutive successful observations
+            // disagree — operators have no other signal that the bus is dirty.
+            if let Some(previous_code) = outcome.disagreement_with {
+                tracing::warn!(
+                    event = "coord_poll_disagreement",
+                    display = %display_id,
+                    previous_code,
+                    observed,
+                );
+            }
+            // A potential ownership loss is held pending further confirmations
+            // (issue #134). Surfacing the deferred count lets operators see the
+            // debounce in flight rather than mistaking the silence for a stall.
+            if let Some(pending_count) = outcome.deferred_loss_count {
+                tracing::info!(
+                    event = "coord_ownership_loss_deferred",
+                    display = %display_id,
+                    pending_count,
+                    observed,
+                );
+            }
+            // A potential ownership gain is held pending further confirmations
+            // (symmetric debounce). Surfacing the deferred count mirrors the
+            // loss-deferred log so operators can see the gain in flight.
+            if let Some(pending_count) = outcome.deferred_gain_count {
+                tracing::info!(
+                    event = "coord_ownership_gain_deferred",
+                    display = %display_id,
+                    pending_count,
+                    observed,
+                );
+            }
+            if let Some(previous_owned) = outcome.committed_prior_owned {
+                let owned = matches!(aliases.classify(observed), InputSourceObservation::Local);
                 tracing::info!(event = "coord_ownership_changed", display = %display_id, previous_owned, owned);
                 let _ = deps
                     .ctl_tx
                     .send(ControlMsg::OwnershipPoll {
-                        display: display_id,
+                        display: display_id.clone(),
                     })
                     .await;
+                // Post-hoc observed-loss hook: fires only on a committed
+                // LOSS (previous_owned == true).  Gain emits no acquire
+                // hook — the poll has no write authority.
+                if previous_owned && let Some(ref ds) = deps.direct_switch {
+                    ds.notify_observed_loss(&display_id).await;
+                }
             }
         } else {
             deps.state.record_failure(&display_id);
@@ -263,6 +324,9 @@ mod tests {
                 controllers: vec!["ddcci".to_string()],
                 scope: DisplayScope::Shared,
                 shared_input_code: Some(0x11),
+                shared_input_write_code: None,
+                shared_peer_input_code: None,
+                shared_peer_input_write_code: None,
                 blank_mode: None,
                 degraded_mode: None,
                 ladder: Vec::new(),
@@ -284,6 +348,7 @@ mod tests {
                 samsung_restore_backlight: 50,
                 treat_unreachable_as_blanked: true,
                 panel_type: PanelType::Unknown,
+                hooks: dormant_core::config::HookSlots::default(),
             },
         );
         Config {
@@ -302,6 +367,8 @@ mod tests {
             notifications: NotificationsConfig::default(),
             watchdog: WatchdogConfig::default(),
             audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
         }
     }
 
@@ -319,6 +386,7 @@ mod tests {
             executors_rx,
             state: state.clone(),
             cancel: cancel.clone(),
+            direct_switch: None,
         });
         (config_tx, executors_tx, ctl_rx, state, cancel)
     }
@@ -347,8 +415,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn successful_other_input_changes_false_and_pokes_once() {
-        let sink = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x12))]));
+        // Default `loss_confirmations = 3` requires three agreeing "not mine"
+        // readings before the verdict commits — issue #134 debounce.
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+        ]));
         let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
+        tick().await;
+        tick().await;
         tick().await;
         assert!(matches!(
             ctl_rx.recv().await,
@@ -360,14 +436,23 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn second_same_verdict_success_does_not_poke_again() {
-        let sink = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x12)), Ok(Some(0x12))]));
+        // First transition reads as committed; second transition's already-stable
+        // not-mine reading must NOT re-fire (test the "stays false" half).
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+        ]));
         let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup(sink);
         tick().await;
+        tick().await;
+        tick().await; // third tick: loss confirmed, OwnershipPoll sent
         assert!(matches!(
             ctl_rx.recv().await,
             Some(ControlMsg::OwnershipPoll { .. })
         ));
-        tick().await;
+        tick().await; // fourth tick: already not owned, no further poke
         assert!(ctl_rx.try_recv().is_err());
         cancel.cancel();
     }
@@ -375,7 +460,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn each_shared_display_polls_independently() {
         let failing = Arc::new(ScriptedSink::with_inputs([Err("unavailable".to_string())]));
-        let healthy = Arc::new(ScriptedSink::with_inputs([Ok(Some(0x12))]));
+        let healthy = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+        ]));
         let (config_tx, executors_tx, mut ctl_rx, state, cancel) = setup(failing);
         state.reconcile_shared([
             DisplayId("shared".to_string()),
@@ -394,6 +483,8 @@ mod tests {
         );
         executors_tx.send_replace(Arc::new(executors));
         tokio::task::yield_now().await;
+        tick().await;
+        tick().await;
         tick().await;
         assert!(matches!(
             ctl_rx.recv().await,
@@ -425,14 +516,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn transient_error_holds_false_and_does_not_poke() {
+        // Three not-mine readings commit a loss; the error then holds it
+        // through the existing hold-last-verdict path. No OwnershipPoll re-poke
+        // after the loss commit, no extra pokes across the failure.
         let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
             Ok(Some(0x12)),
             Err("skipped: command holds panel lock".to_string()),
         ]));
         let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
         tick().await;
-        let _ = ctl_rx.recv().await;
         tick().await;
+        tick().await;
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::OwnershipPoll { .. })
+        ));
+        tick().await; // error after loss commit — verdict held, no poke
         assert!(!state.snapshot()[&DisplayId("shared".to_string())].owned);
         assert!(ctl_rx.try_recv().is_err());
         cancel.cancel();
@@ -440,12 +541,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn recovery_success_logs_ok_and_resets_failures() {
+        // loss_confirmations default 3: a stray failure mid-sequence never
+        // commits a loss. The recovery tick still emits coord_poll_ok because
+        // it lands after a failure.
         let sink = Arc::new(ScriptedSink::with_inputs([
             Ok(Some(0x12)),
             Err("transient".to_string()),
             Ok(Some(0x12)),
+            Ok(Some(0x12)),
         ]));
         let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink);
+        tick().await;
         tick().await;
         tick().await;
         tick().await;
@@ -606,6 +712,7 @@ mod tests {
             executors_rx,
             state: CoordinationHandle::new([display]),
             cancel: CancellationToken::new(),
+            direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
         let mut last_state_read = HashMap::new();
@@ -637,10 +744,119 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn emits_literal_coord_ownership_changed_event_field() {
+        // Issue #134: `loss_confirmations = 3` requires three agreeing
+        // not-mine readings before the verdict commits and the literal
+        // `coord_ownership_changed` event fires.
         assert!(
-            captured_events([Ok(Some(0x12))], 1)
+            captured_events([Ok(Some(0x12)), Ok(Some(0x12)), Ok(Some(0x12))], 3,)
                 .await
                 .contains(&"coord_ownership_changed".to_string())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emits_literal_coord_poll_disagreement_event_field() {
+        // Two consecutive successful observations with different codes
+        // disagree; the literal `coord_poll_disagreement` event must fire so
+        // the operator sees the bus returning inconsistent values.
+        assert!(
+            captured_events([Ok(Some(0x11)), Ok(Some(0x12))], 2)
+                .await
+                .contains(&"coord_poll_disagreement".to_string())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emits_literal_coord_ownership_loss_deferred_event_field() {
+        // One stray not-mine reading under `loss_confirmations = 3` is
+        // deferred; the literal `coord_ownership_loss_deferred` event must
+        // surface the pending count for operator visibility.
+        assert!(
+            captured_events([Ok(Some(0x11)), Ok(Some(0x12))], 2)
+                .await
+                .contains(&"coord_ownership_loss_deferred".to_string())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stray_not_mine_reading_does_not_poke() {
+        // Issue #134 anchor: a single not-mine reading must NOT commit a
+        // loss and must NOT trigger a control-channel poke, even after two
+        // prior owned readings. This is the exact `owned, owned, WRONG`
+        // shape from the live journal.
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x99)),
+            Ok(Some(0x11)),
+        ]));
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
+        for _ in 0..4 {
+            tick().await;
+        }
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "no OwnershipPoll must be sent while verdict stays owned"
+        );
+        assert!(state.snapshot()[&DisplayId("shared".to_string())].owned);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disagreeing_not_mine_reads_hold_verdict_and_emit_disagreement() {
+        // Two different not-mine codes in a row must NOT commit a loss and
+        // must surface a disagreement signal — extending the hold-last-verdict
+        // path to successful-but-inconsistent reads (issue #134 §3.4 verdict
+        // table extension). The disagreeing reading resets the pending counter
+        // so the next agreeing reading stays below the 3-confirmation
+        // threshold.
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x11)), // tick 1: owned, mine
+            Ok(Some(0x12)), // tick 2: not-mine, pending=1
+            Ok(Some(0x13)), // tick 3: not-mine, disagrees with 0x12 → reset, pending=1
+            Ok(Some(0x13)), // tick 4: not-mine, agrees, pending=2 (still under N=3)
+        ]));
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
+        let events_layer = EventCapture::default();
+        let events = events_layer.0.clone();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events_layer));
+        for _ in 0..4 {
+            tick().await;
+        }
+        assert!(ctl_rx.try_recv().is_err(), "no loss commit expected");
+        assert!(state.snapshot()[&DisplayId("shared".to_string())].owned);
+        let captured = events.lock().unwrap().clone();
+        assert!(
+            captured
+                .iter()
+                .any(|event| event == "coord_poll_disagreement"),
+            "expected a coord_poll_disagreement event, got {captured:?}"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_agreeing_not_mine_readings_commit_loss_exactly_once() {
+        // Issue #134 anchor (positive case): a real sustained input switch
+        // (three agreeing not-mine readings) commits exactly one loss.
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+        ]));
+        let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
+        tick().await;
+        tick().await;
+        tick().await; // third tick: loss confirmed, OwnershipPoll sent
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::OwnershipPoll { .. })
+        ));
+        assert!(!state.snapshot()[&DisplayId("shared".to_string())].owned);
+        tick().await; // fourth tick: already not owned, no further poke
+        assert!(ctl_rx.try_recv().is_err());
+        cancel.cancel();
     }
 }

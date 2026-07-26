@@ -12,6 +12,34 @@ use serde::{Deserialize, Serialize};
 use crate::error::DormantError;
 use crate::types::{BlankMode, CmdFailure, PresenceEvent, StageKind};
 
+/// Stable error detail for controllers that cannot write VCP input-source
+/// codes. Executors use this exact capability result to fall through a
+/// mixed controller chain without treating unsupported hardware as an I/O
+/// failure.
+pub const INPUT_SOURCE_WRITE_UNSUPPORTED: &str = "E_DISPLAY_IO: unsupported input-source write";
+
+/// Expected VCP `0x60` value after an input-source write.
+///
+/// Some panels acknowledge one source code but report a different alias for
+/// the same physical input, so verification is defined independently of the
+/// command code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSourceReadback {
+    /// The panel must report this exact input-source code.
+    Exact(u8),
+    /// The panel must report a source code other than this local code.
+    DifferentFrom(u8),
+}
+
+/// An input-source command together with its semantic readback expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputSourceTarget {
+    /// VCP `0x60` code sent to the panel.
+    pub write_code: u8,
+    /// Readback condition that verifies the command changed the panel.
+    pub expected_readback: InputSourceReadback,
+}
+
 /// A coarse power state observed by [`PanelState`] readback.
 ///
 /// Models the two values the control-path verification feature
@@ -156,6 +184,19 @@ pub trait DisplayController: Any + Send + Sync {
         Ok(None)
     }
 
+    /// Select the active input-source code.
+    ///
+    /// Controllers without an input-source write surface return the stable
+    /// unsupported result so a composed controller chain can try its first
+    /// capable member. DDC/CI implementations perform this as command-path
+    /// work because it changes shared-panel ownership.
+    async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
+        Err(CmdFailure {
+            controller: self.name().to_string(),
+            error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
+        })
+    }
+
     /// Read the panel's cumulative usage-hours counter, if the controller
     /// exposes one (DDC/CI VCP `0xC0`).
     ///
@@ -180,6 +221,23 @@ pub trait DisplayController: Any + Send + Sync {
     /// `[displays.*]` config rename instead of following the config key —
     /// the entire reason `WearIdentity` exists (T7 review finding M1).
     fn panel_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Cross-machine claim identity for the shared-panel KVM-switch protocol
+    /// (spec F5): a canonical `manufacturer:model[:serial]` string derived
+    /// ONLY from EDID text fields — never the machine-local bus prefix that
+    /// [`Self::panel_identity`] embeds (the i²c bus index differs across
+    /// machines, so it cannot match a panel shared between them).
+    ///
+    /// Default returns `None` — the honest answer for every controller with
+    /// no EDID-derived identity (`command`, `kwin-dpms`, `ha-passthrough`).
+    /// `DdcciController` overrides with the value its `probe` derived from
+    /// the matched display's EDID. Used by the claim broadcast to match the
+    /// same physical panel across paired machines; an absent identity makes
+    /// the display answer `Denied(identity_unavailable)` rather than match on
+    /// a fabricated string.
+    fn claim_identity(&self) -> Option<String> {
         None
     }
 }
@@ -256,6 +314,17 @@ pub trait CommandSink: Send + Sync {
         Ok(None)
     }
 
+    /// Select the active input-source code through the controller chain.
+    ///
+    /// Default returns the stable unsupported result because a bare command
+    /// sink cannot advertise a writer.
+    async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
+        Err(CmdFailure {
+            controller: "command-sink".to_string(),
+            error: INPUT_SOURCE_WRITE_UNSUPPORTED.to_string(),
+        })
+    }
+
     /// Read the panel's cumulative usage-hours counter through whichever
     /// controller in the chain can report it.
     ///
@@ -275,6 +344,18 @@ pub trait CommandSink: Send + Sync {
     /// implementation in `dormant-displays` (`DisplayExecutor`) overrides
     /// this with a chain-walk identical in shape to `read_usage_hours`.
     fn panel_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Read the cross-machine claim identity through whichever controller in
+    /// the chain can report it — mirrors [`Self::panel_identity`]'s
+    /// chain-walk contract; see [`DisplayController::claim_identity`] for
+    /// the per-controller contract (spec F5).
+    ///
+    /// Default returns `None`. The production [`crate::traits::CommandSink`]
+    /// implementation in `dormant-displays` (`DisplayExecutor`) overrides
+    /// this with a chain-walk identical in shape to `panel_identity`.
+    fn claim_identity(&self) -> Option<String> {
         None
     }
 }
@@ -301,6 +382,16 @@ pub trait RenderSink: Send + Sync {
     /// Infallible: the method has no failure mode — the engine always
     /// considers the surface gone after this call returns.
     async fn teardown(&self, r#gen: u64);
+
+    /// Reassert the current render surface without altering content.
+    ///
+    /// Resets the input latch so the next real input event fires a wake
+    /// edge. If no surface is currently shown, this is a no-op. The
+    /// daemon calls this after rejecting a filtered `InputWake` to ensure
+    /// an ignored device's input doesn't permanently consume the one-shot
+    /// latch — the next genuine keyboard/mouse event must still be able
+    /// to wake the panel.
+    async fn show_current_overlay(&self) -> Result<(), CmdFailure>;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -370,10 +461,24 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(c.read_usage_hours().await, None);
+        let error = c
+            .write_input_source(InputSourceTarget {
+                write_code: 0x12,
+                expected_readback: InputSourceReadback::Exact(0x12),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.controller, "bare");
+        assert_eq!(error.error, "E_DISPLAY_IO: unsupported input-source write");
         assert_eq!(
             c.panel_identity(),
             None,
             "default panel_identity must be honest None, not a fabricated identity"
+        );
+        assert_eq!(
+            c.claim_identity(),
+            None,
+            "default claim_identity must be honest None, not a fabricated identity"
         );
     }
 
@@ -387,10 +492,34 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(s.read_usage_hours().await, None);
+        let error = s
+            .write_input_source(InputSourceTarget {
+                write_code: 0x12,
+                expected_readback: InputSourceReadback::Exact(0x12),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.controller, "command-sink");
+        assert_eq!(error.error, "E_DISPLAY_IO: unsupported input-source write");
         assert_eq!(
             s.panel_identity(),
             None,
             "default panel_identity must be honest None, not a fabricated identity"
         );
+        assert_eq!(
+            s.claim_identity(),
+            None,
+            "default claim_identity must be honest None, not a fabricated identity"
+        );
+    }
+
+    /// F5: `claim_identity` is additive with an honest `None` default — a
+    /// controller/sink that cannot derive an EDID identity must never
+    /// fabricate one, or the cross-machine claim broadcast could match on an
+    /// invented string. Mirrors the `panel_identity` default contract.
+    #[tokio::test]
+    async fn trait_defaults_do_not_fabricate_claim_identity() {
+        assert_eq!(BareController.claim_identity(), None);
+        assert_eq!(BareSink.claim_identity(), None);
     }
 }

@@ -302,6 +302,18 @@ pub fn input_source_readers() -> HashSet<String> {
     readers
 }
 
+/// Controller type names that can write a panel's active-input VCP.
+#[must_use]
+pub fn input_source_writers() -> HashSet<String> {
+    input_source_readers()
+}
+
+/// Controller type names that can provide a stable shared-display identity.
+#[must_use]
+pub fn claim_identity_providers() -> HashSet<String> {
+    input_source_readers()
+}
+
 /// Build the ordered controller chain for one display.
 ///
 /// # Errors
@@ -527,6 +539,10 @@ mod tests {
             controllers: vec!["command".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             blank_mode: Some(BlankMode::PowerOff),
             degraded_mode: None,
             ladder: vec![],
@@ -848,6 +864,10 @@ mod tests {
             controllers: vec!["samsung-tizen".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
             blank_mode: None,
             degraded_mode: None,
             ladder: vec![LadderStage {

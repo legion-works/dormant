@@ -17,7 +17,7 @@
  */
 import { useLiveState } from "../hooks/useLiveState";
 import { Card, StatusChip, HealthChip, phaseChipLabel, useConfirmDialog } from "../components";
-import { postBlank, postWake, postPause, postResume } from "../../api/client";
+import { postBlank, postWake, postPause, postResume, postSwitch, postPush } from "../../api/client";
 import { useCallback, useEffect, useState } from "react";
 import type { DisplaySnapshot } from "../../api/types";
 import DisplayDetail from "./DisplayDetail";
@@ -31,12 +31,15 @@ interface DisplayCardProps {
   zone: string;
   rule: string | undefined;
   dialogOpen: boolean;
+  peerWriteConfigured: boolean;
   error?: string;
   onOpenDetail: (id: string) => void;
   onBlank: (id: string) => void;
   onWake: (id: string) => void;
   onPause: (id: string, rule: string) => void;
   onResume: (id: string, rule: string) => void;
+  onSwitch: (id: string) => void;
+  onPush: (id: string) => void;
 }
 
 function DisplayCard({
@@ -46,12 +49,15 @@ function DisplayCard({
   zone,
   rule,
   dialogOpen,
+  peerWriteConfigured,
   error,
   onOpenDetail,
   onBlank,
   onWake,
   onPause,
   onResume,
+  onSwitch,
+  onPush,
 }: DisplayCardProps) {
   const isShared = snap.scope === "shared";
   const panelLabel = (() => {
@@ -187,6 +193,26 @@ function DisplayCard({
             >
               Force wake
             </button>
+            {isShared && (
+              <>
+                <button
+                  type="button"
+                  className="display-action display-action--wake"
+                  onClick={() => onSwitch(id)}
+                >
+                  Switch to here
+                </button>
+                {peerWriteConfigured && (
+                  <button
+                    type="button"
+                    className="display-action display-action--wake"
+                    onClick={() => onPush(id)}
+                  >
+                    Send to peer
+                  </button>
+                )}
+              </>
+            )}
             {isPaused ? (
               <button
                 type="button"
@@ -279,6 +305,24 @@ export default function Displays() {
     }
   }, [clearActionError]);
 
+  const handleSwitch = useCallback(async (id: string) => {
+    clearActionError(id);
+    try {
+      await postSwitch(id);
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Switch failed" }));
+    }
+  }, [clearActionError]);
+
+  const handlePush = useCallback(async (id: string) => {
+    clearActionError(id);
+    try {
+      await postPush(id);
+    } catch (err: unknown) {
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Push failed" }));
+    }
+  }, [clearActionError]);
+
   const handlePause = useCallback(async (id: string, rule: string) => {
     const accepted = await confirm({
       title: `Pause ${rule}?`,
@@ -343,12 +387,15 @@ export default function Displays() {
             zone={dr?.zone ?? "—"}
             rule={dr?.rule}
             dialogOpen={!!dialog}
+            peerWriteConfigured={dc?.shared_peer_input_write_code != null}
             error={actionErrors[id]}
             onOpenDetail={selectDisplay}
             onBlank={handleBlank}
             onWake={handleWake}
             onPause={handlePause}
             onResume={handleResume}
+            onSwitch={handleSwitch}
+            onPush={handlePush}
           />
         );
       })}

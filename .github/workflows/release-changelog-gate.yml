@@ -18,6 +18,10 @@ name: Release changelog gate
 
 on:
   workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
 
 jobs:
   release-changelog-gate:

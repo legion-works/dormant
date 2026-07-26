@@ -95,7 +95,6 @@ fn spawn_fake_engine() -> (
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
-                    claim_armed_remaining_ms: None,
                 },
             ),
             (
@@ -113,7 +112,6 @@ fn spawn_fake_engine() -> (
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
-                    claim_armed_remaining_ms: None,
                 },
             ),
         ],

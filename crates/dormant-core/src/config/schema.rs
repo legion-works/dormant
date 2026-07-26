@@ -129,42 +129,12 @@ pub struct InputFilterConfig {
     pub ignore_devices: Vec<String>,
 }
 
-/// Policy that may initiate a claim from local activity.
-///
-/// `owner-idle` requires one prior successful claim per display — the local
-/// machine learns the owner's instance identity from `ClaimResponse::Accepted`
-/// and uses it to verify subsequent `IdleReport`s. Until that first claim
-/// completes (via a hotkey, `dormantctl switch`, or an `edge`/`armed` policy),
-/// `owner-idle` will never fire on its own on a fresh daemon.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ActivityClaimPolicy {
-    /// Never initiate claims from activity.
-    #[default]
-    Off,
-    /// Claim only after the current owner is idle.
-    ///
-    /// Warm-up requirement: the daemon must have completed one successful claim
-    /// for this display before `owner-idle` will engage — the owner's instance
-    /// identity is learned from the first accepted claim, not from the config.
-    OwnerIdle,
-    /// Claim on a local input edge.
-    Edge,
-    /// Claim while an explicit local arm window is active.
-    Armed,
-}
-
-/// Multi-machine coordination settings.
-///
-/// `enabled = false` disables mDNS, pairing, and operator routes at runtime;
-/// it never disables local `0x60` ownership polling for a configured shared
-/// display.
+/// Multi-machine coordination settings — direct local input writes
+/// replace the earlier owner-mediated claim protocol (mDNS, SPAKE2,
+/// Ed25519, TCP transport). The remaining fields govern ownership polls
+/// and activity-follow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CoordinationConfig {
-    /// Whether mDNS discovery, pairing, and operator routes are available.
-    #[serde(default = "default_coordination_enabled")]
-    pub enabled: bool,
-
     /// Interval between shared-display ownership polls.
     #[serde(
         default = "default_coordination_poll_interval",
@@ -215,72 +185,11 @@ pub struct CoordinationConfig {
     #[serde(default = "default_coordination_loss_confirmations")]
     pub loss_confirmations: u32,
 
-    /// Requested TCP port for the short-lived pairing listener; zero requests
-    /// an ephemeral port from the operating system.
-    #[serde(default = "default_coordination_pairing_port")]
-    pub pairing_port: u16,
-
-    /// Lifetime of an operator-initiated pairing window.
-    #[serde(
-        default = "default_coordination_pairing_window",
-        with = "humantime_serde"
-    )]
-    pub pairing_window: Duration,
-
-    /// LAN address the pairing listener binds during a pairing window; `None` =
-    /// auto-detect the primary non-loopback LAN address.
-    #[serde(default)]
-    pub pairing_bind_address: Option<String>,
-
-    /// Activity policy that may initiate a shared-display claim.
-    ///
-    /// `owner-idle` requires one prior successful claim per display before it
-    /// engages. Until `ClaimResponse::Accepted` populates the owner identity
-    /// (triggered by a hotkey, `dormantctl switch`, or an `edge`/`armed` policy
-    /// claim), `owner-idle` will not fire. This is a security property — the
-    /// daemon learns the owner via authenticated claim responses, not from the
-    /// config, because ownership is local hardware truth and is never
-    /// broadcast.
-    #[serde(default)]
-    pub activity_claim: ActivityClaimPolicy,
-
-    /// Required owner-idle duration before an owner-idle claim.
-    ///
-    /// See [`activity_claim`](Self::activity_claim) for the warm-up
-    /// requirement: an `owner-idle` claim needs the owner identity populated
-    /// first.
-    #[serde(default = "default_owner_idle_window", with = "humantime_serde")]
-    pub owner_idle_window: Duration,
-
-    /// Duration before an armed claim automatically disarms.
-    #[serde(default = "default_armed_window", with = "humantime_serde")]
-    pub armed_window: Duration,
-
-    /// Request/ack round-trip bound for a claim.
-    #[serde(default = "default_claim_timeout", with = "humantime_serde")]
-    pub claim_timeout: Duration,
-
-    /// Upper cap on a computed release deadline.
-    #[serde(default = "default_release_deadline_cap", with = "humantime_serde")]
-    pub release_deadline_cap: Duration,
-
-    /// Always-on claim listener port; zero requests an OS-assigned port.
-    #[serde(default = "default_claim_port")]
-    pub claim_port: u16,
-
-    /// LAN address for the claim listener; an empty TOML string means auto-detect.
-    #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
-    pub claim_bind_address: Option<String>,
-
-    /// Whether the claim listener advertises its port through mDNS.
-    #[serde(default = "default_claim_advertise_mdns")]
-    pub claim_advertise_mdns: bool,
-
     /// Whether local activity edges automatically pull a shared display.
     #[serde(default = "default_activity_follow")]
     pub activity_follow: bool,
 
-    /// Grace window after a local-activity arm before the pull commits.
+    /// Grace window after a local-activity edge before the pull commits.
     #[serde(default = "default_arm_after", with = "humantime_serde")]
     pub arm_after: Duration,
 
@@ -292,21 +201,9 @@ pub struct CoordinationConfig {
 impl Default for CoordinationConfig {
     fn default() -> Self {
         Self {
-            enabled: defaults::COORDINATION_ENABLED,
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
             state_poll_interval: None,
             loss_confirmations: defaults::COORDINATION_LOSS_CONFIRMATIONS,
-            pairing_port: defaults::COORDINATION_PAIRING_PORT,
-            pairing_window: defaults::COORDINATION_PAIRING_WINDOW,
-            pairing_bind_address: defaults::COORDINATION_PAIRING_BIND_ADDRESS.map(str::to_owned),
-            activity_claim: ActivityClaimPolicy::Off,
-            owner_idle_window: defaults::OWNER_IDLE_WINDOW,
-            armed_window: defaults::ARMED_WINDOW,
-            claim_timeout: defaults::CLAIM_TIMEOUT,
-            release_deadline_cap: defaults::RELEASE_DEADLINE_CAP,
-            claim_port: defaults::CLAIM_PORT,
-            claim_bind_address: None,
-            claim_advertise_mdns: defaults::CLAIM_ADVERTISE_MDNS,
             activity_follow: defaults::ACTIVITY_FOLLOW,
             arm_after: defaults::ARM_AFTER,
             cooldown: defaults::COOLDOWN,
@@ -1319,13 +1216,6 @@ pub struct HookAction {
     pub abort_on_failure: bool,
 }
 
-fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(|value| value.filter(|value| !value.is_empty()))
-}
-
 impl DisplayConfig {
     /// Return the normalised ladder: the user-supplied `ladder` if present,
     /// otherwise desugar `blank_mode` into a single-stage ladder.
@@ -1546,45 +1436,11 @@ fn default_pairing_enabled() -> bool {
     defaults::PAIRING_ENABLED
 }
 
-fn default_coordination_enabled() -> bool {
-    defaults::COORDINATION_ENABLED
-}
-
 fn default_coordination_poll_interval() -> Duration {
     defaults::COORDINATION_POLL_INTERVAL
 }
 fn default_coordination_loss_confirmations() -> u32 {
     defaults::COORDINATION_LOSS_CONFIRMATIONS
-}
-fn default_coordination_pairing_port() -> u16 {
-    defaults::COORDINATION_PAIRING_PORT
-}
-fn default_coordination_pairing_window() -> Duration {
-    defaults::COORDINATION_PAIRING_WINDOW
-}
-
-fn default_claim_timeout() -> Duration {
-    defaults::CLAIM_TIMEOUT
-}
-
-fn default_release_deadline_cap() -> Duration {
-    defaults::RELEASE_DEADLINE_CAP
-}
-
-fn default_armed_window() -> Duration {
-    defaults::ARMED_WINDOW
-}
-
-fn default_owner_idle_window() -> Duration {
-    defaults::OWNER_IDLE_WINDOW
-}
-
-fn default_claim_port() -> u16 {
-    defaults::CLAIM_PORT
-}
-
-fn default_claim_advertise_mdns() -> bool {
-    defaults::CLAIM_ADVERTISE_MDNS
 }
 
 fn default_activity_follow() -> bool {
@@ -2340,10 +2196,10 @@ idle_source = "macos"
     }
 
     #[test]
-    fn coordination_defaults_are_opt_in_with_pairing_window_settings() {
+    fn coordination_defaults_are_opt_in_with_activity_follow() {
         let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
 
-        assert!(!cfg.coordination.enabled);
+        assert!(!cfg.coordination.activity_follow);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(2));
         assert_eq!(cfg.coordination.state_poll_interval, None);
         // Absent key resolves to max(30s, poll_interval=2s) = 30s.
@@ -2353,30 +2209,25 @@ idle_source = "macos"
         );
         // loss_confirmations default — defends against issue #134 garbled reads.
         assert_eq!(cfg.coordination.loss_confirmations, 3);
-        assert_eq!(cfg.coordination.pairing_port, 0);
-        assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(300));
-        assert_eq!(cfg.coordination.pairing_bind_address, None);
+        assert_eq!(cfg.coordination.arm_after, Duration::from_secs(7));
+        assert_eq!(cfg.coordination.cooldown, Duration::from_secs(3));
     }
 
     #[test]
-    fn coordination_enabled_false_parses_in_strict_mode() {
+    fn coordination_parses_surviving_fields() {
         let cfg: Config = toml::from_str(
-            "config_version = 1\n[coordination]\nenabled = false\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\npairing_port = 4567\npairing_window = \"7m\"\npairing_bind_address = \"10.1.1.5\"\n",
+            "config_version = 1\n[coordination]\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\nactivity_follow = true\narm_after = \"5s\"\ncooldown = \"10s\"\n",
         )
         .unwrap();
 
-        assert!(!cfg.coordination.enabled);
+        assert!(cfg.coordination.activity_follow);
         assert_eq!(cfg.coordination.poll_interval, Duration::from_secs(3));
         assert_eq!(
             cfg.coordination.state_poll_interval,
             Some(Duration::from_secs(30))
         );
-        assert_eq!(cfg.coordination.pairing_port, 4567);
-        assert_eq!(cfg.coordination.pairing_window, Duration::from_secs(420));
-        assert_eq!(
-            cfg.coordination.pairing_bind_address.as_deref(),
-            Some("10.1.1.5")
-        );
+        assert_eq!(cfg.coordination.arm_after, Duration::from_secs(5));
+        assert_eq!(cfg.coordination.cooldown, Duration::from_secs(10));
     }
 
     #[test]
@@ -2423,7 +2274,7 @@ idle_source = "macos"
         let path = dir.path().join("kvm_full.toml");
         std::fs::write(&path, include_str!("../../tests/fixtures/kvm_full.toml")).unwrap();
         let (cfg, _) = crate::config::load_config(&path, Strictness::Strict).unwrap();
-        assert_eq!(cfg.coordination.activity_claim, ActivityClaimPolicy::Off);
+        assert!(cfg.coordination.activity_follow);
         assert_eq!(cfg.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
         assert_eq!(cfg.input_filter.ignore_devices, vec!["*jiggler*"]);
         assert_eq!(cfg.displays["monitor"].hooks.before_release.len(), 1);

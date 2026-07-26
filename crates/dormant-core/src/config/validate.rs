@@ -11,15 +11,13 @@
 //! The value is then deserialized into [`Config`] without `deny_unknown_fields`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
 
 use super::schema::{
-    ActivityClaimPolicy, Config, Credentials, DisplayConfig, DisplayScope, HookAction,
-    ValidationError,
+    Config, Credentials, DisplayConfig, DisplayScope, HookAction, ValidationError,
 };
 
 /// A single unknown-key finding from the TOML tree walk.
@@ -83,21 +81,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "coordination",
         &[
-            "enabled",
             "poll_interval",
             "state_poll_interval",
             "loss_confirmations",
-            "pairing_port",
-            "pairing_window",
-            "pairing_bind_address",
-            "activity_claim",
-            "owner_idle_window",
-            "armed_window",
-            "claim_timeout",
-            "release_deadline_cap",
-            "claim_port",
-            "claim_bind_address",
-            "claim_advertise_mdns",
             "activity_follow",
             "arm_after",
             "cooldown",
@@ -877,75 +863,6 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
         });
     }
     validate_loss_confirmations(&cfg.coordination, errors);
-    let pairing_window = cfg.coordination.pairing_window;
-    if !(Duration::from_secs(30)..=Duration::from_secs(15 * 60)).contains(&pairing_window) {
-        errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail: format!(
-                "coordination pairing_window {pairing_window:?} is outside the permitted 30s..=15m range"
-            ),
-        });
-    }
-    if let Some(address) = cfg.coordination.pairing_bind_address.as_deref() {
-        let valid_lan_address = address
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| !ip.is_loopback() && !ip.is_unspecified());
-        if !valid_lan_address {
-            errors.push(ValidationError {
-                what: crate::error::E_CONFIG_INVALID.into(),
-                detail: format!(
-                    "coordination pairing_bind_address {address:?} must be a valid non-loopback, non-wildcard IP address"
-                ),
-            });
-        }
-    }
-    let coordination = &cfg.coordination;
-    for (name, value, minimum) in [
-        (
-            "claim_timeout",
-            coordination.claim_timeout,
-            Duration::from_secs(1),
-        ),
-        (
-            "release_deadline_cap",
-            coordination.release_deadline_cap,
-            Duration::from_secs(15),
-        ),
-        (
-            "armed_window",
-            coordination.armed_window,
-            Duration::from_secs(5),
-        ),
-        (
-            "owner_idle_window",
-            coordination.owner_idle_window,
-            Duration::from_secs(5),
-        ),
-    ] {
-        if value < minimum {
-            errors.push(ValidationError {
-                what: crate::error::E_CONFIG_INVALID.into(),
-                detail: format!(
-                    "coordination {name} {value:?} is below the minimum of {minimum:?}"
-                ),
-            });
-        }
-    }
-    validate_release_deadline_cap(coordination, errors);
-    if coordination.activity_claim != ActivityClaimPolicy::Off && !coordination.enabled {
-        errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail: "coordination activity_claim requires coordination enabled".into(),
-        });
-    }
-    if !coordination.claim_advertise_mdns && coordination.claim_port == 0 {
-        errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail:
-                "coordination claim_advertise_mdns = false requires a fixed non-zero claim_port"
-                    .into(),
-        });
-    }
     if let Some(hotkey) = cfg.keymap.claim_hotkey.as_deref()
         && !is_conservative_accelerator(hotkey)
     {
@@ -970,25 +887,6 @@ fn validate_loss_confirmations(
             detail: format!(
                 "coordination loss_confirmations {} is outside the permitted 1..=10 range",
                 coordination.loss_confirmations
-            ),
-        });
-    }
-}
-
-fn validate_release_deadline_cap(
-    coordination: &super::schema::CoordinationConfig,
-    errors: &mut Vec<ValidationError>,
-) {
-    let release_floor = coordination
-        .poll_interval
-        .saturating_mul(2)
-        .saturating_add(Duration::from_secs(1));
-    if coordination.release_deadline_cap < release_floor {
-        errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail: format!(
-                "coordination release_deadline_cap {:?} must be >= 2 * poll_interval + 1s ({release_floor:?})",
-                coordination.release_deadline_cap
             ),
         });
     }
@@ -2406,65 +2304,7 @@ gracee_period = "60s"
         )
     }
 
-    #[test]
-    fn kvm_coordination_duration_floors_reject_below_and_accept_boundaries() {
-        for (key, below, floor, fragment) in [
-            ("claim_timeout", "999ms", "1s", "claim_timeout"),
-            (
-                "release_deadline_cap",
-                "14999ms",
-                "15s",
-                "release_deadline_cap",
-            ),
-            ("armed_window", "4999ms", "5s", "armed_window"),
-            ("owner_idle_window", "4999ms", "5s", "owner_idle_window"),
-        ] {
-            let errors = validate_str(&format!(
-                "config_version = 1\n[coordination]\n{key} = \"{below}\"\n"
-            ));
-            assert!(
-                errors.iter().any(|error| {
-                    error.what == crate::error::E_CONFIG_INVALID
-                        && error.detail.contains(fragment)
-                        && error.detail.contains("below the minimum")
-                }),
-                "{key} below its floor must be rejected: {errors:?}"
-            );
-            let errors = validate_str(&format!(
-                "config_version = 1\n[coordination]\n{key} = \"{floor}\"\n"
-            ));
-            assert!(
-                !errors.iter().any(|error| error.detail.contains(fragment)),
-                "{key} at its floor must be accepted: {errors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn release_deadline_cap_must_cover_the_coordination_poll_floor() {
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\npoll_interval = \"10s\"\nrelease_deadline_cap = \"20s\"\n",
-        );
-        assert!(
-            errors.iter().any(|error| {
-                error.what == crate::error::E_CONFIG_INVALID
-                    && error.detail.contains("release_deadline_cap")
-                    && error.detail.contains("must be >= 2 * poll_interval + 1s")
-            }),
-            "cap below the poll floor must be rejected: {errors:?}"
-        );
-
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\npoll_interval = \"10s\"\nrelease_deadline_cap = \"21s\"\n",
-        );
-        assert!(
-            !errors.iter().any(|error| {
-                error.what == crate::error::E_CONFIG_INVALID
-                    && error.detail.contains("must be >= 2 * poll_interval + 1s")
-            }),
-            "cap at the poll floor must be accepted: {errors:?}"
-        );
-    }
+    // (dead test functions removed — the validated fields no longer exist)
 
     #[test]
     fn kvm_shared_displays_may_reuse_input_codes() {
@@ -2487,37 +2327,6 @@ gracee_period = "60s"
                 .contains("duplicates a local shared_input_code")),
             "distinct shared input codes must pass: {errors:?}"
         );
-    }
-
-    #[test]
-    fn kvm_claim_transport_and_activity_fatal_rules_are_enforced() {
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\nclaim_advertise_mdns = false\nclaim_port = 0\n",
-        );
-        assert!(errors.iter().any(|error| {
-            error.what == crate::error::E_CONFIG_INVALID
-                && error
-                    .detail
-                    .contains("requires a fixed non-zero claim_port")
-        }));
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\nclaim_advertise_mdns = false\nclaim_port = 1234\n",
-        );
-        assert!(
-            !errors
-                .iter()
-                .any(|error| error.detail.contains("claim_port"))
-        );
-
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\nactivity_claim = \"edge\"\nenabled = false\n",
-        );
-        assert!(errors.iter().any(|error| {
-            error.what == crate::error::E_CONFIG_INVALID
-                && error
-                    .detail
-                    .contains("activity_claim requires coordination enabled")
-        }));
     }
 
     #[test]
@@ -2587,7 +2396,7 @@ gracee_period = "60s"
 
     #[test]
     fn kvm_known_keys_accept_every_new_config_key() {
-        let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\nactivity_claim = \"off\"\nowner_idle_window = \"5s\"\narmed_window = \"5s\"\nclaim_timeout = \"1s\"\nrelease_deadline_cap = \"15s\"\nclaim_port = 42\nclaim_bind_address = \"\"\nclaim_advertise_mdns = false\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
+        let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\npoll_interval = \"2s\"\nactivity_follow = false\narm_after = \"7s\"\ncooldown = \"3s\"\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
         let value: toml::Value = toml::from_str(config).unwrap();
         assert!(collect_unknown_keys(&value).is_empty());
     }
@@ -6571,40 +6380,7 @@ availability_payload_offline = "down"
         }
     }
 
-    #[test]
-    fn coordination_pairing_window_outside_bounds_rejected() {
-        for pairing_window in ["29s", "15m1s"] {
-            let errors = validate_str(&format!(
-                "config_version = 1\n[coordination]\npairing_window = \"{pairing_window}\"\n"
-            ));
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.detail.contains("pairing_window")),
-                "expected pairing_window validation error for {pairing_window}, got {errors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bind_address_override_parses_and_rejects_wildcard() {
-        for address in ["0.0.0.0", "127.0.0.1"] {
-            let errors = validate_str(&format!(
-                "config_version = 1\n[coordination]\npairing_bind_address = \"{address}\"\n"
-            ));
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.what == crate::error::E_CONFIG_INVALID),
-                "expected E_CONFIG_INVALID for {address}, got {errors:?}"
-            );
-        }
-
-        let errors = validate_str(
-            "config_version = 1\n[coordination]\npairing_bind_address = \"10.1.1.5\"\n",
-        );
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-    }
+    // (dead pairing/bind tests removed — the validated fields no longer exist)
 
     #[test]
     fn shared_display_requires_input_code() {

@@ -181,14 +181,14 @@ impl HotkeyStatusTracker {
         else {
             return Some(ResolvedHotkeyStatus::Disabled);
         };
-        if kvm.claim_capable_displays.len() != 1 {
+        if kvm.switch_capable_displays.len() != 1 {
             return Some(ResolvedHotkeyStatus::Ambiguous {
-                count: kvm.claim_capable_displays.len(),
+                count: kvm.switch_capable_displays.len(),
             });
         }
         Some(ResolvedHotkeyStatus::Register {
             accelerator,
-            target: kvm.claim_capable_displays[0].0.clone(),
+            target: kvm.switch_capable_displays[0].0.clone(),
         })
     }
 }
@@ -422,7 +422,6 @@ mod tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
-                    claim_armed_remaining_ms: None,
                 },
             )],
             pending_reload: None,
@@ -440,7 +439,7 @@ mod tests {
                     Some(hotkey.into())
                 },
             },
-            claim_capable_displays: displays.iter().map(|d| DisplayId((*d).into())).collect(),
+            switch_capable_displays: displays.iter().map(|d| DisplayId((*d).into())).collect(),
             ..Default::default()
         }
     }
@@ -682,7 +681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_claim_capable_displays_logs_ambiguous_and_notifies() {
+    async fn zero_switch_capable_displays_logs_ambiguous_and_notifies() {
         let state = Arc::new(tokio::sync::Mutex::new(TrayState::new(
             "/tmp/dormant.sock".into(),
         )));

@@ -186,7 +186,7 @@ fn is_switch_capable(snapshot: Option<&StateSnapshot>, id: &str) -> bool {
             .find(|(display_id, _)| display_id == id)
             .is_some_and(|(_, display)| display.scope == DisplayScope::Shared)
             && snapshot.kvm.as_ref().is_some_and(|kvm| {
-                kvm.claim_capable_displays
+                kvm.switch_capable_displays
                     .iter()
                     .any(|display_id| display_id.0 == id)
             })
@@ -393,7 +393,6 @@ mod tests {
                 wake_attempts: 0,
                 last_blank_failed: false,
                 stage,
-                claim_armed_remaining_ms: None,
             },
         )
     }
@@ -1114,7 +1113,7 @@ mod tests {
             keymap: KeymapConfig {
                 claim_hotkey: hotkey.map(String::from),
             },
-            claim_capable_displays: switch_capable
+            switch_capable_displays: switch_capable
                 .iter()
                 .map(|d| DisplayId((*d).into()))
                 .collect(),
@@ -1139,7 +1138,6 @@ mod tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
-                    claim_armed_remaining_ms: None,
                 },
             )],
             pending_reload: None,
@@ -1177,7 +1175,7 @@ mod tests {
 
     #[test]
     fn non_switch_capable_display_omits_switch_entry() {
-        // Shared but NOT in claim_capable_displays — no switch entry.
+        // Shared but NOT in switch_capable_displays — no switch entry.
         let snapshot = kvm_snap(&[], Some("Meta+F12"));
         let menu = build_menu(Some(&snapshot), false, 8137);
 
@@ -1223,7 +1221,7 @@ mod tests {
                 keymap: KeymapConfig {
                     claim_hotkey: Some("Meta+F12".into()),
                 },
-                claim_capable_displays: vec![DisplayId("monitor".into()), DisplayId("tv".into())],
+                switch_capable_displays: vec![DisplayId("monitor".into()), DisplayId("tv".into())],
                 ..Default::default()
             };
             StateSnapshot {
@@ -1245,7 +1243,6 @@ mod tests {
                             wake_attempts: 0,
                             last_blank_failed: false,
                             stage: None,
-                            claim_armed_remaining_ms: None,
                         },
                     ),
                     (
@@ -1263,7 +1260,6 @@ mod tests {
                             wake_attempts: 0,
                             last_blank_failed: false,
                             stage: None,
-                            claim_armed_remaining_ms: None,
                         },
                     ),
                 ],

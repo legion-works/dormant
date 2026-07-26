@@ -947,7 +947,6 @@ mod tests {
                             owned: true,
                             observed_input_code: None,
                             panel_state: None,
-                            claim_armed_remaining_ms: None,
                         },
                     )
                 })

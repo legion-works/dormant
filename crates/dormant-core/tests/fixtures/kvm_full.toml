@@ -7,14 +7,9 @@ claim_hotkey = "Meta+F12"
 ignore_devices = ["*jiggler*"]
 
 [coordination]
-activity_claim = "off"
-owner_idle_window = "5s"
-armed_window = "5s"
-claim_timeout = "1s"
-release_deadline_cap = "15s"
-claim_port = 32123
-claim_bind_address = ""
-claim_advertise_mdns = false
+activity_follow = true
+arm_after = "7s"
+cooldown = "3s"
 
 [displays.monitor]
 controllers = ["ddcci"]

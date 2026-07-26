@@ -28,8 +28,8 @@ use crate::idle_observation::{IdleObservation, IdleObservationRx};
 /// Production monotonic clock — delegates to the tokio runtime so
 /// paused-time tests (`#[tokio::test(start_paused = true)]`) can
 /// control time via `tokio::time::advance()`.
-#[allow(dead_code)]
-fn production_clock() -> Instant {
+#[must_use]
+pub fn production_clock() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
@@ -41,7 +41,7 @@ pub struct ActivityFollowDeps {
     ///
     /// `None` only during tests with `pull_recorder` set; at runtime
     /// this is always populated.
-    pub direct_switch: Option<DirectSwitchHandle>,
+    pub direct_switch: Option<Arc<DirectSwitchHandle>>,
     /// Shared displays that are not locally owned — the set the loop pulls on.
     pub display_ids: Arc<[DisplayId]>,
     /// Grace window after an activity edge before the pull commits.

@@ -545,7 +545,7 @@ mod tests {
                 keymap: KeymapConfig {
                     claim_hotkey: Some(accelerator.into()),
                 },
-                claim_capable_displays: vec![DisplayId("monitor".into())],
+                switch_capable_displays: vec![DisplayId("monitor".into())],
                 ..Default::default()
             }),
         }

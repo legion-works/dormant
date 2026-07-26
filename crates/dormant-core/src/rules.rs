@@ -552,11 +552,6 @@ pub struct DisplaySnapshot {
     /// omitted when `None`, byte-identical to a pre-stage snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<StageInfo>,
-    /// Remaining arm window in milliseconds for the `armed` activity-claim
-    /// policy. `None` when not armed or the display has no claim capability.
-    /// Computed from the monotonic expiry at snapshot time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_armed_remaining_ms: Option<u64>,
 }
 
 const fn default_owned() -> bool {
@@ -588,8 +583,8 @@ pub struct StateSnapshot {
     /// Boot-time rollback metadata, omitted when no rollback is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackStatus>,
-    /// KVM-switch status payload (resolved keymap, claim-capable
-    /// display set, activity-claim policy). Additive — older
+    /// KVM-switch status payload (resolved keymap, switch-capable
+    /// display set, activity-follow state). Additive — older
     /// clients omit the key. `#[serde(default)]` so legacy
     /// snapshots without the key deserialize cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,18 +598,18 @@ pub struct KvmStatus {
     /// Resolved keymap (`keymap.claim_hotkey`).
     #[serde(default)]
     pub keymap: crate::config::KeymapConfig,
-    /// Post-probe claim-capable display set (shared scope AND
-    /// input-source write capable AND claim identity present).
+    /// Post-probe switch-capable display set (shared scope AND
+    /// input-source write capable AND configured local read code).
+    /// Claim identity no longer participates.
     #[serde(default)]
-    pub claim_capable_displays: Vec<crate::types::DisplayId>,
-    /// Resolved activity-claim policy.
+    pub switch_capable_displays: Vec<crate::types::DisplayId>,
+    /// Whether the activity-follow task is running.
     #[serde(default)]
-    pub activity_claim: crate::config::ActivityClaimPolicy,
-    /// Per-display remaining arm window in milliseconds (`None` when not
-    /// armed or the display has no claim capability). Computed from the
-    /// monotonic expiry at snapshot time.
+    pub activity_following: bool,
+    /// Post-probe push-capable display ids — shared scope, write capable,
+    /// with `shared_peer_input_write_code` configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub claim_armed_remaining: Vec<(crate::types::DisplayId, u64)>,
+    pub push_capable_displays: Vec<crate::types::DisplayId>,
 }
 
 // ── Per-runtime configuration shapes ─────────────────────────────────────────
@@ -1851,12 +1846,6 @@ impl RulesEngine {
                         wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
                         last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
                         stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
-                        claim_armed_remaining_ms: self.kvm.as_ref().and_then(|kvm| {
-                            kvm.claim_armed_remaining
-                                .iter()
-                                .find(|(d, _)| d == &dcfg.display)
-                                .map(|(_, ms)| *ms)
-                        }),
                     },
                 ));
             }
@@ -3013,7 +3002,6 @@ mod tests {
             wake_attempts: 0,
             last_blank_failed: false,
             stage: None,
-            claim_armed_remaining_ms: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("stage"));
@@ -3038,7 +3026,6 @@ mod tests {
                 idx: 1,
                 kind: StageKind::RenderBlack,
             }),
-            claim_armed_remaining_ms: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         // Wire shape: idx=1, kind="render_black"
@@ -3370,24 +3357,23 @@ mod tests {
     /// `KvmStatus`: `SetKvmStatus` replaces the snapshot fold.
     #[tokio::test]
     async fn kvm_status_set_replaces_snapshot_fold() {
-        use crate::config::ActivityClaimPolicy;
         use crate::config::KeymapConfig;
         let mut engine = minimal_engine();
         let status = crate::rules::KvmStatus {
             keymap: KeymapConfig {
                 claim_hotkey: Some("Meta+F12".to_owned()),
             },
-            claim_capable_displays: vec![DisplayId("mon".into())],
-            activity_claim: ActivityClaimPolicy::Armed,
-            claim_armed_remaining: vec![],
+            switch_capable_displays: vec![DisplayId("mon".into())],
+            activity_following: true,
+            push_capable_displays: vec![],
         };
         engine.handle_control(ControlMsg::SetKvmStatus(status));
         let snap = snapshot_of(&mut engine);
         let kvm = snap
             .kvm
             .expect("KvmStatus populated by SetKvmStatus control message");
-        assert_eq!(kvm.claim_capable_displays, vec![DisplayId("mon".into())]);
-        assert_eq!(kvm.activity_claim, ActivityClaimPolicy::Armed);
+        assert_eq!(kvm.switch_capable_displays, vec![DisplayId("mon".into())]);
+        assert!(kvm.activity_following);
         assert_eq!(kvm.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
     }
 

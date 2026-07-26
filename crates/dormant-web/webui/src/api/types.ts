@@ -131,9 +131,6 @@ export interface DisplaySnapshot {
   last_blank_failed?: boolean;
   /** Present only when the display is in the `staged` phase. */
   stage?: { idx: number; kind: StageKind } | null;
-  /** Remaining arm window in milliseconds for the `armed` activity-claim
-   * policy. Absent when not armed or on legacy wire. */
-  claim_armed_remaining_ms?: number;
 }
 
 /** rust: rules.rs RollbackStatus */
@@ -235,8 +232,9 @@ export interface DaemonIdentity {
  */
 export interface KvmStatus {
   keymap: { claim_hotkey?: string };
-  claim_capable_displays: string[];
-  activity_claim: "off" | "owner-idle" | "edge" | "armed";
+  switch_capable_displays: string[];
+  activity_following: boolean;
+  push_capable_displays: string[];
 }
 
 export interface StateSnapshot {
@@ -436,11 +434,8 @@ export interface ConfigInventory {
 
 /** rust: config/schema.rs CoordinationConfig
  *
- * Fields removed from the web mirror (no longer wired for KVM claims):
- * `enabled`, `pairing_port`, `pairing_window`, `pairing_bind_address`,
- * `activity_claim`, `owner_idle_window`, `armed_window`, `claim_timeout`,
- * `release_deadline_cap`, `claim_port`, `claim_bind_address`,
- * `claim_advertise_mdns`. Tasks 15/16 own removal from the Rust struct.
+ * Remaining fields after the KVM direct-write pivot removed the
+ * owner-mediated claim protocol (Task 16).
  */
 export interface CoordinationConfig {
   poll_interval?: string;

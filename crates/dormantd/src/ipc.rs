@@ -280,19 +280,6 @@ async fn handle_connection(
                 let resp = handle_switch_peer(&direct_switch, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::CoordinationPairOpen { .. }
-            | IpcRequest::CoordinationPairJoin { .. }
-            | IpcRequest::CoordinationPairStatus { .. }
-            | IpcRequest::CoordinationPairCancel { .. }
-            | IpcRequest::CoordinationPeersList
-            | IpcRequest::ClaimShared { .. }
-            | IpcRequest::ClaimArm { .. } => {
-                let resp = IpcResponse::error(
-                    "instance pairing and claim negotiation were removed; \
-                     shared displays now switch by direct local input write",
-                );
-                let _ = write_json(&mut writer, &resp).await;
-            }
         }
     }
 }

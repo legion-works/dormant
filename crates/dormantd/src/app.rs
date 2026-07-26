@@ -907,6 +907,59 @@ impl App {
             root.clone(),
         ));
 
+        // ── Spawn activity-follow on boot ───────────────────────────────────
+        let mut activity_follow_handle: Option<tokio::task::JoinHandle<()>> = None;
+        if cfg_clone.coordination.activity_follow {
+            let idle_rx = idle_obs_tx.subscribe();
+            let filtered_rx = filtered_activity_tx.subscribe();
+            let shared: Vec<DisplayId> = cfg_clone
+                .displays
+                .iter()
+                .filter(|(_, dc)| {
+                    dc.scope == dormant_core::config::DisplayScope::Shared
+                        && dc.shared_input_code.is_some()
+                })
+                .map(|(name, _)| DisplayId(name.clone()))
+                .collect();
+            if !shared.is_empty() {
+                let deps = crate::activity_follow::ActivityFollowDeps {
+                    idle_rx,
+                    direct_switch: Some(direct_switch.clone()),
+                    display_ids: shared.into(),
+                    arm_after: cfg_clone.coordination.arm_after,
+                    cancel: root.clone(),
+                    pull_recorder: None,
+                    clock: crate::activity_follow::production_clock,
+                };
+                activity_follow_handle = Some(crate::activity_follow::spawn(deps, filtered_rx));
+            }
+        }
+
+        // ── Publish KVM status on boot (#137 regression guard) ───────────
+        // Build and publish the initial KvmStatus before the run loop starts
+        // so the tray/web/CLI see accurate state from the first snapshot.
+        {
+            let mut switch_capable = Vec::new();
+            let mut push_capable = Vec::new();
+            for (name, dc) in &cfg_clone.displays {
+                if dc.scope == dormant_core::config::DisplayScope::Shared {
+                    if dc.shared_input_code.is_some() {
+                        switch_capable.push(DisplayId(name.clone()));
+                    }
+                    if dc.shared_peer_input_write_code.is_some() {
+                        push_capable.push(DisplayId(name.clone()));
+                    }
+                }
+            }
+            let kvm = dormant_core::rules::KvmStatus {
+                keymap: cfg_clone.keymap.clone(),
+                switch_capable_displays: switch_capable,
+                activity_following: activity_follow_handle.is_some(),
+                push_capable_displays: push_capable,
+            };
+            let _ = spawn.ctl_tx.send(ControlMsg::SetKvmStatus(kvm)).await;
+        }
+
         let (reload_tx, _) = broadcast::channel(16);
         let (reload_request_tx, reload_request_rx) = mpsc::channel::<ReloadRequest>(32);
         let reload_requester =
@@ -1135,6 +1188,7 @@ impl App {
             force_generation_barrier_timeout: self.force_generation_barrier_timeout,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: self.reload_lifecycle_capture,
+            activity_follow_handle,
         };
 
         let join = tokio::spawn(run_loop(
@@ -1517,6 +1571,8 @@ struct Runner {
     force_generation_barrier_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
+    /// The activity-follow task spawned on boot and re-spawned on reload.
+    activity_follow_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
@@ -1628,6 +1684,89 @@ impl Runner {
         self.generation = spawn.generation;
         self.ctl_router.install(spawn.ctl_tx.clone()).await;
         self.events_router.install(spawn.events_tx.clone()).await;
+    }
+
+    /// Build a [`KvmStatus`] from the current generation's config.
+    fn build_kvm_status(&self) -> dormant_core::rules::KvmStatus {
+        use dormant_core::config::DisplayScope;
+        use dormant_core::types::DisplayId;
+
+        let cfg = &self.generation.cfg;
+        let mut switch_capable = Vec::new();
+        let mut push_capable = Vec::new();
+
+        for (name, dc) in &cfg.displays {
+            if dc.scope != DisplayScope::Shared {
+                continue;
+            }
+            if dc.shared_input_code.is_some() {
+                switch_capable.push(DisplayId(name.clone()));
+            }
+            if dc.shared_peer_input_write_code.is_some() {
+                push_capable.push(DisplayId(name.clone()));
+            }
+        }
+
+        dormant_core::rules::KvmStatus {
+            keymap: cfg.keymap.clone(),
+            switch_capable_displays: switch_capable,
+            activity_following: self.activity_follow_handle.is_some(),
+            push_capable_displays: push_capable,
+        }
+    }
+
+    /// Send the current [`KvmStatus`] to the live engine via [`ControlMsg::SetKvmStatus`].
+    ///
+    /// Called on boot (generation 0) and after every accepted reload so the
+    /// tray, web UI, and CLI always observe up-to-date KVM state — prevents
+    /// the first-boot status gap (issue #137).
+    async fn publish_kvm_status(&self) {
+        let kvm = self.build_kvm_status();
+        if let Some(ctl) = self.ctl_router.current().await {
+            let _ = ctl.send(ControlMsg::SetKvmStatus(kvm)).await;
+        }
+    }
+
+    /// Spawn (or re-spawn) the activity-follow task from the current
+    /// generation's config and daemon-lifetime channels.
+    ///
+    /// Drops any prior handle; re-spawns only when
+    /// `coordination.activity_follow` is true.
+    fn spawn_activity_follow(&mut self) {
+        if self.activity_follow_handle.is_some() {
+            self.activity_follow_handle = None;
+        }
+        if self.generation.cfg.coordination.activity_follow
+            && let Some(idle_tx) = self.idle_obs_tx.as_ref()
+        {
+            let idle_rx = idle_tx.subscribe();
+            let filtered_rx = self.filtered_activity_tx.subscribe();
+            let shared: Vec<dormant_core::types::DisplayId> = self
+                .generation
+                .cfg
+                .displays
+                .iter()
+                .filter(|(_, dc)| {
+                    dc.scope == dormant_core::config::DisplayScope::Shared
+                        && dc.shared_input_code.is_some()
+                })
+                .map(|(name, _)| dormant_core::types::DisplayId(name.clone()))
+                .collect();
+
+            if !shared.is_empty() {
+                let deps = crate::activity_follow::ActivityFollowDeps {
+                    idle_rx,
+                    direct_switch: Some(self.direct_switch.clone()),
+                    display_ids: shared.into(),
+                    arm_after: self.generation.cfg.coordination.arm_after,
+                    cancel: self.root.clone(),
+                    pull_recorder: None,
+                    clock: crate::activity_follow::production_clock,
+                };
+                self.activity_follow_handle =
+                    Some(crate::activity_follow::spawn(deps, filtered_rx));
+            }
+        }
     }
 
     /// Publish the KVM claim status to the current engine generation.
@@ -1973,6 +2112,12 @@ impl Runner {
                     .emit(DaemonObservation::GenerationStarted {
                         generation: self.generation_id,
                     });
+
+                // Republish executor/config watches BEFORE activity-follow
+                // or any new edge can write — an edge that fires against a
+                // stale executor writes to the wrong panel.
+                self.spawn_activity_follow();
+                self.publish_kvm_status().await;
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a
                 // successful reload from the operator path while a
@@ -5614,7 +5759,6 @@ mod restore_tests {
             owned: true,
             observed_input_code: None,
             panel_state: None,
-            claim_armed_remaining_ms: None,
         }
     }
 
@@ -6151,7 +6295,6 @@ mod gamma_reload_tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
-                    claim_armed_remaining_ms: None,
                 },
             )],
             pending_reload: None,

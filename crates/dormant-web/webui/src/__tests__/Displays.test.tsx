@@ -133,7 +133,7 @@ function renderDisplayCard(id: string, display: DisplaySnapshot) {
       zones: [],
       displays: [[id, display]],
       pending_reload: null,
-      kvm: { keymap: {}, claim_capable_displays: [id], activity_claim: "off" },
+      kvm: { keymap: {}, switch_capable_displays: [id], activity_following: false, push_capable_displays: [] },
     },
     displayConfigs: {
       [id]: { controllers: [], blank_mode: "power_off" } as DisplayConfig,
@@ -353,7 +353,7 @@ describe("Displays", () => {
         zones: [],
         displays: [["shared-tv", sharedDisplay()]],
         pending_reload: null,
-        kvm: { keymap: {}, claim_capable_displays: ["shared-tv"], activity_claim: "off" },
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
       },
       displayConfigs: {
         "shared-tv": { controllers: [], blank_mode: "power_off", scope: "shared" } as DisplayConfig,
@@ -371,7 +371,7 @@ describe("Displays", () => {
         zones: [],
         displays: [["shared-tv", sharedDisplay()]],
         pending_reload: null,
-        kvm: { keymap: {}, claim_capable_displays: ["shared-tv"], activity_claim: "off" },
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
       },
       displayConfigs: {
         "shared-tv": {

@@ -99,7 +99,7 @@ fn render_table(snapshot: &StateSnapshot) -> String {
                 phase.as_str(),
                 if d.owned { "local" } else { "peer" },
                 if snapshot.kvm.as_ref().is_some_and(|kvm| {
-                    kvm.claim_capable_displays
+                    kvm.switch_capable_displays
                         .iter()
                         .any(|display| display.0 == *id)
                 }) {
@@ -120,7 +120,11 @@ fn render_table(snapshot: &StateSnapshot) -> String {
             out,
             "── KVM ───────────────────────────────────────────────────"
         );
-        let _ = writeln!(out, "Activity claim: {:?}", kvm.activity_claim);
+        let _ = writeln!(
+            out,
+            "Activity follow: {}",
+            if kvm.activity_following { "on" } else { "off" }
+        );
         let _ = writeln!(
             out,
             "Claim hotkey: {}",
@@ -193,7 +197,6 @@ mod tests {
                         wake_attempts: 0,
                         last_blank_failed: false,
                         stage: None,
-                        claim_armed_remaining_ms: None,
                     },
                 ),
                 (
@@ -211,7 +214,6 @@ mod tests {
                         wake_attempts: 0,
                         last_blank_failed: false,
                         stage: None,
-                        claim_armed_remaining_ms: None,
                     },
                 ),
             ],
@@ -287,7 +289,6 @@ mod tests {
                         idx: 2,
                         kind: StageKind::RenderBlack,
                     }),
-                    claim_armed_remaining_ms: None,
                 },
             )],
             pending_reload: None,
@@ -327,7 +328,6 @@ mod tests {
                         idx: 1,
                         kind: StageKind::RenderBlack,
                     }),
-                    claim_armed_remaining_ms: None,
                 },
             )],
             pending_reload: None,
@@ -360,14 +360,14 @@ mod tests {
             keymap: dormant_core::config::KeymapConfig {
                 claim_hotkey: Some("Ctrl+F12".into()),
             },
-            claim_capable_displays: vec![dormant_core::types::DisplayId("main_monitor".into())],
-            activity_claim: dormant_core::config::ActivityClaimPolicy::Armed,
-            claim_armed_remaining: vec![],
+            switch_capable_displays: vec![dormant_core::types::DisplayId("main_monitor".into())],
+            activity_following: true,
+            push_capable_displays: vec![],
         });
         let rendered = render_table(&snap);
         assert!(rendered.contains("peer"));
         assert!(rendered.contains("capable"));
-        assert!(rendered.contains("Activity claim: Armed"));
+        assert!(rendered.contains("Activity follow: on"));
         assert!(rendered.contains("Ctrl+F12"));
     }
 }

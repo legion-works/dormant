@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-26
+
+### Fixed
+
+- Corrected documentation that had drifted from shipped behavior: multi-machine ownership and switching flows, hook blocking defaults, the `/api/push` route in the security-surface lists, and DDC retry semantics.
+- The LD2410C ESPHome example now ships hardware-calibrated defaults — `still_energy_floor` 30 → 28 and `near_cutoff` 2.5 m → 1.6 m — so the distance fallback covers the desk chair without latching onto seating behind it.
+- The daemon smoke tests no longer carry a race condition where the coordinator's batch watcher could observe a stale file state during repeated config reloads, causing spurious test failures (#143).
+
 ## [0.7.0] - 2026-07-26
 
 ### Breaking
@@ -198,7 +206,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/legion-works/dormant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/legion-works/dormant/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/legion-works/dormant/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/legion-works/dormant/compare/v0.4.0...v0.5.0

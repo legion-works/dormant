@@ -43,6 +43,27 @@ The LD2410C divides its detection space into 9 gates. Each defaults to a 75 cm r
 
 Setting per-gate thresholds is necessary but **not sufficient** to fix close-range seated detection on its own — the gate 0/1 hardware limit and the re-arm quirk remain. The energy-gated template is the primary mitigation; per-gate thresholds fine-tune the radar for the gate range where the occupant actually sits.
 
+**Switching an existing sensor over to `desk_seated`.** The template publishes on its
+own MQTT topic, so an existing `[sensors.*]` block keeps reading the old
+distance-gated entity until you repoint it. After reflashing, confirm the new
+topic is live and then update the config:
+
+```bash
+# 1. confirm the ESP is publishing the new entity
+mosquitto_sub -h <broker> -v -t 'ld2410c-desk/binary_sensor/#' -W 5
+
+# 2. point the sensor at it (topic slug follows the entity name)
+#    topic = "ld2410c-desk/binary_sensor/desk_presence_desk_seated/state"
+
+# 3. hot-reload — no daemon restart needed
+dormantctl reload && dormantctl status
+```
+
+Verify the slug from the `mosquitto_sub` output rather than assuming it: ESPHome
+derives it from the entity name, so a renamed template changes the topic.
+Keeping the old `desk_near` subscription is also valid — both entities publish
+independently, and `desk_near` remains the better signal for the far zone.
+
 ## MQTT
 
 dormant connects as an MQTT client (using `rumqttc`, pure Rust, no system dependency). It subscribes to one topic per sensor and reads a JSON pointer into each payload.

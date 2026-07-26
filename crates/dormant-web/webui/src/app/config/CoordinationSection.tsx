@@ -98,13 +98,13 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
         </div>
 
         <div className="cf-card__fields">
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="coordination.poll_interval">
             <DurationField path={[...root, "poll_interval"]} label="poll_interval"
               value={pollInterval} locked={false} help={HELP.poll_interval} placeholder="2s"
               onEdit={(_, v) => edit("poll_interval", v)} />
           </div>
 
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="coordination.loss_confirmations">
             <NumberField path={[...root, "loss_confirmations"]} label="loss_confirmations"
               value={lossConfirmations} locked={false} help={HELP.loss_confirmations}
               error={lossError ?? fieldErrors["coordination.loss_confirmations"]} placeholder="3"
@@ -116,19 +116,19 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
             )}
           </div>
 
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="coordination.activity_follow">
             <BoolField path={[...root, "activity_follow"]} label="activity_follow"
               value={activityFollow} locked={false} help={HELP.activity_follow}
               onEdit={(_, v) => edit("activity_follow", v)} />
           </div>
 
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="coordination.arm_after">
             <DurationField path={[...root, "arm_after"]} label="arm_after"
               value={armAfter} locked={false} help={HELP.arm_after} placeholder="7s"
               onEdit={(_, v) => edit("arm_after", v)} />
           </div>
 
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="coordination.cooldown">
             <DurationField path={[...root, "cooldown"]} label="cooldown"
               value={cooldown} locked={false} help={HELP.cooldown} placeholder="3s"
               onEdit={(_, v) => edit("cooldown", v)} />
@@ -141,7 +141,7 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
           </button>
 
           {showAdvanced && (
-            <div className="cf-field cf-field--row">
+            <div className="cf-field cf-field--row" data-field-id="coordination.state_poll_interval">
               <DurationField path={[...root, "state_poll_interval"]} label="state_poll_interval"
                 value={statePollInterval} locked={false} help={HELP.state_poll_interval}
                 placeholder="max(30s, poll_interval)" error={fieldErrors["coordination.state_poll_interval"]}

@@ -65,12 +65,27 @@ const SECTION_TO_TAB: Record<string, ConfigTab> = {
 /** Parse #/config/{tab} → tab, defaulting to "daemon". */
 function getConfigTabFromHash(): ConfigTab {
   const hash = window.location.hash.replace(/^#\/?/, "");
-  const parts = hash.split("/");
+  // Strip fragment suffix (the second '#' in #/config/switching#coordination.activity_follow)
+  const main = hash.split("#")[0];
+  const parts = main.split("/");
   if (parts[0] === "config" && parts[1]) {
     const candidate = parts[1] as ConfigTab;
     if (CONFIG_TABS.includes(candidate)) return candidate;
   }
   return "daemon";
+}
+
+/**
+ * Extract the deep-link fragment target from the full URL hash.
+ * #/config/switching#coordination.activity_follow → "coordination.activity_follow"
+ * Returns null when no secondary fragment is present.
+ */
+function getConfigFragmentTarget(): string | null {
+  const hash = window.location.hash;
+  const secondHash = hash.indexOf("#", 1); // skip the leading '#'
+  if (secondHash === -1) return null;
+  const target = hash.slice(secondHash + 1);
+  return target || null;
 }
 
 /**
@@ -374,6 +389,27 @@ export default function Config() {
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
   }, []);
+
+  // Scroll to + briefly highlight a deep-linked config fragment (e.g.
+  // #/config/switching#coordination.activity_follow).  The target row
+  // carries id="<section>.<key>"; we wait for the DOM to settle (the
+  // tab switch renders new content), then scroll and flash.
+  useEffect(() => {
+    const target = getConfigFragmentTarget();
+    if (!target) return;
+    // Defer until the tab's sections are in the DOM.
+    const timer = setTimeout(() => {
+      const el = document.querySelector(`[data-field-id="${target}"]`);
+      if (!el) return;
+      (el as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+      (el as HTMLElement).style.transition = "background-color 0.15s ease";
+      (el as HTMLElement).style.backgroundColor = "var(--accent-warm-muted)";
+      setTimeout(() => {
+        (el as HTMLElement).style.backgroundColor = "";
+      }, 1200);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [tab]);
 
   const handleReload = useCallback(async () => {
     setReloading(true);

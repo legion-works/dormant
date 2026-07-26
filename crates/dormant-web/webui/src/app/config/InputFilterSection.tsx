@@ -34,7 +34,7 @@ export default function InputFilterSection({
         </div>
 
         <div className="cf-card__fields">
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="input_filter.ignore_devices">
           <StringListField
             path={["input_filter", "ignore_devices"]}
             label="ignore_devices"

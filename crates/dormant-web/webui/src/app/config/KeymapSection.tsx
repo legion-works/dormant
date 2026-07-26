@@ -52,7 +52,7 @@ export default function KeymapSection({
         </div>
 
         <div className="cf-card__fields">
-          <div className="cf-field cf-field--row">
+          <div className="cf-field cf-field--row" data-field-id="keymap.claim_hotkey">
           <TextField
             path={["keymap", "claim_hotkey"]}
             label="claim_hotkey"

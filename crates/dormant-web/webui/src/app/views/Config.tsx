@@ -9,7 +9,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
-import type { ConfigResponse } from "../../api/types";
+import type { ConfigResponse, KvmStatus } from "../../api/types";
 import { Card, stageKindLabel } from "../components";
 import { SettingsForm } from "../config/SettingsForm";
 import "./Config.css";
@@ -20,6 +20,7 @@ interface ConfigState {
   error: string | null;
   config: ConfigResponse | null;
   pendingReload: string | null;
+  kvm?: KvmStatus | null;
 }
 
 interface TomlLine {
@@ -327,6 +328,7 @@ export default function Config() {
         error: null,
         config: cfg,
         pendingReload: snap.pending_reload,
+        kvm: snap.kvm ?? null,
       });
     } catch (err: unknown) {
       if (!mountedRef.current) return;
@@ -423,7 +425,7 @@ export default function Config() {
 
       {/* SettingsForm — always mounted so the PatchStore survives tab switches. */}
       <div style={{ display: tab === "raw" ? "none" : undefined }}>
-        <SettingsForm config={cfg} onNavigationGuard={handleNavGuard} tab={tab} />
+        <SettingsForm config={cfg} onNavigationGuard={handleNavGuard} tab={tab} kvm={state.kvm} />
       </div>
     </div>
   );

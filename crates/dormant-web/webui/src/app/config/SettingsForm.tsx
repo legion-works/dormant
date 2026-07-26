@@ -7,7 +7,7 @@
  * prop selects which sections are visible.
  */
 import { useState, useRef, useCallback, useEffect } from "react";
-import type { ConfigResponse, ApplyResponse, ApplyErrorBody } from "../../api/types";
+import type { ConfigResponse, ApplyResponse, ApplyErrorBody, KvmStatus } from "../../api/types";
 import { getConfig, postConfigApply, ApiError } from "../../api/client";
 import { createPatchStore } from "./patch";
 import type { PatchStore } from "./patch";
@@ -21,6 +21,7 @@ import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
 import DisplaysSection from "./DisplaysSection";
 import PairingWizard from "./PairingWizard";
+import CoordinationSection from "./CoordinationSection";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
@@ -37,6 +38,8 @@ interface SettingsFormProps {
   onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void } | null) => void;
   /** Active form tab; only sections for this tab are rendered. */
   tab: ConfigFormTab;
+  /** Live KVM state from the state snapshot; absent → not yet loaded. */
+  kvm?: KvmStatus | null;
 }
 
 /** Extract field-level errors from a 422 ApplyErrorBody by matching detail strings. */
@@ -59,7 +62,7 @@ function extractFieldErrors(body: ApplyErrorBody): Record<string, string | undef
   return map;
 }
 
-export function SettingsForm({ config: initialConfig, onNavigationGuard, tab }: SettingsFormProps) {
+export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kvm }: SettingsFormProps) {
   const storeRef = useRef<PatchStore>(createPatchStore());
   const store = storeRef.current;
 
@@ -297,11 +300,15 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab }: 
         </>
       )}
 
-      {/* ── Switching tab (W1-2/3/4 sections are added in later tasks) ── */}
+      {/* ── Switching tab ── */}
       {tab === "switching" && (
-        <div className="cf-placeholder">
-          Coordination, keymap, input filter, and hooks — coming in the next tasks.
-        </div>
+        <CoordinationSection
+          coordination={inv.coordination}
+          store={store}
+          onDirty={onDirty}
+          fieldErrors={fieldErrors}
+          kvm={kvm}
+        />
       )}
 
       {/* ── Raw tab — handled by Config.tsx, SettingsForm renders nothing. ── */}

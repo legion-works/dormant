@@ -376,3 +376,10 @@
 @media (prefers-reduced-motion: reduce) {
   .cf-form { animation: none; }
 }
+
+/* ── Inert state marker (Coordination section header) ── */
+
+.cf-card__type--inert {
+  color: var(--text-faint);
+  opacity: 0.6;
+}

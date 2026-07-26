@@ -5,6 +5,7 @@ import Events from "./views/Events";
 import Config from "./views/Config";
 import { navGuard } from "./navGuard";
 import Doctor from "./views/Doctor";
+import Switching from "./views/Switching";
 import { LiveStateProvider } from "./state";
 import { useLiveState } from "./hooks/useLiveState";
 import { getDaemon, postReload } from "../api/client";
@@ -19,6 +20,7 @@ import "./Shell.css";
 const VIEW_COMPONENTS: Record<ViewId, React.ComponentType> = {
   dashboard: Dashboard,
   displays: Displays,
+  switching: Switching,
   events: Events,
   config: Config,
   doctor: Doctor,
@@ -27,6 +29,7 @@ const VIEW_COMPONENTS: Record<ViewId, React.ComponentType> = {
 const VIEW_LABELS: Record<ViewId, string> = {
   dashboard: "Dashboard",
   displays: "Displays",
+  switching: "Switching",
   events: "Events",
   config: "Config",
   doctor: "Doctor",
@@ -36,6 +39,7 @@ const VIEW_LABELS: Record<ViewId, string> = {
 const VIEW_SUBTITLES: Record<ViewId, string> = {
   dashboard: "live presence-to-display state",
   displays: "per-display control & controller chains",
+  switching: "shared-display KVM ownership",
   events: "daemon event stream",
   config: "settings form, entity CRUD & validation",
   doctor: "environment & integration diagnostics",
@@ -126,12 +130,23 @@ function ShellInner() {
 
   const rollbackActive = snapshot?.rollback != null;
   const doctorFailures = doctorReport?.checks.filter((c) => c.status === "fail").length ?? 0;
+  const switchingEnabled =
+    snapshot?.kvm != null && (snapshot.kvm.switch_capable_displays?.length ?? 0) > 0;
+
+  // Redirect #/switching to #/displays when switching is not available.
+  useEffect(() => {
+    if (!switchingEnabled && getViewFromHash() === "switching") {
+      window.location.hash = "#/displays";
+      setActiveView("displays");
+    }
+  }, [switchingEnabled]);
 
   const items = navItems({
     displayCount: snapshot ? snapshot.displays.length : 0,
     eventsLive: connected,
     rollbackActive,
     doctorFailures,
+    switchingEnabled,
   });
 
   // Generic pending-reload banner only surfaces when there's no rollback

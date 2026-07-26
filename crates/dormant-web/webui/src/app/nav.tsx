@@ -12,7 +12,7 @@
  */
 import { useCallback } from "react";
 
-export type ViewId = "dashboard" | "displays" | "events" | "config" | "doctor";
+export type ViewId = "dashboard" | "displays" | "events" | "config" | "doctor" | "switching";
 
 export interface NavBadge {
   kind: "rollback" | "live" | "count";
@@ -31,11 +31,13 @@ export interface NavMeta {
   eventsLive: boolean;
   rollbackActive: boolean;
   doctorFailures: number;
+  /** Whether the switching view is available (kvm != null && switch_capable_displays.length > 0). */
+  switchingEnabled: boolean;
 }
 
 /** Derive the five sidebar nav items (stable ids/order) from live facts. */
 export function navItems(meta: NavMeta): NavItem[] {
-  return [
+  const items: NavItem[] = [
     { id: "dashboard", label: "Dashboard", icon: "▦" },
     {
       id: "displays",
@@ -62,6 +64,13 @@ export function navItems(meta: NavMeta): NavItem[] {
       badge: meta.doctorFailures > 0 ? { kind: "count", value: String(meta.doctorFailures) } : undefined,
     },
   ];
+
+  // Switching nav item appears between Displays and Events when eligible.
+  if (meta.switchingEnabled) {
+    items.splice(2, 0, { id: "switching", label: "Switching", icon: "⇄" });
+  }
+
+  return items;
 }
 
 /** Render text for a `NavBadge` — `count` uses its own value, `live`/`rollback` are fixed labels. */

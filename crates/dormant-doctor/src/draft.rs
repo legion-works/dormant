@@ -223,11 +223,31 @@ impl SecretSet {
             secrets.push(cred.password.clone());
         }
 
+        // MQTT usernames are credential-derived values that can appear in
+        // probe failure detail strings (e.g. "authentication rejected for
+        // user 'bob'"). Unlike other short strings — which the MIN_SECRET_LEN
+        // gate is designed to protect from over-redacting — a short username
+        // in a draft is an unambiguous leak. Collect them separately so they
+        // survive the length filter.
+        let short_mqtt_users: Vec<String> = creds
+            .mqtt
+            .values()
+            .map(|c| c.username.clone())
+            .filter(|u| u.len() < MIN_SECRET_LEN)
+            .collect();
+
         secrets.retain(|s| s.len() >= MIN_SECRET_LEN);
         // Longest-first so a secret that is a prefix/substring of another
         // (e.g. a broker URL containing a bare host also in the set) is
         // replaced by its longest match rather than leaving a fragment of
         // the shorter one exposed after the longer one is cut.
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.dedup();
+
+        // Re-inject short MQTT usernames after the filter.
+        secrets.extend(short_mqtt_users);
+        // Re-sort: the short usernames should still be sorted by length
+        // (shortest last).
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
 
@@ -913,6 +933,65 @@ mod tests {
     }
 
     // ── SecretSet / redact / scrub_ipv4_literals ────────────────────────────
+
+    #[test]
+    fn secret_set_collects_short_mqtt_usernames() {
+        let broker_url = "tcp://10.0.0.1:1883";
+        let mut sensors = IndexMap::new();
+        sensors.insert(
+            "desk".to_string(),
+            SensorConfig::Mqtt(dormant_core::config::schema::MqttSensorCfg {
+                broker_url: broker_url.to_string(),
+                topic: "dormant/desk".to_string(),
+                field: "/occupancy".to_string(),
+                payload_on: None,
+                payload_off: None,
+                availability_topic: None,
+                availability_payload_online: "online".to_string(),
+                availability_payload_offline: "offline".to_string(),
+                kind: dormant_core::config::schema::SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            sensors,
+            ..config_with_displays(IndexMap::new())
+        };
+        let short_user = "bob";
+        let mut creds = Credentials::default();
+        creds.mqtt.insert(
+            broker_url.to_string(),
+            dormant_core::config::schema::MqttCredential {
+                username: short_user.to_string(),
+                password: "secretpw".to_string(),
+            },
+        );
+
+        let set = SecretSet::collect(&cfg, &creds);
+
+        // The short username must be in the SecretSet so redaction can
+        // catch it in probe detail strings like
+        // "authentication rejected for user 'bob'".
+        assert!(
+            set.secrets.contains(&short_user.to_string()),
+            "short MQTT username must be collected for redaction: {:?}",
+            set.secrets
+        );
+
+        // Integration: the short username must actually be redacted.
+        let detail = format!("authentication rejected for user '{short_user}'");
+        let out = redact(&set, &detail);
+        assert!(
+            !out.contains(short_user),
+            "short MQTT username must be redacted from detail: {out}"
+        );
+        assert!(
+            out.contains("[redacted]"),
+            "redacted detail must contain [redacted] marker: {out}"
+        );
+    }
 
     #[test]
     fn secret_set_skips_short_values() {

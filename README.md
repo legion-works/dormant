@@ -22,7 +22,7 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 
 ## What it does
 
-- Blank displays when a room is empty instead of on a fixed idle timer — MQTT, Home Assistant WebSocket, or USB mmWave radar sensors feed the decision
+- Blank displays when a room is empty instead of on a fixed idle timer — driven by MQTT, Home Assistant WebSocket, or USB mmWave radar sensors
 - Blank without killing audio — DDC/CI, Samsung Tizen, and gamma-table paths leave the OS output intact
 - **Soft KVM** — two machines, one monitor; pull the panel by hotkey, CLI, tray, or web.
 - Escalate through a render ladder: black Wayland overlay → muted mpv screensaver → power-off, on configurable dwell timers
@@ -42,7 +42,7 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 
 ## Why not just DPMS?
 
-The whole point is protecting OLEDs *without* the usual trade-offs — no black bars burned into the panel, no audio cutting out when the TV screen goes dark, no three-second wait to see your desktop again. Every blank mode makes a different bargain:
+Protecting OLEDs *without* the usual trade-offs — no black bars burned into the panel, no audio cutting out when the TV screen goes dark, no three-second wait to see your desktop again. Every blank mode makes a different bargain:
 
 | Mode | OLED protection | Audio survives | Wake |
 |---|---|---|---|
@@ -90,7 +90,7 @@ GitHub issue draft, with known config and credential values redacted.
 
 Each display gets an ordered controller chain with automatic fallback and bounded wake retry. A wake that fails on one controller escalates to the next. Repeated failures surface through desktop notifications, the tray, and the web dashboard.
 
-A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. This is the way a TV joins dormant without a keep-awake dummy zone.
+A display referenced by no rule is **manual-only**: the daemon builds it, `dormantctl status` / the web UI / the tray show it, and it responds to hand-issued `blank` / `wake` commands — but no zone or rule ever drives it. That lets a TV join dormant without a keep-awake dummy zone.
 
 ### Panel-wear tracking
 

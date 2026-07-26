@@ -75,6 +75,12 @@ def _validate_surfaces(
     errors: list[str] = []
 
     for frag_path, fm, _body in fragments:
+        # Report repo-relative, matching every checker under scripts/ci/.
+        try:
+            label = frag_path.relative_to(root)
+        except ValueError:
+            label = frag_path
+
         surfaces: list[str] = fm.get("surfaces", [])
         if not isinstance(surfaces, list):
             surfaces = []
@@ -84,19 +90,19 @@ def _validate_surfaces(
             if isinstance(bullet, str) and bullet.strip():
                 if not _bullet_in_readme(root, bullet):
                     errors.append(
-                        f"{frag_path}: surfaces declares 'readme' but the "
+                        f"{label}: surfaces declares 'readme' but the "
                         f"readme_bullet text is absent from README.md"
                     )
             else:
                 errors.append(
-                    f"{frag_path}: surfaces declares 'readme' but "
+                    f"{label}: surfaces declares 'readme' but "
                     "readme_bullet is missing or empty"
                 )
 
         if "chapter" in surfaces:
             if not _docs_changed_since_prev_tag(root):
                 errors.append(
-                    f"{frag_path}: surfaces declares 'chapter' but no file "
+                    f"{label}: surfaces declares 'chapter' but no file "
                     "under docs/src/ changed since the previous tag"
                 )
 

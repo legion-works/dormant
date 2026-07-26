@@ -98,11 +98,9 @@ export default function Doctor() {
   const passing = checks.filter((c) => c.status === "ok").length;
   const failing = checks.filter((c) => c.status === "fail").length;
   const skipped = checks.filter((c) => c.status === "skip" || c.status === "not_supported").length;
-  const warnings = checks.length - passing - skipped - failing;
 
   const summaryCards = [
     { label: "Passing", count: passing, color: "var(--success)" },
-    { label: "Warnings", count: warnings, color: "var(--warning)" },
     { label: "Skipped", count: skipped, color: "var(--text-muted)" },
     { label: "Failing", count: failing, color: "var(--danger)" },
   ];

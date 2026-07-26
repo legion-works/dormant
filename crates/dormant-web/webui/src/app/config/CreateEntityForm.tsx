@@ -196,7 +196,12 @@ export default function CreateEntityForm({
           />
           <EnumField path={p("scope")} label="scope" value={displayScope} locked={false} onEdit={(_p, v) => setDisplayScope(v as "private" | "shared")} options={["private", "shared"]} />
           {displayScope === "shared" && (
-            <NumberField path={p("shared_input_code")} label="shared_input_code" value={fields.shared_input_code ?? ""} locked={false} onEdit={(_p, v) => setField("shared_input_code", v)} />
+            <>
+              <NumberField path={p("shared_input_code")} label="shared_input_code" value={fields.shared_input_code ?? ""} locked={false} onEdit={(_p, v) => setField("shared_input_code", v)} />
+              <NumberField path={p("shared_input_write_code")} label="shared_input_write_code (optional)" value={fields.shared_input_write_code ?? ""} locked={false} onEdit={(_p, v) => setField("shared_input_write_code", v)} />
+              <NumberField path={p("shared_peer_input_code")} label="shared_peer_input_code (optional peer read code)" value={fields.shared_peer_input_code ?? ""} locked={false} onEdit={(_p, v) => setField("shared_peer_input_code", v)} />
+              <NumberField path={p("shared_peer_input_write_code")} label="shared_peer_input_write_code (optional peer write code)" value={fields.shared_peer_input_write_code ?? ""} locked={false} onEdit={(_p, v) => setField("shared_peer_input_write_code", v)} />
+            </>
           )}
           <TextField path={p("host")} label="host" value={fields.host ?? ""} locked={false} onEdit={(_p, v) => setField("host", v)} />
           <EnumField path={p("blank_mode")} label="blank_mode" value={fields.blank_mode ?? "power_off"} locked={false} onEdit={(_p, v) => setField("blank_mode", v)} options={BLANK_MODE_OPTIONS} />

@@ -31,7 +31,10 @@ interface DisplayCardProps {
   zone: string;
   rule: string | undefined;
   dialogOpen: boolean;
-  peerWriteConfigured: boolean;
+  /** Whether the daemon reports this display as switch-capable (pull input). */
+  switchCapable: boolean;
+  /** Whether the daemon reports this display as push-capable (send input). */
+  pushCapable: boolean;
   error?: string;
   onOpenDetail: (id: string) => void;
   onBlank: (id: string) => void;
@@ -49,7 +52,8 @@ function DisplayCard({
   zone,
   rule,
   dialogOpen,
-  peerWriteConfigured,
+  switchCapable,
+  pushCapable,
   error,
   onOpenDetail,
   onBlank,
@@ -193,26 +197,26 @@ function DisplayCard({
             >
               Force wake
             </button>
-            {isShared && (
-              <>
-                <button
-                  type="button"
-                  className="display-action display-action--wake"
-                  onClick={() => onSwitch(id)}
-                >
-                  Switch to here
-                </button>
-                {peerWriteConfigured && (
-                  <button
-                    type="button"
-                    className="display-action display-action--wake"
-                    onClick={() => onPush(id)}
-                  >
-                    Send to peer
-                  </button>
-                )}
-              </>
-            )}
+{switchCapable && (
+                      <>
+                      <button
+                        type="button"
+                        className="display-action display-action--wake"
+                        onClick={() => onSwitch(id)}
+                      >
+                        Switch to here
+                      </button>
+                      {pushCapable && (
+                        <button
+                          type="button"
+                          className="display-action display-action--wake"
+                          onClick={() => onPush(id)}
+                        >
+                          Send to peer
+                        </button>
+                      )}
+                      </>
+                    )}
             {isPaused ? (
               <button
                 type="button"
@@ -378,6 +382,9 @@ export default function Displays() {
       {displays.map(([id, snap]) => {
         const dc = displayConfigs[id];
         const dr = displayRules[id];
+        const kvm = snapshot.kvm;
+        const switchCapable = kvm != null && kvm.switch_capable_displays.includes(id);
+        const pushCapable = kvm != null && kvm.push_capable_displays.includes(id);
         return (
           <DisplayCard
             key={id}
@@ -387,7 +394,8 @@ export default function Displays() {
             zone={dr?.zone ?? "—"}
             rule={dr?.rule}
             dialogOpen={!!dialog}
-            peerWriteConfigured={dc?.shared_peer_input_write_code != null}
+            switchCapable={switchCapable}
+            pushCapable={pushCapable}
             error={actionErrors[id]}
             onOpenDetail={selectDisplay}
             onBlank={handleBlank}

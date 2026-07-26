@@ -199,11 +199,11 @@ describe("Doctor", () => {
 
     render(<DoctorHarness />);
     fireEvent.click(screen.getByRole("button", { name: "Run doctor" }));
-    await waitFor(() => expect(screen.getByText("Warnings")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Failing")).toBeInTheDocument());
     expect(screen.getByText("Passing")).toBeInTheDocument();
     expect(screen.getByText("Skipped")).toBeInTheDocument();
-    expect(screen.getByText("Failing")).toBeInTheDocument();
-    expect(screen.getAllByText("1")).toHaveLength(4);
+    expect(screen.queryByText("Warnings")).not.toBeInTheDocument();
+    expect(screen.getAllByText("1")).toHaveLength(3);
     expect(screen.getByRole("combobox", { name: "Exercise display" })).toHaveValue("main");
     expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
   });

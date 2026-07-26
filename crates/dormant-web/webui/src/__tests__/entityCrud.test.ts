@@ -43,11 +43,13 @@ describe("CREATABLE_FIELDS — exact mirror of config_patch.rs:488-545", () => {
     expect(CREATABLE_FIELDS.zones).toEqual(["mode", "members", "unavailable_policy", "weights"]);
   });
 
-  it("displays: exactly the 10 Rust fields (blank_command/wake_command deliberately absent)", () => {
+  it("displays: exactly the 14 Rust fields (blank_command/wake_command deliberately absent)", () => {
     expect(CREATABLE_FIELDS.displays).toEqual([
       "controllers", "host", "blank_mode", "output", "ddc_display", "wol_mac",
       "samsung_restore_backlight", "restore_brightness",
       "treat_unreachable_as_blanked", "command_timeout",
+      "shared_input_code", "shared_input_write_code",
+      "shared_peer_input_code", "shared_peer_input_write_code",
     ]);
     expect(CREATABLE_FIELDS.displays).not.toContain("blank_command");
     expect(CREATABLE_FIELDS.displays).not.toContain("wake_command");

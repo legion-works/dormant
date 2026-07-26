@@ -525,6 +525,10 @@ static CREATABLE_FIELDS: &[(&str, &[&str])] = &[
             "restore_brightness",
             "treat_unreachable_as_blanked",
             "command_timeout",
+            "shared_input_code",
+            "shared_input_write_code",
+            "shared_peer_input_code",
+            "shared_peer_input_write_code",
         ],
     ),
     (

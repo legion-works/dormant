@@ -348,7 +348,7 @@ describe("Displays", () => {
     await waitFor(() => expect(mocks.postSwitch).toHaveBeenCalledWith("shared-tv"));
   });
 
-  it("does not render send-to-peer button when peer code not configured", () => {
+  it("does not render send-to-peer button when push not capable", () => {
     const state = liveStateFixture({
       snapshot: {
         sensors: [],
@@ -373,7 +373,7 @@ describe("Displays", () => {
         zones: [],
         displays: [["shared-tv", sharedDisplay()]],
         pending_reload: null,
-        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: ["shared-tv"] },
       },
       displayConfigs: {
         "shared-tv": {
@@ -401,7 +401,7 @@ describe("Displays", () => {
         zones: [],
         displays: [["shared-tv", sharedDisplay()]],
         pending_reload: null,
-        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: [] },
+        kvm: { keymap: {}, switch_capable_displays: ["shared-tv"], activity_following: false, push_capable_displays: ["shared-tv"] },
       },
       displayConfigs: {
         "shared-tv": {
@@ -423,6 +423,44 @@ describe("Displays", () => {
     renderDisplayCard("shared-tv", sharedDisplay());
     fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
     expect(await screen.findByText("write failed: DDC bus unreachable")).toBeInTheDocument();
+  });
+
+  it("hides switch and push buttons when kvm is null", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        // kvm absent — neither switch nor push is possible
+      },
+      displayConfigs: {
+        "shared-tv": { controllers: [], blank_mode: "power_off", scope: "shared" } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    expect(screen.queryByRole("button", { name: "Switch to here" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
+  });
+
+  it("hides switch and push buttons when display not in capability sets", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        kvm: { keymap: {}, switch_capable_displays: [], activity_following: false, push_capable_displays: [] },
+      },
+      displayConfigs: {
+        "shared-tv": { controllers: [], blank_mode: "power_off", scope: "shared" } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    expect(screen.queryByRole("button", { name: "Switch to here" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
   });
 });
 

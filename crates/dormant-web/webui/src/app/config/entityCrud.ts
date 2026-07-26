@@ -39,6 +39,8 @@ export const CREATABLE_FIELDS: Record<CrudCollection, readonly string[]> = {
     "controllers", "host", "blank_mode", "output", "ddc_display", "wol_mac",
     "samsung_restore_backlight", "restore_brightness",
     "treat_unreachable_as_blanked", "command_timeout",
+    "shared_input_code", "shared_input_write_code",
+    "shared_peer_input_code", "shared_peer_input_write_code",
   ],
   rules: [
     "zone", "displays", "grace_period", "inhibitors",

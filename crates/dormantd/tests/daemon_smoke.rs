@@ -327,6 +327,7 @@ async fn start_coordinator_app(
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(state_dir)
     .disable_ipc()
+    .disable_config_watcher()
     .start()
     .await
     .expect("start coordinator app")
@@ -5795,6 +5796,57 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
         "fresh startup grace must inhibit the new generation before grace expires"
     );
     assert_eq!(count(&marker, 'B'), 0, "an inhibited grace must not blank");
+
+    shutdown(handle, join).await;
+}
+
+/// Mutation-proof: when `disable_config_watcher()` is called, a bare
+/// `fs::write` of the config file must produce NO reload at all — no
+/// `ReloadStarted` observation should arrive, because the suppressed
+/// watcher's receiver is dead.
+///
+/// Bounded-wait shape: subscribe to observations, write the config,
+/// then `tokio::time::timeout` on the observation stream.  When the
+/// knob is a no-op the real watcher fires and the observation arrives
+/// within the bound; when active the bound elapses cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_config_watcher_suppression_is_effective() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &coordinator_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (handle, join) = start_coordinator_app(cfg_path.clone(), creds_path).await;
+
+    let mut observations = handle.subscribe_observations();
+
+    fs::write(&cfg_path, coordinator_config(&marker, "2s")).unwrap();
+
+    // When the watcher is suppressed, no ReloadStarted should arrive
+    // (the dead rx.recv() in the run loop never fires).  When the
+    // knob is a no-op, the real notify watcher fires and we see the
+    // observation well within the 2 s bound.
+    let mut saw_reload = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), observations.recv()).await {
+            Ok(Ok(DaemonObservation::ReloadStarted { .. })) => {
+                saw_reload = true;
+                break;
+            }
+            // Unrelated observation — keep polling.
+            Ok(Ok(_)) => {}
+            // Either the observation channel closed, or the bound elapsed with
+            // no ReloadStarted — the latter is the suppressed-watcher pass.
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert!(
+        !saw_reload,
+        "real watcher fired a ReloadStarted — suppression is ineffective"
+    );
 
     shutdown(handle, join).await;
 }

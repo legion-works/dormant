@@ -281,6 +281,13 @@ pub struct App {
     /// transitions must be observed by a test.
     observations: ObservationHub,
     disable_ipc: bool,
+    /// Suppress the `notify`-based config file watcher (test seam).
+    /// When set, the run loop's watcher arm never fires — only explicit
+    /// reload requests (IPC, control, signal) drive reloads. This keeps
+    /// batch-coordinator tests deterministic by removing the third,
+    /// uncontrolled requester.
+    #[cfg(any(test, feature = "test-util"))]
+    disable_config_watcher: bool,
     sd_notify: SdNotify,
     /// Test seam (T4): overrides the watchdog probe-arm's tick period,
     /// otherwise `sd_notify::watchdog_interval_from_env().unwrap_or(30s)`
@@ -476,6 +483,8 @@ impl App {
             notify_sink_builder: default_notify_sink_builder(),
             observations: ObservationHub::new(64),
             disable_ipc: false,
+            #[cfg(any(test, feature = "test-util"))]
+            disable_config_watcher: false,
             sd_notify: SdNotify::from_env(),
             watchdog_interval: None,
             #[cfg(any(test, feature = "test-util"))]
@@ -523,6 +532,8 @@ impl App {
             notify_sink_builder: default_notify_sink_builder(),
             observations: ObservationHub::new(64),
             disable_ipc: false,
+            #[cfg(any(test, feature = "test-util"))]
+            disable_config_watcher: false,
             sd_notify: SdNotify::from_env(),
             watchdog_interval: None,
             #[cfg(any(test, feature = "test-util"))]
@@ -574,6 +585,20 @@ impl App {
     #[must_use]
     pub fn disable_ipc(mut self) -> Self {
         self.disable_ipc = true;
+        self
+    }
+
+    /// Suppress the `notify`-based config file watcher (test seam).
+    ///
+    /// When called, the daemon starts with a dead watcher whose receiver
+    /// never fires — only explicit reload requests (IPC, control, signal)
+    /// will trigger reloads. This makes batch-coordinator tests
+    /// deterministic by removing the uncontrolled filesystem watcher from
+    /// the set of requesters.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn disable_config_watcher(mut self) -> Self {
+        self.disable_config_watcher = true;
         self
     }
 
@@ -1006,6 +1031,14 @@ impl App {
             );
         }
 
+        #[cfg(any(test, feature = "test-util"))]
+        let watcher = if self.disable_config_watcher {
+            reload::suppressed_watcher()
+        } else {
+            reload::config_watcher(&self.operator_config_path)
+                .context("install config file watcher")?
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
         let watcher = reload::config_watcher(&self.operator_config_path)
             .context("install config file watcher")?;
 

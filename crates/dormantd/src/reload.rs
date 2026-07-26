@@ -32,7 +32,8 @@ use tokio::sync::mpsc;
 /// A live config watcher. Dropping it stops watching.
 pub struct ConfigWatcher {
     /// Held to keep the OS watch alive for the process lifetime.
-    _watcher: notify::RecommendedWatcher,
+    /// `None` when the watcher is suppressed (test seam).
+    _watcher: Option<notify::RecommendedWatcher>,
     /// Ticks (one per relevant filesystem change).
     pub rx: mpsc::Receiver<()>,
 }
@@ -80,9 +81,24 @@ pub fn config_watcher(config_path: &Path) -> Result<ConfigWatcher> {
         .with_context(|| format!("watch config directory '{}'", watch_dir.display()))?;
 
     Ok(ConfigWatcher {
-        _watcher: watcher,
+        _watcher: Some(watcher),
         rx,
     })
+}
+
+/// A suppressed watcher whose receiver will never fire (test seam).
+///
+/// The sender is dropped before this returns, so `rx.recv()` always
+/// returns `None` — the watcher arm in the run loop is never entered.
+/// Used by tests that control every reload source explicitly and must
+/// not have a third, uncontrolled requester (the real `notify` filesystem
+/// watcher) inject spurious reloads into the batch coordinator.
+#[cfg(any(test, feature = "test-util"))]
+#[must_use]
+pub fn suppressed_watcher() -> ConfigWatcher {
+    let (tx, rx) = mpsc::channel::<()>(1);
+    drop(tx);
+    ConfigWatcher { _watcher: None, rx }
 }
 
 // ── Reload carry-over: dispatch-relevant voiding gate ──────────────────────────

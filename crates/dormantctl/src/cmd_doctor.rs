@@ -295,33 +295,59 @@ impl DraftKind {
 /// issue draft. The two flags are mutually exclusive (enforced by clap's
 /// `conflicts_with` plus the subcommand check in [`run_async`]).
 async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
-    let (cfg, creds, note) = load_config_and_creds(args)?;
-    if let Some(n) = &note {
-        println!("{n}");
-    }
-    let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
-    print_table(&results);
+    // Resolve the config path up front — it's needed for the draft context
+    // even when load_config_and_creds fails.
+    let config_path = paths::resolve_config_path(args.config.as_deref()).map_or_else(
+        |_| {
+            args.config
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("<default>"))
+                .display()
+                .to_string()
+        },
+        |p| p.display().to_string(),
+    );
 
-    let config_path =
-        paths::resolve_config_path(args.config.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let config_ok = results
-        .iter()
-        .filter(|r| r.name == "config")
-        .all(|r| r.status != ProbeStatus::Fail);
-
-    // Collected from the SAME cfg + creds the probes just ran against —
-    // every host/token/URL a draft could otherwise echo verbatim through a
-    // probe's free-text detail (see `dormant_doctor::draft`'s module docs).
-    let secrets = dormant_doctor::SecretSet::collect(&cfg, &creds);
-
-    let ctx = DraftContext {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        env: dormant_doctor::collect_env(),
-        config_path: config_path.display().to_string(),
-        config_ok,
-        displays: dormant_doctor::build_display_inventory(&cfg),
-        probes: results.clone(),
-        secrets,
+    // Catch config-load failures so a draft is written even when the config
+    // is broken — the user needs a draft to file an issue about it.
+    let (ctx, results) = match load_config_and_creds(args) {
+        Ok((cfg, creds, note)) => {
+            if let Some(n) = &note {
+                println!("{n}");
+            }
+            let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
+            print_table(&results);
+            let config_ok = results
+                .iter()
+                .filter(|r| r.name == "config")
+                .all(|r| r.status != ProbeStatus::Fail);
+            let ctx = DraftContext {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                env: dormant_doctor::collect_env(),
+                config_path,
+                config_ok,
+                displays: dormant_doctor::build_display_inventory(&cfg),
+                probes: results.clone(),
+                secrets: dormant_doctor::SecretSet::collect(&cfg, &creds),
+            };
+            (ctx, results)
+        }
+        Err(e) => {
+            let detail = format!("config load failed: {e:#}");
+            let results = vec![ProbeResult::fail("config", &detail)];
+            println!("{detail}");
+            print_table(&results);
+            let ctx = DraftContext {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                env: dormant_doctor::collect_env(),
+                config_path,
+                config_ok: false,
+                displays: Vec::new(),
+                probes: results.clone(),
+                secrets: dormant_doctor::SecretSet::default(),
+            };
+            (ctx, results)
+        }
     };
 
     let (requested_path, body, kind) = if let Some(p) = &args.report_issue {
@@ -372,6 +398,7 @@ async fn write_draft_atomically(base: &Path, body: &str) -> Result<PathBuf> {
     {
         Ok(mut file) => {
             tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
             return Ok(base.to_path_buf());
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => { /* fall through to suffix loop */ }
@@ -389,6 +416,7 @@ async fn write_draft_atomically(base: &Path, body: &str) -> Result<PathBuf> {
         {
             Ok(mut file) => {
                 tokio::io::AsyncWriteExt::write_all(&mut file, body.as_bytes()).await?;
+                tokio::io::AsyncWriteExt::flush(&mut file).await?;
                 return Ok(candidate);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1183,6 +1211,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #117: `run_draft` must still write a draft when the configuration
+    /// is broken — the user needs a draft to file an issue about it.
+    #[tokio::test]
+    async fn draft_written_even_when_config_is_invalid() {
+        let dir = std::env::temp_dir().join(format!(
+            "dormantctl-draft-test-invalid-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write an invalid config: config_version = "not-a-number".
+        let config_path = dir.join("dormant.toml");
+        std::fs::write(&config_path, b"config_version = \"not-a-number\"\n").unwrap();
+
+        // Write a minimal credentials file.
+        let creds_path = dir.join("credentials.toml");
+        std::fs::write(&creds_path, b"").unwrap();
+
+        let output_path = dir.join("draft.md");
+
+        let args = DoctorArgs::try_parse_from([
+            "doctor",
+            "--report-issue",
+            output_path.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "--credentials",
+            creds_path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        // The old code would propagate the config-load error via `?`.
+        // With the fix, the draft is still written.
+        let outcome = run_draft(&args).await.unwrap();
+        assert_eq!(
+            outcome,
+            DoctorOutcome::SomeFailed,
+            "config failure should produce SomeFailed"
+        );
+
+        // Verify the draft file was written.
+        assert!(
+            output_path.exists(),
+            "draft file must exist even when config is invalid"
+        );
+        let draft = std::fs::read_to_string(&output_path).unwrap();
+        assert!(
+            draft.contains("FAILED to load or validate"),
+            "draft must indicate config failure: {draft}"
+        );
+        assert!(
+            draft.contains("config"),
+            "draft must include config probe row: {draft}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Issue drafting: flag conflicts ──────────────────────────────────────
 
     #[test]
@@ -1274,9 +1361,9 @@ mod tests {
     /// Counterpart: the `=` form binds the value explicitly, so a file
     /// genuinely named after a subcommand is accepted — the escape hatch
     /// the error message points to actually works. Uses a config path that
-    /// doesn't exist so this fails at config-load (an `Err` from a
-    /// different cause), confirming the subcommand-name guard itself did
-    /// NOT fire — the guard-specific error text is absent.
+    /// doesn't exist: with the #117 fix, a draft is still written even
+    /// when config loading fails. Either way, we confirm the
+    /// subcommand-name guard itself did NOT fire.
     #[tokio::test]
     async fn report_issue_explicit_form_with_subcommand_name_is_accepted_by_the_guard() {
         let args = DoctorArgs::try_parse_from([
@@ -1289,13 +1376,25 @@ mod tests {
         assert_eq!(args.report_issue, Some("./ddcci".to_string()));
 
         let result = run_async(&args).await;
-        let err =
-            result.expect_err("nonexistent config path should still fail, just not via the guard");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("looks like a doctor subcommand name"),
-            "the `=` form must not trip the subcommand-name guard; got: {msg}"
-        );
+        match result {
+            Ok(outcome) => {
+                // #117: draft written with config failure — not an error.
+                assert_eq!(
+                    outcome,
+                    DoctorOutcome::SomeFailed,
+                    "nonexistent config must produce SomeFailed"
+                );
+                // Clean up the draft the test just wrote.
+                let _ = std::fs::remove_file("./ddcci");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("looks like a doctor subcommand name"),
+                    "the `=` form must not trip the subcommand-name guard; got: {msg}"
+                );
+            }
+        }
     }
 
     // ── #116: config_ok must only reflect the config probe ──────────

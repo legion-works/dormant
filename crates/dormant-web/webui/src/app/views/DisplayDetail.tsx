@@ -11,7 +11,7 @@
  * section-anchored layout.  Sections are not tabs — the whole page
  * is scannable and deep-links land visibly.
  */
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useMemo } from "react";
 import {
   Card,
   HealthChip,
@@ -20,6 +20,7 @@ import {
   useConfirmDialog,
   normalizeWearGrid,
   WearHeatMap,
+  HEAT_RAMP_STOPS,
   ExerciseRunner,
 } from "../components";
 import { postBlank, postWake, postPause, postResume } from "../../api/client";
@@ -74,6 +75,26 @@ function getAnchorFromHash(): string | null {
   const secondHash = hash.indexOf("#", 1);
   if (secondHash === -1) return null;
   return hash.slice(secondHash + 1) || null;
+}
+
+/** Generate a CSS gradient from HEAT_RAMP_STOPS — the same source heatColor()
+ *  uses, so the legend cannot drift from the heat-map ramp. */
+function heatRampGradient(): string {
+  const stops = HEAT_RAMP_STOPS.map(([v, r, g, b]) => {
+    const pct = Math.round(v * 100);
+    return `rgba(${r}, ${g}, ${b}, 1) ${pct}%`;
+  });
+  return `linear-gradient(90deg, ${stops.join(", ")})`;
+}
+
+/** Seconds-ago → human-readable relative duration (max precision: hours). */
+function relativeTime(epochS: number | null | undefined, nowS: number): string {
+  if (epochS == null) return "—";
+  const delta = Math.max(0, nowS - epochS);
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
+  return `${Math.floor(delta / 86400)}d ago`;
 }
 
 /** Ladder stage display label. */
@@ -152,6 +173,16 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
 
   const averagePercent = grid.averageHeat !== null ? Math.round(grid.averageHeat * 100) : null;
   const uniformityPercent = grid.uniformity !== null ? Math.round(grid.uniformity * 100) : null;
+
+  // W3-3: compute current time for staleness + seeded/measured split.
+  const nowS = useMemo(() => Math.floor(Date.now() / 1000), []);
+  const legendGradient = useMemo(() => heatRampGradient(), []);
+  const seededHours = wear?.seeded_usage_hours ?? null;
+  const measuredHours = seededHours != null
+    ? Math.max(0, (wear?.total_on_hours ?? 0) - seededHours)
+    : (wear?.total_on_hours ?? 0);
+  const isStale = wear?.last_sample_at_epoch_s != null
+    && (nowS - wear.last_sample_at_epoch_s) > 10 * 3600; // 10h default heuristic
 
   return (
     <div className="display-detail">
@@ -359,7 +390,10 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
               {grid.hasGridSamples || grid.hasHeatSamples ? (
                 <div className="display-detail__legend">
                   <span className="display-detail__legend-label">low</span>
-                  <div className="display-detail__legend-bar" />
+                  <div
+                    className="display-detail__legend-bar"
+                    style={{ background: legendGradient }}
+                  />
                   <span className="display-detail__legend-label">high</span>
                 </div>
               ) : null}
@@ -373,21 +407,32 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
             <Card className="display-detail__exposure-card">
               <div className="display-detail__eyebrow">Exposure summary</div>
               <div className="display-detail__tiles">
-                <div className="display-detail__tile">
-                  <div className="display-detail__tile-label">Total on-hours</div>
-                  <div className="display-detail__tile-value">{wear.total_on_hours.toFixed(1)}h</div>
-                </div>
-                <div className="display-detail__tile">
-                  <div className="display-detail__tile-label">Seeded prior</div>
-                  <div className="display-detail__tile-value">
-                    {wear.seeded_usage_hours != null
-                      ? `${wear.seeded_usage_hours}h · VCP 0xC0 seed`
-                      : "not seeded"}
+                {seededHours != null ? (
+                  <>
+                    <div className="display-detail__tile">
+                      <div className="display-detail__tile-label">Seeded from panel</div>
+                      <div className="display-detail__tile-value">{seededHours}h</div>
+                    </div>
+                    <div className="display-detail__tile">
+                      <div className="display-detail__tile-label">dormant-measured</div>
+                      <div className="display-detail__tile-value">{measuredHours.toFixed(1)}h</div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="display-detail__tile">
+                    <div className="display-detail__tile-label">Total on-hours</div>
+                    <div className="display-detail__tile-value">{wear.total_on_hours.toFixed(1)}h</div>
                   </div>
-                </div>
+                )}
                 <div className="display-detail__tile">
                   <div className="display-detail__tile-label">Samples</div>
                   <div className="display-detail__tile-value">{wear.sample_count.toLocaleString()}</div>
+                </div>
+                <div className={`display-detail__tile${isStale ? " display-detail__tile--warning" : ""}`}>
+                  <div className="display-detail__tile-label">Last sample</div>
+                  <div className="display-detail__tile-value">
+                    {relativeTime(wear.last_sample_at_epoch_s, nowS)}
+                  </div>
                 </div>
                 <div className={`display-detail__tile${wear.advisory ? " display-detail__tile--warning" : ""}`}>
                   <div className="display-detail__tile-label">Since long-dwell</div>

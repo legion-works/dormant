@@ -16,7 +16,7 @@ export { default as EmergencyWakeControl } from "./EmergencyWakeControl";
 export { default as ConfirmDialog } from "./ConfirmDialog";
 export type { ConfirmOptions, ConfirmDialogProps } from "./ConfirmDialog";
 export { useConfirmDialog } from "./useConfirmDialog";
-export { WearHeatMap, normalizeWearGrid, heatColor } from "./WearHeatMap";
+export { WearHeatMap, normalizeWearGrid, heatColor, HEAT_RAMP_STOPS } from "./WearHeatMap";
 export type { NormalizedWearGrid } from "./WearHeatMap";
 export { default as ExerciseRunner, aggregateExerciseVerdict } from "./ExerciseRunner";
 export type { ExerciseRunnerProps } from "./ExerciseRunner";

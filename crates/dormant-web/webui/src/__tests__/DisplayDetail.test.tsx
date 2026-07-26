@@ -94,11 +94,15 @@ describe("DisplayDetail", () => {
     expect(screen.getByText("high")).toBeInTheDocument();
     expect(screen.getByText(/v1 attribution is panel-wide and advisory/)).toBeInTheDocument();
 
-    // Exposure summary tiles (F3).
+    // Exposure summary tiles (F3). W3-3: when not seeded, "Total on-hours"
+    // replaces the seeded/measured split.
     expect(screen.getByText("321.3h")).toBeInTheDocument();
-    expect(screen.getByText("not seeded")).toBeInTheDocument();
+    expect(screen.getByText("Total on-hours")).toBeInTheDocument();
     expect(screen.getByText("444")).toBeInTheDocument();
     expect(screen.getByText("5d")).toBeInTheDocument();
+    // W3-3: last-sample relative timestamp and panel type are new tiles.
+    expect(screen.getByText("Last sample")).toBeInTheDocument();
+    expect(screen.getByText("Panel type")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
     expect(screen.getByText("45%")).toBeInTheDocument();
 

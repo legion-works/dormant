@@ -350,8 +350,16 @@ from the TOML file.
 dormantctl validate
 ```
 
-If your config also carried other removed coordination keys (pairing-port,
-pairing-window, pairing-bind-address, claim-port, claim-bind-address,
-claim-advertise-mdns, activity-claim, owner-idle-window, armed-window,
-claim-timeout, release-deadline-cap), delete those as well — they no
-longer exist in the schema.
+If your config also carried any of the other removed coordination keys,
+delete those too — they no longer exist in the schema:
+
+```toml
+# All of these are gone. Delete any that appear under [coordination]:
+#   enabled                 pairing_port            pairing_window
+#   pairing_bind_address    claim_port              claim_bind_address
+#   claim_advertise_mdns    activity_claim          owner_idle_window
+#   armed_window            claim_timeout           release_deadline_cap
+```
+
+The six keys that survive are `poll_interval`, `state_poll_interval`,
+`loss_confirmations`, `activity_follow`, `arm_after`, and `cooldown`.

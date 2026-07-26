@@ -280,6 +280,12 @@ def select_targets(
             for path in (change.new_path, change.old_path):
                 if path not in integration_paths:
                     continue
+                if source_files is not None and source_files.get(path, (None, None))[1] is None:
+                    # The file does not exist at HEAD — a pure deletion, not
+                    # a rename (new_path is tried first and resolves for renames).
+                    # Nothing to select; skip silently.
+                    mapped = True
+                    break
                 if not _platform_compatible(_new_source_for(change, path, source_files), platform):
                     mapped = True
                     break

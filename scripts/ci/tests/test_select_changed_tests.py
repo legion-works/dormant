@@ -211,6 +211,56 @@ mod tests {
 
         self.assert_targets(change, [("example", "test", "alpha")])
 
+    def test_deleted_integration_test_file_selects_nothing(self):
+        change = """diff --git a/crates/example/tests/alpha.rs b/crates/example/tests/alpha.rs
+deleted file mode 100644
+--- a/crates/example/tests/alpha.rs
++++ /dev/null
+@@ -1,3 +0,0 @@ fn checks_value()
+-#[test]
+-fn checks_value() {
+-}
+"""
+        source_files = {"crates/example/tests/alpha.rs": ("#[test]\nfn checks_value() {\n}\n", None)}
+
+        selected = select_changed_tests.select_targets(change, self.metadata, "linux", source_files)
+
+        self.assertEqual(selected, [])
+
+    def test_renamed_integration_test_with_sources_still_resolves_to_new_target(self):
+        change = """diff --git a/crates/example/tests/alpha.rs b/crates/example/tests/renamed.rs
+similarity index 90%
+rename from crates/example/tests/alpha.rs
+rename to crates/example/tests/renamed.rs
+--- a/crates/example/tests/alpha.rs
++++ b/crates/example/tests/renamed.rs
+@@ -3,1 +3,1 @@ fn checks_value()
+-assert!(old());
++assert!(new());
+"""
+        source_files = {
+            "crates/example/tests/alpha.rs": ("fn checks_value() { assert!(old()); }", None),
+            "crates/example/tests/renamed.rs": ("fn checks_value() { assert!(old()); }", "fn checks_value() { assert!(new()); }"),
+        }
+
+        selected = select_changed_tests.select_targets(change, self.metadata, "linux", source_files)
+
+        self.assertEqual([(t.package, t.kind, t.name) for t in selected], [("example", "test", "renamed")])
+
+    def test_missing_target_for_existing_integration_test_still_raises(self):
+        change = """diff --git a/crates/example/tests/gamma.rs b/crates/example/tests/gamma.rs
+--- a/crates/example/tests/gamma.rs
++++ b/crates/example/tests/gamma.rs
+@@ -1,0 +1,3 @@ fn new_test()
++#[test]
++fn new_test() {
++}
+"""
+        source_files = {"crates/example/tests/gamma.rs": ("", "#[test]\nfn new_test() {\n}\n")}
+
+        with self.assertRaisesRegex(select_changed_tests.SelectionError, "gamma.rs.*absent from cargo metadata"):
+            select_changed_tests.select_targets(change, self.metadata, "linux", source_files)
+
     def test_renamed_integration_test_uses_old_path(self):
         change = """diff --git a/crates/example/tests/alpha.rs b/crates/example/tests/renamed.rs
 similarity index 90%

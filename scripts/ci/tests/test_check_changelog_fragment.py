@@ -59,101 +59,125 @@ class FragmentValidationTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _frag(self, content: str, name: str = "feat-x.md") -> pathlib.Path:
-        return _write_fragment(self.root, name, content)
+    def _frag(self, content: str, name: str = "feat-x.md") -> str:
+        _write_fragment(self.root, name, content)
+        return name
+
+    def _validate(self, name: str) -> list[str]:
+        return check_changelog_fragment.validate_fragment(self.root, name)
 
     def test_valid_capability_passes(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: [readme]\nreadme_bullet: \"**X** — y\"\n---\nUser can now: do X\n\nDetail: mechanism\n"
         )
-        self.assertEqual(check_changelog_fragment.validate_fragment(frag), [])
+        self.assertEqual(self._validate(name), [])
 
     def test_valid_improvement_empty_surfaces_passes(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: improvement\nsurfaces: []\n---\nDetail: better thing\n"
         )
-        self.assertEqual(check_changelog_fragment.validate_fragment(frag), [])
+        self.assertEqual(self._validate(name), [])
 
     def test_valid_fix_passes(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: fix\nsurfaces: []\n---\nDetail: fixed crash\n"
         )
-        self.assertEqual(check_changelog_fragment.validate_fragment(frag), [])
+        self.assertEqual(self._validate(name), [])
 
     def test_valid_breaking_passes(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: breaking\nsurfaces: []\n---\nDelete the old config key and run dormantctl validate before upgrading.\n"
         )
-        self.assertEqual(check_changelog_fragment.validate_fragment(frag), [])
+        self.assertEqual(self._validate(name), [])
 
     def test_capability_without_user_can_now_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: [readme]\nreadme_bullet: \"**X**\"\n---\nDetail: but no user can now\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("User can now" in e for e in errors), errors)
 
     def test_capability_with_empty_surfaces_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: []\n---\nUser can now: do X\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("at least one surface" in e for e in errors), errors)
 
     def test_surfaces_readme_without_bullet_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: [readme]\n---\nUser can now: do X\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("readme_bullet" in e for e in errors), errors)
 
     def test_surfaces_readme_with_empty_bullet_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: [readme]\nreadme_bullet: \"\"\n---\nUser can now: do X\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("readme_bullet" in e for e in errors), errors)
 
     def test_breaking_without_body_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: breaking\nsurfaces: []\n---\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("migration sentence" in e for e in errors), errors)
 
     def test_invalid_kind_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: feature\nsurfaces: []\n---\nbody\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("kind must be one of" in e for e in errors), errors)
 
     def test_missing_kind_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nsurfaces: []\n---\nbody\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("kind is required" in e for e in errors), errors)
 
     def test_surfaces_not_a_list_fails(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: fix\nsurfaces: readme\n---\nbody\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("surfaces must be a list" in e for e in errors), errors)
 
     def test_user_can_now_case_insensitive(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: [readme]\nreadme_bullet: \"**X**\"\n---\nUSER CAN NOW: do X\n"
         )
-        self.assertEqual(check_changelog_fragment.validate_fragment(frag), [])
+        self.assertEqual(self._validate(name), [])
 
     def test_user_can_now_needs_content(self):
-        frag = self._frag(
+        name = self._frag(
             "---\nkind: capability\nsurfaces: [readme]\nreadme_bullet: \"**X**\"\n---\nUser can now:\n"
         )
-        errors = check_changelog_fragment.validate_fragment(frag)
+        errors = self._validate(name)
         self.assertTrue(any("User can now" in e for e in errors), errors)
+
+    # -- Error messages use repo-relative paths --
+    def test_error_message_uses_relative_path(self):
+        name = self._frag(
+            "---\nkind: feature\nsurfaces: []\n---\nbody\n"
+        )
+        errors = self._validate(name)
+        self.assertTrue(
+            any(name in e and not str(self.root) in e for e in errors),
+            f"expected relative path in errors, got: {errors}",
+        )
+
+    # -- Absent-at-HEAD fragments (consumed by a release) --
+    def test_absent_fragment_skips_silently(self):
+        # A fragment that existed in the range but was deleted before HEAD
+        # (e.g. consumed by a release commit) must pass without errors.
+        name = "feat-released.md"
+        # Never write the file — simulate a deleted fragment.
+        errors = check_changelog_fragment.validate_fragment(self.root, name)
+        self.assertEqual(errors, [])
 
 
 class TitleDetectionTests(unittest.TestCase):

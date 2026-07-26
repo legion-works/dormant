@@ -24,7 +24,7 @@ VALID_KINDS: frozenset[str] = frozenset({"capability", "improvement", "fix", "br
 FEAT_FIX_RE = re.compile(r"^(feat|fix)(?:\([^)]*\))?\s*:", re.IGNORECASE)
 
 # The directory's own README is not a fragment.
-README_PATH = pathlib.PurePosixPath("changelog.d/README.md")
+_README_RELPATH = "changelog.d/README.md"
 
 
 def _split_front_matter(text: str) -> tuple[list[str], str]:
@@ -102,13 +102,24 @@ def _is_title_feat_or_fix(pr_title: str | None) -> bool:
     return FEAT_FIX_RE.match(pr_title) is not None
 
 
-def validate_fragment(path: pathlib.Path) -> list[str]:
-    """Validate a single fragment file.  Returns a list of error strings."""
+def validate_fragment(root: pathlib.Path, rel_path: str) -> list[str]:
+    """Validate a single fragment file.  Returns a list of error strings.
+
+    A fragment that exists in the revision range but is absent from the
+    worktree was consumed by a release — skip it silently rather than
+    treating it as broken.
+    """
     errors: list[str] = []
-    label = str(path)
+    label = rel_path
+    full_path = root / rel_path
 
     try:
-        text = path.read_text(encoding="utf-8")
+        text = full_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Fragment was added in the range and deleted before HEAD —
+        # consumed by a release commit.  It was already validated
+        # when it was originally added.
+        return []
     except OSError as exc:
         return [f"{label}: cannot read file: {exc}"]
 
@@ -158,8 +169,11 @@ def validate_fragment(path: pathlib.Path) -> list[str]:
     return errors
 
 
-def _find_new_fragments(root: pathlib.Path, revision_range: str) -> list[pathlib.Path]:
-    """Return fragment files added under changelog.d/ within *revision_range*."""
+def _find_new_fragment_relpaths(
+    root: pathlib.Path, revision_range: str,
+) -> list[str]:
+    """Return repo-relative paths of fragments added under changelog.d/
+    within *revision_range*."""
     try:
         proc = subprocess.run(
             [
@@ -176,12 +190,14 @@ def _find_new_fragments(root: pathlib.Path, revision_range: str) -> list[pathlib
         # skipping; if we reach this point the range was provided so
         # surface the error.
         raise
-    paths: list[pathlib.Path] = []
+    paths: list[str] = []
     for line in proc.stdout.splitlines():
-        p = pathlib.PurePosixPath(line.strip())
-        if p == README_PATH:
+        p = line.strip()
+        if not p:
             continue
-        paths.append(root / p)
+        if p == _README_RELPATH:
+            continue
+        paths.append(p)
     return paths
 
 
@@ -208,17 +224,20 @@ def main() -> int:
         ).stdout.strip()
     )
 
-    fragments = _find_new_fragments(root, args.revision_range)
+    fragment_relpaths = _find_new_fragment_relpaths(root, args.revision_range)
 
-    # Validate every fragment that exists.
+    # Validate every fragment that still exists in the worktree.
+    # Fragments consumed by a release (added in the range, deleted
+    # before HEAD) are skipped silently — they were already validated
+    # when they were originally added.
     all_errors: list[str] = []
-    for frag_path in fragments:
-        all_errors.extend(validate_fragment(frag_path))
+    for rel_path in fragment_relpaths:
+        all_errors.extend(validate_fragment(root, rel_path))
 
     # Fragment-existence check: only when the PR title is feat/fix and
     # the skip-changelog label is NOT present.
     enforce = _is_title_feat_or_fix(args.pr_title) and not args.skip_label
-    if enforce and not fragments:
+    if enforce and not fragment_relpaths:
         all_errors.append(
             "feat/fix pull request has no changelog fragment; "
             "add one under changelog.d/ or apply the skip-changelog label"

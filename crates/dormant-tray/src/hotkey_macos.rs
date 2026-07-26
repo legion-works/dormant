@@ -90,7 +90,7 @@ unsafe extern "C" {
 
 struct CallbackState {
     action_tx: UnboundedSender<Action>,
-    registration: RefCell<Option<(String, bool)>>,
+    registration: RefCell<Option<String>>,
 }
 
 /// Main-thread-owned Carbon registration and callback lifetime.
@@ -158,22 +158,21 @@ impl CarbonHotkeyRegistrar {
             return;
         }
 
-        let (accelerator, target, arm) = match status {
+        let (accelerator, target) = match status {
             ResolvedHotkeyStatus::Disabled => return,
             ResolvedHotkeyStatus::Ambiguous { count } => {
                 tracing::warn!(
                     count,
                     event = "hotkey_register_failed",
                     reason = "ambiguous_target",
-                    "claim hotkey requires exactly one claim-capable shared display"
+                    "switch hotkey requires exactly one switch-capable shared display"
                 );
                 return;
             }
             ResolvedHotkeyStatus::Register {
                 accelerator,
                 target,
-                arm,
-            } => (accelerator, target, arm),
+            } => (accelerator, target),
         };
 
         let accelerator = match carbon_accelerator(&accelerator) {
@@ -225,9 +224,9 @@ impl CarbonHotkeyRegistrar {
             .as_ref()
             .expect("callback exists until handler removal")
             .registration
-            .borrow_mut() = Some((target.clone(), arm));
+            .borrow_mut() = Some(target.clone());
         self.hotkey_ref = Some(hotkey_ref);
-        tracing::info!(%target, arm, "claim hotkey registered");
+        tracing::info!(%target, "switch hotkey registered");
     }
 
     pub(crate) fn unregister(&mut self) {
@@ -307,10 +306,10 @@ unsafe fn dispatch_carbon_event(event: EventRef, user_data: *mut c_void) -> OSSt
     let hotkey_id = unsafe { hotkey_id.assume_init() };
     let callback = unsafe { &*user_data.cast::<CallbackState>() };
     let registration = callback.registration.borrow();
-    let Some((target, arm)) = registration.as_ref() else {
+    let Some(target) = registration.as_ref() else {
         return EVENT_NOT_HANDLED_ERR;
     };
-    let Some(action) = carbon_event_action(hotkey_id.signature, hotkey_id.id, target, *arm) else {
+    let Some(action) = carbon_event_action(hotkey_id.signature, hotkey_id.id, target) else {
         return EVENT_NOT_HANDLED_ERR;
     };
     let _ = callback.action_tx.send(action);

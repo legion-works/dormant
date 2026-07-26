@@ -8,7 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
-use super::{accelerator_tokens, claim_action};
+use super::{accelerator_tokens, switch_to_local_action};
 use crate::hotkey::{Accelerator, HotkeyError, HotkeyRegistrar};
 use crate::menu::Action;
 
@@ -211,7 +211,6 @@ impl HotkeyRegistrar for PortalHotkeyRegistrar {
         &mut self,
         accelerator: &Accelerator,
         target: &str,
-        arm: bool,
         tx: UnboundedSender<Action>,
     ) -> Result<(), HotkeyError> {
         self.unregister_claim().await;
@@ -225,8 +224,7 @@ impl HotkeyRegistrar for PortalHotkeyRegistrar {
         let listener_session = session.clone();
         let signal_task = tokio::spawn(async move {
             if let Err(error) =
-                listen_for_activation(listener_conn, listener_session.into(), &target, arm, tx)
-                    .await
+                listen_for_activation(listener_conn, listener_session.into(), &target, tx).await
             {
                 warn!(error = %error, "portal activation listener exited");
             }
@@ -250,7 +248,6 @@ async fn listen_for_activation(
     conn: zbus::Connection,
     session: ObjectPath<'static>,
     target: &str,
-    arm: bool,
     tx: UnboundedSender<Action>,
 ) -> Result<(), HotkeyError> {
     let proxy = zbus::Proxy::new(&conn, SERVICE, PATH, INTERFACE)
@@ -277,10 +274,10 @@ async fn listen_for_activation(
         if message_session.as_str() != session.as_str() || shortcut_id != "claim_panel" {
             continue;
         }
-        if tx.send(claim_action(target, arm)).is_err() {
+        if tx.send(switch_to_local_action(target)).is_err() {
             break;
         }
-        debug!(%target, arm, "claim hotkey activated via portal");
+        debug!(%target, "switch hotkey activated via portal");
     }
     Ok(())
 }

@@ -494,7 +494,6 @@ mod tests {
             &mut self,
             accelerator: &crate::hotkey::Accelerator,
             _target: &str,
-            _arm: bool,
             _tx: tokio::sync::mpsc::UnboundedSender<crate::menu::Action>,
         ) -> Result<(), crate::hotkey::HotkeyError> {
             self.calls
@@ -524,22 +523,6 @@ mod tests {
             Ok(())
         }
 
-        fn claim_shared(
-            &self,
-            _socket: &std::path::Path,
-            _display: &str,
-        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimSharedResultWire> {
-            anyhow::bail!("not used")
-        }
-
-        fn claim_arm(
-            &self,
-            _socket: &std::path::Path,
-            _display: &str,
-        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimArmResultWire> {
-            anyhow::bail!("not used")
-        }
-
         fn open_web(&self, _port: u16) -> anyhow::Result<()> {
             Ok(())
         }
@@ -548,7 +531,7 @@ mod tests {
     }
 
     fn hotkey_snapshot(accelerator: &str) -> StateSnapshot {
-        use dormant_core::config::{ActivityClaimPolicy, KeymapConfig};
+        use dormant_core::config::KeymapConfig;
         use dormant_core::rules::KvmStatus;
         use dormant_core::types::DisplayId;
 
@@ -563,8 +546,7 @@ mod tests {
                     claim_hotkey: Some(accelerator.into()),
                 },
                 claim_capable_displays: vec![DisplayId("monitor".into())],
-                activity_claim: ActivityClaimPolicy::Off,
-                claim_armed_remaining: vec![],
+                ..Default::default()
             }),
         }
     }

@@ -1,6 +1,6 @@
 //! FFI-independent Carbon hotkey parsing and event routing.
 
-use crate::hotkey::{Accelerator, HotkeyError, accelerator_tokens, claim_action};
+use crate::hotkey::{Accelerator, HotkeyError, accelerator_tokens, switch_to_local_action};
 use crate::menu::Action;
 
 pub(crate) const HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"dorm");
@@ -34,16 +34,11 @@ pub(crate) fn carbon_accelerator(
     })
 }
 
-pub(crate) fn carbon_event_action(
-    signature: u32,
-    id: u32,
-    target: &str,
-    arm: bool,
-) -> Option<Action> {
+pub(crate) fn carbon_event_action(signature: u32, id: u32, target: &str) -> Option<Action> {
     if signature != HOTKEY_SIGNATURE || id != CLAIM_HOTKEY_ID {
         return None;
     }
-    Some(claim_action(target, arm))
+    Some(switch_to_local_action(target))
 }
 
 fn carbon_key_code(key: &str) -> Option<u32> {
@@ -131,7 +126,7 @@ mod tests {
 
     impl FakeCarbon {
         fn emit(&self, signature: u32, id: u32) {
-            if let Some(action) = carbon_event_action(signature, id, "monitor", false) {
+            if let Some(action) = carbon_event_action(signature, id, "monitor") {
                 self.events.send(action).unwrap();
             }
         }
@@ -143,10 +138,13 @@ mod tests {
     }
 
     #[test]
-    fn carbon_event_posts_exactly_one_claim_action() {
+    fn carbon_event_posts_exactly_one_switch_action() {
         let (registrar, events) = fake_carbon();
         registrar.emit(HOTKEY_SIGNATURE, CLAIM_HOTKEY_ID);
-        assert_eq!(events.recv().unwrap(), Action::ClaimOne("monitor".into()));
+        assert_eq!(
+            events.recv().unwrap(),
+            Action::SwitchToLocal("monitor".into())
+        );
         assert!(events.try_recv().is_err());
     }
 

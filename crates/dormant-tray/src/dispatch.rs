@@ -18,10 +18,8 @@ pub enum DispatchPlan {
     Ignore,
     /// Send one or more IPC requests to the daemon.
     Ipc(Vec<IpcRequest>),
-    /// Request a KVM claim on a shared display.
-    ClaimOne(String),
-    /// Arm a shared display for activity-based claim.
-    ArmClaim(String),
+    /// Write the local input code to pull a shared display to this machine.
+    SwitchToLocal(String),
     /// Open the daemon web UI on this local port.
     OpenWeb(u16),
     /// Request that the platform tray exits.
@@ -69,8 +67,7 @@ pub fn plan_action(
         Action::WakeOne(display) => DispatchPlan::Ipc(vec![IpcRequest::Wake {
             display: display.clone(),
         }]),
-        Action::ClaimOne(display) => DispatchPlan::ClaimOne(display.clone()),
-        Action::ArmClaim(display) => DispatchPlan::ArmClaim(display.clone()),
+        Action::SwitchToLocal(display) => DispatchPlan::SwitchToLocal(display.clone()),
         Action::OpenWebUi { port } => DispatchPlan::OpenWeb(*port),
         Action::Quit => DispatchPlan::Quit,
         Action::Separator => DispatchPlan::Ignore,
@@ -85,28 +82,6 @@ pub trait DispatchCapabilities: Send + Sync + 'static {
     ///
     /// Returns an error if the connection or daemon request fails.
     fn send_ipc(&self, socket: &Path, request: &IpcRequest) -> Result<()>;
-
-    /// Request a KVM claim and return the wire verdict.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection or daemon request fails.
-    fn claim_shared(
-        &self,
-        socket: &Path,
-        display: &str,
-    ) -> Result<dormant_core::ipc_proto::ClaimSharedResultWire>;
-
-    /// Arm a shared display for activity-based claim.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection or daemon request fails.
-    fn claim_arm(
-        &self,
-        socket: &Path,
-        display: &str,
-    ) -> Result<dormant_core::ipc_proto::ClaimArmResultWire>;
 
     /// Open the local web UI.
     ///
@@ -136,17 +111,6 @@ impl SystemCapabilities {
             send_request: Arc::new(client::send_request),
         }
     }
-
-    #[cfg(test)]
-    fn with_sender(
-        request_quit: Arc<dyn Fn() + Send + Sync>,
-        send_request: Arc<IpcSender>,
-    ) -> Self {
-        Self {
-            request_quit,
-            send_request,
-        }
-    }
 }
 
 impl DispatchCapabilities for SystemCapabilities {
@@ -159,40 +123,6 @@ impl DispatchCapabilities for SystemCapabilities {
             );
         }
         Ok(())
-    }
-
-    fn claim_shared(
-        &self,
-        socket: &Path,
-        display: &str,
-    ) -> Result<dormant_core::ipc_proto::ClaimSharedResultWire> {
-        let response = (self.send_request)(
-            socket,
-            &IpcRequest::ClaimShared {
-                display: display.into(),
-            },
-        )?;
-        client::check_response(&response)?;
-        response
-            .claim_shared
-            .ok_or_else(|| anyhow::anyhow!("daemon returned no claim result"))
-    }
-
-    fn claim_arm(
-        &self,
-        socket: &Path,
-        display: &str,
-    ) -> Result<dormant_core::ipc_proto::ClaimArmResultWire> {
-        let response = (self.send_request)(
-            socket,
-            &IpcRequest::ClaimArm {
-                display: display.into(),
-            },
-        )?;
-        client::check_response(&response)?;
-        response
-            .claim_arm
-            .ok_or_else(|| anyhow::anyhow!("daemon returned no arm result"))
     }
 
     fn open_web(&self, port: u16) -> Result<()> {
@@ -235,39 +165,14 @@ pub async fn execute_plan(
             .await??;
             Ok(())
         }
-        DispatchPlan::ClaimOne(display) => {
+        DispatchPlan::SwitchToLocal(display_id) => {
             let socket_clone = socket.clone();
-            let verdict = tokio::task::spawn_blocking(move || {
-                capabilities.claim_shared(&socket_clone, &display)
-            })
-            .await??;
-            match verdict {
-                dormant_core::ipc_proto::ClaimSharedResultWire::Accepted { .. } => {
-                    info!("claim accepted");
-                }
-                dormant_core::ipc_proto::ClaimSharedResultWire::Busy => {
-                    anyhow::bail!("claim busy");
-                }
-                dormant_core::ipc_proto::ClaimSharedResultWire::Denied { reason }
-                | dormant_core::ipc_proto::ClaimSharedResultWire::Failed { reason } => {
-                    anyhow::bail!("{reason}");
-                }
-            }
-            Ok(())
-        }
-        DispatchPlan::ArmClaim(display) => {
-            let socket_clone = socket.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                capabilities.claim_arm(&socket_clone, &display)
-            })
-            .await??;
-            if !result.armed {
-                anyhow::bail!(
-                    "arm rejected: {}",
-                    result.reason.as_deref().unwrap_or("unknown")
-                );
-            }
-            info!("claim armed");
+            let request = IpcRequest::SwitchToLocal {
+                display: display_id.clone(),
+            };
+            tokio::task::spawn_blocking(move || capabilities.send_ipc(&socket_clone, &request))
+                .await??;
+            info!(display = %display_id, "switch to local dispatched");
             Ok(())
         }
         DispatchPlan::OpenWeb(port) => capabilities.open_web(port),
@@ -283,9 +188,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use super::{
-        DispatchCapabilities, DispatchPlan, SystemCapabilities, execute_plan, plan_action,
-    };
+    use super::{DispatchCapabilities, DispatchPlan, execute_plan, plan_action};
     use crate::menu::Action;
     use dormant_core::ipc_proto::IpcRequest;
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
@@ -367,26 +270,6 @@ mod tests {
             Ok(())
         }
 
-        fn claim_shared(
-            &self,
-            _: &Path,
-            _display: &str,
-        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimSharedResultWire> {
-            Ok(dormant_core::ipc_proto::ClaimSharedResultWire::Accepted { deadline_ms: 0 })
-        }
-
-        fn claim_arm(
-            &self,
-            _: &Path,
-            _display: &str,
-        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimArmResultWire> {
-            Ok(dormant_core::ipc_proto::ClaimArmResultWire {
-                armed: true,
-                deadline_ms: 0,
-                reason: None,
-            })
-        }
-
         fn open_web(&self, port: u16) -> anyhow::Result<()> {
             self.ports.lock().unwrap().push(port);
             Ok(())
@@ -441,57 +324,39 @@ mod tests {
         assert_eq!(*capabilities.quits.lock().unwrap(), 1);
     }
 
-    #[tokio::test]
-    async fn system_capabilities_maps_claim_plans_to_exact_ipc_requests() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&requests);
-        let capabilities = Arc::new(SystemCapabilities::with_sender(
-            Arc::new(|| {}),
-            Arc::new(move |_socket, request| {
-                recorded.lock().unwrap().push(request.clone());
-                match request {
-                    IpcRequest::ClaimShared { .. } => {
-                        Ok(dormant_core::ipc_proto::IpcResponse::claim_shared(
-                            dormant_core::ipc_proto::ClaimSharedResultWire::Accepted {
-                                deadline_ms: 1,
-                            },
-                        ))
-                    }
-                    IpcRequest::ClaimArm { .. } => {
-                        Ok(dormant_core::ipc_proto::IpcResponse::claim_arm(
-                            dormant_core::ipc_proto::ClaimArmResultWire {
-                                armed: true,
-                                deadline_ms: 1,
-                                reason: None,
-                            },
-                        ))
-                    }
-                    other => panic!("unexpected request: {other:?}"),
-                }
-            }),
+    #[test]
+    fn plan_action_switch_to_local_maps_to_dispatch_plan() {
+        assert!(matches!(
+            plan_action(&Action::SwitchToLocal("monitor".into()), None, false),
+            DispatchPlan::SwitchToLocal(id) if id == "monitor"
         ));
+    }
 
+    #[test]
+    fn switch_to_local_unreachable_is_ignored() {
+        assert!(matches!(
+            plan_action(&Action::SwitchToLocal("monitor".into()), None, true),
+            DispatchPlan::Ignore
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_switch_to_local_sends_ipc_request() {
+        let capabilities = Arc::new(MockCapabilities::default());
+        let caps = capabilities.clone();
         execute_plan(
-            DispatchPlan::ClaimOne("shared".into()),
+            DispatchPlan::SwitchToLocal("monitor".into()),
             "/tmp/dormant.sock".into(),
-            capabilities.clone(),
+            caps,
         )
         .await
         .unwrap();
-        execute_plan(
-            DispatchPlan::ArmClaim("armed".into()),
-            "/tmp/dormant.sock".into(),
-            capabilities,
-        )
-        .await
-        .unwrap();
 
+        let requests = capabilities.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
         assert_eq!(
-            serde_json::to_value(requests.lock().unwrap().as_slice()).unwrap(),
-            serde_json::json!([
-                {"req": "claim_shared", "display": "shared"},
-                {"req": "claim_arm", "display": "armed"}
-            ])
+            serde_json::to_value(&requests[0]).unwrap(),
+            serde_json::json!({"req": "switch_to_local", "display": "monitor"})
         );
     }
 }

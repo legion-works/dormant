@@ -11,7 +11,9 @@ use tracing::debug;
 
 use self::kglobalaccel::KGlobalAccelHotkeyRegistrar;
 use self::portal::PortalHotkeyRegistrar;
-use crate::hotkey::{Accelerator, HotkeyError, HotkeyRegistrar, accelerator_tokens, claim_action};
+use crate::hotkey::{
+    Accelerator, HotkeyError, HotkeyRegistrar, accelerator_tokens, switch_to_local_action,
+};
 use crate::menu::Action;
 
 /// Registrar that tries `KGlobalAccel` before the portal fallback.
@@ -45,13 +47,12 @@ impl HotkeyRegistrar for FallbackHotkeyRegistrar {
         &mut self,
         accelerator: &Accelerator,
         target: &str,
-        arm: bool,
         tx: UnboundedSender<Action>,
     ) -> Result<(), HotkeyError> {
         self.unregister_claim().await;
         match self
             .primary
-            .register_claim(accelerator, target, arm, tx.clone())
+            .register_claim(accelerator, target, tx.clone())
             .await
         {
             Ok(()) => {
@@ -61,11 +62,7 @@ impl HotkeyRegistrar for FallbackHotkeyRegistrar {
             Err(primary_error) => {
                 self.primary.unregister_claim().await;
                 debug!(error = %primary_error, "KGlobalAccel unavailable; trying portal");
-                match self
-                    .fallback
-                    .register_claim(accelerator, target, arm, tx)
-                    .await
-                {
+                match self.fallback.register_claim(accelerator, target, tx).await {
                     Ok(()) => {
                         self.active = Some(ActiveBackend::Fallback);
                         Ok(())
@@ -107,14 +104,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activity_claim_policy_flag_selects_shared_or_arm_action() {
+    fn switch_to_local_action_returns_switch_to_local() {
         assert_eq!(
-            claim_action("monitor", false),
-            Action::ClaimOne("monitor".into())
-        );
-        assert_eq!(
-            claim_action("monitor", true),
-            Action::ArmClaim("monitor".into())
+            switch_to_local_action("monitor"),
+            Action::SwitchToLocal("monitor".into())
         );
     }
 
@@ -130,7 +123,6 @@ mod tests {
             &mut self,
             _accelerator: &Accelerator,
             _target: &str,
-            _arm: bool,
             _tx: UnboundedSender<Action>,
         ) -> Result<(), HotkeyError> {
             self.calls.lock().unwrap().push(self.name.to_string());
@@ -165,12 +157,7 @@ mod tests {
         let mut registrar = FallbackHotkeyRegistrar::new(Box::new(primary), Box::new(fallback));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         registrar
-            .register_claim(
-                &Accelerator::parse("Meta+F12").unwrap(),
-                "monitor",
-                false,
-                tx,
-            )
+            .register_claim(&Accelerator::parse("Meta+F12").unwrap(), "monitor", tx)
             .await
             .unwrap();
 
@@ -197,12 +184,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let error = registrar
-            .register_claim(
-                &Accelerator::parse("Meta+F12").unwrap(),
-                "monitor",
-                false,
-                tx,
-            )
+            .register_claim(&Accelerator::parse("Meta+F12").unwrap(), "monitor", tx)
             .await
             .unwrap_err();
 

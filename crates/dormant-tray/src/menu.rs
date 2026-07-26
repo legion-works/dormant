@@ -101,10 +101,8 @@ pub enum Action {
         /// The TCP port to open.
         port: u16,
     },
-    /// Claim ownership of a shared display (KVM switch).
-    ClaimOne(String),
-    /// Arm a shared display for activity-based claim.
-    ArmClaim(String),
+    /// Write the local input code to switch a shared display to this machine.
+    SwitchToLocal(String),
     /// Quit the tray.
     Quit,
 }
@@ -116,9 +114,9 @@ pub enum Action {
 fn glyph_for(action: &Action) -> Glyph {
     match action {
         Action::Pause(_) | Action::Separator => Glyph::Pause,
-        Action::Resume | Action::ArmClaim(_) => Glyph::Play,
+        Action::Resume => Glyph::Play,
         Action::BlankAll | Action::BlankOne(_) => Glyph::DisplayOff,
-        Action::WakeAll | Action::WakeOne(_) | Action::ClaimOne(_) => Glyph::DisplayOn,
+        Action::WakeAll | Action::WakeOne(_) | Action::SwitchToLocal(_) => Glyph::DisplayOn,
         Action::OpenWebUi { .. } => Glyph::Web,
         Action::Quit => Glyph::Exit,
     }
@@ -177,9 +175,10 @@ fn any_paused(snapshot: Option<&StateSnapshot>) -> bool {
     snapshot.is_some_and(|s| s.displays.iter().any(|(_, d)| d.paused))
 }
 
-// Scope remains an independent guard because capability lists can be stale or
-// inconsistent during version skew and reloads.
-fn is_claim_capable(snapshot: Option<&StateSnapshot>, id: &str) -> bool {
+/// True when the snapshot confirms the display is a shared display reachable via
+/// DDC/CI input-write. Scope is checked independently so a stale capability list
+/// during version skew or reload doesn't lie.
+fn is_switch_capable(snapshot: Option<&StateSnapshot>, id: &str) -> bool {
     snapshot.is_some_and(|snapshot| {
         snapshot
             .displays
@@ -299,7 +298,7 @@ pub fn build_menu(
             } else {
                 "Blank now"
             };
-            let claim_capable = is_claim_capable(snapshot, id);
+            let switch_capable = is_switch_capable(snapshot, id);
 
             let mut sub_entries = vec![
                 MenuEntry::Action {
@@ -316,33 +315,14 @@ pub fn build_menu(
                 },
             ];
 
-            // KVM claim actions — only for claim-capable shared displays.
-            if claim_capable {
-                let arm_label = snapshot
-                    .and_then(|s| {
-                        s.kvm.as_ref().and_then(|k| {
-                            k.claim_armed_remaining
-                                .iter()
-                                .find(|(did, _)| did.0 == *id)
-                                .map(|(_, ms)| {
-                                    format!("Arm claim ({}s remaining)", ms.div_ceil(1000))
-                                })
-                        })
-                    })
-                    .unwrap_or_else(|| "Arm claim".into());
-
+            // Direct-write switch — only for shared displays with a configured input code.
+            if switch_capable {
                 sub_entries.push(MenuEntry::Separator);
                 sub_entries.push(MenuEntry::Action {
-                    label: "Claim panel".into(),
+                    label: "Switch to here".into(),
                     enabled: !unreachable,
-                    icon: glyph_for(&Action::ClaimOne(id.clone())),
-                    action: Action::ClaimOne(id.clone()),
-                });
-                sub_entries.push(MenuEntry::Action {
-                    label: arm_label,
-                    enabled: !unreachable,
-                    icon: glyph_for(&Action::ArmClaim(id.clone())),
-                    action: Action::ArmClaim(id.clone()),
+                    icon: glyph_for(&Action::SwitchToLocal(id.clone())),
+                    action: Action::SwitchToLocal(id.clone()),
                 });
             }
 
@@ -1124,29 +1104,21 @@ mod tests {
         }
     }
 
-    // ── KVM claim menu items ──────────────────────────────────────────────
+    // ── KVM switch menu items ─────────────────────────────────────────────
 
-    fn kvm_snap(
-        claim_capable: &[&str],
-        hotkey: Option<&str>,
-        armed_ms: Option<(&str, u64)>,
-    ) -> StateSnapshot {
-        use dormant_core::config::{ActivityClaimPolicy, KeymapConfig};
+    fn kvm_snap(switch_capable: &[&str], hotkey: Option<&str>) -> StateSnapshot {
+        use dormant_core::config::KeymapConfig;
         use dormant_core::types::DisplayId;
 
         let kvm = dormant_core::rules::KvmStatus {
             keymap: KeymapConfig {
                 claim_hotkey: hotkey.map(String::from),
             },
-            claim_capable_displays: claim_capable
+            claim_capable_displays: switch_capable
                 .iter()
                 .map(|d| DisplayId((*d).into()))
                 .collect(),
-            activity_claim: ActivityClaimPolicy::Off,
-            claim_armed_remaining: armed_ms
-                .into_iter()
-                .map(|(d, ms)| (DisplayId(d.into()), ms))
-                .collect(),
+            ..Default::default()
         };
 
         StateSnapshot {
@@ -1177,87 +1149,145 @@ mod tests {
     }
 
     #[test]
-    fn claim_capable_shared_display_has_claim_panel_and_arm_entries() {
-        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
+    fn switch_capable_shared_display_has_switch_to_here_entry() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"));
         let menu = build_menu(Some(&snapshot), false, 8137);
 
-        // Find the "Claim panel" action inside a submenu.
-        let claim = find_action(&menu, "Claim panel");
+        let switch = find_action(&menu, "Switch to here");
         assert!(
-            claim.is_some(),
-            "Claim panel action should exist in the menu"
+            switch.is_some(),
+            "Switch to here action should exist in the menu"
         );
-        match claim.unwrap() {
+        match switch.unwrap() {
             MenuEntry::Action {
                 action, enabled, ..
             } => {
-                assert!(matches!(action, Action::ClaimOne(id) if id == "monitor"));
-                assert!(*enabled, "Claim panel should be enabled when reachable");
+                assert!(matches!(action, Action::SwitchToLocal(id) if id == "monitor"));
+                assert!(*enabled, "Switch to here should be enabled when reachable");
             }
-            _ => panic!("Claim panel is not an Action"),
+            _ => panic!("Switch to here is not an Action"),
         }
 
-        // Arm claim entry should exist.
-        let arm = find_action(&menu, "Arm claim");
-        assert!(arm.is_some(), "Arm claim action should exist in the menu");
-        match arm.unwrap() {
-            MenuEntry::Action { action, .. } => {
-                assert!(matches!(action, Action::ArmClaim(id) if id == "monitor"));
-            }
-            _ => panic!("Arm claim is not an Action"),
-        }
-    }
-
-    #[test]
-    fn armed_remaining_is_shown_in_arm_label() {
-        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), Some(("monitor", 30_000)));
-        let menu = build_menu(Some(&snapshot), false, 8137);
-
-        let arm = find_action(&menu, "Arm claim (30s remaining)");
-        assert!(
-            arm.is_some(),
-            "Arm claim should show remaining seconds when armed"
-        );
-    }
-
-    #[test]
-    fn non_claim_capable_display_omits_claim_entries() {
-        // Shared but NOT in claim_capable_displays — no claim entries.
-        let snapshot = kvm_snap(&[], Some("Meta+F12"), None);
-        let menu = build_menu(Some(&snapshot), false, 8137);
-
-        assert!(
-            find_action(&menu, "Claim panel").is_none(),
-            "non-claim-capable display should not show Claim panel"
-        );
+        // No arm entry present (arm was part of the deleted claim protocol).
         assert!(
             find_action(&menu, "Arm claim").is_none(),
-            "non-claim-capable display should not show Arm claim"
+            "arm claim should not appear in the menu"
+        );
+    }
+
+    #[test]
+    fn non_switch_capable_display_omits_switch_entry() {
+        // Shared but NOT in claim_capable_displays — no switch entry.
+        let snapshot = kvm_snap(&[], Some("Meta+F12"));
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        assert!(
+            find_action(&menu, "Switch to here").is_none(),
+            "non-switch-capable display should not show Switch to here"
         );
     }
 
     #[test]
     fn private_display_is_excluded_even_if_capability_list_is_inconsistent() {
-        let mut snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
+        let mut snapshot = kvm_snap(&["monitor"], Some("Meta+F12"));
         snapshot.displays[0].1.scope = DisplayScope::Private;
-        assert!(!is_claim_capable(Some(&snapshot), "monitor"));
+        assert!(!is_switch_capable(Some(&snapshot), "monitor"));
         let menu = build_menu(Some(&snapshot), false, 8137);
 
-        assert_eq!(find_action(&menu, "Claim panel"), None);
-        assert_eq!(find_action(&menu, "Arm claim"), None);
+        assert_eq!(find_action(&menu, "Switch to here"), None);
     }
 
     #[test]
-    fn claim_entries_disabled_when_unreachable() {
-        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"), None);
+    fn switch_entry_disabled_when_unreachable() {
+        let snapshot = kvm_snap(&["monitor"], Some("Meta+F12"));
         let menu = build_menu(Some(&snapshot), true, 8137);
 
-        let claim = find_action(&menu, "Claim panel").expect("Claim panel present");
-        match claim {
+        let switch = find_action(&menu, "Switch to here").expect("Switch to here present");
+        match switch {
             MenuEntry::Action { enabled, .. } => {
-                assert!(!enabled, "Claim panel should be disabled when unreachable");
+                assert!(
+                    !enabled,
+                    "Switch to here should be disabled when unreachable"
+                );
             }
-            _ => panic!("Claim panel is not an Action"),
+            _ => panic!("Switch to here is not an Action"),
         }
+    }
+
+    #[test]
+    fn ambiguity_two_switch_capable_displays_both_show_menu_entry() {
+        let snapshot = {
+            use dormant_core::config::KeymapConfig;
+            use dormant_core::types::DisplayId;
+            let kvm = dormant_core::rules::KvmStatus {
+                keymap: KeymapConfig {
+                    claim_hotkey: Some("Meta+F12".into()),
+                },
+                claim_capable_displays: vec![DisplayId("monitor".into()), DisplayId("tv".into())],
+                ..Default::default()
+            };
+            StateSnapshot {
+                sensors: vec![],
+                zones: vec![],
+                displays: vec![
+                    (
+                        "monitor".into(),
+                        DisplaySnapshot {
+                            phase: "active".into(),
+                            inhibited: false,
+                            paused: false,
+                            cmd_gen: 0,
+                            scope: DisplayScope::Shared,
+                            owned: true,
+                            observed_input_code: None,
+                            panel_state: None,
+                            controllers: vec![],
+                            wake_attempts: 0,
+                            last_blank_failed: false,
+                            stage: None,
+                            claim_armed_remaining_ms: None,
+                        },
+                    ),
+                    (
+                        "tv".into(),
+                        DisplaySnapshot {
+                            phase: "active".into(),
+                            inhibited: false,
+                            paused: false,
+                            cmd_gen: 0,
+                            scope: DisplayScope::Shared,
+                            owned: false,
+                            observed_input_code: None,
+                            panel_state: None,
+                            controllers: vec![],
+                            wake_attempts: 0,
+                            last_blank_failed: false,
+                            stage: None,
+                            claim_armed_remaining_ms: None,
+                        },
+                    ),
+                ],
+                pending_reload: None,
+                rollback: None,
+                kvm: Some(kvm),
+            }
+        };
+        let menu = build_menu(Some(&snapshot), false, 8137);
+
+        // Each switch-capable display gets its own Switch to here entry.
+        let switches: Vec<_> = menu
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Submenu { entries, .. } => entries.iter().find(
+                    |c| matches!(c, MenuEntry::Action { label, .. } if label == "Switch to here"),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switches.len(),
+            2,
+            "both switch-capable displays should have Switch to here"
+        );
     }
 }

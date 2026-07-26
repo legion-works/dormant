@@ -81,12 +81,8 @@ pub(crate) fn accelerator_tokens(
     Ok((tokens, key))
 }
 
-pub(crate) fn claim_action(target: &str, arm: bool) -> Action {
-    if arm {
-        Action::ArmClaim(target.to_string())
-    } else {
-        Action::ClaimOne(target.to_string())
-    }
+pub(crate) fn switch_to_local_action(target: &str) -> Action {
+    Action::SwitchToLocal(target.to_string())
 }
 
 /// Errors that can occur during hotkey registration.
@@ -108,9 +104,9 @@ pub enum HotkeyError {
         /// Returned `OSStatus` value.
         status: i32,
     },
-    /// The snapshot does not identify exactly one claim target.
+    /// The snapshot does not identify exactly one switch target.
     AmbiguousTarget {
-        /// Number of claim-capable displays in the snapshot.
+        /// Number of switch-capable displays in the snapshot.
         count: usize,
     },
     /// The active backend cannot represent the configured accelerator.
@@ -133,7 +129,7 @@ impl fmt::Display for HotkeyError {
             HotkeyError::AmbiguousTarget { count } => {
                 write!(
                     f,
-                    "ambiguous hotkey target: {count} claim-capable displays (need exactly 1)"
+                    "ambiguous hotkey target: {count} switch-capable displays (need exactly 1)"
                 )
             }
             HotkeyError::InvalidAccelerator(accel) => {
@@ -143,24 +139,22 @@ impl fmt::Display for HotkeyError {
     }
 }
 
-/// A fully resolved claim-hotkey state derived from the daemon snapshot.
+/// A fully resolved switch-hotkey state derived from the daemon snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedHotkeyStatus {
     /// No configured accelerator is currently active.
     Disabled,
-    /// The configured accelerator has no unique claim target.
+    /// The configured accelerator has no unique switch target.
     Ambiguous {
-        /// Number of claim-capable displays in the snapshot.
+        /// Number of switch-capable displays in the snapshot.
         count: usize,
     },
-    /// Register this accelerator and dispatch the resolved claim action.
+    /// Register this accelerator and dispatch the resolved switch action.
     Register {
         /// Platform-neutral configured accelerator.
         accelerator: Accelerator,
-        /// Sole claim-capable display.
+        /// Sole switch-capable display.
         target: String,
-        /// Whether activation arms rather than immediately claims.
-        arm: bool,
     },
 }
 
@@ -195,10 +189,6 @@ impl HotkeyStatusTracker {
         Some(ResolvedHotkeyStatus::Register {
             accelerator,
             target: kvm.claim_capable_displays[0].0.clone(),
-            arm: matches!(
-                kvm.activity_claim,
-                dormant_core::config::ActivityClaimPolicy::Armed
-            ),
         })
     }
 }
@@ -206,7 +196,7 @@ impl HotkeyStatusTracker {
 /// Contract for OS-level global hotkey registration.
 #[async_trait]
 pub trait HotkeyRegistrar: Send + Sync {
-    /// Register the claim accelerator and route activations to `tx`.
+    /// Register the switch accelerator and route activations to `tx`.
     ///
     /// # Errors
     ///
@@ -215,7 +205,6 @@ pub trait HotkeyRegistrar: Send + Sync {
         &mut self,
         accelerator: &Accelerator,
         target: &str,
-        arm: bool,
         tx: UnboundedSender<Action>,
     ) -> Result<(), HotkeyError>;
 
@@ -314,20 +303,20 @@ impl HotkeyManager {
 
         self.unregister_current().await;
 
-        let (hotkey, target, arm) = match resolved {
+        let (hotkey, target) = match resolved {
             ResolvedHotkeyStatus::Disabled => return,
             ResolvedHotkeyStatus::Ambiguous { count } => {
                 warn!(
                     count,
                     event = "hotkey_register_failed",
                     reason = "ambiguous_target",
-                    "claim hotkey requires exactly one claim-capable shared display"
+                    "switch hotkey requires exactly one switch-capable shared display"
                 );
                 if let Some(ref n) = self.notifier {
                     n.notify(
                         "dormant — hotkey not registered",
                         &format!(
-                            "Cannot register claim hotkey: {count} claim-capable displays (need exactly 1).  Use the tray menu instead."
+                            "Cannot register switch hotkey: {count} switch-capable displays (need exactly 1).  Use the tray menu instead."
                         ),
                     );
                 }
@@ -336,8 +325,7 @@ impl HotkeyManager {
             ResolvedHotkeyStatus::Register {
                 accelerator,
                 target,
-                arm,
-            } => (accelerator, target, arm),
+            } => (accelerator, target),
         };
 
         let Some(ref mut registrar) = self.registrar else {
@@ -345,15 +333,14 @@ impl HotkeyManager {
         };
 
         match registrar
-            .register_claim(&hotkey, &target, arm, self.action_tx.clone())
+            .register_claim(&hotkey, &target, self.action_tx.clone())
             .await
         {
             Ok(()) => {
                 info!(
                     %hotkey,
                     %target,
-                    arm,
-                    "claim hotkey registered"
+                    "switch hotkey registered"
                 );
                 self.current_accelerator = Some(hotkey);
                 self.current_target = Some(target);
@@ -364,7 +351,7 @@ impl HotkeyManager {
                     %hotkey,
                     event = "hotkey_register_failed",
                     reason = "dbus_error",
-                    "claim hotkey registration failed; manual menu path remains available"
+                    "switch hotkey registration failed; manual menu path remains available"
                 );
                 if let Some(ref n) = self.notifier {
                     n.notify(
@@ -410,7 +397,7 @@ mod tests {
     use super::*;
     use crate::dispatch::DispatchCapabilities;
     use crate::menu::{MenuEntry, build_menu};
-    use dormant_core::config::{ActivityClaimPolicy, KeymapConfig};
+    use dormant_core::config::KeymapConfig;
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
     use dormant_core::types::DisplayId;
     use std::path::Path;
@@ -444,7 +431,7 @@ mod tests {
         }
     }
 
-    fn kvm_status(hotkey: &str, displays: &[&str], policy: ActivityClaimPolicy) -> KvmStatus {
+    fn kvm_status(hotkey: &str, displays: &[&str]) -> KvmStatus {
         KvmStatus {
             keymap: KeymapConfig {
                 claim_hotkey: if hotkey.is_empty() {
@@ -454,15 +441,14 @@ mod tests {
                 },
             },
             claim_capable_displays: displays.iter().map(|d| DisplayId((*d).into())).collect(),
-            activity_claim: policy,
-            claim_armed_remaining: vec![],
+            ..Default::default()
         }
     }
 
     #[test]
     fn tracker_resolves_removed_kvm_status_to_disabled() {
         let mut tracker = HotkeyStatusTracker::default();
-        let status = kvm_status("Meta+F12", &["monitor"], ActivityClaimPolicy::OwnerIdle);
+        let status = kvm_status("Meta+F12", &["monitor"]);
 
         assert!(matches!(
             tracker.update(Some(status)),
@@ -471,10 +457,10 @@ mod tests {
         assert_eq!(tracker.update(None), Some(ResolvedHotkeyStatus::Disabled));
     }
 
-    fn has_enabled_claim(entries: &[MenuEntry]) -> bool {
+    fn has_enabled_switch(entries: &[MenuEntry]) -> bool {
         entries.iter().any(|entry| match entry {
-            MenuEntry::Action { label, enabled, .. } => label == "Claim panel" && *enabled,
-            MenuEntry::Submenu { entries, .. } => has_enabled_claim(entries),
+            MenuEntry::Action { label, enabled, .. } => label == "Switch to here" && *enabled,
+            MenuEntry::Submenu { entries, .. } => has_enabled_switch(entries),
             MenuEntry::Separator | MenuEntry::Info { .. } => false,
         })
     }
@@ -489,11 +475,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RegistrarCall {
-        Register {
-            accel: String,
-            target: String,
-            arm: bool,
-        },
+        Register { accel: String, target: String },
         Unregister,
     }
 
@@ -503,7 +485,6 @@ mod tests {
             &mut self,
             accelerator: &Accelerator,
             target: &str,
-            arm: bool,
             _tx: UnboundedSender<Action>,
         ) -> Result<(), HotkeyError> {
             if self.should_fail {
@@ -512,7 +493,6 @@ mod tests {
             self.calls.lock().unwrap().push(RegistrarCall::Register {
                 accel: accelerator.raw.clone(),
                 target: target.into(),
-                arm,
             });
             if let Some(ref n) = self.register_notify {
                 n.notify_one();
@@ -587,20 +567,6 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        fn claim_shared(
-            &self,
-            _: &Path,
-            _: &str,
-        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimSharedResultWire> {
-            anyhow::bail!("noop")
-        }
-        fn claim_arm(
-            &self,
-            _: &Path,
-            _: &str,
-        ) -> anyhow::Result<dormant_core::ipc_proto::ClaimArmResultWire> {
-            anyhow::bail!("noop")
-        }
         fn open_web(&self, _: u16) -> anyhow::Result<()> {
             Ok(())
         }
@@ -663,11 +629,7 @@ mod tests {
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor"])));
             s.unreachable = false;
         }
 
@@ -679,7 +641,7 @@ mod tests {
         assert!(
             recorded
                 .iter()
-                .any(|c| matches!(c, RegistrarCall::Register { accel, target, arm } if accel == "Meta+F12" && target == "monitor" && !arm)),
+                .any(|c| matches!(c, RegistrarCall::Register { accel, target } if accel == "Meta+F12" && target == "monitor")),
             "expected Register(Meta+F12, monitor), got: {recorded:?}"
         );
     }
@@ -691,11 +653,7 @@ mod tests {
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor"])));
             s.unreachable = false;
         }
 
@@ -730,11 +688,7 @@ mod tests {
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &[],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &[])));
             s.unreachable = false;
         }
 
@@ -771,8 +725,8 @@ mod tests {
         assert!(
             notifications
                 .iter()
-                .any(|(_, body)| body.contains("0 claim-capable")),
-            "notification should mention 0 claim-capable displays: {notifications:?}"
+                .any(|(_, body)| body.contains("0 switch-capable")),
+            "notification should mention 0 switch-capable displays: {notifications:?}"
         );
     }
 
@@ -783,11 +737,7 @@ mod tests {
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor", "tv"],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor", "tv"])));
             s.unreachable = false;
         }
 
@@ -837,11 +787,7 @@ mod tests {
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor"])));
             s.unreachable = false;
         }
 
@@ -878,23 +824,19 @@ mod tests {
         let tray = state.lock().await;
         let menu = build_menu(tray.snapshot.as_ref(), tray.unreachable, 8137);
         assert!(
-            has_enabled_claim(&menu),
-            "registrar failure must leave the manual Claim panel action enabled"
+            has_enabled_switch(&menu),
+            "registrar failure must leave the manual Switch to here action enabled"
         );
     }
 
     #[tokio::test]
-    async fn armed_policy_registers_arm_claim() {
+    async fn initial_snapshot_registers_switch_action() {
         let state = Arc::new(tokio::sync::Mutex::new(TrayState::new(
             "/tmp/dormant.sock".into(),
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor"],
-                ActivityClaimPolicy::Armed,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor"])));
             s.unreachable = false;
         }
 
@@ -906,8 +848,8 @@ mod tests {
         assert!(
             recorded
                 .iter()
-                .any(|c| matches!(c, RegistrarCall::Register { arm: true, .. })),
-            "armed policy should pass arm=true to registrar, got: {recorded:?}"
+                .any(|c| matches!(c, RegistrarCall::Register { .. })),
+            "initial kvm snapshot should register, got: {recorded:?}"
         );
     }
 
@@ -921,11 +863,7 @@ mod tests {
         )));
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F12",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor"])));
             s.unreachable = false;
         }
 
@@ -944,11 +882,7 @@ mod tests {
         // with new config).
         {
             let mut s = state.lock().await;
-            s.snapshot = Some(snap_with_kvm(kvm_status(
-                "Meta+F1",
-                &["monitor"],
-                ActivityClaimPolicy::Off,
-            )));
+            s.snapshot = Some(snap_with_kvm(kvm_status("Meta+F1", &["monitor"])));
         }
         refresh_tx.send_replace(());
         tokio::task::yield_now().await;

@@ -6,7 +6,7 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, warn};
 use zbus::zvariant::OwnedObjectPath;
 
-use super::{accelerator_tokens, claim_action};
+use super::{accelerator_tokens, switch_to_local_action};
 use crate::hotkey::{Accelerator, HotkeyError, HotkeyRegistrar};
 use crate::menu::Action;
 
@@ -116,7 +116,6 @@ impl HotkeyRegistrar for KGlobalAccelHotkeyRegistrar {
         &mut self,
         accelerator: &Accelerator,
         target: &str,
-        arm: bool,
         tx: UnboundedSender<Action>,
     ) -> Result<(), HotkeyError> {
         self.unregister_claim().await;
@@ -149,7 +148,6 @@ impl HotkeyRegistrar for KGlobalAccelHotkeyRegistrar {
                     listener_conn,
                     component_path,
                     &listener_target,
-                    arm,
                     tx,
                     ready_tx,
                 )
@@ -209,7 +207,6 @@ async fn listen_for_activation(
     conn: zbus::Connection,
     component_path: OwnedObjectPath,
     target: &str,
-    arm: bool,
     tx: UnboundedSender<Action>,
     ready: oneshot::Sender<Result<(), HotkeyError>>,
 ) -> Result<(), HotkeyError> {
@@ -240,10 +237,10 @@ async fn listen_for_activation(
         if component != COMPONENT || action != ACTION {
             continue;
         }
-        if tx.send(claim_action(target, arm)).is_err() {
+        if tx.send(switch_to_local_action(target)).is_err() {
             break;
         }
-        debug!(%target, arm, "claim hotkey activated through KGlobalAccel");
+        debug!(%target, "switch hotkey activated through KGlobalAccel");
     }
     Ok(())
 }

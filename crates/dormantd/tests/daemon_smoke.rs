@@ -5836,9 +5836,11 @@ async fn coordinator_config_watcher_suppression_is_effective() {
                 saw_reload = true;
                 break;
             }
-            Ok(Ok(_)) => continue, // unrelated observation — keep polling
-            Ok(Err(_)) => break,   // observation channel closed
-            Err(_) => break,       // timeout — watcher suppressed ✓
+            // Unrelated observation — keep polling.
+            Ok(Ok(_)) => {}
+            // Either the observation channel closed, or the bound elapsed with
+            // no ReloadStarted — the latter is the suppressed-watcher pass.
+            Ok(Err(_)) | Err(_) => break,
         }
     }
     assert!(

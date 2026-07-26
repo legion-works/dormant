@@ -625,9 +625,11 @@ impl DisplayController for DdcciController {
     ///
     /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is
     /// therefore conditional on an immediate command-priority readback of the requested value.
-    /// The readback is retried up to [`VERIFY_READBACK_MAX_ATTEMPTS`] times with a
-    /// [`VERIFY_READBACK_RETRY_DELAY`] delay between attempts because the DDC bus on shared
+    /// The readback is retried up to `VERIFY_READBACK_MAX_ATTEMPTS` times with a
+    /// `VERIFY_READBACK_RETRY_DELAY` delay between attempts because the DDC bus on shared
     /// panels often garbles the verification read despite the write having succeeded (issue #138).
+    /// A clean read carrying the wrong value is a genuine failure and returns immediately — only
+    /// transport-level errors are retried, so a silently-ignored write is still detected.
     async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
         // Retry constants for the verification readback (issue #138).
         const VERIFY_READBACK_MAX_ATTEMPTS: u32 = 3;

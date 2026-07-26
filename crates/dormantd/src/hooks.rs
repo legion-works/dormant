@@ -1882,51 +1882,31 @@ mod tests {
 
     // ── Session env allowlist ────────────────────────────────────────────
 
-    /// A hook child receives allowlisted session env vars present in the
-    /// daemon's environment, so compositor and session commands can reach
-    /// the display server and D-Bus.
+    /// An allowlisted session env var present in the daemon's environment
+    /// reaches the hook child.  Routes through the production
+    /// [`run_argv_command`] path — `/usr/bin/printenv VAR` exits 0 when
+    /// VAR is set, non-zero otherwise.
     #[tokio::test]
-    async fn hook_child_inherits_allowlisted_session_env_vars() {
-        // Use a unique sentinel per test run to avoid races with parallel
-        // tests that also touch process-wide env vars.
-        let sentinel = format!("dormant-ut-allowlist-{}", std::process::id());
-        // Only set vars that won't break the test runner itself — skip
-        // DISPLAY and DBUS_SESSION_BUS_ADDRESS which might be in use.
+    async fn allowlisted_env_var_reaches_child_via_production_path() {
         let test_var = "WAYLAND_DISPLAY";
+        let sentinel = format!("dormant-ut-al-{}", std::process::id());
         let saved = std::env::var_os(test_var);
         unsafe { std::env::set_var(test_var, &sentinel) };
 
-        // Build the exact same env a call through run_argv_command would.
         let env_owned: Vec<(String, String)> = ctx_for(Phase::Before, Direction::Release)
             .env()
             .into_iter()
             .map(|(k, v)| (k.clone(), v))
             .collect();
-        let mut cmd = tokio::process::Command::new("/usr/bin/env");
-        cmd.env_clear();
-        for (k, v) in &env_owned {
-            cmd.env(k, v);
-        }
-        cmd.env("PATH", env_path());
-        if let Some(home) = env_home() {
-            cmd.env("HOME", home);
-        }
-        // Mirror the allowlist passthrough from run_argv_command.
-        for var_name in HOOK_SESSION_ENV_ALLOWLIST {
-            if let Some(value) = std::env::var_os(var_name) {
-                cmd.env(var_name, value);
-            }
-        }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let output = tokio::time::timeout(Duration::from_secs(2), cmd.output())
-            .await
-            .expect("/usr/bin/env must complete within 2s")
-            .expect("/usr/bin/env must spawn successfully");
-        let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Restore before asserting so a panic still cleans up.
+        let result = run_argv_command(
+            &env_owned,
+            &["/usr/bin/printenv".to_string(), test_var.to_string()],
+            Duration::from_secs(2),
+        )
+        .await;
+
+        // Restore before asserting — a panic still cleans up.
         unsafe {
             match saved {
                 Some(v) => std::env::set_var(test_var, v),
@@ -1934,74 +1914,73 @@ mod tests {
             }
         }
 
-        // The allowlisted var we set must be present in the child.
-        let expected = format!("{test_var}={sentinel}");
         assert!(
-            stdout.contains(&expected),
-            "allowlisted var {test_var} must be in child env; lines:\n{stdout}"
-        );
-        // A non-allowlisted var must NOT leak through, even when we set
-        // one in the daemon's env here. We set it in the test process
-        // scope (the env_clear + explicit allowlist should exclude it).
-        // The COMMAND child env was built with env_clear + explicit vars
-        // only, so this is already proven by construction — the child
-        // only gets what the test explicitly passed. We verify by
-        // checking that HOME (which we DID set) is the only non-DORMANT
-        // user-level var — nothing extra leaked.
-        assert!(
-            stdout.contains(&expected),
-            "child must receive the allowlisted var"
+            result.is_ok(),
+            "{test_var} must reach child via allowlist; run_argv_command returned {result:?}"
         );
     }
 
-    /// When the daemon does not have an allowlisted session env var, the
-    /// child simply does not receive it — no crash, no empty-string
-    /// injection.
+    /// A non-allowlisted env var set in the daemon does NOT leak into the
+    /// hook child.  Also exercises the allowlist loop with a second var
+    /// (`XDG_RUNTIME_DIR`) so this test is mutation-sensitive: disabling
+    /// the passthrough loop makes the allowlisted-var check fail.
     #[tokio::test]
-    async fn missing_allowlisted_var_is_gracefully_absent() {
-        // Prove that a non-existent env var (never set, in or out of the
-        // allowlist) does not appear in the child.  Use a unique name.
+    async fn non_allowlisted_env_var_does_not_leak_and_allowlisted_var_reaches_child() {
+        // --- non-allowlisted: must NOT leak ---
+        let leak_name = format!("DORMANT_UT_LEAK_{}", std::process::id());
+        let leak_sentinel = "should-not-appear";
+        unsafe { std::env::set_var(&leak_name, leak_sentinel) };
+
+        // --- allowlisted: must reach child ---
+        let al_var = "XDG_RUNTIME_DIR";
+        let al_sentinel = format!("dormant-ut-al2-{}", std::process::id());
+        let al_saved = std::env::var_os(al_var);
+        unsafe { std::env::set_var(al_var, &al_sentinel) };
+
         let env_owned: Vec<(String, String)> = ctx_for(Phase::Before, Direction::Release)
             .env()
             .into_iter()
             .map(|(k, v)| (k.clone(), v))
             .collect();
-        let mut cmd = tokio::process::Command::new("/usr/bin/env");
-        cmd.env_clear();
-        for (k, v) in &env_owned {
-            cmd.env(k, v);
-        }
-        cmd.env("PATH", env_path());
-        if let Some(home) = env_home() {
-            cmd.env("HOME", home);
-        }
-        // Mirror the allowlist passthrough — whatever the daemon has.
-        for var_name in HOOK_SESSION_ENV_ALLOWLIST {
-            if let Some(value) = std::env::var_os(var_name) {
-                cmd.env(var_name, value);
+
+        // Non-allowlisted var: must not appear in child (printenv exits 1).
+        let leak_result = run_argv_command(
+            &env_owned,
+            &["/usr/bin/printenv".to_string(), leak_name.clone()],
+            Duration::from_secs(2),
+        )
+        .await;
+
+        // Allowlisted var: must appear in child (printenv exits 0).
+        let al_result = run_argv_command(
+            &env_owned,
+            &["/usr/bin/printenv".to_string(), al_var.to_string()],
+            Duration::from_secs(2),
+        )
+        .await;
+
+        // Restore before asserting.
+        unsafe {
+            std::env::remove_var(&leak_name);
+            match al_saved {
+                Some(v) => std::env::set_var(al_var, v),
+                None => std::env::remove_var(al_var),
             }
         }
-        // Also set a non-allowlisted sentinel in the DAEMON env to
-        // prove it does NOT leak into the child.
-        let leak_name = format!("DORMANT_UT_LEAK_{}", std::process::id());
-        let leak_sentinel = "should-not-appear";
-        unsafe { std::env::set_var(&leak_name, leak_sentinel) };
 
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let output = tokio::time::timeout(Duration::from_secs(2), cmd.output())
-            .await
-            .expect("/usr/bin/env must complete within 2s")
-            .expect("/usr/bin/env must spawn successfully");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Non-allowlisted var must NOT leak.
+        match leak_result {
+            Err(ref reason) if reason.starts_with(E_HOOK_FAILED) => {}
+            other => {
+                panic!("non-allowlisted var must not leak; expected E_HOOK_FAILED, got {other:?}")
+            }
+        }
 
-        unsafe { std::env::remove_var(&leak_name) };
-
-        // The non-allowlisted var must NOT appear in the child.
+        // Allowlisted var must reach child (this is the mutation-sensitive
+        // assertion — fails when the passthrough loop is disabled).
         assert!(
-            !stdout.contains(leak_sentinel),
-            "non-allowlisted var leaked into child env:\n{stdout}"
+            al_result.is_ok(),
+            "{al_var} must reach child via allowlist; run_argv_command returned {al_result:?}"
         );
     }
 }

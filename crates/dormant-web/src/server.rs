@@ -422,6 +422,68 @@ mod tests {
         }
     }
 
+    // ── Default-local control-plane inventory (Task 19) ───────────────────
+
+    /// Under default loopback bind, every registered POST route MUST
+    /// reject a non-loopback Host header (403).  This is the behavioural
+    /// proof for the claim that default-reachable mutating switch paths
+    /// are local-only — no write route can be reached from the LAN
+    /// without the explicit `web_allow_nonloopback` opt-out.
+    ///
+    /// The inventory is derived from real `route_post!` registrations,
+    /// not a hand-maintained list, so deleting a route without updating
+    /// this test would report a false pass — the non-empty assertion
+    /// catches that by forcing the scan to prove it would FIND a route
+    /// before it can claim none is reachable.
+    #[tokio::test]
+    async fn every_post_route_rejects_nonloopback_host_under_default_bind() {
+        // Populate the registry once.
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state1, _cancel1, _ctl_rx1) = test_web_state_with_bind(bind);
+        let _router = build_router(state1);
+
+        let post_routes = registered_post_routes();
+        assert!(
+            !post_routes.is_empty(),
+            "post-route inventory must be non-empty — otherwise this test \
+             would vacuously pass with nothing to check"
+        );
+
+        for route in &post_routes {
+            // Fresh router per route so `oneshot`-consume leaves no shared
+            // state between iterations.
+            let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
+            let router = build_router(state);
+
+            // Parameterised routes need a concrete value for the segment.
+            let uri = if route.contains(":display") {
+                route.replace(":display", "test-display")
+            } else if route.contains(":id") {
+                route.replace(":id", "test-id")
+            } else {
+                route.to_string()
+            };
+
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("Host", "evil.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "POST {route} with non-loopback Host must be rejected (403); \
+                 got {} — this write route may be reachable from the LAN \
+                 without web_allow_nonloopback",
+                resp.status()
+            );
+        }
+    }
+
     // ── Emergency-wake route (Task 2) ──────────────────────────────────────
 
     /// Exercises the endpoint through the real `build_router` (not the

@@ -480,6 +480,38 @@ directions), or disable coordination on one of the machines
   restart, the owner identity must be relearned — `owner_instance_id` lives
   in memory, not on disk.
 
+### Web UI network surface
+
+The network pairing and claim protocol (mDNS discovery, SPAKE2 pairing
+listener, Ed25519 signed claim frames, TCP claim transport) was removed in
+v0.6.0. After that deletion the **web UI is the only remaining remote
+control surface** — there is no other network listener that can fire a hook
+or write a DDC command.
+
+Under default configuration the web server binds `127.0.0.1` only. Binding
+a non-loopback address is rejected at startup unless
+`daemon.web_allow_nonloopback` is explicitly set to `true`. Both live
+deployments use the default `127.0.0.1` and neither sets the opt-out.
+
+**If `web_allow_nonloopback = true` is set**, the following unauthenticated
+endpoints become reachable from the LAN:
+
+- `POST /api/switch` — switch display input
+- `POST /api/blank` — blank the panel
+- `POST /api/wake` — wake the panel
+- `POST /api/pause` / `POST /api/resume` — pause or resume rule processing
+- `POST /api/emergency-wake` — immediate global wake
+- `POST /api/reload` — reload config from disk
+- `POST /api/config/apply` — write a new config
+- `POST /api/doctor` / `POST /api/doctor/exercise/:display` — run probes
+- `POST /api/pair/samsung` — pair with a Samsung TV
+
+The blank, switch, pause, and resume routes fire operator-configured hooks
+that run arbitrary commands (including MQTT publishes) — a wider surface
+than "someone can flip my monitor input." The web UI has no authentication
+layer of its own; it relies entirely on the loopback bind for access
+control. Opening the bind to the LAN removes the only barrier.
+
 ## Troubleshooting
 
 **Peer is not discovered.** Confirm `coordination.enabled = true` on both

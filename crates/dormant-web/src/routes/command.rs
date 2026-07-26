@@ -41,8 +41,6 @@ pub(crate) struct WakeBody {
 #[derive(Deserialize, Debug)]
 pub(crate) struct SwitchBody {
     pub(crate) display: String,
-    #[serde(default)]
-    pub(crate) arm: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -59,48 +57,24 @@ pub(crate) struct ResumeBody {
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
-fn request_for_switch(display: &str, arm: bool) -> dormant_core::ipc_proto::IpcRequest {
-    if arm {
-        dormant_core::ipc_proto::IpcRequest::ClaimArm {
-            display: display.to_string(),
-        }
-    } else {
-        dormant_core::ipc_proto::IpcRequest::ClaimShared {
-            display: display.to_string(),
-        }
-    }
-}
-
-/// `POST /api/switch` — request or arm a shared-panel claim.
+/// `POST /api/switch` — write the local input code to pull the display.
 pub(crate) async fn post_switch(
     State(state): State<WebState>,
     Json(body): Json<SwitchBody>,
 ) -> Result<Json<serde_json::Value>, WebError> {
     validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
-    let response =
-        crate::request_daemon_ipc(&state, request_for_switch(&body.display, body.arm)).await?;
+    let request = dormant_core::ipc_proto::IpcRequest::SwitchToLocal {
+        display: body.display,
+    };
+    let response = crate::request_daemon_ipc(&state, request).await?;
     if !response.ok {
         return Err(WebError::BadRequest(
             response
                 .error
-                .unwrap_or_else(|| "claim rejected".to_string()),
+                .unwrap_or_else(|| "switch failed".to_string()),
         ));
     }
-    let value = if body.arm {
-        serde_json::to_value(
-            response
-                .claim_arm
-                .ok_or_else(|| WebError::BadRequest("daemon returned no arm result".into()))?,
-        )
-    } else {
-        serde_json::to_value(
-            response
-                .claim_shared
-                .ok_or_else(|| WebError::BadRequest("daemon returned no claim result".into()))?,
-        )
-    }
-    .map_err(|error| WebError::BadRequest(error.to_string()))?;
-    Ok(Json(value))
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 /// `POST /api/blank` — validate display exists, then force-blank.
@@ -596,8 +570,12 @@ mod tests {
         }
     }
 
+    // ── Switch-to-local tests ──────────────────────────────────────────
+
+    /// Router-level: `POST /api/switch` with `{"display":"shared"}`
+    /// sends `SwitchToLocal` and returns `{"status":"ok"}` on success.
     #[tokio::test]
-    async fn switch_router_round_trips_claim_verdict() {
+    async fn switch_sends_switch_to_local_and_returns_ok() {
         let snap = snapshot_with_displays(&["shared"]);
         let (ctl_tx, _) = spawn_fake_engine(snap);
         let dir = tempfile::tempdir().unwrap();
@@ -610,8 +588,11 @@ mod tests {
             std::io::BufReader::new(&stream)
                 .read_line(&mut request)
                 .unwrap();
-            assert!(request.contains("claim_shared"));
-            stream.write_all(b"{\"ok\":true,\"claim_shared\":{\"verdict\":\"accepted\",\"deadline_ms\":123}}\n").unwrap();
+            assert!(
+                request.contains("switch_to_local"),
+                "expected switch_to_local, got: {request}"
+            );
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
         });
         let router = command_test_router_at(ctl_tx, Some(socket));
         tokio::task::yield_now().await;
@@ -631,8 +612,69 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["verdict"], "accepted");
+        assert_eq!(json["status"], "ok");
         server.await.unwrap();
+    }
+
+    /// Router-level: `POST /api/switch` surfaces a daemon error as HTTP 400.
+    #[tokio::test]
+    async fn switch_surfaces_failed_write() {
+        let snap = snapshot_with_displays(&["shared"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            stream
+                .write_all(b"{\"ok\":false,\"error\":\"write failed: DDC bus unreachable\"}\n")
+                .unwrap();
+        });
+        let router = command_test_router_at(ctl_tx, Some(socket));
+        tokio::task::yield_now().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/switch")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"shared"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["detail"].as_str().unwrap().contains("DDC bus"));
+        server.await.unwrap();
+    }
+
+    /// Router-level: `POST /api/switch` with an unknown display returns 404.
+    #[tokio::test]
+    async fn switch_unknown_display_returns_404() {
+        let snap = snapshot_with_displays(&["main"]);
+        let (ctl_tx, _) = spawn_fake_engine(snap);
+        let router = command_test_router(ctl_tx);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/switch")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"display":"bogus"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Pause / Resume tests ──────────────────────────────────────────────
@@ -924,20 +966,5 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({"error": "emergency_wake_in_progress"})
         );
-    }
-    #[test]
-    fn switch_arm_maps_to_claim_arm() {
-        assert!(matches!(
-            request_for_switch("monitor", true),
-            dormant_core::ipc_proto::IpcRequest::ClaimArm { display } if display == "monitor"
-        ));
-    }
-
-    #[test]
-    fn switch_plain_maps_to_claim_shared() {
-        assert!(matches!(
-            request_for_switch("monitor", false),
-            dormant_core::ipc_proto::IpcRequest::ClaimShared { display } if display == "monitor"
-        ));
     }
 }

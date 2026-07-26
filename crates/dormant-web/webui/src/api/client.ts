@@ -32,9 +32,7 @@ import type {
   ExerciseReport,
   OperationsStatus,
   DaemonIdentity,
-  ClaimSharedResult,
-  ClaimArmResult,
-} from "./types";
+}  from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
 
@@ -101,14 +99,12 @@ export function postWake(display: string): Promise<void> {
   });
 }
 
-/** POST /api/switch — claim or arm a shared display. */
-export function postSwitch(display: string, arm: false): Promise<ClaimSharedResult>;
-export function postSwitch(display: string, arm: true): Promise<ClaimArmResult>;
-export function postSwitch(display: string, arm: boolean): Promise<ClaimSharedResult | ClaimArmResult> {
-  return request<ClaimSharedResult | ClaimArmResult>("/switch", {
+/** POST /api/switch — write the local input code to pull the display. */
+export function postSwitch(display: string): Promise<void> {
+  return request<void>("/switch", {
     method: "POST",
     headers: JSON_CT,
-    body: JSON.stringify({ display, arm }),
+    body: JSON.stringify({ display }),
   });
 }
 

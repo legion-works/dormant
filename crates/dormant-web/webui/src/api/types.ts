@@ -239,17 +239,6 @@ export interface KvmStatus {
   activity_claim: "off" | "owner-idle" | "edge" | "armed";
 }
 
-export type ClaimSharedResult =
-  | { verdict: "accepted"; deadline_ms: number }
-  | { verdict: "busy" }
-  | { verdict: "denied" | "failed"; reason: string };
-
-export interface ClaimArmResult {
-  armed: boolean;
-  deadline_ms: number;
-  reason?: string;
-}
-
 export interface StateSnapshot {
   sensors: SensorSnapshot[];
   zones: ZoneSnapshot[];
@@ -445,23 +434,18 @@ export interface ConfigInventory {
   rules: Record<string, RuleConfig>;
 }
 
-/** rust: config/schema.rs CoordinationConfig */
+/** rust: config/schema.rs CoordinationConfig
+ *
+ * Fields removed from the web mirror (no longer wired for KVM claims):
+ * `enabled`, `pairing_port`, `pairing_window`, `pairing_bind_address`,
+ * `activity_claim`, `owner_idle_window`, `armed_window`, `claim_timeout`,
+ * `release_deadline_cap`, `claim_port`, `claim_bind_address`,
+ * `claim_advertise_mdns`. Tasks 15/16 own removal from the Rust struct.
+ */
 export interface CoordinationConfig {
-  enabled?: boolean;
   poll_interval?: string;
   state_poll_interval?: string;
   loss_confirmations?: number;
-  pairing_port?: number;
-  pairing_window?: string;
-  pairing_bind_address?: string | null;
-  activity_claim?: "off" | "owner-idle" | "edge" | "armed";
-  owner_idle_window?: string;
-  armed_window?: string;
-  claim_timeout?: string;
-  release_deadline_cap?: string;
-  claim_port?: number;
-  claim_bind_address?: string | null;
-  claim_advertise_mdns?: boolean;
   activity_follow?: boolean;
   arm_after?: string;
   cooldown?: string;

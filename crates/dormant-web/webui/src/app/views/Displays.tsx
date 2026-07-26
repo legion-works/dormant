@@ -31,14 +31,14 @@ interface DisplayCardProps {
   zone: string;
   rule: string | undefined;
   dialogOpen: boolean;
-  claimCapable: boolean;
+  peerWriteConfigured: boolean;
   error?: string;
   onOpenDetail: (id: string) => void;
   onBlank: (id: string) => void;
   onWake: (id: string) => void;
   onPause: (id: string, rule: string) => void;
   onResume: (id: string, rule: string) => void;
-  onClaim: (id: string) => void;
+  onSwitch: (id: string) => void;
 }
 
 function DisplayCard({
@@ -48,14 +48,14 @@ function DisplayCard({
   zone,
   rule,
   dialogOpen,
-  claimCapable,
+  peerWriteConfigured,
   error,
   onOpenDetail,
   onBlank,
   onWake,
   onPause,
   onResume,
-  onClaim,
+  onSwitch,
 }: DisplayCardProps) {
   const isShared = snap.scope === "shared";
   const panelLabel = (() => {
@@ -196,12 +196,19 @@ function DisplayCard({
                 <button
                   type="button"
                   className="display-action display-action--wake"
-                  onClick={() => onClaim(id)}
-                  disabled={!claimCapable}
+                  onClick={() => onSwitch(id)}
                 >
-                  Claim panel
+                  Switch to here
                 </button>
-                {!claimCapable && <span>Claim unavailable for this display</span>}
+                {peerWriteConfigured && (
+                  <button
+                    type="button"
+                    className="display-action display-action--wake"
+                    onClick={() => onSwitch(id)}
+                  >
+                    Send to peer
+                  </button>
+                )}
               </>
             )}
             {isPaused ? (
@@ -296,15 +303,12 @@ export default function Displays() {
     }
   }, [clearActionError]);
 
-  const handleClaim = useCallback(async (id: string) => {
+  const handleSwitch = useCallback(async (id: string) => {
     clearActionError(id);
     try {
-      const result = await postSwitch(id, false);
-      if (result.verdict !== "accepted") {
-        throw new Error("reason" in result ? result.reason : result.verdict);
-      }
+      await postSwitch(id);
     } catch (err: unknown) {
-      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Claim failed" }));
+      setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Switch failed" }));
     }
   }, [clearActionError]);
 
@@ -372,14 +376,14 @@ export default function Displays() {
             zone={dr?.zone ?? "—"}
             rule={dr?.rule}
             dialogOpen={!!dialog}
-            claimCapable={snapshot.kvm?.claim_capable_displays.includes(id) ?? false}
+            peerWriteConfigured={dc?.shared_peer_input_write_code != null}
             error={actionErrors[id]}
             onOpenDetail={selectDisplay}
             onBlank={handleBlank}
             onWake={handleWake}
             onPause={handlePause}
             onResume={handleResume}
-            onClaim={handleClaim}
+            onSwitch={handleSwitch}
           />
         );
       })}

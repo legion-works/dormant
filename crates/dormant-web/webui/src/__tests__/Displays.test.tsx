@@ -340,40 +340,58 @@ describe("Displays", () => {
     expect(screen.getByRole("button", { name: "Force blank" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force wake" })).toBeInTheDocument();
   });
-  it("claims a capable shared display", async () => {
+  it("switch-to-here button calls postSwitch", async () => {
     renderDisplayCard("shared-tv", sharedDisplay());
-    fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
-    await waitFor(() => expect(mocks.postSwitch).toHaveBeenCalledWith("shared-tv", false));
+    fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
+    await waitFor(() => expect(mocks.postSwitch).toHaveBeenCalledWith("shared-tv"));
   });
 
-  it("disables claim for a shared display not reported capable", () => {
+  it("does not render send-to-peer button when peer code not configured", () => {
     const state = liveStateFixture({
       snapshot: {
         sensors: [],
         zones: [],
         displays: [["shared-tv", sharedDisplay()]],
         pending_reload: null,
-        kvm: { keymap: {}, claim_capable_displays: [], activity_claim: "off" },
+        kvm: { keymap: {}, claim_capable_displays: ["shared-tv"], activity_claim: "off" },
       },
+      displayConfigs: {
+        "shared-tv": { controllers: [], blank_mode: "power_off", scope: "shared" } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
-    expect(screen.getByRole("button", { name: "Claim panel" })).toBeDisabled();
-    expect(screen.getByText(/claim unavailable/i)).toBeInTheDocument();
-    expect(mocks.postSwitch).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
   });
 
-  it("renders a rejected claim reason", async () => {
-    mocks.postSwitch.mockRejectedValueOnce(new Error("unsupported"));
-    renderDisplayCard("shared-tv", sharedDisplay());
-    fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
-    expect(await screen.findByText("unsupported")).toBeInTheDocument();
+  it("renders send-to-peer button when peer write code is configured", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["shared-tv", sharedDisplay()]],
+        pending_reload: null,
+        kvm: { keymap: {}, claim_capable_displays: ["shared-tv"], activity_claim: "off" },
+      },
+      displayConfigs: {
+        "shared-tv": {
+          controllers: [],
+          blank_mode: "power_off",
+          scope: "shared",
+          shared_peer_input_write_code: 96,
+        } as DisplayConfig,
+      },
+      displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    expect(screen.getByRole("button", { name: "Send to peer" })).toBeInTheDocument();
   });
 
-  it("renders a denied claim verdict reason", async () => {
-    mocks.postSwitch.mockResolvedValueOnce({ verdict: "denied", reason: "identity_unavailable" });
+  it("surfaces a failed switch as an error", async () => {
+    mocks.postSwitch.mockRejectedValueOnce(new Error("write failed: DDC bus unreachable"));
     renderDisplayCard("shared-tv", sharedDisplay());
-    fireEvent.click(screen.getByRole("button", { name: "Claim panel" }));
-    expect(await screen.findByText("identity_unavailable")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
+    expect(await screen.findByText("write failed: DDC bus unreachable")).toBeInTheDocument();
   });
 });
 

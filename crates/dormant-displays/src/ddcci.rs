@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_DISPLAY_IO};
@@ -278,6 +279,11 @@ impl DisplayController for DdcciController {
     }
 
     async fn probe(&mut self) -> Result<(), DormantError> {
+        // Retry knobs for the D6 detection probe — declared as items
+        // before any statement to satisfy clippy::items-after-statements.
+        const D6_RETRIES: usize = 3;
+        const D6_RETRY_BACKOFF_MS: u64 = 50;
+
         // Order matters (spec §4.3): enumerate → match → derive the
         // canonical key → resolve THIS panel's lock → only then touch the
         // bus. Deriving the key before any transaction means every VCP
@@ -296,12 +302,25 @@ impl DisplayController for DdcciController {
 
         // Test D6 power control support — the first physical VCP
         // transaction, always at command priority (probe is a one-time
-        // startup call, never periodic sampling).
-        let d6_ok = self
-            .ops
-            .get_vcp(&matched, VCP_POWER, &panel_lock, VcpPriority::Command)
-            .await
-            .is_ok();
+        // startup call, never periodic sampling). Retry up to 2 extra times
+        // (3 total) with a short backoff: a single transient VCP read error
+        // under DDC bus contention (e.g. concurrent 0x60 coordination poll)
+        // should not permanently drop PowerOff from supported_modes().
+
+        let mut d6_ok = false;
+        for attempt in 0..D6_RETRIES {
+            let result = self
+                .ops
+                .get_vcp(&matched, VCP_POWER, &panel_lock, VcpPriority::Command)
+                .await;
+            if result.is_ok() {
+                d6_ok = true;
+                break;
+            }
+            if attempt + 1 < D6_RETRIES {
+                tokio::time::sleep(Duration::from_millis(D6_RETRY_BACKOFF_MS)).await;
+            }
+        }
 
         if d6_ok {
             tracing::info!(
@@ -1035,6 +1054,42 @@ mod tests {
         assert!(
             !ctrl2.supported_modes().contains(&BlankMode::PowerOff),
             "PowerOff should NOT be in supported_modes when D6 is unsupported"
+        );
+    }
+
+    /// #123: a single transient VCP read failure (e.g. bus contention from
+    /// a concurrent coordination poll) should not permanently drop `PowerOff`
+    /// from `supported_modes()`. The probe retries D6 detection up to 3×
+    /// with 50 ms backoff.
+    #[tokio::test]
+    async fn probe_detects_d6_after_transient_failure() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        // First call: transient failure (bus contention).
+        // Second call: succeeds (bus clear).
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("DDC/CI read failure".into()));
+            f.expect_get(ident, VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        {
+            let state = ctrl.state.lock().unwrap();
+            assert!(
+                state.d6_supported,
+                "D6 should be detected after retry on transient failure"
+            );
+        }
+        assert!(
+            ctrl.supported_modes().contains(&BlankMode::PowerOff),
+            "PowerOff should be in supported_modes after retry"
         );
     }
 

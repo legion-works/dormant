@@ -1,5 +1,28 @@
 # Displays
 
+**What this gives you.** Six blank controllers (DDC/CI, KWin DPMS, command,
+HA passthrough, macOS gamma-black, Samsung Tizen) plus escalation ladders plus
+two render stages — every audio-safe and panel-internal mode in one document.
+
+**When to use it.** Picking a controller for a new display, diagnosing why a
+rule fired the wrong blank mode, or configuring a fallback chain so a display
+never stays on when it should be dark.
+
+**Quick setup.** Write one `[displays.<id>]` block with a `controllers` list
+and `blank_mode`, then verify the controller can reach the panel:
+
+```toml
+[displays.main]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+```
+
+```bash
+dormantctl doctor ddcci
+```
+
+---
+
 dormant controls displays through an ordered controller chain. If one controller fails, the next is tried. Wake commands follow the rule's configured retry schedule before escalating.
 
 ## Controllers
@@ -64,6 +87,17 @@ dormantctl doctor ddcci
 ```
 
 If `power_off` is unsupported, `brightness_zero` is always available as a fallback (DDC/CI unconditionally supports brightness control). `screen_off_audio_on` is not a DDC/CI mode — use a different controller for that.
+
+The D6 probe is retried up to 3 times with a 50 ms backoff to ride out a
+single transient VCP read error under DDC bus contention — a concurrent
+coordination poll should not permanently drop `power_off` from
+`supported_modes()` (`ddcci.rs:284-323`).
+
+When `setvcp 60` is issued for a shared display, the controller immediately
+reads back VCP `0x60` up to 3 times (200 ms apart) to verify the write
+landed. A clean read carrying the wrong value is a genuine failure and returns
+immediately without retry; only transport-level read errors (DDC bus noise,
+concurrent peer-machine traffic) are retried (`ddcci.rs:633-716`).
 
 ### `ha-passthrough` — Home Assistant passthrough
 

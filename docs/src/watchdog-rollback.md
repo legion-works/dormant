@@ -1,5 +1,30 @@
 # Watchdog + last-known-good rollback
 
+**What this gives you.** Three recovery mechanisms — health-gated last-known-good
+(LKG) config promotion, boot-time rollback for invalid configs and counted
+crash loops, and a systemd watchdog — so a broken config or a wedged daemon
+does not strand the panel.
+
+**When to use it.** You see a rollback banner, the daemon booted from an LKG
+config, or you want to know when to set `watchdog.lkg_rollback_enabled =
+false` (during rapid debug restarts). All three mechanisms are on by default
+with sensible bounds.
+
+**Quick setup.** Leave everything at defaults:
+
+```toml
+[watchdog]
+lkg_enabled = true
+lkg_rollback_enabled = true
+stability_window = "5m"
+```
+
+```bash
+dormantctl status    # reports rollback state and running config fingerprint
+```
+
+---
+
 dormant combines three recovery mechanisms:
 
 1. a health-gated last-known-good (LKG) config snapshot;

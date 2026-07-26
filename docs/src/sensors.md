@@ -1,5 +1,32 @@
 # Sensors
 
+**What this gives you.** Three sensor inputs (MQTT, Home Assistant WebSocket,
+USB-LD2410) with a uniform `[sensors.<id>]` config shape and a uniform doctor
+probe per type.
+
+**When to use it.** Wiring the first presence source into a config. Choose
+MQTT for an ESP32 or Zigbee sensor, HA WebSocket for a sensor already in Home
+Assistant, or USB for a direct-attached HLK-LD2410 radar.
+
+**Quick setup.** Pick the `type`, drop in one block, hot-reload:
+
+```toml
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "ld2410c-desk/binary_sensor/desk_presence_desk_seated/state"
+```
+
+```bash
+dormantctl reload && dormantctl status
+```
+
+The sensor appears in `dormantctl status` as `unavailable` until its first
+event — the default zone policy treats unavailable as present, so the display
+stays on.
+
+---
+
 dormant ingests presence from three sensor types: MQTT, Home Assistant WebSocket, and USB-serial. This page covers setup and the `dormantctl doctor` checks for each.
 
 ## Two ways to wire the LD2410C

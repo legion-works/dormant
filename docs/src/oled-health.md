@@ -1,5 +1,22 @@
 # Panel-wear tracking
 
+**What this gives you.** Brightness-weighted on-hours per display, visible in
+the web dashboard and via `GET /api/wear`, with an advisory after no long
+standby window has occurred in 96 h.
+
+**When to use it.** Anytime you want to know whether your panel is getting the
+long dim it needs. Tracking is on by default; turn it off with `wear.enabled =
+false` if on-hours accounting is not useful for your setup.
+
+**Quick setup.** Tracking is on by default — the dashboard panel-exposure card
+and `dormantctl status` are the readout:
+
+```bash
+dormantctl status
+```
+
+---
+
 dormant records brightness-weighted panel on-time and shows it in the web
 dashboard. v1 measures and advises; it does not alter blank/wake timing.
 

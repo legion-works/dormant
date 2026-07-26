@@ -303,7 +303,10 @@ async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
 
     let config_path =
         paths::resolve_config_path(args.config.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let config_ok = results.iter().all(|r| r.status != ProbeStatus::Fail);
+    let config_ok = results
+        .iter()
+        .filter(|r| r.name == "config")
+        .all(|r| r.status != ProbeStatus::Fail);
 
     // Collected from the SAME cfg + creds the probes just ran against —
     // every host/token/URL a draft could otherwise echo verbatim through a
@@ -1214,6 +1217,34 @@ mod tests {
         assert!(
             !msg.contains("looks like a doctor subcommand name"),
             "the `=` form must not trip the subcommand-name guard; got: {msg}"
+        );
+    }
+
+    // ── #116: config_ok must only reflect the config probe ──────────
+
+    #[test]
+    fn config_ok_only_checks_config_probe() {
+        let results = [
+            ProbeResult::pass("config", "configuration OK"),
+            ProbeResult::fail("mqtt office", "connection refused"),
+            ProbeResult::fail("ddcci", "no DDC/CI displays detected"),
+        ];
+
+        // OLD bug: checks ALL results → a failing MQTT probe makes config_ok false.
+        let old_way = results.iter().all(|r| r.status != ProbeStatus::Fail);
+        assert!(
+            !old_way,
+            "old way: any non-config failure should make this false — this IS the bug"
+        );
+
+        // NEW fix: only the config probe matters for config_ok.
+        let new_way = results
+            .iter()
+            .filter(|r| r.name == "config")
+            .all(|r| r.status != ProbeStatus::Fail);
+        assert!(
+            new_way,
+            "new way: config passed, so config_ok must be true regardless of other probe failures"
         );
     }
 }

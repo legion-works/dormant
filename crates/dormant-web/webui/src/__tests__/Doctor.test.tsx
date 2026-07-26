@@ -158,15 +158,9 @@ describe("Doctor", () => {
     });
   });
 
-  it("shows four summary tiles and launches exercise for a chosen display", async () => {
-    // Adaptation: the plan's RED test draft declares its own standalone
-    // `runDoctor` mock (checks: config/ok, mqtt/warn, usb/skip,
-    // ddcci/fail). This file has a single hoisted `api` object shared by
-    // every test (mirroring the DisplayDetail.test.tsx "single final
-    // definition" precedent — two competing `vi.mock("../api/client", …)`
-    // factories are not possible), so the pre-T8 tests' six-check fixture
-    // stays the shared default and this test overrides it for one call
-    // via `mockResolvedValueOnce` with the plan's exact data instead.
+  it("shows summary tiles and launches exercise for a chosen display", async () => {
+    // Two competing `vi.mock` factories are not possible with a shared `api`;
+    // override the single mock with `mockResolvedValueOnce` here.
     vi.mocked(api.runDoctor).mockResolvedValueOnce({
       checks: [
         { name: "config", status: "ok", detail: "valid" },

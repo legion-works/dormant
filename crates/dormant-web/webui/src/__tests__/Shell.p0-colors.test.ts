@@ -14,13 +14,14 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const SHELL_CSS_PATH = resolve(import.meta.dirname, "../app/Shell.css");
+const CONFIG_CSS_PATH = resolve(import.meta.dirname, "../app/views/Config.css");
 
 /** Extract a `.selector { ... }` block's raw body from the stylesheet
  * text (first match only — every rule pinned here is declared once). */
 function ruleBody(css: string, selector: string): string {
   const escaped = selector.replace(/[.]/g, "\\.");
   const match = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
-  if (!match) throw new Error(`rule ${selector} not found in Shell.css`);
+  if (!match) throw new Error(`rule ${selector} not found in CSS`);
   return match[1];
 }
 
@@ -47,5 +48,16 @@ describe("Shell.css P0 color-role pin", () => {
     const body = ruleBody(css, ".topbar-reload:hover");
     expect(body).toMatch(/var\(--accent\)/);
     expect(body).not.toMatch(/var\(--success\)/);
+  });
+});
+
+describe("Config.css P0 color-role pin", () => {
+  const css = readFileSync(CONFIG_CSS_PATH, "utf8");
+
+  it(".config-tab--active is green (tinted + bordered), never cyan", () => {
+    const body = ruleBody(css, ".config-tab--active");
+    expect(body).toMatch(/var\(--success\)/);
+    expect(body).toMatch(/var\(--success-muted\)/);
+    expect(body).not.toMatch(/var\(--accent\)/);
   });
 });

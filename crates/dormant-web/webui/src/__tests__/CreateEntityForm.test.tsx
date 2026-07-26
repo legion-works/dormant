@@ -17,9 +17,9 @@ describe("CreateEntityForm — id hygiene live feedback", () => {
     );
 
     expect(screen.getByLabelText("scope")).toHaveValue("private");
-    expect(screen.queryByLabelText("shared_input_code")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/shared_input_code/)).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("scope"), { target: { value: "shared" } });
-    expect(screen.getByLabelText("shared_input_code")).toBeInTheDocument();
+    expect(screen.getByLabelText(/shared_input_code/)).toBeInTheDocument();
   });
 
   it("shows no error for an empty id (not yet typed)", () => {

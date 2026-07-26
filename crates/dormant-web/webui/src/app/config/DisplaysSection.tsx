@@ -13,7 +13,7 @@
 import FormSection from "./FormSection";
 import LadderEditor from "./LadderEditor";
 import ScreensaverEditor from "./ScreensaverEditor";
-import { EnumField, NumberField, PANEL_TYPES } from "./fields";
+import { EnumField, HexCodeField, PANEL_TYPES } from "./fields";
 import { useState, useEffect } from "react";
 import type { DisplayConfig, LadderStage, RuleConfig } from "../../api/types";
 import type { PatchStore } from "./patch";
@@ -164,7 +164,7 @@ export default function DisplaysSection({
                     />
                     {scope === "shared" && (
                       <>
-                      <NumberField
+                      <HexCodeField
                         path={[...basePath, "shared_input_code"]}
                         label="shared_input_code"
                         value={cfg.shared_input_code ?? ""}
@@ -172,7 +172,7 @@ export default function DisplaysSection({
                         onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
                         error={fieldErrors[[...basePath, "shared_input_code"].join(".")]}
                       />
-                      <NumberField
+                      <HexCodeField
                         path={[...basePath, "shared_input_write_code"]}
                         label="shared_input_write_code (optional)"
                         value={cfg.shared_input_write_code ?? ""}
@@ -180,7 +180,7 @@ export default function DisplaysSection({
                         onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
                         error={fieldErrors[[...basePath, "shared_input_write_code"].join(".")]}
                       />
-                      <NumberField
+                      <HexCodeField
                         path={[...basePath, "shared_peer_input_code"]}
                         label="shared_peer_input_code (optional peer read code)"
                         value={cfg.shared_peer_input_code ?? ""}
@@ -188,7 +188,7 @@ export default function DisplaysSection({
                         onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
                         error={fieldErrors[[...basePath, "shared_peer_input_code"].join(".")]}
                       />
-                      <NumberField
+                      <HexCodeField
                         path={[...basePath, "shared_peer_input_write_code"]}
                         label="shared_peer_input_write_code (optional peer write code)"
                         value={cfg.shared_peer_input_write_code ?? ""}

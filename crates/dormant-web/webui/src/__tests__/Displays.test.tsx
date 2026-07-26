@@ -329,18 +329,28 @@ describe("Displays", () => {
     })).toBeInTheDocument();
   });
 
-  it("private card copy unchanged", () => {
-    renderDisplayCard("private-panel", {
-      phase: "active",
-      inhibited: false,
-      paused: false,
-      cmd_gen: 1,
-      controllers: [],
+  it("renders basic private panel label and action buttons without KVM controls", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["private-panel", { phase: "active", inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
+        pending_reload: null,
+        kvm: { keymap: {}, switch_capable_displays: [], activity_following: false, push_capable_displays: [] },
+      },
+      displayConfigs: {
+        "private-panel": { controllers: [], blank_mode: "power_off" } as DisplayConfig,
+      },
+      displayRules: { "private-panel": { rule: "office-rule", zone: "office" } },
     });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
 
     expect(screen.getByText("● ON")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force blank" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force wake" })).toBeInTheDocument();
+    // KVM switch/push buttons are absent when the display is not in either capability set.
+    expect(screen.queryByRole("button", { name: "Switch to here" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
   });
   it("switch-to-here button calls postSwitch", async () => {
     renderDisplayCard("shared-tv", sharedDisplay());

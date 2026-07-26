@@ -2637,6 +2637,25 @@ capture_is_call = false
     }
 
     #[test]
+    fn create_display_with_shared_input_write_code_roundtrips() {
+        let mut cur = minimal_config();
+        let patches = [Patch::CreateEntity {
+            collection: "displays".into(),
+            id: "newdisplay".into(),
+            value: json!({"controllers": ["ddcci"], "blank_mode": "power_off", "shared_input_write_code": 96}),
+        }];
+        check_patches(&patches, &cur, &[]).unwrap();
+        apply_patches(&mut cur, &patches).unwrap();
+
+        // Verify the TOML output contains the new field — minimal_config() carries
+        // intentionally-invalid values (blank_mode = "picture_off") so full Config
+        // deserialization is not available; check the raw TOML string instead.
+        let toml_str = cur.to_string();
+        assert!(toml_str.contains("shared_input_write_code = 96"));
+        assert!(toml_str.contains("controllers = [\"ddcci\"]"));
+    }
+
+    #[test]
     fn check_patches_delete_entity_end_to_end_ok() {
         let cur = minimal_config();
         let patches = [Patch::DeleteEntity {

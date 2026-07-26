@@ -157,6 +157,28 @@ export function NumberField({ path, label, value, locked, lockedReason, onEdit, 
 }
 
 /**
+ * VCP hex-code field — numeric input with a live hex/decimal echo in
+ * the label.  The patch store still receives a plain number; this is
+ * a presentation-only wrapper.
+ *
+ * E.g. when the value is 96 the label renders "shared_input_code
+ * · 0x60 (96)".  When empty or non-numeric the suffix is omitted.
+ */
+export function HexCodeField(props: FieldProps) {
+  const nv = typeof props.value === "number" ? props.value : Number(props.value);
+  const hexSuffix = Number.isFinite(nv) && !Number.isNaN(nv as number)
+    ? ` · 0x${(nv as number).toString(16).padStart(2, "0")} (${nv})`
+    : "";
+
+  return (
+    <NumberField
+      {...props}
+      label={`${props.label}${hexSuffix}`}
+    />
+  );
+}
+
+/**
  * Multi-select field — a checkbox per option, tracking an array of
  * selected strings. Used for cross-reference array fields (rules'
  * `displays`/`inhibitors`, zones' `members`, displays' `controllers`) —

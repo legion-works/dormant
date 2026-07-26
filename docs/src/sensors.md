@@ -11,11 +11,37 @@ The HLK-LD2410C mmWave radar is a plain serial device, so the same sensor reache
 | **Radar on an ESP32 → WiFi → MQTT** | `mqtt` | Radar → ESP32 (ESPHome) → WiFi → broker → dormant | Sensor placed anywhere with power; tuned live from Home Assistant; one radar can feed many consumers. Appears in HA natively over the ESPHome API. |
 | **Radar direct to the host** | `usb-ld2410` | Radar → USB-serial adapter → dormant | Sensor at the machine it guards: no WiFi, no broker, lowest latency. The ESP is not needed; dormant reads the raw UART frames itself. |
 
-A ready-to-flash ESPHome config for the MQTT topology ships at [`examples/esphome/ld2410c-c6-wifi-mqtt.yaml`](https://github.com/legion-works/dormant/blob/dev/examples/esphome/ld2410c-c6-wifi-mqtt.yaml) — it exposes near/far distance zones and the radar's tuning entities (detection range, per-gate sensitivity, zone cutoff), all adjustable from HA without reflashing. The USB topology needs only a `type = "usb-ld2410"` sensor block (see below) and a ~$2 adapter.
+A ready-to-flash ESPHome config for the MQTT topology ships at [`examples/esphome/ld2410c-c6-wifi-mqtt.yaml`](https://github.com/legion-works/dormant/blob/dev/examples/esphome/ld2410c-c6-wifi-mqtt.yaml) — it exposes near/far distance zones, per-gate sensitivity thresholds (g0–g8 move/still), an energy-gated `desk_seated` template that bypasses the LD2410C's presence-flag quirks, and a tunable still-energy floor, all adjustable from HA without reflashing. The USB topology needs only a `type = "usb-ld2410"` sensor block (see below) and a ~$2 adapter.
 
 Both are **fail-safe symmetric**: broker loss (MQTT, via the retained LWT) and USB unplug both mark the sensor `unavailable`, which the default zone policy treats as *present* — dormant never blanks a room it can't see, whichever transport drops.
 
 > **2D zones need different silicon.** The LD2410C reports one target along a single axis (distance), so it does 1D near/far zones only. True X/Y polygon zones (as on the Everything Presence Pro) need a multi-target radar like the LD2450, which wires to the same ESP32 identically — swap the module, keep the board and config shape.
+
+### LD2410C tuning and hardware quirks
+
+The LD2410C divides its detection space into 9 gates. Each defaults to a 75 cm radial slice, and each gate has independent **moving** and **static** energy thresholds (0–100; lower = more sensitive). A target is reported only when the measured energy exceeds that gate's threshold.
+
+| Gate | Approx. range | Default move | Default still | Notes |
+| --- | --- | --- | --- | --- |
+| 0 | 0–75 cm | 50 | 0 | Still threshold **not hardware-settable** per HLK datasheet; any value written is ignored. |
+| 1 | 75–150 cm | 50 | 0 | Still threshold **not hardware-settable**, same as gate 0. |
+| 2 | 150–225 cm | 40 | 40 | |
+| 3 | 225–300 cm | 30 | 40 | |
+| 4 | 300–375 cm | 20 | 30 | |
+| 5 | 375–450 cm | 15 | 30 | |
+| 6 | 450–525 cm | 15 | 20 | |
+| 7 | 525–600 cm | 15 | 20 | |
+| 8 | 600–675 cm | 15 | 20 | |
+
+**Gate 0/1 limitation.** A person sitting still within ~150 cm of the sensor cannot be detected as a *still* target — gate 0 and 1 have no settable static sensitivity, and their moving thresholds (50) are the highest of any gate. A desk-mounted sensor is therefore the worst case: the occupant sits in the gates with no static detection and the strictest moving threshold.
+
+**Mounting guidance.** Position the sensor so the monitored position falls in gates 2–5 (150 cm to 450 cm), where both moving and static thresholds are available and defaults are already lower. If the sensor must be close to the occupant, lower the gate 0/1 **moving** thresholds and use the energy-gated `desk_seated` template (in the example YAML) instead of the LD2410C's native presence flags — the template keys off the raw still-energy level, which rises reliably even when the flags stay absent.
+
+**Re-arm quirk.** Multiple HA-community reports describe the LD2410C still-presence flag requiring a *moving* trigger to re-latch after it clears — still-energy above the gate threshold alone does not always re-arm `has_still_target`. The energy-gated `desk_seated` template avoids this flag and reads the energy level directly, so it is immune to the re-arm quirk.
+
+**Staleness.** The example ESPHome config publishes occupancy on-change only. During long still periods (occupant seated, no movement), dormant's default `sensors.<id>.stale_timeout` of `5m` fires and the sensor reads unavailable. The fail-safe (default zone policy = `"present"`) keeps the display on, but occupancy-driven wake-on-return is lost until the next MQTT edge. The maintainer's live config sets `stale_timeout = "15m"` as a workaround. Adding a periodic re-publish (commented-out `interval` block in the example YAML) lets `stale_timeout` come back down to ~`"2m"` — the sensor then only goes unavailable if the ESP drops off the network entirely.
+
+Setting per-gate thresholds is necessary but **not sufficient** to fix close-range seated detection on its own — the gate 0/1 hardware limit and the re-arm quirk remain. The energy-gated template is the primary mitigation; per-gate thresholds fine-tune the radar for the gate range where the occupant actually sits.
 
 ## MQTT
 
@@ -164,7 +190,9 @@ Verifies: serial port accessibility, baud rate negotiation, frame parsing, last 
 
 ### Tuning
 
-The LD2410 has configurable sensitivity and detection ranges. These are set via the module's own serial protocol (outside dormant's scope). Use the manufacturer's PC tool or ESPHome to configure them. Common adjustments:
+The LD2410 has configurable sensitivity and detection ranges. See the [LD2410C tuning and hardware quirks](#ld2410c-tuning-and-hardware-quirks) section above for the gate table, the gate 0/1 static-sensitivity limitation, mounting guidance, and the re-arm quirk — those apply regardless of transport.
+
+For the USB-serial topology, thresholds are set via the module's own serial protocol (outside dormant's scope). Use the manufacturer's PC tool or ESPHome to configure them. Common adjustments:
 
 - Reduce maximum detection range in small rooms (default 6 m is often too sensitive)
 - Increase "no occupancy" delay if the sensor flickers (minimum 15 s on consumer modules)

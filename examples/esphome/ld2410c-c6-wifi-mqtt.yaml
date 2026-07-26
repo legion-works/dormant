@@ -2,7 +2,8 @@
 #
 # HLK-LD2410C 24GHz mmWave presence sensor on ESP32-C6 with WiFi + MQTT.
 # Publishes occupancy binary_sensors over MQTT; dormant consumes the
-# `desk_near` (or `has_target`) topic via its MQTT sensor source.
+# `desk_seated` topic (energy-gated) or `desk_near` (distance-gated)
+# via its MQTT sensor source.
 #
 # This is one of two supported topologies for the same radar (see
 # docs/src/sensors.md "Two ways to wire the LD2410C"): the ESP carries the
@@ -121,6 +122,28 @@ binary_sensor:
       return id(det_dist).raw_state > id(near_cutoff).state * 100.0f;
     filters:
       - delayed_off: 5s
+  # Energy-gated desk presence: the LD2410C's presence flags can read
+  # absent at close range (gate 0/1 have no static sensitivity) and can
+  # glitch on distance. This template bypasses both — if still-energy
+  # exceeds the tunable floor, the desk is occupied regardless of flags.
+  # Use this as the occupancy source for a desk zone in dormant; leave
+  # desk_near + room_far for general near/far partitioning when the
+  # reported presence flags are reliable.
+  - platform: template
+    name: "${friendly_name} Desk Seated"
+    id: desk_seated
+    device_class: occupancy
+    lambda: |-
+      if (std::isnan(id(still_energy).raw_state)) return {};
+      // Energy above floor: present regardless of has_target / distance.
+      // Also gate on distance when within near_cutoff (belt-and-suspenders).
+      bool energy_ok = id(still_energy).raw_state >= id(still_energy_floor).state;
+      if (energy_ok) return true;
+      if (!id(has_tgt).state) return false;
+      if (std::isnan(id(det_dist).raw_state)) return false;
+      return id(det_dist).raw_state <= id(near_cutoff).state * 100.0f;
+    filters:
+      - delayed_off: 5s
 
 # Diagnostic/tuning sensors — throttled so MQTT traffic stays sane.
 sensor:
@@ -130,9 +153,11 @@ sensor:
       name: "${friendly_name} Detection Distance"
       filters: [throttle: 10s]
     moving_energy:
+      id: moving_energy
       name: "${friendly_name} Moving Energy"
       filters: [throttle: 10s]
     still_energy:
+      id: still_energy
       name: "${friendly_name} Still Energy"
       filters: [throttle: 10s]
     moving_distance:
@@ -152,6 +177,54 @@ number:
       name: "${friendly_name} Max Move Gate"
     max_still_distance_gate:
       name: "${friendly_name} Max Still Gate"
+    # Per-gate sensitivity thresholds (0-100). Lower = more sensitive.
+    # Gate 0/1 still thresholds exist in YAML but are not settable in
+    # hardware per the HLK-LD2410C datasheet — setting them has no effect.
+    g0:
+      move_threshold:
+        name: "${friendly_name} G0 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G0 Still Threshold"
+    g1:
+      move_threshold:
+        name: "${friendly_name} G1 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G1 Still Threshold"
+    g2:
+      move_threshold:
+        name: "${friendly_name} G2 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G2 Still Threshold"
+    g3:
+      move_threshold:
+        name: "${friendly_name} G3 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G3 Still Threshold"
+    g4:
+      move_threshold:
+        name: "${friendly_name} G4 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G4 Still Threshold"
+    g5:
+      move_threshold:
+        name: "${friendly_name} G5 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G5 Still Threshold"
+    g6:
+      move_threshold:
+        name: "${friendly_name} G6 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G6 Still Threshold"
+    g7:
+      move_threshold:
+        name: "${friendly_name} G7 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G7 Still Threshold"
+    g8:
+      move_threshold:
+        name: "${friendly_name} G8 Move Threshold"
+      still_threshold:
+        name: "${friendly_name} G8 Still Threshold"
   - platform: template
     name: "${friendly_name} Near Cutoff"
     id: near_cutoff
@@ -164,3 +237,43 @@ number:
     initial_value: 2.5
     optimistic: true
     restore_value: true
+  # Still-energy floor: when still_energy exceeds this value the desk is
+  # considered occupied regardless of the LD2410's reported presence flags
+  # or detection_distance. Set by watching the empty-room energy baseline
+  # (typically 3-5) and the occupied baseline (typically 40+).
+  - platform: template
+    name: "${friendly_name} Still Energy Floor"
+    id: still_energy_floor
+    icon: mdi:gauge
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+
+# ——— Staleness and heartbeat ——————————————————————————————————————————
+# This config publishes occupancy on-change only: no edge → no MQTT
+# message. During long still periods (occupant seated, no movement),
+# dormant's default sensors.<id>.stale_timeout of 5m fires and the sensor
+# reads unavailable. The fail-safe (default zone policy = "present") keeps
+# the display on, but you lose occupancy-driven wake on return until the
+# next MQTT edge arrives.
+#
+# The maintainer's live config sets stale_timeout = "15m" as a workaround.
+# A periodic re-publish of the occupancy state lets stale_timeout come
+# down to ~2m. One way: add an interval that re-publishes desk_seated:
+#
+#   interval:
+#     - interval: 60s
+#       then:
+#         - mqtt.publish:
+#             topic: ${device_name}/sensor/desk_seated/state
+#             payload: !lambda |-
+#               return id(desk_seated).state ? "ON" : "OFF";
+#             retain: true
+#
+# With that in place, set dormant's stale_timeout to "2m" and the daemon
+# will only go unavailable if the ESP drops off the network entirely.

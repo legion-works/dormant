@@ -12,9 +12,7 @@ import { getConfig, getState, postReload } from "../../api/client";
 import type { ConfigResponse, KvmStatus } from "../../api/types";
 import { Card, stageKindLabel } from "../components";
 import { SettingsForm } from "../config/SettingsForm";
-
-/** Global nav guard — Shell reads this before navigating away from Config. */
-export const navGuard = { current: null as { dirtyCount: number; discard: () => void; dirtySections: Set<string> } | null };
+import { navGuard } from "../navGuard";
 import "./Config.css";
 import "../config/ConfigForm.css";
 

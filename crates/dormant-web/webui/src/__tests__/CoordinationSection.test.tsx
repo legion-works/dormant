@@ -154,7 +154,6 @@ describe("CoordinationSection", () => {
     const patches = store.buildPatches();
     expect(patches.some((p) => "path" in p && p.path.join(".") === "coordination.poll_interval")).toBe(true);
   });
-});
 
   it("latency chip updates live when poll_interval is edited", () => {
     const store = createPatchStore();
@@ -193,3 +192,4 @@ describe("CoordinationSection", () => {
 
     expect(screen.getByText(/~10\.0s to commit/)).toBeInTheDocument();
   });
+});

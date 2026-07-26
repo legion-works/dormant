@@ -76,6 +76,32 @@ vi.mock("../api/client", () => ({
   postReload: mocks.postReload,
 }));
 
+// Mock SettingsForm to exercise the nav-guard callback for dirty-tab
+// rendering. The real SettingsForm is a heavy component with many
+// sub-tabs; this test only needs to verify the tab-dot DOM path.
+vi.mock("../app/config/SettingsForm", () => ({
+  SettingsForm: ({
+    onNavigationGuard,
+  }: {
+    onNavigationGuard: (g: {
+      dirtyCount: number;
+      discard: () => void;
+      dirtySections: Set<string>;
+    } | null) => void;
+  }) => {
+    const { useEffect } = require("react");
+    useEffect(() => {
+      // Fire the guard callback to simulate a dirty state on the daemon tab.
+      onNavigationGuard({
+        dirtyCount: 2,
+        discard: () => {},
+        dirtySections: new Set(["daemon"]),
+      });
+    }, [onNavigationGuard]);
+    return <div>settings form</div>;
+  },
+}));
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -301,5 +327,42 @@ describe("Config", () => {
     expect(screen.getByText("Last 5 kept")).toBeInTheDocument();
     expect(screen.getByText(/backups\/config\.toml\.<timestamp>\.<suffix>/)).toBeInTheDocument();
     expect(screen.getByText(/filenames are not exposed by the Web API/i)).toBeInTheDocument();
+  });
+
+  it("shows dirty dot on tab with unsaved edits", async () => {
+    render(<Config />);
+
+    // The mocked SettingsForm fires onNavigationGuard with dirtySections=["daemon"].
+    // Wait for Config to load and the guard callback to take effect.
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    // Find the Daemon tab button — it should contain a dirty-dot span.
+    const daemonTab = screen.getByText("Daemon").closest("button");
+    expect(daemonTab).not.toBeNull();
+
+    // The dot is a span with inline width:6px and accent-warm background.
+    // jsdom renders React inline styles as element.style properties;
+    // query for any span inside the tab button (the dot is the only one).
+    const dotSpans = daemonTab!.querySelectorAll("span");
+    const hasDot = Array.from(dotSpans).some((span) => {
+      const st = (span as HTMLElement).style;
+      return (
+        st.width === "6px" &&
+        st.height === "6px" &&
+        st.borderRadius === "50%"
+      );
+    });
+    expect(hasDot).toBe(true);
+
+    // Tabs without edits (e.g. Switching) must NOT have a dot.
+    const switchingTab = screen.getByText("Switching").closest("button");
+    const switchingSpans = switchingTab!.querySelectorAll("span");
+    const switchingHasDot = Array.from(switchingSpans).some((span) => {
+      const st = (span as HTMLElement).style;
+      return st.width === "6px" && st.height === "6px";
+    });
+    expect(switchingHasDot).toBe(false);
   });
 });

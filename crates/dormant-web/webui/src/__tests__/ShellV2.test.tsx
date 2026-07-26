@@ -15,6 +15,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import Shell from "../app/Shell";
+import { navGuard } from "../app/navGuard";
 
 const mocks = vi.hoisted(() => ({
   postEmergencyWake: vi.fn().mockResolvedValue({
@@ -115,5 +116,60 @@ describe("Shell v2 global chrome", () => {
     fireEvent.click(screen.getByRole("button", { name: "Wake every display" }));
     await waitFor(() => expect(mocks.postEmergencyWake).toHaveBeenCalledOnce());
     expect(screen.getByRole("status")).toHaveTextContent("1/1 displays woke");
+  });
+
+  it("prompts on nav-away from dirty Config and cancel preserves view", async () => {
+    const confirm = vi.fn<Window["confirm"]>();
+    const discard = vi.fn();
+
+    // Set nav guard to simulate unsaved Config edits.
+    navGuard.current = { dirtyCount: 3, discard, dirtySections: new Set(["daemon"]) };
+
+    vi.stubGlobal("confirm", confirm);
+    confirm.mockReturnValueOnce(false); // operator cancels
+
+    render(<Shell />);
+
+    // Navigate to Config first.
+    const configLink = screen.getByRole("link", { name: /Config rollback/i });
+    fireEvent.click(configLink);
+
+    // Try to navigate away to Dashboard.
+    const dashboardLink = screen.getByRole("link", { name: /Dashboard/i });
+    fireEvent.click(dashboardLink);
+
+    // Confirm must have been called with the dirty-count message.
+    expect(confirm).toHaveBeenCalledWith("Discard 3 unsaved changes in Config?");
+    // Discard must NOT have been called (operator cancelled).
+    expect(discard).not.toHaveBeenCalled();
+
+    // Clean up.
+    navGuard.current = null;
+    vi.unstubAllGlobals();
+  });
+
+  it("confirms nav-away and discards when operator approves", async () => {
+    const confirm = vi.fn<Window["confirm"]>();
+    const discard = vi.fn();
+
+    navGuard.current = { dirtyCount: 1, discard, dirtySections: new Set(["daemon"]) };
+
+    vi.stubGlobal("confirm", confirm);
+    confirm.mockReturnValueOnce(true); // operator approves
+
+    render(<Shell />);
+
+    // Navigate to Config first.
+    fireEvent.click(screen.getByRole("link", { name: /Config rollback/i }));
+    // Navigate away to Events.
+    fireEvent.click(screen.getByRole("link", { name: /Events live/i }));
+
+    // Confirm must have been called.
+    expect(confirm).toHaveBeenCalledWith("Discard 1 unsaved change in Config?");
+    // Discard must have been called.
+    expect(discard).toHaveBeenCalledOnce();
+
+    navGuard.current = null;
+    vi.unstubAllGlobals();
   });
 });

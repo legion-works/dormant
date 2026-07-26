@@ -986,7 +986,7 @@ describe("Config tab-switch guard", () => {
       expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
     });
 
-    const { navGuard } = await import("../app/views/Config");
+    const { navGuard } = await import("../app/navGuard");
     await waitFor(() => {
       expect(navGuard.current).not.toBeNull();
     });

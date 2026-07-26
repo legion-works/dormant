@@ -354,7 +354,7 @@ fn ddc_gate() -> std::sync::MutexGuard<'static, ()> {
 /// error:"`, `"Service not found"`, `"Display location not found"` are
 /// transport; `"DDC/CI error:"` is protocol.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn is_transport_error(err_msg: &str) -> bool {
+pub(crate) fn is_transport_error(err_msg: &str) -> bool {
     // If it's specifically a DDC/CI protocol error (not I2C), the handle is
     // healthy — only the feature is absent.
     if err_msg.contains("DDC/CI error:") && !err_msg.contains("I2C error") {

@@ -850,6 +850,7 @@ impl App {
             config_rx.clone(),
             hook_engine,
             front_ctl_tx.clone(),
+            coordination.clone(),
         ));
 
         let spawn = spawn_generation(
@@ -3319,7 +3320,10 @@ async fn assemble_static(
         }
 
         let effective = executor.effective_modes();
-        let chosen = if effective.contains(&dc.primary_blank_mode()) {
+        let chosen = if !dc.has_controller_stage() {
+            // Render-only ladder: no hardware mode to validate.
+            dc.primary_blank_mode()
+        } else if effective.contains(&dc.primary_blank_mode()) {
             dc.primary_blank_mode()
         } else if let Some(degraded) = dc.degraded_mode.filter(|d| effective.contains(d)) {
             tracing::warn!(
@@ -6048,6 +6052,88 @@ mod macos_gamma_black_assembly_tests {
                 e.to_string().contains("E_MODE_UNSUPPORTED"),
                 "expected E_MODE_UNSUPPORTED, got: {e}"
             ),
+        }
+    }
+
+    /// #122: a render-only ladder (no Controller stage) must pass assembly
+    /// even when the hardware controllers don't support `PowerOff` — the
+    /// phantom `PowerOff` validation should be skipped.
+    #[tokio::test]
+    async fn render_only_ladder_passes_assembly_without_hardware_power_off_support() {
+        use dormant_core::config::schema::DisplayConfig;
+        use dormant_core::types::{LadderStage, StageKind};
+
+        let display = DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
+            controllers: vec!["command".into()],
+            blank_mode: None,
+            degraded_mode: None,
+            // Render-only ladder — no Controller stage.
+            ladder: vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: None,
+            }],
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: Some("/bin/true".into()),
+            wake_command: Some("/bin/true".into()),
+            // The command controller only supports BrightnessZero, not PowerOff.
+            modes: Some(vec![BlankMode::BrightnessZero]),
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 80,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
+        };
+        let mut displays = IndexMap::new();
+        displays.insert("panel".to_string(), display);
+
+        let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays,
+            rules: IndexMap::new(),
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            watchdog: WatchdogConfig::default(),
+            audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+        };
+        let creds = Credentials::default();
+        let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
+        let ctx = ControllerBuildContext::new(
+            PanelLocks::new(),
+            std::env::temp_dir().join("dormantd-render-only-test"),
+        );
+
+        #[cfg(feature = "render")]
+        let result = assemble_static(cfg, creds, &source_builder, None, &ctx).await;
+        #[cfg(not(feature = "render"))]
+        let result = assemble_static(cfg, creds, &source_builder, &ctx).await;
+
+        // Render-only ladder should NOT fail with E_MODE_UNSUPPORTED.
+        match result {
+            Ok(_) => {} // pass
+            Err(e) => {
+                panic!("render-only ladder should pass assembly, but got: {e}");
+            }
         }
     }
 }

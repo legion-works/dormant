@@ -1253,6 +1253,15 @@ impl DisplayConfig {
         BlankMode::PowerOff
     }
 
+    /// True when the normalised ladder contains at least one
+    /// `Controller` stage (render-only ladders have none).
+    #[must_use]
+    pub fn has_controller_stage(&self) -> bool {
+        self.normalized_ladder()
+            .iter()
+            .any(|s| matches!(s.kind, StageKind::Controller(_)))
+    }
+
     /// True when this display is capable of software rendering: at least
     /// one controller is local (`kwin-dpms`, `ddcci`, or `command`) and
     /// the controller list is not composed SOLELY of remote controllers

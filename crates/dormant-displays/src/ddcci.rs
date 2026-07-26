@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dormant_core::error::{DormantError, E_DISPLAY_IO};
@@ -278,6 +279,11 @@ impl DisplayController for DdcciController {
     }
 
     async fn probe(&mut self) -> Result<(), DormantError> {
+        // Retry knobs for the D6 detection probe — declared as items
+        // before any statement to satisfy clippy::items-after-statements.
+        const D6_RETRIES: usize = 3;
+        const D6_RETRY_BACKOFF_MS: u64 = 50;
+
         // Order matters (spec §4.3): enumerate → match → derive the
         // canonical key → resolve THIS panel's lock → only then touch the
         // bus. Deriving the key before any transaction means every VCP
@@ -296,12 +302,25 @@ impl DisplayController for DdcciController {
 
         // Test D6 power control support — the first physical VCP
         // transaction, always at command priority (probe is a one-time
-        // startup call, never periodic sampling).
-        let d6_ok = self
-            .ops
-            .get_vcp(&matched, VCP_POWER, &panel_lock, VcpPriority::Command)
-            .await
-            .is_ok();
+        // startup call, never periodic sampling). Retry up to 2 extra times
+        // (3 total) with a short backoff: a single transient VCP read error
+        // under DDC bus contention (e.g. concurrent 0x60 coordination poll)
+        // should not permanently drop PowerOff from supported_modes().
+
+        let mut d6_ok = false;
+        for attempt in 0..D6_RETRIES {
+            let result = self
+                .ops
+                .get_vcp(&matched, VCP_POWER, &panel_lock, VcpPriority::Command)
+                .await;
+            if result.is_ok() {
+                d6_ok = true;
+                break;
+            }
+            if attempt + 1 < D6_RETRIES {
+                tokio::time::sleep(Duration::from_millis(D6_RETRY_BACKOFF_MS)).await;
+            }
+        }
 
         if d6_ok {
             tracing::info!(
@@ -606,7 +625,16 @@ impl DisplayController for DdcciController {
     ///
     /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is
     /// therefore conditional on an immediate command-priority readback of the requested value.
+    /// The readback is retried up to `VERIFY_READBACK_MAX_ATTEMPTS` times with a
+    /// `VERIFY_READBACK_RETRY_DELAY` delay between attempts because the DDC bus on shared
+    /// panels often garbles the verification read despite the write having succeeded (issue #138).
+    /// A clean read carrying the wrong value is a genuine failure and returns immediately — only
+    /// transport-level errors are retried, so a silently-ignored write is still detected.
     async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
+        // Retry constants for the verification readback (issue #138).
+        const VERIFY_READBACK_MAX_ATTEMPTS: u32 = 3;
+        const VERIFY_READBACK_RETRY_DELAY: Duration = Duration::from_millis(200);
+
         let (ident, lock) = {
             let state = self.state.lock().unwrap();
             match (&state.matched_ident, &state.panel_lock) {
@@ -634,36 +662,57 @@ impl DisplayController for DdcciController {
                 error: format!("{E_DISPLAY_IO}: failed to set input source: {error}"),
             })?;
 
-        let readback = self
-            .ops
-            .get_vcp(&ident, VCP_INPUT_SOURCE, &lock, VcpPriority::Command)
-            .await
-            .map_err(|error| CmdFailure {
-                controller: Self::NAME.to_string(),
-                error: format!(
-                    "{E_DISPLAY_IO}: input-source write verification read failed on {ident}: {error}"
-                ),
-            })?;
-        let (verified, expected) = match target.expected_readback {
-            InputSourceReadback::Exact(expected) => (
-                readback == u16::from(expected),
-                format!("Exact(0x{expected:02x})"),
-            ),
-            InputSourceReadback::DifferentFrom(local) => (
-                readback != u16::from(local),
-                format!("DifferentFrom(0x{local:02x})"),
-            ),
-        };
-        if !verified {
-            return Err(CmdFailure {
-                controller: Self::NAME.to_string(),
-                error: format!(
-                    "{E_DISPLAY_IO}: input-source write verification mismatch on {ident}: wrote 0x{write_code:02x}, expected {expected}, observed 0x{readback:02x}",
-                    write_code = target.write_code,
-                ),
-            });
+        // Verification readback with retry — transport-level read failures
+        // (bus noise, concurrent DDC traffic) are retried; a semantic mismatch
+        // (clean read but wrong value) fails immediately without retry.
+        let mut last_error: Option<String> = None;
+        for attempt in 0..VERIFY_READBACK_MAX_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(VERIFY_READBACK_RETRY_DELAY).await;
+            }
+            match self
+                .ops
+                .get_vcp(&ident, VCP_INPUT_SOURCE, &lock, VcpPriority::Command)
+                .await
+            {
+                Ok(readback) => {
+                    let (verified, expected) = match target.expected_readback {
+                        InputSourceReadback::Exact(expected) => (
+                            readback == u16::from(expected),
+                            format!("Exact(0x{expected:02x})"),
+                        ),
+                        InputSourceReadback::DifferentFrom(local) => (
+                            readback != u16::from(local),
+                            format!("DifferentFrom(0x{local:02x})"),
+                        ),
+                    };
+                    if !verified {
+                        // Clean read but wrong semantic value — genuine failure, no retry.
+                        return Err(CmdFailure {
+                            controller: Self::NAME.to_string(),
+                            error: format!(
+                                "{E_DISPLAY_IO}: input-source write verification mismatch on {ident}: wrote 0x{write_code:02x}, expected {expected}, observed 0x{readback:02x}",
+                                write_code = target.write_code,
+                            ),
+                        });
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    // Cache the last error for the final failure message.
+                    last_error = Some(error);
+                }
+            }
         }
-        Ok(())
+
+        // All verification read attempts failed.
+        let error = last_error.unwrap_or_else(|| "unknown".to_string());
+        Err(CmdFailure {
+            controller: Self::NAME.to_string(),
+            error: format!(
+                "{E_DISPLAY_IO}: input-source write verification read failed on {ident} after {VERIFY_READBACK_MAX_ATTEMPTS} attempts: {error}"
+            ),
+        })
     }
 
     /// Read the panel's cumulative usage-hours counter (VCP `0xC0`,
@@ -1035,6 +1084,42 @@ mod tests {
         assert!(
             !ctrl2.supported_modes().contains(&BlankMode::PowerOff),
             "PowerOff should NOT be in supported_modes when D6 is unsupported"
+        );
+    }
+
+    /// #123: a single transient VCP read failure (e.g. bus contention from
+    /// a concurrent coordination poll) should not permanently drop `PowerOff`
+    /// from `supported_modes()`. The probe retries D6 detection up to 3×
+    /// with 50 ms backoff.
+    #[tokio::test]
+    async fn probe_detects_d6_after_transient_failure() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        // First call: transient failure (bus contention).
+        // Second call: succeeds (bus clear).
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("DDC/CI read failure".into()));
+            f.expect_get(ident, VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        {
+            let state = ctrl.state.lock().unwrap();
+            assert!(
+                state.d6_supported,
+                "D6 should be detected after retry on transient failure"
+            );
+        }
+        assert!(
+            ctrl.supported_modes().contains(&BlankMode::PowerOff),
+            "PowerOff should be in supported_modes after retry"
         );
     }
 
@@ -2194,7 +2279,22 @@ mod tests {
         ctrl.probe().await.unwrap();
         let _ = fake.take_call_log();
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
-        fake.expect_get(ident, VCP_INPUT_SOURCE, Err("transient read error".into()));
+        // Three failed readbacks exhaust all retry attempts.
+        fake.expect_get(
+            ident,
+            VCP_INPUT_SOURCE,
+            Err("DDC/CI I2C error: bus timeout".into()),
+        );
+        fake.expect_get(
+            ident,
+            VCP_INPUT_SOURCE,
+            Err("DDC/CI I2C error: bus timeout".into()),
+        );
+        fake.expect_get(
+            ident,
+            VCP_INPUT_SOURCE,
+            Err("DDC/CI I2C error: bus timeout".into()),
+        );
 
         let error = ctrl
             .write_input_source(InputSourceTarget {
@@ -2207,9 +2307,104 @@ mod tests {
         assert!(
             error
                 .error
-                .contains("input-source write verification read failed")
+                .contains("input-source write verification read failed"),
+            "error must mention verification read failure: {}",
+            error.error
         );
-        assert!(error.error.contains("transient read error"));
+        assert!(
+            error.error.contains("after 3 attempts"),
+            "error must report retry count: {}",
+            error.error
+        );
+    }
+
+    /// A transport-level read failure is retried; a clean read on the second
+    /// attempt verifies successfully — the write is reported as `Ok`.
+    #[tokio::test(start_paused = true)]
+    async fn write_input_source_retries_verification_read_and_succeeds() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
+        // First readback fails (transport), second succeeds.
+        fake.expect_get(
+            ident,
+            VCP_INPUT_SOURCE,
+            Err("DDC/CI I2C error: bus timeout".into()),
+        );
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x10));
+
+        ctrl.write_input_source(InputSourceTarget {
+            write_code: 0x10,
+            expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 16)"),
+                format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+                format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+            ]
+        );
+    }
+
+    /// A clean read that returns a semantically wrong value fails immediately —
+    /// no retries are wasted on a panel that genuinely disagrees.
+    #[tokio::test(start_paused = true)]
+    async fn write_input_source_fails_immediately_on_semantic_mismatch_no_retry() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f
+        });
+        let locks = PanelLocks::new();
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
+        // Clean read but wrong value — must fail immediately without retry.
+        fake.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x0f));
+
+        let error = ctrl
+            .write_input_source(InputSourceTarget {
+                write_code: 0x10,
+                expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.error.contains("verification mismatch"));
+        // Only one get_vcp call — no retry on semantic mismatch.
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                format!("set_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X}, 16)"),
+                format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
+            ]
+        );
     }
 
     #[tokio::test]

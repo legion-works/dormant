@@ -168,15 +168,39 @@ notice — it learns from its own poll afterward and fires the
 
 ### Hook environment
 
+Hook commands run in a deliberately minimal environment — the daemon's
+build environment and unrelated secrets must not leak into a hook child.
+
 Every hook command receives:
 
-| Variable | Meaning |
-|---|---|
-| `DORMANT_DISPLAY` | Config display id |
-| `DORMANT_DISPLAY_IDENTITY` | Claim identity (`manufacturer:model[:serial]`) |
-| `DORMANT_DIRECTION` | `acquire` or `release` or `observed_loss` |
-| `DORMANT_PHASE` | `before` or `after` |
-| `DORMANT_PEER` | Peer's instance id (not display name) |
+| Variable | Source | Meaning |
+|---|---|---|
+| `PATH` | hard-coded | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` — the daemon's PATH is never inherited |
+| `HOME` | daemon | Inherited so `~` resolution works |
+| `WAYLAND_DISPLAY` | daemon (if set) | Wayland compositor socket |
+| `XDG_RUNTIME_DIR` | daemon (if set) | Per-user runtime directory |
+| `DISPLAY` | daemon (if set) | X11 display (XWayland) |
+| `XDG_SESSION_TYPE` | daemon (if set) | `wayland` or `x11` |
+| `DBUS_SESSION_BUS_ADDRESS` | daemon (if set) | User D-Bus session bus |
+| `DORMANT_DISPLAY` | context | Config display id |
+| `DORMANT_DISPLAY_IDENTITY` | context | Claim identity (`manufacturer:model[:serial]`) |
+| `DORMANT_DIRECTION` | context | `acquire` or `release` or `observed_loss` |
+| `DORMANT_PHASE` | context | `before` or `after` |
+| `DORMANT_PEER` | context | Peer's instance id (not display name) |
+| `DORMANT_FALLBACK` | context | `0` or `1` — whether this slot is firing on the fallback path |
+| `DORMANT_ABORTED` | context | `0` or `1` — whether this is a write-failure compensation channel |
+
+Nothing else is inherited. If the daemon does not have a session var (e.g.
+`WAYLAND_DISPLAY` on a non-Wayland session), it is simply absent from the
+child — no empty-string injection.
+
+**A `blocking = true` `before_acquire` hook is an abort gate.** If the hook
+fails for any reason (non-zero exit, timeout, spawn failure, missing binary),
+the switch is cancelled and `claim_acquire_aborted` is logged. An
+environmentally-broken hook is therefore a correctness risk — verify your
+hook commands run successfully under the hook environment before deploying.
+See [Signal-presence law](#signal-presence-law) for why the
+`before_acquire` wake-and-verify slot is load-bearing.
 
 ### Scheduling and idempotence
 

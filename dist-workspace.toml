@@ -40,7 +40,7 @@ post-announce-jobs = ["./publish-aur"]
 # Generate checksums for release artifacts
 checksums = true
 # Verify packaged Linux binaries actually run before publishing (#38)
-global-artifacts-jobs = ["./release-artifact-smoke"]
+global-artifacts-jobs = ["./release-artifact-smoke", "./release-changelog-gate"]
 # Build with the web UI embedded. The release CI must build the frontend
 # dist before the Rust build so rust-embed can bundle the real SPA.
 # The github-build-setup snippet handles Node + npm ci + npm run build.

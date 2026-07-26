@@ -233,6 +233,7 @@ fn fake_direct_switch_with(
         config_rx,
         hook_engine,
         ctl_tx,
+        None,
     ))
 }
 

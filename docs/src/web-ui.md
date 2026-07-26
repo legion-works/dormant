@@ -1,5 +1,29 @@
 # Web UI
 
+**What this gives you.** Live state, blank/wake controls, config editor,
+panel-wear tracking, doctor diagnostics, and Samsung pairing — all on a
+loopback-only HTTP/WS bridge with a built-in SPA. No separate web server or
+static-file host is needed.
+
+**When to use it.** You want to drive the daemon from a browser instead of a
+CLI, or change config without editing the TOML file. Not for remote access —
+the web server binds loopback-only by default and has no authentication layer.
+
+**Quick setup.** Build with `--features web-ui`, set `daemon.web_port`, and
+open the bound address:
+
+```toml
+[daemon]
+web_port = 8080
+web_bind = "127.0.0.1"
+```
+
+```bash
+dormantctl status   # confirms the daemon is running with the web UI enabled
+```
+
+---
+
 dormant serves an optional web dashboard for live state, control, config editing, panel-wear tracking, failure state, and doctor reports. The SPA is embedded in `dormantd`; it needs no separate static-file server.
 
 ## Enabling
@@ -45,7 +69,7 @@ The server validates the `Host` header on every request. Requests with a `Host` 
 
 ### Origin (CSRF) guard
 
-Every `POST` must carry `Content-Type: application/json`. Beyond that, two different Origin checks apply depending on the route. Most write routes (`/api/blank`, `/api/wake`, `/api/pause`, `/api/resume`, `/api/reload`, `/api/doctor`) accept a same-origin request *or* one with no Origin header at all — a deliberately narrower posture, acceptable for routes that toggle running state rather than write config or credentials. Two routes carry a **strict** check instead: `POST /api/config/apply` and `POST /api/pair/samsung`. On these, the Origin header must be present and must match the bound loopback address and port exactly; an absent Origin is rejected. This closes the classic form-POST/no-Origin CSRF gap for the two routes that write to disk. A residual, honestly stated: a browser extension holding a loopback host permission isn't necessarily bound by page-Origin rules the same way ordinary page script is — a known gap, not claimed defended.
+Every `POST` must carry `Content-Type: application/json`. Beyond that, two different Origin checks apply depending on the route. Most write routes (`POST /api/blank`, `POST /api/wake`, `POST /api/switch`, `POST /api/push`, `POST /api/pause`, `POST /api/resume`, `POST /api/reload`, `POST /api/doctor`) accept a same-origin request *or* one with no Origin header at all — a deliberately narrower posture, acceptable for routes that toggle running state rather than write config or credentials. Two routes carry a **strict** check instead: `POST /api/config/apply` and `POST /api/pair/samsung`. On these, the Origin header must be present and must match the bound loopback address and port exactly; an absent Origin is rejected. This closes the classic form-POST/no-Origin CSRF gap for the two routes that write to disk. A residual, honestly stated: a browser extension holding a loopback host permission isn't necessarily bound by page-Origin rules the same way ordinary page script is — a known gap, not claimed defended.
 
 ### What this defends, and what it doesn't
 
@@ -71,7 +95,7 @@ Each sensor row shows its id, type, state, and last-seen age. An unavailable sen
 
 ### Displays
 
-A per-display card list. Each card shows a screen preview glyph (ON / grace / … / OFF / wake), phase and paused/inhibited status chips, the blank mode label, the driving zone and rule, the command generation counter, and the controller chain rendered as HealthChips (each controller's name, role — primary/fallback — and health status). Action buttons let the operator force-blank, force-wake, and pause or resume the governing rule.
+A per-display card list. Each card shows a screen preview glyph (ON / grace / … / OFF / wake), phase and paused/inhibited status chips, the blank mode label, the driving zone and rule, the command generation counter, and the controller chain rendered as HealthChips (each controller's name, role — primary/fallback — and health status). Action buttons let the operator force-blank, force-wake, and pause or resume the governing rule. Shared displays additionally show **Switch to here** (PULL — writes the local input code via `POST /api/switch`) and **Send to peer** (PUSH — writes the peer's code via `POST /api/push`; visible only when `shared_peer_input_write_code` is configured). Both routes go through the same-origin weak-origin check.
 
 ### Events
 

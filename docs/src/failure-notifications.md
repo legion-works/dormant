@@ -1,5 +1,31 @@
 # Failure notifications
 
+**What this gives you.** Three coordinated surfaces — desktop notification
+(session D-Bus, critical urgency), tray `Failure` state, and web failure
+banner — for wake and blank failures.
+
+**When to use it.** A wake keeps failing and you want a persistent notice, or
+you suspect the desktop popup is being swallowed by the notification daemon
+(the tray and web banner do not depend on D-Bus). Disable desktop
+notifications with `notifications.enabled = false`; the tray and web surfaces
+are unaffected.
+
+**Quick setup.** Notifications fire automatically when the per-display counter
+hits the threshold. Verify the daemon can reach the session bus:
+
+```toml
+[notifications]
+enabled = true
+wake_attempt_threshold = 3
+cooldown = "15m"
+```
+
+```bash
+dormantctl status   # confirm the daemon is running
+```
+
+---
+
 When a wake command keeps failing or a blank command exhausts its controller
 chain, dormant surfaces the failure in three places:
 

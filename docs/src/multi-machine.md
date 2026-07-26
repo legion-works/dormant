@@ -1,5 +1,25 @@
 # Multi-machine KVM switching
 
+**What this gives you.** Two machines, one OLED: pull the panel to whichever
+one you are using with a hotkey, the tray, the CLI, or the web — no pairing,
+no network protocol. Each machine writes its own input code directly over its
+DDC bus; ownership is observed from VCP `0x60` polling, not negotiated.
+
+**When to use it.** You have one good panel connected to two machines (or one
+machine and one console) and would rather not buy a KVM. Not for you if you
+have a real KVM or a dedicated video matrix with stable EDID-controlled
+switching, or if either machine lacks a DDC/CI-capable output.
+
+**Quick setup.** Add `scope = "shared"`, `shared_input_code`, and
+`shared_input_write_code` to both ends; add `shared_peer_input_code` for push
+support. Verify each machine can read and write VCP `0x60`:
+
+```bash
+dormantctl doctor ddcci
+```
+
+---
+
 One physical monitor can serve two `dormant` instances through a KVM or a
 multi-input panel. Mark that display `shared` on both machines and give each
 machine its own input-source code. Selection is a direct local DDC write —
@@ -72,6 +92,13 @@ own `shared_input_write_code` to the panel's VCP `0x60`.
 Pulls are always safe: the acting machine is awake, its output is driving
 signal, and the write lands.
 
+```bash
+# Pull the panel to this machine (write my input code)
+dormantctl switch shared_oled
+# Push the panel to the peer (write the peer's code; requires shared_peer_input_write_code)
+dormantctl switch shared_oled --to-peer
+```
+
 ### PUSH — write the peer's input code
 
 `dormantctl switch <display> --to-peer` and the web UI "Send to peer" button
@@ -104,18 +131,30 @@ Ownership is a **local observation** of what the panel reports — the daemon
 never broadcasts "I own the panel" to a peer, and nothing consults ownership
 before writing.
 
-The poller debounces both gain and loss through `loss_confirmations` (default
-`3`) consecutive agreeing reads. A differing garbled code resets the pending
-transition; a read failure holds the prior verdict. This defends against
-cross-machine DDC collisions returning the same wrong code N times (issue #134).
+Ownership **gain** and **loss** are debounced differently depending on the path:
 
-With defaults, a genuine input switch takes ~6 seconds to commit (`2s` × 3).
-During that window the old owner still believes it owns the panel and may
-issue a blank; the new owner reads "mine" on its next poll, commits the gain
-eagerly, and wakes the panel. The old owner's blank can land on top of the
-new owner's wake, producing a short visible flicker if presence/absence
-transitions happen to align. Operators who cannot tolerate that window can
-lower `loss_confirmations` toward `1` at the cost of flap-susceptibility.
+- **Gain observed by the poll** follows the same `loss_confirmations` (default
+  `3`) consecutive agreeing reads as loss — a single "mine" reading does not
+  immediately commit ownership. This defends against cross-machine DDC
+  collisions returning the same wrong code N times (issue #134).
+- **Gain from a verified local pull** (`dormantctl switch`, tray, web, hotkey,
+  activity follow) calls `mark_owned_immediate` after the write-verification
+  readback confirms the panel moved — the machine has first-hand proof of
+  ownership, so the poll's debounce is bypassed. There is no ~7.5 s wake lag on
+  the acquiring side (`coordination.rs:305`, `direct_switch.rs:258`).
+- **Loss** is always debounced through `loss_confirmations` consecutive "not
+  mine" reads. With defaults a loss takes ~6 seconds to commit (`2s` × 3).
+  During that window the old owner still believes it owns the panel and may
+  issue a blank that can land on top of the new owner's wake. Lower
+  `loss_confirmations` toward `1` to shrink the window at the cost of
+  flap-susceptibility.
+
+A read whose observed code is **neither** the local nor the peer input code is
+treated as a transport failure — the prior verdict is held and the debounce
+counter is not incremented. Only observations that classify as `Local`,
+`Peer`, or a definite debounce-influencing pattern reach the state machine
+(`coordination_poll.rs:124-137`, issue #138 part B). A read failure also
+holds the prior verdict.
 
 ### Convergence, not mutual exclusion
 
@@ -204,9 +243,12 @@ See [Signal-presence law](#signal-presence-law) for why the
 
 ### Scheduling and idempotence
 
-Entries declared `blocking = true` (the slot default) run to completion and
-block the next phase; non-blocking entries are spawned and the phase continues
-immediately. Hooks are bounded by their per-entry `timeout` (default `5s`),
+The `blocking` default is phase-dependent: `before_*` slots default to
+blocking, `after_*` slots default to fire-and-forget
+(`hooks.rs::default_blocking_for`). `on_observed_loss` is an `after_*` slot
+and therefore defaults to non-blocking. Entries declared `blocking = true` run
+to completion and block the next phase; non-blocking entries are spawned and
+the phase continues immediately. Hooks are bounded by their per-entry `timeout` (default `5s`),
 not cancellable mid-run. Hook commands must be idempotent — check
 `DORMANT_DIRECTION` and `DORMANT_PHASE` in the environment to decide whether
 to act or skip.
@@ -273,7 +315,7 @@ any key within it) has no effect without a shared display.
 |---|---|---|---|
 | `poll_interval` | duration | `"2s"` | Shared-display ownership poll cadence (VCP `0x60`); minimum `"1s"`. |
 | `state_poll_interval` | duration | unset | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics. When unset, defaults to `max(30s, poll_interval)`; when set, must be `>= poll_interval`. Ownership still polls at `poll_interval`; only panel state refreshes here, to cut per-transaction i2c traffic. |
-| `loss_confirmations` | integer | `3` | Consecutive agreeing "not mine" VCP `0x60` readings required before the cached ownership verdict flips `true → false`. Defends against garbled reads from concurrent cross-machine DDC traffic (issue #134). Validated `1..=10`. Ownership *gain* stays eager — waking on a possibly-wrong "I own" read is idempotent and the next poll re-confirms. |
+| `loss_confirmations` | integer | `3` | Consecutive agreeing VCP `0x60` readings required before the cached ownership verdict flips — symmetric for gain and loss. Defends against garbled reads from concurrent cross-machine DDC traffic (issue #134). Validated `1..=10`. A verified local pull marks ownership immediately (the machine has first-hand proof), so `loss_confirmations` only governs the poll-observed transitions. |
 | `activity_follow` | boolean | `false` | When `true`, a genuine local activity edge (keyboard, mouse, tablet) pulls a shared display to this machine after `arm_after` idle. |
 | `arm_after` | duration | `"7s"` | Grace window after receiving a local arm before the pull commits (only meaningful when `activity_follow = true`). |
 | `cooldown` | duration | `"3s"` | Minimum interval between successive activity-driven pulls. Hotkeys, CLI, tray, and web bypass this — an explicit operator action is never swallowed. |
@@ -321,9 +363,11 @@ on_observed_loss = [
 - Two daemons polling the **same** physical panel will see occasional
   successful-but-wrong reads on each other's bus traffic. The
   `loss_confirmations` debounce holds the prior verdict on a stray "not mine"
-  reading; `coord_poll_disagreement` (when consecutive observations disagree)
-  and `coord_ownership_loss_deferred` (when the pending counter is below the
-  threshold) are emitted as literal anchors so the operator can see the bus is
+  reading; `coord_poll_disagreement` (when consecutive observations disagree),
+  `coord_ownership_loss_deferred` (when the pending loss counter is below the
+  threshold), and `coord_ownership_gain_deferred` (when the pending gain
+  counter is in flight — the symmetric counterpart to the loss-deferred signal)
+  are emitted as literal anchors so the operator can see the bus is
   dirty without parsing the verdict cache.
 - The debounce reduces but does not eliminate false losses. If cross-machine
   DDC collisions return the same wrong code N times in a row, a false loss can
@@ -345,6 +389,7 @@ to `true`.
 endpoints become reachable from the LAN:
 
 - `POST /api/switch` — switch display input
+- `POST /api/push` — push the panel to the peer (write the peer input code; requires `shared_peer_input_write_code`)
 - `POST /api/blank` — blank the panel
 - `POST /api/wake` — wake the panel
 - `POST /api/pause` / `POST /api/resume` — pause or resume rule processing

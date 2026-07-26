@@ -70,6 +70,8 @@ The LD2410C divides its detection space into 9 gates. Each defaults to a 75 cm r
 
 Setting per-gate thresholds is necessary but **not sufficient** to fix close-range seated detection on its own — the gate 0/1 hardware limit and the re-arm quirk remain. The energy-gated template is the primary mitigation; per-gate thresholds fine-tune the radar for the gate range where the occupant actually sits.
 
+**Calibrating the floor and gates.** The most reliable tuning method is a marked-scenario data run: record still-energy values for each scenario (away, seated, standing, couch, walking) with the sensor in its final position. Compare the per-scenario distributions and set the still-energy floor between the worst-seated-still measurement and the best-absent measurement, leaving margin on both sides. When a couch or sofa sits behind the desk, prefer cutting the max still gate over raising the floor — stopping the radar from reporting targets beyond the desk in-hardware prevents false presence at the source and stabilizes the reported detection distance against far-wall echoes.
+
 **Switching an existing sensor over to `desk_seated`.** The template publishes on its
 own MQTT topic, so an existing `[sensors.*]` block keeps reading the old
 distance-gated entity until you repoint it. After reflashing, confirm the new

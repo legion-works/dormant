@@ -176,6 +176,10 @@ number:
     max_move_distance_gate:
       name: "${friendly_name} Max Move Gate"
     max_still_distance_gate:
+      # Lowering this gate to just past the chair (e.g. 2 = 225 cm for a
+      # desk) masks people on furniture behind the desk at the source — the
+      # chip stops reporting still targets beyond the gate, which also
+      # stabilizes detection_distance against far-wall echo jumps.
       name: "${friendly_name} Max Still Gate"
     # Per-gate sensitivity thresholds (0-100). Lower = more sensitive.
     # Gate 0/1 still thresholds exist in YAML but are not settable in
@@ -234,13 +238,15 @@ number:
     min_value: 0.5
     max_value: 6.0
     step: 0.25
-    initial_value: 2.5
+    initial_value: 1.6
     optimistic: true
     restore_value: true
   # Still-energy floor: when still_energy exceeds this value the desk is
   # considered occupied regardless of the LD2410's reported presence flags
-  # or detection_distance. Set by watching the empty-room energy baseline
-  # (typically 3-5) and the occupied baseline (typically 40+).
+  # or detection_distance. Calibrate by recording still-energy per scenario
+  # (away / seated / standing / couch) and picking a floor that splits the
+  # worst-present measurement from the best-absent measurement with margin.
+  # Typical baselines: empty-room 3-5, occupied 40+.
   - platform: template
     name: "${friendly_name} Still Energy Floor"
     id: still_energy_floor
@@ -250,7 +256,7 @@ number:
     min_value: 1
     max_value: 100
     step: 1
-    initial_value: 30
+    initial_value: 28
     optimistic: true
     restore_value: true
 

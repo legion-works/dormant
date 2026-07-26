@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-26
+
 ### Removed
 
 - The owner-mediated claim protocol (mDNS discovery, SPAKE2 pairing, Ed25519 signed frames, TCP transport, claim-engine state machine, peer store). Replaced by direct local DDC writes — each machine writes its own input code over its own DDC bus with no network protocol, peer connection, handshake, or crypto. See `docs/src/multi-machine.md`.
@@ -19,6 +21,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Surviving `[coordination]` keys: `poll_interval`, `state_poll_interval`, `loss_confirmations`, `activity_follow`, `arm_after`, `cooldown`.
 - New `on_observed_loss` hook slot: fires after the poller commits an ownership loss (post-hoc, fire-and-forget).
 - Activity-follow pulls are gated by `activity_follow` (default `false`), `arm_after` (default `7s`), and `cooldown` (default `3s`).
+
+### Fixed
+
+- Input-source write verification no longer reports `E_DISPLAY_IO` for a switch that succeeded. The readback is retried three times with a 200 ms delay on transport errors; a clean read carrying the wrong value still fails immediately, so a silently-ignored VCP `0x60` write is detected. Measured on a shared panel, the verification read garbles roughly one time in three ([#138](https://github.com/legion-works/dormant/issues/138)).
+- Coordination poll reads that decode outside the display's configured code set (`shared_input_code` / `shared_peer_input_code`) are treated as transport failures, holding the last verdict, instead of disagreements that reset the debounce. On the reference panel ~30% of reads under concurrent DDC access decode to a plausible-but-wrong input, including codes that exist in the panel's capability string ([#138](https://github.com/legion-works/dormant/issues/138)).
+- Exit codes for a failed switch now agree between the pull and push paths ([#138](https://github.com/legion-works/dormant/issues/138)).
+- A verified local pull feeds ownership immediately instead of waiting for the debounced poll to rediscover the machine's own write, removing ~7.5 s of visible wake lag on the acquiring machine. The debounce still governs loss and poll-observed gain; ownership remains an observation and the poll still causes no writes ([#139](https://github.com/legion-works/dormant/issues/139)).
+- Hook children inherit five session environment variables when present — `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DISPLAY`, `XDG_SESSION_TYPE`, `DBUS_SESSION_BUS_ADDRESS` — via a documented allowlist. Without them a compositor command such as `kscreen-doctor` aborts, so no such hook had ever executed successfully. `PATH` remains hard-coded ([#140](https://github.com/legion-works/dormant/issues/140)).
+- Both `hook_timeout` log arms now carry the `reason` field, which was previously discarded — a non-timeout failure could be logged as a timeout with no way to tell what actually failed ([#140](https://github.com/legion-works/dormant/issues/140)).
+- Render-only ladders are no longer reload-rejected with `E_MODE_UNSUPPORTED`. Hardware blank-mode validation is skipped when the normalised ladder contains no controller stage; ladders that contain one are validated unchanged ([#122](https://github.com/legion-works/dormant/issues/122)).
+- The DDC/CI D6 power-control probe retries three times with a 50 ms backoff, so a transient bus error no longer drops `PowerOff` from a display's supported modes for the lifetime of the generation ([#123](https://github.com/legion-works/dormant/issues/123)).
+- `dormantctl doctor --report-issue` writes a draft when the configuration fails to load, rendering a config-failed probe row and skipping the dependent probes, instead of producing nothing ([#117](https://github.com/legion-works/dormant/issues/117)).
+- The draft's configuration-validity line reflects only the config probe, rather than every probe result — a failing MQTT or DDC probe no longer makes the draft claim the configuration is invalid ([#116](https://github.com/legion-works/dormant/issues/116)).
+- MQTT usernames shorter than the minimum secret length are redacted in issue drafts. They are collected separately and re-injected after the length filter, so short strings in general are still not over-redacted ([#118](https://github.com/legion-works/dormant/issues/118)).
+- Draft files are created with `create_new` and a retry on collision, closing a check-then-write race where concurrent runs could overwrite each other's output ([#119](https://github.com/legion-works/dormant/issues/119)).
+
+### Added
+
+- The LD2410C example config exposes all 18 per-gate sensitivity thresholds (gates 0-8, moving and static), an energy-gated `desk_seated` presence template, and a tunable still-energy floor. Gates 0 and 1 have no settable static sensitivity in firmware, so a person sitting still within ~75 cm cannot be detected as a still target — per-gate tuning alone cannot fix close-range seated presence, and the energy-gated template is the mitigation. Requires reflashing the device and repointing the sensor's MQTT topic; see `docs/src/sensors.md` ([#135](https://github.com/legion-works/dormant/issues/135)).
 
 ## [0.6.0] - 2026-07-23
 
@@ -170,7 +191,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/legion-works/dormant/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/legion-works/dormant/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/legion-works/dormant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/legion-works/dormant/compare/v0.3.1...v0.4.0

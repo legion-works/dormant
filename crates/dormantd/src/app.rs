@@ -868,6 +868,7 @@ impl App {
             Some(self.observations.clone()),
             Some(idle_obs_tx.clone()),
             filtered_activity_tx.clone(),
+            &direct_switch,
         )?;
         self.observations
             .emit(DaemonObservation::GenerationStarted {
@@ -2087,6 +2088,7 @@ impl Runner {
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
             self.filtered_activity_tx.clone(),
+            &self.direct_switch,
         );
         // Test seam (F1): see `App::force_reload_spawn_failure` doc — no
         // config-only path reaches an `Err` here, so a test that needs to
@@ -2412,6 +2414,7 @@ impl Runner {
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
             self.filtered_activity_tx.clone(),
+            &self.direct_switch,
         );
         #[cfg(any(test, feature = "test-util"))]
         let spawn_result = if self.force_rebuild_old_spawn_failure {
@@ -3800,6 +3803,7 @@ fn spawn_generation(
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
+    direct_switch: &Arc<DirectSwitchHandle>,
 ) -> Result<GenSpawn> {
     let engine_token = root.child_token();
     let engine_cancel = engine_token.clone();
@@ -3856,6 +3860,7 @@ fn spawn_generation(
             executors_rx,
             state,
             cancel: producer_token.clone(),
+            direct_switch: Some(Arc::clone(direct_switch)),
         }));
     }
 
@@ -4054,6 +4059,7 @@ fn spawn_generation_for_reload(
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
+    direct_switch: &Arc<DirectSwitchHandle>,
 ) -> Result<GenSpawn> {
     #[cfg(any(test, feature = "test-util"))]
     record_reload_spawn_rollback_for_test(state_dir, rollback.as_ref());
@@ -4074,6 +4080,7 @@ fn spawn_generation_for_reload(
         observations,
         idle_tx,
         filtered_activity_tx,
+        direct_switch,
     )
 }
 

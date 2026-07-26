@@ -471,6 +471,8 @@ export interface HookSlots {
   after_release?: HookAction[];
   before_acquire?: HookAction[];
   after_acquire?: HookAction[];
+  /** Actions run after observing (via VCP 0x60 poll) that a peer pulled the panel. */
+  on_observed_loss?: HookAction[];
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */

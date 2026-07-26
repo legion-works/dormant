@@ -1840,6 +1840,7 @@ fn validate_hooks(
         ("after_release", &display.hooks.after_release),
         ("before_acquire", &display.hooks.before_acquire),
         ("after_acquire", &display.hooks.after_acquire),
+        ("on_observed_loss", &display.hooks.on_observed_loss),
     ];
     for (slot, actions) in slots {
         if display.scope != DisplayScope::Shared && !actions.is_empty() {

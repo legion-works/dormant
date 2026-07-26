@@ -84,6 +84,8 @@ use tracing::{debug, info, warn};
 pub enum Direction {
     Release,
     Acquire,
+    /// Post-hoc observation: the poll detected a peer pulled the panel.
+    ObservedLoss,
 }
 
 impl Direction {
@@ -93,6 +95,7 @@ impl Direction {
         match self {
             Self::Release => "release",
             Self::Acquire => "acquire",
+            Self::ObservedLoss => "observed_loss",
         }
     }
 }
@@ -307,6 +310,7 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
                         let event = match slot.context.direction {
                             Direction::Release => "claim_release_aborted",
                             Direction::Acquire => "claim_acquire_aborted",
+                            Direction::ObservedLoss => "observed_loss_aborted",
                         };
                         warn!(
                             event = %event,
@@ -1610,6 +1614,7 @@ mod tests {
     fn direction_and_phase_strings_match_spec() {
         assert_eq!(Direction::Release.as_str(), "release");
         assert_eq!(Direction::Acquire.as_str(), "acquire");
+        assert_eq!(Direction::ObservedLoss.as_str(), "observed_loss");
         assert_eq!(Phase::Before.as_str(), "before");
         assert_eq!(Phase::After.as_str(), "after");
     }
@@ -1695,10 +1700,12 @@ mod tests {
             let release_event = match Direction::Release {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
+                Direction::ObservedLoss => unreachable!(),
             };
             let acquire_event = match Direction::Acquire {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
+                Direction::ObservedLoss => unreachable!(),
             };
             captured.lock().unwrap().push(release_event.to_string());
             captured.lock().unwrap().push(acquire_event.to_string());

@@ -15,6 +15,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::direct_switch::DirectSwitchHandle;
+
 /// Dependencies required by the shared-display ownership poller.
 pub struct CoordinationPollDeps {
     /// Reloadable configuration, including the polling cadence and shared displays.
@@ -27,6 +29,9 @@ pub struct CoordinationPollDeps {
     pub state: CoordinationHandle,
     /// Daemon-lifetime cancellation token.
     pub cancel: CancellationToken,
+    /// Direct switch handle for firing post-hoc observed-loss hooks.
+    /// `None` in tests that don't need hook firing.
+    pub direct_switch: Option<Arc<DirectSwitchHandle>>,
 }
 
 /// Spawn the shared-display ownership poller.
@@ -173,9 +178,15 @@ async fn poll_once(
                 let _ = deps
                     .ctl_tx
                     .send(ControlMsg::OwnershipPoll {
-                        display: display_id,
+                        display: display_id.clone(),
                     })
                     .await;
+                // Post-hoc observed-loss hook: fires only on a committed
+                // LOSS (previous_owned == true).  Gain emits no acquire
+                // hook — the poll has no write authority.
+                if previous_owned && let Some(ref ds) = deps.direct_switch {
+                    ds.notify_observed_loss(&display_id).await;
+                }
             }
         } else {
             deps.state.record_failure(&display_id);
@@ -375,6 +386,7 @@ mod tests {
             executors_rx,
             state: state.clone(),
             cancel: cancel.clone(),
+            direct_switch: None,
         });
         (config_tx, executors_tx, ctl_rx, state, cancel)
     }
@@ -700,6 +712,7 @@ mod tests {
             executors_rx,
             state: CoordinationHandle::new([display]),
             cancel: CancellationToken::new(),
+            direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
         let mut last_state_read = HashMap::new();

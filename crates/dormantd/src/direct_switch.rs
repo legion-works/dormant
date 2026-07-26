@@ -132,6 +132,9 @@ fn slot_for(
         (Direction::Release, Phase::After) => &hooks.after_release,
         (Direction::Acquire, Phase::Before) => &hooks.before_acquire,
         (Direction::Acquire, Phase::After) => &hooks.after_acquire,
+        // ObservedLoss is not an initiator path — never reached through
+        // slot_for (the caller uses notify_observed_loss instead).
+        (Direction::ObservedLoss, _) => &[],
     }
 }
 
@@ -412,6 +415,41 @@ impl DirectSwitchHandle {
             HookOutcome::Aborted { reason, .. } => Some(reason),
         }
     }
+
+    /// Fire the post-hoc `on_observed_loss` hook for a display whose
+    /// ownership was lost to a peer (detected via VCP 0x60 poll).
+    ///
+    /// Fire-and-forget — a hook failure here must never trigger a
+    /// corrective DDC write or retry.  The poll path has no write
+    /// authority.
+    pub async fn notify_observed_loss(&self, display: &DisplayId) {
+        // Clone the actions Vec outside the watch::Ref borrow so the
+        // guard is dropped before the await (watch::Ref is !Send).
+        let actions: Vec<_> = {
+            let config = self.config.borrow();
+            let Some(dc) = config.displays.get(&display.0) else {
+                return;
+            };
+            dc.hooks.on_observed_loss.clone()
+        };
+        if actions.is_empty() {
+            return;
+        }
+        let display_name = display.0.clone();
+        let slot = HookSlot {
+            context: HookContext {
+                display: &display_name,
+                display_identity: "",
+                direction: Direction::ObservedLoss,
+                phase: Phase::After,
+                peer: "",
+                fallback: false,
+                aborted: false,
+            },
+            actions: &actions,
+        };
+        let _ = self.hooks.run_slot(slot).await;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -427,6 +465,7 @@ mod tests {
         WearConfig,
     };
     use dormant_core::types::CmdFailure;
+    use tokio::sync::Barrier;
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Test fakes
@@ -862,34 +901,145 @@ mod tests {
     //  Suppression-cleanup tests
     // ═══════════════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn suppression_set_and_cleared_on_success() {
-        let sink = Arc::new(FakeSink::new("ddcci"));
-        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
-        let handle = build_handle(display_config(), sink, noop_hook_engine(), front_ctl_tx);
-
-        let _ = handle.pull(display_id(), SwitchReason::Activity).await;
-
-        // Drain channel: first msg = SetClaimSuppression with Some(until),
-        // second msg = SetClaimSuppression with None (clear).
-        let mut saw_set = false;
-        let mut saw_clear = false;
-        while let Ok(msg) = front_ctl_rx.try_recv() {
+    /// Collect all suppression messages in order from the channel.
+    fn drain_suppression(
+        rx: &mut mpsc::Receiver<dormant_core::rules::ControlMsg>,
+    ) -> Vec<Option<Instant>> {
+        let mut msgs = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
             if let dormant_core::rules::ControlMsg::SetClaimSuppression { until, .. } = msg {
-                if until.is_some() {
-                    saw_set = true;
-                } else {
-                    saw_clear = true;
-                }
+                msgs.push(until);
             }
         }
+        msgs
+    }
 
-        assert!(saw_set, "suppression set message must be sent");
-        assert!(saw_clear, "suppression clear message must be sent");
+    /// A [`HookRunner`] that gates the `after_acquire` hook on a barrier
+    /// so the test can observe that the suppression clear was enqueued
+    /// BEFORE the hook completed.  Also records commands.
+    struct SignalHookRunner {
+        commands: Arc<Mutex<Vec<Vec<String>>>>,
+        gate: Arc<Barrier>,
+    }
+
+    impl SignalHookRunner {
+        fn new(gate: Arc<Barrier>) -> Self {
+            Self {
+                commands: Arc::new(Mutex::new(Vec::new())),
+                gate,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookRunner for SignalHookRunner {
+        async fn run_command(
+            &self,
+            _env: &crate::hooks::EnvList,
+            argv: &[String],
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            self.commands.lock().unwrap().push(argv.to_vec());
+            // Block until the test has observed the clear.
+            self.gate.wait().await;
+            Ok(())
+        }
+
+        async fn publish_mqtt(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            Ok(())
+        }
+    }
+
+    fn after_acquire_blocking_action() -> cs::HookAction {
+        cs::HookAction {
+            command: Some(vec!["after-acquire-hook".into()]),
+            mqtt: None,
+            timeout: Duration::from_secs(1),
+            blocking: Some(true),
+            abort_on_failure: false,
+        }
+    }
+
+    /// Assert the explicit `guard.clear()` on the success path fires
+    /// BEFORE the `after_acquire` hook — the suppression window ends
+    /// before hook side-effects, not after.
+    ///
+    /// A `Barrier` gates the hook's completion.  With `guard.clear()`
+    /// present, the clear is `try_send`-ed to the channel before the
+    /// hook reaches `barrier.wait()`, so the test receives it.
+    /// Without it, `guard.clear()` is absent → the hook blocks on the
+    /// barrier → the clear (from Drop) hasn't been sent yet → the
+    /// test's `recv()` times out.
+    #[tokio::test(start_paused = true)]
+    async fn suppression_clear_ordered_before_after_acquire_hook() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let gate = Arc::new(Barrier::new(2));
+        let runner = SignalHookRunner::new(Arc::clone(&gate));
+        let commands = runner.commands.clone();
+        let hook_engine = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+
+        let mut dc = display_config();
+        dc.hooks.after_acquire = vec![after_acquire_blocking_action()];
+        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, sink, hook_engine, front_ctl_tx);
+
+        // Subscribe BEFORE the call so no message is missed.
+        let pull_handle =
+            tokio::spawn(async move { handle.pull(display_id(), SwitchReason::Activity).await });
+
+        // First message: set.
+        let msg1 = front_ctl_rx
+            .recv()
+            .await
+            .expect("suppression set must arrive");
+        assert!(
+            matches!(
+                msg1,
+                dormant_core::rules::ControlMsg::SetClaimSuppression { until: Some(_), .. }
+            ),
+            "first msg must be set"
+        );
+
+        // The explicit clear must be enqueued BEFORE the hook reaches
+        // the barrier.  If guard.clear() is absent, the clear (from
+        // Drop) hasn't been sent yet because the hook is blocking.
+        let msg2 = tokio::time::timeout(Duration::from_secs(1), front_ctl_rx.recv())
+            .await
+            .expect("timeout waiting for clear — guard.clear() missing or reordered")
+            .expect("clear channel closed");
+        assert!(
+            matches!(
+                msg2,
+                dormant_core::rules::ControlMsg::SetClaimSuppression { until: None, .. }
+            ),
+            "second msg must be explicit clear"
+        );
+
+        // Release the hook so pull() can complete.
+        gate.wait().await;
+        let outcome = pull_handle.await.unwrap();
+        assert!(matches!(outcome, SwitchOutcome::Switched));
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            1,
+            "after_acquire hook fired"
+        );
+
+        // No extra suppression message (prove Drop didn't fire).
+        let trailing = drain_suppression(&mut front_ctl_rx);
+        assert!(
+            trailing.is_empty(),
+            "no extra suppression message after explicit clear + Drop (cleared flag)"
+        );
     }
 
     #[tokio::test]
-    async fn suppression_cleared_on_hook_abort() {
+    async fn suppression_set_then_exactly_one_clear_on_hook_abort() {
         let sink = Arc::new(FakeSink::new("ddcci"));
 
         let runner = crate::hooks::ScriptedHookRunner::new();
@@ -904,18 +1054,14 @@ mod tests {
         let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
         assert!(matches!(outcome, SwitchOutcome::HookAborted { .. }));
 
-        // Must see a clear message.
-        let mut saw_clear = false;
-        while let Ok(msg) = front_ctl_rx.try_recv() {
-            if let dormant_core::rules::ControlMsg::SetClaimSuppression { until: None, .. } = msg {
-                saw_clear = true;
-            }
-        }
-        assert!(saw_clear, "suppression must be cleared on hook abort");
+        let msgs = drain_suppression(&mut front_ctl_rx);
+        assert_eq!(msgs.len(), 2, "exactly one set + one clear on abort");
+        assert!(msgs[0].is_some(), "first msg: set");
+        assert!(msgs[1].is_none(), "second msg: explicit clear");
     }
 
     #[tokio::test]
-    async fn suppression_cleared_on_write_failure() {
+    async fn suppression_set_then_exactly_one_clear_on_write_failure() {
         let sink = Arc::new(FakeSink::new("ddcci"));
         sink.set_write_result(Err(CmdFailure {
             controller: "ddcci".into(),
@@ -928,13 +1074,33 @@ mod tests {
         let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
         assert!(matches!(outcome, SwitchOutcome::WriteFailed { .. }));
 
-        let mut saw_clear = false;
-        while let Ok(msg) = front_ctl_rx.try_recv() {
-            if let dormant_core::rules::ControlMsg::SetClaimSuppression { until: None, .. } = msg {
-                saw_clear = true;
-            }
+        let msgs = drain_suppression(&mut front_ctl_rx);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "exactly one set + one clear on write failure"
+        );
+        assert!(msgs[0].is_some(), "first msg: set");
+        assert!(msgs[1].is_none(), "second msg: explicit clear");
+    }
+
+    /// Prove Drop supplies a clear when explicit `clear()` is not called —
+    /// the safety net is real and independently testable.
+    #[tokio::test]
+    async fn suppression_drop_sends_clear_when_not_explicitly_cleared() {
+        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
+        let display = display_id();
+
+        {
+            let _guard = SuppressionGuard::set(&front_ctl_tx, &display);
+            // Guard goes out of scope without explicit clear() — Drop must
+            // send the clear.
         }
-        assert!(saw_clear, "suppression must be cleared on write failure");
+
+        let msgs = drain_suppression(&mut front_ctl_rx);
+        assert_eq!(msgs.len(), 2, "set + drop clear");
+        assert!(msgs[0].is_some(), "first: set");
+        assert!(msgs[1].is_none(), "second: drop clear");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1291,5 +1457,152 @@ mod tests {
             total_writes, 4,
             "total writes equals admitted edges (2+2), no ping-pong overflow"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Observed-loss hook tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A [`HookRunner`] that captures every command argv and succeeds.
+    struct CapturingHookRunner {
+        commands: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl CapturingHookRunner {
+        fn new() -> Self {
+            Self {
+                commands: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookRunner for CapturingHookRunner {
+        async fn run_command(
+            &self,
+            _env: &crate::hooks::EnvList,
+            argv: &[String],
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            self.commands.lock().unwrap().push(argv.to_vec());
+            Ok(())
+        }
+
+        async fn publish_mqtt(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            Ok(())
+        }
+    }
+
+    fn observed_loss_action() -> cs::HookAction {
+        cs::HookAction {
+            command: Some(vec!["observed-loss-hook".into()]),
+            mqtt: None,
+            timeout: Duration::from_secs(1),
+            blocking: Some(true),
+            abort_on_failure: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_observed_loss_fires_on_observed_loss_slot() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = CapturingHookRunner::new();
+        let commands = runner.commands.clone();
+        let hook_engine = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+
+        let mut dc = display_config();
+        dc.hooks.on_observed_loss = vec![observed_loss_action()];
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, sink, hook_engine, front_ctl_tx);
+
+        handle.notify_observed_loss(&display_id()).await;
+
+        let captured = commands.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "one hook should fire");
+        assert_eq!(captured[0], vec!["observed-loss-hook"]);
+    }
+
+    #[tokio::test]
+    async fn notify_observed_loss_noop_on_empty_slot() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = CapturingHookRunner::new();
+        let commands = runner.commands.clone();
+        let hook_engine = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+
+        let dc = display_config(); // on_observed_loss defaults to empty
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, sink, hook_engine, front_ctl_tx);
+
+        handle.notify_observed_loss(&display_id()).await;
+
+        let captured = commands.lock().unwrap().clone();
+        assert!(captured.is_empty(), "no hook should fire on empty slot");
+    }
+
+    #[tokio::test]
+    async fn notify_observed_loss_never_triggers_write() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let hook_engine = Arc::new(HookEngine::with_runner(Arc::new(NoopHookRunner)));
+
+        let mut dc = display_config();
+        dc.hooks.on_observed_loss = vec![observed_loss_action()];
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, Arc::clone(&sink), hook_engine, front_ctl_tx);
+
+        handle.notify_observed_loss(&display_id()).await;
+
+        assert_eq!(
+            sink.write_calls(),
+            0,
+            "notify must never trigger a DDC write"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_observed_loss_unknown_display_is_noop() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = CapturingHookRunner::new();
+        let commands = runner.commands.clone();
+        let hook_engine = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+
+        let mut dc = display_config();
+        dc.hooks.on_observed_loss = vec![observed_loss_action()];
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, sink, hook_engine, front_ctl_tx);
+
+        // Notify for a different display — should be a no-op.
+        handle
+            .notify_observed_loss(&DisplayId("nonexistent".to_string()))
+            .await;
+
+        let captured = commands.lock().unwrap().clone();
+        assert!(captured.is_empty(), "unknown display must not fire hooks");
+    }
+
+    /// Regression guard: the initiator blocking `before_acquire` still
+    /// prevents the DDC write on abort.
+    #[tokio::test]
+    async fn initiator_before_acquire_abort_still_blocks_write() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = crate::hooks::ScriptedHookRunner::new();
+        runner.push_command(Err("timeout".to_string()));
+        let hook_engine = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+
+        let mut dc = display_config();
+        dc.hooks.before_acquire = vec![abortable_before_acquire_action()];
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, Arc::clone(&sink), hook_engine, front_ctl_tx);
+
+        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        assert!(
+            matches!(outcome, SwitchOutcome::HookAborted { .. }),
+            "aborted before_acquire must prevent write"
+        );
+        assert_eq!(sink.write_calls(), 0, "no DDC write after abort");
     }
 }

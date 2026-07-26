@@ -1167,7 +1167,8 @@ pub struct DisplayConfig {
     pub panel_type: PanelType,
 }
 
-/// The four KVM hand-off hook slots available on a shared display.
+/// The KVM hand-off hook slots available on a shared display, plus the
+/// post-hoc observed-loss slot for the losing machine.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HookSlots {
     /// Actions run before releasing a display to another machine.
@@ -1182,6 +1183,12 @@ pub struct HookSlots {
     /// Actions run after acquiring a display from another machine.
     #[serde(default)]
     pub after_acquire: Vec<HookAction>,
+    /// Actions run after this machine observes (via VCP 0x60 poll) that the
+    /// panel has been pulled by a peer.  Always after-the-fact — the losing
+    /// machine has no advance notice.  Fire-and-forget; a hook failure here
+    /// must never trigger a corrective DDC write or retry.
+    #[serde(default)]
+    pub on_observed_loss: Vec<HookAction>,
 }
 
 /// Command argv used by a KVM hook.

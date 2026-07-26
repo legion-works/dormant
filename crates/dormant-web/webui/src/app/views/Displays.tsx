@@ -1,39 +1,36 @@
 /**
- * Displays view — list mode with per-display cards, or a single-display
- * detail mode (wear heat map + summaries + guarded controls) when
- * `selectedDisplay` is set.
+ * Displays view — list mode with per-display rows, or a single-display
+ * detail mode when `selectedDisplay` is set.
  *
  * Data: /api/state (phase, inhibited, paused, cmd_gen, controllers[])
  * + /api/config (blank_mode, zone/rule via display_rules reverse lookup)
- * + /api/wear/:display (wear detail, keyed by display_name — provider-owned).
+ * + /api/wear (wear_advisory chip).
  *
- * Visual authority: design/web-ui/Dormant Dashboard.dc.html lines 190-248.
+ * Row layout per views/displays.md §1: rows over cards, shared/private
+ * grouping, "held by" column, full chip set (paused, inhibited,
+ * blank_failed, wear_advisory).
  *
- * List-card actions (Force blank/wake, Pause/Resume) share ONE
- * `useConfirmDialog` instance across every card — only one confirmation
- * can be pending at a time, so every card's action row hides while any
- * dialog is open (`dialogOpen`), leaving the dialog's own button as the
- * sole element with that accessible name.
+ * [keep] single-shared-`useConfirmDialog` pattern — every row's action
+ * cluster hides while any dialog is open, leaving the dialog's own
+ * button as the sole element with that accessible name.
  */
 import { useLiveState } from "../hooks/useLiveState";
-import { Card, StatusChip, HealthChip, phaseChipLabel, useConfirmDialog } from "../components";
+import { StatusChip, HealthChip, phaseChipLabel, useConfirmDialog } from "../components";
 import { postBlank, postWake, postPause, postResume, postSwitch, postPush } from "../../api/client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useMemo } from "react";
 import type { DisplaySnapshot } from "../../api/types";
 import DisplayDetail from "./DisplayDetail";
 import "./Displays.css";
 
 
-interface DisplayCardProps {
+interface DisplayRowProps {
   id: string;
   snap: DisplaySnapshot;
-  blankMode: string;
   zone: string;
   rule: string | undefined;
+  wearAdvisory: boolean;
   dialogOpen: boolean;
-  /** Whether the daemon reports this display as switch-capable (pull input). */
   switchCapable: boolean;
-  /** Whether the daemon reports this display as push-capable (send input). */
   pushCapable: boolean;
   error?: string;
   onOpenDetail: (id: string) => void;
@@ -45,12 +42,32 @@ interface DisplayCardProps {
   onPush: (id: string) => void;
 }
 
-function DisplayCard({
+/** Derive the "held by" one-liner for a display row.
+ *
+ *  · shared + peer-owned → "peer holds panel"
+ *  · a rule is configured → "rule · zone"
+ *  · otherwise → "manual-only"
+ */
+function heldByLabel(
+  snap: DisplaySnapshot,
+  zone: string,
+  rule: string | undefined,
+): string {
+  if (snap.scope === "shared" && snap.owned === false) {
+    return "peer holds panel";
+  }
+  if (rule) {
+    return `${rule}${zone ? ` · ${zone}` : ""}`;
+  }
+  return "manual-only";
+}
+
+function DisplayRow({
   id,
   snap,
-  blankMode,
   zone,
   rule,
+  wearAdvisory,
   dialogOpen,
   switchCapable,
   pushCapable,
@@ -62,127 +79,74 @@ function DisplayCard({
   onResume,
   onSwitch,
   onPush,
-}: DisplayCardProps) {
+}: DisplayRowProps) {
   const isShared = snap.scope === "shared";
-  const panelLabel = (() => {
-    switch (snap.panel_state?.power) {
-      case "on": return "ON";
-      case "standby": return "OFF";
-      default: return "unknown";
-    }
-  })();
-
-  // A peer can own a shared panel, so its local phase cannot describe hardware state.
-  const previewGlyph = (() => {
-    if (isShared) {
-      switch (snap.panel_state?.power) {
-        case "on": return "● ON";
-        case "standby": return "○ OFF";
-        default: return "? unknown";
-      }
-    }
+  const phaseDot = (() => {
     switch (snap.phase) {
-      case "active": return "● ON";
-      case "grace": return "◐ grace";
-      case "blanking": return "◑ …";
-      case "blanked": return "○ OFF";
-      case "waking": return "◔ wake";
-      case "staged": return "◑ staged";
-      case "render_pending": return "◐ render";
-      default: return snap.phase;
+      case "active": return "●";
+      case "grace": return "◐";
+      case "blanking": return "◑";
+      case "blanked": return "○";
+      case "waking": return "◔";
+      case "staged": return "◑";
+      case "render_pending": return "◐";
+      default: return "·";
     }
   })();
-
-  const phaseIsAlive = isShared
-    ? snap.panel_state?.power === "on"
-    : snap.phase === "active" || snap.phase === "waking";
+  const blankFailed = snap.last_blank_failed ?? false;
   const isPaused = snap.paused;
+  const sharedGlyphEl = isShared ? <span className="display-row__shared-glyph" title="shared">⇄</span> : null;
   const blankLabel = isShared
     ? "Blank shared panel — affects all connected machines"
     : "Force blank";
 
-  const blankModeLabel = blankMode.split("_").map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
-
   return (
-    <Card className="display-card">
-      <div className="display-card__body">
-        {/* Screen preview */}
-        <div className={`display-preview${phaseIsAlive ? " display-preview--alive" : ""}`}>
-          <span className="display-preview__glyph">{previewGlyph}</span>
-        </div>
+    <>
+      <tr className={`display-row${isShared ? " display-row--shared" : ""}`}>
+        {/* Panel */}
+        <td className="display-row__panel">
+          <span className="display-row__phase-dot">{phaseDot}</span>
+          <span className="display-row__id">{id}</span>
+          {sharedGlyphEl}
+        </td>
 
-        {/* Details */}
-        <div className="display-card__details">
-          <div className="display-card__title-row">
-            <span className="display-card__id">{id}</span>
+        {/* State */}
+        <td className="display-row__state">
+          <div className="display-row__chips">
             <StatusChip kind={snap.phase} label={phaseChipLabel(snap.phase, snap.stage)} />
             {isPaused && <StatusChip kind="paused" />}
             {snap.inhibited && <StatusChip kind="inhibited" />}
-            <button
-              type="button"
-              className="display-card__open-detail"
-              aria-label={`Open ${id} detail`}
-              onClick={() => onOpenDetail(id)}
-            >
-              Open detail →
-            </button>
+            {blankFailed && <StatusChip kind="blank_failed" />}
+            {wearAdvisory && <StatusChip kind="wear_advisory" />}
           </div>
+        </td>
 
-          {/* Metric grid */}
-          <div className="display-card__metrics">
-            <div className="display-metric">
-              <div className="display-metric__label">Blank mode</div>
-              <div className="display-metric__value">{blankModeLabel}</div>
-            </div>
-            <div className="display-metric">
-              <div className="display-metric__label">Driven by zone</div>
-              <div className="display-metric__value">{zone || "—"}</div>
-            </div>
-            <div className="display-metric">
-              <div className="display-metric__label">Rule</div>
-              <div className="display-metric__value">{rule ?? "—"}</div>
-            </div>
-            <div className="display-metric">
-              <div className="display-metric__label">Cmd gen</div>
-              <div className="display-metric__value">{snap.cmd_gen}</div>
-            </div>
-            {isShared && (
-              <>
-                <div className="display-metric">
-                  <div className="display-metric__label">Ownership</div>
-                  <div className="display-metric__value">{snap.owned ? "owner" : "deferred"}</div>
-                </div>
-                <div className="display-metric">
-                  <div className="display-metric__label">Panel</div>
-                  <div className="display-metric__value">{panelLabel}</div>
-                </div>
-              </>
-            )}
-          </div>
+        {/* Held by */}
+        <td className="display-row__held-by">
+          <span className="display-row__held-by-text">
+            {heldByLabel(snap, zone, rule)}
+          </span>
+        </td>
 
-          {/* Controller chain */}
-          {snap.controllers.length > 0 && (
-            <div className="display-card__controllers">
-              <div className="display-card__controllers-label">Controller chain (fallback order)</div>
-              <div className="display-card__controllers-row">
-                {snap.controllers.map((c) => (
-                  <HealthChip key={c.name} health={c} />
-                ))}
-              </div>
+        {/* Chain */}
+        <td className="display-row__chain">
+          {snap.controllers.length > 0 ? (
+            <div className="display-row__chain-inner">
+              {snap.controllers.map((c, i) => (
+                <span key={c.name} className="display-row__chain-item">
+                  {i > 0 && <span className="display-row__chain-sep"> → </span>}
+                  <HealthChip health={c} />
+                </span>
+              ))}
             </div>
+          ) : (
+            <span className="display-row__chain-empty">—</span>
           )}
+        </td>
 
-          {/* Action error */}
-          {error && (
-            <div className="display-card__action-error">
-              {error}
-            </div>
-          )}
-        </div>
-
-        {/* Actions column */}
+        {/* Actions */}
         {!dialogOpen && (
-          <div className="display-card__actions">
+          <td className="display-row__actions">
             <button
               type="button"
               className="display-action display-action--blank"
@@ -197,26 +161,24 @@ function DisplayCard({
             >
               Force wake
             </button>
-{switchCapable && (
-                      <>
-                      <button
-                        type="button"
-                        className="display-action display-action--wake"
-                        onClick={() => onSwitch(id)}
-                      >
-                        Switch to here
-                      </button>
-                      {pushCapable && (
-                        <button
-                          type="button"
-                          className="display-action display-action--wake"
-                          onClick={() => onPush(id)}
-                        >
-                          Send to peer
-                        </button>
-                      )}
-                      </>
-                    )}
+            {switchCapable && (
+              <button
+                type="button"
+                className="display-action display-action--wake"
+                onClick={() => onSwitch(id)}
+              >
+                Pull
+              </button>
+            )}
+            {pushCapable && (
+              <button
+                type="button"
+                className="display-action display-action--wake"
+                onClick={() => onPush(id)}
+              >
+                Push
+              </button>
+            )}
             {isPaused ? (
               <button
                 type="button"
@@ -236,10 +198,24 @@ function DisplayCard({
                 Pause rule
               </button>
             )}
-          </div>
+            <button
+              type="button"
+              className="display-action display-action--detail"
+              onClick={() => onOpenDetail(id)}
+            >
+              Detail →
+            </button>
+          </td>
         )}
-      </div>
-    </Card>
+      </tr>
+      {error && (
+        <tr className="display-row__error-row">
+          <td colSpan={5}>
+            <div className="display-row__action-error">{error}</div>
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 
@@ -251,6 +227,7 @@ export default function Displays() {
     snapshot,
     displayConfigs,
     displayRules,
+    wear,
     wearDetails,
     selectedDisplay,
     selectDisplay,
@@ -262,6 +239,29 @@ export default function Displays() {
   const selectedSnap = selectedDisplay
     ? displays.find(([id]) => id === selectedDisplay)?.[1]
     : undefined;
+
+  // Build a wear-advisory set keyed by config display id.
+  const wearAdvisorySet = useMemo(() => {
+    const set = new Set<string>();
+    if (wear) {
+      for (const s of wear.displays) {
+        if (s.advisory) set.add(s.display_name);
+      }
+    }
+    return set;
+  }, [wear]);
+
+  // Partition into shared and private for grouping — cheap inline for small lists.
+  const shared: [string, DisplaySnapshot][] = [];
+  const privateDisplays: [string, DisplaySnapshot][] = [];
+  for (const d of displays) {
+    const dc = displayConfigs[d[0]];
+    if (dc?.scope === "shared" || d[1].scope === "shared") {
+      shared.push(d);
+    } else {
+      privateDisplays.push(d);
+    }
+  }
 
   // If the selected display disappears from the snapshot (e.g. removed by
   // a config reload), fall back to the list rather than getting stuck on
@@ -297,9 +297,6 @@ export default function Displays() {
     }
   }, [confirm, clearActionError]);
 
-  // Force wake is non-destructive — it just lights the panel — so it is
-  // un-gated per the proto's friction model (P1-F); Force blank keeps its
-  // confirm because it can strand the panel dark.
   const handleWake = useCallback(async (id: string) => {
     clearActionError(id);
     try {
@@ -342,7 +339,6 @@ export default function Displays() {
     }
   }, [confirm, clearActionError]);
 
-  // Resume is non-destructive — un-gated per P1-F, same rationale as wake.
   const handleResume = useCallback(async (id: string, rule: string) => {
     clearActionError(id);
     try {
@@ -377,36 +373,86 @@ export default function Displays() {
     );
   }
 
+  const kvm = snapshot.kvm;
+
+  function renderRows(displaysList: [string, DisplaySnapshot][]) {
+    return displaysList.map(([id, snap]) => {
+      const dr = displayRules[id];
+      const switchCapable = kvm != null && kvm.switch_capable_displays.includes(id);
+      const pushCapable = kvm != null && kvm.push_capable_displays.includes(id);
+      return (
+        <DisplayRow
+          key={id}
+          id={id}
+          snap={snap}
+          zone={dr?.zone ?? "—"}
+          rule={dr?.rule}
+          wearAdvisory={wearAdvisorySet.has(id)}
+          dialogOpen={!!dialog}
+          switchCapable={switchCapable}
+          pushCapable={pushCapable}
+          error={actionErrors[id]}
+          onOpenDetail={selectDisplay}
+          onBlank={handleBlank}
+          onWake={handleWake}
+          onPause={handlePause}
+          onResume={handleResume}
+          onSwitch={handleSwitch}
+          onPush={handlePush}
+        />
+      );
+    });
+  }
+
+  const showHeaders = shared.length > 0 && privateDisplays.length > 0;
+
   return (
     <div className="displays">
-      {displays.map(([id, snap]) => {
-        const dc = displayConfigs[id];
-        const dr = displayRules[id];
-        const kvm = snapshot.kvm;
-        const switchCapable = kvm != null && kvm.switch_capable_displays.includes(id);
-        const pushCapable = kvm != null && kvm.push_capable_displays.includes(id);
-        return (
-          <DisplayCard
-            key={id}
-            id={id}
-            snap={snap}
-            blankMode={dc?.blank_mode ?? "—"}
-            zone={dr?.zone ?? "—"}
-            rule={dr?.rule}
-            dialogOpen={!!dialog}
-            switchCapable={switchCapable}
-            pushCapable={pushCapable}
-            error={actionErrors[id]}
-            onOpenDetail={selectDisplay}
-            onBlank={handleBlank}
-            onWake={handleWake}
-            onPause={handlePause}
-            onResume={handleResume}
-            onSwitch={handleSwitch}
-            onPush={handlePush}
-          />
-        );
-      })}
+      {/* SHARED group */}
+      {shared.length > 0 && (
+        <>
+          {showHeaders && <h2 className="displays-group-header">SHARED</h2>}
+          <table className="displays-table">
+            <thead>
+              <tr className="displays-table__head">
+                <th>Panel</th>
+                <th>State</th>
+                <th>Held by</th>
+                <th>Chain</th>
+                {!dialog && <th>Actions</th>}
+              </tr>
+            </thead>
+            <tbody>{renderRows(shared)}</tbody>
+          </table>
+        </>
+      )}
+
+      {/* PRIVATE group */}
+      {privateDisplays.length > 0 && (
+        <>
+          {showHeaders && <h2 className="displays-group-header">PRIVATE</h2>}
+          <table className="displays-table">
+            <thead>
+              <tr className="displays-table__head">
+                <th>Panel</th>
+                <th>State</th>
+                <th>Held by</th>
+                <th>Chain</th>
+                {!dialog && <th>Actions</th>}
+              </tr>
+            </thead>
+            <tbody>{renderRows(privateDisplays)}</tbody>
+          </table>
+        </>
+      )}
+
+      {displays.length === 0 && (
+        <div className="displays-empty">
+          No displays configured.
+          <a href="#/config/displays" className="displays-empty__link"> Add a display →</a>
+        </div>
+      )}
+
       {dialog}
     </div>
   );

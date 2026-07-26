@@ -1,6 +1,6 @@
 /**
- * Displays component test — renders per-display cards with actions,
- * plus the list/detail-mode switch.
+ * Displays component test — W3-1 row-based list layout with
+ * shared/private grouping, held-by column, and full chip set.
  */
 import { useState } from "react";
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -128,7 +128,16 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function renderDisplayCard(id: string, display: DisplaySnapshot) {
+function renderDisplayCard(id: string, display: DisplaySnapshot, overrides: {
+  scope?: "shared";
+  config?: Partial<DisplayConfig>;
+} = {}) {
+  const dc: DisplayConfig = {
+    controllers: [],
+    blank_mode: "power_off",
+    scope: overrides.scope,
+    ...overrides.config,
+  } as DisplayConfig;
   const state = liveStateFixture({
     snapshot: {
       sensors: [],
@@ -137,9 +146,7 @@ function renderDisplayCard(id: string, display: DisplaySnapshot) {
       pending_reload: null,
       kvm: { keymap: {}, switch_capable_displays: [id], activity_following: false, push_capable_displays: [] },
     },
-    displayConfigs: {
-      [id]: { controllers: [], blank_mode: "power_off" } as DisplayConfig,
-    },
+    displayConfigs: { [id]: dc },
     displayRules: { [id]: { rule: "office-rule", zone: "office" } },
   });
   render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
@@ -161,7 +168,7 @@ function sharedDisplay(overrides: Partial<DisplaySnapshot> = {}): DisplaySnapsho
 }
 
 describe("Displays", () => {
-  it("renders display cards with IDs and phases", async () => {
+  it("renders display IDs and phases in row layout", async () => {
     render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
@@ -169,6 +176,7 @@ describe("Displays", () => {
     });
 
     expect(screen.getByText("samsung-tv")).toBeInTheDocument();
+    // Phase chips render their labels
     expect(screen.getByText("active")).toBeInTheDocument();
     expect(screen.getByText("blanked")).toBeInTheDocument();
   });
@@ -194,30 +202,17 @@ describe("Displays", () => {
     expect(screen.getAllByText("fallback").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("renders metric fields", async () => {
+  it("renderds held-by column with rule and zone", async () => {
     render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
     });
 
-    // "Blank mode" etc. appear in every display card — use getAllByText
-    expect(screen.getAllByText("Blank mode").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("Driven by zone").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("Rule").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("Cmd gen").length).toBeGreaterThanOrEqual(1);
-  });
-
-  it("renders zone and rule from display_rules reverse lookup", async () => {
-    render(<LiveStateProvider><Displays /></LiveStateProvider>);
-
-    await waitFor(() => {
-      expect(screen.getByText("aoc-main")).toBeInTheDocument();
-    });
-
-    // Both displays map to the "office" zone in the fixture
-    expect(screen.getAllByText("office").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("office-rule").length).toBeGreaterThanOrEqual(1);
+    // Held-by column shows "office-rule · office"
+    expect(screen.getAllByText("office-rule · office").length).toBeGreaterThanOrEqual(1);
+    // tv-rule also exists
+    expect(screen.getByText("tv-rule · office")).toBeInTheDocument();
   });
 
   it("calls postBlank guarded by confirmation, and postPause guarded by confirmation, with correct ids", async () => {
@@ -228,10 +223,8 @@ describe("Displays", () => {
     });
     expect(screen.getByText("samsung-tv")).toBeInTheDocument();
 
-    // First card (aoc-main): not paused → "Pause rule", "Force blank", "Force wake".
-    // Force blank/Pause each share one confirm dialog, so each trigger click
-    // hides every card's action row — the dialog's own button is the sole
-    // remaining element with that accessible name.
+    // Force blank on first display (aoc-main). When dialog opens, every
+    // row's action column hides — only the dialog button remains.
     fireEvent.click(screen.getAllByText("Force blank")[0]);
     expect(screen.getByRole("alertdialog", { name: "Force blank aoc-main?" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
@@ -245,8 +238,7 @@ describe("Displays", () => {
   });
 
   // P1-F: Force wake and Resume are non-destructive (wake just lights the
-  // panel) — the proto's friction model leaves them un-gated. No confirm
-  // dialog should appear; the click posts immediately.
+  // panel) — the proto's friction model leaves them un-gated.
   it("calls postWake/postResume immediately with correct ids, no confirm dialog", async () => {
     render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
@@ -274,12 +266,6 @@ describe("Displays", () => {
       expect(screen.getByText("aoc-main")).toBeInTheDocument();
     });
 
-    // `confirm()`'s promise resolves synchronously inside the Cancel
-    // button's onClick (useConfirmDialog's `finish`), so the `.then`
-    // continuation that would call postBlank is only scheduled as a
-    // microtask — it hasn't run yet immediately after `fireEvent.click`
-    // returns. Flush microtasks before asserting "not called" so a
-    // mutant that ignores `accepted` doesn't pass by accident.
     const flush = () => act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -307,22 +293,25 @@ describe("Displays", () => {
     expect(screen.getAllByText("Pause rule").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("shared card uses panel state instead of local phase", () => {
-    renderDisplayCard("shared-tv", sharedDisplay());
+  it("shared display shows peer-holds-panel in held-by when not owned", () => {
+    renderDisplayCard("shared-tv", sharedDisplay({ owned: false }), { scope: "shared" });
 
-    expect(screen.getByText("○ OFF")).toBeInTheDocument();
-    expect(screen.getByText("owner")).toBeInTheDocument();
+    // Phase dot shows for active
+    expect(screen.getByText("shared-tv")).toBeInTheDocument();
+    // Held-by column: shared + not owned → "peer holds panel"
+    expect(screen.getByText("peer holds panel")).toBeInTheDocument();
   });
 
-  it("deferred shared card keeps force wake enabled", () => {
-    renderDisplayCard("shared-tv", sharedDisplay({ owned: false }));
+  it("shared display shows rule · zone in held-by when owned", () => {
+    renderDisplayCard("shared-tv", sharedDisplay({ owned: true }), { scope: "shared" });
 
-    expect(screen.getByText("deferred")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Force wake" })).toBeEnabled();
+    expect(screen.getByText("shared-tv")).toBeInTheDocument();
+    // Held-by column: shared + owned → "office-rule · office"
+    expect(screen.getByText("office-rule · office")).toBeInTheDocument();
   });
 
   it("shared force blank has affects-all copy", () => {
-    renderDisplayCard("shared-tv", sharedDisplay());
+    renderDisplayCard("shared-tv", sharedDisplay(), { scope: "shared" });
 
     expect(screen.getByRole("button", {
       name: "Blank shared panel — affects all connected machines",
@@ -345,20 +334,21 @@ describe("Displays", () => {
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
 
-    expect(screen.getByText("● ON")).toBeInTheDocument();
+    expect(screen.getByText("private-panel")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force blank" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Force wake" })).toBeInTheDocument();
     // KVM switch/push buttons are absent when the display is not in either capability set.
-    expect(screen.queryByRole("button", { name: "Switch to here" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pull" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Push" })).not.toBeInTheDocument();
   });
-  it("switch-to-here button calls postSwitch", async () => {
+
+  it("switch-to-here (Pull) button calls postSwitch", async () => {
     renderDisplayCard("shared-tv", sharedDisplay());
-    fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pull" }));
     await waitFor(() => expect(mocks.postSwitch).toHaveBeenCalledWith("shared-tv"));
   });
 
-  it("does not render send-to-peer button when push not capable", () => {
+  it("does not render push button when push not capable", () => {
     const state = liveStateFixture({
       snapshot: {
         sensors: [],
@@ -373,10 +363,10 @@ describe("Displays", () => {
       displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
-    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Push" })).not.toBeInTheDocument();
   });
 
-  it("send-to-peer button calls postPush, not postSwitch", async () => {
+  it("send-to-peer (Push) button calls postPush, not postSwitch", async () => {
     const state = liveStateFixture({
       snapshot: {
         sensors: [],
@@ -396,7 +386,7 @@ describe("Displays", () => {
       displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
-    const btn = screen.getByRole("button", { name: "Send to peer" });
+    const btn = screen.getByRole("button", { name: "Push" });
     expect(btn).toBeInTheDocument();
     fireEvent.click(btn);
     await waitFor(() => expect(mocks.postPush).toHaveBeenCalledWith("shared-tv"));
@@ -424,14 +414,14 @@ describe("Displays", () => {
       displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
-    fireEvent.click(screen.getByRole("button", { name: "Send to peer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Push" }));
     expect(await screen.findByText("write failed: DDC bus unreachable")).toBeInTheDocument();
   });
 
   it("surfaces a failed switch as an error", async () => {
     mocks.postSwitch.mockRejectedValueOnce(new Error("write failed: DDC bus unreachable"));
     renderDisplayCard("shared-tv", sharedDisplay());
-    fireEvent.click(screen.getByRole("button", { name: "Switch to here" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pull" }));
     expect(await screen.findByText("write failed: DDC bus unreachable")).toBeInTheDocument();
   });
 
@@ -450,8 +440,8 @@ describe("Displays", () => {
       displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
-    expect(screen.queryByRole("button", { name: "Switch to here" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pull" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Push" })).not.toBeInTheDocument();
   });
 
   it("hides switch and push buttons when display not in capability sets", () => {
@@ -469,8 +459,8 @@ describe("Displays", () => {
       displayRules: { "shared-tv": { rule: "tv-rule", zone: "tv" } },
     });
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
-    expect(screen.queryByRole("button", { name: "Switch to here" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Send to peer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pull" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Push" })).not.toBeInTheDocument();
   });
 });
 
@@ -544,8 +534,8 @@ function DisplaysDetailHarness() {
 
 it("switches between the display list and selected detail in one view", () => {
   render(<DisplaysDetailHarness />);
-  fireEvent.click(screen.getByRole("button", { name: "Open main detail" }));
+  fireEvent.click(screen.getByRole("button", { name: "Detail →" }));
   expect(screen.getByRole("grid", { name: "main panel wear heat map" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "← Displays" }));
-  expect(screen.getByRole("button", { name: "Open main detail" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Detail →" })).toBeInTheDocument();
 });

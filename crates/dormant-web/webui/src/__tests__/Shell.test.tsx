@@ -165,7 +165,7 @@ describe("Shell", () => {
     )!;
     fireEvent.click(displaysNav);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Open d1 detail" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Detail →" }));
 
     await waitFor(() => {
       expect(document.querySelector(".topbar-title")?.textContent).toBe("d1");

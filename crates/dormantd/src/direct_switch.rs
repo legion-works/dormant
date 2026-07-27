@@ -5,12 +5,15 @@
 //! `pull` (always available) and `push` (configuration-gated via
 //! `shared_peer_input_write_code`).
 
+#![allow(clippy::too_many_lines)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dormant_core::config::Config;
 use dormant_core::config::schema::DisplayScope;
+use dormant_core::rules::DaemonEvent;
 use dormant_core::traits::{CommandSink, InputSourceReadback, InputSourceTarget};
 use dormant_core::types::DisplayId;
 use tokio::sync::{mpsc, watch};
@@ -30,6 +33,22 @@ pub enum SwitchReason {
     Tray,
     Release,
     Toggle,
+}
+
+impl SwitchReason {
+    /// Wire-form cause string for [`DaemonEvent::Ownership`].
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Activity => "activity_follow",
+            Self::Hotkey => "hotkey",
+            Self::Cli => "cli",
+            Self::Web => "web",
+            Self::Tray => "tray",
+            Self::Release => "push",
+            Self::Toggle => "pull",
+        }
+    }
 }
 
 /// The outcome of a direct (local, no-network) switch attempt.
@@ -229,8 +248,26 @@ impl DirectSwitchHandle {
                 false,
             )
             .await;
+        let cause = reason.as_str();
         if let Some(reason) = aborted {
             guard.clear();
+            // Emit ownership event for hook-aborted pull.
+            let _ =
+                self.front_ctl_tx
+                    .try_send(dormant_core::rules::ControlMsg::PublishDaemonEvent(
+                        DaemonEvent::Ownership {
+                            display: display.clone(),
+                            owned: self
+                                .coordination
+                                .as_ref()
+                                .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
+                            observed_input_code: None,
+                            written_code: Some(target.write_code),
+                            cause: cause.to_string(),
+                            verified: None,
+                            degraded: false,
+                        },
+                    ));
             return SwitchOutcome::HookAborted { reason };
         }
 
@@ -265,10 +302,37 @@ impl DirectSwitchHandle {
                         },
                     );
                 }
+                // Emit verified ownership event for the successful pull.
+                let _ = self.front_ctl_tx.try_send(
+                    dormant_core::rules::ControlMsg::PublishDaemonEvent(DaemonEvent::Ownership {
+                        display: display.clone(),
+                        owned: true,
+                        observed_input_code: None,
+                        written_code: Some(target.write_code),
+                        cause: cause.to_string(),
+                        verified: Some(true),
+                        degraded: false,
+                    }),
+                );
                 SwitchOutcome::Switched
             }
             Err(cmd) => {
                 guard.clear();
+                // Emit failed ownership event for the failed pull.
+                let _ = self.front_ctl_tx.try_send(
+                    dormant_core::rules::ControlMsg::PublishDaemonEvent(DaemonEvent::Ownership {
+                        display: display.clone(),
+                        owned: self
+                            .coordination
+                            .as_ref()
+                            .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
+                        observed_input_code: None,
+                        written_code: Some(target.write_code),
+                        cause: cause.to_string(),
+                        verified: Some(false),
+                        degraded: false,
+                    }),
+                );
                 SwitchOutcome::WriteFailed { error: cmd.error }
             }
         }
@@ -282,7 +346,7 @@ impl DirectSwitchHandle {
     /// degrades to `DifferentFrom(local_read)` with an emitted WARN
     /// `kvm_push_verification_degraded` when the peer read alias is
     /// absent.
-    pub async fn push(&self, display: DisplayId, _reason: SwitchReason) -> SwitchOutcome {
+    pub async fn push(&self, display: DisplayId, reason: SwitchReason) -> SwitchOutcome {
         let (dc, target) = match self.resolve_peer_target(&display) {
             Ok(pair) => pair,
             Err(outcome) => return outcome,
@@ -291,6 +355,13 @@ impl DirectSwitchHandle {
         let Some(executor) = self.resolve_executor(&display) else {
             return SwitchOutcome::Unsupported;
         };
+
+        // Determine whether verification is degraded before the write.
+        let degraded = matches!(
+            target.expected_readback,
+            InputSourceReadback::DifferentFrom(_)
+        );
+        let cause = reason.as_str();
 
         // before_release — aborts the push on failure.
         let aborted = self
@@ -302,8 +373,26 @@ impl DirectSwitchHandle {
                 false,
             )
             .await;
-        if let Some(reason) = aborted {
-            return SwitchOutcome::HookAborted { reason };
+        if let Some(hook_reason) = aborted {
+            let _ =
+                self.front_ctl_tx
+                    .try_send(dormant_core::rules::ControlMsg::PublishDaemonEvent(
+                        DaemonEvent::Ownership {
+                            display: display.clone(),
+                            owned: self
+                                .coordination
+                                .as_ref()
+                                .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
+                            observed_input_code: None,
+                            written_code: Some(target.write_code),
+                            cause: cause.to_string(),
+                            verified: None,
+                            degraded,
+                        },
+                    ));
+            return SwitchOutcome::HookAborted {
+                reason: hook_reason,
+            };
         }
 
         match executor.write_input_source(target).await {
@@ -312,9 +401,40 @@ impl DirectSwitchHandle {
                 let _ = self
                     .run_hook(&display, &dc.hooks, Direction::Release, Phase::After, false)
                     .await;
+                // Emit ownership event for the successful push (panel released to peer).
+                let _ = self.front_ctl_tx.try_send(
+                    dormant_core::rules::ControlMsg::PublishDaemonEvent(DaemonEvent::Ownership {
+                        display: display.clone(),
+                        owned: self
+                            .coordination
+                            .as_ref()
+                            .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
+                        observed_input_code: None,
+                        written_code: Some(target.write_code),
+                        cause: cause.to_string(),
+                        verified: Some(true),
+                        degraded,
+                    }),
+                );
                 SwitchOutcome::Switched
             }
-            Err(cmd) => SwitchOutcome::WriteFailed { error: cmd.error },
+            Err(cmd) => {
+                let _ = self.front_ctl_tx.try_send(
+                    dormant_core::rules::ControlMsg::PublishDaemonEvent(DaemonEvent::Ownership {
+                        display: display.clone(),
+                        owned: self
+                            .coordination
+                            .as_ref()
+                            .is_none_or(|c| c.snapshot().get(&display).is_none_or(|r| r.owned)),
+                        observed_input_code: None,
+                        written_code: Some(target.write_code),
+                        cause: cause.to_string(),
+                        verified: Some(false),
+                        degraded,
+                    }),
+                );
+                SwitchOutcome::WriteFailed { error: cmd.error }
+            }
         }
     }
 
@@ -477,6 +597,7 @@ impl DirectSwitchHandle {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -1723,5 +1844,132 @@ mod tests {
             "aborted before_acquire must prevent write"
         );
         assert_eq!(sink.write_calls(), 0, "no DDC write after abort");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BG-1 — Ownership event emission
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Drain all `PublishDaemonEvent` messages from the channel, returning
+    /// the extracted [`DaemonEvent`]s in order.
+    fn drain_events(rx: &mut mpsc::Receiver<dormant_core::rules::ControlMsg>) -> Vec<DaemonEvent> {
+        let mut events = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let dormant_core::rules::ControlMsg::PublishDaemonEvent(ev) = msg {
+                events.push(ev);
+            }
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn verified_pull_emits_ownership_event_with_correct_fields() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(
+            display_config(),
+            sink.clone(),
+            noop_hook_engine(),
+            front_ctl_tx,
+        );
+
+        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        assert_eq!(outcome, SwitchOutcome::Switched);
+
+        // Collect all non-suppression events from the channel.
+        let events = drain_events(&mut front_ctl_rx);
+        assert_eq!(events.len(), 1, "exactly one Ownership event after pull");
+
+        match &events[0] {
+            DaemonEvent::Ownership {
+                display,
+                owned,
+                observed_input_code,
+                written_code,
+                cause,
+                verified,
+                degraded,
+            } => {
+                assert_eq!(*display, display_id());
+                assert!(*owned, "pull marks ownership");
+                assert!(observed_input_code.is_none(), "no readback from write path");
+                assert!(written_code.is_some(), "written code must be set");
+                assert_eq!(written_code.unwrap(), LOCAL_WRITE);
+                assert_eq!(cause, "activity_follow");
+                assert_eq!(*verified, Some(true), "verified pull");
+                assert!(!degraded, "pull is never degraded");
+            }
+            other => panic!("expected Ownership event, got {other:?}"),
+        }
+
+        // Verify the serialized wire tag.
+        let json = serde_json::to_string(&events[0]).unwrap();
+        assert!(
+            json.contains("\"event\":\"ownership\""),
+            "wire tag must be ownership, got: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_write_emits_ownership_event_with_verified_false() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.set_write_result(Err(CmdFailure {
+            controller: "ddcci".into(),
+            error: "E_DISPLAY_IO: write failed".into(),
+        }));
+        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(display_config(), sink, noop_hook_engine(), front_ctl_tx);
+
+        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        assert!(matches!(outcome, SwitchOutcome::WriteFailed { .. }));
+
+        let events = drain_events(&mut front_ctl_rx);
+        assert_eq!(events.len(), 1, "failed write still emits Ownership event");
+
+        match &events[0] {
+            DaemonEvent::Ownership {
+                display,
+                verified,
+                cause,
+                ..
+            } => {
+                assert_eq!(*display, display_id());
+                assert_eq!(*verified, Some(false), "failed write");
+                assert_eq!(cause, "activity_follow");
+            }
+            other => panic!("expected Ownership event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_push_emits_ownership_event_with_degraded_true() {
+        let mut dc = display_config();
+        dc.shared_peer_input_write_code = Some(PEER_WRITE);
+        dc.shared_peer_input_code = None; // degraded: no peer read alias
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
+        let handle = build_handle(dc, sink.clone(), noop_hook_engine(), front_ctl_tx);
+
+        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        assert_eq!(outcome, SwitchOutcome::Switched);
+
+        let events = drain_events(&mut front_ctl_rx);
+        assert!(!events.is_empty(), "push must emit Ownership event");
+
+        match &events[0] {
+            DaemonEvent::Ownership {
+                display,
+                cause,
+                verified,
+                degraded,
+                ..
+            } => {
+                assert_eq!(*display, display_id());
+                assert_eq!(cause, "push");
+                assert_eq!(*verified, Some(true));
+                assert!(*degraded, "degraded push");
+            }
+            other => panic!("expected Ownership event, got {other:?}"),
+        }
     }
 }

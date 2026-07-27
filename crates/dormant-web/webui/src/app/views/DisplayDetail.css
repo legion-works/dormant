@@ -1,4 +1,4 @@
-/* Display detail view — wear heat map + summaries + guarded controls.
+/* Display detail view — single-column, section-anchored layout.
    All colors use DS tokens; no hardcoded hex/rgba. */
 
 .display-detail {
@@ -26,7 +26,158 @@
   border-color: var(--border-strong);
 }
 
-.display-detail__columns {
+/* ── Header ── */
+
+.display-detail__header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.display-detail__id {
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.display-detail__shared-badge {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-muted);
+  border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+}
+
+/* ── Sections ── */
+
+.display-detail__section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scroll-margin-top: 16px;
+}
+
+.display-detail__section-title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-body);
+  margin: 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Facts grid ── */
+
+.display-detail__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 26px;
+}
+
+.display-detail__fact-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.display-detail__fact-value {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-body);
+  margin-top: 5px;
+}
+
+.display-detail__fact-value--danger {
+  color: var(--danger);
+}
+
+/* ── Wake warning ── */
+
+.display-detail__wake-warning {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--warning);
+  background: var(--warning-muted);
+  border: 1px solid color-mix(in oklab, var(--warning) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+
+/* ── Action controls ── */
+
+.display-detail__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.display-detail__action {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  padding: 9px 16px;
+  cursor: pointer;
+  text-align: center;
+  border: 1px solid var(--border);
+  background: var(--bg-sunken);
+  color: var(--text-body);
+  transition: border-color var(--dur-fast) var(--ease),
+              background-color var(--dur-fast) var(--ease);
+}
+.display-detail__action:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.display-detail__action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.display-detail__action--wake {
+  color: var(--success);
+  background: var(--success-muted);
+  border-color: color-mix(in oklab, var(--success) 40%, transparent);
+}
+.display-detail__action--wake:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--success) 20%, transparent);
+}
+
+.display-detail__action--resume {
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
+}
+.display-detail__action--resume:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent-warm) 20%, transparent);
+}
+
+/* ── Action error ── */
+
+.display-detail__action-error {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--danger);
+  background: var(--danger-muted);
+  border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+
+/* ── Wear grid ── */
+
+.display-detail__wear-grid {
   display: grid;
   grid-template-columns: 1.35fr 1fr;
   gap: 16px;
@@ -34,20 +185,13 @@
 }
 
 @media (max-width: 860px) {
-  .display-detail__columns {
+  .display-detail__wear-grid {
     grid-template-columns: 1fr;
   }
 }
 
-.display-detail__left-column {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
 .display-detail__heat-card,
-.display-detail__exposure-card,
-.display-detail__info-card {
+.display-detail__exposure-card {
   padding: 20px 22px;
 }
 
@@ -105,21 +249,10 @@
   letter-spacing: 0.08em;
 }
 
-/* Literal ramp stops (design handoff "Design tokens" §Heat-map ramp) —
-   mirrors WearHeatMap.tsx's heatColor() stops; no DS token covers a
-   continuous ramp gradient. */
 .display-detail__legend-bar {
   flex: 1;
   height: 8px;
   border-radius: var(--radius-pill);
-  background: linear-gradient(
-    90deg,
-    rgba(60, 70, 90, 0.6),
-    #c3e88d 32%,
-    #ffc777 62%,
-    #ff966c 82%,
-    #ff757f
-  );
 }
 
 .display-detail__honesty-note {
@@ -130,17 +263,7 @@
   font-style: italic;
 }
 
-.display-detail__metric {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  color: var(--text-body);
-}
-
-.display-detail__metric--muted {
-  color: var(--text-faint);
-  font-size: 12px;
-  margin-top: 12px;
-}
+/* ── Exposure tiles ── */
 
 .display-detail__tiles {
   display: grid;
@@ -179,57 +302,21 @@
   color: var(--success);
 }
 
-.display-detail__advisory {
+/* ── Metric ── */
+
+.display-detail__metric {
   font-family: var(--font-mono);
-  font-size: 12px;
-  border-radius: var(--radius-sm);
-  padding: 6px 10px;
-  width: fit-content;
-}
-.display-detail__advisory--warning {
-  color: var(--warning);
-  background: var(--warning-muted);
-}
-.display-detail__advisory--success {
-  color: var(--success);
-  background: var(--success-muted);
-}
-
-.display-detail__title-row {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  flex-wrap: wrap;
-}
-
-.display-detail__id {
-  font-family: var(--font-display);
-  font-size: 19px;
-  font-weight: 600;
-  color: var(--text-strong);
-}
-
-.display-detail__facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px 26px;
-  margin-top: 15px;
-}
-
-.display-detail__fact-label {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-}
-
-.display-detail__fact-value {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text-body);
-  margin-top: 5px;
 }
+
+.display-detail__metric--muted {
+  color: var(--text-faint);
+  font-size: 12px;
+  margin-top: 12px;
+}
+
+/* ── Controllers (Health section) ── */
 
 .display-detail__controllers {
   margin-top: 16px;
@@ -244,11 +331,10 @@
   margin-bottom: 8px;
 }
 
-.display-detail__controllers-row {
+.display-detail__controllers-list {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .display-detail__controller {
@@ -263,63 +349,15 @@
   color: var(--danger);
 }
 
-.display-detail__action-error {
-  margin-top: 12px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--danger);
-  background: var(--danger-muted);
-  border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
-  border-radius: var(--radius-sm);
-  padding: 6px 10px;
+/* ── Exercise runner ── */
+
+.display-detail__exercise {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
 }
 
-.display-detail__controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 18px;
-}
-
-.display-detail__action {
-  font-family: var(--font-ui);
-  font-size: 12.5px;
-  font-weight: 500;
-  border-radius: var(--radius-md);
-  padding: 9px 16px;
-  cursor: pointer;
-  text-align: center;
-  border: 1px solid var(--border);
-  background: var(--bg-sunken);
-  color: var(--text-body);
-  transition: border-color var(--dur-fast) var(--ease),
-              background-color var(--dur-fast) var(--ease);
-}
-.display-detail__action:hover:not(:disabled) {
-  border-color: var(--border-strong);
-}
-.display-detail__action:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.display-detail__action--wake {
-  color: var(--success);
-  background: var(--success-muted);
-  border-color: color-mix(in oklab, var(--success) 40%, transparent);
-}
-.display-detail__action--wake:hover:not(:disabled) {
-  background: color-mix(in oklab, var(--success) 20%, transparent);
-}
-
-.display-detail__action--resume {
-  color: var(--accent-warm);
-  background: var(--accent-warm-muted);
-  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
-}
-.display-detail__action--resume:hover:not(:disabled) {
-  background: color-mix(in oklab, var(--accent-warm) 20%, transparent);
-}
+/* ── Animation ── */
 
 @keyframes ddRise {
   from { opacity: 0; transform: translateY(8px); }
@@ -328,4 +366,41 @@
 
 @media (prefers-reduced-motion: reduce) {
   .display-detail { animation: none; }
+}
+
+/* ── Staleness warning ── */
+
+.display-detail__stale-warning {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--warning);
+  padding: 4px 0;
+  grid-column: 1 / -1;
+}
+
+/* ── Sharing link ── */
+
+.display-detail__sharing-link {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.display-detail__link-btn {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+.display-detail__link-btn:hover {
+  color: var(--accent-strong);
+}
+
+/* ── Error danger ── */
+
+.display-detail__metric--danger {
+  color: var(--danger);
 }

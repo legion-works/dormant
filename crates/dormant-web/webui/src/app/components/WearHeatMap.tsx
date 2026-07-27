@@ -20,7 +20,7 @@ import "./WearHeatMap.css";
  * the single source (both `heatColor` and the legend gradient CSS derive
  * from the same five stops).
  */
-const HEAT_RAMP_STOPS: readonly [number, number, number, number][] = [
+export const HEAT_RAMP_STOPS: readonly [number, number, number, number][] = [
   [0.0, 60, 70, 90],
   [0.32, 195, 232, 141], // #C3E88D
   [0.62, 255, 199, 119], // #FFC777

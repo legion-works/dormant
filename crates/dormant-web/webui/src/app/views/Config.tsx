@@ -1,16 +1,18 @@
 /**
  * Config view — rendered config file + validation + inventory (Raw TOML tab)
- * + editable settings form (Settings tab, default).
+ * + editable settings form (five content tabs, one PatchStore).
  *
- * Fetches /api/config + /api/state in parallel on mount. Two-tab layout:
- * "Settings" (default) renders the editable form; "Raw TOML" shows the
- * syntax-highlighted file viewer with inventory and validation.
+ * Fetches /api/config + /api/state in parallel on mount. Six sub-tabs
+ * (daemon · presence · displays · switching · protection · raw), routed
+ * at #/config/{tab}.  One SettingsForm instance owns one PatchStore
+ * across all form tabs; the Raw tab is a separate read-only surface.
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { getConfig, getState, postReload } from "../../api/client";
-import type { ConfigResponse } from "../../api/types";
-import { Card, stageKindLabel, useConfirmDialog } from "../components";
+import type { ConfigResponse, KvmStatus } from "../../api/types";
+import { Card, stageKindLabel } from "../components";
 import { SettingsForm } from "../config/SettingsForm";
+import { navGuard } from "../navGuard";
 import "./Config.css";
 import "../config/ConfigForm.css";
 
@@ -19,6 +21,7 @@ interface ConfigState {
   error: string | null;
   config: ConfigResponse | null;
   pendingReload: string | null;
+  kvm?: KvmStatus | null;
 }
 
 interface TomlLine {
@@ -30,7 +33,60 @@ interface TomlLine {
   valColor: string;
 }
 
-type ConfigTab = "settings" | "raw";
+type ConfigTab = "daemon" | "presence" | "displays" | "switching" | "protection" | "raw";
+
+const CONFIG_TABS: ConfigTab[] = ["daemon", "presence", "displays", "switching", "protection", "raw"];
+
+const TAB_LABELS: Record<ConfigTab, string> = {
+  daemon: "Daemon",
+  presence: "Presence",
+  displays: "Displays",
+  switching: "Switching",
+  protection: "Protection",
+  raw: "Raw",
+};
+
+/** Map patch prefix → Config tab for per-tab dirty dots. */
+const SECTION_TO_TAB: Record<string, ConfigTab> = {
+  daemon: "daemon",
+  sensors: "presence",
+  zones: "presence",
+  rules: "presence",
+  audio: "presence",
+  displays: "displays",
+  coordination: "switching",
+  keymap: "switching",
+  input_filter: "switching",
+  wear: "protection",
+  watchdog: "protection",
+  notifications: "protection",
+};
+
+/** Parse #/config/{tab} → tab, defaulting to "daemon". */
+function getConfigTabFromHash(): ConfigTab {
+  const hash = window.location.hash.replace(/^#\/?/, "");
+  // Strip fragment suffix (the second '#' in #/config/switching#coordination.activity_follow)
+  const main = hash.split("#")[0];
+  const parts = main.split("/");
+  if (parts[0] === "config" && parts[1]) {
+    const candidate = parts[1] as ConfigTab;
+    if (CONFIG_TABS.includes(candidate)) return candidate;
+  }
+  return "daemon";
+}
+
+/**
+ * Extract the deep-link fragment target from the full URL hash.
+ * #/config/switching#coordination.activity_follow → "coordination.activity_follow"
+ * Returns null when no secondary fragment is present.
+ */
+function getConfigFragmentTarget(): string | null {
+  const hash = window.location.hash;
+  const secondHash = hash.indexOf("#", 1); // skip the leading '#'
+  if (secondHash === -1) return null;
+  const target = hash.slice(secondHash + 1);
+  return target || null;
+}
 
 /**
  * Line-by-line TOML classifier for syntax highlighting.
@@ -286,16 +342,13 @@ export default function Config() {
     pendingReload: null,
   });
   const [reloading, setReloading] = useState(false);
-  const [tab, setTab] = useState<ConfigTab>("settings");
+  const [tab, setTab] = useState<ConfigTab>(getConfigTabFromHash);
+  const [dirtyTabs, setDirtyTabs] = useState<Set<ConfigTab>>(new Set());
   const mountedRef = useRef(true);
 
-  // Navigation guard state from SettingsForm
-  const [navGuard, setNavGuard] = useState<{
-    dirtyCount: number;
-    discard: () => void;
-  } | null>(null);
-
-  const { confirm, dialog } = useConfirmDialog();
+  // Navigation guard state from SettingsForm. Config internal tab
+  // switches never prompt.
+  const navGuardRef = useRef<{ dirtyCount: number; discard: () => void } | null>(null);
 
   const fetchData = useCallback(async () => {
     setState((prev) => ({ ...prev, error: null }));
@@ -307,6 +360,7 @@ export default function Config() {
         error: null,
         config: cfg,
         pendingReload: snap.pending_reload,
+        kvm: snap.kvm ?? null,
       });
     } catch (err: unknown) {
       if (!mountedRef.current) return;
@@ -325,6 +379,37 @@ export default function Config() {
     return () => { mountedRef.current = false; };
   }, [fetchData]);
 
+  // Sync tab from hash on hashchange (sidebar nav, back/forward).
+  useEffect(() => {
+    const handler = () => {
+      const nextTab = getConfigTabFromHash();
+      setTab(nextTab);
+    };
+    window.addEventListener("hashchange", handler);
+    return () => window.removeEventListener("hashchange", handler);
+  }, []);
+
+  // Scroll to + briefly highlight a deep-linked config fragment (e.g.
+  // #/config/switching#coordination.activity_follow).  The target row
+  // carries data-field-id="<section>.<key>"; we wait for the DOM to
+  // settle (the tab switch renders new content), then scroll and flash.
+  useEffect(() => {
+    const target = getConfigFragmentTarget();
+    if (!target) return;
+    // Defer until the tab's sections are in the DOM.
+    const timer = setTimeout(() => {
+      const el = document.querySelector(`[data-field-id="${target}"]`);
+      if (!el) return;
+      (el as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+      (el as HTMLElement).style.transition = "background-color 0.15s ease";
+      (el as HTMLElement).style.backgroundColor = "var(--accent-warm-muted)";
+      setTimeout(() => {
+        (el as HTMLElement).style.backgroundColor = "";
+      }, 1200);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [tab]);
+
   const handleReload = useCallback(async () => {
     setReloading(true);
     try {
@@ -336,22 +421,35 @@ export default function Config() {
     setReloading(false);
   }, [fetchData]);
 
-  /** Tab click handler — guards against losing dirty edits on switch. */
+  /** Tab click — switches sub-tab unconditionally; never prompts. */
   const handleTabClick = useCallback(
-    async (targetTab: ConfigTab) => {
-      if (tab === "settings" && targetTab !== "settings" && navGuard) {
-        const accepted = await confirm({
-          title: `Discard ${navGuard.dirtyCount} unsaved change${navGuard.dirtyCount === 1 ? "" : "s"}?`,
-          description: "Switching to Raw TOML discards the pending Settings edits.",
-          confirmLabel: "Discard changes",
-          tone: "danger",
-        });
-        if (!accepted) return;
-        navGuard.discard();
-      }
+    (targetTab: ConfigTab) => {
       setTab(targetTab);
+      window.location.hash = `#/config/${targetTab}`;
     },
-    [tab, navGuard, confirm],
+    [],
+  );
+
+  // Provide nav-guard callback to SettingsForm; Config does not prompt on
+  // internal tab switches but surfaces the guard to the Shell via this ref
+  // so a future Shell-level guard can use it (beforeunload is the immediate
+  // guard that still fires).
+  const handleNavGuard = useCallback(
+    (guard: { dirtyCount: number; discard: () => void; dirtySections: Set<string> } | null) => {
+      navGuardRef.current = guard;
+      navGuard.current = guard;
+      if (guard) {
+        const tabs = new Set<ConfigTab>();
+        for (const s of guard.dirtySections) {
+          const t = SECTION_TO_TAB[s];
+          if (t) tabs.add(t);
+        }
+        setDirtyTabs(tabs);
+      } else {
+        setDirtyTabs(new Set());
+      }
+    },
+    [],
   );
 
   if (state.loading) {
@@ -367,33 +465,43 @@ export default function Config() {
   return (
     <div className="config">
       <div className="config-tabs">
-        <button
-          type="button"
-          className={`config-tab${tab === "settings" ? " config-tab--active" : ""}`}
-          onClick={() => handleTabClick("settings")}
-        >
-          Settings
-        </button>
-        <button
-          type="button"
-          className={`config-tab${tab === "raw" ? " config-tab--active" : ""}`}
-          onClick={() => handleTabClick("raw")}
-        >
-          Raw TOML
-        </button>
+        {CONFIG_TABS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            className={`config-tab${tab === t ? " config-tab--active" : ""}`}
+            onClick={() => handleTabClick(t)}
+          >
+            {TAB_LABELS[t]}
+            {dirtyTabs.has(t) && (
+              <span style={{
+                display: "inline-block",
+                width: "6px",
+                height: "6px",
+                borderRadius: "50%",
+                background: "var(--accent-warm)",
+                marginLeft: "6px",
+                verticalAlign: "middle",
+              }} />
+            )}
+          </button>
+        ))}
       </div>
 
-      {tab === "settings" ? (
-        <SettingsForm config={cfg} onNavigationGuard={setNavGuard} />
-      ) : (
+      {/* Raw tab content — always mounted but hidden when not active. */}
+      <div style={{ display: tab === "raw" ? undefined : "none" }}>
         <RawTomlTab
           config={cfg}
           pendingReload={state.pendingReload}
           reloading={reloading}
           onReload={handleReload}
         />
-      )}
-      {dialog}
+      </div>
+
+      {/* SettingsForm — always mounted so the PatchStore survives tab switches. */}
+      <div style={{ display: tab === "raw" ? "none" : undefined }}>
+        <SettingsForm config={cfg} onNavigationGuard={handleNavGuard} tab={tab} kvm={state.kvm} />
+      </div>
     </div>
   );
 }

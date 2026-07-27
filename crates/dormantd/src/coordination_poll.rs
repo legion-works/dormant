@@ -8,7 +8,7 @@ use dormant_core::config::{Config, DisplayScope};
 use dormant_core::coordination::{
     COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle, InputCodeAliases, InputSourceObservation,
 };
-use dormant_core::rules::ControlMsg;
+use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
 use tokio::sync::{mpsc, watch};
@@ -189,11 +189,26 @@ async fn poll_once(
             if let Some(previous_owned) = outcome.committed_prior_owned {
                 let owned = matches!(aliases.classify(observed), InputSourceObservation::Local);
                 tracing::info!(event = "coord_ownership_changed", display = %display_id, previous_owned, owned);
+                // Feed ownership to the rules engine first so it wakes the
+                // display before consumers see the event.
                 let _ = deps
                     .ctl_tx
                     .send(ControlMsg::OwnershipPoll {
                         display: display_id.clone(),
                     })
+                    .await;
+                // Emit ownership event for debounced poll transition.
+                let _ = deps
+                    .ctl_tx
+                    .send(ControlMsg::PublishDaemonEvent(DaemonEvent::Ownership {
+                        display: display_id.clone(),
+                        owned,
+                        observed_input_code: Some(observed),
+                        written_code: None,
+                        cause: "poll".to_string(),
+                        verified: None,
+                        degraded: false,
+                    }))
                     .await;
                 // Post-hoc observed-loss hook: fires only on a committed
                 // LOSS (previous_owned == true).  Gain emits no acquire
@@ -476,6 +491,13 @@ mod tests {
             ctl_rx.recv().await,
             Some(ControlMsg::OwnershipPoll { .. })
         ));
+        // Drain the trailing PublishDaemonEvent(Ownership).
+        assert!(matches!(
+            ctl_rx.try_recv(),
+            Ok(ControlMsg::PublishDaemonEvent(
+                dormant_core::rules::DaemonEvent::Ownership { .. }
+            ))
+        ));
         assert!(ctl_rx.try_recv().is_err());
         cancel.cancel();
     }
@@ -495,10 +517,17 @@ mod tests {
         let (_config_tx, _executors_tx, mut ctl_rx, _state, cancel) = setup_with_config(cfg, sink);
         tick().await;
         tick().await;
-        tick().await; // third tick: loss confirmed, OwnershipPoll sent
+        tick().await; // third tick: loss confirmed, OwnershipPoll + PublishDaemonEvent sent
         assert!(matches!(
             ctl_rx.recv().await,
             Some(ControlMsg::OwnershipPoll { .. })
+        ));
+        // Drain the trailing PublishDaemonEvent before the next tick.
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::PublishDaemonEvent(
+                dormant_core::rules::DaemonEvent::Ownership { .. }
+            ))
         ));
         tick().await; // fourth tick: already not owned, no further poke
         assert!(ctl_rx.try_recv().is_err());
@@ -580,6 +609,13 @@ mod tests {
         assert!(matches!(
             ctl_rx.recv().await,
             Some(ControlMsg::OwnershipPoll { .. })
+        ));
+        // Drain the trailing PublishDaemonEvent before the error tick.
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::PublishDaemonEvent(
+                dormant_core::rules::DaemonEvent::Ownership { .. }
+            ))
         ));
         tick().await; // error after loss commit — verdict held, no poke
         assert!(!state.snapshot()[&DisplayId("shared".to_string())].owned);
@@ -1007,12 +1043,19 @@ mod tests {
         let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup_with_config(cfg, sink);
         tick().await;
         tick().await;
-        tick().await; // third tick: loss confirmed, OwnershipPoll sent
+        tick().await; // third tick: loss confirmed, OwnershipPoll + PublishDaemonEvent sent
         assert!(matches!(
             ctl_rx.recv().await,
             Some(ControlMsg::OwnershipPoll { .. })
         ));
         assert!(!state.snapshot()[&DisplayId("shared".to_string())].owned);
+        // Drain the trailing PublishDaemonEvent before the next tick.
+        assert!(matches!(
+            ctl_rx.recv().await,
+            Some(ControlMsg::PublishDaemonEvent(
+                dormant_core::rules::DaemonEvent::Ownership { .. }
+            ))
+        ));
         tick().await; // fourth tick: already not owned, no further poke
         assert!(ctl_rx.try_recv().is_err());
         cancel.cancel();

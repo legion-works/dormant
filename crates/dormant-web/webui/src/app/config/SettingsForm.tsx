@@ -3,10 +3,11 @@
  *
  * Manages a PatchStore instance, dirty tracking, and the apply
  * lifecycle (call POST /api/config/apply, handle responses and
- * errors).
+ * errors).  One instance spans all five Config form tabs; the `tab`
+ * prop selects which sections are visible.
  */
-import { useState, useRef, useCallback, useEffect } from "react";
-import type { ConfigResponse, ApplyResponse, ApplyErrorBody } from "../../api/types";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import type { ConfigResponse, ApplyResponse, ApplyErrorBody, KvmStatus } from "../../api/types";
 import { getConfig, postConfigApply, ApiError } from "../../api/client";
 import { createPatchStore } from "./patch";
 import type { PatchStore } from "./patch";
@@ -20,17 +21,29 @@ import ZonesSection from "./ZonesSection";
 import RulesSection from "./RulesSection";
 import DisplaysSection from "./DisplaysSection";
 import PairingWizard from "./PairingWizard";
+import CoordinationSection from "./CoordinationSection";
+import KeymapSection from "./KeymapSection";
+import InputFilterSection from "./InputFilterSection";
+import HooksInspector from "./HooksInspector";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
-import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
+import { isEntityCrudEnabled, isPairingEnabled, isHookEditEnabled } from "./entityCrud";
+import RollbackRecoveryCard from "./RollbackRecoveryCard";
+
+/** Config sub-tab — the five form-bearing tabs (raw is handled by Config.tsx, SettingsForm renders nothing for it). */
+export type ConfigFormTab = "daemon" | "presence" | "displays" | "switching" | "protection" | "raw";
 
 interface SettingsFormProps {
   config: ConfigResponse;
   /**
    * Called when the dirty state changes so the parent can guard
-   * navigation (tab-switch, route change).  Passes null when clean.
+   * navigation (route change).  Passes null when clean.
    */
-  onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void } | null) => void;
+  onNavigationGuard?: (guard: { dirtyCount: number; discard: () => void; dirtySections: Set<string> } | null) => void;
+  /** Active form tab; only sections for this tab are rendered. */
+  tab: ConfigFormTab;
+  /** Live KVM state from the state snapshot; absent → not yet loaded. */
+  kvm?: KvmStatus | null;
 }
 
 /** Extract field-level errors from a 422 ApplyErrorBody by matching detail strings. */
@@ -53,14 +66,18 @@ function extractFieldErrors(body: ApplyErrorBody): Record<string, string | undef
   return map;
 }
 
-export function SettingsForm({ config: initialConfig, onNavigationGuard }: SettingsFormProps) {
+export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kvm }: SettingsFormProps) {
   const storeRef = useRef<PatchStore>(createPatchStore());
   const store = storeRef.current;
 
   const [config, setConfig] = useState<ConfigResponse>(initialConfig);
   const lastFingerprintRef = useRef(initialConfig.fingerprint);
   const [dirtyVersion, setDirtyVersion] = useState(0);
-  const dirtyCount = dirtyVersion === 0 ? 0 : store.buildPatches().length + 0; // force recalc on each version
+  const dirtyCount = useMemo(
+    () => (dirtyVersion === 0 ? 0 : store.buildPatches().length),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dirtyVersion],
+  );
 
   const [applying, setApplying] = useState(false);
   const [outcome, setOutcome] = useState<ApplyOutcome | null>(null);
@@ -202,108 +219,172 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard }: Setti
   useEffect(() => {
     if (onNavigationGuard) {
       if (dirtyCount > 0) {
-        onNavigationGuard({ dirtyCount, discard: handleDiscard });
+        // Compute which top-level sections have pending edits.
+        const dirtySections = new Set<string>(
+          store.buildPatches()
+            .filter((p) => "path" in p)
+            .map((p) => (p as { path: string[] }).path[0]),
+        );
+        onNavigationGuard({ dirtyCount, discard: handleDiscard, dirtySections });
       } else {
         onNavigationGuard(null);
       }
     }
-  }, [dirtyCount, onNavigationGuard, handleDiscard]);
+  }, [dirtyCount, onNavigationGuard, handleDiscard, store]);
 
   const inv = config.inventory;
   const entityCrudEnabled = isEntityCrudEnabled(inv.daemon);
   const pairingEnabled = isPairingEnabled(inv.daemon);
+  const hookEditEnabled = isHookEditEnabled(inv.daemon);
   const sensorIds = Object.keys(inv.sensors);
   const zoneIds = Object.keys(inv.zones);
   const displayIds = Object.keys(inv.displays);
 
   return (
     <div className="cf-form">
-      <DaemonSection
-        daemon={inv.daemon}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Daemon tab ── */}
+      {tab === "daemon" && (
+        <DaemonSection
+          daemon={inv.daemon}
+          store={store}
+          redactedPaths={config.redacted_paths}
+          onDirty={onDirty}
+          fieldErrors={fieldErrors}
+        />
+      )}
 
-      <WearSection
-        wear={inv.wear}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Presence tab ── */}
+      {tab === "presence" && (
+        <>
+          <SensorsSection
+            sensors={inv.sensors}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            zones={inv.zones}
+          />
+          <ZonesSection
+            zones={inv.zones}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            sensorIds={sensorIds}
+            rules={inv.rules}
+          />
+          <RulesSection
+            rules={inv.rules}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            zoneIds={zoneIds}
+            displayIds={displayIds}
+          />
+          <AudioSection
+            audio={inv.audio}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+        </>
+      )}
 
-      <NotificationsSection
-        notifications={inv.notifications}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Displays tab ── */}
+      {tab === "displays" && (
+        <>
+          <DisplaysSection
+            displays={inv.displays}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            entityCrudEnabled={entityCrudEnabled}
+            rules={inv.rules}
+            createPrefill={pairingPrefill}
+          />
+          <PairingWizard
+            pairingEnabled={pairingEnabled}
+            onDisplayCreateRequest={(prefill) => setPairingPrefill(prefill)}
+          />
+        </>
+      )}
 
-      <WatchdogSection
-        watchdog={inv.watchdog}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
-      <AudioSection
-        audio={inv.audio}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-      />
+      {/* ── Switching tab ── */}
+      {tab === "switching" && (
+        <>
+          <CoordinationSection
+            coordination={inv.coordination}
+            store={store}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+            kvm={kvm}
+          />
+          <KeymapSection
+            keymap={inv.keymap}
+            store={store}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <InputFilterSection
+            inputFilter={inv.input_filter}
+            store={store}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
 
-      <SensorsSection
-        sensors={inv.sensors}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        zones={inv.zones}
-      />
+          {/* Hooks inspector — one per shared display */}
+          {Object.entries(inv.displays ?? {})
+            .filter(([, dc]) => dc.scope === "shared")
+            .map(([id, dc]) => (
+              <HooksInspector
+                key={id}
+                displayId={id}
+                hooks={dc.hooks}
+                hookEditEnabled={hookEditEnabled}
+                store={store}
+                onDirty={onDirty}
+                fieldErrors={fieldErrors}
+              />
+            ))}
+        </>
+      )}
 
-      <ZonesSection
-        zones={inv.zones}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        sensorIds={sensorIds}
-        rules={inv.rules}
-      />
+      {/* ── Raw tab — handled by Config.tsx, SettingsForm renders nothing. ── */}
 
-      <RulesSection
-        rules={inv.rules}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        zoneIds={zoneIds}
-        displayIds={displayIds}
-      />
+      {/* ── Protection tab ── */}
+      {tab === "protection" && (
+        <>
+          <WearSection
+            wear={inv.wear}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <WatchdogSection
+            watchdog={inv.watchdog}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <NotificationsSection
+            notifications={inv.notifications}
+            store={store}
+            redactedPaths={config.redacted_paths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+          <RollbackRecoveryCard />
+        </>
+      )}
 
-      <DisplaysSection
-        displays={inv.displays}
-        store={store}
-        redactedPaths={config.redacted_paths}
-        onDirty={onDirty}
-        fieldErrors={fieldErrors}
-        entityCrudEnabled={entityCrudEnabled}
-        rules={inv.rules}
-        createPrefill={pairingPrefill}
-      />
-
-      <PairingWizard
-        pairingEnabled={pairingEnabled}
-        onDisplayCreateRequest={(prefill) => setPairingPrefill(prefill)}
-      />
       {/* Banner-level errors not mapped to fields */}
       {bannerErrors.length > 0 && (
         <div className="cf-apply__banner cf-apply__banner--rejected">

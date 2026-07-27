@@ -14,7 +14,7 @@ import {
   UNAVAILABLE_POLICIES,
   DAEMON_EVENT_TAGS,
 } from "../api/types";
-import type { RollbackStatus, StateSnapshot } from "../api/types";
+import type { RollbackStatus, StateSnapshot, OwnershipEvent } from "../api/types";
 
 describe("enum arrays match Rust serde wire strings", () => {
   it("SensorState — serde(rename_all = 'lowercase')", () => {
@@ -50,6 +50,7 @@ describe("enum arrays match Rust serde wire strings", () => {
       "blank_failure",
       "blank_recovered",
       "wake_recovered",
+      "ownership",
     ]);
   });
 
@@ -75,4 +76,48 @@ it("mirrors additive rollback status from rules.rs", () => {
   } satisfies StateSnapshot;
 
   expect(snapshot.rollback.failed_fp).toContain("deadbeef");
+});
+
+it("Ownership wire shape matches BG-1 serde(tag='event', rename_all='snake_case')", () => {
+  // Verified pull — all fields present.
+  const verified: OwnershipEvent = {
+    event: "ownership" as const,
+    display: "shared_oled",
+    owned: true,
+    written_code: 21,
+    observed_input_code: 15,
+    cause: "pull",
+    verified: true,
+    degraded: false,
+  };
+  expect(verified.event).toBe("ownership");
+  expect(verified.written_code).toBe(21);
+  expect(verified.observed_input_code).toBe(15);
+
+  // Poll-observed loss — no written_code, verified: None (read-only).
+  const polled: OwnershipEvent = {
+    event: "ownership" as const,
+    display: "shared_oled",
+    owned: false,
+    observed_input_code: 16,
+    cause: "poll",
+  };
+  expect(polled.cause).toBe("poll");
+  expect(polled.verified).toBeUndefined();
+  expect(polled.written_code).toBeUndefined();
+  expect(polled.degraded).toBeUndefined();
+
+  // Failed write — written_code present, verified: false.
+  const failed: OwnershipEvent = {
+    event: "ownership" as const,
+    display: "shared_oled",
+    owned: true,
+    written_code: 21,
+    cause: "pull",
+    verified: false,
+    degraded: false,
+  };
+  expect(failed.verified).toBe(false);
+  expect(failed.written_code).toBe(21);
+  expect(failed.observed_input_code).toBeUndefined();
 });

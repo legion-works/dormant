@@ -44,8 +44,10 @@ describe("DisplaysSection — Add affordance", () => {
     });
 
     expect(screen.getByLabelText("scope")).toHaveValue("shared");
-    expect(screen.getByLabelText("shared_input_code")).toHaveValue(15);
-    fireEvent.change(screen.getByLabelText("shared_input_code"), { target: { value: "16" } });
+    expect(screen.getByLabelText(/shared_input_code/)).toHaveValue(15);
+    // Hex echo: label text includes "0x0f (15)" when value is 15.
+    expect(screen.getByLabelText(/shared_input_code.*0x0f.*15/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/shared_input_code/), { target: { value: "16" } });
 
     expect(store.buildPatches()).toContainEqual({
       op: "set",

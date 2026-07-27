@@ -278,6 +278,7 @@ fn ensure_ledgers_loaded(
         let identity = WearIdentity {
             key: key.clone(),
             display_name: display_id.0.clone(),
+            config_display_id: Some(display_id.0.clone()),
         };
         let result = load_or_create_ledger(
             dir,
@@ -953,6 +954,7 @@ mod tests {
             WearIdentity {
                 key: sanitize_identity_key(&display.0),
                 display_name: display.0.clone(),
+                config_display_id: Some(display.0.clone()),
             },
             PanelType::Unknown,
             9,
@@ -1765,6 +1767,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         let mut ledger = WearLedger::new(identity.clone(), PanelType::QdOled, 9, 16, 0);
         ledger.attribute_uniform(Duration::from_secs(3600), 0.5);
@@ -1837,6 +1840,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         let now = 12_345;
         let result = load_or_create_ledger(
@@ -1869,6 +1873,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         let result = load_or_create_ledger(
             dir.path(),
@@ -1897,6 +1902,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
 
         let observations = ObservationHub::new(1);
@@ -1928,6 +1934,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         let mut future = WearLedger::new(identity.clone(), PanelType::Unknown, 9, 16, 0);
         future.schema_version = 99;
@@ -1981,6 +1988,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         let mut future = WearLedger::new(identity.clone(), PanelType::Unknown, 9, 16, 0);
         future.schema_version = 99;
@@ -2042,6 +2050,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         // Persist a ledger with Unknown — simulating a pre-config-declaration
         // ledger created before the operator set panel_type.
@@ -2140,6 +2149,7 @@ mod tests {
         let identity = WearIdentity {
             key: "mon".into(),
             display_name: "mon".into(),
+            config_display_id: None,
         };
         // Brand new — no file — needs_seed true.
         let fresh = load_or_create_ledger(

@@ -5369,6 +5369,7 @@ async fn rebuild_old_after_snapshot_timeout_preserves_runner_rollback() {
         failed_fp: "12:deadbeef".to_string(),
         lkg_fp: "11:cafebabe".to_string(),
         detail: "running last-known-good".to_string(),
+        recovery_command: None,
     };
     let lifecycle = ReloadLifecycleCapture::new();
     let app = App::build_with_sources(

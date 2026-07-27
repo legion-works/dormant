@@ -57,6 +57,7 @@ export const DAEMON_EVENT_TAGS = [
   "blank_failure",
   "blank_recovered",
   "wake_recovered",
+  "ownership",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -138,6 +139,8 @@ export interface RollbackStatus {
   failed_fp: string;
   lkg_fp: string;
   detail: string;
+  /** Platform-specific restart command suggestion. Absent on older daemons. */
+  recovery_command?: string;
 }
 
 /**
@@ -265,7 +268,8 @@ export type DaemonEvent =
   | CompensationAdvisoryEvent
   | BlankFailureEvent
   | BlankRecoveredEvent
-  | WakeRecoveredEvent;
+  | WakeRecoveredEvent
+  | OwnershipEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -365,18 +369,53 @@ export interface WakeRecoveredEvent {
 }
 
 /**
+ * rust: rules.rs DaemonEvent::Ownership
+ * serde: `observed_input_code` / `verified` / `degraded` are `#[serde(default)]`.
+ */
+export interface OwnershipEvent {
+  event: "ownership";
+  display: string;
+  owned: boolean;
+  /** VCP 0x60 code written (write path), absent for poll-observed events. */
+  written_code?: number | null;
+  observed_input_code?: number | null;
+  /** "pull" | "push" | "poll" | "activity_follow" | "hotkey" | "cli" | "tray" | "web" */
+  cause: string;
+  /** Present when cause is a write path: did readback verify the panel moved? */
+  verified?: boolean | null;
+  /** Set when the write path degraded (peer READ alias absent). */
+  degraded?: boolean;
+}
+
+/**
  * rust: doctor.rs Check
  * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+ * `category` / `subject` are added by BG-7.
  */
 export interface Check {
   name: string;
   status: CheckStatus;
   detail?: string;
+  /** "config" | "sensor" | "display" | "platform" | "network" */
+  category?: string;
+  /** The entity this check is about — display id, sensor id, or absent. */
+  subject?: string;
 }
 
 /** rust: doctor.rs DoctorReport */
 export interface DoctorReport {
   checks: Check[];
+}
+
+/** rust: event_ring.rs RecentEvent — a DaemonEvent with server timestamp. */
+export interface RecentEvent {
+  at_epoch_ms: number;
+  event: DaemonEvent;
+}
+
+/** rust: GET /api/events/recent response */
+export interface RecentEventsResponse {
+  events: RecentEvent[];
 }
 
 /**
@@ -426,6 +465,10 @@ export interface ConfigInventory {
   audio?: Record<string, unknown>;
   /** rust: config/schema.rs CoordinationConfig — optional for older payloads. */
   coordination?: CoordinationConfig;
+  /** rust: config/schema.rs KeymapConfig — optional for older payloads. */
+  keymap?: KeymapConfig;
+  /** rust: config/schema.rs InputFilterConfig — optional for older payloads. */
+  input_filter?: InputFilterConfig;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
@@ -755,6 +798,10 @@ export interface ConfigResponse {
 export interface WearSummary {
   display: string;
   display_name: string;
+  /** The `[displays.*]` config id this ledger is attributed to, when
+   * known.  The frontend joins on this field first, falling back to
+   * `display_name` for backward compatibility with pre-BG-8 ledgers. */
+  config_display_id?: string | null;
   panel_type: PanelType;
   total_on_hours: number;
   seeded_usage_hours?: number | null;

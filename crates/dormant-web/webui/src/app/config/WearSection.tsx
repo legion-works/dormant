@@ -1,11 +1,8 @@
 /**
  * Wear (panel-exposure) settings section — the `[wear]` TOML section.
  *
- * Renders each known `wear.*` key with the appropriate widget, mirroring
- * DaemonSection's known-field guidance pattern. All ten keys have
- * defaults in the Rust schema (`WearConfig::default()`), so the section
- * is only hidden when `wear` is entirely absent from the inventory
- * (older fixture/payload shape).
+ * Renders each known `wear.*` key with the appropriate widget.
+ * W1-5: 230px label column + changed-field markers.
  */
 import FormSection from "./FormSection";
 import { BoolField, DurationField, NumberField, TextField } from "./fields";
@@ -20,7 +17,6 @@ interface WearSectionProps {
   fieldErrors: Record<string, string | undefined>;
 }
 
-/** Known wear keys with explicit widget choices. */
 const KNOWN_FIELDS: Record<string, { kind: "bool" | "number" | "duration" | "text" }> = {
   enabled: { kind: "bool" },
   sample_interval: { kind: "duration" },
@@ -34,7 +30,6 @@ const KNOWN_FIELDS: Record<string, { kind: "bool" | "number" | "duration" | "tex
   advisory_after: { kind: "duration" },
 };
 
-/** Per-field help text — accurate to the real config semantics. */
 const FIELD_HELP: Record<string, string> = {
   enabled: "Enable panel-wear tracking. On by default.",
   sample_interval: "How often to sample panel state for wear attribution.",
@@ -44,11 +39,10 @@ const FIELD_HELP: Record<string, string> = {
   grid_cols: "Number of columns in the wear-attribution grid.",
   fallback_brightness: "Brightness fraction (0.0-1.0) assumed when the real brightness can't be read.",
   screensaver_factor: "Brightness fraction (0.0-1.0) attributed while the screensaver is active.",
-  short_cycle_dwell: "Minimum dwell before a blank/wake cycle counts as a full cycle rather than a short cycle.",
+  short_cycle_dwell: "Minimum dwell before a blank/wake cycle counts as a full cycle.",
   advisory_after: "Panel age (accumulated on-hours) after which wear advisories start surfacing.",
 };
 
-/** Placeholder text for empty inputs — the real default value. */
 const FIELD_PLACEHOLDER: Record<string, string> = {
   sample_interval: "60s",
   persist_interval: "300s",
@@ -69,48 +63,40 @@ export default function WearSection({ wear, store, redactedPaths, onDirty, field
           const path = ["wear", key];
           const value = inv[key];
           const locked = store.isLocked(path, redactedPaths);
-          const lockedReason = locked ? "contains credentials — edit in the config file" : undefined;
           const known = KNOWN_FIELDS[key];
           const error = fieldErrors[path.join(".")];
+          const pending = store.getEdit(path);
+          const changed = pending !== undefined && pending !== value;
 
           const shared: FieldProps = {
-            path,
-            label: key,
-            value,
-            locked,
-            lockedReason,
-            error,
-            help: FIELD_HELP[key],
-            placeholder: FIELD_PLACEHOLDER[key],
-            onEdit: (p, v) => {
-              store.trackEdit(p, v);
-              onDirty();
-            },
+            path, label: key, value, locked,
+            lockedReason: locked ? "contains credentials — edit in the config file" : undefined,
+            error, help: FIELD_HELP[key], placeholder: FIELD_PLACEHOLDER[key],
+            onEdit: (p, v) => { store.trackEdit(p, v); onDirty(); },
           };
 
-          if (locked) {
-            return <TextField key={key} {...shared} />;
+          let widget: React.ReactNode;
+          if (locked) widget = <TextField key={key} {...shared} />;
+          else if (!known) {
+            if (typeof value === "number") widget = <NumberField key={key} {...shared} />;
+            else if (typeof value === "boolean") widget = <BoolField key={key} {...shared} />;
+            else if (typeof value === "string") widget = <TextField key={key} {...shared} />;
+            else return null;
+          } else switch (known.kind) {
+            case "bool": widget = <BoolField key={key} {...shared} />; break;
+            case "number": widget = <NumberField key={key} {...shared} />; break;
+            case "duration": widget = <DurationField key={key} {...shared} />; break;
+            case "text": widget = <TextField key={key} {...shared} />; break;
+            default: return null;
           }
 
-          if (!known) {
-            if (typeof value === "number") return <NumberField key={key} {...shared} />;
-            if (typeof value === "boolean") return <BoolField key={key} {...shared} />;
-            if (typeof value === "string") return <TextField key={key} {...shared} />;
-            return null;
-          }
-
-          switch (known.kind) {
-            case "bool":
-              return <BoolField key={key} {...shared} />;
-            case "number":
-              return <NumberField key={key} {...shared} />;
-            case "duration":
-              return <DurationField key={key} {...shared} />;
-            case "text":
-              return <TextField key={key} {...shared} />;
-            default:
-              return null;
-          }
+          const cls = `cf-field cf-field--row${changed ? " cf-field--changed" : ""}`;
+          return (
+            <div key={key} className={cls}>
+              {widget}
+              {changed && <span className="cf-field__was">changed · was {String(value ?? "")}</span>}
+            </div>
+          );
         })}
       </div>
     </FormSection>

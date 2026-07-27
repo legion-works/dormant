@@ -43,10 +43,12 @@
 //!   we immediately try again — the engine's swap is bounded, so this
 //!   converges without hot-spinning.
 
+use axum::Json;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 
 use dormant_core::reload::ReloadOutcome;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
@@ -65,6 +67,30 @@ pub(crate) async fn ws_events(
             tracing::debug!(event = "ws_events_error", error = %e);
         }
     })
+}
+
+/// Query parameters for `GET /api/events/recent`.
+#[derive(Deserialize)]
+pub(crate) struct RecentEventsQuery {
+    /// Max events to return (default 100, max 500).
+    #[serde(default = "default_recent_limit")]
+    limit: usize,
+}
+
+fn default_recent_limit() -> usize {
+    100
+}
+
+/// `GET /api/events/recent?limit=N` — return the N most recent events
+/// from the in-memory ring buffer, oldest first.
+pub(crate) async fn get_recent(
+    State(state): State<WebState>,
+    axum::extract::Query(query): axum::extract::Query<RecentEventsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.clamp(1, 500);
+    let events = state.inner.event_history.snapshot(limit);
+    let body = serde_json::json!({ "events": events });
+    Json(body)
 }
 
 /// Core streaming loop — subscribe, stream, re-subscribe on reload.

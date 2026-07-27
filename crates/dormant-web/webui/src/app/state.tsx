@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useEvents } from "../api/ws";
-import { getState, getConfig, getOperations, getWear, getWearDetail } from "../api/client";
+import { getState, getConfig, getOperations, getWear, getWearDetail, getRecentEvents } from "../api/client";
 import type {
   SensorSnapshot,
   StateSnapshot,
@@ -125,6 +125,7 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<StateSnapshot | null>(null);
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [events, setEvents] = useState<StampedEvent[]>([]);
+  const [historySeeded, setHistorySeeded] = useState(false);
   const [lagged, setLagged] = useState(false);
   const [wearSnapshots, setWearSnapshots] = useState<Record<string, WearSnapshotPatch>>({});
   const [wearAdvisories, setWearAdvisories] = useState<Record<string, number>>({});
@@ -180,8 +181,9 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
       );
       const failures = settled.length - details.length;
       setWear(list);
-      // Replacing, rather than merging, invalidates removed displays and stale ids.
-      setWearDetails(Object.fromEntries(details.map((detail) => [detail.display_name, detail])));
+      // Key by config_display_id when available, falling back to display_name
+      // for backward compatibility with pre-BG-8 ledgers.
+      setWearDetails(Object.fromEntries(details.map((detail) => [detail.config_display_id ?? detail.display_name, detail])));
       setWearError(failures > 0 ? `${failures} wear detail request${failures === 1 ? "" : "s"} failed` : null);
     } catch (err: unknown) {
       if (!mountedRef.current || request !== wearRequestSequence.current) return;
@@ -241,10 +243,61 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     mountedRef.current = true;
     void fetchAll("initial");
     void refreshWear();
+
+    // Seed event history from the server ring on mount.
+    // Guarded: older daemons lack the endpoint; test mocks may omit the function.
+    void (async () => {
+      try {
+        const res = await getRecentEvents(100);
+        if (!mountedRef.current) return;
+        if (res.events.length > 0) {
+          // Dedupe key: timestamp + serialized event so rapid identical
+          // frames (e.g. double config_reloaded) both render.
+          const seen = new Set<string>();
+          const dedupKey = (se: { time: string; event: unknown }): string =>
+            `${se.time}|${JSON.stringify(se.event)}`;
+          for (const se of events) {
+            seen.add(dedupKey(se));
+          }
+
+          // History events arrive oldest-first. Convert and dedupe.
+          const historyEntries: StampedEvent[] = [];
+          for (const re of res.events) {
+            const stampedTime = new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false });
+            const entry: { time: string; event: unknown } = { time: stampedTime, event: re.event };
+            const key = dedupKey(entry);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            historyEntries.push(entry as StampedEvent);
+          }
+
+          if (historyEntries.length > 0) {
+            // History oldest-first, reverse to match live order (newest first).
+            historyEntries.reverse();
+            // Separator between history and live.
+            historyEntries.push({
+              time: "",
+              event: { event: "_history_separator" } as never,
+            });
+            // Merge: history (newest first) + separator + existing live events.
+            setEvents((prev) => {
+              const merged = [...historyEntries, ...prev].slice(0, MAX_EVENTS);
+              return merged;
+            });
+          }
+        }
+      } catch {
+        // Endpoint unavailable — silent fallback.
+      } finally {
+        if (mountedRef.current) setHistorySeeded(true);
+      }
+    })();
+
     return () => {
       mountedRef.current = false;
       if (lagTimerRef.current != null) clearTimeout(lagTimerRef.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps — history seed reads events for dedup
   }, [fetchAll, refreshWear]);
 
   // Poll state and authoritative operation guards together at one-second
@@ -338,6 +391,24 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
             const be = ev as { display: string };
             return patchBlankFailed(prev, be.display, false);
           }
+          case "ownership": {
+            const oe = ev as { display: string; owned: boolean; observed_input_code?: number | null };
+            // Patch the display snapshot's owned/observed_input_code fields.
+            const displays = prev.displays.map(
+              ([id, d]): [string, DisplaySnapshot] =>
+                id === oe.display
+                  ? [
+                      id,
+                      {
+                        ...d,
+                        owned: oe.owned,
+                        observed_input_code: oe.observed_input_code ?? d.observed_input_code,
+                      },
+                    ]
+                  : [id, d],
+            );
+            return { ...prev, displays };
+          }
           case "wear_snapshot": {
             // Not part of StateSnapshot — patches the separate
             // wearSnapshots map as a side effect; the snapshot itself
@@ -426,7 +497,7 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     refresh,
   };
 
-  const eventLog: EventLogState = { events, connected, lagged };
+  const eventLog: EventLogState = { events, connected, lagged, historySeeded };
 
   return (
     <LiveStateContext.Provider value={liveState}>

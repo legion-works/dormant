@@ -96,6 +96,7 @@ pub enum BootOutcome {
 /// build, post-probe validation, watcher install) verbatim — those are
 /// unexpected-at-runtime failures, distinct from the two EXPECTED
 /// [`BootOutcome`] failure shapes above.
+#[allow(clippy::too_many_lines)]
 pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
     let observations = inputs.observations.clone();
     let lkg_path = boot_guard::lkg_path(&inputs.state_dir);
@@ -159,6 +160,9 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
                                 failed_fp: boot_guard::fingerprint_label(current_fp),
                                 lkg_fp: boot_guard::fingerprint_label(lkg_fp),
                                 detail: pending.clone(),
+                                recovery_command: Some(
+                                    boot_guard::recovery_command_suggestion().to_string(),
+                                ),
                             };
                             (app, lkg_path.clone(), true, Some(pending), Some(rollback))
                         }

@@ -29,6 +29,9 @@ const api = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/client", () => api);
+vi.mock("../app/nav", () => ({
+  useNavigate: () => vi.fn(),
+}));
 vi.mock("../app/hooks/useLiveState", () => ({
   useLiveState: () => ({
     operations: {
@@ -79,6 +82,7 @@ describe("DisplayDetail", () => {
         config={{ controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" } as DisplayConfig}
         rule={{ rule: "office_blank", zone: "office" }}
         wear={wear}
+        wearError={null}
         onBack={vi.fn()}
       />,
     );
@@ -94,11 +98,15 @@ describe("DisplayDetail", () => {
     expect(screen.getByText("high")).toBeInTheDocument();
     expect(screen.getByText(/v1 attribution is panel-wide and advisory/)).toBeInTheDocument();
 
-    // Exposure summary tiles (F3).
+    // Exposure summary tiles (F3). W3-3: when not seeded, "Total on-hours"
+    // replaces the seeded/measured split.
     expect(screen.getByText("321.3h")).toBeInTheDocument();
-    expect(screen.getByText("not seeded")).toBeInTheDocument();
+    expect(screen.getByText("Total on-hours")).toBeInTheDocument();
     expect(screen.getByText("444")).toBeInTheDocument();
     expect(screen.getByText("5d")).toBeInTheDocument();
+    // W3-3: last-sample relative timestamp and panel type are new tiles.
+    expect(screen.getByText("Last sample")).toBeInTheDocument();
+    expect(screen.getByText("Panel type")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
     expect(screen.getByText("45%")).toBeInTheDocument();
 
@@ -128,6 +136,7 @@ describe("DisplayDetail", () => {
         config={{ controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" } as DisplayConfig}
         rule={{ rule: "office_blank", zone: "office" }}
         wear={wear}
+        wearError={null}
         onBack={vi.fn()}
       />,
     );
@@ -148,6 +157,7 @@ describe("DisplayDetail", () => {
         config={{ controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" } as DisplayConfig}
         rule={{ rule: "office_blank", zone: "office" }}
         wear={wear}
+        wearError={null}
         onBack={vi.fn()}
       />,
     );
@@ -165,6 +175,7 @@ describe("DisplayDetail", () => {
         config={{ controllers: ["ddcci", "kwin-dpms"], blank_mode: "power_off" } as DisplayConfig}
         rule={{ rule: "office_blank", zone: "office" }}
         wear={wear}
+        wearError={null}
         onBack={vi.fn()}
       />,
     );
@@ -196,6 +207,7 @@ describe("DisplayDetail", () => {
         config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
         rule={{ rule: "office_blank", zone: "office" }}
         wear={undefined}
+        wearError={null}
         onBack={vi.fn()}
       />,
     );
@@ -247,6 +259,87 @@ describe("DisplayDetail", () => {
       heat: [],
       hasGridSamples: false,
       hasHeatSamples: false,
+    });
+  });
+
+  // W3-2 acceptance: Sharing section absent for private displays.
+  it("does not render Sharing section for private displays", () => {
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={{ ...snapshot, scope: "private" }}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={wear}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("heading", { name: "Sharing" })).not.toBeInTheDocument();
+  });
+
+  // W3-2 acceptance: Sharing section renders for shared displays.
+  it("renders Sharing section with OwnershipPair for shared displays", () => {
+    render(
+      <DisplayDetail
+        id="shared-panel"
+        snapshot={{
+          phase: "active",
+          inhibited: false,
+          paused: false,
+          cmd_gen: 1,
+          controllers: [],
+          scope: "shared",
+          owned: true,
+          observed_input_code: 96,
+          panel_state: { power: "on" },
+        }}
+        config={{
+          controllers: ["ddcci"],
+          blank_mode: "power_off",
+          scope: "shared",
+          shared_input_code: 96,
+          shared_input_write_code: 96,
+          shared_peer_input_code: 0,
+        } as DisplayConfig}
+        rule={{ rule: "shared-rule", zone: "shared-zone" }}
+        wear={wear}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "Sharing" })).toBeInTheDocument();
+    // OwnershipPair renders the compact ownership state.
+    expect(screen.getByText(/holds the panel/)).toBeInTheDocument();
+    // The "open Switching →" link is present.
+    expect(screen.getByText(/open Switching/)).toBeInTheDocument();
+  });
+
+  // W3-2 acceptance: #/displays/{id}#wear scrolls to and highlights the section.
+  it("scrolls to and highlights the target anchor section", () => {
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    // Simulate a deep-link hash fragment.
+    vi.stubGlobal("location", { hash: "#/displays/main#wear" });
+
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={wear}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+    // The useEffect defers 150ms; wait for it.
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        expect(scrollIntoView).toHaveBeenCalled();
+        vi.unstubAllGlobals();
+        resolve();
+      }, 200);
     });
   });
 });

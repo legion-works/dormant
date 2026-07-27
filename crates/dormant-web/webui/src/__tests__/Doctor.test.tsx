@@ -136,7 +136,8 @@ describe("Doctor", () => {
     expect(screen.getAllByText("ok").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("skip")).toBeInTheDocument();
     expect(screen.getByText("fail")).toBeInTheDocument();
-    expect(screen.getByText("n/a")).toBeInTheDocument();
+    // not_supported is labelled "not applicable on this platform" per spec.
+    expect(screen.getByText("not applicable on this platform")).toBeInTheDocument();
   });
 
   it("shows loading state while running", () => {
@@ -158,15 +159,9 @@ describe("Doctor", () => {
     });
   });
 
-  it("shows four summary tiles and launches exercise for a chosen display", async () => {
-    // Adaptation: the plan's RED test draft declares its own standalone
-    // `runDoctor` mock (checks: config/ok, mqtt/warn, usb/skip,
-    // ddcci/fail). This file has a single hoisted `api` object shared by
-    // every test (mirroring the DisplayDetail.test.tsx "single final
-    // definition" precedent — two competing `vi.mock("../api/client", …)`
-    // factories are not possible), so the pre-T8 tests' six-check fixture
-    // stays the shared default and this test overrides it for one call
-    // via `mockResolvedValueOnce` with the plan's exact data instead.
+  it("shows summary tiles and launches exercise for a chosen display", async () => {
+    // Two competing `vi.mock` factories are not possible with a shared `api`;
+    // override the single mock with `mockResolvedValueOnce` here.
     vi.mocked(api.runDoctor).mockResolvedValueOnce({
       checks: [
         { name: "config", status: "ok", detail: "valid" },
@@ -199,12 +194,159 @@ describe("Doctor", () => {
 
     render(<DoctorHarness />);
     fireEvent.click(screen.getByRole("button", { name: "Run doctor" }));
-    await waitFor(() => expect(screen.getByText("Warnings")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Failing")).toBeInTheDocument());
     expect(screen.getByText("Passing")).toBeInTheDocument();
     expect(screen.getByText("Skipped")).toBeInTheDocument();
-    expect(screen.getByText("Failing")).toBeInTheDocument();
-    expect(screen.getAllByText("1")).toHaveLength(4);
-    expect(screen.getByRole("combobox", { name: "Exercise display" })).toHaveValue("main");
+    // Warnings tile is removed (W0-4). Three tiles: Passing · Failing · Skipped.
+    expect(screen.queryByText("Warnings")).not.toBeInTheDocument();
+    // Exercise is now a peer panel, not a <select>.
     expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
+  });
+
+  it("renders checks grouped by heuristic fallback when no category/subject", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [
+        { name: "config", status: "ok" as const, detail: "valid" },
+        { name: "unknown-probe", status: "fail" as const, detail: "something broke" },
+      ],
+    });
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      // "config" name matches heuristic → CONFIG group header.
+      expect(screen.getByText("CONFIG")).toBeInTheDocument();
+      // "unknown-probe" doesn't match any heuristic → OTHER group.
+      expect(screen.getByText("OTHER")).toBeInTheDocument();
+    });
+
+    // The Other bucket contains the unknown probe.
+    expect(screen.getByText("unknown-probe")).toBeInTheDocument();
+  });
+
+  it("renders exercise runner with button not disabled from local state", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [],
+    });
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        snapshot: {
+          sensors: [],
+          zones: [],
+          displays: [["main", {
+            phase: "active",
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: [],
+          }]],
+          pending_reload: null,
+        },
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      const btn = screen.getByRole("button", { name: "Run control-path exercise" });
+      // Exercise button should be enabled when no exercise is in flight.
+      expect(btn).not.toBeDisabled();
+    });
+  });
+
+  it("renders groups using real category/subject when BG-7 data is present", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [
+        { name: "config", status: "ok", detail: "valid", category: "config" },
+        { name: "ddcci (studio)", status: "ok", detail: "last attempt succeeded", category: "display", subject: "studio" },
+        { name: "mqtt desk-mmwave", status: "fail", detail: "timeout", category: "sensor", subject: "desk-mmwave" },
+        { name: "oddball-check", status: "skip", detail: "mystery" },
+        // Warm-up A (W4 residual Should): a check whose name would match the
+        // display heuristic — `name.match(/\(([^)]+)\)$/)` pulls "studio" —
+        // but whose BG-7 category is "sensor", so it lands under SENSOR, not
+        // DISPLAY.  The fixture includes "studio" in `displays` so the
+        // heuristic WOULD have placed it in DISPLAY had category been absent.
+        { name: "panel (studio)", status: "ok", detail: "panel ok", category: "sensor", subject: "studio" },
+      ],
+    });
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        snapshot: {
+          sensors: [],
+          zones: [],
+          displays: [["studio", { phase: "active", inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
+          pending_reload: null,
+        },
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      // Category headers appear in uppercase.
+      // config → CONFIG, display → DISPLAY, sensor → SENSOR.
+      // oddball-check (no category) falls into OTHER bucket.
+      expect(screen.getByText("oddball-check")).toBeInTheDocument();
+
+      // Warm-up A: "panel (studio)" has category "sensor", subject "studio".
+      // The heuristic on its name would match "studio" as a display and place
+      // it under DISPLAY, but the BG-7 category wins — assert it renders under
+      // the SENSOR group header.  Two SENSOR groups exist (desk-mmwave and
+      // studio), so we find the one containing our target check text.
+      const sensorGroup = Array.from(document.querySelectorAll(".doctor-group"))
+        .find((el) => el.querySelector(".doctor-group__category")?.textContent === "SENSOR"
+          && el.textContent?.includes("panel (studio)"));
+      expect(sensorGroup).toBeTruthy();
+      expect(sensorGroup!.textContent).toContain("panel (studio)");
+    });
+  });
+
+  it("scrolls and highlights ?subject= group", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [
+        { name: "ddcci (studio)", status: "ok", detail: "ok", category: "display", subject: "studio" },
+      ],
+    });
+
+    window.location.hash = "#/doctor?subject=studio";
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      const groups = document.querySelectorAll(".doctor-group--highlighted");
+      expect(groups.length).toBeGreaterThanOrEqual(1);
+    });
   });
 });

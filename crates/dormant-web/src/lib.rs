@@ -17,6 +17,7 @@
 mod assets;
 mod config_patch;
 mod error;
+mod event_ring;
 mod routes;
 mod security;
 mod server;

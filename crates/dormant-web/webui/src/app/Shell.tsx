@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import Dashboard from "./views/Dashboard";
+import Overview from "./views/Overview";
 import Displays from "./views/Displays";
 import Events from "./views/Events";
 import Config from "./views/Config";
+import { navGuard } from "./navGuard";
 import Doctor from "./views/Doctor";
+import Switching from "./views/Switching";
 import { LiveStateProvider } from "./state";
 import { useLiveState } from "./hooks/useLiveState";
 import { getDaemon, postReload } from "../api/client";
@@ -16,16 +18,20 @@ import SidebarFooter from "./components/SidebarFooter";
 import "./Shell.css";
 
 const VIEW_COMPONENTS: Record<ViewId, React.ComponentType> = {
-  dashboard: Dashboard,
+  dashboard: Overview,
+  overview: Overview,
   displays: Displays,
+  switching: Switching,
   events: Events,
   config: Config,
   doctor: Doctor,
 };
 
 const VIEW_LABELS: Record<ViewId, string> = {
-  dashboard: "Dashboard",
+  dashboard: "Overview",
+  overview: "Overview",
   displays: "Displays",
+  switching: "Switching",
   events: "Events",
   config: "Config",
   doctor: "Doctor",
@@ -33,8 +39,10 @@ const VIEW_LABELS: Record<ViewId, string> = {
 
 /** Topbar subtitle per view — a one-line reminder of what the view covers. */
 const VIEW_SUBTITLES: Record<ViewId, string> = {
-  dashboard: "live presence-to-display state",
+  dashboard: "what every panel is doing right now",
+  overview: "what every panel is doing right now",
   displays: "per-display control & controller chains",
+  switching: "shared-display KVM ownership",
   events: "daemon event stream",
   config: "settings form, entity CRUD & validation",
   doctor: "environment & integration diagnostics",
@@ -44,7 +52,9 @@ const VIEW_IDS = Object.keys(VIEW_COMPONENTS) as ViewId[];
 
 function getViewFromHash(): ViewId {
   const hash = window.location.hash.replace(/^#\/?/, "");
-  return (VIEW_IDS as string[]).includes(hash) ? (hash as ViewId) : "dashboard";
+  // Support sub-routes like #/config/presence by matching the first segment only.
+  const firstSegment = hash.split("/")[0];
+  return (VIEW_IDS as string[]).includes(firstSegment) ? (firstSegment as ViewId) : "dashboard";
 }
 
 function formatClock(): string {
@@ -90,9 +100,18 @@ function ShellInner() {
   }, [connected]);
 
   const navigate = useCallback((key: ViewId) => {
+    // Check Config nav guard before leaving — data-loss prevention.
+    if (activeView === "config" && key !== "config" && navGuard.current) {
+      const g = navGuard.current;
+      const ok = window.confirm(
+        `Discard ${g.dirtyCount} unsaved change${g.dirtyCount === 1 ? "" : "s"} in Config?`,
+      );
+      if (!ok) return;
+      g.discard();
+    }
     setActiveView(key);
     window.location.hash = `#/${key}`;
-  }, []);
+  }, [activeView]);
 
   const handleReload = useCallback(async () => {
     try {
@@ -114,12 +133,23 @@ function ShellInner() {
 
   const rollbackActive = snapshot?.rollback != null;
   const doctorFailures = doctorReport?.checks.filter((c) => c.status === "fail").length ?? 0;
+  const switchingEnabled =
+    snapshot?.kvm != null && (snapshot.kvm.switch_capable_displays?.length ?? 0) > 0;
+
+  // Redirect #/switching to #/displays when switching is not available.
+  useEffect(() => {
+    if (!switchingEnabled && getViewFromHash() === "switching") {
+      window.location.hash = "#/displays";
+      setActiveView("displays");
+    }
+  }, [switchingEnabled]);
 
   const items = navItems({
     displayCount: snapshot ? snapshot.displays.length : 0,
     eventsLive: connected,
     rollbackActive,
     doctorFailures,
+    switchingEnabled,
   });
 
   // Generic pending-reload banner only surfaces when there's no rollback
@@ -173,7 +203,12 @@ function ShellInner() {
           ))}
         </nav>
 
-        <SidebarFooter connected={connected} daemon={daemon} />
+        <SidebarFooter
+          connected={connected}
+          daemon={daemon}
+          webBind={config?.inventory.daemon.web_bind}
+          webAllowNonloopback={config?.inventory.daemon.web_allow_nonloopback}
+        />
       </aside>
 
       <main className="main">

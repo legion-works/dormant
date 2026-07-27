@@ -6,7 +6,7 @@
  * the underlying WebSocket hook.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import Events from "../app/views/Events";
 
 
@@ -70,7 +70,7 @@ describe("Events", () => {
       screen.getByText("live · subscribed to daemon event stream"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Waiting for events from the daemon…"),
+      screen.getByText("Waiting for the first event…"),
     ).toBeInTheDocument();
     expect(screen.getByText("0 events")).toBeInTheDocument();
   });
@@ -219,5 +219,65 @@ describe("Events", () => {
     expect(
       screen.getByText('{"event":"future_event_v2","payload":"test"}'),
     ).toBeInTheDocument();
+  });
+
+  it("hides switching filter group when no ownership events exist", () => {
+    mockUseEventLog.events = [
+      { time: "12:00:00", event: { event: "sensor_changed", sensor: "a", state: "present" } },
+    ];
+    render(<Events />);
+    // The "switching" filter chip should NOT be visible.
+    expect(screen.queryByText(/switching/i)).not.toBeInTheDocument();
+  });
+
+  it("shows switching filter group after ownership event arrives", () => {
+    mockUseEventLog.events = [
+      { time: "12:00:00", event: { event: "ownership" as const, display: "d", owned: true, cause: "pull" } },
+    ];
+    render(<Events />);
+    // The filter chip with label "switching" should be visible.
+    // getByText works because button text is just the label.
+    expect(screen.queryByText("switching")).not.toBeNull();
+  });
+
+  it("renders history separator sentinel as a divider", () => {
+    mockUseEventLog.events = [
+      { time: "12:00:01", event: { event: "_history_separator" } },
+      { time: "12:00:00", event: { event: "sensor_changed", sensor: "a", state: "present" } },
+    ];
+    render(<Events />);
+    expect(screen.getByText(/— history —/)).toBeInTheDocument();
+  });
+
+  it("history separator survives active tag filters", () => {
+    mockUseEventLog.events = [
+      { time: "12:00:01", event: { event: "_history_separator" } },
+      { time: "12:00:00", event: { event: "zone_changed", zone: "z", present: true, cause: "s" } },
+    ];
+    // Simulate active filter by updating hash params
+    window.location.hash = "#/events?tag=zone_changed";
+    render(<Events />);
+    // Separator should still be visible even though it's not in any filter group.
+    expect(screen.getByText(/— history —/)).toBeInTheDocument();
+    // But the zone_changed event should also be visible (matching filter).
+    expect(screen.getByText(/zone 'z'/)).toBeInTheDocument();
+  });
+
+  it("clicking a filter chip toggles the hash query parameter", () => {
+    mockUseEventLog.events = [
+      { time: "12:00:00", event: { event: "zone_changed", zone: "z", present: true, cause: "s" } },
+    ];
+    window.location.hash = "#/events";
+    render(<Events />);
+
+    // Click the "presence" filter group (covers zone_changed).
+    const presenceChip = screen.getByText("presence");
+    fireEvent.click(presenceChip);
+
+    // Hash should now include ?tag=zone_changed,sensor_changed
+    // (the presence group covers both tags).
+    expect(window.location.hash).toContain("?tag=");
+    expect(window.location.hash).toContain("zone_changed");
+    expect(window.location.hash).toContain("sensor_changed");
   });
 });

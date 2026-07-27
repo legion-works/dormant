@@ -97,6 +97,11 @@ pub const ENTITY_CRUD_ENABLED: bool = true;
 /// Whether the Samsung pairing wizard route is enabled by default.
 pub const PAIRING_ENABLED: bool = true;
 
+/// Whether the web UI's hook-edit affordance is enabled by default.
+/// Defaults to `false` — no argv-writing form on an unauthenticated
+/// loopback surface without explicit operator consent.
+pub const HOOK_EDIT_ENABLED: bool = false;
+
 /// Cadence for polling shared-display ownership state.
 pub const COORDINATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 

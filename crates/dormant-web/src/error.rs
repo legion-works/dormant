@@ -81,6 +81,10 @@ pub(crate) enum WebError {
     /// (spec §2: "the UI hides the affordance but the server is the
     /// boundary"). `Set`/`Remove` patches are unaffected.
     EntityCrudFeatureDisabled,
+    /// A `Set`/`Remove` patch targeting a `hooks` path was submitted while
+    /// `daemon.hook_edit_enabled = false` — the server boundary mirrors the
+    /// UI's hidden affordance.
+    HookEditDisabled,
     /// `POST /api/pair/samsung` was called while
     /// `daemon.pairing_enabled = false`.
     PairFeatureDisabled,
@@ -196,12 +200,11 @@ impl IntoResponse for WebError {
                 }] });
                 return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
             }
-            WebError::EntityCrudFeatureDisabled => {
-                (StatusCode::FORBIDDEN, "feature_disabled", None)
-            }
+            WebError::EntityCrudFeatureDisabled
+            | WebError::HookEditDisabled
+            | WebError::PairFeatureDisabled => (StatusCode::FORBIDDEN, "feature_disabled", None),
 
             // ── Pairing-wizard variants (Task 5) ───────────────────────────────
-            WebError::PairFeatureDisabled => (StatusCode::FORBIDDEN, "feature_disabled", None),
             WebError::PairInProgress => (StatusCode::CONFLICT, "pairing_in_progress", None),
             WebError::PairNotFound => (StatusCode::NOT_FOUND, "pair_not_found", None),
             WebError::CoordinationUnavailable => (

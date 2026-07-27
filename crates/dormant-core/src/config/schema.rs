@@ -228,6 +228,7 @@ impl CoordinationConfig {
 
 /// Daemon-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DaemonConfig {
     /// How long to wait after startup before acting.
     #[serde(default = "default_startup_holdoff", with = "humantime_serde")]
@@ -290,6 +291,12 @@ pub struct DaemonConfig {
     #[serde(default = "default_pairing_enabled")]
     pub pairing_enabled: bool,
 
+    /// Whether the web UI's hook-edit affordance is enabled.
+    /// Defaults to `false` — no argv-writing form on an unauthenticated
+    /// loopback surface without explicit operator consent.
+    #[serde(default)]
+    pub hook_edit_enabled: bool,
+
     /// Timeout for a single pairing-wizard attempt. Validated to
     /// `30s..=300s`.
     #[serde(default = "default_pair_timeout", with = "humantime_serde")]
@@ -338,6 +345,7 @@ impl Default for DaemonConfig {
             entity_crud_enabled: defaults::ENTITY_CRUD_ENABLED,
             pairing_enabled: defaults::PAIRING_ENABLED,
             pair_timeout: defaults::PAIR_TIMEOUT,
+            hook_edit_enabled: defaults::HOOK_EDIT_ENABLED,
             doctor_wake_settle: defaults::DOCTOR_WAKE_SETTLE,
             macos_idle_frozen_polls: defaults::MACOS_IDLE_FROZEN_POLLS,
             macos_idle_sanity_cap: defaults::MACOS_IDLE_SANITY_CAP,

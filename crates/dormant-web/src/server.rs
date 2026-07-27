@@ -128,6 +128,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
     );
     let api = api
         .route("/events", get(events::ws_events))
+        .route("/events/recent", get(events::get_recent))
         .route("/operations", get(operations::get_operations))
         .route("/daemon", get(daemon::get_daemon))
         .route("/wear", get(wear::get_wear))

@@ -376,3 +376,96 @@
 @media (prefers-reduced-motion: reduce) {
   .cf-form { animation: none; }
 }
+
+/* ── Inert state marker (Coordination section header) ── */
+
+.cf-card__type--inert {
+  color: var(--text-faint);
+  opacity: 0.6;
+}
+
+/* ── Density pass (W1-5): 230px label column, per-entity collapse ── */
+
+/* Horizontal-row layout: label (230px column) | control (1fr column). */
+.cf-field.cf-field--row {
+  display: grid;
+  grid-template-columns: 230px 1fr;
+  gap: 2px 8px;
+  align-items: start;
+}
+
+.cf-field.cf-field--row .cf-field__label {
+  grid-column: 1;
+  padding-top: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cf-field.cf-field--row .cf-field__input-row,
+.cf-field.cf-field--row > .cf-field__input,
+.cf-field.cf-field--row > .cf-field__select,
+.cf-field.cf-field--row .cf-field__multiselect,
+.cf-field.cf-field--row .cf-field__value-list,
+.cf-field.cf-field--row .cf-field__value-row {
+  grid-column: 2;
+}
+
+.cf-field.cf-field--row .cf-field__hint,
+.cf-field.cf-field--row .cf-field__error,
+.cf-field.cf-field--row .cf-field__was {
+  grid-column: 2;
+}
+
+/* Checkbox labels span both columns (label text IS the control). */
+.cf-field.cf-field--row .cf-field__label--checkbox {
+  grid-column: 1 / -1;
+  padding-top: 0;
+}
+
+/* Entity collapse toggle */
+.cf-card__collapse-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  margin-left: auto;
+}
+
+.cf-card__collapse-btn:hover {
+  color: var(--text-body);
+}
+
+/* Summary row for collapsed entities */
+.cf-card__summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.cf-card__summary-type {
+  color: var(--text-faint);
+}
+
+/* Changed-field marker */
+.cf-field--changed .cf-field__input,
+.cf-field--changed .cf-field__select {
+  border-color: var(--accent-warm);
+}
+
+.cf-field__was {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--accent-warm);
+  font-style: italic;
+  margin-left: 4px;
+  white-space: nowrap;
+}

@@ -34,6 +34,7 @@ import type {
   ExerciseReport,
   OperationsStatus,
   DaemonIdentity,
+  RecentEventsResponse,
 }  from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -81,6 +82,12 @@ export function getWear(): Promise<WearListResponse> {
 /** GET /api/wear/:display — one display's summary plus its wear grid. */
 export function getWearDetail(display: string): Promise<WearDetail> {
   return request<WearDetail>(`/wear/${encodeURIComponent(display)}`);
+}
+
+/** GET /api/events/recent?limit=N — recent event history from the in-memory ring. */
+export function getRecentEvents(limit?: number): Promise<RecentEventsResponse> {
+  const qs = limit != null ? `?limit=${limit}` : "";
+  return request<RecentEventsResponse>(`/events/recent${qs}`);
 }
 
 /** POST /api/blank — force-blank a display by id. */

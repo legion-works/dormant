@@ -76,17 +76,43 @@ vi.mock("../api/client", () => ({
   postReload: mocks.postReload,
 }));
 
+// Mock SettingsForm to exercise the nav-guard callback for dirty-tab
+// rendering. The real SettingsForm is a heavy component with many
+// sub-tabs; this test only needs to verify the tab-dot DOM path.
+vi.mock("../app/config/SettingsForm", () => ({
+  SettingsForm: ({
+    onNavigationGuard,
+  }: {
+    onNavigationGuard: (g: {
+      dirtyCount: number;
+      discard: () => void;
+      dirtySections: Set<string>;
+    } | null) => void;
+  }) => {
+    const { useEffect } = require("react");
+    useEffect(() => {
+      // Fire the guard callback to simulate a dirty state on the daemon tab.
+      onNavigationGuard({
+        dirtyCount: 2,
+        discard: () => {},
+        dirtySections: new Set(["daemon"]),
+      });
+    }, [onNavigationGuard]);
+    return <div>settings form</div>;
+  },
+}));
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
 
-/** Switch from the default Settings tab to the Raw TOML tab. */
+/** Switch from the default Daemon tab to the Raw tab. */
 async function openRawToml() {
   await waitFor(() => {
-    expect(screen.getByText("Raw TOML")).toBeInTheDocument();
+    expect(screen.getByText("Raw")).toBeInTheDocument();
   });
-  fireEvent.click(screen.getByText("Raw TOML"));
+  fireEvent.click(screen.getByText("Raw"));
 }
 
 describe("Config", () => {
@@ -250,7 +276,6 @@ describe("Config", () => {
       expect(screen.getByText(/Config source: on_disk \(not yet applied\)/)).toBeInTheDocument();
     });
   });
-});
 
   it("renders ladder and screensaver summary when displays have them configured", async () => {
     render(<Config />);
@@ -303,3 +328,41 @@ describe("Config", () => {
     expect(screen.getByText(/backups\/config\.toml\.<timestamp>\.<suffix>/)).toBeInTheDocument();
     expect(screen.getByText(/filenames are not exposed by the Web API/i)).toBeInTheDocument();
   });
+
+  it("shows dirty dot on tab with unsaved edits", async () => {
+    render(<Config />);
+
+    // The mocked SettingsForm fires onNavigationGuard with dirtySections=["daemon"].
+    // Wait for Config to load and the guard callback to take effect.
+    await waitFor(() => {
+      expect(screen.getByText("Daemon")).toBeInTheDocument();
+    });
+
+    // The dot is rendered asynchronously via NavigationGuard callback.
+    // Wait specifically for the dot span to appear before asserting.
+    await waitFor(() => {
+      const daemonTab = screen.getByText("Daemon").closest("button");
+      if (!daemonTab) return false;
+      const dotSpans = daemonTab.querySelectorAll("span");
+      return Array.from(dotSpans).some((span) => {
+        const st = (span as HTMLElement).style;
+        return (
+          st.width === "6px" &&
+          st.height === "6px" &&
+          st.borderRadius === "50%"
+        );
+      });
+    }).then((hasDot) => {
+      expect(hasDot).toBe(true);
+    });
+
+    // Tabs without edits (e.g. Switching) must NOT have a dot.
+    const switchingTab = screen.getByText("Switching").closest("button");
+    const switchingSpans = switchingTab!.querySelectorAll("span");
+    const switchingHasDot = Array.from(switchingSpans).some((span) => {
+      const st = (span as HTMLElement).style;
+      return st.width === "6px" && st.height === "6px";
+    });
+    expect(switchingHasDot).toBe(false);
+  });
+});

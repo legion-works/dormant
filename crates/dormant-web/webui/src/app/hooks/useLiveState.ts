@@ -81,6 +81,8 @@ export interface EventLogState {
   events: StampedEvent[];
   connected: boolean;
   lagged: boolean;
+  /** Whether event history was seeded from the server ring on mount. */
+  historySeeded: boolean;
 }
 
 export const EventLogContext = createContext<EventLogState | null>(null);

@@ -37,5 +37,5 @@ export function liveStateFixture(overrides: Partial<LiveState> = {}): LiveState 
 }
 
 export function eventLogFixture(overrides: Partial<EventLogState> = {}): EventLogState {
-  return { events: [], connected: true, lagged: false, ...overrides };
+  return { events: [], connected: true, lagged: false, historySeeded: false, ...overrides };
 }

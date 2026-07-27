@@ -35,6 +35,8 @@ export function badgeForEvent(ev: DaemonEvent): EventBadge {
       return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "blank_recovered" };
     case "wake_recovered":
       return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "wake_recovered" };
+    case "ownership":
+      return { color: "var(--accent-warm)", bg: "var(--accent-warm-muted)", label: "ownership" };
     default:
       return { color: "var(--text-muted)", bg: "var(--bg-sunken)", label: (ev as { event: string }).event };
   }
@@ -66,6 +68,10 @@ export function messageForEvent(ev: DaemonEvent): string {
       return `${ev.display}: blank recovered`;
     case "wake_recovered":
       return `${ev.display}: wake recovered after ${ev.attempts} attempt${ev.attempts === 1 ? "" : "s"}`;
+    case "ownership": {
+      const ver = ev.verified === true ? "✓" : ev.verified === false ? "✗" : "";
+      return `${ev.display}: ${ev.cause} → ${ev.owned ? "ours" : "peer"} ${ver}${ev.degraded ? " degraded" : ""}`;
+    }
     default:
       return JSON.stringify(ev);
   }

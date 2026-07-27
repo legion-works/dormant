@@ -1,7 +1,8 @@
 /**
  * Sidebar footer — connection status + the daemon identity block (P1-D):
- * a mono `pid <pid> · up <duration>` / socket line, a hairline divider,
- * then the "Legion fleet daemon" label row and the GitHub link.
+ * a mono `pid <pid> · up <duration>` / socket line, a web-surface posture
+ * chip (§W5-1), a hairline divider, then the "Legion fleet daemon" label
+ * row and the GitHub link.
  *
  * Receives daemon identity from the shell so the brand and footer share
  * one `GET /api/daemon` request at startup and after reconnects.
@@ -13,6 +14,11 @@ import "./SidebarFooter.css";
 export interface SidebarFooterProps {
   connected: boolean;
   daemon: DaemonIdentity | null;
+  /** rust: daemon.web_bind — the configured bind address (unused by posture chip; retained in the interface for future use). */
+  /** rust: daemon.web_bind — the configured bind address. */
+  webBind?: unknown;
+  /** rust: daemon.web_allow_nonloopback — opt-in flag. */
+  webAllowNonloopback?: unknown;
 }
 
 /** Format seconds elapsed as `6h 12m` style — hours are always shown
@@ -26,7 +32,7 @@ function formatUptime(elapsedSeconds: number): string {
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
-export default function SidebarFooter({ connected, daemon }: SidebarFooterProps) {
+export default function SidebarFooter({ connected, daemon, webBind, webAllowNonloopback }: SidebarFooterProps) {
   const [now, setNow] = useState(() => Date.now());
 
   // Tick the displayed uptime once a minute — cheap, and daemon uptime
@@ -40,6 +46,16 @@ export default function SidebarFooter({ connected, daemon }: SidebarFooterProps)
     ? formatUptime(now / 1000 - daemon.started_epoch_s)
     : null;
 
+  // W5-1: truth table — LAN posture requires BOTH a non-loopback bind
+  // AND the explicit web_allow_nonloopback opt-in.  A loopback bind with
+  // the flag true is still loopback-only (the flag doesn't override the
+  // actual listener).  Non-loopback without the flag is rejected by the
+  // server security guard at startup, so that combination never appears
+  // live; classify it as loopback-only for safety.
+  const isLoopbackBind = typeof webBind === "string"
+    && (webBind === "127.0.0.1" || webBind === "::1" || webBind.startsWith("127."));
+  const isNonloopback = !isLoopbackBind && Boolean(webAllowNonloopback);
+
   return (
     <div className="sidebar-footer">
       <div className="sidebar-footer__conn-row">
@@ -48,6 +64,15 @@ export default function SidebarFooter({ connected, daemon }: SidebarFooterProps)
           {connected ? "dormantd running" : "connecting…"}
         </span>
       </div>
+
+      {/* W5-1: web-surface posture chip */}
+      {daemon && (
+        <div className="sidebar-footer__posture">
+          <span className={`posture-chip${isNonloopback ? " posture-chip--lan" : " posture-chip--loopback"}`}>
+            {isNonloopback ? "LAN · unauthenticated" : "loopback only"}
+          </span>
+        </div>
+      )}
 
       {daemon && (
         <div className="sidebar-footer__daemon">

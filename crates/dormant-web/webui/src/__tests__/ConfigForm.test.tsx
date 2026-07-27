@@ -219,19 +219,29 @@ describe("SettingsForm", () => {
     vi.clearAllMocks();
   });
 
-  it("renders sections from fixture", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+  it("renders daemon section on daemon tab", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
     });
-    expect(screen.getByText("Sensors")).toBeInTheDocument();
-    expect(screen.getByText("Zones")).toBeInTheDocument();
-    expect(screen.getByText("Rules")).toBeInTheDocument();
-    expect(screen.getByText("Displays")).toBeInTheDocument();
 
     expect(screen.getByText("log_level")).toBeInTheDocument();
     expect(screen.getByText("web_port")).toBeInTheDocument();
+
+    // Sensors/Zones/Rules/Displays are on other tabs — not rendered here.
+    expect(screen.queryByText("Sensors")).toBeNull();
+    expect(screen.queryByText("desk-mmwave")).toBeNull();
+  });
+
+  it("renders presence tab sections", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="presence" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Sensors")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Zones")).toBeInTheDocument();
+    expect(screen.getByText("Rules")).toBeInTheDocument();
 
     const mmwaveEls = screen.getAllByText("desk-mmwave");
     expect(mmwaveEls.length).toBeGreaterThanOrEqual(1);
@@ -243,8 +253,18 @@ describe("SettingsForm", () => {
     expect(screen.getByText("office-rule")).toBeInTheDocument();
   });
 
+  it("renders displays tab sections", async () => {
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="displays" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Displays")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("lg-oled")).toBeInTheDocument();
+  });
+
   it("edit marks dirty and ApplyBar count increments", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -261,7 +281,7 @@ describe("SettingsForm", () => {
   });
 
   it("locked field disabled with tooltip (redacted broker_url)", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="presence" />);
 
     await waitFor(() => {
       const pirEls = screen.getAllByText("room-pir");
@@ -282,7 +302,7 @@ describe("SettingsForm", () => {
     const applyRes: ApplyResponse = { applied: true, reload: "reloaded" };
     mocks.postConfigApply.mockResolvedValueOnce(applyRes);
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -322,7 +342,7 @@ describe("SettingsForm", () => {
       new ApiError(409, { error: "Config changed on disk — fingerprint mismatch" }),
     );
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -354,7 +374,7 @@ describe("SettingsForm", () => {
       }),
     );
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="presence" />);
 
     await waitFor(() => {
       const mmwaveEls = screen.getAllByText("desk-mmwave");
@@ -381,7 +401,7 @@ describe("SettingsForm", () => {
     mocks.postConfigApply.mockResolvedValueOnce(applyRes);
     mocks.getConfig.mockResolvedValueOnce(UPDATED_CONFIG);
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -415,7 +435,7 @@ describe("SettingsForm", () => {
     // Refetch returns config with fingerprint F2
     mocks.getConfig.mockResolvedValueOnce(UPDATED_CONFIG);
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -467,7 +487,7 @@ describe("SettingsForm", () => {
   // ── Fingerprint refetch on conflict / rejection ──
 
   it("409 → refetches fingerprint, preserves dirty store", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
     });
@@ -523,7 +543,7 @@ describe("SettingsForm", () => {
   });
 
   it("rejected → refetches fingerprint, preserves dirty store, banner shows file-written note", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
     });
@@ -575,7 +595,7 @@ describe("SettingsForm", () => {
     const addSpy = vi.spyOn(window, "addEventListener");
     const removeSpy = vi.spyOn(window, "removeEventListener");
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -616,7 +636,7 @@ describe("SettingsForm", () => {
     const removeSpy = vi.spyOn(window, "removeEventListener");
     mocks.postConfigApply.mockResolvedValueOnce({ applied: true, reload: "reloaded" } as ApplyResponse);
 
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -655,11 +675,13 @@ describe("SettingsForm", () => {
 
 
 // ── Config tab-switch navigation guard tests ──
+// W1-1: internal sub-tab switches never prompt; dirty state persists across tabs.
 
 describe("Config tab-switch guard", () => {
   beforeEach(() => {
     mocks.getConfig.mockResolvedValue(SAMPLE_CONFIG);
     mocks.getState.mockResolvedValue(SAMPLE_STATE);
+    window.location.hash = "";
   });
 
   afterEach(() => {
@@ -667,12 +689,13 @@ describe("Config tab-switch guard", () => {
     vi.clearAllMocks();
   });
 
-  it("shows a shared confirm dialog when switching from dirty Settings to Raw TOML, and stays on Settings when cancelled", async () => {
+  it("switches from daemon to raw tab without prompting even when dirty", async () => {
     render(<Config />);
 
-    // Wait for Settings tab to load
+    // Wait for daemon tab to load (default tab) — "Daemon" appears in both the
+    // tab bar button and the section <h2>; find the section heading to confirm.
     await waitFor(() => {
-      expect(screen.getByText("Daemon")).toBeInTheDocument();
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
     });
 
     // Make dirty
@@ -683,73 +706,48 @@ describe("Config tab-switch guard", () => {
       expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
     });
 
-    // Click Raw TOML tab
-    fireEvent.click(screen.getByText("Raw TOML"));
+    // Click Raw tab — no confirm dialog
+    fireEvent.click(screen.getByText("Raw"));
 
-    expect(screen.getByRole("alertdialog", { name: "Discard 1 unsaved change?" })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-
-    // `confirm()`'s promise resolves synchronously inside Cancel's onClick
-    // (useConfirmDialog's `finish`), so the `.then` continuation that would
-    // switch tabs is only scheduled as a microtask — flush before asserting
-    // "stayed on Settings" so a mutant that ignores `accepted` doesn't pass
-    // by accident (C6 precedent, T6/T7/T8).
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    // Since the dialog was cancelled, we stay on Settings tab
-    expect(screen.getByText("Daemon")).toBeInTheDocument();
-    // Raw TOML content should NOT be visible
-    expect(screen.queryByText("Parsed inventory")).toBeNull();
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
-  });
-
-  it("confirming discard switches tab and resets dirty state", async () => {
-    render(<Config />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Daemon")).toBeInTheDocument();
-    });
-
-    // Make dirty
-    fireEvent.change(
-      screen.getByLabelText("log_level") as HTMLSelectElement,
-      { target: { value: "debug" } },
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
-    });
-
-    // Click Raw TOML tab — shows the shared dialog
-    fireEvent.click(screen.getByText("Raw TOML"));
-    expect(screen.getByRole("alertdialog", { name: "Discard 1 unsaved change?" })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-
-    // Should have switched to Raw TOML tab
+    // Raw TOML content should appear immediately
     await waitFor(() => {
       expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
     });
 
-    // Switch back to Settings — should be clean (discard reset the store)
-    fireEvent.click(screen.getByText("Settings"));
+    // No alertdialog should appear
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
 
+    // Switch back to daemon — dirty state persisted (patches survive tab switch)
+    fireEvent.click(screen.getByText("Daemon"));
     await waitFor(() => {
-      expect(screen.getByText("Daemon")).toBeInTheDocument();
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
     });
 
-    // Should show 0 unsaved (discard was called)
-    expect(screen.getByText(/0 unsaved/)).toBeInTheDocument();
+    // Dirty count should still show (store was not reset)
+    expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+  });
+
+  it("does not show confirm when switching while clean", async () => {
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
+    });
+
+    // Not dirty — switch to Raw tab without confirm
+    fireEvent.click(screen.getByText("Raw"));
+
+    await waitFor(() => {
+      expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   // ── Per-field guidance (help text) ──
 
   it("zone mode renders help text", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="presence" />);
 
     await waitFor(() => {
       expect(screen.getByText("Zones")).toBeInTheDocument();
@@ -760,7 +758,7 @@ describe("Config tab-switch guard", () => {
   });
 
   it("zone unavailable_policy renders help text", async () => {
-    render(<SettingsForm config={SAMPLE_CONFIG} />);
+    render(<SettingsForm config={SAMPLE_CONFIG} tab="presence" />);
 
     await waitFor(() => {
       expect(screen.getByText("Zones")).toBeInTheDocument();
@@ -770,7 +768,7 @@ describe("Config tab-switch guard", () => {
   });
 
   it("display blank_mode renders help text", async () => {
-    render(<SettingsForm config={DISPLAY_BLANK_MODE} />);
+    render(<SettingsForm config={DISPLAY_BLANK_MODE} tab="displays" />);
 
     await waitFor(() => {
       expect(screen.getByText("Displays")).toBeInTheDocument();
@@ -797,7 +795,7 @@ describe("Config tab-switch guard", () => {
       },
     };
 
-    render(<SettingsForm config={cfg} />);
+    render(<SettingsForm config={cfg} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -864,7 +862,7 @@ describe("Config tab-switch guard", () => {
       },
     };
 
-    render(<SettingsForm config={cfg} />);
+    render(<SettingsForm config={cfg} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -905,7 +903,7 @@ describe("Config tab-switch guard", () => {
       },
     };
 
-    render(<SettingsForm config={cfg} />);
+    render(<SettingsForm config={cfg} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -931,7 +929,7 @@ describe("Config tab-switch guard", () => {
       },
     };
 
-    render(<SettingsForm config={cfg} />);
+    render(<SettingsForm config={cfg} tab="daemon" />);
 
     await waitFor(() => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
@@ -942,22 +940,61 @@ describe("Config tab-switch guard", () => {
     expect(holdoffInput.placeholder).toBe("30s");
   });
 
-  it("does not show confirm when switching while clean", async () => {
+  it("per-tab dirty dot persists on the daemon tab after editing a daemon field", async () => {
+    window.location.hash = "#/config/daemon";
     render(<Config />);
 
     await waitFor(() => {
-      expect(screen.getByText("Daemon")).toBeInTheDocument();
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
     });
 
-    // Not dirty — switch to Raw TOML without confirm
-    fireEvent.click(screen.getByText("Raw TOML"));
+    const logLevelSelect = screen.getByLabelText("log_level") as HTMLSelectElement;
+    fireEvent.change(logLevelSelect, { target: { value: "debug" } });
 
+    await waitFor(() => {
+      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Raw"));
     await waitFor(() => {
       expect(screen.getByText("Parsed inventory")).toBeInTheDocument();
     });
 
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("Daemon"));
+    await waitFor(() => {
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
+    });
+    expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
   });
+
+  it("nav-away guard fires when leaving Config with dirty edits", async () => {
+    window.location.hash = "#/config/daemon";
+    render(<Config />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("log_level")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.change(
+        screen.getByLabelText("log_level") as HTMLSelectElement,
+        { target: { value: "debug" } },
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 unsaved/)).toBeInTheDocument();
+    });
+
+    const { navGuard } = await import("../app/navGuard");
+    await waitFor(() => {
+      expect(navGuard.current).not.toBeNull();
+    });
+    expect(navGuard.current!.dirtyCount).toBe(1);
+
+    navGuard.current!.discard();
+  });
+
 });
 
 
@@ -1070,7 +1107,7 @@ describe("DisplaysSection — mode switch", () => {
   it("display with NEITHER blank_mode NOR ladder — renders warning card, no crash", async () => {
     mocks.getConfig.mockResolvedValue(DISPLAY_NO_MODE);
 
-    render(<SettingsForm config={DISPLAY_NO_MODE} />);
+    render(<SettingsForm config={DISPLAY_NO_MODE} tab="displays" />);
 
     await waitFor(() => {
       expect(screen.getByText("Displays")).toBeInTheDocument();
@@ -1125,7 +1162,7 @@ describe("DisplaysSection — mode switch", () => {
   it("display with ladder shows the ladder editor", async () => {
     mocks.getConfig.mockResolvedValue(DISPLAY_WITH_LADDER);
 
-    render(<SettingsForm config={DISPLAY_WITH_LADDER} />);
+    render(<SettingsForm config={DISPLAY_WITH_LADDER} tab="displays" />);
 
     await waitFor(() => {
       expect(screen.getByText("Displays")).toBeInTheDocument();
@@ -1143,7 +1180,7 @@ describe("DisplaysSection — mode switch", () => {
   it("display with redacted source locks sources editor but not ladder editor", async () => {
     mocks.getConfig.mockResolvedValue(DISPLAY_WITH_REDACTED_SOURCE);
 
-    render(<SettingsForm config={DISPLAY_WITH_REDACTED_SOURCE} />);
+    render(<SettingsForm config={DISPLAY_WITH_REDACTED_SOURCE} tab="displays" />);
 
     await waitFor(() => {
       expect(screen.getByText("Displays")).toBeInTheDocument();

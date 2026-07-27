@@ -574,6 +574,7 @@ pub fn prepare(
                 failed_fp: fingerprint_label(current_fp),
                 lkg_fp: fingerprint_label(lkg_fp),
                 detail: message.clone(),
+                recovery_command: Some(recovery_command_suggestion().to_string()),
             };
             (
                 lkg_path.clone(),
@@ -599,6 +600,7 @@ pub fn prepare(
                 failed_fp: fingerprint_label(failed),
                 lkg_fp: fingerprint_label(fingerprint_file(&lkg_path)),
                 detail: message.clone(),
+                recovery_command: Some(recovery_command_suggestion().to_string()),
             };
             (
                 lkg_path.clone(),
@@ -697,6 +699,22 @@ pub(crate) fn pending_message_for_rollback(detail: &str) -> String {
         "your latest config failed and was rolled back to last-known-good — \
          fix it and reload: {detail}"
     )
+}
+
+/// Best-effort recovery command for the current platform, surfaced in
+/// [`RollbackStatus::recovery_command`] so the operator can copy it to
+/// restart the daemon after fixing the config.
+#[must_use]
+pub(crate) fn recovery_command_suggestion() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "systemctl --user restart dormant"
+    } else if cfg!(target_os = "macos") {
+        // Use `$(id -u)` so the command works regardless of the operator's
+        // UID — the plist label matches crates/dormantd/share/com.legionworks.dormant.plist.
+        "launchctl kickstart -k gui/$(id -u)/com.legionworks.dormant"
+    } else {
+        "restart the dormant daemon"
+    }
 }
 
 /// Build [`LkgInfo`] for `lkg_path`: existence, `load_config`

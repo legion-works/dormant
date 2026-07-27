@@ -38,6 +38,10 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 </p>
 
 <p align="center">
+  <img src="design/screenshots/switching.png" alt="dormant switching view — shared-panel ownership, pull and push actions, and the per-display hooks" width="820">
+</p>
+
+<p align="center">
   <img src="design/screenshots/tray.png" alt="dormant KDE tray applet — status tooltip and pause/blank/wake menu" width="620">
 </p>
 

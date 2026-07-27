@@ -261,24 +261,16 @@ impl DdcciController {
 impl DdcciController {
     /// Literal controller name — grep-stable, matches the `ddcci` config type.
     const NAME: &'static str = "ddcci";
-}
 
-#[async_trait]
-impl DisplayController for DdcciController {
-    fn name(&self) -> &'static str {
-        Self::NAME
-    }
-
-    fn supported_modes(&self) -> Vec<BlankMode> {
-        let state = self.state.lock().unwrap();
-        let mut modes = vec![BlankMode::BrightnessZero];
-        if state.d6_supported {
-            modes.push(BlankMode::PowerOff);
-        }
-        modes
-    }
-
-    async fn probe(&mut self) -> Result<(), DormantError> {
+    /// The probe body, callable from `&self` (the trait's `probe` takes
+    /// `&mut self` purely by signature; all state lives behind the mutex).
+    ///
+    /// Kept separate so command paths can lazily re-probe: a controller whose
+    /// startup probe failed (panel held by the other machine, display link
+    /// down, monitor asleep) must not stay dead until a daemon restart —
+    /// observed live on the Mac: every switch failed with "controller not
+    /// probed" until the process was kicked. See `ensure_probed`.
+    async fn probe_now(&self) -> Result<(), DormantError> {
         // Retry knobs for the D6 detection probe — declared as items
         // before any statement to satisfy clippy::items-after-statements.
         const D6_RETRIES: usize = 3;
@@ -345,6 +337,68 @@ impl DisplayController for DdcciController {
         Ok(())
     }
 
+    /// Return the probed `(ident, panel_lock)`, lazily re-probing when the
+    /// startup probe failed or never ran.
+    ///
+    /// A failed startup probe is an environmental condition, not a permanent
+    /// verdict: on a shared panel the display link is down whenever the other
+    /// machine holds the input, so the daemon regularly boots unprobed. Every
+    /// command entry point (blank/wake/switch) funnels through here so the
+    /// first command after the panel becomes reachable heals the controller
+    /// instead of failing with "controller not probed" until a restart.
+    /// Emits `ddcci_lazy_probe` on a successful heal.
+    async fn ensure_probed(&self) -> Result<(Arc<str>, Arc<PanelLock>), CmdFailure> {
+        {
+            let state = self.state.lock().unwrap();
+            if let (Some(id), Some(lock)) = (&state.matched_ident, &state.panel_lock) {
+                return Ok((Arc::from(id.as_str()), Arc::clone(lock)));
+            }
+        }
+
+        match self.probe_now().await {
+            Ok(()) => {
+                let state = self.state.lock().unwrap();
+                if let (Some(id), Some(lock)) = (&state.matched_ident, &state.panel_lock) {
+                    tracing::info!(
+                        event = "ddcci_lazy_probe",
+                        display = %id,
+                        "DDC/CI controller probed on demand after failed/missing startup probe",
+                    );
+                    Ok((Arc::from(id.as_str()), Arc::clone(lock)))
+                } else {
+                    Err(CmdFailure {
+                        controller: Self::NAME.to_string(),
+                        error: format!("{E_DISPLAY_IO}: controller not probed"),
+                    })
+                }
+            }
+            Err(e) => Err(CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!("{E_DISPLAY_IO}: on-demand probe failed: {e}"),
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl DisplayController for DdcciController {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn supported_modes(&self) -> Vec<BlankMode> {
+        let state = self.state.lock().unwrap();
+        let mut modes = vec![BlankMode::BrightnessZero];
+        if state.d6_supported {
+            modes.push(BlankMode::PowerOff);
+        }
+        modes
+    }
+
+    async fn probe(&mut self) -> Result<(), DormantError> {
+        self.probe_now().await
+    }
+
     async fn is_available(&self) -> bool {
         let ident = {
             let state = self.state.lock().unwrap();
@@ -359,19 +413,9 @@ impl DisplayController for DdcciController {
     }
 
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
-        let (ident, lock, d6_supported) = {
-            let state = self.state.lock().unwrap();
-            let (ident, lock) = match (&state.matched_ident, &state.panel_lock) {
-                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
-                _ => {
-                    return Err(CmdFailure {
-                        controller: Self::NAME.to_string(),
-                        error: format!("{E_DISPLAY_IO}: controller not probed"),
-                    });
-                }
-            };
-            (ident, lock, state.d6_supported)
-        };
+        let (ident, lock) = self.ensure_probed().await?;
+        let ident = ident.to_string();
+        let d6_supported = self.state.lock().unwrap().d6_supported;
 
         let result = match mode {
             BlankMode::BrightnessZero => {
@@ -476,17 +520,10 @@ impl DisplayController for DdcciController {
     }
 
     async fn wake(&self) -> Result<(), CmdFailure> {
-        let (ident, lock, d6_supported, effective_mode) = {
+        let (ident, lock) = self.ensure_probed().await?;
+        let ident = ident.to_string();
+        let (d6_supported, effective_mode) = {
             let state = self.state.lock().unwrap();
-            let (ident, lock) = match (&state.matched_ident, &state.panel_lock) {
-                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
-                _ => {
-                    return Err(CmdFailure {
-                        controller: Self::NAME.to_string(),
-                        error: format!("{E_DISPLAY_IO}: controller not probed"),
-                    });
-                }
-            };
             // Reverse whatever the LAST successful blank actually did.
             // `last_blank_mode.or(Some(configured_primary_mode))` means a
             // fresh daemon (no blank yet) still takes the configured
@@ -494,7 +531,7 @@ impl DisplayController for DdcciController {
             let mode = state
                 .last_blank_mode
                 .unwrap_or(self.configured_primary_mode);
-            (ident, lock, state.d6_supported, mode)
+            (state.d6_supported, mode)
         };
 
         match effective_mode {
@@ -625,28 +662,31 @@ impl DisplayController for DdcciController {
     ///
     /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is
     /// therefore conditional on an immediate command-priority readback of the requested value.
-    /// The readback is retried up to `VERIFY_READBACK_MAX_ATTEMPTS` times with a
-    /// `VERIFY_READBACK_RETRY_DELAY` delay between attempts because the DDC bus on shared
-    /// panels often garbles the verification read despite the write having succeeded (issue #138).
-    /// A clean read carrying the wrong value is a genuine failure and returns immediately — only
-    /// transport-level errors are retried, so a silently-ignored write is still detected.
+    /// The readback is retried up to `VERIFY_READBACK_MAX_ATTEMPTS` times with an
+    /// escalating `VERIFY_READBACK_RETRY_DELAYS` schedule because the DDC bus on shared
+    /// panels garbles the verification read despite the write having succeeded (issue #138) —
+    /// and after an input switch the panel keeps answering with checksum-mismatch garble for
+    /// the whole re-sync window (observed live on the AOC AG326UZD: a successful switch
+    /// reported `E_DISPLAY_IO` because three 200ms-spaced reads all landed inside re-sync).
+    /// The schedule spans ~3.5s so the final attempts land after the panel has settled on
+    /// the new input. A clean read carrying the wrong value is a genuine failure and returns
+    /// immediately — only transport-level errors are retried, so a silently-ignored write is
+    /// still detected.
     async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
-        // Retry constants for the verification readback (issue #138).
-        const VERIFY_READBACK_MAX_ATTEMPTS: u32 = 3;
-        const VERIFY_READBACK_RETRY_DELAY: Duration = Duration::from_millis(200);
+        // Escalating retry schedule for the verification readback (issue #138): the
+        // early attempts catch plain bus-contention garble cheaply; the late ones
+        // outlast the panel's input re-sync window.
+        const VERIFY_READBACK_RETRY_DELAYS: [Duration; 4] = [
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_millis(1800),
+        ];
+        #[allow(clippy::cast_possible_truncation)] // 4-element const array
+        const VERIFY_READBACK_MAX_ATTEMPTS: u32 = VERIFY_READBACK_RETRY_DELAYS.len() as u32 + 1;
 
-        let (ident, lock) = {
-            let state = self.state.lock().unwrap();
-            match (&state.matched_ident, &state.panel_lock) {
-                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
-                _ => {
-                    return Err(CmdFailure {
-                        controller: Self::NAME.to_string(),
-                        error: format!("{E_DISPLAY_IO}: controller not probed"),
-                    });
-                }
-            }
-        };
+        let (ident, lock) = self.ensure_probed().await?;
+        let ident = ident.to_string();
 
         self.ops
             .set_vcp(
@@ -668,7 +708,7 @@ impl DisplayController for DdcciController {
         let mut last_error: Option<String> = None;
         for attempt in 0..VERIFY_READBACK_MAX_ATTEMPTS {
             if attempt > 0 {
-                tokio::time::sleep(VERIFY_READBACK_RETRY_DELAY).await;
+                tokio::time::sleep(VERIFY_READBACK_RETRY_DELAYS[(attempt - 1) as usize]).await;
             }
             match self
                 .ops
@@ -2260,7 +2300,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn write_input_source_errors_when_readback_fails() {
         let ident = "i2c-dev:56 DEL DELL U2723QE";
         let fake = Arc::new({
@@ -2279,22 +2319,14 @@ mod tests {
         ctrl.probe().await.unwrap();
         let _ = fake.take_call_log();
         fake.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
-        // Three failed readbacks exhaust all retry attempts.
-        fake.expect_get(
-            ident,
-            VCP_INPUT_SOURCE,
-            Err("DDC/CI I2C error: bus timeout".into()),
-        );
-        fake.expect_get(
-            ident,
-            VCP_INPUT_SOURCE,
-            Err("DDC/CI I2C error: bus timeout".into()),
-        );
-        fake.expect_get(
-            ident,
-            VCP_INPUT_SOURCE,
-            Err("DDC/CI I2C error: bus timeout".into()),
-        );
+        // Five failed readbacks exhaust the full escalating retry schedule.
+        for _ in 0..5 {
+            fake.expect_get(
+                ident,
+                VCP_INPUT_SOURCE,
+                Err("DDC/CI I2C error: bus timeout".into()),
+            );
+        }
 
         let error = ctrl
             .write_input_source(InputSourceTarget {
@@ -2312,7 +2344,7 @@ mod tests {
             error.error
         );
         assert!(
-            error.error.contains("after 3 attempts"),
+            error.error.contains("after 5 attempts"),
             "error must report retry count: {}",
             error.error
         );
@@ -2442,6 +2474,46 @@ mod tests {
                 format!("get_vcp({ident}, 0x{VCP_INPUT_SOURCE:02X})"),
             ]
         );
+    }
+
+    /// A controller whose startup probe never succeeded heals itself on the
+    /// first command instead of failing with "controller not probed" until a
+    /// daemon restart (the live Mac wedge: panel held by the peer at boot →
+    /// probe failed → every later switch refused even after the panel was
+    /// reachable again).
+    #[tokio::test(start_paused = true)]
+    async fn write_input_source_lazily_probes_when_startup_probe_never_ran() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            // The lazy probe's D6 detection (3 attempts, all failing is fine).
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            f.expect_get(ident, VCP_POWER, Err("no".into()));
+            // The switch write + clean verification readback.
+            f.expect_set(ident, VCP_INPUT_SOURCE, 0x10, Ok(()));
+            f.expect_get(ident, VCP_INPUT_SOURCE, Ok(0x10));
+            f
+        });
+        let locks = PanelLocks::new();
+        let ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &locks,
+        );
+        // NO ctrl.probe() — simulates the startup probe having failed.
+
+        ctrl.write_input_source(InputSourceTarget {
+            write_code: 0x10,
+            expected_readback: dormant_core::traits::InputSourceReadback::Exact(0x10),
+        })
+        .await
+        .expect("command must lazily probe and succeed, not report 'controller not probed'");
+
+        // The controller is now probed — identity retained for later commands.
+        assert_eq!(ctrl.panel_identity().as_deref(), Some(ident));
     }
 
     #[tokio::test]

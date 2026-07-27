@@ -798,6 +798,12 @@ mod tests {
         let content = r#"
 config_version = 1
 
+[sensors.dummy]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "test"
+field = "/val"
+
 [zones.myzone]
 mode = "any"
 members = []
@@ -1813,7 +1819,7 @@ members = []
             "myzone".into(),
             ZoneConfig {
                 mode: "any".into(),
-                members: vec![],
+                members: vec!["dummy".into()],
                 quorum: None,
                 threshold: None,
                 weights: IndexMap::default(),
@@ -2277,6 +2283,123 @@ on_observed_loss = [{ command = ["/usr/bin/example-hook"] }]
         assert!(
             !joined.contains("entity_created"),
             "a rejected create must never emit entity_created: {joined}"
+        );
+    }
+
+    // ── M8: shared display validate parity regression (PR #152) ────────────
+    // The web apply pipeline originally called the plain `validate()` which
+    // passes an empty `input_source_readers` set, causing every Apply on a
+    // config with a shared display + ddcci chain to falsely emit
+    //   "E_CONFIG_INVALID — display '{id}' is shared but no controller in
+    //   its chain can read the active input"
+    // This test pins that a same-value patch against a shared-display config
+    // with a ddcci controller succeeds (the daemon's validate_with_input_source_readers
+    // recognises ddcci as a VCP 0x60 reader).
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn shared_display_with_ddcci_apply_succeeds_no_false_reader_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"
+config_version = 1
+
+[displays.monitor]
+controllers = ["ddcci"]
+scope = "shared"
+blank_mode = "power_off"
+shared_input_code = 0x0f
+shared_input_write_code = 0x15
+"#;
+        write_config(dir.path(), content);
+
+        let mut displays: IndexMap<String, dormant_core::config::schema::DisplayConfig> =
+            IndexMap::new();
+        displays.insert(
+            "monitor".into(),
+            dormant_core::config::schema::DisplayConfig {
+                controllers: vec!["ddcci".into()],
+                scope: dormant_core::config::schema::DisplayScope::Shared,
+                shared_input_code: Some(0x0f),
+                shared_input_write_code: Some(0x15),
+                shared_peer_input_code: None,
+                shared_peer_input_write_code: None,
+                hooks: dormant_core::config::schema::HookSlots::default(),
+                blank_mode: Some(dormant_core::types::BlankMode::PowerOff),
+                degraded_mode: None,
+                ladder: vec![],
+                screensaver: None,
+                output: None,
+                ddc_display: None,
+                host: None,
+                wol_mac: None,
+                blank_command: None,
+                wake_command: None,
+                modes: None,
+                ha_url: None,
+                blank_service: None,
+                blank_data: None,
+                wake_service: None,
+                wake_data: None,
+                command_timeout: std::time::Duration::from_secs(5),
+                restore_brightness: 100,
+                samsung_restore_backlight: 50,
+                treat_unreachable_as_blanked: false,
+                #[allow(clippy::default_trait_access)]
+                panel_type: Default::default(),
+            },
+        );
+        let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            sensors: IndexMap::default(),
+            zones: IndexMap::default(),
+            displays,
+            rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+        };
+
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        // Benign same-value patch: set shared_input_code to its current value.
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec![
+                    "displays".into(),
+                    "monitor".into(),
+                    "shared_input_code".into(),
+                ],
+                value: serde_json::Value::Number(serde_json::Number::from(0x0f)),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(
+            result.is_ok(),
+            "shared display with ddcci must pass validate: {:?}",
+            result.err()
+        );
+
+        // Parse the success response.
+        let resp = result.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            !body_text.contains("can read the active input"),
+            "response must not contain the false reader error: {body_text}"
+        );
+        assert!(
+            body_text.contains("\"applied\":true"),
+            "response must report applied:true: {body_text}"
         );
     }
 }

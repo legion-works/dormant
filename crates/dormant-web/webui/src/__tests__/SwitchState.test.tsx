@@ -75,7 +75,7 @@ describe("SwitchState", () => {
 
   it("renders push button when push-capable", () => {
     renderSwitch({ pushCapable: true, peerWriteCode: 0x11 });
-    expect(screen.getByText("▶ Push to peer")).toBeInTheDocument();
+    expect(screen.getByText("Send to peer ▶")).toBeInTheDocument();
   });
 
   it("renders absent push with reason when not push-capable", () => {
@@ -137,7 +137,7 @@ describe("SwitchState", () => {
   it("shows push released on success", async () => {
     mocks.postPush.mockResolvedValueOnce(undefined);
     renderSwitch({ pushCapable: true, peerWriteCode: 0x11 });
-    fireEvent.click(screen.getByText("▶ Push to peer"));
+    fireEvent.click(screen.getByText("Send to peer ▶"));
     await waitFor(() => {
       expect(screen.getByText("✓ sent")).toBeInTheDocument();
     });

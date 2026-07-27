@@ -96,9 +96,15 @@ pub trait SensorSource: Send {
     /// **must** emit [`crate::types::SensorState::Unavailable`] for all of its
     /// sensors before retrying or returning — fail-safe presence depends on
     /// unavailability being reported, never silently dropped.
+    ///
+    /// `ctl_tx` is the engine's control channel; sources that surface
+    /// availability (LWT) edges use it to push
+    /// [`crate::rules::ControlMsg::SensorAvailability`] for the rules engine
+    /// to record. Sources without an availability concept may ignore it.
     async fn run(
         self: Box<Self>,
         tx: tokio::sync::mpsc::Sender<PresenceEvent>,
+        ctl_tx: tokio::sync::mpsc::Sender<crate::rules::ControlMsg>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()>;
 }

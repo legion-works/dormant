@@ -29,6 +29,7 @@ import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled, isHookEditEnabled } from "./entityCrud";
 import { SectionRailProvider } from "./SectionRailContext";
+import { SectionRail } from "./SectionRail";
 import RollbackRecoveryCard from "./RollbackRecoveryCard";
 
 /** Config sub-tab — the five form-bearing tabs (raw is handled by Config.tsx, SettingsForm renders nothing for it). */
@@ -243,6 +244,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
 
   return (
     <SectionRailProvider tab={tab}>
+      <SectionRail />
       <div className="cf-form">
       {/* ── Daemon tab ── */}
       {tab === "daemon" && (

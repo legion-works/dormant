@@ -277,12 +277,24 @@ describe("Doctor", () => {
         { name: "ddcci (studio)", status: "ok", detail: "last attempt succeeded", category: "display", subject: "studio" },
         { name: "mqtt desk-mmwave", status: "fail", detail: "timeout", category: "sensor", subject: "desk-mmwave" },
         { name: "oddball-check", status: "skip", detail: "mystery" },
+        // Warm-up A (W4 residual Should): a check whose name would match the
+        // display heuristic — `name.match(/\(([^)]+)\)$/)` pulls "studio" —
+        // but whose BG-7 category is "sensor", so it lands under SENSOR, not
+        // DISPLAY.  The fixture includes "studio" in `displays` so the
+        // heuristic WOULD have placed it in DISPLAY had category been absent.
+        { name: "panel (studio)", status: "ok", detail: "panel ok", category: "sensor", subject: "studio" },
       ],
     });
 
     function Harness() {
       const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
       const state = liveStateFixture({
+        snapshot: {
+          sensors: [],
+          zones: [],
+          displays: [["studio", { display_id: "studio", phase: "active", blank: false, inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
+          pending_reload: null,
+        },
         doctorReport,
         setDoctorReport,
       });
@@ -294,9 +306,20 @@ describe("Doctor", () => {
 
     await waitFor(() => {
       // Category headers appear in uppercase.
-      // config → CONFIG, display → DISPLAYS, sensor → SENSORS.
+      // config → CONFIG, display → DISPLAY, sensor → SENSOR.
       // oddball-check (no category) falls into OTHER bucket.
       expect(screen.getByText("oddball-check")).toBeInTheDocument();
+
+      // Warm-up A: "panel (studio)" has category "sensor", subject "studio".
+      // The heuristic on its name would match "studio" as a display and place
+      // it under DISPLAY, but the BG-7 category wins — assert it renders under
+      // the SENSOR group header.  Two SENSOR groups exist (desk-mmwave and
+      // studio), so we find the one containing our target check text.
+      const sensorGroup = Array.from(document.querySelectorAll(".doctor-group"))
+        .find((el) => el.querySelector(".doctor-group__category")?.textContent === "SENSOR"
+          && el.textContent?.includes("panel (studio)"));
+      expect(sensorGroup).toBeTruthy();
+      expect(sensorGroup!.textContent).toContain("panel (studio)");
     });
   });
 

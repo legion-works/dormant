@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -452,6 +453,59 @@ rename to crates/example/tests/renamed.rs
 
         self.assertEqual(library, root / "target/nextest/changed/dormantctl-lib-dormantctl.xml")
         self.assertEqual(binary, root / "target/nextest/changed/dormantctl-bin-dormantctl.xml")
+
+    def test_run_targets_skips_ignored_only_target(self):
+        """A target with only #[ignore] tests skips gracefully, exit 0."""
+        target = select_changed_tests.Target("example", "test", "ignored-only")
+
+        # First list (no --run-ignored) returns empty.
+        # Second list (--run-ignored all) returns non-empty.
+        def fake_run(cmd, **kwargs):
+            if "--run-ignored" in cmd and "all" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="ignored-target::ignored_test", stderr="")
+            if "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            # Should not reach run command for skipped target
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run):
+                result = select_changed_tests.run_targets(root, [target], 1)
+            self.assertEqual(result, 0)
+
+    def test_run_targets_fails_genuinely_empty_target(self):
+        """A target with zero tests even after --run-ignored all still fails."""
+        target = select_changed_tests.Target("example", "test", "buggy-filter")
+
+        # Both list calls return empty — the selector is broken.
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run):
+                result = select_changed_tests.run_targets(root, [target], 1)
+            self.assertEqual(result, 1)
+
+    def test_run_targets_normal_target_unaffected(self):
+        """A normal target with runnable tests is not affected by the ignored check."""
+        target = select_changed_tests.Target("example", "test", "alpha")
+
+        def fake_run(cmd, **kwargs):
+            if "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="alpha::test_one\nalpha::test_two", stderr="")
+            if "run" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        dummy_path = pathlib.Path("/dev/null")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run), \
+                 unittest.mock.patch.object(select_changed_tests, "_copy_junit", return_value=dummy_path):
+                result = select_changed_tests.run_targets(root, [target], 1)
+            self.assertEqual(result, 0)
 
 
 if __name__ == "__main__":

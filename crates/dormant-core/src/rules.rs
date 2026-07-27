@@ -2107,42 +2107,33 @@ impl RulesEngine {
                 operation_id,
                 generation: accepted_generation,
             };
-            let sequence_sink = Arc::clone(&sink);
-            let sequence_rules = rules_to_resume.clone();
-            let sequence_target = target.clone();
-            let sequence = tokio::spawn(async move {
-                run_exercise_sequence(
-                    &sequence_sink,
-                    effective_mode,
-                    pre_phase,
-                    sequence_rules,
-                    sequence_target,
-                    wake_settle,
-                )
-                .await
-            });
-            let mut report = match sequence.await {
+            let mut report = match run_supervised_exercise(
+                Arc::clone(&sink),
+                effective_mode,
+                pre_phase,
+                rules_to_resume.clone(),
+                target.clone(),
+                wake_settle,
+            )
+            .await
+            {
                 Ok(report) => report,
-                Err(join_error) => {
-                    tracing::error!(event = "exercise_task_panicked", error = %join_error, "exercise task failed; forcing wake");
-                    wake_after_exercise_panic(&sink).await;
-                    ExerciseReport {
-                        display: target,
-                        pre_phase: "unknown".into(),
-                        operation_id: Some(operation_id),
-                        generation: Some(accepted_generation),
-                        paused_rules: rules_to_resume.clone(),
-                        steps: vec![ExerciseStep {
-                            command: "panic".into(),
-                            blank_mode: None,
-                            returned_ok: false,
-                            state_before: None,
-                            state_after: None,
-                            verdict: ExerciseVerdict::Failed,
-                            error: Some("E_EXERCISE_PANIC: exercise task panicked".into()),
-                        }],
-                    }
-                }
+                Err(()) => ExerciseReport {
+                    display: target,
+                    pre_phase: "unknown".into(),
+                    operation_id: Some(operation_id),
+                    generation: Some(accepted_generation),
+                    paused_rules: rules_to_resume.clone(),
+                    steps: vec![ExerciseStep {
+                        command: "panic".into(),
+                        blank_mode: None,
+                        returned_ok: false,
+                        state_before: None,
+                        state_after: None,
+                        verdict: ExerciseVerdict::Failed,
+                        error: Some("E_EXERCISE_PANIC: exercise task panicked".into()),
+                    }],
+                },
             };
             report.operation_id = Some(operation_id);
             report.generation = Some(accepted_generation);
@@ -2930,6 +2921,36 @@ async fn wake_after_exercise_panic(sink: &Arc<dyn CommandSink>) {
     let _ = sink.wake_once().await;
 }
 
+async fn run_supervised_exercise(
+    sink: Arc<dyn CommandSink>,
+    effective_mode: Option<BlankMode>,
+    pre_phase: String,
+    paused_rules: Vec<RuleId>,
+    display: DisplayId,
+    wake_settle: Duration,
+) -> Result<ExerciseReport, ()> {
+    let task_sink = Arc::clone(&sink);
+    let task = tokio::spawn(async move {
+        run_exercise_sequence(
+            &task_sink,
+            effective_mode,
+            pre_phase,
+            paused_rules,
+            display,
+            wake_settle,
+        )
+        .await
+    });
+    match task.await {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            tracing::error!(event = "exercise_task_panicked", error = %error, "exercise task failed; forcing wake");
+            wake_after_exercise_panic(&sink).await;
+            Err(())
+        }
+    }
+}
+
 /// Verdict for the blank step: did the panel state move from baseline?
 ///
 /// Order matters: a command error is `Failed` regardless of readback
@@ -3050,10 +3071,9 @@ mod tests {
         let fake = Arc::new(crate::fakes::ExerciseSink::new());
         let sink: Arc<dyn CommandSink> = fake.clone();
         fake.panic_once_on("blank");
-        let task_sink = sink.clone();
-        let task = tokio::spawn(async move {
-            run_exercise_sequence(
-                &task_sink,
+        assert!(
+            run_supervised_exercise(
+                sink,
                 Some(BlankMode::PowerOff),
                 "active".into(),
                 vec![RuleId("office".into())],
@@ -3061,9 +3081,8 @@ mod tests {
                 Duration::ZERO,
             )
             .await
-        });
-        assert!(task.await.is_err());
-        let _ = sink.wake_once().await;
+            .is_err()
+        );
         assert!(matches!(fake.log().last(), Some(SinkCmd::Wake)));
     }
 
@@ -3079,6 +3098,18 @@ mod tests {
             .expect("operation accepted");
         registry.cancel_generation(generation);
         assert!(lease.is_cancelled());
+        let (results_tx, mut results_rx) = mpsc::unbounded_channel();
+        let guard = ExercisePauseGuard {
+            results_tx,
+            rules: Some(vec![RuleId("office".into())]),
+            operation_id: 1,
+            generation,
+        };
+        drop(guard);
+        assert!(matches!(
+            results_rx.try_recv(),
+            Ok(InternalResult::ExerciseResume { .. })
+        ));
         let sink = Arc::new(crate::fakes::ExerciseSink::new());
         let _ = sink.wake_once().await;
         assert!(matches!(sink.log().last(), Some(SinkCmd::Wake)));

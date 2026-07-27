@@ -900,6 +900,8 @@ async fn smoke_blank_and_wake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The bounded lease contract itself is pinned by app.rs unit tests; this keeps
+// the end-to-end accepted-generation/report path covered.
 async fn exercise_during_reload_finishes_or_cancels_before_teardown() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");

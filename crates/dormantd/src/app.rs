@@ -98,6 +98,39 @@ use crate::watchdog_schedule::WatchdogSchedule;
 
 const QUIESCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuiesceOutcome {
+    Clear,
+    ClearedAfterCancel,
+    Busy,
+}
+
+/// Wait for generation-owned hardware leases before teardown. The reload
+/// coordinator uses `Busy` to restore the paused old generation, so this
+/// pure phase is the load-bearing contract behind the integration rejection.
+async fn quiesce_operations(
+    registry: &OperationRegistry,
+    generation: GenerationId,
+    first_wait: Duration,
+    second_wait: Duration,
+) -> QuiesceOutcome {
+    if tokio::time::timeout(first_wait, registry.wait_generation_empty(generation))
+        .await
+        .is_ok()
+    {
+        return QuiesceOutcome::Clear;
+    }
+    registry.cancel_generation(generation);
+    if tokio::time::timeout(second_wait, registry.wait_generation_empty(generation))
+        .await
+        .is_ok()
+    {
+        QuiesceOutcome::ClearedAfterCancel
+    } else {
+        QuiesceOutcome::Busy
+    }
+}
+
 /// Builds the daemon-lifetime notification sink. Production defaults to
 /// [`notifier::ZbusSink`]; tests inject a factory returning a shared
 /// recording fake (`with_notify_sink_builder` — `source_builder` precedent).
@@ -2051,57 +2084,41 @@ impl Runner {
         self.record_reload_lifecycle_stage("routers_paused");
         quiesce_inputs(&mut self.generation).await;
         self.record_reload_lifecycle_stage("inputs_quiesced");
-        if tokio::time::timeout(
-            QUIESCE_OPERATION_TIMEOUT,
-            self.operation_registry
-                .wait_generation_empty(self.generation_id),
-        )
-        .await
-        .is_err()
-        {
+        if matches!(
+            quiesce_operations(
+                &self.operation_registry,
+                self.generation_id,
+                QUIESCE_OPERATION_TIMEOUT,
+                QUIESCE_OPERATION_TIMEOUT,
+            )
+            .await,
+            QuiesceOutcome::Busy
+        ) {
             tracing::warn!(
                 event = "operation_quiesce_cancelled",
                 generation = self.generation_id.0
             );
-            self.operation_registry
-                .cancel_generation(self.generation_id);
-            if tokio::time::timeout(
-                QUIESCE_OPERATION_TIMEOUT,
-                self.operation_registry
-                    .wait_generation_empty(self.generation_id),
-            )
-            .await
-            .is_err()
-            {
-                let executors = self
-                    .generation
-                    .display_executors
-                    .iter()
-                    .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
-                    .collect();
-                self.executors_tx.send_replace(Arc::new(executors));
-                self.ctl_router
-                    .install_generation(old_ctl.clone(), self.generation_id)
-                    .await;
-                if let Some(events) = self.generation.engine_events_tx.clone() {
-                    self.events_router.install(events).await;
-                }
-                let detail =
-                    "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
-                tracing::warn!(
-                    event = "reload_rejected_operation_busy",
-                    generation = self.generation_id.0
-                );
-                let outcome = ReloadOutcome::Rejected(detail);
-                let _ = self.reload_tx.send(outcome.clone());
-                return self.reload_receipt(
-                    request_ids,
-                    sources,
-                    requested_revision,
-                    outcome,
-                    false,
-                );
+            let executors = self
+                .generation
+                .display_executors
+                .iter()
+                .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+                .collect();
+            self.executors_tx.send_replace(Arc::new(executors));
+            self.ctl_router
+                .install_generation(old_ctl.clone(), self.generation_id)
+                .await;
+            if let Some(events) = self.generation.engine_events_tx.clone() {
+                self.events_router.install(events).await;
             }
+            let detail = "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
+            tracing::warn!(
+                event = "reload_rejected_operation_busy",
+                generation = self.generation_id.0
+            );
+            let outcome = ReloadOutcome::Rejected(detail);
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
         }
         #[cfg(any(test, feature = "test-util"))]
         if let Some(gate) = &self.generation_barrier_gate {
@@ -5942,6 +5959,86 @@ mod render_tests {
 mod generation_router_tests {
     use super::*;
     use dormant_core::types::{SensorState, Timestamp};
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_without_leases_is_clear() {
+        let registry = OperationRegistry::default();
+        assert_eq!(
+            quiesce_operations(
+                &registry,
+                GenerationId(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            )
+            .await,
+            QuiesceOutcome::Clear
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_dropped_lease_is_clear() {
+        let registry = OperationRegistry::default();
+        let (_, lease) = registry
+            .try_acquire(GenerationId(2), OperationKind::EmergencyWake)
+            .unwrap();
+        drop(lease);
+        assert_eq!(
+            quiesce_operations(
+                &registry,
+                GenerationId(2),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            )
+            .await,
+            QuiesceOutcome::Clear
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_cancels_and_clears_lease() {
+        let registry = OperationRegistry::default();
+        let (generation, lease) = (
+            GenerationId(3),
+            registry
+                .try_acquire(GenerationId(3), OperationKind::EmergencyWake)
+                .unwrap()
+                .1,
+        );
+        let waiter = tokio::spawn(async move {
+            lease.cancelled().await;
+        });
+        let result = quiesce_operations(
+            &registry,
+            generation,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(result);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(result.await, QuiesceOutcome::ClearedAfterCancel);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_reports_busy_for_leaked_lease() {
+        let registry = OperationRegistry::default();
+        let (_, lease) = registry
+            .try_acquire(GenerationId(4), OperationKind::EmergencyWake)
+            .unwrap();
+        std::mem::forget(lease);
+        let result = quiesce_operations(
+            &registry,
+            GenerationId(4),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(result);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(result.await, QuiesceOutcome::Busy);
+    }
 
     #[tokio::test]
     async fn control_queued_while_paused_releases_once_to_new_generation() {

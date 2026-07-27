@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-27
+
+### Fixed
+
+- Two DDC/CI fixes from live shared-panel switching: a controller whose startup probe failed (panel held by the peer machine, display link down) now re-probes on the first command instead of refusing every blank, wake, and switch with "controller not probed" until the daemon is restarted; and input-switch verification reads now follow an escalating retry schedule (~3.5s) so the panel's post-switch re-sync garble no longer reports a successful switch as a DDC checksum failure.
+
 ## [0.8.1] - 2026-07-27
 
 ### Fixed
@@ -228,7 +234,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/legion-works/dormant/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/legion-works/dormant/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/legion-works/dormant/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/legion-works/dormant/compare/v0.7.0...v0.7.1

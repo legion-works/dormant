@@ -94,13 +94,19 @@ export default function Events() {
   );
 
   const visibleGroups = FILTER_GROUPS.map((g) =>
-    g.id === "switching" && !hasSwitchingEvents ? { ...g, hidden: true } : g,
+    g.id === "switching"
+      ? { ...g, hidden: !hasSwitchingEvents }
+      : { ...g, hidden: g.hidden ?? false },
   );
 
-  // Filter events by active tags
+  // Filter events by active tags.  The history separator (_history_separator)
+  // is a non-filterable sentinel — always rendered regardless of tag selection.
   const filteredEvents = useMemo(() => {
     if (activeTags.size === 0) return events;
-    return events.filter((se) => activeTags.has(se.event.event));
+    return events.filter((se) => {
+      const tag = (se.event as { event: string }).event;
+      return tag === "_history_separator" || activeTags.has(tag);
+    });
   }, [events, activeTags]);
 
   const showBanner = !connected || lagged;

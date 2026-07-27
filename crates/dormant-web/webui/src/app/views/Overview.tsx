@@ -10,7 +10,7 @@ import { useNavigate } from "../nav";
 import { useLiveState, useEventLog } from "../hooks/useLiveState";
 import { Card, StatusChip, WearCard, useConfirmDialog, statusLabel, phaseChipLabel } from "../components";
 import { badgeForEvent, messageForEvent } from "./eventFormat";
-import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot, DisplayConfig } from "../../api/types";
+import type { SensorSnapshot, ZoneSnapshot, DisplaySnapshot, DisplayConfig, RuleConfig } from "../../api/types";
 import { postBlank, postWake, postSwitch, postPush } from "../../api/client";
 import { useCallback, useState } from "react";
 import "./Overview.css";
@@ -133,13 +133,16 @@ interface HolderCandidate {
 /** Derive the list of candidate reasons a display is held awake.
  *  The snapshot's `inhibited` boolean is a single value — when more than
  *  one inhibitor is possible, the UI renders a *candidate list* prefixed
- *  with ▸ rather than fabricating a specific cause. */
+ *  with ▸ rather than fabricating a specific cause.
+ *
+ *  `ruleCfgs` is a map from rule id to its config (inhibitors, activity_idle_threshold).
+ *  Passed from the parent which has access to `config.inventory.rules`. */
 function heldByCandidates(
   id: string,
   snap: DisplaySnapshot,
-  _dc: DisplayConfig | undefined,
   displayRules: Record<string, { rule: string; zone: string }>,
   zones: ZoneSnapshot[],
+  ruleCfgs: Record<string, { inhibitors?: string[]; activity_idle_threshold?: unknown }>,
 ): HolderCandidate[] | null {
   const candidates: HolderCandidate[] = [];
 
@@ -150,36 +153,51 @@ function heldByCandidates(
     if (zone && zone.present === true) {
       candidates.push({ reason: `\u2022 ${dr.zone} \u00b7 present`, color: "var(--success)" });
     } else if (zone && zone.present === false && snap.phase === "grace") {
-      // Zone vacant, still in grace window
       candidates.push({ reason: `\u2022 ${dr.zone} \u00b7 vacant \u00b7 grace`, color: "var(--warning)" });
     }
   }
 
-  // 2) Activity (inhibited + activity_idle_threshold on rule).
-  // The rule config is keyed by rule id, so we look through inventory rules to find one that lists this display.
-  // (rule config access is via config.inventory.rules, pulled below)
-
-  // 3) audio-playback / call inhibitors
+  // 2) Inhibitors — read the rule's actual config, never fabricate.
   if (snap.inhibited) {
-    // Mark activity and audio/call inhibitors as candidates when inhibited.
-    // The exact truth is unknown, so we prefix with ▸ for ambiguity.
-    candidates.push(
-      { reason: "\u25b8 activity", color: "var(--accent-warm)" },
-      { reason: "\u25b8 audio-inhibitor", color: "var(--accent-warm)" },
-    );
+    const ruleCfg = dr ? ruleCfgs[dr.rule] : undefined;
+    const activityThreshold = ruleCfg?.activity_idle_threshold;
+    const inhibitors = ruleCfg?.inhibitors ?? [];
+
+    // Collect the configured inhibitor names.
+    const configured: string[] = [];
+    if (activityThreshold != null) {
+      configured.push("activity");
+    }
+    for (const inhibitor of inhibitors) {
+      // audio-playback, call, or any other named inhibitor.
+      configured.push(inhibitor);
+    }
+
+    if (configured.length === 1) {
+      // Exactly one configured — state it flatly (no ▸ prefix).
+      candidates.push({ reason: `\u2022 ${configured[0]}`, color: "var(--accent-warm)" });
+    } else if (configured.length > 1) {
+      // Multiple configured — list as candidates (▸ prefix).
+      for (const inhibitor of configured) {
+        candidates.push({ reason: `\u25b8 ${inhibitor}`, color: "var(--accent-warm)" });
+      }
+    } else {
+      // inhibited=true but zero inhibitors configured — honest unknown.
+      candidates.push({ reason: "\u25b8 unknown inhibitor", color: "var(--accent-warm)" });
+    }
   }
 
-  // 4) Paused
+  // 3) Paused
   if (snap.paused) {
     candidates.push({ reason: "\u25b8 paused", color: "var(--accent-warm)" });
   }
 
-  // 5) Peer holds the panel
+  // 4) Peer holds the panel
   if (snap.scope === "shared" && !snap.owned) {
     candidates.push({ reason: "\u25b8 peer holds the panel", color: "var(--text-muted)" });
   }
 
-  // 6) Manual-only — no rule
+  // 5) Manual-only — no rule
   if (!dr) {
     candidates.push({ reason: "\u25b8 manual-only \u00b7 no rule", color: "var(--text-muted)" });
   }
@@ -236,11 +254,12 @@ interface PanelTileProps {
   dc: DisplayConfig | undefined;
   displayRules: Record<string, { rule: string; zone: string }>;
   zones: ZoneSnapshot[];
+  ruleCfgs: Record<string, { inhibitors?: string[]; activity_idle_threshold?: unknown }>;
   kvm: { switch_capable_displays: string[]; push_capable_displays: string[] } | null;
   dimmed: boolean;
 }
 
-function PanelTile({ id, snap, dc, displayRules, zones, kvm, dimmed }: PanelTileProps) {
+function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }: PanelTileProps) {
   const navigate = useNavigate();
   const { confirm, dialog } = useConfirmDialog();
   const [inFlight, setInFlight] = useState<string | null>(null);
@@ -249,7 +268,7 @@ function PanelTile({ id, snap, dc, displayRules, zones, kvm, dimmed }: PanelTile
   const phaseLabel = phaseChipLabel(snap.phase, snap.stage);
   const preview = panelPreviewGlyph(snap);
   const controllers = dc?.controllers ?? [];
-  const candidates = heldByCandidates(id, snap, dc, displayRules, zones);
+  const candidates = heldByCandidates(id, snap, displayRules, zones, ruleCfgs);
   const header = heldByHeader(candidates ?? []);
   const shared = snap.scope === "shared";
   const observedInput = snap.observed_input_code;
@@ -441,16 +460,25 @@ export default function Overview() {
   const displayRulesMap: Record<string, { rule: string; zone: string }> = displayRules;
 
   // Build rules column rows from config.inventory.rules + display_rules.
+  // Also build ruleCfgs for use by heldByCandidates.
   const ruleRows: { id: string; zone: string; displayIds: string[]; grace?: string; inhibitors?: string[] }[] = [];
-  if (config.inventory.rules) {
-    for (const [ruleId, ruleCfg] of Object.entries(config.inventory.rules)) {
+  const ruleCfgsForTiles: Record<string, { inhibitors?: string[]; activity_idle_threshold?: unknown }> = {};
+  const ruleCfgInventory = config.inventory.rules as Record<string, RuleConfig> | undefined;
+  if (ruleCfgInventory) {
+    for (const [ruleId, _ruleCfg] of Object.entries(ruleCfgInventory)) {
+      // Convert to typed access (S5 fix).
+      const r = _ruleCfg;
       ruleRows.push({
         id: ruleId,
-        zone: ruleCfg.zone as string,
-        displayIds: (ruleCfg.displays as string[]) ?? [],
-        grace: ruleCfg.grace_period ? String(ruleCfg.grace_period) : undefined,
-        inhibitors: ruleCfg.inhibitors ? ruleCfg.inhibitors as string[] : undefined,
+        zone: r.zone,
+        displayIds: r.displays ?? [],
+        grace: r.grace_period ? String(r.grace_period) : undefined,
+        inhibitors: r.inhibitors,
       });
+      ruleCfgsForTiles[ruleId] = {
+        inhibitors: r.inhibitors,
+        activity_idle_threshold: r.activity_idle_threshold,
+      };
     }
   }
   // Add manual-only displays (not covered by any rule) as a pseudo-row.
@@ -485,6 +513,7 @@ export default function Overview() {
               dc={displayConfigs[id]}
               displayRules={displayRulesMap}
               zones={zones}
+              ruleCfgs={ruleCfgsForTiles}
               kvm={kvm ? { switch_capable_displays: kvm.switch_capable_displays, push_capable_displays: kvm.push_capable_displays } : null}
               dimmed={dimmed}
             />

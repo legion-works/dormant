@@ -251,16 +251,38 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
         const res = await getRecentEvents(100);
         if (!mountedRef.current) return;
         if (res.events.length > 0) {
-          const stamped = res.events.map((re) => ({
-            time: new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false }),
-            event: re.event,
-          }));
-          stamped.reverse();
-          stamped.push({
-            time: "",
-            event: { event: "_history_separator" } as never,
-          });
-          setEvents(stamped.slice(0, MAX_EVENTS));
+          // Dedupe key: JSON-serialized event (stable across ring and WS).
+          const seen = new Set<string>();
+          for (const se of events) {
+            seen.add(JSON.stringify(se.event));
+          }
+
+          // History events arrive oldest-first. Convert and dedupe.
+          const historyEntries: StampedEvent[] = [];
+          for (const re of res.events) {
+            const key = JSON.stringify(re.event);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            historyEntries.push({
+              time: new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false }),
+              event: re.event,
+            });
+          }
+
+          if (historyEntries.length > 0) {
+            // History oldest-first, reverse to match live order (newest first).
+            historyEntries.reverse();
+            // Separator between history and live.
+            historyEntries.push({
+              time: "",
+              event: { event: "_history_separator" } as never,
+            });
+            // Merge: history (newest first) + separator + existing live events.
+            setEvents((prev) => {
+              const merged = [...historyEntries, ...prev].slice(0, MAX_EVENTS);
+              return merged;
+            });
+          }
         }
       } catch {
         // Endpoint unavailable — silent fallback.
@@ -273,6 +295,7 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
       mountedRef.current = false;
       if (lagTimerRef.current != null) clearTimeout(lagTimerRef.current);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps — history seed reads events for dedup
   }, [fetchAll, refreshWear]);
 
   // Poll state and authoritative operation guards together at one-second

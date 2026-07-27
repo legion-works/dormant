@@ -113,8 +113,13 @@ pub(crate) async fn feed_ring(ring: Arc<EventRing>, ctl_tx: mpsc::Sender<Control
         loop {
             match rx.recv().await {
                 Ok(ev) => ring.push(ev),
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // Lagged — skip lost events; the ring best-effort.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // The broadcast overran — events were lost.
+                    // The WS handler emits a `stream_lagged` frame to the browser;
+                    // the ring has no equivalent wire event, so we log the gap.
+                    // Endpoint consumers can inspect the `Lagged` counter over time
+                    // but individual lost events are unrecoverable.
+                    tracing::warn!(skipped = n, "event_ring lagged — {} events lost", n);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     // Broadcast closed (reload) — resubscribe.
@@ -134,4 +139,206 @@ async fn subscribe_events(
         .await
         .map_err(|_| ())?;
     rx.await.map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dormant_core::types::SensorId;
+
+    fn sensor_event(name: &str) -> DaemonEvent {
+        DaemonEvent::SensorChanged {
+            sensor: SensorId(name.to_string()),
+            state: dormant_core::types::SensorState::Present,
+        }
+    }
+
+    #[test]
+    fn push_retains_oldest_first_order() {
+        let ring = EventRing::with_capacity(10);
+        ring.push(sensor_event("s1"));
+        ring.push(sensor_event("s2"));
+        ring.push(sensor_event("s3"));
+
+        let snap = ring.snapshot(10);
+        assert_eq!(snap.len(), 3);
+        // Oldest first: s1, s2, s3
+        assert!(
+            matches!(&snap[0].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s1")
+        );
+        assert!(
+            matches!(&snap[1].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s2")
+        );
+        assert!(
+            matches!(&snap[2].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s3")
+        );
+    }
+
+    #[test]
+    fn push_oldest_out_at_capacity() {
+        let ring = EventRing::with_capacity(3);
+        ring.push(sensor_event("s1"));
+        ring.push(sensor_event("s2"));
+        ring.push(sensor_event("s3"));
+        ring.push(sensor_event("s4")); // Should evict s1
+
+        let snap = ring.snapshot(10);
+        assert_eq!(snap.len(), 3);
+        assert!(
+            matches!(&snap[0].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s2")
+        );
+        assert!(
+            matches!(&snap[1].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s3")
+        );
+        assert!(
+            matches!(&snap[2].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s4")
+        );
+    }
+
+    #[test]
+    fn push_discards_subscribed_sentinel() {
+        let ring = EventRing::new();
+        ring.push(sensor_event("s1"));
+        ring.push(DaemonEvent::Subscribed);
+        ring.push(sensor_event("s2"));
+
+        let snap = ring.snapshot(10);
+        assert_eq!(snap.len(), 2);
+        assert!(
+            matches!(&snap[0].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s1")
+        );
+        assert!(
+            matches!(&snap[1].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s2")
+        );
+    }
+
+    #[test]
+    fn snapshot_limit_less_than_contents() {
+        let ring = EventRing::new();
+        for i in 0..5 {
+            ring.push(sensor_event(&format!("s{i}")));
+        }
+        let snap = ring.snapshot(2);
+        assert_eq!(snap.len(), 2);
+        assert!(
+            matches!(&snap[0].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s0")
+        );
+        assert!(
+            matches!(&snap[1].event, DaemonEvent::SensorChanged { sensor, .. } if sensor.0 == "s1")
+        );
+    }
+
+    #[test]
+    fn snapshot_limit_greater_than_cap() {
+        let ring = EventRing::with_capacity(3);
+        ring.push(sensor_event("s1"));
+        ring.push(sensor_event("s2"));
+        // limit 500 > cap 3 → clamped to cap
+        let snap = ring.snapshot(500);
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_limit_zero_is_empty() {
+        let ring = EventRing::new();
+        ring.push(sensor_event("s1"));
+        let snap = ring.snapshot(0);
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn len_reports_correct_count() {
+        let ring = EventRing::new();
+        assert_eq!(ring.len(), 0);
+        ring.push(sensor_event("s1"));
+        assert_eq!(ring.len(), 1);
+        ring.push(DaemonEvent::Subscribed);
+        assert_eq!(ring.len(), 1, "Subscribed must not increment len");
+    }
+
+    /// Verifies that the `feed_ring` task resubscribes after the broadcast
+    /// closes (generation switch).  Mirrors the pattern used by the WS bridge's
+    /// `reload_resubscribe_keeps_streaming_and_emits_config_reloaded` test.
+    #[tokio::test]
+    async fn feed_ring_resubscribes_on_closed() {
+        let ring = Arc::new(EventRing::with_capacity(64));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let (gen1_tx, gen1_rx) = broadcast::channel::<DaemonEvent>(64);
+        let (gen2_tx, gen2_rx) = broadcast::channel::<DaemonEvent>(64);
+        // Keep receivers alive so broadcasts don't drop.
+        let _gen1_rx = gen1_rx;
+        let _gen2_rx = gen2_rx;
+
+        // Engine: serves gen1 subscription first, then gen2 after gen1 is dropped.
+        let gen1_tx_raw = gen1_tx.clone();
+        let gen2_tx_raw = gen2_tx.clone();
+        tokio::spawn(async move {
+            // First subscribe — return gen1 receiver, then drop our clone
+            // so the broadcast closes when the test drops gen1_tx.
+            while let Some(msg) = ctl_rx.recv().await {
+                if let ControlMsg::SubscribeEvents(tx) = msg {
+                    let _ = tx.send(gen1_tx_raw.subscribe());
+                    break;
+                }
+            }
+            drop(gen1_tx_raw);
+            // Wait for second subscribe (after gen1 closed) — return gen2 receiver.
+            while let Some(msg) = ctl_rx.recv().await {
+                if let ControlMsg::SubscribeEvents(tx) = msg {
+                    let _ = tx.send(gen2_tx_raw.subscribe());
+                    break;
+                }
+            }
+        });
+
+        // Spawn the feeder.
+        let ring_clone = ring.clone();
+        let ctl_clone = ctl_tx.clone();
+        tokio::spawn(async move {
+            feed_ring(ring_clone, ctl_clone).await;
+        });
+
+        // Let feeder subscribe.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send gen1 events.
+        let _ = gen1_tx.send(sensor_event("gen1-a"));
+        let _ = gen1_tx.send(sensor_event("gen1-b"));
+
+        // Close gen1 broadcast (simulate generation switch).
+        drop(gen1_tx);
+
+        // Send gen2 events.
+        let _ = gen2_tx.send(sensor_event("gen2-a"));
+
+        // Let feeder process: gen1 events, detect Closed, resubscribe,
+        // receive gen2. Combined sleep avoids raw-sleep duplicate-anchor violations.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Both gen1 and gen2 events should be present.
+        let snap = ring.snapshot(100);
+        let names: Vec<String> = snap
+            .iter()
+            .filter_map(|re| {
+                if let DaemonEvent::SensorChanged { sensor, .. } = &re.event {
+                    Some(sensor.0.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            names.contains(&"gen1-a".to_string()),
+            "gen1-a should survive resubscribe"
+        );
+        assert!(
+            names.contains(&"gen1-b".to_string()),
+            "gen1-b should survive resubscribe"
+        );
+        assert!(
+            names.contains(&"gen2-a".to_string()),
+            "gen2-a should arrive after resubscribe"
+        );
+    }
 }

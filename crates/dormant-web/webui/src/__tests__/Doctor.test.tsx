@@ -202,4 +202,71 @@ describe("Doctor", () => {
     // Exercise is now a peer panel, not a <select>.
     expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
   });
+
+  it("renders checks grouped by heuristic fallback when no category/subject", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [
+        { name: "config", status: "ok" as const, detail: "valid" },
+        { name: "unknown-probe", status: "fail" as const, detail: "something broke" },
+      ],
+    });
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      // "config" name matches heuristic → CONFIG group header.
+      expect(screen.getByText("CONFIG")).toBeInTheDocument();
+      // "unknown-probe" doesn't match any heuristic → OTHER group.
+      expect(screen.getByText("OTHER")).toBeInTheDocument();
+    });
+
+    // The Other bucket contains the unknown probe.
+    expect(screen.getByText("unknown-probe")).toBeInTheDocument();
+  });
+
+  it("renders exercise runner with button not disabled from local state", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [],
+    });
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        snapshot: {
+          sensors: [],
+          zones: [],
+          displays: [["main", {
+            phase: "active",
+            inhibited: false,
+            paused: false,
+            cmd_gen: 1,
+            controllers: [],
+          }]],
+          pending_reload: null,
+        },
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      const btn = screen.getByRole("button", { name: "Run control-path exercise" });
+      // Exercise button should be enabled when no exercise is in flight.
+      expect(btn).not.toBeDisabled();
+    });
+  });
 });

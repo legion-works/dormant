@@ -100,35 +100,63 @@
 }
 
 
-/* ── Fields ── */
+/* ── Fields — two-column row layout (screens/03) ── */
 
 .cf-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  display: grid;
+  grid-template-columns: minmax(240px, 2fr) minmax(300px, 3fr);
+  column-gap: 28px;
+  row-gap: 4px;
+  align-items: start;
+  padding: 12px 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 55%, transparent);
+}
+.cf-field:last-child {
+  border-bottom: none;
 }
 
+/* Escape hatch: full-width single-column fields (arrays, textareas, chip rows). */
+.cf-field--full {
+  grid-template-columns: 1fr;
+}
+.cf-field--full .cf-field__label,
+.cf-field--full .cf-field__input-row,
+.cf-field--full .cf-field__hint,
+.cf-field--full .cf-field__error,
+.cf-field--full .cf-field__value-list {
+  grid-column: 1;
+}
+
+/* Label: column 1, row 1 — mono key name */
 .cf-field__label {
+  grid-column: 1;
+  grid-row: 1;
   font-family: var(--font-mono);
-  font-size: 10.5px;
-  color: var(--text-muted);
-  text-transform: lowercase;
-}
-
-.cf-field__label--checkbox {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  text-transform: none;
-  cursor: pointer;
-  color: var(--text-body);
   font-size: 13px;
+  font-weight: 500;
+  color: var(--text-body);
+  text-transform: none;
+  padding-top: 4px;
 }
 
+/* Hint / help text: column 1, row 2 — under the label */
+.cf-field__hint {
+  grid-column: 1;
+  grid-row: 2;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+/* Control area: column 2, spans both rows for tall controls */
 .cf-field__input-row {
+  grid-column: 2;
+  grid-row: 1 / span 2;
   display: flex;
   align-items: center;
   gap: 6px;
+  align-self: start;
 }
 
 .cf-field__input,
@@ -157,6 +185,34 @@
   cursor: not-allowed;
 }
 
+/* Checkbox labels span both columns (label text IS the control). */
+.cf-field__label--checkbox {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: none;
+  cursor: pointer;
+  color: var(--text-body);
+  font-size: 13px;
+  padding-top: 0;
+}
+
+/* Direct child inputs (no input-row wrapper) go to column 2. */
+.cf-field > .cf-field__input,
+.cf-field > .cf-field__select,
+.cf-field > .cf-field__multiselect {
+  grid-column: 2;
+}
+
+/* Lock icon stays in column 2, inline with the control. */
+.cf-field__lock {
+  font-size: 13px;
+  flex-shrink: 0;
+  cursor: help;
+}
+
+/* Actual checkbox input styling */
 .cf-field__checkbox {
   accent-color: var(--accent);
   cursor: pointer;
@@ -164,12 +220,6 @@
 
 .cf-field__checkbox:disabled {
   cursor: not-allowed;
-}
-
-.cf-field__lock {
-  font-size: 13px;
-  flex-shrink: 0;
-  cursor: help;
 }
 
 .cf-field--locked .cf-field__input,
@@ -182,26 +232,23 @@
   border-color: var(--danger);
 }
 
-.cf-field__hint {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-faint);
-}
-
 .cf-field__error {
+  grid-column: 2;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--danger);
   line-height: 1.4;
 }
 
 .cf-field__value-row {
+  grid-column: 2;
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
 .cf-field__value-text {
+  grid-column: 2;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-body);
@@ -212,6 +259,7 @@
 }
 
 .cf-field__value-list {
+  grid-column: 2;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -384,43 +432,11 @@
   opacity: 0.6;
 }
 
-/* ── Density pass (W1-5): 230px label column, per-entity collapse ── */
-
-/* Horizontal-row layout: label (230px column) | control (1fr column). */
+/* ── Density pass: the base .cf-field is now a two-column row by default.
+   .cf-field--row is kept as a no-op alias for backward compatibility;
+   all section files already use the class. */
 .cf-field.cf-field--row {
-  display: grid;
-  grid-template-columns: 230px 1fr;
-  gap: 6px 20px;
-  align-items: start;
-}
-
-.cf-field.cf-field--row .cf-field__label {
-  grid-column: 1;
-  padding-top: 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cf-field.cf-field--row .cf-field__input-row,
-.cf-field.cf-field--row > .cf-field__input,
-.cf-field.cf-field--row > .cf-field__select,
-.cf-field.cf-field--row .cf-field__multiselect,
-.cf-field.cf-field--row .cf-field__value-list,
-.cf-field.cf-field--row .cf-field__value-row {
-  grid-column: 2;
-}
-
-.cf-field.cf-field--row .cf-field__hint,
-.cf-field.cf-field--row .cf-field__error,
-.cf-field.cf-field--row .cf-field__was {
-  grid-column: 2;
-}
-
-/* Checkbox labels span both columns (label text IS the control). */
-.cf-field.cf-field--row .cf-field__label--checkbox {
-  grid-column: 1 / -1;
-  padding-top: 0;
+  /* All grid rules are now on the base .cf-field; nothing extra needed. */
 }
 
 /* Entity collapse toggle */

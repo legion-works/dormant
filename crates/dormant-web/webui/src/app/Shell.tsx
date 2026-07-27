@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import Dashboard from "./views/Dashboard";
+import Overview from "./views/Overview";
 import Displays from "./views/Displays";
 import Events from "./views/Events";
 import Config from "./views/Config";
@@ -18,7 +18,8 @@ import SidebarFooter from "./components/SidebarFooter";
 import "./Shell.css";
 
 const VIEW_COMPONENTS: Record<ViewId, React.ComponentType> = {
-  dashboard: Dashboard,
+  dashboard: Overview,
+  overview: Overview,
   displays: Displays,
   switching: Switching,
   events: Events,
@@ -27,7 +28,8 @@ const VIEW_COMPONENTS: Record<ViewId, React.ComponentType> = {
 };
 
 const VIEW_LABELS: Record<ViewId, string> = {
-  dashboard: "Dashboard",
+  dashboard: "Overview",
+  overview: "Overview",
   displays: "Displays",
   switching: "Switching",
   events: "Events",
@@ -37,7 +39,8 @@ const VIEW_LABELS: Record<ViewId, string> = {
 
 /** Topbar subtitle per view — a one-line reminder of what the view covers. */
 const VIEW_SUBTITLES: Record<ViewId, string> = {
-  dashboard: "live presence-to-display state",
+  dashboard: "what every panel is doing right now",
+  overview: "what every panel is doing right now",
   displays: "per-display control & controller chains",
   switching: "shared-display KVM ownership",
   events: "daemon event stream",

@@ -85,7 +85,7 @@ describe("Shell", () => {
     render(<Shell />);
 
     const navEl = document.querySelector(".sidebar-nav")!;
-    const navLabels = ["Dashboard", "Displays", "Events", "Config", "Doctor"];
+    const navLabels = ["Overview", "Displays", "Events", "Config", "Doctor"];
     for (const label of navLabels) {
       const found = Array.from(navEl.querySelectorAll(".nav-label")).some(
         (el) => el.textContent === label,
@@ -93,7 +93,7 @@ describe("Shell", () => {
       expect(found).toBe(true);
     }
 
-    expect(document.querySelector(".topbar-title")?.textContent).toBe("Dashboard");
+    expect(document.querySelector(".topbar-title")?.textContent).toBe("Overview");
   });
 
   it("shows the reload button and clock", () => {

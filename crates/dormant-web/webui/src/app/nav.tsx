@@ -12,7 +12,7 @@
  */
 import { useCallback } from "react";
 
-export type ViewId = "dashboard" | "displays" | "events" | "config" | "doctor" | "switching";
+export type ViewId = "dashboard" | "overview" | "displays" | "events" | "config" | "doctor" | "switching";
 
 export interface NavBadge {
   kind: "rollback" | "live" | "count";
@@ -38,7 +38,7 @@ export interface NavMeta {
 /** Derive the five sidebar nav items (stable ids/order) from live facts. */
 export function navItems(meta: NavMeta): NavItem[] {
   const items: NavItem[] = [
-    { id: "dashboard", label: "Dashboard", icon: "▦" },
+      { id: "dashboard", label: "Overview", icon: "▦" },
     {
       id: "displays",
       label: "Displays",

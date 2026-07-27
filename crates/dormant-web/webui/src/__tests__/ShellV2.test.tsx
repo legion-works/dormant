@@ -87,7 +87,7 @@ vi.mock("../api/client", () => ({
     socket: "/tmp/dormant.sock",
   }),
 }));
-vi.mock("../app/views/Dashboard", () => ({ default: () => <div>dashboard view</div> }));
+vi.mock("../app/views/Overview", () => ({ default: () => <div>overview view</div> }));
 vi.mock("../app/views/Displays", () => ({ default: () => <div>displays view</div> }));
 vi.mock("../app/views/Events", () => ({ default: () => <div>events view</div> }));
 vi.mock("../app/views/Config", () => ({ default: () => <div>config view</div> }));
@@ -134,8 +134,8 @@ describe("Shell v2 global chrome", () => {
     const configLink = screen.getByRole("link", { name: /Config rollback/i });
     fireEvent.click(configLink);
 
-    // Try to navigate away to Dashboard.
-    const dashboardLink = screen.getByRole("link", { name: /Dashboard/i });
+    // Try to navigate away to Overview.
+    const dashboardLink = screen.getByRole("link", { name: /Overview/i });
     fireEvent.click(dashboardLink);
 
     // Confirm must have been called with the dirty-count message.

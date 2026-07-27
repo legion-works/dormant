@@ -245,6 +245,22 @@ export function getOperations(): Promise<OperationsStatus> {
   return request<OperationsStatus>("/operations");
 }
 
+/** POST /api/star-nudge/star — attempt to star the repo via gh CLI, then dismiss. */
+export function postStarNudgeStar(): Promise<{ starred: boolean }> {
+  return request<{ starred: boolean }>("/star-nudge/star", {
+    method: "POST",
+    headers: JSON_CT,
+  });
+}
+
+/** POST /api/star-nudge/dismiss — dismiss the "Star the repo" sidebar nudge permanently. */
+export function postStarNudgeDismiss(): Promise<void> {
+  return request<void>("/star-nudge/dismiss", {
+    method: "POST",
+    headers: JSON_CT,
+  });
+}
+
 /** GET /api/daemon — daemon process identity (pid, uptime, version, socket). */
 export function getDaemon(): Promise<DaemonIdentity> {
   return request<DaemonIdentity>("/daemon");

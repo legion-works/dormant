@@ -164,6 +164,23 @@ pub struct WebStateInner {
     /// `GET /api/events/recent`.  Fed by a background subscriber task
     /// spawned in [`WebStateInner::assemble`].
     pub(crate) event_history: Arc<EventRing>,
+
+    /// Path to the `star-nudge-dismissed` flag file in the config directory.
+    /// Existence of this file means the user has dismissed the "Star the repo"
+    /// nudge in the web UI. Read by `GET /api/daemon`; written atomically by
+    /// `POST /api/star-nudge/dismiss`.
+    pub(crate) star_nudge_path: PathBuf,
+
+    /// Test-only seam: explicit path to the `gh` binary for
+    /// `POST /api/star-nudge/star`.  When `None` (production), the handler
+    /// does a PATH lookup on a fixed, hardened PATH.  Tests inject a
+    /// nonexistent path to verify the false-branch without mutating global
+    /// env.
+    pub(crate) star_gh_path: Option<PathBuf>,
+
+    /// Test-only seam: override [`GH_CHILD_PATH`] with a test directory
+    /// containing a stub `gh` binary — no global `env::set_var` needed.
+    pub(crate) star_test_path: Option<PathBuf>,
 }
 
 /// The subset of [`WebStateInner`]'s fields that vary across construction
@@ -262,6 +279,16 @@ impl WebStateInner {
             });
         }
 
+        // CORR 3: if parent is empty (e.g. relative `config.toml`), use
+        // the current directory so star_nudge_path is always a real
+        // filesystem location rather than panicking.
+        let config_dir = params
+            .config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let star_nudge_path = config_dir.join("star-nudge-dismissed");
+
         Self {
             ctl_tx: params.ctl_tx,
             reload_requester: params.reload_requester,
@@ -284,6 +311,9 @@ impl WebStateInner {
             exercise_in_flight: Arc::new(Mutex::new(HashSet::new())),
             started_epoch_s: now_epoch_s(),
             event_history,
+            star_nudge_path,
+            star_gh_path: None,
+            star_test_path: None,
         }
     }
 }

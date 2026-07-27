@@ -30,6 +30,12 @@ pub(crate) struct DaemonIdentity {
     /// Resolved IPC socket path — same resolution `dormantd` uses to spawn
     /// its own IPC listener (`dormant_core::paths::resolve_socket_path`).
     pub socket: String,
+    /// Whether the "Star the repo" sidebar nudge has been dismissed.
+    /// Persisted as a flag file (`star-nudge-dismissed`) in the config directory.
+    /// Defaults to `false` when absent — older clients and first-load treat
+    /// an unknown/missing key as not-yet-dismissed.
+    #[serde(default)]
+    pub star_nudge_dismissed: bool,
 }
 
 /// `GET /api/daemon` — report the daemon's process identity.
@@ -44,6 +50,7 @@ pub(crate) async fn get_daemon(State(state): State<WebState>) -> impl IntoRespon
             started_epoch_s: state.inner.started_epoch_s,
             version: env!("CARGO_PKG_VERSION"),
             socket: socket.display().to_string(),
+            star_nudge_dismissed: state.inner.star_nudge_path.exists(),
         }),
     )
 }

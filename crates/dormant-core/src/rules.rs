@@ -596,6 +596,12 @@ pub struct RollbackStatus {
     pub lkg_fp: String,
     /// Human-readable rollback reason; matches the pending-reload rollback detail.
     pub detail: String,
+    /// Suggested command to restart the daemon after fixing the config.
+    /// Platform-specific best-effort suggestion (e.g.
+    /// `"systemctl --user restart dormant"` on Linux,
+    /// `"launchctl kickstart -k gui/501/dev.legionworks.dormant"` on macOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_command: Option<String>,
 }
 
 /// A point-in-time view of engine state, returned by [`ControlMsg::Snapshot`].
@@ -3850,6 +3856,7 @@ mod tests {
             failed_fp: "12:deadbeef".to_string(),
             lkg_fp: "11:cafebabe".to_string(),
             detail: "rolled back to last-known-good".to_string(),
+            recovery_command: None,
         };
 
         engine.set_rollback(Some(status.clone()));

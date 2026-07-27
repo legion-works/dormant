@@ -441,6 +441,17 @@
   font-style: italic;
 }
 
+/* Uniform panel honest copy — pinned next to the legend so the user
+   sees "uniform exposure — no hotspots" instead of inferring it from
+   a flat heat map. Uses the muted token so it reads as informational
+   ("we know this is uniform"), not alarming. */
+.display-detail__uniform-note {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* ── Exposure tiles ── */
 
 .display-detail__tiles {

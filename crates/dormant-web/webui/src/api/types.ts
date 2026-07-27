@@ -836,4 +836,13 @@ export interface WearDetail extends WearSummary {
   grid_cols: number;
   cells: number[];
   heat: number[];
+  /**
+   * Maximum per-cell on-hours in the grid — the denominator the heat map
+   * was zero-max-normalized against. `0` when no cell has any recorded
+   * exposure (the heat map is then also all-zero). Use this to label
+   * the legend with real hours — do NOT infer absolute hours from the
+   * normalized `heat` (issue #108: a uniformly-worn panel collapses to
+   * a flat grey / zero heat under the old min-max form).
+   */
+  max_cell_hours: number;
 }

@@ -28,10 +28,12 @@ use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use dormant_core::config::{Strictness, load_config, load_credentials, validate};
+use dormant_core::config::{
+    Strictness, load_config, load_credentials, validate_with_input_source_readers,
+};
 use dormant_core::observation::{ContentRevision, ReloadSource};
 use dormant_core::reload::ReloadOutcome;
-use dormant_displays::registry::capabilities;
+use dormant_displays::registry::{capabilities, input_source_readers};
 
 // ── Request / response types ──────────────────────────────────────────────
 
@@ -198,7 +200,8 @@ pub(crate) async fn post_apply(
         }
     };
 
-    let errors = validate(&cfg, &capabilities(), &creds);
+    let errors =
+        validate_with_input_source_readers(&cfg, &capabilities(), &input_source_readers(), &creds);
     if !errors.is_empty() {
         let _ = std::fs::remove_file(&temp_path);
         let serialized: Vec<SerializableValidationError> = errors

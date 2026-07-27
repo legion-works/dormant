@@ -15,9 +15,10 @@ use dormant_core::config::schema::{
     Config, DisplayConfig, HaSensorCfg, MqttSensorCfg, SensorConfig,
 };
 use dormant_core::config::{
-    Strictness, ValidationError, Warning, load_config, load_credentials, validate,
+    Strictness, ValidationError, Warning, load_config, load_credentials,
+    validate_with_input_source_readers,
 };
-use dormant_displays::registry::capabilities;
+use dormant_displays::registry::{capabilities, input_source_readers};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -158,7 +159,12 @@ pub(crate) async fn get_config(
                     }));
                 }
             };
-            let errs = validate(&cfg, &capabilities(), &creds);
+            let errs = validate_with_input_source_readers(
+                &cfg,
+                &capabilities(),
+                &input_source_readers(),
+                &creds,
+            );
             (warns, errs, None)
         }
         Err(e) => (vec![], vec![], Some(e.to_string())),

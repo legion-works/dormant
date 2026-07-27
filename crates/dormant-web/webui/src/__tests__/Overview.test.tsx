@@ -8,6 +8,7 @@ import { LiveStateProvider } from "../app/state";
 import { EventLogContext } from "../app/hooks/useLiveState";
 import { eventLogFixture } from "./fixtures/live-state";
 import type { StateSnapshot, ConfigResponse, DisplayConfig } from "../api/types";
+import { getState, getConfig } from "../api/client";
 
 const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
   SAMPLE_STATE: {
@@ -144,6 +145,79 @@ describe("Overview", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/peer holds the panel/)).toBeInTheDocument();
+    });
+  });
+
+  it("shows flat single inhibitor (no ▸) when exactly one is configured", async () => {
+    // Override state: studio is inhibited, office-rule has only activity_idle_threshold.
+    const state: StateSnapshot = {
+      ...SAMPLE_STATE,
+      displays: [
+        ["studio", { phase: "active", inhibited: true, paused: false, cmd_gen: 1, controllers: [{ name: "ddcci", role: "primary" as const, healthy: true }] }],
+        ["shared-oled", { phase: "blanked", inhibited: false, paused: false, cmd_gen: 2, controllers: [], scope: "shared" as const, owned: false }],
+      ],
+    };
+    const config: ConfigResponse = {
+      ...SAMPLE_CONFIG,
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        rules: {
+          "office-rule": { zone: "office", displays: ["studio"], activity_idle_threshold: "30s" },
+          "tv-rule": { zone: "hallway", displays: ["shared-oled"], inhibitors: [] },
+        },
+      },
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+    vi.mocked(getConfig).mockResolvedValueOnce(config);
+
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={eventLogFixture()}>
+          <Overview />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      // studio has inhibited=true, office-rule has only activity_idle_threshold
+      // → exactly one inhibitor → flat prefix (•, not ▸).
+      expect(screen.getByText(/\u2022 activity/)).toBeInTheDocument();
+    });
+  });
+
+  it("shows ▸-prefixed candidates when multiple inhibitors configured", async () => {
+    const state: StateSnapshot = {
+      ...SAMPLE_STATE,
+      displays: [
+        ["studio", { phase: "active", inhibited: true, paused: false, cmd_gen: 1, controllers: [{ name: "ddcci", role: "primary" as const, healthy: true }] }],
+        ["shared-oled", { phase: "blanked", inhibited: false, paused: false, cmd_gen: 2, controllers: [], scope: "shared" as const, owned: false }],
+      ],
+    };
+    const config: ConfigResponse = {
+      ...SAMPLE_CONFIG,
+      inventory: {
+        ...SAMPLE_CONFIG.inventory,
+        rules: {
+          "office-rule": { zone: "office", displays: ["studio"], activity_idle_threshold: "30s", inhibitors: ["audio-playback", "call"] },
+          "tv-rule": { zone: "hallway", displays: ["shared-oled"], inhibitors: [] },
+        },
+      },
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+    vi.mocked(getConfig).mockResolvedValueOnce(config);
+
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={eventLogFixture()}>
+          <Overview />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      // Multiple inhibitors configured → ▸ prefix.
+      expect(screen.getByText(/\u25b8 audio-playback/)).toBeInTheDocument();
+      expect(screen.getByText(/\u25b8 call/)).toBeInTheDocument();
     });
   });
 });

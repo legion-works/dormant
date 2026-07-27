@@ -251,22 +251,24 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
         const res = await getRecentEvents(100);
         if (!mountedRef.current) return;
         if (res.events.length > 0) {
-          // Dedupe key: JSON-serialized event (stable across ring and WS).
+          // Dedupe key: timestamp + serialized event so rapid identical
+          // frames (e.g. double config_reloaded) both render.
           const seen = new Set<string>();
+          const dedupKey = (se: { time: string; event: unknown }): string =>
+            `${se.time}|${JSON.stringify(se.event)}`;
           for (const se of events) {
-            seen.add(JSON.stringify(se.event));
+            seen.add(dedupKey(se));
           }
 
           // History events arrive oldest-first. Convert and dedupe.
           const historyEntries: StampedEvent[] = [];
           for (const re of res.events) {
-            const key = JSON.stringify(re.event);
+            const stampedTime = new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false });
+            const entry: { time: string; event: unknown } = { time: stampedTime, event: re.event };
+            const key = dedupKey(entry);
             if (seen.has(key)) continue;
             seen.add(key);
-            historyEntries.push({
-              time: new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false }),
-              event: re.event,
-            });
+            historyEntries.push(entry as StampedEvent);
           }
 
           if (historyEntries.length > 0) {

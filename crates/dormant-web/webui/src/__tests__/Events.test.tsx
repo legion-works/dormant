@@ -6,7 +6,7 @@
  * the underlying WebSocket hook.
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import Events from "../app/views/Events";
 
 
@@ -261,5 +261,23 @@ describe("Events", () => {
     expect(screen.getByText(/— history —/)).toBeInTheDocument();
     // But the zone_changed event should also be visible (matching filter).
     expect(screen.getByText(/zone 'z'/)).toBeInTheDocument();
+  });
+
+  it("clicking a filter chip toggles the hash query parameter", () => {
+    mockUseEventLog.events = [
+      { time: "12:00:00", event: { event: "zone_changed", zone: "z", present: true, cause: "s" } },
+    ];
+    window.location.hash = "#/events";
+    render(<Events />);
+
+    // Click the "presence" filter group (covers zone_changed).
+    const presenceChip = screen.getByText("presence");
+    fireEvent.click(presenceChip);
+
+    // Hash should now include ?tag=zone_changed,sensor_changed
+    // (the presence group covers both tags).
+    expect(window.location.hash).toContain("?tag=");
+    expect(window.location.hash).toContain("zone_changed");
+    expect(window.location.hash).toContain("sensor_changed");
   });
 });

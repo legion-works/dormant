@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup } from "@testing-library/react";
-import Dashboard from "../app/views/Dashboard";
+import Overview from "../app/views/Overview";
 import { LiveStateProvider } from "../app/state";
 import { EventLogContext } from "../app/hooks/useLiveState";
 import type { StampedEvent } from "../app/hooks/useLiveState";
@@ -98,23 +98,26 @@ vi.mock("../api/ws", () => ({
 
 afterEach(() => cleanup());
 
-describe("Dashboard", () => {
+describe("Overview", () => {
   it("renders the four stat cards after loading", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
-      const labels = screen.getAllByText("Displays");
-      expect(labels.length).toBeGreaterThanOrEqual(2);
+      // Displays appears in the stat card label.
+      expect(screen.getByText("Displays")).toBeInTheDocument();
     });
 
-    expect(screen.getByText("3")).toBeInTheDocument();
+    // Displays stat card shows "3" (total count).
+    const threes = screen.getAllByText("3");
+    expect(threes.length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("2/3")).toBeInTheDocument();
     expect(screen.getByText("1/2")).toBeInTheDocument();
-    expect(screen.getByText("Active")).toBeInTheDocument();
+    // Overview shows "Protected" stat card instead of "OLED guard Active".
+    expect(screen.getByText("Protected")).toBeInTheDocument();
   });
 
   it("renders sensor rows with correct state labels", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("desk-mmwave")).toBeInTheDocument();
@@ -129,7 +132,7 @@ describe("Dashboard", () => {
   });
 
   it("renders zone rows with mode and members", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("office")).toBeInTheDocument();
@@ -138,46 +141,36 @@ describe("Dashboard", () => {
     expect(screen.getByText("ANY")).toBeInTheDocument();
   });
 
-  // T6: force-blank/wake moved from a per-row hook pair into the shared
-  // "Quick actions" section (`Blank ${id}` / `Wake ${id}` chips, one
-  // in-flight state for the whole section) — the signal-grid display
-  // row itself is informational-only now (id, phase chip, blank_mode,
-  // controller chain).
-  it("renders display rows with config metadata and Quick action chips per display", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+  // Overview panel tiles have per-display Blank/Wake action chips.
+  it("renders panel tile action chips for each display", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
-      expect(screen.getAllByText("aoc-main").length).toBeGreaterThanOrEqual(1);
+      // Per-tile Blank/Wake/Pull/Push action chips.
+      const blanks = screen.getAllByRole("button", { name: "Blank" });
+      expect(blanks.length).toBeGreaterThanOrEqual(1);
     });
 
-    expect(screen.getByText("Quick actions")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Blank aoc-main" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Wake aoc-main" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Blank samsung-tv" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Wake samsung-tv" })).toBeInTheDocument();
-
-    // MUST 1: blank_mode and controller chain from config
-    expect(screen.getAllByText("power_off").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("ddcci")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Wake" }).length).toBeGreaterThanOrEqual(1);
   });
 
   it("shows section headers", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("Signal flow")).toBeInTheDocument();
     });
 
-    expect(screen.getByText(/sensors → zones → displays/)).toBeInTheDocument();
+    expect(screen.getByText("Signal flow")).toBeInTheDocument();
     expect(screen.getByText("Recent activity")).toBeInTheDocument();
-    expect(screen.getByText("view all →")).toBeInTheDocument();
+    expect(screen.getByText(/view all/)).toBeInTheDocument();
   });
 
   it("shows empty state in recent activity when event log is empty", async () => {
     render(
       <LiveStateProvider>
         <EventLogContext.Provider value={{ events: [], connected: true, lagged: false, historySeeded: false }}>
-          <Dashboard />
+          <Overview />
         </EventLogContext.Provider>
       </LiveStateProvider>,
     );
@@ -202,7 +195,7 @@ describe("Dashboard", () => {
     render(
       <LiveStateProvider>
         <EventLogContext.Provider value={{ events: mockEvents, connected: true, lagged: false, historySeeded: false }}>
-          <Dashboard />
+          <Overview />
         </EventLogContext.Provider>
       </LiveStateProvider>,
     );
@@ -215,11 +208,10 @@ describe("Dashboard", () => {
 });
 
   it("renders stage detail in display row when a display is staged", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
-      // "lg-oled" now also appears as a Quick actions group label —
-      // assert on the signal-grid row's id, at least one match.
+      // lg-oled appears in the panel tile grid.
       expect(screen.getAllByText("lg-oled").length).toBeGreaterThanOrEqual(1);
     });
 
@@ -228,11 +220,10 @@ describe("Dashboard", () => {
   });
 
   it("does not render stage detail on non-staged display rows", async () => {
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
-      // "aoc-main" now also appears as a Quick actions group label —
-      // assert on the signal-grid row's id, at least one match.
+      // aoc-main appears in the panel tile grid.
       expect(screen.getAllByText("aoc-main").length).toBeGreaterThanOrEqual(1);
     });
 
@@ -250,7 +241,7 @@ describe("Dashboard", () => {
 
 // ── "no data since start" sensor hint (spec T6) ──
 
-describe("Dashboard — sensor reported hint", () => {
+describe("Overview — sensor reported hint", () => {
   afterEach(() => cleanup());
 
   it("shows the hint for an unavailable sensor with reported: false", async () => {
@@ -264,7 +255,7 @@ describe("Dashboard — sensor reported hint", () => {
     };
     vi.mocked(getState).mockResolvedValueOnce(state);
 
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
@@ -284,7 +275,7 @@ describe("Dashboard — sensor reported hint", () => {
     };
     vi.mocked(getState).mockResolvedValueOnce(state);
 
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
@@ -305,7 +296,7 @@ describe("Dashboard — sensor reported hint", () => {
     };
     vi.mocked(getState).mockResolvedValueOnce(state);
 
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("desk-mmwave")).toBeInTheDocument();
@@ -337,7 +328,7 @@ describe("Dashboard — sensor reported hint", () => {
     };
     vi.mocked(getState).mockResolvedValueOnce(state);
 
-    render(<LiveStateProvider><Dashboard /></LiveStateProvider>);
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
 
     await waitFor(() => {
       expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();

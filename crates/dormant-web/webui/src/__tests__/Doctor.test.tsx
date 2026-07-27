@@ -269,4 +269,61 @@ describe("Doctor", () => {
       expect(btn).not.toBeDisabled();
     });
   });
+
+  it("renders groups using real category/subject when BG-7 data is present", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [
+        { name: "config", status: "ok", detail: "valid", category: "config" },
+        { name: "ddcci (studio)", status: "ok", detail: "last attempt succeeded", category: "display", subject: "studio" },
+        { name: "mqtt desk-mmwave", status: "fail", detail: "timeout", category: "sensor", subject: "desk-mmwave" },
+        { name: "oddball-check", status: "skip", detail: "mystery" },
+      ],
+    });
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      // Category headers appear in uppercase.
+      // config → CONFIG, display → DISPLAYS, sensor → SENSORS.
+      // oddball-check (no category) falls into OTHER bucket.
+      expect(screen.getByText("oddball-check")).toBeInTheDocument();
+    });
+  });
+
+  it("scrolls and highlights ?subject= group", async () => {
+    vi.mocked(api.runDoctor).mockResolvedValueOnce({
+      checks: [
+        { name: "ddcci (studio)", status: "ok", detail: "ok", category: "display", subject: "studio" },
+      ],
+    });
+
+    window.location.hash = "#/doctor?subject=studio";
+
+    function Harness() {
+      const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+      const state = liveStateFixture({
+        doctorReport,
+        setDoctorReport,
+      });
+      return <LiveStateContext.Provider value={state}><Doctor /></LiveStateContext.Provider>;
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByText("Run doctor"));
+
+    await waitFor(() => {
+      const groups = document.querySelectorAll(".doctor-group--highlighted");
+      expect(groups.length).toBeGreaterThanOrEqual(1);
+    });
+  });
 });

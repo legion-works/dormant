@@ -532,6 +532,8 @@ pub(crate) async fn probe_and_wake_all(
 
     EmergencyWakeReport {
         paused: false, // No engine to pause — the daemon is wedged or absent.
+        operation_id: None,
+        generation: None,
         displays: results,
     }
 }
@@ -659,6 +661,8 @@ mod gamma_restore_ordering_tests {
                 trace.lock().unwrap().push("direct-fallback".to_string());
             }
             Ok(EmergencyWakeReport {
+                operation_id: None,
+                generation: None,
                 paused: false,
                 displays: vec![],
             })
@@ -731,6 +735,8 @@ mod gamma_restore_ordering_tests {
                 .unwrap()
                 .push("ipc-emergency-wake".to_string());
             let report = EmergencyWakeReport {
+                operation_id: None,
+                generation: None,
                 paused: true,
                 displays: vec![],
             };
@@ -867,6 +873,8 @@ mod tests {
 
             // Reply.
             let report = EmergencyWakeReport {
+                operation_id: None,
+                generation: None,
                 paused: true,
                 displays: vec![EmergencyWakeResult {
                     display: DisplayId("mon".into()),
@@ -941,6 +949,8 @@ mod tests {
     #[test]
     fn aggregation_collects_all_results_no_short_circuit() {
         let report = EmergencyWakeReport {
+            operation_id: None,
+            generation: None,
             paused: false,
             displays: vec![
                 EmergencyWakeResult {
@@ -978,10 +988,14 @@ mod tests {
     #[test]
     fn daemon_path_sets_paused_fallback_does_not() {
         let daemon_report = EmergencyWakeReport {
+            operation_id: None,
+            generation: None,
             paused: true,
             displays: vec![],
         };
         let fallback_report = EmergencyWakeReport {
+            operation_id: None,
+            generation: None,
             paused: false,
             displays: vec![],
         };
@@ -994,6 +1008,8 @@ mod tests {
     #[test]
     fn print_report_marks_failures_with_x_and_success_with_check() {
         let report = EmergencyWakeReport {
+            operation_id: None,
+            generation: None,
             paused: true,
             displays: vec![
                 EmergencyWakeResult {

@@ -1030,6 +1030,8 @@ mod tests {
         let second = post_emergency_wake(State(state)).await.unwrap_err();
         assert!(matches!(second, WebError::EmergencyWakeInProgress));
         let _ = reply.send(EmergencyWakeReport {
+            operation_id: None,
+            generation: None,
             paused: true,
             displays: Vec::new(),
         });

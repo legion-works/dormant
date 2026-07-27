@@ -461,6 +461,8 @@ mod tests {
         // slots are absent.
         let report = EmergencyWakeReport {
             paused: true,
+            operation_id: None,
+            generation: None,
             displays: vec![],
         };
         let resp = IpcResponse::emergency(report);
@@ -502,6 +504,8 @@ mod tests {
         // exercise_report object keyed "exercise_report", and the other
         // slots are absent.
         let report = crate::rules::ExerciseReport {
+            operation_id: None,
+            generation: None,
             display: DisplayId("mon".into()),
             pre_phase: "active".into(),
             paused_rules: vec![],
@@ -558,6 +562,8 @@ mod tests {
         assert!(
             !serde_json::to_string(&IpcResponse::emergency(crate::rules::EmergencyWakeReport {
                 paused: true,
+                operation_id: None,
+                generation: None,
                 displays: vec![],
             }))
             .unwrap()

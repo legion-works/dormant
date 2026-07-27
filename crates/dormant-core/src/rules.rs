@@ -255,6 +255,10 @@ impl OperationRegistry {
     }
 }
 
+fn operation_completion_matches_generation(accepted: GenerationId, current: GenerationId) -> bool {
+    accepted == current
+}
+
 /// Inbound control messages to the engine.
 #[derive(Debug)]
 pub enum ControlMsg {
@@ -415,6 +419,12 @@ pub struct EmergencyWakeReport {
     /// global pause fan-out encountered an error (very rare — rules set
     /// + `Input::Pause` step per display, so this is mostly diagnostic).
     pub paused: bool,
+    /// Accepted operation identity, when the request was generation-fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<u64>,
+    /// Generation that accepted the operation, when fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationId>,
     /// Per-display wake results, one entry per display the engine owns.
     pub displays: Vec<EmergencyWakeResult>,
 }
@@ -495,6 +505,12 @@ pub struct ExerciseReport {
     /// The phase the display was in before the exercise started (so the
     /// operator can confirm the restore target was the right one).
     pub pre_phase: String,
+    /// Accepted operation identity, when the request was generation-fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<u64>,
+    /// Generation that accepted the operation, when fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationId>,
     /// Rule ids the handler paused for the exercise window.  Empty for
     /// manual-only displays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -965,6 +981,10 @@ enum InternalResult {
         /// Rule ids to resume (any that were paused for the exercise
         /// window).  Empty Vec is a no-op.
         rules: Vec<RuleId>,
+        /// Operation identity used to fence completion after a reload.
+        operation_id: u64,
+        /// Generation that accepted the operation.
+        generation: GenerationId,
     },
 }
 
@@ -972,14 +992,18 @@ enum InternalResult {
 struct ExercisePauseGuard {
     results_tx: mpsc::UnboundedSender<InternalResult>,
     rules: Option<Vec<RuleId>>,
+    operation_id: u64,
+    generation: GenerationId,
 }
 
 impl Drop for ExercisePauseGuard {
     fn drop(&mut self) {
         if let Some(rules) = self.rules.take() {
-            let _ = self
-                .results_tx
-                .send(InternalResult::ExerciseResume { rules });
+            let _ = self.results_tx.send(InternalResult::ExerciseResume {
+                rules,
+                operation_id: self.operation_id,
+                generation: self.generation,
+            });
         }
     }
 }
@@ -1661,23 +1685,24 @@ impl RulesEngine {
             ControlMsg::SetKvmStatus(status) => {
                 self.kvm = Some(status);
             }
-            ControlMsg::EmergencyWake { reply }
-            | ControlMsg::EmergencyWakeAccepted {
-                operation: _,
-                reply,
-            } => self.handle_emergency_wake(reply),
-            ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply),
+            ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply, None),
+            ControlMsg::EmergencyWakeAccepted { operation, reply } => {
+                self.handle_emergency_wake(reply, Some(operation));
+            }
+            ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply, None),
             ControlMsg::ExerciseAccepted { operation, reply } => {
-                let OperationKind::Exercise(display) = operation.kind else {
+                let OperationKind::Exercise(ref display) = operation.kind else {
                     let _ = reply.send(ExerciseReport {
                         display: DisplayId("unknown".into()),
                         pre_phase: "unknown".into(),
+                        operation_id: None,
+                        generation: None,
                         paused_rules: Vec::new(),
                         steps: Vec::new(),
                     });
                     return;
                 };
-                self.handle_exercise(display, reply);
+                self.handle_exercise(display.clone(), reply, Some(operation));
             }
             ControlMsg::GenerationBarrier(ack) => {
                 let _ = ack.send(());
@@ -1834,7 +1859,11 @@ impl RulesEngine {
     /// `dormantd::ipc::handle_emergency_wake`); the `dormantctl` client
     /// falls back to direct-hardware construction when that window
     /// elapses.
-    fn handle_emergency_wake(&mut self, reply: oneshot::Sender<EmergencyWakeReport>) {
+    fn handle_emergency_wake(
+        &mut self,
+        reply: oneshot::Sender<EmergencyWakeReport>,
+        accepted: Option<AcceptedOperation>,
+    ) {
         // Pause every rule indefinitely — reuse the existing pause path so
         // the state-machine overlays route the same way as a normal
         // global pause.  Without this an absent-zone would re-trigger
@@ -1908,6 +1937,8 @@ impl RulesEngine {
 
             let report = EmergencyWakeReport {
                 paused: true,
+                operation_id: accepted.as_ref().map(|operation| operation.id),
+                generation: accepted.as_ref().map(|operation| operation.generation),
                 displays: results,
             };
             let _ = reply.send(report);
@@ -1937,18 +1968,30 @@ impl RulesEngine {
     /// mid-exercise, the restore step's blanket invocation of the wake path
     /// means an exercise cannot leave a panel dark.
     #[allow(clippy::too_many_lines)]
-    fn handle_exercise(&mut self, target: DisplayId, reply: oneshot::Sender<ExerciseReport>) {
-        let generation = self
-            .observations
-            .as_ref()
-            .map_or(GenerationId(0), |(id, _)| *id);
-        let Ok((_operation, lease)) = self
+    fn handle_exercise(
+        &mut self,
+        target: DisplayId,
+        reply: oneshot::Sender<ExerciseReport>,
+        accepted: Option<AcceptedOperation>,
+    ) {
+        let generation = accepted.as_ref().map_or_else(
+            || {
+                self.observations
+                    .as_ref()
+                    .map_or(GenerationId(0), |(id, _)| *id)
+            },
+            |operation| operation.generation,
+        );
+        let current_generation = self.observations.as_ref().map_or(generation, |(id, _)| *id);
+        let Ok((acquired_operation, lease)) = self
             .operation_registry
-            .try_acquire(generation, OperationKind::Exercise(target.clone()))
+            .try_acquire(current_generation, OperationKind::Exercise(target.clone()))
         else {
             let _ = reply.send(ExerciseReport {
                 display: target,
                 pre_phase: "rejected".into(),
+                operation_id: accepted.as_ref().map(|operation| operation.id),
+                generation: accepted.as_ref().map(|operation| operation.generation),
                 paused_rules: Vec::new(),
                 steps: vec![ExerciseStep {
                     command: "reject".into(),
@@ -1962,6 +2005,9 @@ impl RulesEngine {
             });
             return;
         };
+        let operation = accepted.unwrap_or(acquired_operation);
+        let operation_id = operation.id;
+        let accepted_generation = operation.generation;
         // Snapshot the rules bound to this display so the spawned task can
         // un-pause them without holding a borrow on `self`.
         let rules_for_target: Vec<RuleId> = self
@@ -2014,6 +2060,8 @@ impl RulesEngine {
             let _ = reply.send(ExerciseReport {
                 display: target,
                 pre_phase,
+                operation_id: Some(operation_id),
+                generation: Some(accepted_generation),
                 paused_rules: Vec::new(),
                 steps: vec![ExerciseStep {
                     command: "no_executor".into(),
@@ -2056,6 +2104,8 @@ impl RulesEngine {
             let pause_guard = ExercisePauseGuard {
                 results_tx: results_tx.clone(),
                 rules: Some(rules_to_resume.clone()),
+                operation_id,
+                generation: accepted_generation,
             };
             let sequence_sink = Arc::clone(&sink);
             let sequence_rules = rules_to_resume.clone();
@@ -2071,7 +2121,7 @@ impl RulesEngine {
                 )
                 .await
             });
-            let report = match sequence.await {
+            let mut report = match sequence.await {
                 Ok(report) => report,
                 Err(join_error) => {
                     tracing::error!(event = "exercise_task_panicked", error = %join_error, "exercise task failed; forcing wake");
@@ -2079,6 +2129,8 @@ impl RulesEngine {
                     ExerciseReport {
                         display: target,
                         pre_phase: "unknown".into(),
+                        operation_id: Some(operation_id),
+                        generation: Some(accepted_generation),
                         paused_rules: rules_to_resume.clone(),
                         steps: vec![ExerciseStep {
                             command: "panic".into(),
@@ -2092,6 +2144,8 @@ impl RulesEngine {
                     }
                 }
             };
+            report.operation_id = Some(operation_id);
+            report.generation = Some(accepted_generation);
 
             tracing::info!(
                 event = "control_path_exercise",
@@ -2345,7 +2399,25 @@ impl RulesEngine {
             } => {
                 self.step_machine(&display, Input::RenderResult { r#gen, result }, now);
             }
-            InternalResult::ExerciseResume { rules } => {
+            InternalResult::ExerciseResume {
+                rules,
+                operation_id,
+                generation,
+            } => {
+                let current_generation = self
+                    .observations
+                    .as_ref()
+                    .map_or(GenerationId(0), |(id, _)| *id);
+                if !operation_completion_matches_generation(generation, current_generation) {
+                    tracing::warn!(
+                        event = "operation_completion_discarded",
+                        op_id = operation_id,
+                        accepted_gen = generation.0,
+                        current_gen = current_generation.0,
+                        "discarding operation completion from an old generation",
+                    );
+                    return;
+                }
                 // Off-run-loop exercise sequence completed (possibly
                 // successfully, possibly with the IPC caller having
                 // timed out or dropped its receiver).  Resume every
@@ -2847,6 +2919,8 @@ async fn run_exercise_sequence(
     ExerciseReport {
         display,
         pre_phase,
+        operation_id: None,
+        generation: None,
         paused_rules,
         steps,
     }
@@ -2995,6 +3069,18 @@ mod tests {
             kind: OperationKind::EmergencyWake,
         };
         assert_eq!(operation.generation, GenerationId(3));
+    }
+
+    #[test]
+    fn operation_accepted_by_old_generation_never_mutates_new() {
+        assert!(!operation_completion_matches_generation(
+            GenerationId(4),
+            GenerationId(5)
+        ));
+        assert!(operation_completion_matches_generation(
+            GenerationId(5),
+            GenerationId(5)
+        ));
     }
 
     // ── InhibitorKind::from_config literal pin ──────────────────────────────

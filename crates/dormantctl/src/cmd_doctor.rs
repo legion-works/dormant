@@ -967,6 +967,8 @@ mod tests {
         use dormant_core::types::{BlankMode, DisplayId, RuleId};
 
         let report = ExerciseReport {
+            operation_id: None,
+            generation: None,
             display: DisplayId("mon".into()),
             pre_phase: "active".into(),
             paused_rules: vec![RuleId("office".into())],
@@ -1016,6 +1018,8 @@ mod tests {
         use dormant_core::types::{BlankMode, DisplayId};
 
         let report = ExerciseReport {
+            operation_id: None,
+            generation: None,
             display: DisplayId("manual".into()),
             pre_phase: "active".into(),
             paused_rules: vec![],

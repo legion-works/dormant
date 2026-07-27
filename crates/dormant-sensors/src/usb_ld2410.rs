@@ -234,6 +234,7 @@ impl SensorSource for UsbLd2410Source {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<PresenceEvent>,
+        _ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         // ── Outer retry loop (hotplug tolerant) ────────────────────────────
@@ -562,11 +563,13 @@ mod tests {
         let source = UsbLd2410Source::new(SensorId("test".into()), cfg);
 
         let (tx, mut rx) = mpsc::channel(16);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let cancel_spawn = cancel.clone();
 
         // Spawn the source.
-        let handle = tokio::spawn(async move { Box::new(source).run(tx, cancel_spawn).await });
+        let handle =
+            tokio::spawn(async move { Box::new(source).run(tx, ctl_tx, cancel_spawn).await });
 
         // We should get an Unavailable event within a few seconds.
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;

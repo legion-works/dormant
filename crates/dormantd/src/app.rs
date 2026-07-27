@@ -56,6 +56,7 @@ use dormant_core::config::{
     load_credentials_from_bytes, validate_with_input_source_readers,
 };
 use dormant_core::coordination::{CoordinationGate, CoordinationHandle};
+use dormant_core::error::DormantError;
 use dormant_core::observation::{
     ContentRevision, DaemonObservation, GenerationId, ObservationHub, ReloadReceipt, ReloadSource,
     RuntimeRevision,
@@ -67,7 +68,7 @@ use dormant_core::rules::{
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
-use dormant_core::types::{DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
+use dormant_core::types::{BlankMode, DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
 use dormant_core::zone::{ZoneEngine, ZoneSpec, absent_mqtt_hazards};
 use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
@@ -3343,7 +3344,8 @@ async fn assemble_static(
             controller_chain_fingerprint(dc),
         );
 
-        for (controller, result) in executor.probe_all().await {
+        let probe_results = executor.probe_all().await;
+        for (controller, result) in &probe_results {
             tracing::info!(
                 event = "controller_probe",
                 display = %did,
@@ -3351,6 +3353,8 @@ async fn assemble_static(
                 ok = result.is_ok(),
             );
         }
+        let all_probes_failed =
+            !probe_results.is_empty() && probe_results.iter().all(|(_, r)| r.is_err());
 
         let effective = executor.effective_modes();
         let chosen = if !dc.has_controller_stage() {
@@ -3367,13 +3371,26 @@ async fn assemble_static(
             );
             degraded
         } else {
-            anyhow::bail!(
-                "E_MODE_UNSUPPORTED: display '{name}' cannot blank: wanted {:?} \
-                 (degraded {:?}), effective modes {:?}",
-                dc.primary_blank_mode(),
-                dc.degraded_mode,
-                effective,
-            );
+            match startup_mode_decision(dc.primary_blank_mode(), &effective, all_probes_failed) {
+                Ok(mode) => {
+                    tracing::warn!(
+                        event = "display_start_degraded",
+                        display = %did,
+                        mode = ?dc.primary_blank_mode(),
+                        "display probes failed; deferring mode eligibility until first command",
+                    );
+                    mode
+                }
+                Err(_e) => {
+                    anyhow::bail!(
+                        "E_MODE_UNSUPPORTED: display '{name}' cannot blank: wanted {:?} \
+                         (degraded {:?}), effective modes {:?}",
+                        dc.primary_blank_mode(),
+                        dc.degraded_mode,
+                        effective,
+                    );
+                }
+            }
         };
 
         display_runtime.push(DisplayRuntimeCfg {
@@ -3399,6 +3416,7 @@ async fn assemble_static(
                 .map(|d| DisplayId(d.clone()))
                 .filter(|d| built.contains(d))
                 .collect(),
+            input_wake_hold: rc.input_wake_hold,
         })
         .collect();
 
@@ -3447,6 +3465,31 @@ async fn assemble_static(
         render_sinks,
         #[cfg(feature = "render")]
         input_wake_rx: Some(input_wake_rx),
+    })
+}
+
+/// Decide the mode to use at startup, given effective modes and whether
+/// every controller probe failed.
+///
+/// - `effective` contains `configured` → returns it unchanged.
+/// - `effective` is missing `configured` AND `all_probes_failed` → returns
+///   `configured` (admitted as degraded — capabilities are unknown).
+/// - `effective` is missing `configured` AND some probe succeeded →
+///   `Err(ModeUnsupported)`. The caller should log at the appropriate level.
+fn startup_mode_decision(
+    configured: BlankMode,
+    effective: &[BlankMode],
+    all_probes_failed: bool,
+) -> Result<BlankMode, DormantError> {
+    if effective.contains(&configured) {
+        return Ok(configured);
+    }
+    if all_probes_failed {
+        return Ok(configured);
+    }
+    Err(DormantError::ModeUnsupported {
+        display: String::new(),
+        mode: format!("{configured:?}"),
     })
 }
 
@@ -3576,6 +3619,7 @@ mod audio_rules_tests {
             wake_retries: 0,
             wake_retry_backoff: Duration::from_millis(10),
             wake_retry_interval: Duration::from_secs(1),
+            input_wake_hold: Duration::ZERO,
         }
     }
 
@@ -3924,9 +3968,10 @@ fn spawn_generation(
 
     for source in assembly.sources {
         let stx = events_tx.clone();
+        let sctl = ctl_tx.clone();
         let stoken = producer_token.clone();
         producer_handles.push(tokio::spawn(async move {
-            if let Err(e) = source.run(stx, stoken).await {
+            if let Err(e) = source.run(stx, sctl, stoken).await {
                 tracing::error!(event = "sensor_source_exited", error = %e);
             }
         }));
@@ -4132,6 +4177,16 @@ fn spawn_generation_for_reload(
 /// quiesce should prevent a naked `Blanking` from reaching here, but
 /// restoring a display mid-toggle (e.g. Samsung `KEY_PICTURE_OFF` which
 /// toggles) would be incorrect, so `continue` is the safe default.
+///
+/// Transient engine state (`availability_online`, `input_wake_holds`) is
+/// deliberately NOT carried across reload — both reset empty.  This is
+/// fail-safe: worst case is one stale sweep before the next online
+/// availability frame, and one lost hold window (the display re-enters
+/// grace on the next zone edge, which the new engine processes normally).
+/// A future implementer tempted to seed these should re-verify that
+/// timing is correct: `availability_online` needs the source to emit a
+/// fresh online frame before the new engine's stale timeout, and
+/// `input_wake_holds` apply only until the next presence edge.
 fn apply_restore(
     engine: &mut RulesEngine,
     snapshot: &StateSnapshot,
@@ -5095,6 +5150,7 @@ mod render_tests {
                         wake_retries: 0,
                         wake_retry_backoff: Duration::from_millis(10),
                         wake_retry_interval: Duration::from_secs(1),
+                        input_wake_hold: Duration::ZERO,
                     },
                 );
                 m
@@ -6169,6 +6225,49 @@ mod macos_gamma_black_assembly_tests {
             }
         }
     }
+
+    // ── startup_mode_decision unit tests ──────────────────────────────────
+
+    /// All probes failed + mode not in empty effective → Ok(configured).
+    #[test]
+    fn startup_mode_decision_all_probes_failed_returns_configured() {
+        let result = startup_mode_decision(BlankMode::PowerOff, &[], true);
+        assert_eq!(result.unwrap(), BlankMode::PowerOff);
+    }
+
+    /// Some probe succeeded + mode absent from effective → Err.
+    #[test]
+    fn startup_mode_decision_some_probe_ok_mode_absent_is_err() {
+        let result =
+            startup_mode_decision(BlankMode::PowerOff, &[BlankMode::BrightnessZero], false);
+        match result {
+            Err(DormantError::ModeUnsupported { mode, .. }) => {
+                assert!(mode.contains("PowerOff"));
+            }
+            other => panic!("expected ModeUnsupported, got {other:?}"),
+        }
+    }
+
+    /// Mode in effective → Ok regardless of probe status.
+    #[test]
+    fn startup_mode_decision_mode_in_effective_returns_ok() {
+        let result = startup_mode_decision(
+            BlankMode::PowerOff,
+            &[BlankMode::PowerOff, BlankMode::BrightnessZero],
+            false,
+        );
+        assert_eq!(result.unwrap(), BlankMode::PowerOff);
+
+        // Also when all_probes_failed: effective can be non-empty from
+        // supported_modes() declarations alone — probe results don't
+        // change the mode union.
+        let result2 = startup_mode_decision(
+            BlankMode::BrightnessZero,
+            &[BlankMode::BrightnessZero],
+            true,
+        );
+        assert_eq!(result2.unwrap(), BlankMode::BrightnessZero);
+    }
 }
 
 /// Task 8 RED-first: reload-continuity behavior for the gamma-blank
@@ -6382,6 +6481,7 @@ mod gamma_reload_tests {
                     wake_retries: 0,
                     wake_retry_backoff: Duration::from_millis(10),
                     wake_retry_interval: Duration::from_secs(1),
+                    input_wake_hold: Duration::ZERO,
                 },
             );
         }

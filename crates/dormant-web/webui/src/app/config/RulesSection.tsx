@@ -21,6 +21,7 @@ const RULE_HELP: Record<string, string> = {
   activity_idle_threshold: "No keyboard/mouse events for this long means the user is inactive.",
   activity_poll_interval: "How often to poll user-activity state while an activity inhibitor is active.",
   wake_retry_backoff: "Backoff between the immediate wake attempt and the first retry.",
+  input_wake_hold: "How long to hold a display awake after typing wakens it in a vacant room (0s disables).",
 };
 
 interface RulesSectionProps {
@@ -186,7 +187,7 @@ export default function RulesSection({
                   let widget: React.ReactNode;
                   if (typeof value === "number") widget = <NumberField key={key} {...makeShared(key, value, extra)} />;
                   else if (typeof value === "string") {
-                    if (/_time$|_period$|_interval$|_backoff$/.test(key)) widget = <DurationField key={key} {...makeShared(key, value, extra)} />;
+                    if (/_time$|_period$|_interval$|_backoff$|_hold$/.test(key)) widget = <DurationField key={key} {...makeShared(key, value, extra)} />;
                     else widget = <TextField key={key} {...makeShared(key, value, extra)} />;
                   } else return null;
                   return (

@@ -399,6 +399,10 @@ impl DisplayController for DdcciController {
         self.probe_now().await
     }
 
+    async fn reprobe(&self) -> Result<(), DormantError> {
+        self.probe_now().await
+    }
+
     async fn is_available(&self) -> bool {
         let ident = {
             let state = self.state.lock().unwrap();

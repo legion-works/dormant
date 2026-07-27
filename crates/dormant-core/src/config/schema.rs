@@ -1336,6 +1336,11 @@ pub struct RuleConfig {
     /// Interval between successive wake retries.
     #[serde(default = "default_wake_retry_interval", with = "humantime_serde")]
     pub wake_retry_interval: Duration,
+
+    /// How long to hold a display awake after a render-surface `InputWake`
+    /// when every driving zone is vacant.  Zero disables the hold.
+    #[serde(default = "default_input_wake_hold", with = "humantime_serde")]
+    pub input_wake_hold: Duration,
 }
 
 // ── Credentials ─────────────────────────────────────────────────────────────────
@@ -1449,6 +1454,9 @@ fn default_wake_retry_backoff() -> Duration {
 }
 fn default_wake_retry_interval() -> Duration {
     defaults::WAKE_RETRY_INTERVAL
+}
+fn default_input_wake_hold() -> Duration {
+    defaults::INPUT_WAKE_HOLD
 }
 fn default_web_bind() -> std::net::IpAddr {
     defaults::WEB_BIND_DEFAULT

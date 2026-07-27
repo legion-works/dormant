@@ -199,11 +199,26 @@ impl DisplayExecutor {
     ///
     /// The returned vector preserves chain order so callers can correlate
     /// outcomes with the configured chain.
+    ///
+    /// Also seeds [`Self::controller_health`] with one entry per controller
+    /// reflecting its probe result — callers that check
+    /// `controller_health()` after `probe_all()` can surface degraded-display
+    /// cause before the first blank/wake attempt.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal health [`Mutex`] is poisoned.
     pub async fn probe_all(&mut self) -> Vec<(String, Result<(), DormantError>)> {
         let mut out = Vec::with_capacity(self.chain.len());
-        for controller in &mut self.chain {
+        let mut health: Vec<ControllerHealth> = Vec::with_capacity(self.chain.len());
+        for (i, controller) in self.chain.iter_mut().enumerate() {
             let name = controller.name().to_string();
             let result = controller.probe().await;
+            let role = if i == 0 {
+                ControllerRole::Primary
+            } else {
+                ControllerRole::Fallback
+            };
             if let Err(ref e) = result {
                 tracing::warn!(
                     event = "display_probe_failed",
@@ -212,9 +227,26 @@ impl DisplayExecutor {
                     error = %e,
                     "controller probe failed; staying in chain",
                 );
+                health.push(ControllerHealth {
+                    name,
+                    role,
+                    healthy: false,
+                    detail: Some(e.to_string()),
+                });
+            } else {
+                health.push(ControllerHealth {
+                    name,
+                    role,
+                    healthy: true,
+                    detail: None,
+                });
             }
-            out.push((name, result));
+            out.push((controller.name().to_string(), result));
         }
+        *self
+            .health
+            .lock()
+            .expect("DisplayExecutor health lock poisoned") = health;
         out
     }
 
@@ -286,6 +318,7 @@ impl DisplayExecutor {
 
 #[async_trait]
 impl CommandSink for DisplayExecutor {
+    #[allow(clippy::too_many_lines)]
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
         let _supersede_token = self.rotate_supersede();
 
@@ -351,6 +384,44 @@ impl CommandSink for DisplayExecutor {
             }
         }
 
+        // One bounded re-probe heal before failing — when probe_all
+        // initially missed a controller (e.g. ddcci display was disconnected
+        // at startup), the first command after reattach must re-probe the
+        // chain instead of staying dead until restart (issue #114).
+        if eligible_count == 0 {
+            tracing::info!(
+                event = "executor_reprobe",
+                display = %self.display,
+                "zero available controllers for blank; attempting on-demand reprobe",
+            );
+            for (i, controller) in self.chain.iter().enumerate() {
+                let _ = controller.reprobe().await;
+                // Re-evaluate after reprbe — re-insert if now available.
+                if !controller.is_available().await {
+                    continue;
+                }
+                if !controller.supported_modes().contains(&mode) {
+                    continue;
+                }
+                eligible_count += 1;
+                match controller.blank(mode).await {
+                    Ok(()) => {
+                        health[i].healthy = true;
+                        health[i].detail = None;
+                        *self.health.lock().unwrap() = health;
+                        self.blank_owners
+                            .record(&self.display, &self.chain_fingerprint, i);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        health[i].healthy = false;
+                        health[i].detail = Some(e.to_string());
+                        last_controller = controller.name().to_string();
+                    }
+                }
+            }
+        }
+
         tracing::error!(
             event = "blank_failed",
             display = %self.display,
@@ -411,6 +482,31 @@ impl CommandSink for DisplayExecutor {
                 if is_owner_attempt {
                     self.blank_owners
                         .clear_if_owner(&self.display, &self.chain_fingerprint, i);
+                }
+                return Ok(());
+            }
+        }
+
+        // On-demand re-probe before failing — same heal as blank path.
+        // A single attempt without eligibility counting means we re-probe
+        // unconditionally before the final Err.
+        tracing::info!(
+            event = "executor_reprobe",
+            display = %self.display,
+            "all wake_once attempts failed; attempting on-demand reprobe",
+        );
+        for (i, controller) in self.chain.iter().enumerate() {
+            let _ = controller.reprobe().await;
+            let is_owner_attempt = owner == Some(i);
+            if !is_owner_attempt && !controller.is_available().await {
+                continue;
+            }
+            if controller.wake().await.is_ok() {
+                if supersede_token.is_cancelled() {
+                    return Err(CmdFailure {
+                        controller: "superseded".to_string(),
+                        error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                    });
                 }
                 return Ok(());
             }
@@ -569,6 +665,30 @@ impl CommandSink for DisplayExecutor {
             .health
             .lock()
             .expect("DisplayExecutor health lock poisoned") = health;
+
+        // On-demand re-probe before failing (issue #114 / MUST 3).
+        tracing::info!(
+            event = "executor_reprobe",
+            display = %self.display,
+            "all wake rounds exhausted; attempting on-demand reprobe",
+        );
+        for (i, controller) in self.chain.iter().enumerate() {
+            let _ = controller.reprobe().await;
+            let is_owner_attempt = owner == Some(i);
+            if !is_owner_attempt && !controller.is_available().await {
+                continue;
+            }
+            if controller.wake().await.is_ok() {
+                if supersede_token.is_cancelled() {
+                    return Err(CmdFailure {
+                        controller: "superseded".to_string(),
+                        error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                    });
+                }
+                return Ok(());
+            }
+        }
+
         Err(CmdFailure {
             controller: "exhausted".to_string(),
             error: format!("{E_WAKE_FAILED}: burst exhausted after {total_rounds} rounds"),
@@ -739,6 +859,8 @@ mod tests {
     struct FakeInner {
         modes: Vec<BlankMode>,
         available: bool,
+        /// Scripted `probe()` result.  `None` → default `Ok(())`.
+        probe_result: Option<Result<(), DormantError>>,
         blank_results: VecDeque<Result<(), CmdFailure>>,
         wake_results: VecDeque<Result<(), CmdFailure>>,
         log: Vec<(String, &'static str)>,
@@ -777,6 +899,20 @@ mod tests {
 
         fn set_available(&self, v: bool) {
             self.inner.lock().unwrap().available = v;
+        }
+
+        fn set_probe_result(&self, r: Result<(), DormantError>) {
+            self.inner.lock().unwrap().probe_result = Some(r);
+        }
+
+        /// Consume and return the scripted probe result, or `Ok(())`.
+        fn take_probe_result(&self) -> Result<(), DormantError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .probe_result
+                .take()
+                .unwrap_or(Ok(()))
         }
 
         fn push_blank_result(&self, r: Result<(), CmdFailure>) {
@@ -872,6 +1008,29 @@ mod tests {
 
         fn supported_modes(&self) -> Vec<BlankMode> {
             self.inner.lock().unwrap().modes.clone()
+        }
+
+        async fn probe(&mut self) -> Result<(), DormantError> {
+            self.take_probe_result()
+        }
+
+        async fn reprobe(&self) -> Result<(), DormantError> {
+            // Mirror the real controllers (ddcci::reprobe -> probe_now): a
+            // scripted Ok probe result heals availability — this is what lets
+            // tests flip a controller from dead-at-startup to reachable and
+            // exercise the executor's zero-available heal. With no scripted
+            // result the fake keeps its manual `set_available` state, so
+            // existing unavailable-chain tests are unaffected.
+            let mut g = self.inner.lock().unwrap();
+            g.log.push((self.name.to_string(), "reprobe"));
+            match g.probe_result.take() {
+                Some(Ok(())) => {
+                    g.available = true;
+                    Ok(())
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(()),
+            }
         }
 
         async fn is_available(&self) -> bool {
@@ -1030,6 +1189,47 @@ mod tests {
         assert_eq!(b.count_op("blank"), 1, "B tried after A failed");
     }
 
+    /// Issue #114 heal: a display dead at startup (probe failed, controller
+    /// unavailable) must come back on the FIRST command after reattach via
+    /// the executor's zero-available re-probe — not stay dead until a daemon
+    /// restart.
+    #[tokio::test]
+    async fn blank_heals_dead_chain_via_reprobe() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        // Dead at startup: unavailable, like ddcci with matched_ident None.
+        a.set_available(false);
+        // The display has "reattached": the next (re)probe succeeds.
+        a.set_probe_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff)
+            .await
+            .expect("first command after reattach must heal the chain via reprobe");
+
+        assert_eq!(a.count_op("reprobe"), 1, "executor re-probed the chain");
+        assert_eq!(a.count_op("blank"), 1, "blank ran after the heal");
+    }
+
+    /// The heal is bounded: when reprobe does NOT bring a controller back,
+    /// the command fails after exactly one re-probe pass — no retry loop.
+    #[tokio::test]
+    async fn blank_reprobe_heal_is_bounded_when_still_dead() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        a.set_probe_result(Err(DormantError::DisplayIo {
+            controller: "A".into(),
+            detail: "still detached".into(),
+        }));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff)
+            .await
+            .expect_err("still-dead chain must fail");
+
+        assert_eq!(a.count_op("reprobe"), 1, "exactly one re-probe pass");
+        assert_eq!(a.count_op("blank"), 0, "no blank on a dead chain");
+    }
+
     #[tokio::test]
     async fn blank_skips_unavailable_and_mode_mismatch() {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
@@ -1099,8 +1299,8 @@ mod tests {
     async fn wake_exhausted_returns_err_after_initial_plus_n_rounds() {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let b = FakeController::new("B", vec![BlankMode::PowerOff]);
-        // Both controllers always fail (script enough for 3 rounds × 2 = 6).
-        for _ in 0..6 {
+        // 3 rounds + 1 on-demand re-probe = 4 attempts per controller.
+        for _ in 0..8 {
             a.push_wake_result(Err(err("A")));
             b.push_wake_result(Err(err("B")));
         }
@@ -1115,9 +1315,9 @@ mod tests {
         assert_eq!(res.controller, "exhausted");
         assert!(res.error.starts_with(E_WAKE_FAILED));
 
-        // 3 rounds × 2 controllers = 6 wake calls.
-        assert_eq!(a.count_op("wake"), 3);
-        assert_eq!(b.count_op("wake"), 3);
+        // 3 rounds + 1 re-probe = 4 per controller.
+        assert_eq!(a.count_op("wake"), 4);
+        assert_eq!(b.count_op("wake"), 4);
     }
 
     #[tokio::test]
@@ -1219,6 +1419,44 @@ mod tests {
         assert!(results.iter().all(|(_, r)| r.is_ok()));
     }
 
+    /// After `probe_all`, `controller_health()` contains one entry per
+    /// controller with probe-failure detail.
+    #[tokio::test(start_paused = true)]
+    async fn probe_all_seeds_health_with_probe_results() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        b.set_probe_result(Err(DormantError::DisplayIo {
+            controller: "B".into(),
+            detail: "no display found".into(),
+        }));
+        let boxed: Vec<Box<dyn DisplayController>> = vec![Box::new(a.clone()), Box::new(b.clone())];
+        let mut exec = DisplayExecutor::new(
+            DisplayId("probe-health".into()),
+            boxed,
+            BlankMode::PowerOff,
+            default_retry(),
+        );
+        exec.probe_all().await;
+
+        let health = exec.controller_health();
+        assert_eq!(health.len(), 2);
+        // Primary A: probe succeeded.
+        assert_eq!(health[0].name, "A");
+        assert!(matches!(health[0].role, ControllerRole::Primary));
+        assert!(health[0].healthy);
+        assert!(health[0].detail.is_none());
+        // Fallback B: probe failed.
+        assert_eq!(health[1].name, "B");
+        assert!(matches!(health[1].role, ControllerRole::Fallback));
+        assert!(!health[1].healthy);
+        assert!(
+            health[1]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no display found"))
+        );
+    }
+
     // ── Should 2 — mid-round supersede ────────────────────────────────────
 
     #[tokio::test(start_paused = true)]
@@ -1274,8 +1512,8 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let b = FakeController::new("B", vec![BlankMode::PowerOff]);
         let c = FakeController::new("C", vec![BlankMode::PowerOff]);
-        // 4 rounds × 3 controllers = 12 calls. All fail.
-        for _ in 0..12 {
+        // 4 rounds + 1 on-demand re-probe = 5 attempts per controller × 3 = 15.
+        for _ in 0..15 {
             a.push_wake_result(Err(err("A")));
             b.push_wake_result(Err(err("B")));
             c.push_wake_result(Err(err("C")));
@@ -1295,10 +1533,10 @@ mod tests {
         let err = res.unwrap_err();
         assert_eq!(err.controller, "exhausted");
 
-        // 4 rounds × 3 controllers = 12 wake calls.
-        assert_eq!(a.count_op("wake"), 4);
-        assert_eq!(b.count_op("wake"), 4);
-        assert_eq!(c.count_op("wake"), 4);
+        // 4 rounds + 1 re-probe = 5 attempts per controller.
+        assert_eq!(a.count_op("wake"), 5);
+        assert_eq!(b.count_op("wake"), 5);
+        assert_eq!(c.count_op("wake"), 5);
 
         // Backoff doublings between rounds 0→1, 1→2, 2→3: 1+2+4 = 7×base.
         // This assertion distinguishes 2^round from (round+1) (the latter

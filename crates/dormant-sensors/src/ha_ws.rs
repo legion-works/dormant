@@ -87,6 +87,7 @@ impl SensorSource for HaWsSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<PresenceEvent>,
+        _ctl_tx: mpsc::Sender<dormant_core::rules::ControlMsg>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut backoff = BACKOFF_MIN;

@@ -624,6 +624,7 @@ mod tests {
                 wake_retries: 3,
                 wake_retry_backoff: std::time::Duration::from_secs(2),
                 wake_retry_interval: std::time::Duration::from_secs(2),
+                input_wake_hold: std::time::Duration::ZERO,
             },
         );
         let mut zones = IndexMap::new();

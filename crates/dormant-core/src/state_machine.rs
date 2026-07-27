@@ -227,8 +227,10 @@ pub struct SmTimings {
 ///
 /// All fields are private — the public API is [`DisplayStateMachine::step`],
 /// [`DisplayStateMachine::phase`], [`DisplayStateMachine::phase_name`],
-/// [`DisplayStateMachine::overlays`], [`DisplayStateMachine::cmd_gen`], and
-/// [`DisplayStateMachine::restore`].
+/// [`DisplayStateMachine::overlays`], [`DisplayStateMachine::cmd_gen`],
+/// [`DisplayStateMachine::restore`], and
+/// [`DisplayStateMachine::set_input_wake_hold_active`].
+#[allow(clippy::struct_excessive_bools)]
 pub struct DisplayStateMachine {
     phase: Phase,
     overlays: Overlays,
@@ -270,6 +272,12 @@ pub struct DisplayStateMachine {
     /// Set when presence arrives during a blank command — the machine will
     /// transition to waking as soon as the blank result confirms.
     pending_wake: bool,
+    /// When `true`, [`enter_active`] skips the deferred Grace chain that
+    /// normally follows a wake while the zone is known absent.  Set by the
+    /// rules engine when an `InputWake` arrives from an operator at a blanked
+    /// display in a vacant room; cleared by the engine when the hold expires
+    /// or presence returns.  See issue #125.
+    input_wake_hold_active: bool,
     /// Reserved for M2 auto-cycling; not consumed by any M1 transition.
     #[allow(dead_code)]
     pending_reblank: bool,
@@ -319,6 +327,7 @@ impl DisplayStateMachine {
             pending_reblank: false,
             zone_present: None,
             grace_frozen_remaining: None,
+            input_wake_hold_active: false,
         }
     }
 
@@ -359,6 +368,7 @@ impl DisplayStateMachine {
             pending_reblank: false,
             zone_present: None,
             grace_frozen_remaining: None,
+            input_wake_hold_active: false,
         };
 
         let effects = match phase {
@@ -1159,6 +1169,13 @@ impl DisplayStateMachine {
         &self.overlays
     }
 
+    /// Set or clear the input-wake hold flag.  When `true`,
+    /// `enter_active` skips the deferred Grace chain so a render-surface
+    /// input wake does not immediately re-blank a vacant room.
+    pub fn set_input_wake_hold_active(&mut self, active: bool) {
+        self.input_wake_hold_active = active;
+    }
+
     /// Return the current command generation counter (for snapshot carry-over).
     #[must_use]
     pub fn cmd_gen(&self) -> u64 {
@@ -1279,8 +1296,11 @@ impl DisplayStateMachine {
             to: "active",
             cause,
         }];
-        // If zone is known absent, immediately begin grace.
-        if self.zone_present == Some(false) {
+        // If zone is known absent, immediately begin grace — unless an
+        // input-wake hold is active (issue #125: hold input-woken displays
+        // awake so the operator can type without a blank → type → wake →
+        // re-blank loop every grace period).
+        if self.zone_present == Some(false) && !self.input_wake_hold_active {
             effects.append(&mut self.enter_grace(now, "deferred_zone_clear"));
         }
         effects

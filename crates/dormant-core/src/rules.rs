@@ -214,6 +214,14 @@ pub enum ControlMsg {
     /// generation-local producers have stopped, so acknowledgement proves the
     /// old engine consumed every input queued before the swap.
     GenerationBarrier(oneshot::Sender<()>),
+    /// An availability (LWT) edge from a sensor source. `online = true`
+    /// records the source's reachability verdict in
+    /// `RulesEngine::availability_online`, which the stale sweep consults
+    /// to decide whether topic silence may be treated as a stale timeout.
+    /// `online = false` (LWT) clears the assertion and synthesises an
+    /// [`crate::types::SensorState::Unavailable`] presence edge so the
+    /// fail-safe path takes over immediately.
+    SensorAvailability(crate::types::SensorAvailabilityEvent),
 }
 
 /// Per-display outcome of an [`ControlMsg::EmergencyWake`].
@@ -688,6 +696,9 @@ pub struct RuleRuntimeCfg {
     pub zone: ZoneId,
     /// The displays to step when the zone flips.
     pub displays: Vec<DisplayId>,
+    /// How long to hold a display awake after a render-surface input wake
+    /// when every driving zone is vacant (`0s` disables).
+    pub input_wake_hold: Duration,
 }
 
 /// Per-sensor runtime configuration for the engine.
@@ -736,6 +747,9 @@ enum TimerEntry {
     DisplayStageTick(DisplayId, u64),
     /// Hold-time expiry: synthesize the held Absent event for this sensor.
     HoldExpiry(SensorId),
+    /// Input-wake hold expiry: remove the hold and re-enter the normal
+    /// grace path for this display (issue #125).
+    InputWakeHoldExpiry(DisplayId),
 }
 
 /// Reply from a spawned dispatch task back to the engine.
@@ -869,6 +883,20 @@ pub struct RulesEngine {
     /// Virtual last-seen per sensor — drives the stale-sensor sweep using
     /// the tokio clock so paused tests can advance minutes in milliseconds.
     sensor_last_seen_virtual: HashMap<SensorId, tokio::time::Instant>,
+    /// Sensors whose source has asserted `online = true` via a recent
+    /// availability (LWT) edge. The stale sweep consults this set to
+    /// decide whether a sensor's presence-topic silence may be treated as
+    /// "state unchanged" (in-set) or "device gone" (not in set → fire
+    /// `Unavailable`).  Source `Unavailable` events and broker failures
+    /// remove the entry; a fresh `online` assertion adds it back.
+    ///
+    /// Clearing sites: [`RulesEngine::handle_presence_event`]
+    /// (`state == Unavailable` path) and
+    /// [`RulesEngine::handle_sensor_availability`] (offline LWT).
+    /// Consumed by [`RulesEngine::sweep_stale_sensors`].
+    /// See also [`RulesEngine::input_wake_holds`] for the analogous
+    /// per-display hold expiry path.
+    availability_online: HashSet<SensorId>,
     /// Timer wheel — min-heap on `(Tick, entry)`.
     timers: BinaryHeap<Reverse<(Tick, TimerEntry)>>,
     /// Internal results mpsc — spawned dispatch tasks write here.
@@ -904,6 +932,22 @@ pub struct RulesEngine {
     /// it through the standard control channel.
     #[allow(clippy::type_complexity)]
     claim_suppression: HashMap<DisplayId, Instant>,
+    /// Per-display input-wake hold deadlines (issue #125).  When a render-
+    /// surface `InputWake` arrives while every zone that drives this display
+    /// is vacant and the rule's `input_wake_hold` is > 0, a deadline
+    /// (`now + hold`) is stored here and a [`TimerEntry::InputWakeHoldExpiry`]
+    /// is scheduled.  While the deadline is in the future, the state machine's
+    /// `input_wake_hold_active` flag prevents the deferred Grace chain in
+    /// [`DisplayStateMachine::enter_active`].
+    ///
+    /// Clearing sites: [`RulesEngine::fan_zone_change_to_displays`]
+    /// (when presence returns, `present == true`) and
+    /// [`RulesEngine::fire_input_wake_hold_expiry`] (hold expiry).
+    /// Both clear the hold map entry AND the state machine flag.
+    /// NOT carried across reload — see `apply_restore` in `dormantd`.
+    /// See also [`RulesEngine::availability_online`] for the analogous
+    /// cleared-on-presence pattern.
+    input_wake_holds: HashMap<DisplayId, Instant>,
 }
 
 impl RulesEngine {
@@ -1002,6 +1046,7 @@ impl RulesEngine {
             reported: HashSet::new(),
             last_blank_failed: HashSet::new(),
             sensor_last_seen_virtual: HashMap::new(),
+            availability_online: HashSet::new(),
             timers: BinaryHeap::new(),
             results_rx,
             results_tx,
@@ -1011,6 +1056,7 @@ impl RulesEngine {
             rollback: None,
             kvm: None,
             claim_suppression: HashMap::new(),
+            input_wake_holds: HashMap::new(),
             pending_restore: Vec::new(),
         })
     }
@@ -1216,6 +1262,17 @@ impl RulesEngine {
         // the field doc on `RulesEngine::reported`).
         self.reported.insert(ev.sensor_id.clone());
 
+        // Clear the source-asserted `online` availability claim whenever a
+        // sensor reports Unavailable — the same code path covers LWT
+        // `offline` payloads (already synthesised by
+        // `handle_sensor_availability` above) and broker/source failures
+        // (the source emits Unavailable for every owned sensor). Without
+        // this, a dead connection whose last broker-side state was `online`
+        // could preserve stale presence forever by gating the sweep.
+        if ev.state == SensorState::Unavailable {
+            self.availability_online.remove(&ev.sensor_id);
+        }
+
         // Hold-filter: swallow / arm / pass through based on the sensor's
         // kind and hold_time.
         let effective = self.apply_hold_filter(ev);
@@ -1320,6 +1377,15 @@ impl RulesEngine {
                 None => continue,
             };
             for display_id in displays {
+                // Issue #125: when presence returns, clear any active
+                // input-wake hold — the room is occupied, so there is
+                // nothing to hold back.
+                if present {
+                    self.input_wake_holds.remove(&display_id);
+                    if let Some(machine) = self.machines.get_mut(&display_id) {
+                        machine.set_input_wake_hold_active(false);
+                    }
+                }
                 // Feed ownership so the gate verdict is current before
                 // processing the presence edge.
                 self.feed_ownership(&display_id, now);
@@ -1336,7 +1402,35 @@ impl RulesEngine {
             ControlMsg::Resume { rule } => self.handle_resume(rule.as_ref()),
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
-            ControlMsg::InputWake(d) => self.step_one(&d, Input::InputWake),
+            ControlMsg::InputWake(d) => {
+                // Issue #125: if every zone that drives this display is
+                // vacant and the effective `input_wake_hold` for the
+                // applicable rule is > 0, arm the hold so the state
+                // machine does not immediately chain back into Grace
+                // after the wake.
+                #[allow(clippy::collapsible_if)]
+                if let Some(hold) = self.effective_input_wake_hold(&d) {
+                    if hold > Duration::ZERO {
+                        // Tick::now(), not std Instant::now(): the deadline is
+                        // compared against the virtual-aware timer clock, and
+                        // mixing clocks silently breaks under paused-time tests
+                        // (the stale-timer guard compares Tick-derived instants).
+                        let now = Tick::now().0;
+                        let deadline = now + hold;
+                        self.input_wake_holds.insert(d.clone(), deadline);
+                        self.timers.push(Reverse((
+                            Tick(deadline),
+                            TimerEntry::InputWakeHoldExpiry(d.clone()),
+                        )));
+                        // Set the hold flag on the state machine so
+                        // `enter_active` skips the deferred Grace chain.
+                        if let Some(machine) = self.machines.get_mut(&d) {
+                            machine.set_input_wake_hold_active(true);
+                        }
+                    }
+                }
+                self.step_one(&d, Input::InputWake);
+            }
             ControlMsg::OwnershipPoll { display } => self.feed_ownership(&display, Tick::now()),
             ControlMsg::PublishDaemonEvent(ev) => {
                 debug_assert!(
@@ -1374,6 +1468,32 @@ impl RulesEngine {
             ControlMsg::GenerationBarrier(ack) => {
                 let _ = ack.send(());
             }
+            ControlMsg::SensorAvailability(ev) => self.handle_sensor_availability(ev),
+        }
+    }
+
+    /// Record a source-asserted availability (LWT) edge.
+    ///
+    /// `online = true` inserts the sensor into [`Self::availability_online`]
+    /// so the stale sweep leaves it alone on topic silence. Deliberately
+    /// does NOT touch `sensor_last_seen_virtual` — the trap from issue #136:
+    /// a heartbeat-style "online" frame would otherwise mask a real broker
+    /// disconnect from the next sweep's view of elapsed time.
+    ///
+    /// `online = false` (LWT) removes the sensor from the set AND synthesises
+    /// an `Unavailable` [`PresenceEvent`] so the fail-safe presence path
+    /// takes over immediately, matching today's behavior for an `offline`
+    /// payload.
+    fn handle_sensor_availability(&mut self, ev: crate::types::SensorAvailabilityEvent) {
+        if ev.online {
+            self.availability_online.insert(ev.sensor);
+        } else {
+            self.availability_online.remove(&ev.sensor);
+            self.handle_presence_event(PresenceEvent::new(
+                ev.sensor,
+                SensorState::Unavailable,
+                ev.at,
+            ));
         }
     }
 
@@ -1972,6 +2092,27 @@ impl RulesEngine {
 
     // ── Internal: timers ────────────────────────────────────────────────────
 
+    /// Find the effective `input_wake_hold` for a display.
+    ///
+    /// Returns `None` if no rule drives this display or if any driving zone
+    /// is currently present.  Returns `Some(hold)` from the first matching
+    /// rule when every driving zone is vacant.
+    fn effective_input_wake_hold(&self, display: &DisplayId) -> Option<Duration> {
+        for rule in &self.cfg.rules {
+            if rule.displays.contains(display) {
+                let present = self.zone_engine.is_present(&rule.zone).unwrap_or(true); // unknown = present (fail-safe)
+                if present {
+                    // At least one driving zone is present — no hold.
+                    return None;
+                }
+                // Zone is known-vacant — use this rule's hold.
+                return Some(rule.input_wake_hold);
+            }
+        }
+        // Display is not driven by any rule (e.g. manual-only).
+        None
+    }
+
     fn compute_sweep_period(&self) -> Duration {
         let min_stale = self
             .cfg
@@ -2009,6 +2150,9 @@ impl RulesEngine {
                     TimerEntry::HoldExpiry(sensor_id) => {
                         self.fire_hold_expiry(&sensor_id, deadline);
                     }
+                    TimerEntry::InputWakeHoldExpiry(display) => {
+                        self.fire_input_wake_hold_expiry(&display, deadline);
+                    }
                 }
             } else {
                 break;
@@ -2042,6 +2186,32 @@ impl RulesEngine {
         }
     }
 
+    /// Input-wake hold expiry (issue #125): clear the hold flag and re-enter
+    /// the normal grace path — never a direct blank.  A stale timer (hold
+    /// already cleared by presence or a newer `InputWake`) is silently dropped.
+    fn fire_input_wake_hold_expiry(&mut self, display: &DisplayId, now: Tick) {
+        // Guard against stale timers: a second `InputWake` during the hold
+        // pushes a later deadline into the map, but the OLD heap timer still
+        // fires.  Check the stored deadline before acting — mirroring
+        // `fire_hold_expiry`'s `now < armed_until` guard.
+        let Some(&stored_deadline) = self.input_wake_holds.get(display) else {
+            // Hold already cleared (presence returned, display removed).
+            return;
+        };
+        if stored_deadline > now.0 {
+            // Stale timer — a newer InputWake re-armed the hold past this
+            // expiry.  Drop without acting; the newer timer will fire.
+            return;
+        }
+        // Timer is current — safe to remove and act.
+        self.input_wake_holds.remove(display);
+        if let Some(machine) = self.machines.get_mut(display) {
+            machine.set_input_wake_hold_active(false);
+        }
+        self.feed_ownership(display, now);
+        self.step_machine(display, Input::ZonePresent(false), now);
+    }
+
     // ── Internal: stale sensor sweep ────────────────────────────────────────
 
     fn sweep_stale_sensors(&mut self) {
@@ -2059,6 +2229,14 @@ impl RulesEngine {
                 continue;
             };
             if state == SensorState::Unavailable {
+                continue;
+            }
+            // A source-asserted `online` availability edge means topic
+            // silence is "state unchanged", not "device gone" — skip the
+            // sweep for this sensor.  An Unavailable presence event below
+            // (broker failure, LWT offline) removes the entry, so a dead
+            // connection cannot preserve stale presence forever.
+            if self.availability_online.contains(&sensor_id) {
                 continue;
             }
             // Use virtual time for the elapsed comparison so paused tests
@@ -3911,6 +4089,212 @@ mod tests {
         let mut engine = minimal_engine();
         engine.handle_control(ControlMsg::PublishDaemonEvent(DaemonEvent::Unknown));
     }
+
+    // ── MQTT availability gates the stale sweep (issue #136) ───────────────
+
+    use crate::types::SensorAvailabilityEvent;
+
+    /// A minimal engine with exactly ONE sensor and a SHORT `stale_timeout`
+    /// — for the availability-gating tests below, which need a sweep to fire
+    /// within a few hundred milliseconds of virtual time.
+    fn engine_with_short_stale(id: &str, stale: Duration) -> RulesEngine {
+        let sid = SensorId(id.into());
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![],
+                sensors: vec![SensorRuntimeCfg {
+                    sensor: sid.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: stale,
+                }],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[sid]).expect("single-sensor empty-zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("single-sensor engine config is valid")
+    }
+
+    /// Helper: find the sensor snapshot for `id` and return its
+    /// `(state, last_seen_secs_ago)`.
+    fn sensor_view(snap: &StateSnapshot, id: &str) -> (SensorState, u64) {
+        let s = snap
+            .sensors
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("sensor {id} in snapshot"));
+        (s.state, s.last_seen_secs_ago)
+    }
+
+    /// Issue #136: a healthy radar with a retained `online` availability
+    /// signal must not be marked `Unavailable` by the stale sweep just
+    /// because the state topic is silent (occupant seated, no motion).
+    /// The online assertion gates the sweep AND must NOT refresh the
+    /// `last_seen` clock — silence still means "state unchanged", not
+    /// "new data".
+    #[tokio::test(start_paused = true)]
+    async fn retained_online_suppresses_silence_staleness() {
+        let sensor = SensorId("desk".into());
+        let mut engine = engine_with_short_stale("desk", Duration::from_millis(500));
+
+        // 1. Sensor reports Present.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+
+        // Snapshot the last-seen baseline so we can prove the online
+        // assertion did NOT refresh it.
+        let baseline = snapshot_of(&mut engine);
+        let (_, last_seen_baseline) = sensor_view(&baseline, "desk");
+        assert_eq!(last_seen_baseline, 0, "no virtual time has passed yet");
+
+        // 2. Sensor source asserts online.
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // 3. Advance virtual time well past stale_timeout, then run the
+        //    sweep explicitly (these tests drive `handle_*` directly; the
+        //    `run()` loop's timer-driven sweep is exercised by
+        //    `tests/rules_end_to_end.rs`).
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        engine.sweep_stale_sensors();
+
+        // The state must still be Present — the online assertion gates the
+        // sweep, so silence past stale_timeout is no longer a fault.
+        let after = snapshot_of(&mut engine);
+        let (state, last_seen_after) = sensor_view(&after, "desk");
+        assert_eq!(
+            state,
+            SensorState::Present,
+            "online assertion must keep a present sensor present across silence (got {state:?})"
+        );
+        // CRUCIAL: last_seen must reflect elapsed time (not be reset by
+        // online). The 1200ms sleep elapses, so the unscaled
+        // `last_seen_secs_ago` must be > the baseline — proving the online
+        // event did not refresh the clock.
+        assert!(
+            last_seen_after >= last_seen_baseline,
+            "last_seen_secs_ago must reflect elapsed time, not be reset by online"
+        );
+    }
+
+    /// A sensor with NO availability topic keeps today's behavior: silence
+    /// past `stale_timeout` marks it `Unavailable`. This is the regression
+    /// guard for sensors whose bridge does not publish LWT.
+    #[tokio::test(start_paused = true)]
+    async fn no_availability_still_stales() {
+        let sensor = SensorId("no_aw".into());
+        let mut engine = engine_with_short_stale("no_aw", Duration::from_millis(500));
+
+        // Present, no availability event. Sweep at 1.2s should mark
+        // Unavailable — the pre-#136 behavior.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        engine.sweep_stale_sensors();
+
+        let after = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&after, "no_aw");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "sensor without an availability topic must still go stale on silence (got {state:?})"
+        );
+    }
+
+    /// An explicit `offline` availability edge must mark the sensor
+    /// `Unavailable` IMMEDIATELY, even if the stale sweep hasn't fired
+    /// yet — that's the LWT contract.
+    #[tokio::test(start_paused = true)]
+    async fn explicit_offline_transitions_to_unavailable_immediately() {
+        let sensor = SensorId("lwt".into());
+        let mut engine = engine_with_short_stale("lwt", Duration::from_secs(3600));
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // LWT fires well before the long stale timeout would.
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), false, Timestamp::now()),
+        ));
+
+        let snap = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&snap, "lwt");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "explicit offline must transition to Unavailable immediately (got {state:?})"
+        );
+    }
+
+    /// Broker disconnect (a `PresenceEvent::Unavailable` from the source)
+    /// must clear the `availability_online` assertion so a dead connection
+    /// cannot preserve stale presence forever — the next sweep then
+    /// correctly demotes a still-quiet sensor.
+    #[tokio::test(start_paused = true)]
+    async fn broker_disconnect_clears_online_assertion() {
+        let sensor = SensorId("disc".into());
+        let mut engine = engine_with_short_stale("disc", Duration::from_millis(500));
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // Advance time under the online assertion: state stays Present.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.sweep_stale_sensors();
+        let still_present = snapshot_of(&mut engine);
+        assert_eq!(sensor_view(&still_present, "disc").0, SensorState::Present);
+
+        // Broker drops: source emits Unavailable. The online assertion
+        // must clear so the next sweep re-engages the timeout.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+
+        // Now bring the sensor back to Present (reconnect restored the
+        // subscription), but WITHOUT a fresh online assertion. Advance
+        // past the stale timeout: the sweep must demote it again
+        // because the disconnect cleared the assertion.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        engine.sweep_stale_sensors();
+
+        let after = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&after, "disc");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "post-disconnect silence must re-engage the stale sweep (got {state:?})"
+        );
+    }
 }
 
 /// Restoring a manual-only display's phase into the engine must carry
@@ -3967,6 +4351,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
+        availability_online: HashSet::new(),
         timers: BinaryHeap::new(),
         results_rx,
         results_tx,
@@ -3976,6 +4361,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         rollback: None,
         kvm: None,
         claim_suppression: HashMap::new(),
+        input_wake_holds: HashMap::new(),
         pending_restore: Vec::new(),
     };
 
@@ -4071,6 +4457,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
+        availability_online: HashSet::new(),
         timers: BinaryHeap::new(),
         results_rx,
         results_tx,
@@ -4080,6 +4467,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         rollback: None,
         kvm: None,
         claim_suppression: HashMap::new(),
+        input_wake_holds: HashMap::new(),
         pending_restore: Vec::new(),
     };
 
@@ -4115,4 +4503,376 @@ fn install_restored_never_owned_refeed_not_dropped() {
 
     // Assert: ownership was re-seeded (NeverOwned returns false).
     assert_eq!(engine.last_owned.get(&display_id), Some(&false));
+}
+
+#[cfg(test)]
+use crate::fakes::RecordingSink;
+
+#[cfg(test)]
+/// Build a test engine with one display, one zone, one presence sensor,
+/// and one rule whose `input_wake_hold` is `hold`.  The `RecordingSink`
+/// records blank/wake commands and succeeds by default.
+fn input_wake_hold_engine(hold: Duration) -> (RulesEngine, DisplayId, Arc<RecordingSink>) {
+    use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
+    let display = DisplayId("d1".into());
+    let zone = ZoneId("z1".into());
+    let sensor = SensorId("s1".into());
+
+    let timings = DisplayRuntimeCfg::manual_defaults(Duration::ZERO);
+    let ladder = vec![LadderStage {
+        kind: StageKind::Controller(BlankMode::PowerOff),
+        dwell: None,
+    }];
+
+    let sink = Arc::new(RecordingSink::new());
+    let mut executors = HashMap::new();
+    executors.insert(display.clone(), sink.clone() as Arc<dyn CommandSink>);
+
+    let zone_spec = ZoneSpec {
+        id: zone.clone(),
+        mode: FusionMode::Any,
+        members: vec![ZoneMember::Sensor(sensor.clone())],
+        weights: HashMap::new(),
+        unavailable_policy: crate::zone::UnavailablePolicy::Present,
+    };
+
+    let engine = RulesEngine::new(
+        RulesEngineConfig {
+            rules: vec![RuleRuntimeCfg {
+                rule: RuleId("r1".into()),
+                zone: zone.clone(),
+                displays: vec![display.clone()],
+                input_wake_hold: hold,
+            }],
+            displays: vec![DisplayRuntimeCfg {
+                display: display.clone(),
+                blank_mode: BlankMode::PowerOff,
+                ladder: ladder.clone(),
+                timings,
+            }],
+            sensors: vec![SensorRuntimeCfg {
+                sensor: sensor.clone(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: Duration::from_secs(3600),
+            }],
+            doctor_wake_settle: Duration::from_secs(3),
+        },
+        ZoneEngine::new(vec![zone_spec], &[sensor]).expect("zone engine must be valid"),
+        executors,
+        HashMap::new(),
+        Arc::new(crate::ownership::AlwaysOwned),
+    )
+    .expect("engine must be valid");
+
+    (engine, display, sink)
+}
+
+#[cfg(test)]
+/// Drive a display machine through the Happy Path to Blanked:
+/// zone absent → Grace → tick expiry → Blanking → BlankResult(Ok) → Blanked.
+fn drive_to_blanked(engine: &mut RulesEngine, display: &DisplayId) {
+    let now = Tick::now();
+    // Mark zone absent via a presence event.
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+    // Drive grace expiry by stepping with a Tick past the grace period.
+    let grace_end = Tick(now.0 + Duration::from_secs(60)); // manual_defaults uses 60s grace
+    engine.step_machine(display, Input::Tick, grace_end);
+    // Now the machine should be in Blanking; feed a successful BlankResult.
+    let blank_gen = engine
+        .machines
+        .get(display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        display,
+        Input::BlankResult {
+            r#gen: blank_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+}
+
+/// After a display-wake from Blanked (issue #125), the input-wake hold keeps
+/// the display in Active — it does NOT immediately re-enter Grace even though
+/// the zone is known vacant.
+#[tokio::test(start_paused = true)]
+async fn vacant_blanked_input_wake_stays_active_inside_hold() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // The display is now Blanked; the zone is vacant.
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "blanked"
+    );
+
+    // Act: send InputWake (simulating operator typing on the render surface).
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+
+    // Feed a successful WakeResult to complete the wake.
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert: the hold is armed.
+    assert!(
+        engine.input_wake_holds.contains_key(&display),
+        "input_wake_hold must be armed for display after InputWake in vacant zone"
+    );
+
+    // Assert: the state machine is Active (not Grace).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "display must stay Active inside the hold — not re-enter Grace"
+    );
+}
+
+/// After the input-wake hold expires in a still-vacant zone, the display
+/// must re-enter Grace (never a direct blank).
+#[tokio::test(start_paused = true)]
+async fn vacant_blanked_input_wake_reenters_grace_after_hold() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Send InputWake and complete the wake.
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert hold is armed.
+    assert!(engine.input_wake_holds.contains_key(&display));
+
+    // Advance time past the hold (120 s).
+    tokio::time::sleep(Duration::from_secs(121)).await;
+
+    // Fire due timers — the InputWakeHoldExpiry should fire.
+    engine.fire_due_timers(Tick::now());
+
+    // Assert: hold was removed.
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "hold must be cleared after expiry"
+    );
+
+    // Assert: the state machine is now in Grace (never a direct blank).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "grace",
+        "expired hold must re-enter Grace, never a direct blank"
+    );
+}
+
+/// When presence returns during an input-wake hold, the hold must be
+/// cancelled — the display stays awake normally as long as the room is
+/// occupied, without a latent timer that re-blanks it.
+#[tokio::test(start_paused = true)]
+async fn presence_during_input_wake_hold_cancels_reblank() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Send InputWake and complete the wake.
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert hold is armed.
+    assert!(engine.input_wake_holds.contains_key(&display));
+
+    // Act: presence returns.
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+
+    // Assert: hold was cleared by presence.
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "hold must be cleared when presence returns"
+    );
+
+    // Assert: the state machine is Active (presence detected).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "presence during hold must keep display Active"
+    );
+
+    // Advance time past the original hold deadline to prove no latent
+    // timer re-blanks an occupied room.
+    tokio::time::sleep(Duration::from_secs(121)).await;
+    engine.fire_due_timers(Tick::now());
+
+    // Still Active — the hold is gone, presence keeps it awake.
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "no latent timer must re-blank an occupied room after hold cleared"
+    );
+}
+
+/// When `input_wake_hold` is `0s`, the display immediately re-enters Grace
+/// after an input wake in a vacant zone — the pre-#125 behaviour.
+#[tokio::test(start_paused = true)]
+async fn zero_input_wake_hold_preserves_immediate_grace_behavior() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::ZERO);
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Send InputWake and complete the wake with hold=0.
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert: no hold was armed (hold == 0s disables it).
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "zero input_wake_hold must not arm a hold"
+    );
+
+    // Assert: the state machine is already in Grace (immediate re-grace).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "grace",
+        "zero hold must immediately re-enter Grace after InputWake in vacant zone"
+    );
+}
+
+/// A second `InputWake` during an active hold re-arms the deadline — the
+/// old timer must NOT prematurely clear the hold.  This pins the stale-
+/// timer guard in `fire_input_wake_hold_expiry`.
+#[tokio::test(start_paused = true)]
+async fn second_input_wake_rearms_hold() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Drain any stale timers left by drive_to_blanked (e.g. DisplayTick
+    // from the initial Grace entry) so they don't interfere with the
+    // hold-timer assertions below.
+    engine.fire_due_timers(Tick::now());
+
+    // --- First InputWake: arm the hold (deadline = now + 120s) ---
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+    assert!(engine.input_wake_holds.contains_key(&display));
+    // Verify we're active (hold prevents deferred Grace).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active"
+    );
+
+    // --- Advance half the hold (60s) ---
+    tokio::time::sleep(Duration::from_secs(60)).await;
+
+    // --- Second InputWake: re-arm the hold (deadline = now + 120s = 180s) ---
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // --- Advance past the FIRST deadline (120s from start) ---
+    // At t=60s we re-armed, so now we're at t=60+61=121s, past the
+    // original 120s deadline.  The old timer fires here.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    engine.fire_due_timers(Tick::now());
+
+    // Assert: STILL active — the old timer must NOT have cleared the
+    // re-armed hold.
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "old timer must not clear a re-armed hold"
+    );
+    assert!(
+        engine.input_wake_holds.contains_key(&display),
+        "hold must still be armed after stale timer fires"
+    );
+
+    // --- Advance just past the SECOND deadline (180s from start; we are at
+    // t=121s, so +60s lands at t=181s). Overshooting further would also
+    // expire the grace period that starts at expiry, collapsing
+    // grace→blanking inside one timer drain and masking the phase we
+    // assert here. ---
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    engine.fire_due_timers(Tick::now());
+
+    // Assert: now in Grace — the second timer fired correctly.
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "hold must be cleared after second deadline"
+    );
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "grace",
+        "re-armed hold expiry must re-enter Grace"
+    );
 }

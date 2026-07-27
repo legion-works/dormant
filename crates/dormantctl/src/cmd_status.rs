@@ -91,9 +91,18 @@ fn render_table(snapshot: &StateSnapshot) -> String {
             "── Displays ──────────────────────────────────────────────"
         );
         let mut table = Table::new();
-        table.set_header(vec!["ID", "Phase", "Owner", "Claim", "Inhibited", "Paused"]);
+        table.set_header(vec![
+            "ID",
+            "Phase",
+            "Owner",
+            "Claim",
+            "Inhibited",
+            "Paused",
+            "Health",
+        ]);
         for (id, d) in &snapshot.displays {
             let phase = phase_cell(d);
+            let health_cell = health_cell(d);
             table.add_row(vec![
                 id.as_str(),
                 phase.as_str(),
@@ -109,6 +118,7 @@ fn render_table(snapshot: &StateSnapshot) -> String {
                 },
                 if d.inhibited { "yes" } else { "no" },
                 if d.paused { "yes" } else { "no" },
+                &health_cell,
             ]);
         }
         let _ = writeln!(out, "{table}");
@@ -154,6 +164,36 @@ fn phase_cell(d: &DisplaySnapshot) -> String {
         ),
         None => d.phase.clone(),
     }
+}
+
+/// Build the Health column cell for a [`DisplaySnapshot`].
+///
+/// Returns `"healthy"` when every controller is healthy (or when the
+/// controller list is empty — no probe has run yet). Otherwise joins each
+/// unhealthy controller as `"name: detail"` (truncated).
+fn health_cell(d: &DisplaySnapshot) -> String {
+    if d.controllers.is_empty() || d.controllers.iter().all(|c| c.healthy) {
+        return "healthy".to_string();
+    }
+    d.controllers
+        .iter()
+        .filter(|c| !c.healthy)
+        .map(|c| {
+            if let Some(detail) = &c.detail {
+                // Keep the cell bounded — a full probe-error dump belongs in
+                // the doctor output, not a cramped status table.
+                let short = if detail.len() > 80 {
+                    format!("{}…", &detail[..80])
+                } else {
+                    detail.clone()
+                };
+                format!("{}: {short}", c.name)
+            } else {
+                format!("{}: unknown", c.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -369,5 +409,55 @@ mod tests {
         assert!(rendered.contains("capable"));
         assert!(rendered.contains("Activity follow: on"));
         assert!(rendered.contains("Ctrl+F12"));
+    }
+
+    #[test]
+    fn health_column_healthy_when_empty_controllers() {
+        let snap = canned_snapshot();
+        let rendered = render_table(&snap);
+        // Empty controllers → "healthy"
+        assert!(rendered.contains("healthy"), "got: {rendered}");
+        assert!(rendered.contains("Health"), "Health header missing");
+    }
+
+    #[test]
+    fn health_column_shows_unhealthy_controller_detail() {
+        use dormant_core::rules::ControllerHealth;
+        use dormant_core::rules::ControllerRole;
+
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "active".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 1,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
+                    controllers: vec![ControllerHealth {
+                        name: "ddcci".into(),
+                        role: ControllerRole::Primary,
+                        healthy: false,
+                        detail: Some("E_DISPLAY_IO: no display found".into()),
+                    }],
+                    wake_attempts: 0,
+                    last_blank_failed: false,
+                    stage: None,
+                },
+            )],
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+        };
+        let rendered = render_table(&snap);
+        assert!(
+            rendered.contains("ddcci: E_DISPLAY_IO: no display found"),
+            "Health column missing probe-failure detail: {rendered}"
+        );
     }
 }

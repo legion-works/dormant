@@ -49,6 +49,7 @@ impl SensorSource for FakeSensorSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<PresenceEvent>,
+        _ctl_tx: mpsc::Sender<crate::rules::ControlMsg>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let iter = self.script.into_iter();

@@ -469,6 +469,18 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
             first_failure = first_failure or listed.returncode
             continue
         if not listed.stdout.strip():
+            # The target matched (the selector is not broken), but every test
+            # inside is env-gated behind #[ignore].  Confirm by listing with
+            # --run-ignored all; if that returns tests we can skip, otherwise
+            # the target is genuinely empty and the selector is wrong.
+            ignored_list_cmd = [*list_command, "--run-ignored", "all"]
+            ignored_listed = subprocess.run(ignored_list_cmd, cwd=root, text=True, capture_output=True, env=run_env)
+            if ignored_listed.returncode == 0 and ignored_listed.stdout.strip():
+                print(
+                    f"{target.package}/{target.name}: all tests ignored (env-gated); skipping",
+                    file=sys.stderr,
+                )
+                continue
             print(f"{target.package}/{target.name}: selected target contains zero tests", file=sys.stderr)
             first_failure = first_failure or 1
             continue

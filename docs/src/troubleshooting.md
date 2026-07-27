@@ -92,6 +92,20 @@ Look for `unavailable` sensor states, then repair the broker, connection, or dev
 grace_period = "30s"
 ```
 
+### Input-wake hold is active
+
+**Symptom:** the display wakes on keyboard input but stays awake for
+longer than the configured grace period even though the zone is vacant.
+
+**Cause:** `rules.<id>.input_wake_hold` is deferring the re-blank after
+a render-surface input wake (issue #125). The default is 120 seconds.
+Set to `"0s"` to disable and restore the immediate-grace behaviour.
+
+```toml
+[rules.office_blank]
+input_wake_hold = "30s"
+```
+
 ### Inhibitor is active
 
 **Symptom:** the sensor and zone are vacant, but the rule remains inhibited.

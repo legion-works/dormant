@@ -2082,8 +2082,7 @@ impl Runner {
         self.ctl_router.pause().await;
         self.events_router.pause().await;
         self.record_reload_lifecycle_stage("routers_paused");
-        quiesce_inputs(&mut self.generation).await;
-        self.record_reload_lifecycle_stage("inputs_quiesced");
+        self.operation_registry.begin_quiesce(self.generation_id);
         if matches!(
             quiesce_operations(
                 &self.operation_registry,
@@ -2112,6 +2111,7 @@ impl Runner {
                 self.events_router.install(events).await;
             }
             let detail = "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
+            self.operation_registry.end_quiesce(self.generation_id);
             tracing::warn!(
                 event = "reload_rejected_operation_busy",
                 generation = self.generation_id.0
@@ -2120,6 +2120,8 @@ impl Runner {
             let _ = self.reload_tx.send(outcome.clone());
             return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
         }
+        quiesce_inputs(&mut self.generation).await;
+        self.record_reload_lifecycle_stage("inputs_quiesced");
         #[cfg(any(test, feature = "test-util"))]
         if let Some(gate) = &self.generation_barrier_gate {
             gate.reach(old_ctl.clone()).await;

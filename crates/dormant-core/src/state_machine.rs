@@ -919,8 +919,9 @@ impl DisplayStateMachine {
                 to: "blanking",
                 cause: "force_blank",
             }]),
-            // SoftBlank in Waking: enter the ladder from stage 0 (cancels the wake retry loop).
-            (Phase::Waking, Input::SoftBlank) => self.enter_ladder_stage(0, now, "soft_blank"),
+            // SoftBlank while Waking is intentionally ignored: the in-flight
+            // wake retry remains the sole exit driver until the panel is awake.
+            (Phase::Waking, Input::SoftBlank) => vec![],
             // ForceWake in Waking: restart the wake attempt with a fresh
             // generation.
             (Phase::Waking, Input::ForceWake) => self.issue_wake(vec![], now),
@@ -2066,6 +2067,27 @@ mod tests {
         let effects = sm.step(Input::Tick, retry_at);
         assert!(matches!(sm.phase(), Phase::Waking));
         assert_issue_wake(&effects, 4);
+    }
+
+    #[test]
+    fn soft_blank_while_waking_preserves_failed_wake_retry_driver() {
+        let mut sm = sm(500);
+        drive_blank(&mut sm, t(0), true);
+        let effects = sm.step(Input::ZonePresent(true), t(100));
+        assert_issue_wake(&effects, 2);
+        assert!(sm.step(Input::SoftBlank, t(110)).is_empty());
+        let effects = sm.step(
+            Input::WakeResult {
+                r#gen: 2,
+                result: Err(crate::types::CmdFailure {
+                    controller: "test".into(),
+                    error: "fail".into(),
+                }),
+            },
+            t(120),
+        );
+        assert!(matches!(sm.phase(), Phase::Waking));
+        assert_issue_wake(&effects, 3);
     }
 
     #[test]

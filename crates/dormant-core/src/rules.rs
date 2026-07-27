@@ -121,6 +121,7 @@ pub struct AcceptedOperation {
 struct OperationState {
     next_id: u64,
     active: HashMap<u64, (GenerationId, OperationKind, CancellationToken)>,
+    quiescing: HashSet<GenerationId>,
 }
 
 /// Daemon-lifetime active operation leases, shared by all generations.
@@ -169,6 +170,20 @@ impl Drop for OperationLease {
 }
 
 impl OperationRegistry {
+    /// Close acceptance for a generation before quiescing its active leases.
+    pub fn begin_quiesce(&self, generation: GenerationId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.quiescing.insert(generation);
+        }
+    }
+
+    /// Reopen operation acceptance after a rejected reload.
+    pub fn end_quiesce(&self, generation: GenerationId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.quiescing.remove(&generation);
+        }
+    }
+
     /// Adopt an operation accepted by the daemon front door.
     #[must_use]
     pub fn lease_accepted(&self, operation: &AcceptedOperation) -> Option<OperationLease> {
@@ -202,6 +217,9 @@ impl OperationRegistry {
             .state
             .lock()
             .expect("operation registry mutex poisoned");
+        if state.quiescing.contains(&generation) {
+            return Err(kind);
+        }
         let conflicts = state
             .active
             .values()

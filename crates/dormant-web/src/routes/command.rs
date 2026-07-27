@@ -32,21 +32,14 @@ const EMERGENCY_WAKE_WEB_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) struct BlankBody {
     pub(crate) display: String,
     /// Blank mode — see [`dormant_core::ipc_proto::BlankRequestMode`].
-    /// Defaults to `Hard` so a legacy webui that omits `mode` still
-    /// triggers the operator-override path; issue #124 leaves the
-    /// safe-soft path to the explicit `dormantctl blank` default and to
-    /// a future "Soft blank" webui surface.  Note: the wire-protocol
-    /// `IpcRequest::Blank` defaults to `Soft` (safety-first for legacy
-    /// `dormantctl` clients) — the HTTP body here deliberately diverges
-    /// because the existing webui only ships a "Force blank" button.
-    #[serde(default = "blank_body_default_mode_hard")]
+    /// Defaults to `Soft`, matching the safety-first CLI and wire protocol.
+    #[serde(default = "blank_body_default_mode_soft")]
     pub(crate) mode: dormant_core::ipc_proto::BlankRequestMode,
 }
 
-/// HTTP-body default for [`BlankBody::mode`].  Hard so a missing `mode`
-/// field preserves the existing webui "Force blank" behaviour.
-fn blank_body_default_mode_hard() -> dormant_core::ipc_proto::BlankRequestMode {
-    dormant_core::ipc_proto::BlankRequestMode::Hard
+/// HTTP-body default for [`BlankBody::mode`].
+fn blank_body_default_mode_soft() -> dormant_core::ipc_proto::BlankRequestMode {
+    dormant_core::ipc_proto::BlankRequestMode::Soft
 }
 
 #[derive(Deserialize, Debug)]
@@ -568,12 +561,9 @@ mod tests {
         );
     }
 
-    /// `POST /api/blank` with no `mode` field must default to Hard — the
-    /// existing webui has been sending `{"display":...}` without `mode`,
-    /// and the policy in this fix is "do not silently change behaviour of
-    /// existing callers".  Issue #124 — the safe-soft path is opt-in.
+    /// `POST /api/blank` with no `mode` field defaults to the safe Soft path.
     #[tokio::test]
-    async fn blank_legacy_no_mode_defaults_to_hard() {
+    async fn blank_no_mode_defaults_to_soft() {
         let snap = snapshot_with_displays(&["main"]);
         let (ctl_tx, last_msg) = spawn_fake_engine(snap);
         let state = test_web_state(ctl_tx);
@@ -581,8 +571,8 @@ mod tests {
         let body: BlankBody = serde_json::from_str(r#"{"display":"main"}"#).unwrap();
         assert_eq!(
             body.mode,
-            dormant_core::ipc_proto::BlankRequestMode::Hard,
-            "missing mode field must default to Hard so the existing webui behaviour is preserved"
+            dormant_core::ipc_proto::BlankRequestMode::Soft,
+            "missing mode field must default to Soft"
         );
 
         let result = post_blank(State(state), Json(body)).await;
@@ -592,8 +582,8 @@ mod tests {
 
         let msg = last_msg.lock().unwrap().take();
         assert!(
-            matches!(msg, Some(ControlMsg::ForceBlank(ref id)) if id.0 == "main"),
-            "expected ForceBlank(main) for the legacy no-mode frame, got {msg:?}"
+            matches!(msg, Some(ControlMsg::SoftBlank(ref id)) if id.0 == "main"),
+            "expected SoftBlank(main) for the no-mode frame, got {msg:?}"
         );
     }
 

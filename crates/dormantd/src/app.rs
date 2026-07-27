@@ -931,7 +931,7 @@ impl App {
             let (_, lease) = operation_registry
                 .try_acquire(
                     GenerationId(0),
-                    OperationKind::Exercise(DisplayId("mon".into())),
+                    OperationKind::Exercise(DisplayId("other".into())),
                 )
                 .expect("test operation reservation");
             std::mem::forget(lease);

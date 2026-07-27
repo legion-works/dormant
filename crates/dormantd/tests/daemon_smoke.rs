@@ -916,7 +916,10 @@ async fn exercise_during_reload_finishes_or_cancels_before_teardown() {
         cfg_path.clone(),
         dir.path().join("credentials.toml"),
         Strictness::Strict,
-        fake_factory("desk", Vec::new()),
+        fake_factory(
+            "desk",
+            vec![(Duration::from_secs(3), ev("desk", SensorState::Present))],
+        ),
     )
     .unwrap()
     .with_notify_sink_builder(noop_factory)
@@ -1041,6 +1044,20 @@ async fn operation_accepted_by_n_never_mutates_n_plus_1() {
     assert!(first.operation_id.is_some());
     let snapshot = snapshot_with_retry(&handle.control_sender()).await;
     assert!(snapshot.displays.iter().any(|(id, _)| id == "mon"));
+    let (post_tx, post_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Exercise {
+            display: DisplayId("mon".into()),
+            reply: post_tx,
+        })
+        .await
+        .unwrap();
+    let post = tokio::time::timeout(Duration::from_secs(8), post_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(post.operation_id.is_some());
     shutdown(handle, join).await;
 }
 
@@ -1059,7 +1076,13 @@ async fn busy_exercise_timeout_rejects_reload_and_keeps_n_live() {
         cfg_path.clone(),
         dir.path().join("credentials.toml"),
         Strictness::Strict,
-        fake_factory("desk", Vec::new()),
+        fake_factory(
+            "desk",
+            vec![(
+                Duration::from_millis(1500),
+                ev("desk", SensorState::Present),
+            )],
+        ),
     )
     .unwrap()
     .with_notify_sink_builder(noop_factory)
@@ -1086,6 +1109,26 @@ async fn busy_exercise_timeout_rejects_reload_and_keeps_n_live() {
     assert!(matches!(receipt.outcome, ReloadOutcome::Rejected(_)));
     let snapshot = snapshot_with_retry(&handle.control_sender()).await;
     assert!(snapshot.displays.iter().any(|(id, _)| id == "mon"));
+    assert!(
+        snapshot
+            .sensors
+            .iter()
+            .any(|sensor| sensor.id == "desk" && sensor.state == SensorState::Present)
+    );
+    let (post_tx, post_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Exercise {
+            display: DisplayId("mon".into()),
+            reply: post_tx,
+        })
+        .await
+        .unwrap();
+    let post = tokio::time::timeout(Duration::from_secs(8), post_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(post.operation_id.is_some());
     shutdown(handle, join).await;
 }
 

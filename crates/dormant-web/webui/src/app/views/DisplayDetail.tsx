@@ -11,11 +11,9 @@
  * land visibly.
  */
 import { useNavigate } from "../nav";
-import OwnershipPair from "./OwnershipPair";
 import { useCallback, useState, useEffect, useMemo } from "react";
 import {
   Card,
-  HealthChip,
   StatusChip,
   phaseChipLabel,
   useConfirmDialog,
@@ -174,9 +172,6 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
     }
   }, [ruleName]);
 
-  const averagePercent = grid.averageHeat !== null ? Math.round(grid.averageHeat * 100) : null;
-  const uniformityPercent = grid.uniformity !== null ? Math.round(grid.uniformity * 100) : null;
-
   // Compute current time for staleness + seeded/measured split.
   const nowS = useMemo(() => Math.floor(Date.now() / 1000), []);
   const legendGradient = useMemo(() => heatRampGradient(), []);
@@ -184,8 +179,6 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
   const measuredHours = seededHours != null
     ? Math.max(0, (wear?.total_on_hours ?? 0) - seededHours)
     : (wear?.total_on_hours ?? 0);
-  const isStale = wear?.last_sample_at_epoch_s != null
-    && (nowS - wear.last_sample_at_epoch_s) > 10 * 3600; // 10h default heuristic
 
   return (
     <div className="display-detail">
@@ -203,47 +196,41 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
         )}
       </div>
 
-      {/* ── 1. Control ── */}
-      <section id="control" className="display-detail__section">
-        <h2 className="display-detail__section-title">Control</h2>
+      {/* Two-column: CONTROL (left) + HEALTH (right) — screens/04 */}
+      <div className="display-detail__top-row">
+        {/* CONTROL */}
         <Card>
-          <div className="display-detail__facts">
-            <div className="display-detail__fact">
-              <div className="display-detail__fact-label">Phase</div>
-              <div className="display-detail__fact-value">{snapshot.phase}</div>
-            </div>
-            {snapshot.stage && (
-              <div className="display-detail__fact">
-                <div className="display-detail__fact-label">Stage</div>
-                <div className="display-detail__fact-value">
-                  {snapshot.stage.idx + 1}/{snapshot.stage.kind.replace(/_/g, " ")}
-                </div>
-              </div>
-            )}
-            <div className="display-detail__fact">
-              <div className="display-detail__fact-label">Cmd gen</div>
-              <div className="display-detail__fact-value">{snapshot.cmd_gen}</div>
-            </div>
-            <div className="display-detail__fact">
-              <div className="display-detail__fact-label">Blank mode</div>
-              <div className="display-detail__fact-value">{blankModeLabel(config?.blank_mode)}</div>
+          <div className="display-detail__eyebrow">Control</div>
+          <StatusChip kind={snapshot.phase} label={phaseChipLabel(snapshot.phase, snapshot.stage)} />
+          <span className="display-detail__cmd-gen">cmd gen {snapshot.cmd_gen}</span>
+
+          {/* State box */}
+          <div className={`display-detail__state-box${snapshot.phase === "active" ? " display-detail__state-box--active" : ""}`}>
+            {snapshot.phase === "active" ? "● ON" : "○ OFF"}
+          </div>
+
+          {/* Fact rows */}
+          <div className="display-detail__fact-rows">
+            <div className="display-detail__fact-row">
+              <span className="display-detail__fact-label">Blank mode</span>
+              <span className="display-detail__fact-value">{blankModeLabel(config?.blank_mode)}</span>
             </div>
             {config?.degraded_mode && (
-              <div className="display-detail__fact">
-                <div className="display-detail__fact-label">Degraded mode</div>
-                <div className="display-detail__fact-value">{blankModeLabel(config.degraded_mode)}</div>
+              <div className="display-detail__fact-row">
+                <span className="display-detail__fact-label">Degraded</span>
+                <span className="display-detail__fact-value">{blankModeLabel(config.degraded_mode)}</span>
               </div>
             )}
-            <div className="display-detail__fact">
-              <div className="display-detail__fact-label">Driven by</div>
-              <div className="display-detail__fact-value">
+            <div className="display-detail__fact-row">
+              <span className="display-detail__fact-label">Driven by</span>
+              <span className="display-detail__fact-value">
                 {rule ? `${rule.zone} → ${rule.rule}` : "—"}
-              </div>
+              </span>
             </div>
             {config?.ladder && config.ladder.length > 0 && (
-              <div className="display-detail__fact">
-                <div className="display-detail__fact-label">Ladder</div>
-                <div className="display-detail__fact-value">{ladderLabel(config.ladder)}</div>
+              <div className="display-detail__fact-row">
+                <span className="display-detail__fact-label">Ladder</span>
+                <span className="display-detail__fact-value">{ladderLabel(config.ladder)}</span>
               </div>
             )}
           </div>
@@ -260,82 +247,85 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
 
           {!dialog && (
             <div className="display-detail__controls">
-              <button
-                type="button"
-                className="display-detail__action display-detail__action--blank"
-                onClick={() => void handleBlank()}
-              >
+              <button type="button" className="display-detail__action" onClick={() => void handleBlank()}>
                 Force blank
               </button>
-              <button
-                type="button"
-                className="display-detail__action display-detail__action--wake"
-                onClick={() => void handleWake()}
-              >
+              <button type="button" className="display-detail__action display-detail__action--wake" onClick={() => void handleWake()}>
                 Force wake
               </button>
               {snapshot.paused ? (
-                <button
-                  type="button"
-                  className="display-detail__action display-detail__action--resume"
-                  onClick={() => void handleResume()}
-                  disabled={!ruleName}
-                >
+                <button type="button" className="display-detail__action display-detail__action--resume" onClick={() => void handleResume()} disabled={!ruleName}>
                   Resume rule
                 </button>
               ) : (
-                <button
-                  type="button"
-                  className="display-detail__action display-detail__action--pause"
-                  onClick={() => void handlePause()}
-                  disabled={!ruleName}
-                >
+                <button type="button" className="display-detail__action display-detail__action--pause" onClick={() => void handlePause()} disabled={!ruleName}>
                   Pause rule
                 </button>
               )}
             </div>
           )}
-        </Card>
-      </section>
 
-      {/* ── 2. Sharing (shared displays only) ── */}
-      {isShared && (
-        <section id="sharing" className="display-detail__section">
-          <h2 className="display-detail__section-title">Sharing</h2>
-          <Card>
-            <OwnershipPair
-              displayId={id}
-              snap={snapshot}
-              config={config}
-              size="compact"
-            />
+          {/* Sharing link (shared displays only) */}
+          {isShared && (
             <div className="display-detail__sharing-link">
-              <button
-                type="button"
-                className="display-detail__link-btn"
-                onClick={() => navigate("switching")}
-              >
+              <button type="button" className="display-detail__link-btn" onClick={() => navigate("switching")}>
                 open Switching →
               </button>
             </div>
-          </Card>
-        </section>
-      )}
+          )}
+        </Card>
 
-      {/* ── 3. Wear ── */}
-      <section id="wear" className="display-detail__section">
-        <h2 className="display-detail__section-title">Wear</h2>
-        {wear ? (
-          <div className="display-detail__wear-grid">
-            <Card className="display-detail__heat-card">
+        {/* HEALTH */}
+        <Card>
+          <div className="display-detail__eyebrow">Health</div>
+          <span className="display-detail__health-meta">controller chain · fallback order</span>
+
+          {/* Controller chain rows */}
+          <div className="display-detail__controllers-list">
+            {snapshot.controllers.length > 0 ? (
+              snapshot.controllers.map((c) => (
+                <div key={c.name} className={`display-detail__controller-row${c.healthy ? "" : " display-detail__controller-row--failing"}`}>
+                  <span className={`display-detail__controller-dot${c.healthy ? " display-detail__controller-dot--healthy" : " display-detail__controller-dot--failing"}`} />
+                  <div className="display-detail__controller-info">
+                    <span className="display-detail__controller-name">{c.name}</span>
+                    {!c.healthy && c.detail && (
+                      <span className="display-detail__controller-detail">{c.detail}</span>
+                    )}
+                    {c.healthy && (
+                      <span className="display-detail__controller-detail">primary · last attempt succeeded</span>
+                    )}
+                  </div>
+                  <span className={`display-detail__controller-status${c.healthy ? " display-detail__controller-status--ok" : " display-detail__controller-status--fail"}`}>
+                    {c.healthy ? "healthy" : "failing"}
+                  </span>
+                </div>
+              ))
+            ) : (
+              <div className="display-detail__metric display-detail__metric--muted">
+                no blank/wake attempts recorded yet
+              </div>
+            )}
+          </div>
+
+          {/* Exercise runner */}
+          <div className="display-detail__exercise">
+            <ExerciseRunner display={id} compact />
+          </div>
+        </Card>
+      </div>
+
+      {/* PANEL EXPOSURE — full width below */}
+      {wear ? (
+        <Card className="display-detail__exposure-card">
+          <div className="display-detail__exposure-layout">
+            <div className="display-detail__exposure-heat">
               <div className="display-detail__heat-header">
                 <div>
-                  <div className="display-detail__eyebrow">Panel wear heat map</div>
+                  <div className="display-detail__eyebrow">Panel exposure</div>
                   <div className="display-detail__heat-caption">
-                    {grid.cols}×{grid.rows} grid · per-cell brightness-weighted on-hours
+                    {grid.cols}×{grid.rows} grid · brightness-weighted on-hours
                   </div>
                 </div>
-                <span className="display-detail__panel-chip">{panelTypeLabel(wear.panel_type)}</span>
               </div>
 
               <div className="display-detail__heat-map-wrap">
@@ -344,152 +334,67 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
 
               {grid.hasGridSamples || grid.hasHeatSamples ? (
                 <div className="display-detail__legend">
-                  <span className="display-detail__legend-label">low</span>
-                  <div
-                    className="display-detail__legend-bar"
-                    style={{ background: legendGradient }}
-                  />
-                  <span className="display-detail__legend-label">high</span>
+                  <span className="display-detail__legend-label">cool</span>
+                  <div className="display-detail__legend-bar" style={{ background: legendGradient }} />
+                  <span className="display-detail__legend-label">hot</span>
                 </div>
               ) : null}
+            </div>
 
-              <div className="display-detail__honesty-note">
-                v1 attribution is panel-wide and advisory — spatial variation appears only once
-                per-region sampling ships.
-              </div>
-            </Card>
+            <div className="display-detail__exposure-stats">
+              <span className="display-detail__panel-chip">{panelTypeLabel(wear.panel_type)}</span>
+              <StatusChip kind={wear.advisory ? "wear_advisory" : "ok"} label={wear.advisory ? "advisory" : "no advisory"} />
 
-            <Card className="display-detail__exposure-card">
-              <div className="display-detail__eyebrow">Exposure summary</div>
-              <div className="display-detail__tiles">
-                {seededHours != null ? (
+              <div className="display-detail__exposure-rows">
+                <div className="display-detail__exposure-row">
+                  <span className="display-detail__exposure-label">Total on-hours</span>
+                  <span className="display-detail__exposure-value">{wear.total_on_hours.toFixed(0)}</span>
+                </div>
+                {seededHours != null && (
                   <>
-                    <div className="display-detail__tile">
-                      <div className="display-detail__tile-label">Seeded from panel</div>
-                      <div className="display-detail__tile-value">{seededHours}h</div>
+                    <div className="display-detail__exposure-row">
+                      <span className="display-detail__exposure-label">Seeded from panel</span>
+                      <span className="display-detail__exposure-value">{seededHours}</span>
+                      <span className="display-detail__exposure-hint">VCP 0xC0</span>
                     </div>
-                    <div className="display-detail__tile">
-                      <div className="display-detail__tile-label">dormant-measured</div>
-                      <div className="display-detail__tile-value">{measuredHours.toFixed(1)}h</div>
+                    <div className="display-detail__exposure-row">
+                      <span className="display-detail__exposure-label">dormant-measured</span>
+                      <span className="display-detail__exposure-value">{measuredHours.toFixed(0)}</span>
                     </div>
                   </>
-                ) : (
-                  <div className="display-detail__tile">
-                    <div className="display-detail__tile-label">Total on-hours</div>
-                    <div className="display-detail__tile-value">{wear.total_on_hours.toFixed(1)}h</div>
-                  </div>
                 )}
-                <div className="display-detail__tile">
-                  <div className="display-detail__tile-label">Samples</div>
-                  <div className="display-detail__tile-value">{wear.sample_count.toLocaleString()}</div>
+                <div className="display-detail__exposure-row">
+                  <span className="display-detail__exposure-label">Samples</span>
+                  <span className="display-detail__exposure-value">{wear.sample_count.toLocaleString()}</span>
                 </div>
-                <div className={`display-detail__tile${isStale ? " display-detail__tile--warning" : ""}`}>
-                  <div className="display-detail__tile-label">Last sample</div>
-                  <div className="display-detail__tile-value">
+                <div className="display-detail__exposure-row">
+                  <span className="display-detail__exposure-label">Last sample</span>
+                  <span className="display-detail__exposure-value">
                     {relativeTime(wear.last_sample_at_epoch_s, nowS)}
-                  </div>
+                  </span>
                 </div>
-                {isStale && (
-                  <div className="display-detail__stale-warning">
-                    ledger may be stale — check wear.enabled and the panel read path
-                  </div>
-                )}
-                <div className={`display-detail__tile${wear.advisory ? " display-detail__tile--warning" : ""}`}>
-                  <div className="display-detail__tile-label">Since long-dwell</div>
-                  <div className="display-detail__tile-value">
-                    {Math.floor(wear.hours_since_long_dwell / 24)}d
-                  </div>
+                <div className="display-detail__exposure-row">
+                  <span className="display-detail__exposure-label">Since long dwell</span>
+                  <span className="display-detail__exposure-value">{Math.floor(wear.hours_since_long_dwell / 24)}d</span>
+                  <span className="display-detail__exposure-hint">advisory at 48h</span>
                 </div>
-                <div className="display-detail__tile">
-                  <div className="display-detail__tile-label">Panel type</div>
-                  <div className="display-detail__tile-value">{panelTypeLabel(wear.panel_type)}</div>
-                </div>
-                <div className={`display-detail__tile${wear.advisory ? " display-detail__tile--warning" : " display-detail__tile--success"}`}>
-                  <div className="display-detail__tile-label">Advisory</div>
-                  <div className="display-detail__tile-value">{wear.advisory ? "Active" : "Clear"}</div>
-                </div>
-                {grid.hasHeatSamples && averagePercent !== null && uniformityPercent !== null ? (
-                  <>
-                    <div className="display-detail__tile">
-                      <div className="display-detail__tile-label">Average hotness</div>
-                      <div className="display-detail__tile-value">{averagePercent}%</div>
-                    </div>
-                    <div className="display-detail__tile">
-                      <div className="display-detail__tile-label">Uniformity</div>
-                      <div className="display-detail__tile-value">{uniformityPercent}%</div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="display-detail__metric display-detail__metric--muted">
-                    Heat metrics unavailable — no valid samples.
-                  </div>
-                )}
-              </div>
-            </Card>
-          </div>
-        ) : (
-          <Card>
-            {wearError ? (
-              <div className="display-detail__metric display-detail__metric--danger">
-                panel exposure unavailable — {wearError}
-              </div>
-            ) : (
-              /* Always render the heat map so the empty-sample state is shown. */
-              <div className="display-detail__heat-map-wrap">
-                <WearHeatMap display={id} grid={grid} />
-              </div>
-            )}
-          </Card>
-        )}
-      </section>
-
-      {/* ── 4. Health ── */}
-      <section id="health" className="display-detail__section">
-        <h2 className="display-detail__section-title">Health</h2>
-        <Card>
-          <div className="display-detail__facts">
-            {snapshot.last_blank_failed && (
-              <div className="display-detail__fact">
-                <div className="display-detail__fact-label">Last blank</div>
-                <div className="display-detail__fact-value display-detail__fact-value--danger">
-                  failed
-                </div>
-              </div>
-            )}
-            <div className="display-detail__fact">
-              <div className="display-detail__fact-label">Wake attempts</div>
-              <div className="display-detail__fact-value">{snapshot.wake_attempts ?? 0}</div>
-            </div>
-          </div>
-
-          {snapshot.controllers.length > 0 && (
-            <div className="display-detail__controllers">
-              <div className="display-detail__controllers-label">Controller chain (fallback order)</div>
-              <div className="display-detail__controllers-list">
-                {snapshot.controllers.map((c) => (
-                  <div key={c.name} className="display-detail__controller">
-                    <HealthChip health={c} />
-                    {!c.healthy && c.detail && (
-                      <span className="display-detail__controller-detail">{c.detail}</span>
-                    )}
-                  </div>
-                ))}
               </div>
             </div>
-          )}
-
-          {snapshot.controllers.length === 0 && (
-            <div className="display-detail__metric display-detail__metric--muted">
-              no blank/wake attempts recorded yet
-            </div>
-          )}
-
-          {/* Exercise runner — pre-bound to this display, same component as Doctor. */}
-          <div className="display-detail__exercise">
-            <ExerciseRunner display={id} compact />
           </div>
         </Card>
-      </section>
+      ) : (
+        <Card>
+          {wearError ? (
+            <div className="display-detail__metric display-detail__metric--danger">
+              panel exposure unavailable — {wearError}
+            </div>
+          ) : (
+            <div className="display-detail__heat-map-wrap">
+              <WearHeatMap display={id} grid={grid} />
+            </div>
+          )}
+        </Card>
+      )}
 
       {dialog}
     </div>

@@ -1,5 +1,13 @@
 /* Global resets + base styles.
-   DS tokens (colors, fonts, spacing) are loaded via src/ds.css. */
+   DS tokens (colors, fonts, spacing) are loaded via src/ds.css.
+
+   The DS type scale uses rem units with a 16px design base.
+   Lock the root so the entire cascade is predictable regardless
+   of user-agent or browser-zoom defaults. */
+
+html {
+  font-size: 16px;
+}
 
 *,
 *::before,

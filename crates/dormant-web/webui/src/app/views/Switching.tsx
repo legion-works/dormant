@@ -66,7 +66,7 @@ export default function Switching() {
 
         return (
           <div key={displayId} className="switching-block">
-            {/* Ownership pair — full size */}
+            {/* Ownership panel — full width */}
             <OwnershipPair
               displayId={displayId}
               snap={snap}
@@ -75,7 +75,7 @@ export default function Switching() {
               size="full"
             />
 
-            {/* Pull/push controls */}
+            {/* Pull/push controls — action bar below ownership */}
             <SwitchState
               displayId={displayId}
               switchCapable={kvm.switch_capable_displays.includes(displayId)}
@@ -87,65 +87,81 @@ export default function Switching() {
               coordination={coordination}
             />
 
-            {/* How it switches — deep-linked to config fields */}
-            <div className="switching-how">
-              <h3 className="switching-section-title">HOW IT SWITCHES</h3>
+            {/* Two-column grid: How it switches (left) + Hooks (right) — screens/02 */}
+            <div className="switching-two-col">
+              {/* How it switches — deep-linked to config fields */}
+              <div className="switching-how">
+                <h3 className="switching-section-title">How it switches</h3>
 
-              <div className="switching-row">
-                <span className="switching-row__label">Activity follow</span>
-                <span className={`switching-row__value${kvm.activity_following ? " switching-row__value--on" : ""}`}>
-                  {kvm.activity_following ? "● on" : "○ off"}
-                </span>
-                {coordination && (
-                  <span className="switching-row__detail">
-                    arm {coordination.arm_after ?? "7s"} · cooldown {coordination.cooldown ?? "3s"}
+                <div className="switching-row">
+                  <div className="switching-row__left">
+                    <span className="switching-row__label">Activity follow</span>
+                    <span className="switching-row__detail">
+                      arm {coordination?.arm_after ?? "7s"} · cooldown {coordination?.cooldown ?? "3s"}
+                    </span>
+                  </div>
+                  <span className={`switching-row__value${kvm.activity_following ? " switching-row__value--on" : ""}`}>
+                    {kvm.activity_following ? (
+                      <><span className="switching-row__dot switching-row__dot--on" />on</>
+                    ) : (
+                      "off"
+                    )}
                   </span>
-                )}
-                <a className="switching-row__edit" href="#/config/switching#coordination.activity_follow">edit</a>
+                  <a className="switching-row__edit" href="#/config/switching#coordination.activity_follow">edit</a>
+                </div>
+
+                <div className="switching-row">
+                  <div className="switching-row__left">
+                    <span className="switching-row__label">Claim hotkey</span>
+                    <span className="switching-row__detail">
+                      registered by the tray
+                    </span>
+                  </div>
+                  <span className="switching-row__value">
+                    {kvm.keymap?.claim_hotkey ? (
+                      <kbd>{kvm.keymap.claim_hotkey}</kbd>
+                    ) : (
+                      "not bound"
+                    )}
+                  </span>
+                  <a className="switching-row__edit" href="#/config/switching#keymap.claim_hotkey">edit</a>
+                </div>
+
+                <div className="switching-row">
+                  <div className="switching-row__left">
+                    <span className="switching-row__label">Ownership poll</span>
+                    <span className="switching-row__detail">
+                      every {coordination?.poll_interval ?? "2s"} · {coordination?.loss_confirmations ?? 3} agreeing reads to flip
+                    </span>
+                  </div>
+                  <span className="switching-row__detail switching-row__extra">
+                    ~{(coordination?.poll_interval ? parseInt(coordination.poll_interval, 10) * (coordination?.loss_confirmations ?? 3) : 6)}s handoff
+                  </span>
+                  <a className="switching-row__edit" href="#/config/switching#coordination.poll_interval">edit</a>
+                </div>
+
+                <div className="switching-row">
+                  <div className="switching-row__left">
+                    <span className="switching-row__label">Ignored devices</span>
+                    <span className="switching-row__detail">
+                      {config?.inventory?.input_filter?.ignore_devices?.length
+                        ? `${config.inventory.input_filter.ignore_devices.length} globs`
+                        : "none"}
+                    </span>
+                  </div>
+                  <a className="switching-row__edit" href="#/config/switching#input_filter.ignore_devices">edit</a>
+                </div>
               </div>
 
-              <div className="switching-row">
-                <span className="switching-row__label">Claim hotkey</span>
-                <span className="switching-row__value">
-                  {kvm.keymap?.claim_hotkey ? (
-                    <kbd>{kvm.keymap.claim_hotkey}</kbd>
-                  ) : (
-                    "not bound"
-                  )}
-                </span>
-                <a className="switching-row__edit" href="#/config/switching#keymap.claim_hotkey">edit</a>
-              </div>
-
-              <div className="switching-row">
-                <span className="switching-row__label">Ownership poll</span>
-                <span className="switching-row__value">
-                  every {coordination?.poll_interval ?? "2s"} · {coordination?.loss_confirmations ?? 3} agreeing reads to flip
-                </span>
-                <a className="switching-row__edit" href="#/config/switching#coordination.poll_interval">edit</a>
-              </div>
-
-              <div className="switching-row">
-                <span className="switching-row__label">Panel state poll</span>
-                <span className="switching-row__value">
-                  every {coordination?.state_poll_interval ?? `max(30s, ${coordination?.poll_interval ?? "2s"})`}
-                  {(coordination?.state_poll_interval == null) && " (default: max(30s, poll_interval))"}
-                </span>
-                <a className="switching-row__edit" href="#/config/switching#coordination.state_poll_interval">edit</a>
-              </div>
-
-              <div className="switching-row">
-                <span className="switching-row__label">Ignored devices</span>
-                <span className="switching-row__value">
-                  {config?.inventory?.input_filter?.ignore_devices?.length
-                    ? `${config.inventory.input_filter.ignore_devices.length} globs`
-                    : "none"}
-                </span>
-                <a className="switching-row__edit" href="#/config/switching#input_filter.ignore_devices">edit</a>
+              {/* Hooks inspector (read-only) */}
+              <div className="switching-hooks">
+                <div className="switching-hooks__header">
+                  <span className="switching-section-title">Hooks</span>
+                  <span className="switching-hooks__meta">read-only</span>
+                </div>
+                <HooksInspector hooks={dc?.hooks} displayId={displayId} />
               </div>
             </div>
-
-            {/* Hooks inspector (W1-4 read-only) */}
-            <HooksInspector hooks={dc?.hooks} displayId={displayId} />
           </div>
         );
       })}

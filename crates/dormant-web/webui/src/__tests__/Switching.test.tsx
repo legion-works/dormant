@@ -82,7 +82,7 @@ describe("Switching", () => {
   it("renders ownership block for switch-capable display", () => {
     renderSwitching();
     expect(screen.getByText("shared_oled")).toBeInTheDocument();
-    expect(screen.getByText("HOW IT SWITCHES")).toBeInTheDocument();
+    expect(screen.getByText("How it switches")).toBeInTheDocument();
     // Deep links are present.
     expect(screen.getAllByText("edit").length).toBeGreaterThanOrEqual(4);
   });

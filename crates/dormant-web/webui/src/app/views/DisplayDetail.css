@@ -1,4 +1,4 @@
-/* Display detail view — single-column, section-anchored layout.
+/* Display detail view — v3 fidelity: side-by-side CONTROL|HEALTH + PANEL EXPOSURE below.
    All colors use DS tokens; no hardcoded hex/rgba. */
 
 .display-detail {
@@ -6,6 +6,168 @@
   flex-direction: column;
   gap: 16px;
   animation: ddRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+/* Two-column top row: CONTROL (left) + HEALTH (right) — screens/04 */
+.display-detail__top-row {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+/* State box — large centered badge */
+.display-detail__state-box {
+  height: 96px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin: 10px 0 14px;
+}
+.display-detail__state-box--active {
+  border-color: color-mix(in oklab, var(--success) 26%, transparent);
+  background: linear-gradient(160deg, color-mix(in oklab, var(--success) 12%, transparent), transparent 70%), var(--bg-sunken);
+  color: var(--success);
+}
+
+.display-detail__cmd-gen {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+
+.display-detail__fact-rows {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.display-detail__fact-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.display-detail__health-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+
+.display-detail__controller-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  border-left: 2px solid var(--success);
+  margin-bottom: 8px;
+}
+.display-detail__controller-row--failing {
+  border-left-color: var(--danger);
+}
+.display-detail__controller-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.display-detail__controller-dot--healthy {
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+.display-detail__controller-dot--failing {
+  background: var(--danger);
+  box-shadow: 0 0 6px var(--danger);
+}
+.display-detail__controller-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+}
+.display-detail__controller-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-body);
+}
+.display-detail__controller-status {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 4px 9px;
+  border-radius: var(--radius-pill);
+  flex-shrink: 0;
+}
+.display-detail__controller-status--ok {
+  color: var(--success);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+}
+.display-detail__controller-status--fail {
+  color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 13%, transparent);
+}
+
+/* Panel exposure layout: heat map (left) + stats (right) */
+.display-detail__exposure-layout {
+  display: flex;
+  gap: 24px;
+}
+.display-detail__exposure-heat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: none;
+}
+.display-detail__exposure-stats {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+.display-detail__exposure-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.display-detail__exposure-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+}
+.display-detail__exposure-row:first-child {
+  border-top: none;
+}
+.display-detail__exposure-label {
+  width: 170px;
+  flex-shrink: 0;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.display-detail__exposure-value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-body);
+}
+.display-detail__exposure-hint {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
 }
 
 .display-detail__back {

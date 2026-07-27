@@ -144,6 +144,18 @@ pub(crate) async fn post_apply(
         return Err(WebError::EntityCrudFeatureDisabled);
     }
 
+    // ── Step 2c: hook_edit_enabled gate (BG-6) ──────────────────────────
+    // Reject any Set/Remove whose path contains a `hooks` segment when
+    // the flag is off — the UI hides the affordance but the server is
+    // the boundary (same doctrine as entity_crud_enabled).
+    let wants_hook_edit = body.patches.iter().any(|p| match p {
+        Patch::Set { path, .. } | Patch::Remove { path } => path.iter().any(|s| s == "hooks"),
+        _ => false,
+    });
+    if wants_hook_edit && !cfg.daemon.hook_edit_enabled {
+        return Err(WebError::HookEditDisabled);
+    }
+
     // ── Step 3: redact for redacted-path checking ──────────────────────
     let redacted = redact_config_secrets(&mut cfg);
 

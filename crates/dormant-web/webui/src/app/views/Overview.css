@@ -281,6 +281,33 @@
   cursor: not-allowed;
 }
 
+.panel-tile__action-chip--wake {
+  color: var(--success);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+  border-color: color-mix(in oklab, var(--success) 42%, transparent);
+}
+.panel-tile__action-chip--wake:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--success) 20%, transparent);
+}
+
+.panel-tile__action-chip--pull {
+  color: var(--success);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+  border-color: color-mix(in oklab, var(--success) 42%, transparent);
+}
+.panel-tile__action-chip--pull:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--success) 20%, transparent);
+}
+
+.panel-tile__action-chip--push {
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 10%, transparent);
+  border-color: var(--border-accent);
+}
+.panel-tile__action-chip--push:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+}
+
 .panel-tile__error {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -487,7 +514,7 @@
 /* ── Recent activity ─────────────────────────────────────────────── */
 .recent-row {
   display: grid;
-  grid-template-columns: 82px 118px 1fr;
+  grid-template-columns: 82px minmax(118px, max-content) 1fr;
   align-items: center;
   gap: 14px;
   padding: 9px 16px;

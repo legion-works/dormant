@@ -331,12 +331,17 @@ describe("Displays", () => {
     expect(screen.getByText("office-rule · office")).toBeInTheDocument();
   });
 
-  it("shared force blank has affects-all copy", () => {
+  it("shared force blank has affects-all copy in confirm dialog", async () => {
     renderDisplayCard("shared-tv", sharedDisplay(), { scope: "shared" });
 
-    expect(screen.getByRole("button", {
-      name: "Blank shared panel — affects all connected machines",
-    })).toBeInTheDocument();
+    // Button always says "Force blank"; the shared warning moved to the confirm dialog.
+    const btn = screen.getByRole("button", { name: "Force blank" });
+    expect(btn).toBeInTheDocument();
+    // Clicking opens the confirm dialog with the shared-blank warning.
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(screen.getByRole("alertdialog", { name: /Force blank shared-tv/ })).toBeInTheDocument();
+    });
   });
 
   it("renders basic private panel label and action buttons without KVM controls", () => {

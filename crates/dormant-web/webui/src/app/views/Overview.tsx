@@ -337,34 +337,34 @@ function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }:
           onClick={() => void runAction("blank")}
           disabled={inFlight != null}
         >
-          {inFlight === "blank" ? "Blanking\u2026" : "Blank"}
+          {inFlight === "blank" ? "Blanking…" : "Blank"}
         </button>
         <button
           type="button"
-          className="panel-tile__action-chip"
+          className="panel-tile__action-chip panel-tile__action-chip--wake"
           onClick={() => void runAction("wake")}
           disabled={inFlight != null}
         >
-          {inFlight === "wake" ? "Waking\u2026" : "Wake"}
+          {inFlight === "wake" ? "Waking…" : "Wake"}
         </button>
         {canPull && (
           <button
             type="button"
-            className="panel-tile__action-chip"
+            className="panel-tile__action-chip panel-tile__action-chip--pull"
             onClick={() => void runAction("pull")}
             disabled={inFlight != null}
           >
-            {inFlight === "pull" ? "Pulling\u2026" : "Pull"}
+            {inFlight === "pull" ? "Pulling…" : "Pull"}
           </button>
         )}
         {canPush && (
           <button
             type="button"
-            className="panel-tile__action-chip"
+            className="panel-tile__action-chip panel-tile__action-chip--push"
             onClick={() => void runAction("push")}
             disabled={inFlight != null}
           >
-            {inFlight === "push" ? "Pushing\u2026" : "Push"}
+            {inFlight === "push" ? "Pushing…" : "Push"}
           </button>
         )}
       </div>
@@ -428,7 +428,7 @@ export default function Overview() {
     return t;
   };
 
-  const recentSlice = events.slice(0, 6);
+  const recentSlice = events.filter((se) => (se.event as { event: string }).event !== "_history_separator").slice(0, 6);
 
   const displayRulesMap: Record<string, { rule: string; zone: string }> = displayRules;
 

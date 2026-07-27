@@ -19,9 +19,15 @@
 .display-detail__top-row .dormant-card {
   display: flex;
   flex-direction: column;
+  padding: 16px 18px;
 }
 .display-detail__top-row .dormant-card .display-detail__controls {
   margin-top: auto;
+}
+
+/* Status chips inline (not full-width bars) */
+.display-detail__top-row .status-chip {
+  align-self: flex-start;
 }
 
 /* State box — large centered badge */

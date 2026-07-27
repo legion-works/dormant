@@ -36,9 +36,14 @@ export interface DisplayDetailProps {
   onBack: () => void;
 }
 
-function blankModeLabel(mode: string | undefined): string {
-  if (!mode) return "—";
-  return mode.split("_").map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
+function blankModeLabel(mode: string | undefined, ladder?: DisplayConfig["ladder"]): string {
+  if (mode) return mode.split("_").map((w) => w[0].toUpperCase() + w.slice(1)).join(" ");
+  // When blank_mode is unset because a ladder is configured, show the last stage.
+  if (ladder && ladder.length > 0) {
+    const last = ladder[ladder.length - 1];
+    return last.kind.replace(/_/g, " ");
+  }
+  return "power off"; // daemon default when nothing is configured
 }
 
 const PANEL_TYPE_LABELS: Record<PanelType, string> = {
@@ -213,7 +218,7 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
           <div className="display-detail__fact-rows">
             <div className="display-detail__fact-row">
               <span className="display-detail__fact-label">Blank mode</span>
-              <span className="display-detail__fact-value">{blankModeLabel(config?.blank_mode)}</span>
+              <span className="display-detail__fact-value">{blankModeLabel(config?.blank_mode, config?.ladder)}</span>
             </div>
             {config?.degraded_mode && (
               <div className="display-detail__fact-row">

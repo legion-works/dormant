@@ -83,9 +83,18 @@ pub(crate) struct WearDetail {
     /// Raw per-cell brightness-weighted on-hours, row-major,
     /// length `grid_rows * grid_cols`.
     pub(crate) cells: Vec<f64>,
-    /// Min-max normalized per-cell heat (`0.0..=1.0`), row-major, same
-    /// length as `cells` — see [`WearLedger::heat_map`].
+    /// Zero-max normalized per-cell heat (`0.0..=1.0`), row-major, same
+    /// length as `cells` — see [`WearLedger::heat_map`]. The denominator
+    /// is `max_cell_hours` below, so the client can derive real on-hours
+    /// from `heat * max_cell_hours` if needed; we expose the absolute
+    /// `cells` separately so the UI never has to.
     pub(crate) heat: Vec<f32>,
+    /// Maximum per-cell on-hours in the grid — the denominator the heat
+    /// map was normalized against. `0.0` when no cell has any recorded
+    /// exposure (i.e. the heat map is also all-zero — the "no data"
+    /// signal). Exposed so the legend can label real hours instead of
+    /// inferring them from the normalized heat.
+    pub(crate) max_cell_hours: f64,
 }
 
 /// Current wall-clock time as epoch seconds; `0` if the clock is somehow
@@ -175,7 +184,12 @@ pub(crate) async fn get_wear_detail(
         .ok_or_else(|| WebError::UnknownDisplay(display.clone()))?;
 
     let summary = summarize(&display, ledger, advisory_after, now);
-    let cells = ledger.cells.iter().map(|c| c.wear_hours).collect();
+    let cells: Vec<f64> = ledger.cells.iter().map(|c| c.wear_hours).collect();
+    // Compute the max once and reuse it: it's the denominator the
+    // heat map was normalized against, AND it's what the legend
+    // labels (a single fold keeps the value bit-identical to the
+    // heat map's own max computation — see `heat_map`).
+    let max_cell_hours = cells.iter().copied().fold(0.0_f64, f64::max);
     let heat = ledger.heat_map();
 
     Ok(Json(WearDetail {
@@ -184,6 +198,7 @@ pub(crate) async fn get_wear_detail(
         grid_cols: ledger.grid_cols,
         cells,
         heat,
+        max_cell_hours,
     }))
 }
 
@@ -466,6 +481,53 @@ mod tests {
             "heat length must equal rows*cols"
         );
         assert_eq!(detail.summary.display, "panel-a");
+    }
+
+    // T11 (#108): the detail response carries BOTH the raw absolute
+    // `cells` (clients still need real on-hours, not a normalized
+    // value) AND the new `max_cell_hours` field (so the UI legend can
+    // label real hours instead of inferring them from the normalized
+    // heat). Pinning the coexistence here so a future refactor that
+    // drops one or the other breaks the test, not the dashboard.
+    #[tokio::test]
+    async fn get_wear_detail_response_includes_cells_heat_and_max_cell_hours() {
+        let now = now_epoch_s();
+        // Hand-built cells so the maximum is an exact, predictable
+        // value (4.0) — attribute_uniform would put the same number
+        // in every cell, which is a degenerate max for this check.
+        let mut ledger = WearLedger::new(
+            WearIdentity {
+                key: "panel-mix".to_string(),
+                display_name: "Mixed Panel".to_string(),
+                config_display_id: None,
+            },
+            PanelType::QdOled,
+            1,
+            3,
+            now,
+        );
+        ledger.cells[0].wear_hours = 0.0;
+        ledger.cells[1].wear_hours = 2.0;
+        ledger.cells[2].wear_hours = 4.0;
+
+        let mut wear = HashMap::new();
+        wear.insert("panel-mix".to_string(), ledger);
+        let state = test_state_with(wear, WearConfig::default(), BIND);
+
+        let result = get_wear_detail(State(state), Path("panel-mix".to_string())).await;
+        let Json(detail) = result.expect("known display must resolve");
+
+        // absolute hours preserved (clients still need this)
+        assert_eq!(detail.cells, vec![0.0, 2.0, 4.0]);
+        // zero-max normalized heat (varied grid starting at 0 reads the
+        // same as the old min-max form: 0, 0.5, 1)
+        assert_eq!(detail.heat, vec![0.0, 0.5, 1.0]);
+        // max_cell_hours exposes the denominator the legend needs
+        assert!(
+            (detail.max_cell_hours - 4.0).abs() < 1e-9,
+            "max_cell_hours must equal the max of `cells` (4.0), got {}",
+            detail.max_cell_hours
+        );
     }
 
     #[tokio::test]

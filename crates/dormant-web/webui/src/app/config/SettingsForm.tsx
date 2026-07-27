@@ -28,6 +28,7 @@ import HooksInspector from "./HooksInspector";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled, isHookEditEnabled } from "./entityCrud";
+import RollbackRecoveryCard from "./RollbackRecoveryCard";
 
 /** Config sub-tab — the five form-bearing tabs (raw is handled by Config.tsx, SettingsForm renders nothing for it). */
 export type ConfigFormTab = "daemon" | "presence" | "displays" | "switching" | "protection" | "raw";
@@ -380,6 +381,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
             onDirty={onDirty}
             fieldErrors={fieldErrors}
           />
+          <RollbackRecoveryCard />
         </>
       )}
 

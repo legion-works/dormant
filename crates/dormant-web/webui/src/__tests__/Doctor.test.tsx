@@ -292,7 +292,7 @@ describe("Doctor", () => {
         snapshot: {
           sensors: [],
           zones: [],
-          displays: [["studio", { display_id: "studio", phase: "active", blank: false, inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
+          displays: [["studio", { phase: "active", inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
           pending_reload: null,
         },
         doctorReport,

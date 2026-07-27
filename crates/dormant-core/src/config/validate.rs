@@ -257,6 +257,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "after_release",
             "before_acquire",
             "after_acquire",
+            "on_observed_loss",
         ],
     ),
     (
@@ -275,10 +276,18 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
         "displays..hooks.after_acquire",
         &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
     ),
+    (
+        "displays..hooks.on_observed_loss",
+        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+    ),
     ("displays..hooks.before_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.after_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.before_acquire.mqtt", &["topic", "payload"]),
     ("displays..hooks.after_acquire.mqtt", &["topic", "payload"]),
+    (
+        "displays..hooks.on_observed_loss.mqtt",
+        &["topic", "payload"],
+    ),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
         "displays..screensaver",

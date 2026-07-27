@@ -709,7 +709,9 @@ pub(crate) fn recovery_command_suggestion() -> &'static str {
     if cfg!(target_os = "linux") {
         "systemctl --user restart dormant"
     } else if cfg!(target_os = "macos") {
-        "launchctl kickstart -k gui/501/dev.legionworks.dormant"
+        // Use `$(id -u)` so the command works regardless of the operator's
+        // UID — the plist label matches crates/dormantd/share/com.legionworks.dormant.plist.
+        "launchctl kickstart -k gui/$(id -u)/com.legionworks.dormant"
     } else {
         "restart the dormant daemon"
     }

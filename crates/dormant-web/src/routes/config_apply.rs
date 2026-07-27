@@ -1879,6 +1879,202 @@ members = []
         );
     }
 
+    // ── hook_edit_enabled server-side enforcement (BG-6, review S2) ──────
+    // The flag gates Set/Remove on any path containing a "hooks" segment.
+    // Tests: false-flag rejection, true-flag round-trip, ordinary Set
+    // unaffected, file untouched when denied.
+
+    fn minimal_config_hook_edit_disabled() -> Config {
+        let mut cfg = minimal_config();
+        cfg.daemon.hook_edit_enabled = false;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn hook_path_set_denied_when_hook_edit_disabled_403_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"
+config_version = 1
+
+[daemon]
+hook_edit_enabled = false
+
+[displays.shared_oled]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+scope = "shared"
+shared_input_code = 0x0f
+
+[displays.shared_oled.hooks]
+before_release = [{ command = ["/usr/bin/example-hook"] }]
+"#;
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_hook_edit_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+        let original_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec![
+                    "displays".into(),
+                    "shared_oled".into(),
+                    "hooks".into(),
+                    "before_release".into(),
+                ],
+                value: serde_json::json!([{"command": ["/usr/bin/evil"]}]),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "hook Set must be denied 403 when daemon.hook_edit_enabled is false"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "feature_disabled");
+
+        let after_bytes = std::fs::read(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            original_bytes, after_bytes,
+            "real config file must be untouched when hook editing is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_path_remove_denied_when_hook_edit_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"
+config_version = 1
+
+[daemon]
+hook_edit_enabled = false
+
+[displays.shared_oled]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+scope = "shared"
+shared_input_code = 0x0f
+
+[displays.shared_oled.hooks]
+before_release = [{ command = ["/usr/bin/example-hook"] }]
+"#;
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_hook_edit_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Remove {
+                path: vec![
+                    "displays".into(),
+                    "shared_oled".into(),
+                    "hooks".into(),
+                    "before_release".into(),
+                ],
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "hook Remove must be denied 403 when daemon.hook_edit_enabled is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_set_patch_unaffected_by_hook_edit_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "config_version = 1\n[daemon]\nhook_edit_enabled = false\n";
+        write_config(dir.path(), content);
+
+        let state = test_state(dir.path(), minimal_config_hook_edit_disabled(), 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec!["daemon".into(), "log_level".into()],
+                value: serde_json::Value::String("debug".into()),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        assert!(
+            result.is_ok(),
+            "an ordinary Set patch must still succeed when hook_edit_enabled is false \
+             (the flag gates hook paths only, not all Set/Remove): {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_path_set_not_blocked_by_flag_when_hook_edit_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use the same config as the deny test (valid display with hooks)
+        // but with the flag ENABLED — the gate should not fire.
+        // In the test environment, input_source_readers is empty so shared
+        // display validation will fail at a LATER step; we assert only that
+        // the flag gate itself is not the block.
+        let content = r#"
+config_version = 1
+
+[daemon]
+hook_edit_enabled = true
+
+[displays.shared_oled]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+scope = "shared"
+shared_input_code = 0x0f
+
+[displays.shared_oled.hooks]
+before_release = [{ command = ["/usr/bin/example-hook"] }]
+"#;
+        write_config(dir.path(), content);
+
+        let mut cfg = minimal_config();
+        cfg.daemon.hook_edit_enabled = true;
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec![
+                    "displays".into(),
+                    "shared_oled".into(),
+                    "hooks".into(),
+                    "before_release".into(),
+                ],
+                value: serde_json::json!([{"command": ["/usr/bin/example-hook"]}]),
+            }],
+        };
+
+        let result = post_apply(State(state), axum::Json(req)).await;
+        // The flag gate must NOT block — any rejection must be from a
+        // different step (e.g. validation), not a 403 feature_disabled.
+        if let Err(e) = result {
+            let resp = e.into_response();
+            assert_ne!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "hook Set must NOT be denied by the flag gate when hook_edit_enabled is true"
+            );
+        }
+    }
+
     // ── entity_created / entity_deleted audit events (spec §11 invariant 8,
     // §14) ────────────────────────────────────────────────────────────────
     // These literal `event = "entity_created"` / `event = "entity_deleted"`

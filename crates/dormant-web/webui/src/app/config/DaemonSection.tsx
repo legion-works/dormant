@@ -132,7 +132,12 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
   }
 
   // W5-1: posture card — derived from web_bind / web_allow_nonloopback.
-  const isNonloopback = Boolean(daemon.web_allow_nonloopback);
+  // Truth table: LAN posture requires BOTH a non-loopback bind AND the
+  // explicit web_allow_nonloopback opt-in.  Loopback bind + flag-true is
+  // still loopback-only (the flag doesn't override the actual listener).
+  const webBind = typeof daemon.web_bind === "string" ? daemon.web_bind : "";
+  const isLoopbackBind = webBind === "127.0.0.1" || webBind === "::1" || webBind.startsWith("127.");
+  const isNonloopback = !isLoopbackBind && Boolean(daemon.web_allow_nonloopback);
   const postureCard = (
     <div
       className={`cf-posture-card${isNonloopback ? " cf-posture-card--lan" : " cf-posture-card--loopback"}`}
@@ -169,7 +174,7 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
       </span>
       <span style={{ color: "var(--text-body)" }}>
         {isNonloopback
-          ? `The web surface is bound to ${daemon.web_bind || "non-loopback"} and reachable from the network without authentication. Exposed write routes: config apply, display blank/wake/switch/push, doctor exercise, pairing, emergency wake.`
+          ? `The web surface is bound to ${daemon.web_bind || "non-loopback"} and reachable from the network without authentication. Exposed write routes: config apply, display blank/wake/switch/push, pause/resume, reload, doctor, emergency wake, pairing, doctor exercise.`
           : "Loopback only — the web surface is not reachable from the LAN. All write routes require local access."}
       </span>
     </div>

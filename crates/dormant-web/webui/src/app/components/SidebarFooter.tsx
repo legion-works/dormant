@@ -32,7 +32,7 @@ function formatUptime(elapsedSeconds: number): string {
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
-export default function SidebarFooter({ connected, daemon, webBind: _webBind, webAllowNonloopback }: SidebarFooterProps) {
+export default function SidebarFooter({ connected, daemon, webBind, webAllowNonloopback }: SidebarFooterProps) {
   const [now, setNow] = useState(() => Date.now());
 
   // Tick the displayed uptime once a minute — cheap, and daemon uptime
@@ -46,7 +46,15 @@ export default function SidebarFooter({ connected, daemon, webBind: _webBind, we
     ? formatUptime(now / 1000 - daemon.started_epoch_s)
     : null;
 
-  const isNonloopback = Boolean(webAllowNonloopback);
+  // W5-1: truth table — LAN posture requires BOTH a non-loopback bind
+  // AND the explicit web_allow_nonloopback opt-in.  A loopback bind with
+  // the flag true is still loopback-only (the flag doesn't override the
+  // actual listener).  Non-loopback without the flag is rejected by the
+  // server security guard at startup, so that combination never appears
+  // live; classify it as loopback-only for safety.
+  const isLoopbackBind = typeof webBind === "string"
+    && (webBind === "127.0.0.1" || webBind === "::1" || webBind.startsWith("127."));
+  const isNonloopback = !isLoopbackBind && Boolean(webAllowNonloopback);
 
   return (
     <div className="sidebar-footer">

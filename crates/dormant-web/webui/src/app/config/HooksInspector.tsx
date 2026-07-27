@@ -89,7 +89,7 @@ export default function HooksInspector({ hooks, displayId, hookEditEnabled, stor
                   {slot.label}
                 </label>
 
-                {empty ? (
+                {empty && !editing ? (
                   <span className="cf-field__hint" style={{ fontStyle: "italic" }}>
                     — none
                   </span>
@@ -142,9 +142,41 @@ export default function HooksInspector({ hooks, displayId, hookEditEnabled, stor
                                 }}
                                 error={fieldErrors?.[[...actPath, "command"].join(".")]}
                                 placeholder="argv words"
-                                help="Shell command and arguments, space-separated."
-                              />
-                              <BoolField
+                              help="Shell command and arguments, space-separated."
+                            />
+                            <TextField
+                              path={[...actPath, "mqtt", "topic"]}
+                              label="mqtt topic"
+                              value={a.mqtt?.topic ?? ""}
+                              locked={false}
+                              onEdit={(_p, v) => {
+                                const next = [...actions];
+                                const topic = String(v);
+                                next[i] = { ...next[i], mqtt: topic ? { topic, payload: a.mqtt?.payload ?? "" } : undefined };
+                                emitSlot(slot.key, next);
+                              }}
+                              error={fieldErrors?.[[...actPath, "mqtt", "topic"].join(".")]}
+                              placeholder="dormant/status"
+                              help="MQTT topic to publish.  Leave empty to use command instead."
+                            />
+                            <TextField
+                              path={[...actPath, "mqtt", "payload"]}
+                              label="mqtt payload"
+                              value={a.mqtt?.payload ?? ""}
+                              locked={false}
+                              onEdit={(_p, v) => {
+                                const next = [...actions];
+                                const payload = String(v);
+                                if (a.mqtt) {
+                                  next[i] = { ...next[i], mqtt: { ...a.mqtt, payload } };
+                                }
+                                emitSlot(slot.key, next);
+                              }}
+                              error={fieldErrors?.[[...actPath, "mqtt", "payload"].join(".")]}
+                              placeholder='{"status":"releasing"}'
+                              help="Payload sent to the MQTT topic."
+                            />
+                            <BoolField
                                 path={[...actPath, "blocking"]}
                                 label="blocking"
                                 value={a.blocking ?? slot.defaultBlocking}

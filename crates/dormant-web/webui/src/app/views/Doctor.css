@@ -1,4 +1,4 @@
-/* Doctor view — diagnostics runner.
+/* Doctor view — diagnostics runner with grouped checks.
    All colors via DS tokens; zero hardcoded hex. */
 
 .doctor {
@@ -7,7 +7,11 @@
 
 
 .doctor-run-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
   margin-bottom: 16px;
+  flex-wrap: wrap;
 }
 
 .doctor-run-btn {
@@ -31,6 +35,12 @@
   cursor: not-allowed;
 }
 
+.doctor-last-run {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-faint);
+}
+
 
 .doctor-error {
   font-family: var(--font-mono);
@@ -38,6 +48,17 @@
   color: var(--danger);
   background: var(--danger-muted);
   border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  margin-bottom: 16px;
+}
+
+.doctor-warning {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border: 1px solid color-mix(in oklab, var(--accent-warm) 35%, transparent);
   border-radius: var(--radius-sm);
   padding: 8px 14px;
   margin-bottom: 16px;
@@ -53,9 +74,9 @@
 
 .doctor-summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 20px;
 }
 
 @media (max-width: 640px) {
@@ -85,6 +106,51 @@
 }
 
 
+/* ── Grouped checks ─────────────────────────────────────────────── */
+.doctor-group {
+  margin-bottom: 18px;
+}
+
+.doctor-group--highlighted {
+  background: color-mix(in oklab, var(--accent) 6%, transparent);
+  border-radius: var(--radius-md);
+  padding: 2px;
+  margin: -2px;
+  outline: 1px solid color-mix(in oklab, var(--accent) 20%, transparent);
+}
+
+.doctor-group__header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0 10px;
+  font-family: var(--font-mono);
+}
+
+.doctor-group__category {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+}
+
+.doctor-group__label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+
+.doctor-group__counts {
+  margin-left: auto;
+  font-size: var(--text-2xs);
+  color: var(--text-faint);
+}
+
+.doctor-group__failing {
+  color: var(--danger);
+}
+
+
 .doctor-check-row {
   display: flex;
   align-items: flex-start;
@@ -94,6 +160,10 @@
 }
 .doctor-check-row:last-child {
   border-bottom: none;
+}
+.doctor-check-row--failing {
+  border-left: 2px solid var(--danger);
+  padding-left: 15px;
 }
 
 .doctor-check-row__icon {
@@ -127,51 +197,40 @@
   margin-top: 3px;
 }
 
-.doctor-check-row__tag {
-  flex: none;
+
+/* ── Exercise panel ─────────────────────────────────────────────── */
+.doctor-exercise-panel {
+  margin-top: 24px;
+}
+
+.doctor-exercise-desc {
   font-family: var(--font-mono);
-  font-size: 10px;
-  padding: 2px 9px;
-  border-radius: var(--radius-pill);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-
-.doctor-exercise-card {
-  margin-top: 16px;
-  padding: 20px 22px;
-}
-
-.doctor-exercise-card__picker {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-width: 260px;
-}
-
-.doctor-exercise-card__label {
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
+  margin: 0 0 14px;
+  line-height: 1.5;
 }
 
-.doctor-exercise-card__select {
+.doctor-exercise-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.doctor-exercise-tile {
+  padding: 16px;
+}
+
+.doctor-exercise-tile__header {
   font-family: var(--font-mono);
+  font-weight: 500;
   font-size: 13px;
-  color: var(--text-body);
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  cursor: pointer;
-}
-.doctor-exercise-card__select:hover {
-  border-color: var(--border-strong);
+  color: var(--text-strong);
+  margin-bottom: 10px;
 }
 
+
+/* ── Shared animations ──────────────────────────────────────────── */
 @keyframes dmRise {
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: none; }

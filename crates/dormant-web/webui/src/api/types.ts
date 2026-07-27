@@ -388,16 +388,32 @@ export interface OwnershipEvent {
 /**
  * rust: doctor.rs Check
  * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+ * `category` / `subject` are added by BG-7.
  */
 export interface Check {
   name: string;
   status: CheckStatus;
   detail?: string;
+  /** "config" | "sensor" | "display" | "platform" | "network" */
+  category?: string;
+  /** The entity this check is about — display id, sensor id, or absent. */
+  subject?: string;
 }
 
 /** rust: doctor.rs DoctorReport */
 export interface DoctorReport {
   checks: Check[];
+}
+
+/** rust: event_ring.rs RecentEvent — a DaemonEvent with server timestamp. */
+export interface RecentEvent {
+  at_epoch_ms: number;
+  event: DaemonEvent;
+}
+
+/** rust: GET /api/events/recent response */
+export interface RecentEventsResponse {
+  events: RecentEvent[];
 }
 
 /**

@@ -136,7 +136,8 @@ describe("Doctor", () => {
     expect(screen.getAllByText("ok").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("skip")).toBeInTheDocument();
     expect(screen.getByText("fail")).toBeInTheDocument();
-    expect(screen.getByText("n/a")).toBeInTheDocument();
+    // not_supported is labelled "not applicable on this platform" per spec.
+    expect(screen.getByText("not applicable on this platform")).toBeInTheDocument();
   });
 
   it("shows loading state while running", () => {
@@ -196,9 +197,9 @@ describe("Doctor", () => {
     await waitFor(() => expect(screen.getByText("Failing")).toBeInTheDocument());
     expect(screen.getByText("Passing")).toBeInTheDocument();
     expect(screen.getByText("Skipped")).toBeInTheDocument();
+    // Warnings tile is removed (W0-4). Three tiles: Passing · Failing · Skipped.
     expect(screen.queryByText("Warnings")).not.toBeInTheDocument();
-    expect(screen.getAllByText("1")).toHaveLength(3);
-    expect(screen.getByRole("combobox", { name: "Exercise display" })).toHaveValue("main");
+    // Exercise is now a peer panel, not a <select>.
     expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
   });
 });

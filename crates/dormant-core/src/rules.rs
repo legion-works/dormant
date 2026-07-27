@@ -169,6 +169,21 @@ impl Drop for OperationLease {
 }
 
 impl OperationRegistry {
+    /// Adopt an operation accepted by the daemon front door.
+    #[must_use]
+    pub fn lease_accepted(&self, operation: &AcceptedOperation) -> Option<OperationLease> {
+        let state = self.state.lock().ok()?;
+        let (_, kind, token) = state.active.get(&operation.id)?;
+        if operation.generation != state.active.get(&operation.id)?.0 || *kind != operation.kind {
+            return None;
+        }
+        Some(OperationLease {
+            registry: self.clone(),
+            id: operation.id,
+            token: token.clone(),
+        })
+    }
+
     /// Accept an operation unless a conflicting operation is active.
     ///
     /// # Errors
@@ -1873,6 +1888,9 @@ impl RulesEngine {
         // Snapshot executor handles so the spawned task does not hold a
         // borrow on `self`.  Per the spec, wake EVERY display the engine
         // owns — that includes manual-only displays (no rule bound).
+        let lease = accepted
+            .as_ref()
+            .and_then(|operation| self.operation_registry.lease_accepted(operation));
         let executors: Vec<(DisplayId, Arc<dyn CommandSink>)> = self
             .executors
             .iter()
@@ -1886,6 +1904,7 @@ impl RulesEngine {
         );
 
         tokio::spawn(async move {
+            let _lease = lease;
             // Spawn ALL per-display wake tasks up front, THEN await them.
             // Awaiting inside the same loop would force serial execution
             // and let one slow controller (Tizen, HA-passthrough) block
@@ -1968,6 +1987,7 @@ impl RulesEngine {
     /// mid-exercise, the restore step's blanket invocation of the wake path
     /// means an exercise cannot leave a panel dark.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::needless_pass_by_value)]
     fn handle_exercise(
         &mut self,
         target: DisplayId,
@@ -1983,10 +2003,19 @@ impl RulesEngine {
             |operation| operation.generation,
         );
         let current_generation = self.observations.as_ref().map_or(generation, |(id, _)| *id);
-        let Ok((acquired_operation, lease)) = self
-            .operation_registry
-            .try_acquire(current_generation, OperationKind::Exercise(target.clone()))
-        else {
+        let acquired = accepted
+            .as_ref()
+            .and_then(|operation| {
+                self.operation_registry
+                    .lease_accepted(operation)
+                    .map(|lease| (operation.clone(), lease))
+            })
+            .or_else(|| {
+                self.operation_registry
+                    .try_acquire(current_generation, OperationKind::Exercise(target.clone()))
+                    .ok()
+            });
+        let Some((acquired_operation, lease)) = acquired else {
             let _ = reply.send(ExerciseReport {
                 display: target,
                 pre_phase: "rejected".into(),
@@ -2005,7 +2034,7 @@ impl RulesEngine {
             });
             return;
         };
-        let operation = accepted.unwrap_or(acquired_operation);
+        let operation = acquired_operation;
         let operation_id = operation.id;
         let accepted_generation = operation.generation;
         // Snapshot the rules bound to this display so the spawned task can
@@ -2100,14 +2129,15 @@ impl RulesEngine {
         let wake_settle = self.cfg.doctor_wake_settle;
 
         tokio::spawn(async move {
-            let _lease = lease;
+            let lease = lease;
             let pause_guard = ExercisePauseGuard {
                 results_tx: results_tx.clone(),
                 rules: Some(rules_to_resume.clone()),
                 operation_id,
                 generation: accepted_generation,
             };
-            let mut report = match run_supervised_exercise(
+            let mut report = match run_supervised_exercise_cancellable(
+                Some(&lease),
                 Arc::clone(&sink),
                 effective_mode,
                 pre_phase,
@@ -2921,7 +2951,29 @@ async fn wake_after_exercise_panic(sink: &Arc<dyn CommandSink>) {
     let _ = sink.wake_once().await;
 }
 
+#[cfg(test)]
 async fn run_supervised_exercise(
+    sink: Arc<dyn CommandSink>,
+    effective_mode: Option<BlankMode>,
+    pre_phase: String,
+    paused_rules: Vec<RuleId>,
+    display: DisplayId,
+    wake_settle: Duration,
+) -> Result<ExerciseReport, ()> {
+    run_supervised_exercise_cancellable(
+        None,
+        sink,
+        effective_mode,
+        pre_phase,
+        paused_rules,
+        display,
+        wake_settle,
+    )
+    .await
+}
+
+async fn run_supervised_exercise_cancellable(
+    lease: Option<&OperationLease>,
     sink: Arc<dyn CommandSink>,
     effective_mode: Option<BlankMode>,
     pre_phase: String,
@@ -2941,7 +2993,18 @@ async fn run_supervised_exercise(
         )
         .await
     });
-    match task.await {
+    let result = if let Some(lease) = lease {
+        tokio::select! {
+            result = task => result,
+            () = lease.cancelled() => {
+                let _ = sink.wake_once().await;
+                return Err(());
+            }
+        }
+    } else {
+        task.await
+    };
+    match result {
         Ok(report) => Ok(report),
         Err(error) => {
             tracing::error!(event = "exercise_task_panicked", error = %error, "exercise task failed; forcing wake");

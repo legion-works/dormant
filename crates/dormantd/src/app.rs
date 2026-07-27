@@ -63,8 +63,8 @@ use dormant_core::observation::{
 };
 use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
 use dormant_core::rules::{
-    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
-    RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
+    ControlMsg, DisplayRuntimeCfg, InhibitorKind, OperationKind, OperationRegistry, RollbackStatus,
+    RuleRuntimeCfg, RulesEngine, RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
@@ -95,6 +95,8 @@ use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
 use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
+
+const QUIESCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Builds the daemon-lifetime notification sink. Production defaults to
 /// [`notifier::ZbusSink`]; tests inject a factory returning a shared
@@ -879,6 +881,7 @@ impl App {
             coordination.clone(),
         ));
 
+        let operation_registry = Arc::new(OperationRegistry::default());
         let spawn = spawn_generation(
             &root,
             assembly,
@@ -892,6 +895,7 @@ impl App {
             config_rx.clone(),
             executors_rx.clone(),
             GenerationId(0),
+            operation_registry.clone(),
             Some(self.observations.clone()),
             Some(idle_obs_tx.clone()),
             filtered_activity_tx.clone(),
@@ -923,7 +927,11 @@ impl App {
 
         // Stable front channels are paused before an old engine is drained, so
         // no delivery can race behind the generation barrier.
-        let ctl_router = Arc::new(GenerationRouter::new(spawn.ctl_tx.clone()));
+        let ctl_router = Arc::new(GenerationRouter::new_with_generation(
+            spawn.ctl_tx.clone(),
+            GenerationId(0),
+            operation_registry.clone(),
+        ));
         let events_router = Arc::new(GenerationRouter::new(spawn.events_tx.clone()));
         let (front_events_tx, front_events_rx) = mpsc::channel::<PresenceEvent>(256);
 
@@ -1188,6 +1196,7 @@ impl App {
             generation: spawn.generation,
             applied_revision,
             generation_id: GenerationId(0),
+            operation_registry,
             wear_tracker_handle,
             started_web_port,
             started_web_bind,
@@ -1483,6 +1492,7 @@ struct Runner {
     generation: Generation,
     applied_revision: RuntimeRevision,
     generation_id: GenerationId,
+    operation_registry: Arc<OperationRegistry>,
     /// The wear tracker's `JoinHandle` (#47 fix, secondary hardening):
     /// retained (no longer fire-and-forget) so `run_loop` can bound-await
     /// its cancellation-triggered final persist during shutdown, mirroring
@@ -1718,7 +1728,9 @@ impl Runner {
         self.generation_barrier_ack_timeout =
             spawn.generation.cfg.daemon.generation_barrier_ack_timeout;
         self.generation = spawn.generation;
-        self.ctl_router.install(spawn.ctl_tx.clone()).await;
+        self.ctl_router
+            .install_generation(spawn.ctl_tx.clone(), self.generation_id)
+            .await;
         self.events_router.install(spawn.events_tx.clone()).await;
     }
 
@@ -2018,6 +2030,58 @@ impl Runner {
         self.record_reload_lifecycle_stage("routers_paused");
         quiesce_inputs(&mut self.generation).await;
         self.record_reload_lifecycle_stage("inputs_quiesced");
+        if tokio::time::timeout(
+            QUIESCE_OPERATION_TIMEOUT,
+            self.operation_registry
+                .wait_generation_empty(self.generation_id),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                event = "operation_quiesce_cancelled",
+                generation = self.generation_id.0
+            );
+            self.operation_registry
+                .cancel_generation(self.generation_id);
+            if tokio::time::timeout(
+                QUIESCE_OPERATION_TIMEOUT,
+                self.operation_registry
+                    .wait_generation_empty(self.generation_id),
+            )
+            .await
+            .is_err()
+            {
+                let executors = self
+                    .generation
+                    .display_executors
+                    .iter()
+                    .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+                    .collect();
+                self.executors_tx.send_replace(Arc::new(executors));
+                self.ctl_router
+                    .install_generation(old_ctl.clone(), self.generation_id)
+                    .await;
+                if let Some(events) = self.generation.engine_events_tx.clone() {
+                    self.events_router.install(events).await;
+                }
+                let detail =
+                    "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
+                tracing::warn!(
+                    event = "reload_rejected_operation_busy",
+                    generation = self.generation_id.0
+                );
+                let outcome = ReloadOutcome::Rejected(detail);
+                let _ = self.reload_tx.send(outcome.clone());
+                return self.reload_receipt(
+                    request_ids,
+                    sources,
+                    requested_revision,
+                    outcome,
+                    false,
+                );
+            }
+        }
         #[cfg(any(test, feature = "test-util"))]
         if let Some(gate) = &self.generation_barrier_gate {
             gate.reach(old_ctl.clone()).await;
@@ -2120,6 +2184,7 @@ impl Runner {
             self.config_tx.subscribe(),
             self.executors_tx.subscribe(),
             next_generation,
+            self.operation_registry.clone(),
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
             self.filtered_activity_tx.clone(),
@@ -2446,6 +2511,7 @@ impl Runner {
             self.config_tx.subscribe(),
             self.executors_tx.subscribe(),
             self.generation_id,
+            self.operation_registry.clone(),
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
             self.filtered_activity_tx.clone(),
@@ -3084,6 +3150,8 @@ struct GenerationRouterState<T> {
     paused: bool,
     target: Option<mpsc::Sender<T>>,
     queued: VecDeque<T>,
+    generation_id: Option<GenerationId>,
+    operation_registry: Option<Arc<OperationRegistry>>,
 }
 
 impl<T: Send + 'static> GenerationRouter<T> {
@@ -3093,6 +3161,8 @@ impl<T: Send + 'static> GenerationRouter<T> {
                 paused: false,
                 target: Some(target),
                 queued: VecDeque::new(),
+                generation_id: None,
+                operation_registry: None,
             }),
         }
     }
@@ -3147,6 +3217,95 @@ impl<T: Send + 'static> GenerationRouter<T> {
                 result.is_ok()
             }
         }
+    }
+}
+
+impl GenerationRouter<ControlMsg> {
+    fn new_with_generation(
+        target: mpsc::Sender<ControlMsg>,
+        generation_id: GenerationId,
+        operation_registry: Arc<OperationRegistry>,
+    ) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(GenerationRouterState {
+                paused: false,
+                target: Some(target),
+                queued: VecDeque::new(),
+                generation_id: Some(generation_id),
+                operation_registry: Some(operation_registry),
+            }),
+        }
+    }
+
+    async fn install_generation(
+        &self,
+        target: mpsc::Sender<ControlMsg>,
+        generation_id: GenerationId,
+    ) {
+        let mut state = self.state.lock().await;
+        state.target = Some(target.clone());
+        state.generation_id = Some(generation_id);
+        while let Some(message) = state.queued.pop_front() {
+            let message = stamp_control_operation(
+                message,
+                state
+                    .operation_registry
+                    .as_ref()
+                    .expect("operation registry installed"),
+                generation_id,
+            );
+            if target.send(message).await.is_err() {
+                tracing::error!(
+                    event = "generation_route_install_failed",
+                    "new generation closed while queued inputs were being released"
+                );
+                break;
+            }
+        }
+        state.paused = false;
+    }
+
+    async fn route_control(&self, mut message: ControlMsg, root: &CancellationToken) -> bool {
+        let mut state = self.state.lock().await;
+        if state.paused {
+            state.queued.push_back(message);
+            return true;
+        }
+        if let (Some(registry), Some(generation)) = (&state.operation_registry, state.generation_id)
+        {
+            message = stamp_control_operation(message, registry, generation);
+        }
+        let Some(target) = state.target.clone() else {
+            return false;
+        };
+        tokio::select! {
+            () = root.cancelled() => false,
+            result = target.send(message) => result.is_ok(),
+        }
+    }
+}
+
+fn stamp_control_operation(
+    message: ControlMsg,
+    registry: &OperationRegistry,
+    generation: GenerationId,
+) -> ControlMsg {
+    let kind = match &message {
+        ControlMsg::Exercise { display, .. } => Some(OperationKind::Exercise(display.clone())),
+        ControlMsg::EmergencyWake { .. } => Some(OperationKind::EmergencyWake),
+        _ => None,
+    };
+    let Some(kind) = kind else { return message };
+    let Ok((operation, lease)) = registry.try_acquire(generation, kind) else {
+        return message;
+    };
+    std::mem::forget(lease);
+    match message {
+        ControlMsg::Exercise { reply, .. } => ControlMsg::ExerciseAccepted { operation, reply },
+        ControlMsg::EmergencyWake { reply } => {
+            ControlMsg::EmergencyWakeAccepted { operation, reply }
+        }
+        other => other,
     }
 }
 
@@ -3866,6 +4025,7 @@ fn build_render_sinks(
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
     reason = "generation construction keeps every producer and daemon-lifetime handle visible at its spawn site"
 )]
 fn spawn_generation(
@@ -3881,6 +4041,7 @@ fn spawn_generation(
     config_rx: watch::Receiver<Arc<Config>>,
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
+    operation_registry: Arc<OperationRegistry>,
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
@@ -3915,6 +4076,7 @@ fn spawn_generation(
     if let Some(observations) = observations {
         engine = engine.with_observation_hub(generation_id, observations);
     }
+    engine = engine.with_operation_registry((*operation_registry).clone());
 
     if let Some(detail) = pending {
         engine.set_pending_reload(Some(detail));
@@ -4138,6 +4300,7 @@ fn spawn_generation_for_reload(
     config_rx: watch::Receiver<Arc<Config>>,
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
+    operation_registry: Arc<OperationRegistry>,
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
@@ -4159,6 +4322,7 @@ fn spawn_generation_for_reload(
         config_rx,
         executors_rx,
         generation_id,
+        operation_registry,
         observations,
         idle_tx,
         filtered_activity_tx,
@@ -4407,7 +4571,7 @@ async fn forward_ctl(
             msg = rx.recv() => match msg {
                 None => break,
                 Some(m) => {
-                    if !router.route(m, &cancel).await {
+                    if !router.route_control(m, &cancel).await {
                         break;
                     }
                 }

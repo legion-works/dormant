@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-27
+
+### Fixed
+
+- The `user-activity` inhibitor now binds `ext_idle_notifier_v1` at version 2 and uses the input-idle notification when the compositor offers it, so application idle inhibitors (a browser tab holding a WebRTC or video inhibitor) can no longer hold a blank on a vacant room. v1-only compositors keep the legacy inhibitor-respecting behavior.
+- The ESPHome radar example now ships a 5-minute retained state heartbeat (previously a commented-out suggestion), so a stably-detected occupant no longer starves dormant's silence-based staleness clock into marking a healthy sensor unavailable. Docs recommend `stale_timeout = "6m"` to match.
+
 ## [0.8.0] - 2026-07-27
 
 ### Highlights
@@ -221,7 +228,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/legion-works/dormant/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/legion-works/dormant/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/legion-works/dormant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/legion-works/dormant/compare/v0.6.0...v0.7.0

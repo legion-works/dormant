@@ -346,9 +346,8 @@ export default function Config() {
   const [dirtyTabs, setDirtyTabs] = useState<Set<ConfigTab>>(new Set());
   const mountedRef = useRef(true);
 
-  // Navigation guard state from SettingsForm — kept for the parent
-  // (Shell) to consume in a later wave; Config internal tab switches
-  // never prompt.
+  // Navigation guard state from SettingsForm. Config internal tab
+  // switches never prompt.
   const navGuardRef = useRef<{ dirtyCount: number; discard: () => void } | null>(null);
 
   const fetchData = useCallback(async () => {

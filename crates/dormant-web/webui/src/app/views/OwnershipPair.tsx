@@ -22,7 +22,7 @@ export interface OwnershipPairProps {
   size: OwnershipSize;
 }
 
-/** Hex-echo for a u8 code — reuse W0 pattern. */
+/** Hex-echo for a u8 code. */
 function hexCode(code: number | undefined | null): string {
   if (code == null) return "—";
   return `0x${code.toString(16).padStart(2, "0")} (${code})`;

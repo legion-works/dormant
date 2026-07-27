@@ -2,7 +2,7 @@
  * Display detail view — single-display scannable detail with four
  * anchored sections: Control, Sharing (shared only), Wear, Health.
  *
- * Reached from the Displays list ("Detail →") or from the Dashboard's
+ * Reached from the Displays list ("Detail →") or from the Overview's
  * panel-exposure card.  Data is passed in by the caller (Displays.tsx
  * reads `useLiveState()` and resolves `config`/`rule`/`wear` for the
  * selected id) — this component has no private fetch.

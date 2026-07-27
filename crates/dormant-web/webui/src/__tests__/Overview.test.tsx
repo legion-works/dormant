@@ -1,11 +1,13 @@
 /**
- * Overview view tests — panel tiles, held-by candidates, Protected tile, Rules column.
+ * Overview view tests — panel tiles, held-by candidates, Protected tile, Rules column,
+ * stat cards, sensor rows, zone rows, stage detail, and reported sensor hints.
  */
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, cleanup, waitFor } from "@testing-library/react";
 import Overview from "../app/views/Overview";
 import { LiveStateProvider } from "../app/state";
 import { EventLogContext } from "../app/hooks/useLiveState";
+import type { StampedEvent } from "../app/hooks/useLiveState";
 import { eventLogFixture } from "./fixtures/live-state";
 import type { StateSnapshot, ConfigResponse, DisplayConfig } from "../api/types";
 import { getState, getConfig } from "../api/client";
@@ -219,5 +221,315 @@ describe("Overview", () => {
       expect(screen.getByText(/\u25b8 audio-playback/)).toBeInTheDocument();
       expect(screen.getByText(/\u25b8 call/)).toBeInTheDocument();
     });
+  });
+});
+
+// ── Stat cards, signal flow, section headers (fixture with 3 displays) ──
+
+const STAT_FIXTURE = {
+  state: {
+    sensors: [
+      { id: "desk-mmwave", state: "present" as const, last_seen_secs_ago: 3 },
+      { id: "room-pir", state: "absent" as const, last_seen_secs_ago: 45 },
+      { id: "balcony-mqtt", state: "unavailable" as const, last_seen_secs_ago: 120 },
+    ],
+    zones: [
+      { id: "office", present: true },
+      { id: "hallway", present: false },
+    ],
+    displays: [
+      [
+        "aoc-main",
+        { phase: "active", inhibited: false, paused: false, cmd_gen: 42, controllers: [{ name: "ddcci", role: "primary" as const, healthy: true }] },
+      ],
+      [
+        "samsung-tv",
+        { phase: "blanked", inhibited: false, paused: true, cmd_gen: 15, controllers: [{ name: "samsung-tizen", role: "primary" as const, healthy: true }] },
+      ],
+      [
+        "lg-oled",
+        { phase: "staged", inhibited: false, paused: false, cmd_gen: 7, controllers: [{ name: "lg-webos", role: "primary" as const, healthy: true }], stage: { idx: 1, kind: "render_screensaver" } },
+      ],
+    ],
+    pending_reload: null,
+  } as StateSnapshot,
+  config: {
+    path: "/tmp/config.toml",
+    config_version: 1,
+    source: "last_applied",
+    raw_toml: "",
+    inventory: {
+      config_version: 1,
+      daemon: {},
+      sensors: {
+        "desk-mmwave": { type: "usb-ld2410" as const, port: "/dev/ttyUSB0" },
+        "room-pir": { type: "mqtt" as const, broker_url: "", topic: "" },
+        "balcony-mqtt": { type: "ha" as const, url: "", entity: "" },
+      },
+      zones: {
+        office: { mode: "any", members: ["desk-mmwave", "room-pir"], weights: {}, unavailable_policy: "present" as const },
+        hallway: { mode: "all", members: ["room-pir"], weights: {}, unavailable_policy: "absent" as const },
+      },
+      displays: {
+        "aoc-main": { controllers: ["ddcci"], blank_mode: "power_off" as const },
+        "samsung-tv": { controllers: ["samsung-tizen"], blank_mode: "screen_off_audio_on" as const },
+        "lg-oled": { controllers: ["lg-webos"], blank_mode: "power_off" as const, ladder: [{ kind: "render_screensaver", dwell: "10s" }] },
+      },
+      rules: {
+        "office-rule": { zone: "office", displays: ["aoc-main"], wake_retries: 3 },
+        "tv-rule": { zone: "hallway", displays: ["samsung-tv"], wake_retries: 5 },
+      },
+    },
+    validation: { ok: true, warnings: [], errors: [] },
+    display_rules: {
+      "aoc-main": { rule: "office-rule", zone: "office" },
+      "samsung-tv": { rule: "tv-rule", zone: "hallway" },
+      "lg-oled": { rule: "office-rule", zone: "office" },
+    },
+    fingerprint: "abc123",
+    redacted_paths: [],
+  } as ConfigResponse,
+};
+
+describe("Overview — panel tiles and signal flow", () => {
+  beforeEach(() => {
+    vi.mocked(getState).mockResolvedValue(STAT_FIXTURE.state);
+    vi.mocked(getConfig).mockResolvedValue(STAT_FIXTURE.config);
+  });
+
+  it("renders the four stat cards after loading", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      // Displays appears in the stat card label.
+      expect(screen.getByText("Displays")).toBeInTheDocument();
+    });
+
+    // Displays stat card shows "3" (total count).
+    const threes = screen.getAllByText("3");
+    expect(threes.length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("2/3")).toBeInTheDocument();
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    // Overview shows "Protected" stat card instead of "OLED guard Active".
+    expect(screen.getByText("Protected")).toBeInTheDocument();
+  });
+
+  it("renders sensor rows with correct state labels", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("desk-mmwave")).toBeInTheDocument();
+    });
+
+    // "present"/"absent"/"unavailable" appear in sensor rows AND zone rows
+    expect(screen.getAllByText("present").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("absent").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("unavailable").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("LD2410 radar")).toBeInTheDocument();
+    expect(screen.getByText("MQTT")).toBeInTheDocument();
+  });
+
+  it("renders zone rows with mode and members", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("office")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("ANY")).toBeInTheDocument();
+  });
+
+  // Overview panel tiles have per-display Blank/Wake action chips.
+  it("renders panel tile action chips for each display", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      // Per-tile Blank/Wake/Pull/Push action chips.
+      const blanks = screen.getAllByRole("button", { name: "Blank" });
+      expect(blanks.length).toBeGreaterThanOrEqual(1);
+    });
+
+    expect(screen.getAllByRole("button", { name: "Wake" }).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("shows section headers", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("Signal flow")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("Signal flow")).toBeInTheDocument();
+    expect(screen.getByText("Recent activity")).toBeInTheDocument();
+    expect(screen.getByText(/view all/)).toBeInTheDocument();
+  });
+
+  it("shows empty state in recent activity when event log is empty", async () => {
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={{ events: [], connected: true, lagged: false, historySeeded: false }}>
+          <Overview />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("No recent events from the daemon.")).toBeInTheDocument();
+    });
+  });
+
+  it("renders recent activity from the event log", async () => {
+    const mockEvents: StampedEvent[] = [
+      {
+        time: "14:23:01",
+        event: {
+          event: "sensor_changed",
+          sensor: "desk-mmwave",
+          state: "present",
+        },
+      },
+    ];
+
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={{ events: mockEvents, connected: true, lagged: false, historySeeded: false }}>
+          <Overview />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("desk-mmwave → present")).toBeInTheDocument();
+    });
+    expect(screen.getByText("sensor_changed")).toBeInTheDocument();
+  });
+
+  it("renders stage detail in display row when a display is staged", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      // lg-oled appears in the panel tile grid.
+      expect(screen.getAllByText("lg-oled").length).toBeGreaterThanOrEqual(1);
+    });
+
+    // The staged display chip shows "staged · render screensaver".
+    expect(screen.getByText("staged · render screensaver")).toBeInTheDocument();
+  });
+
+  it("does not render stage detail on non-staged display rows", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      // aoc-main appears in the panel tile grid.
+      expect(screen.getAllByText("aoc-main").length).toBeGreaterThanOrEqual(1);
+    });
+
+    // The active display chip label is "active", not a stage label.
+    expect(screen.getByText("active")).toBeInTheDocument();
+    // The blanked display chip label is "blanked".
+    expect(screen.getByText("blanked")).toBeInTheDocument();
+
+    // Stage detail only for the staged display.
+    const stageLabels = screen.getAllByText(/render screensaver/);
+    // lg-oled chip + possibly the blank_mode in config metadata
+    expect(stageLabels.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+
+// ── "no data since start" sensor hint (spec T6) ──
+
+describe("Overview — sensor reported hint", () => {
+  it("shows the hint for an unavailable sensor with reported: false", async () => {
+    const state: StateSnapshot = {
+      sensors: [
+        { id: "balcony-mqtt", state: "unavailable", last_seen_secs_ago: 999, reported: false },
+      ],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/no data since start/i)).toBeInTheDocument();
+  });
+
+  it("hides the hint for an unavailable sensor with reported: true", async () => {
+    const state: StateSnapshot = {
+      sensors: [
+        { id: "balcony-mqtt", state: "unavailable", last_seen_secs_ago: 999, reported: true },
+      ],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText(/no data since start/i)).toBeNull();
+  });
+
+  it("never shows the hint for a present or absent sensor, reported or not", async () => {
+    const state: StateSnapshot = {
+      sensors: [
+        { id: "desk-mmwave", state: "present", last_seen_secs_ago: 3, reported: false },
+        { id: "room-pir", state: "absent", last_seen_secs_ago: 45, reported: false },
+      ],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("desk-mmwave")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText(/no data since start/i)).toBeNull();
+  });
+
+  // Legacy wire predates `reported` — the key is entirely absent from the
+  // snapshot object, not merely `false`. `sensor.reported ?? false` treats
+  // that identically to `false`. Pinning what the code actually does: the
+  // hint is NEW, so an unavailable sensor on a legacy snapshot renders it —
+  // there is no prior rendering to preserve for this exact case, since the
+  // hint did not exist before this feature. This is the adjudicated,
+  // intended behavior per spec T6, not a back-compat gap.
+  it("legacy snapshot (no `reported` key at all) — unavailable sensor shows the hint", async () => {
+    const legacySensor: StateSnapshot["sensors"][number] = {
+      id: "balcony-mqtt",
+      state: "unavailable",
+      last_seen_secs_ago: 999,
+    };
+    expect("reported" in legacySensor).toBe(false);
+
+    const state: StateSnapshot = {
+      sensors: [legacySensor],
+      zones: [],
+      displays: [],
+      pending_reload: null,
+    };
+    vi.mocked(getState).mockResolvedValueOnce(state);
+
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      expect(screen.getByText("balcony-mqtt")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText(/no data since start/i)).toBeInTheDocument();
   });
 });

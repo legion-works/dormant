@@ -44,6 +44,7 @@ When the feature is enabled, these daemon config keys control the web server:
 | `daemon.entity_crud_enabled` | `true` | Allow creating/deleting sensors, zones, displays, and rules from the Settings form ([Entity create/delete](#entity-createdelete)) |
 | `daemon.pairing_enabled` | `true` | Allow the Samsung pairing wizard ([Pairing wizard](#pairing-wizard)) |
 | `daemon.pair_timeout` | `"120s"` | How long the pairing wizard waits for the TV to accept before giving up (`30s`..`300s`) |
+| `daemon.hook_edit_enabled` | `false` | Allow editing hook slots (`on_blank`, `on_wake`, `on_observed_loss`) in the Settings form. When `false` hooks are always read-only. |
 
 Example:
 
@@ -83,13 +84,13 @@ Do not reverse-proxy the dashboard onto the public internet. If remote visibilit
 
 ## Views
 
-The SPA has five views, selected from a left-hand navigation sidebar.
+The SPA has five views — plus a sixth (Switching) when shared displays are configured — selected from a left-hand navigation sidebar.
 
-### Dashboard
+### Overview
 
-![The dormant dashboard: stat row, signal-flow grid, and panel-exposure summary](images/dashboard.png)
+![The dormant overview: stat row, signal-flow grid, and panel-exposure summary](images/dashboard.png)
 
-The landing page. Shows a stat row (displays count with active/blanked split, sensor online/unavailable split, zone occupied/vacant split, OLED guard status), a three-column signal-flow grid (Sensors → Zones → Displays), and a recent-activity feed.
+The landing page. Shows a stat row (displays count with active/blanked split, sensor online/unavailable split, zone occupied/vacant split, Protected count), a three-column signal-flow grid (Sensors → Zones → Displays), a Rules column, and a recent-activity feed.
 
 Each sensor row shows its id, type, state, and last-seen age. An unavailable sensor that has not delivered data since daemon start is marked "no data since start" from its `reported` diagnostic. Zone rows show occupancy, fusion mode, and members. Display rows show phase, blank mode, controller chain, and blank/wake controls. Failing displays appear in a dashboard banner; tracked displays also get a panel-exposure card.
 
@@ -99,7 +100,11 @@ A per-display card list. Each card shows a screen preview glyph (ON / grace / �
 
 ### Events
 
-A scrolling, auto-pruning event log. It shows presence changes, display phase transitions, wake retries, blank/wake failures and recoveries, panel-wear advisories, and config reloads. Timestamps use the browser's clock when each WebSocket message arrives. Reloading the page starts a fresh client-side log.
+A scrolling, auto-pruning event log. It shows presence changes, display phase transitions, wake retries, blank/wake failures and recoveries, panel-wear advisories, and config reloads. Timestamps use the browser's clock when each WebSocket message arrives. Reloading the page seeds the log from `/api/events/recent` so recent history is preserved; events that arrive while the page is loading are deduplicated.
+
+### Switching
+
+For displays configured with `scope = "shared"` and a `[coordination]` section, the Switching view shows live panel ownership — which machine currently holds the panel, the observed input code, and both machines' configured codes — updated in real time via `Ownership` daemon events over the WebSocket. Each display's row includes the local and peer input codes in hex, the panel state, short-press Poll button, and an agreement verdict that checks whether the observed code matches the configured local code. The view appears in the sidebar only when at least one display is configured as shared.
 
 ### Display detail and panel exposure
 
@@ -164,19 +169,20 @@ affected display and controller evidence and links directly to its detail view.
 
 ### Config
 
-Two tabs: **Settings** (a form editor for live config changes without touching the TOML file) and **Raw TOML** (the original read-only syntax-highlighted viewer with inventory sidebar and a reload button).
+Six tabs: **Daemon**, **Sensors**, **Zones**, **Rules**, **Displays**, and **Coordination** — plus the original **Raw TOML** tab (a read-only syntax-highlighted viewer with inventory sidebar and a reload button).
 
-#### Settings tab
+#### Settings tabs
 
-The Settings form presents the running config as editable sections: Daemon, Sensors, Zones, Rules, and Displays. Each field shows the current value from `GET /api/config`; edits are accumulated in a client-side patch store and submitted together via `POST /api/config/apply`.
+The Settings form presents the running config as editable sections, one per tab. Each field shows the current value from `GET /api/config`; edits are accumulated in a client-side patch store and submitted together via `POST /api/config/apply`.
 
-**What is editable (v1):**
-- Leaf string, number, and duration values (e.g. `grace_period`, `startup_holdoff`, `hold_time`).
-- Whole arrays (e.g. a rule's `displays` list, the `ladder` array-of-tables, screensaver `source` lists). Setting an array replaces it wholesale.
+**What is editable:**
+- Leaf string, number, and duration values across every section (e.g. `grace_period`, `startup_holdoff`, `hold_time`, coordination timeouts, keymap entries, input-filter patterns).
+- Whole arrays (e.g. a rule's `displays` list, the `ladder` array-of-tables, screensaver `source` lists, coordination `keymap` entries). Setting an array replaces it wholesale.
 - A limited set of optional keys can be *removed* via the Remove op: `blank_mode`, `degraded_mode`, `dwell`, `order`, `image_duration`, `scale_mode`, `transition`, `transition_duration`, `hold_time`, `stale_timeout`, `ddc_display`, `output`, `wol_mac`, `host`.
+- Hook slots (`on_blank`, `on_wake`, `on_observed_loss`) — editing is gated behind `daemon.hook_edit_enabled = true` (default: off); when disabled, hooks are displayed read-only.
 
-**File-only in v1:**
-- Display command strings (`wake_command`, `blank_command`), controller lists (`controllers`), and mode lists (`modes`) are not rendered in the Settings form. They are valid targets for the patch API (a direct `POST /api/config/apply` can set them), but the form does not expose controls for them.
+**File-only:**
+- Display command strings (`wake_command`, `blank_command`) are not rendered in the Settings form.
 
 **What is not editable:**
 - **Locked leaves** — `type` on an existing entity, `blank_data`, and `wake_data` are never writable through the patch API. The form marks them locked and explains why. `type` is set only when an entity is created; changing a sensor type requires delete-and-recreate so type-specific fields cannot be dropped silently.

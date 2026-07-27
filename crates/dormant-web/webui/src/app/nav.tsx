@@ -35,7 +35,7 @@ export interface NavMeta {
   switchingEnabled: boolean;
 }
 
-/** Derive the five sidebar nav items (stable ids/order) from live facts. */
+/** Derive the sidebar nav items (stable ids/order) from live facts. */
 export function navItems(meta: NavMeta): NavItem[] {
   const items: NavItem[] = [
       { id: "dashboard", label: "Overview", icon: "▦" },

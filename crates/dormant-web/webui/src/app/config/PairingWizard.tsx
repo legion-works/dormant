@@ -17,6 +17,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { postPairSamsung, getPairStatus, ApiError } from "../../api/client";
+import FormSection from "./FormSection";
 import type { PairStatus } from "../../api/types";
 import { SAMSUNG_TIZEN_CONTROLLER } from "./entityCrud";
 
@@ -110,6 +111,7 @@ export default function PairingWizard({
   const pairedHost = pairedHostRef.current;
 
   return (
+    <FormSection id="pairing" title="Pairing">
     <div className="cf-card cf-pairing-wizard" data-testid="pairing-wizard">
       <div className="cf-card__header">
         <span className="cf-card__name">Pair a Samsung TV</span>
@@ -193,5 +195,6 @@ export default function PairingWizard({
         </>
       )}
     </div>
+    </FormSection>
   );
 }

@@ -108,7 +108,7 @@ export default function SensorsSection({
 
   return (
     <>
-    <FormSection title="Sensors">
+    <FormSection id="sensors" title="Sensors">
       {ids.map((id) => {
         const cfg = sensors[id];
         const basePath = ["sensors", id];

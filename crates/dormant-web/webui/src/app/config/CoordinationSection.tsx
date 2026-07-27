@@ -88,7 +88,7 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
   }
 
   return (
-    <FormSection title="Coordination">
+    <FormSection id="coordination" title="Coordination">
       <div className="cf-card">
         <div className="cf-card__header">
           <span className="cf-card__name">[coordination]</span>

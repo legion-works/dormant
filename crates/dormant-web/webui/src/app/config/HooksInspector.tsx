@@ -71,7 +71,7 @@ export default function HooksInspector({ hooks, displayId, hookEditEnabled, stor
   }
 
   return (
-    <FormSection title={`Hooks — ${displayId}`}>
+    <FormSection id="hooks" title={`Hooks — ${displayId}`}>
       <div className="cf-card">
         <div className="cf-card__header">
           <span className="cf-card__name">hooks</span>

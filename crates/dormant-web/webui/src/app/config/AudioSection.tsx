@@ -113,7 +113,7 @@ export default function AudioSection({ audio, store, redactedPaths, onDirty, fie
   if (keys.length === 0) return null;
 
   return (
-    <FormSection title="Audio">
+    <FormSection id="audio" title="Audio">
       <div className="cf-card">
         {keys.map((key) => {
           if (key === "playback_roles") {

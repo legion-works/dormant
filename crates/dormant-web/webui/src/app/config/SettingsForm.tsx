@@ -28,6 +28,7 @@ import HooksInspector from "./HooksInspector";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
 import { isEntityCrudEnabled, isPairingEnabled, isHookEditEnabled } from "./entityCrud";
+import { SectionRailProvider } from "./SectionRailContext";
 import RollbackRecoveryCard from "./RollbackRecoveryCard";
 
 /** Config sub-tab — the five form-bearing tabs (raw is handled by Config.tsx, SettingsForm renders nothing for it). */
@@ -241,7 +242,8 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
   const displayIds = Object.keys(inv.displays);
 
   return (
-    <div className="cf-form">
+    <SectionRailProvider tab={tab}>
+      <div className="cf-form">
       {/* ── Daemon tab ── */}
       {tab === "daemon" && (
         <DaemonSection
@@ -404,6 +406,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
         onReload={handleReload}
         onDismissConflict={() => setConflict(false)}
       />
-    </div>
+      </div>
+    </SectionRailProvider>
   );
 }

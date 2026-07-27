@@ -21,7 +21,7 @@ use crate::WebState;
 use crate::assets;
 use crate::error::WebError;
 use crate::routes::{
-    command, config, config_apply, daemon, doctor, events, operations, pair, wear,
+    command, config, config_apply, daemon, doctor, events, operations, pair, star_nudge, wear,
 };
 use crate::security::security_guard;
 
@@ -113,6 +113,16 @@ pub(crate) fn build_router(state: WebState) -> Router {
     let api = route_post!(api, "/push", post(command::post_push));
     let api = route_post!(api, "/pause", post(command::post_pause));
     let api = route_post!(api, "/resume", post(command::post_resume));
+    let api = route_post!(
+        api,
+        "/star-nudge/dismiss",
+        post(star_nudge::post_star_nudge_dismiss)
+    );
+    let api = route_post!(
+        api,
+        "/star-nudge/star",
+        post(star_nudge::post_star_nudge_star)
+    );
     let api = route_post!(api, "/reload", post(command::post_reload));
     let api = route_post!(api, "/doctor", post(doctor::post_doctor));
     let api = route_post!(api, "/emergency-wake", post(command::post_emergency_wake));
@@ -384,6 +394,8 @@ mod tests {
             "/api/wake",
             "/api/pause",
             "/api/resume",
+            "/api/star-nudge/dismiss",
+            "/api/star-nudge/star",
             "/api/reload",
             "/api/doctor",
             "/api/emergency-wake",

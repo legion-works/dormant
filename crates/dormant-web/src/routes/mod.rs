@@ -11,4 +11,5 @@ pub(crate) mod doctor;
 pub(crate) mod events;
 pub(crate) mod operations;
 pub(crate) mod pair;
+pub(crate) mod star_nudge;
 pub(crate) mod wear;

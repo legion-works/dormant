@@ -226,6 +226,10 @@ export interface DaemonIdentity {
   started_epoch_s: number;
   version: string;
   socket: string;
+  /** rust: DaemonIdentity::star_nudge_dismissed — whether the sidebar
+   *  "Star the repo" nudge has been dismissed (flag file in config dir).
+   *  Omitted by old daemons so the API client defaults it to false. */
+  star_nudge_dismissed?: boolean;
 }
 
 /**

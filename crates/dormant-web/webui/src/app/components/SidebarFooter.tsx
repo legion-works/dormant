@@ -7,14 +7,14 @@
  * Receives daemon identity from the shell so the brand and footer share
  * one `GET /api/daemon` request at startup and after reconnects.
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { DaemonIdentity } from "../../api/types";
+import { postStarNudgeDismiss, postStarNudgeStar } from "../../api/client";
 import "./SidebarFooter.css";
 
 export interface SidebarFooterProps {
   connected: boolean;
   daemon: DaemonIdentity | null;
-  /** rust: daemon.web_bind — the configured bind address (unused by posture chip; retained in the interface for future use). */
   /** rust: daemon.web_bind — the configured bind address. */
   webBind?: unknown;
   /** rust: daemon.web_allow_nonloopback — opt-in flag. */
@@ -34,6 +34,34 @@ function formatUptime(elapsedSeconds: number): string {
 
 export default function SidebarFooter({ connected, daemon, webBind, webAllowNonloopback }: SidebarFooterProps) {
   const [now, setNow] = useState(() => Date.now());
+
+  // Local dismiss state for the star nudge — starts from the server flag,
+  // then stays true in this session once the user dismisses (optimistic).
+  const [starNudgeDismissed, setStarNudgeDismissed] = useState(
+    () => daemon?.star_nudge_dismissed ?? false,
+  );
+  // Transient "Starred ✓" state shown briefly after a successful gh star.
+  const [starNudgeStarred, setStarNudgeStarred] = useState(false);
+  // CORR 2: timer id so we can clear it on unmount and prevent a second
+  // timer from stacking on double-click.
+  const starTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Keep local state in sync if the daemon identity reloads (e.g. after
+  // a WebSocket reconnect and re-fetch).
+  useEffect(() => {
+    if (daemon?.star_nudge_dismissed) {
+      setStarNudgeDismissed(true);
+    }
+  }, [daemon?.star_nudge_dismissed]);
+
+  // CORR 2: clear the "Starred ✓" timer on unmount so it cannot fire
+  // after the component is gone.
+  useEffect(() => {
+    return () => {
+      if (starTimerRef.current !== null) {
+        clearTimeout(starTimerRef.current);
+      }
+    };
+  }, []);
 
   // Tick the displayed uptime once a minute — cheap, and daemon uptime
   // never needs sub-minute precision.
@@ -55,6 +83,39 @@ export default function SidebarFooter({ connected, daemon, webBind, webAllowNonl
   const isLoopbackBind = typeof webBind === "string"
     && (webBind === "127.0.0.1" || webBind === "::1" || webBind.startsWith("127."));
   const isNonloopback = !isLoopbackBind && Boolean(webAllowNonloopback);
+
+  const handleStarClick = useCallback(async () => {
+    // CORR 2: prevent double-timer on fast double-click.
+    if (starTimerRef.current !== null) {
+      clearTimeout(starTimerRef.current);
+      starTimerRef.current = null;
+    }
+    try {
+      const resp = await postStarNudgeStar();
+      if (resp.starred) {
+        // gh CLI succeeded — show brief "Starred ✓", then hide.
+        setStarNudgeStarred(true);
+        starTimerRef.current = setTimeout(() => {
+          starTimerRef.current = null;
+          setStarNudgeDismissed(true);
+          setStarNudgeStarred(false);
+        }, 2000);
+        return;
+      }
+    } catch {
+      // Network error — proceed to fallback below.
+    }
+    // gh CLI failed or unavailable — open the repo page as fallback.
+    window.open("https://github.com/legion-works/dormant", "_blank", "noopener,noreferrer");
+    setStarNudgeDismissed(true);
+  }, []);
+
+  const handleStarDismiss = useCallback(() => {
+    setStarNudgeDismissed(true);
+    postStarNudgeDismiss();
+  }, []);
+
+  const showStarNudge = daemon && !starNudgeDismissed;
 
   return (
     <div className="sidebar-footer">
@@ -86,6 +147,34 @@ export default function SidebarFooter({ connected, daemon, webBind, webAllowNonl
       )}
 
       <div className="sidebar-footer__divider" />
+
+      {/* Star-the-repo nudge — shown once, dismissed permanently server-side */}
+      {showStarNudge && (
+        <div className="sidebar-footer__star-nudge">
+          {starNudgeStarred ? (
+            <span className="star-nudge-starred">☆ Starred ✓</span>
+          ) : (
+            <>
+              <span className="star-nudge-glyph" aria-hidden="true">☆</span>
+              <button
+                type="button"
+                className="star-nudge-link"
+                onClick={handleStarClick}
+              >
+                Star the repo
+              </button>
+              <button
+                type="button"
+                className="star-nudge-dismiss"
+                onClick={handleStarDismiss}
+                aria-label="Dismiss star nudge"
+              >
+                ×
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="sidebar-footer__fleet-row">
         <img src="/legion-mark.svg" alt="" aria-hidden="true" className="footer-fleet-mark" />

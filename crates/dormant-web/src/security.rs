@@ -40,7 +40,11 @@ const ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 /// mounted, it is already strict by construction — there is no window
 /// where a forgotten classification decision defaults to the weaker
 /// same-origin check.
-pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &["/api/config/apply", "/api/pair/samsung"];
+pub(crate) static STRICT_ORIGIN_PATHS: &[&str] = &[
+    "/api/config/apply",
+    "/api/pair/samsung",
+    "/api/star-nudge/star",
+];
 
 /// Full `/api`-prefixed `POST` routes that are deliberately left on the
 /// generic same-origin check (`is_same_origin`) rather than the strict
@@ -66,6 +70,7 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/push",
     "/api/pause",
     "/api/resume",
+    "/api/star-nudge/dismiss",
     "/api/reload",
     "/api/doctor",
     "/api/emergency-wake",
@@ -680,6 +685,18 @@ mod tests {
     fn exercise_is_explicitly_acknowledged_weak() {
         assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/doctor/exercise/:display"));
         assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/doctor/exercise/:display"));
+    }
+
+    #[test]
+    fn star_nudge_dismiss_is_explicitly_acknowledged_weak() {
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/star-nudge/dismiss"));
+        assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/star-nudge/dismiss"));
+    }
+
+    #[test]
+    fn star_nudge_star_is_explicitly_acknowledged_strict() {
+        assert!(STRICT_ORIGIN_PATHS.contains(&"/api/star-nudge/star"));
+        assert!(!ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/star-nudge/star"));
     }
 
     /// Structural comment-test (no path-normalization layer): the guard

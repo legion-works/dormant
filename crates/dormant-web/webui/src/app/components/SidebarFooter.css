@@ -126,3 +126,60 @@
 .footer-github:hover {
   color: var(--text-strong);
 }
+
+/* ── Star-the-repo nudge ──────────────────────────────────────────── */
+
+.sidebar-footer__star-nudge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.star-nudge-glyph {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.star-nudge-link {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.star-nudge-link:hover {
+  color: var(--text-muted);
+}
+
+.star-nudge-dismiss {
+  margin-left: auto;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-faint);
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+}
+
+.star-nudge-dismiss:hover {
+  opacity: 1;
+  color: var(--text-muted);
+}
+
+.star-nudge-starred {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--success);
+}

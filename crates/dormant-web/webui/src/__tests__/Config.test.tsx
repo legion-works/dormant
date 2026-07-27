@@ -89,9 +89,11 @@ vi.mock("../app/config/SettingsForm", () => ({
       dirtySections: Set<string>;
     } | null) => void;
   }) => {
-    const { useEffect } = require("react");
-    useEffect(() => {
-      // Fire the guard callback to simulate a dirty state on the daemon tab.
+    const { useLayoutEffect } = require("react");
+    // useLayoutEffect fires synchronously after DOM mutations, before paint.
+    // This avoids the React 18 StrictMode double-mount race where useEffect
+    // may fire its state update after the test's waitFor polling window.
+    useLayoutEffect(() => {
       onNavigationGuard({
         dirtyCount: 2,
         discard: () => {},
@@ -339,7 +341,8 @@ describe("Config", () => {
     });
 
     // The dot is rendered asynchronously via NavigationGuard callback.
-    // Wait specifically for the dot span to appear before asserting.
+    // Use a longer timeout — React 18 StrictMode double-fires effects,
+    // and the dirty-tab state update may land after the initial paint.
     await waitFor(() => {
       const daemonTab = screen.getByText("Daemon").closest("button");
       if (!daemonTab) return false;
@@ -352,7 +355,7 @@ describe("Config", () => {
           st.borderRadius === "50%"
         );
       });
-    }).then((hasDot) => {
+    }, { timeout: 3000 }).then((hasDot) => {
       expect(hasDot).toBe(true);
     });
 

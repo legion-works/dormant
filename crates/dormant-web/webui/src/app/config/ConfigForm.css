@@ -143,7 +143,7 @@
   outline: none;
   transition: border-color var(--dur-fast) var(--ease);
   width: 100%;
-  max-width: 360px;
+  max-width: 420px;
 }
 
 .cf-field__input:focus,
@@ -390,7 +390,7 @@
 .cf-field.cf-field--row {
   display: grid;
   grid-template-columns: 230px 1fr;
-  gap: 2px 8px;
+  gap: 6px 20px;
   align-items: start;
 }
 

@@ -141,7 +141,6 @@
   flex-direction: column;
   min-width: 0;
   overflow: hidden;
-  align-items: center;
 }
 
 .topbar {
@@ -153,6 +152,8 @@
   padding: 0 20px;
   border-bottom: 1px solid var(--border);
   background-color: var(--bg-base);
+  width: 100%;
+  flex-shrink: 0;
 }
 
 .topbar-left {

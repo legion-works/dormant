@@ -138,9 +138,10 @@
 /* ── Panel tiles ─────────────────────────────────────────────────── */
 .panel-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
+  align-items: stretch;
 }
 
 .panel-tile {
@@ -148,6 +149,8 @@
   border: 1px solid var(--border);
   border-radius: var(--panel-radius);
   background: var(--bg-raised);
+  display: flex;
+  flex-direction: column;
   transition: opacity var(--dur-fast) var(--ease);
 }
 
@@ -252,6 +255,8 @@
   display: flex;
   gap: 7px;
   flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 8px;
 }
 
 .panel-tile__action-chip {

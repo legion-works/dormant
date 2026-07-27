@@ -167,7 +167,7 @@
   font-weight: 500;
   text-align: center;
   white-space: nowrap;
-  width: 152px;
+  min-width: 152px;
   flex-shrink: 0;
 }
 

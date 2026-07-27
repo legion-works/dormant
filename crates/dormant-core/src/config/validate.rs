@@ -152,6 +152,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "entity_crud_enabled",
             "pairing_enabled",
             "pair_timeout",
+            "hook_edit_enabled",
             "doctor_wake_settle",
             "macos_idle_frozen_polls",
             "macos_idle_sanity_cap",

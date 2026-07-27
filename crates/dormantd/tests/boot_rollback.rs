@@ -1315,3 +1315,185 @@ async fn boot_sends_ready_before_any_watchdog_ping() {
 
     shutdown(handle, join).await;
 }
+
+/// A DDC selector that cannot match the test host must start in degraded
+/// health (probe-seeded detail) and must not crash-loop on repeated boots.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn ddc_probe_failure_starts_with_degraded_health_no_crash_loop() {
+    let h = Harness::new();
+    let cfg_path = write_file(
+        h.paths.root(),
+        "config.toml",
+        &format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+socket_path = "{sock}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+ddc_display = "nonexistent-999"
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "0s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            sock = h.socket_path().display(),
+        ),
+    );
+    let cfg_bytes = std::fs::read(&cfg_path).unwrap();
+    let cfg_fp = fingerprint_bytes(&cfg_bytes);
+    let now = now_epoch_s();
+    h.seed_crash_loop(&CrashLoopState {
+        schema_version: 1,
+        starts: vec![entry(now - 60, cfg_fp, 201), entry(now - 30, cfg_fp, 202)],
+        rollback_active: false,
+        rolled_back_from: None,
+    });
+
+    // First boot: must start, not crash-loop.
+    let plan = boot_guard::prepare(
+        &cfg_path,
+        &h.creds_path,
+        &h.state_dir,
+        Strictness::Strict,
+        true,
+    );
+    let outcome = boot::boot(plan, h.inputs()).await.expect("first boot");
+    let BootOutcome::Started {
+        handle,
+        join,
+        rolled_back: rb1,
+        ..
+    } = outcome
+    else {
+        panic!("expected Started on first boot");
+    };
+    assert!(!rb1, "no rollback expected on degraded display start");
+
+    let (_pending, rollback) = status_of(&handle).await;
+    assert!(
+        rollback.is_none(),
+        "rollback must be unset on degraded start"
+    );
+
+    // Snapshot must show ddcci controller as unhealthy with non-empty detail.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Snapshot(tx))
+        .await
+        .expect("send snapshot");
+    let snap: StateSnapshot = rx.await.expect("recv snapshot");
+    let (_did, ds) = snap
+        .displays
+        .iter()
+        .find(|(did, _)| did == "mon")
+        .expect("mon display in snapshot");
+    let ddcci = ds
+        .controllers
+        .iter()
+        .find(|c| c.name == "ddcci")
+        .expect("ddcci controller in health list");
+    assert!(
+        !ddcci.healthy,
+        "ddcci must be unhealthy after probe failure"
+    );
+    assert!(
+        ddcci.detail.is_some(),
+        "ddcci must carry probe-failure detail"
+    );
+
+    shutdown(handle, join).await;
+    // `boot()` intentionally leaks the lock via `mem::forget` — the fd
+    // stays held for the process lifetime so a second boot with the same
+    // lock_path would fail. Create a fresh harness for the second boot
+    // (different lock_path, different tempdir) to simulate a second boot
+    // cycle and prove no crash-loop.
+
+    let h2 = Harness::new();
+    let cfg_path2 = write_file(
+        h2.paths.root(),
+        "config.toml",
+        &format!(
+            r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+socket_path = "{sock}"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+ddc_display = "nonexistent-999"
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "0s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+            sock = h2.socket_path().display(),
+        ),
+    );
+    let cfg_bytes2 = std::fs::read(&cfg_path2).unwrap();
+    let cfg_fp2 = fingerprint_bytes(&cfg_bytes2);
+    let now2 = now_epoch_s();
+    h2.seed_crash_loop(&CrashLoopState {
+        schema_version: 1,
+        starts: vec![
+            entry(now2 - 45, cfg_fp2, 203),
+            entry(now2 - 15, cfg_fp2, 204),
+        ],
+        rollback_active: false,
+        rolled_back_from: None,
+    });
+    let plan2 = boot_guard::prepare(
+        &cfg_path2,
+        &h2.creds_path,
+        &h2.state_dir,
+        Strictness::Strict,
+        true,
+    );
+    let outcome2 = boot::boot(plan2, h2.inputs()).await.expect("second boot");
+    let BootOutcome::Started {
+        handle: hh2,
+        join: j2,
+        rolled_back: rb2,
+        ..
+    } = outcome2
+    else {
+        panic!("expected Started on second boot");
+    };
+    assert!(!rb2, "no rollback on second degraded boot");
+    assert!(status_of(&hh2).await.1.is_none());
+    shutdown(hh2, j2).await;
+}

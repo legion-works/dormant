@@ -199,11 +199,26 @@ impl DisplayExecutor {
     ///
     /// The returned vector preserves chain order so callers can correlate
     /// outcomes with the configured chain.
+    ///
+    /// Also seeds [`Self::controller_health`] with one entry per controller
+    /// reflecting its probe result — callers that check
+    /// `controller_health()` after `probe_all()` can surface degraded-display
+    /// cause before the first blank/wake attempt.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal health [`Mutex`] is poisoned.
     pub async fn probe_all(&mut self) -> Vec<(String, Result<(), DormantError>)> {
         let mut out = Vec::with_capacity(self.chain.len());
-        for controller in &mut self.chain {
+        let mut health: Vec<ControllerHealth> = Vec::with_capacity(self.chain.len());
+        for (i, controller) in self.chain.iter_mut().enumerate() {
             let name = controller.name().to_string();
             let result = controller.probe().await;
+            let role = if i == 0 {
+                ControllerRole::Primary
+            } else {
+                ControllerRole::Fallback
+            };
             if let Err(ref e) = result {
                 tracing::warn!(
                     event = "display_probe_failed",
@@ -212,9 +227,26 @@ impl DisplayExecutor {
                     error = %e,
                     "controller probe failed; staying in chain",
                 );
+                health.push(ControllerHealth {
+                    name,
+                    role,
+                    healthy: false,
+                    detail: Some(e.to_string()),
+                });
+            } else {
+                health.push(ControllerHealth {
+                    name,
+                    role,
+                    healthy: true,
+                    detail: None,
+                });
             }
-            out.push((name, result));
+            out.push((controller.name().to_string(), result));
         }
+        *self
+            .health
+            .lock()
+            .expect("DisplayExecutor health lock poisoned") = health;
         out
     }
 
@@ -739,6 +771,8 @@ mod tests {
     struct FakeInner {
         modes: Vec<BlankMode>,
         available: bool,
+        /// Scripted `probe()` result.  `None` → default `Ok(())`.
+        probe_result: Option<Result<(), DormantError>>,
         blank_results: VecDeque<Result<(), CmdFailure>>,
         wake_results: VecDeque<Result<(), CmdFailure>>,
         log: Vec<(String, &'static str)>,
@@ -777,6 +811,20 @@ mod tests {
 
         fn set_available(&self, v: bool) {
             self.inner.lock().unwrap().available = v;
+        }
+
+        fn set_probe_result(&self, r: Result<(), DormantError>) {
+            self.inner.lock().unwrap().probe_result = Some(r);
+        }
+
+        /// Consume and return the scripted probe result, or `Ok(())`.
+        fn take_probe_result(&self) -> Result<(), DormantError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .probe_result
+                .take()
+                .unwrap_or(Ok(()))
         }
 
         fn push_blank_result(&self, r: Result<(), CmdFailure>) {
@@ -872,6 +920,10 @@ mod tests {
 
         fn supported_modes(&self) -> Vec<BlankMode> {
             self.inner.lock().unwrap().modes.clone()
+        }
+
+        async fn probe(&mut self) -> Result<(), DormantError> {
+            self.take_probe_result()
         }
 
         async fn is_available(&self) -> bool {
@@ -1217,6 +1269,44 @@ mod tests {
         assert_eq!(results[0].0, "A");
         assert_eq!(results[1].0, "B");
         assert!(results.iter().all(|(_, r)| r.is_ok()));
+    }
+
+    /// After `probe_all`, `controller_health()` contains one entry per
+    /// controller with probe-failure detail.
+    #[tokio::test(start_paused = true)]
+    async fn probe_all_seeds_health_with_probe_results() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        b.set_probe_result(Err(DormantError::DisplayIo {
+            controller: "B".into(),
+            detail: "no display found".into(),
+        }));
+        let boxed: Vec<Box<dyn DisplayController>> = vec![Box::new(a.clone()), Box::new(b.clone())];
+        let mut exec = DisplayExecutor::new(
+            DisplayId("probe-health".into()),
+            boxed,
+            BlankMode::PowerOff,
+            default_retry(),
+        );
+        exec.probe_all().await;
+
+        let health = exec.controller_health();
+        assert_eq!(health.len(), 2);
+        // Primary A: probe succeeded.
+        assert_eq!(health[0].name, "A");
+        assert!(matches!(health[0].role, ControllerRole::Primary));
+        assert!(health[0].healthy);
+        assert!(health[0].detail.is_none());
+        // Fallback B: probe failed.
+        assert_eq!(health[1].name, "B");
+        assert!(matches!(health[1].role, ControllerRole::Fallback));
+        assert!(!health[1].healthy);
+        assert!(
+            health[1]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no display found"))
+        );
     }
 
     // ── Should 2 — mid-round supersede ────────────────────────────────────

@@ -261,25 +261,27 @@ number:
     restore_value: true
 
 # ——— Staleness and heartbeat ——————————————————————————————————————————
-# This config publishes occupancy on-change only: no edge → no MQTT
-# message. During long still periods (occupant seated, no movement),
-# dormant's default sensors.<id>.stale_timeout of 5m fires and the sensor
+# Binary sensors publish on-change only: no edge → no MQTT message. During
+# long still periods (occupant seated, no movement) a change-only topic
+# goes silent, dormant's sensors.<id>.stale_timeout fires, and the sensor
 # reads unavailable. The fail-safe (default zone policy = "present") keeps
-# the display on, but you lose occupancy-driven wake on return until the
-# next MQTT edge arrives.
+# the display on, but occupancy-driven wake is lost until the next edge.
 #
-# The maintainer's live config sets stale_timeout = "15m" as a workaround.
-# A periodic re-publish of the occupancy state lets stale_timeout come
-# down to ~2m. One way: add an interval that re-publishes desk_seated:
+# The heartbeat below re-publishes the current desk_seated state every
+# 5 minutes even when unchanged, so silence again means "device gone", not
+# "occupant still". Verified on the maintainer's device: retained value on
+# subscribe, then republishes at exact 5-minute marks.
 #
-#   interval:
-#     - interval: 60s
-#       then:
-#         - mqtt.publish:
-#             topic: ${device_name}/sensor/desk_seated/state
-#             payload: !lambda |-
-#               return id(desk_seated).state ? "ON" : "OFF";
-#             retain: true
-#
-# With that in place, set dormant's stale_timeout to "2m" and the daemon
-# will only go unavailable if the ESP drops off the network entirely.
+# Match dormant's stale_timeout to a bit over one heartbeat (e.g. "6m"):
+# the daemon then only goes unavailable if the ESP truly drops off the
+# network. The topic must match this config's MQTT naming:
+#   <device_name>/binary_sensor/<friendly_name snake_cased>_desk_seated/state
+
+interval:
+  - interval: 5min
+    then:
+      - mqtt.publish:
+          topic: ${device_name}/binary_sensor/desk_presence_desk_seated/state
+          payload: !lambda |-
+            return id(desk_seated).state ? std::string("ON") : std::string("OFF");
+          retain: true

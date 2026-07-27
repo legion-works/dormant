@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-27
+
+### Highlights
+
+**Web UI v3** — edit every config section (coordination, keymap, input filter, hooks) from the web Settings editor, inspect shared-display ownership with live pull/push feedback on the new Switching view, and keep event history across page reloads. See [the web UI chapter](./docs/src/web-ui.md).
+
+### Added
+
+- six-tab Settings layout (Daemon, Sensors, Zones, Rules, Displays, Coordination). Switching view surfaces `Ownership` daemon events over the WebSocket and shows both machines' input codes, the panel state, poll cadence, and agreement verdict. `/api/events/recent` seeds the event log on page load so history survives a reload. Doctor checks are grouped by subject. Panel-wear detail now splits wear time into seeded (pre-existing) and measured (new samples) with a per-cell heat map. The rollback banner surfaces the recovery command when one is configured. A security-posture card honestly states what the Host and Origin guards defend, and what they don't. Hook editing is gated behind the new `daemon.hook_edit_enabled` flag (default off); without it hooks are read-only everywhere.
+
+### Fixed
+
+- Web UI matches the v3 design: corrected type scale and panel styling, the mock's Switching and display-detail layouts, and literal `\uXXXX` escape sequences that rendered as raw text in several views.
+- Web Apply no longer falsely rejects shared-display configs (the apply route validated with an empty input-source-reader set, unlike the daemon). Also a batch of operator-reported UI fixes: event badge overflow, the history sentinel rendering as a raw row, unstyled action buttons, the shared-blank warning displacing the actions row, and display-detail card padding.
+
 ## [0.7.1] - 2026-07-26
 
 ### Fixed
@@ -206,7 +221,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/legion-works/dormant/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/legion-works/dormant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/legion-works/dormant/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/legion-works/dormant/compare/v0.5.0...v0.6.0

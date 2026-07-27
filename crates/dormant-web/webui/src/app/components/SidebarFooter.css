@@ -38,6 +38,35 @@
   color: var(--text-muted);
 }
 
+/* ── W5-1: web-surface posture chip ─────────────────────────────────── */
+
+.sidebar-footer__posture {
+  display: flex;
+}
+
+.posture-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: var(--radius-full);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.6;
+  border: 1px solid;
+}
+
+.posture-chip--loopback {
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 30%, transparent);
+  background: color-mix(in oklab, var(--accent) 8%, transparent);
+}
+
+.posture-chip--lan {
+  color: var(--accent-warm);
+  border-color: color-mix(in oklab, var(--accent-warm) 30%, transparent);
+  background: color-mix(in oklab, var(--accent-warm) 8%, transparent);
+}
+
 .sidebar-footer__daemon {
   display: flex;
   flex-direction: column;

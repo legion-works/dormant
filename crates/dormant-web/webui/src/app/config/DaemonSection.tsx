@@ -131,9 +131,55 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
     );
   }
 
+  // W5-1: posture card — derived from web_bind / web_allow_nonloopback.
+  const isNonloopback = Boolean(daemon.web_allow_nonloopback);
+  const postureCard = (
+    <div
+      className={`cf-posture-card${isNonloopback ? " cf-posture-card--lan" : " cf-posture-card--loopback"}`}
+      style={{
+        padding: "10px 14px",
+        borderRadius: "var(--radius-md)",
+        marginBottom: "14px",
+        fontSize: "11.5px",
+        lineHeight: 1.55,
+        display: "flex",
+        alignItems: "flex-start",
+        gap: "10px",
+      }}
+    >
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          padding: "1px 8px",
+          borderRadius: "var(--radius-full)",
+          fontFamily: "var(--font-mono)",
+          fontSize: "10px",
+          fontWeight: 600,
+          flexShrink: 0,
+          marginTop: "1px",
+          color: isNonloopback ? "var(--accent-warm)" : "var(--accent)",
+          border: `1px solid ${isNonloopback ? "color-mix(in oklab, var(--accent-warm) 35%, transparent)" : "color-mix(in oklab, var(--accent) 35%, transparent)"}`,
+          background: isNonloopback
+            ? "color-mix(in oklab, var(--accent-warm) 10%, transparent)"
+            : "color-mix(in oklab, var(--accent) 10%, transparent)",
+        }}
+      >
+        {isNonloopback ? "LAN" : "loopback"}
+      </span>
+      <span style={{ color: "var(--text-body)" }}>
+        {isNonloopback
+          ? `The web surface is bound to ${daemon.web_bind || "non-loopback"} and reachable from the network without authentication. Exposed write routes: config apply, display blank/wake/switch/push, doctor exercise, pairing, emergency wake.`
+          : "Loopback only — the web surface is not reachable from the LAN. All write routes require local access."}
+      </span>
+    </div>
+  );
+
   return (
     <FormSection title="Daemon">
       <div className="cf-card">
+        {postureCard}
+
         {/* Groups: Web surface, Timing, Platform, Feature flags */}
         <div className="cf-card__summary-type" style={{ marginBottom: "6px" }}>
           Web surface

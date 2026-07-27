@@ -203,7 +203,12 @@ function ShellInner() {
           ))}
         </nav>
 
-        <SidebarFooter connected={connected} daemon={daemon} />
+        <SidebarFooter
+          connected={connected}
+          daemon={daemon}
+          webBind={config?.inventory.daemon.web_bind}
+          webAllowNonloopback={config?.inventory.daemon.web_allow_nonloopback}
+        />
       </aside>
 
       <main className="main">

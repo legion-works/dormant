@@ -298,22 +298,38 @@ mod tests {
             feed_ring(ring_clone, ctl_clone).await;
         });
 
-        // Let feeder subscribe.
+        // Let feeder subscribe and process gen1 events.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Send gen1 events.
         let _ = gen1_tx.send(sensor_event("gen1-a"));
         let _ = gen1_tx.send(sensor_event("gen1-b"));
 
+        // Wait for gen1 events to land in the ring.
+        for _ in 0..100 {
+            if ring.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(ring.len(), 2, "gen1 events should be in the ring");
+
         // Close gen1 broadcast (simulate generation switch).
         drop(gen1_tx);
+
+        // Give feeder time to detect Closed and resubscribe to gen2.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Send gen2 events.
         let _ = gen2_tx.send(sensor_event("gen2-a"));
 
-        // Let feeder process: gen1 events, detect Closed, resubscribe,
-        // receive gen2. Combined sleep avoids raw-sleep duplicate-anchor violations.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wait for gen2 event to land after resubscribe.
+        for _ in 0..100 {
+            if ring.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         // Both gen1 and gen2 events should be present.
         let snap = ring.snapshot(100);

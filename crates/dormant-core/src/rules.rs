@@ -117,6 +117,15 @@ pub enum ControlMsg {
     ForceBlank(DisplayId),
     /// Force-immediate wake (operator override).
     ForceWake(DisplayId),
+    /// Walk the configured render/stage/controller blank ladder from its
+    /// first stage (issue #124 — soft alternative to [`Self::ForceBlank`]
+    /// that never hard-powers the panel).  Operator-initiated like
+    /// `ForceBlank` but routes through [`Input::SoftBlank`] so the
+    /// state machine enters the ladder instead of issuing a primary
+    /// hardware blank.  When the ladder has no render stage this still
+    /// issues a controller blank, but always at the configured
+    /// `primary_blank_mode` rather than the operator override.
+    SoftBlank(DisplayId),
     /// Request a current snapshot of engine state.
     Snapshot(oneshot::Sender<StateSnapshot>),
     /// Subscribe to [`DaemonEvent`]s from this point forward.
@@ -1402,6 +1411,7 @@ impl RulesEngine {
             ControlMsg::Resume { rule } => self.handle_resume(rule.as_ref()),
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
+            ControlMsg::SoftBlank(d) => self.step_one(&d, Input::SoftBlank),
             ControlMsg::InputWake(d) => {
                 // Issue #125: if every zone that drives this display is
                 // vacant and the effective `input_wake_hold` for the
@@ -3874,6 +3884,38 @@ mod tests {
         .expect("one-display engine config is valid")
     }
 
+    /// Build a manual one-display engine with a caller-supplied ladder and
+    /// render sinks.  Used by the soft/hard blank tests (issue #124) so
+    /// they can observe the difference between "walk the render ladder" and
+    /// "issue a primary controller blank."
+    #[allow(clippy::implicit_hasher)]
+    fn manual_engine_with_ladder(
+        display: DisplayId,
+        executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+        render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+        ladder: Vec<LadderStage>,
+        ownership: Arc<dyn OwnershipGate>,
+    ) -> RulesEngine {
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![DisplayRuntimeCfg {
+                    display,
+                    blank_mode: BlankMode::PowerOff,
+                    ladder,
+                    timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                }],
+                sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
+            executors,
+            render_sinks,
+            ownership,
+        )
+        .expect("one-display ladder engine config is valid")
+    }
+
     #[tokio::test]
     async fn ownership_poll_refeeds_changed_cached_verdict_without_timer_sweep() {
         let display = DisplayId("mon".into());
@@ -3979,6 +4021,134 @@ mod tests {
                 .iter()
                 .any(|(_, command)| matches!(command, SinkCmd::Blank(BlankMode::PowerOff))),
             "ForceBlank must issue a command when the ownership gate denies control"
+        );
+    }
+
+    // ── Soft vs Hard blank (issue #124) ────────────────────────────────
+
+    use crate::fakes::{RecordingRenderSink, RenderCmd};
+
+    /// `ControlMsg::SoftBlank` must walk the configured render/stage/controller
+    /// ladder from its FIRST stage — never skip past the render overlay.  This
+    /// is the safety guarantee the issue-#124 fix relies on: a soft blank on a
+    /// shared panel must NOT hard-power the panel before the render surface
+    /// is shown.  Pin the ladder-shape distinction so a future refactor that
+    /// routes Soft through `ForceBlank`'s primary-mode path fails loudly.
+    #[tokio::test]
+    async fn soft_blank_walks_ladder_from_first_stage() {
+        let display = DisplayId("mon".into());
+        let cmd_sink = Arc::new(RecordingSink::new());
+        let render_sink = Arc::new(RecordingRenderSink::new());
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        execs.insert(display.clone(), cmd_sink.clone());
+        let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+        renders.insert(display.clone(), render_sink.clone());
+        let ladder = vec![
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            },
+            LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            },
+        ];
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = manual_engine_with_ladder(
+            display.clone(),
+            execs,
+            renders,
+            ladder,
+            Arc::new(FlipGate(owned)),
+        );
+
+        engine.handle_control(ControlMsg::SoftBlank(display.clone()));
+        // Drain the spawned render/show result via the engine's own
+        // results channel — event-driven synchronization (no sleep, which
+        // the test-timing policy would reject).
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("soft blank renders the render stage and reports a result");
+        assert!(
+            matches!(result, crate::rules::InternalResult::Render { .. }),
+            "SoftBlank must enter the ladder at stage 0 (RenderBlack), got {result:?}"
+        );
+
+        let render_log = render_sink.log();
+        assert!(
+            render_log.iter().any(|(_, c)| matches!(
+                c,
+                RenderCmd::Show {
+                    kind: StageKind::RenderBlack,
+                    ..
+                }
+            )),
+            "SoftBlank must enter the ladder at stage 0 (RenderBlack), got {render_log:?}"
+        );
+        let cmd_log = cmd_sink.log();
+        assert!(
+            !cmd_log.iter().any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+            "SoftBlank must NOT issue a controller blank before the render dwell elapses, got {cmd_log:?}"
+        );
+    }
+
+    /// `ControlMsg::ForceBlank` (Hard) must skip the render ladder and issue
+    /// the primary controller blank immediately — the operator-override path
+    /// unchanged by issue #124.  This is the discriminant for the soft/hard
+    /// split: a regression that re-routes `ForceBlank` through the ladder would
+    /// break every existing "Force blank" surface (tray, web, `dormantctl
+    /// blank --hard`).
+    #[tokio::test]
+    async fn hard_blank_skips_to_primary_hardware_mode() {
+        let display = DisplayId("mon".into());
+        let cmd_sink = Arc::new(RecordingSink::new());
+        let render_sink = Arc::new(RecordingRenderSink::new());
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        execs.insert(display.clone(), cmd_sink.clone());
+        let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+        renders.insert(display.clone(), render_sink.clone());
+        let ladder = vec![
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            },
+            LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            },
+        ];
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = manual_engine_with_ladder(
+            display.clone(),
+            execs,
+            renders,
+            ladder,
+            Arc::new(FlipGate(owned)),
+        );
+
+        engine.handle_control(ControlMsg::ForceBlank(display.clone()));
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("ForceBlank reports a blank command result");
+
+        assert!(matches!(result, InternalResult::Blank { .. }));
+        let cmd_log = cmd_sink.log();
+        assert!(
+            cmd_log
+                .iter()
+                .any(|(_, c)| matches!(c, SinkCmd::Blank(BlankMode::PowerOff))),
+            "ForceBlank must issue the primary controller blank immediately, got {cmd_log:?}"
+        );
+        let render_log = render_sink.log();
+        assert!(
+            !render_log
+                .iter()
+                .any(|(_, c)| matches!(c, RenderCmd::Show { .. })),
+            "ForceBlank must NOT enter the render ladder first, got {render_log:?}"
         );
     }
 

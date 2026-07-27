@@ -216,6 +216,7 @@ async fn force_blank(socket_path: &std::path::Path) {
                 &p,
                 &IpcRequest::Blank {
                     display: "mon".to_string(),
+                    mode: dormant_core::ipc_proto::BlankRequestMode::Hard,
                 },
             )
         }),

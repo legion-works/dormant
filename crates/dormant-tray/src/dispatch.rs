@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::{BlankRequestMode, IpcRequest, IpcResponse};
 use dormant_core::rules::StateSnapshot;
 use dormantctl::client;
 use tracing::info;
@@ -49,6 +49,12 @@ pub fn plan_action(
                 .iter()
                 .map(|(id, _)| IpcRequest::Blank {
                     display: id.clone(),
+                    // Tray's "Force blank all…" is always Hard — the operator
+                    // override.  Issue #124 split the policy: the tray
+                    // deliberately stays on the safe-to-invoke path and
+                    // confirms the intent through the label, not by deferring
+                    // to the safe default.
+                    mode: BlankRequestMode::Hard,
                 })
                 .collect()
         })),
@@ -63,6 +69,7 @@ pub fn plan_action(
         })),
         Action::BlankOne(display) => DispatchPlan::Ipc(vec![IpcRequest::Blank {
             display: display.clone(),
+            mode: BlankRequestMode::Hard,
         }]),
         Action::WakeOne(display) => DispatchPlan::Ipc(vec![IpcRequest::Wake {
             display: display.clone(),
@@ -190,7 +197,7 @@ mod tests {
 
     use super::{DispatchCapabilities, DispatchPlan, execute_plan, plan_action};
     use crate::menu::Action;
-    use dormant_core::ipc_proto::IpcRequest;
+    use dormant_core::ipc_proto::{BlankRequestMode, IpcRequest};
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
 
     fn display(id: &str) -> (String, DisplaySnapshot) {
@@ -234,9 +241,27 @@ mod tests {
         assert_eq!(
             serde_json::to_value(requests).unwrap(),
             serde_json::json!([
-                {"req": "blank", "display": "a"},
-                {"req": "blank", "display": "b"}
+                {"req": "blank", "display": "a", "mode": "hard"},
+                {"req": "blank", "display": "b", "mode": "hard"}
             ])
+        );
+    }
+
+    /// `Action::BlankOne` from a single-display snapshot must emit one
+    /// explicit-`hard` `Blank` request.  The tray never soft-blanks; the
+    /// operator override is the only mode the menu offers (issue #124).
+    #[test]
+    fn blank_one_emits_explicit_hard_wire_request() {
+        let DispatchPlan::Ipc(requests) = plan_action(
+            &Action::BlankOne("a".into()),
+            Some(&two_display_snapshot()),
+            false,
+        ) else {
+            panic!("expected IPC plan")
+        };
+        assert_eq!(
+            serde_json::to_value(requests).unwrap(),
+            serde_json::json!([{"req": "blank", "display": "a", "mode": "hard"}])
         );
     }
 
@@ -287,6 +312,7 @@ mod tests {
             DispatchPlan::Ipc(vec![
                 IpcRequest::Blank {
                     display: "a".into(),
+                    mode: BlankRequestMode::Hard,
                 },
                 IpcRequest::Wake {
                     display: "b".into(),
@@ -315,7 +341,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(capabilities.requests.lock().unwrap().as_slice()).unwrap(),
             serde_json::json!([
-                {"req": "blank", "display": "a"},
+                {"req": "blank", "display": "a", "mode": "hard"},
                 {"req": "wake", "display": "b"}
             ])
         );

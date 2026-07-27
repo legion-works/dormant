@@ -136,7 +136,7 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
     if (!accepted) return;
     setActionError(null);
     try {
-      await postBlank(id);
+      await postBlank(id, "hard");
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : "Force blank failed");
     }

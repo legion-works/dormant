@@ -12,6 +12,46 @@ use crate::rules::{EmergencyWakeReport, ExerciseReport, StateSnapshot};
 
 // ── IpcRequest ────────────────────────────────────────────────────────────────
 
+/// The blanking mode requested by `IpcRequest::Blank`.
+///
+/// Two semantics are deliberately split at the wire boundary so the IPC
+/// surface cannot conflate them (issue #124 — a forced `PowerOff` on a shared
+/// panel can hard-power the USB hub and starve a downstream sensor).
+///
+/// * `Soft` walks the display's configured blank ladder from its first stage
+///   (render overlay first, then controller blank if the ladder escalates).
+/// * `Hard` issues the operator-override `ForceBlank`, which goes straight to
+///   the primary hardware controller mode and bypasses the render ladder.
+///
+/// Legacy `Blank` frames from older `dormantctl` builds carry NO `mode` field
+/// and deserialize to `Soft` (safety-first — see the decision doc at
+/// `.opencode/decisions/2026-07-27-blank-wire-default.md`). New builds omit
+/// `mode` from the wire when it is `Soft` so the legacy frame shape is
+/// preserved on the happy path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlankRequestMode {
+    /// Walk the configured render/stage/controller ladder from its first
+    /// stage.  Default for legacy frames without a `mode` field.
+    #[default]
+    Soft,
+    /// Operator override: skip the ladder, issue the primary hardware mode.
+    Hard,
+}
+
+/// `true` when the IPC `mode` field carries the legacy default and should be
+/// elided from the JSON payload.  Keeps the wire shape unchanged for the
+/// happy path so pre-mode `dormantctl` clients and the legacy frame stay
+/// byte-identical.  Accepts `&BlankRequestMode` to match serde's
+/// `skip_serializing_if` signature.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if requires a function pointer; the copy is a single byte"
+)]
+fn blank_mode_is_soft_default_value(m: &BlankRequestMode) -> bool {
+    matches!(m, BlankRequestMode::Soft)
+}
+
 /// A request from `dormantctl` to `dormantd`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "req", rename_all = "snake_case")]
@@ -33,10 +73,20 @@ pub enum IpcRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
     },
-    /// Force-blank a display.
+    /// Blank a display.
+    ///
+    /// The `mode` field selects between the soft ladder path and the
+    /// operator-override `ForceBlank` path.  `mode` is elided from the wire
+    /// when it carries the default `Soft`, and a frame that arrives without
+    /// a `mode` field deserializes to `Soft` so legacy `dormantctl` clients
+    /// keep working.
     Blank {
         /// Display id.
         display: String,
+        /// Blank mode — see [`BlankRequestMode`].  Defaults to [`Soft`](BlankRequestMode::Soft)
+        /// when absent on the wire.
+        #[serde(default, skip_serializing_if = "blank_mode_is_soft_default_value")]
+        mode: BlankRequestMode,
     },
     /// Force-wake a display.
     Wake {
@@ -259,14 +309,97 @@ mod tests {
     fn request_blank_serde() {
         let req = IpcRequest::Blank {
             display: "main".into(),
+            mode: BlankRequestMode::Soft,
         };
         let json = serde_json::to_string(&req).unwrap();
+        // Soft is the default and is elided from the wire so the legacy
+        // frame shape is preserved byte-for-byte.
         assert_eq!(json, r#"{"req":"blank","display":"main"}"#);
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
         match back {
-            IpcRequest::Blank { display } => assert_eq!(display, "main"),
+            IpcRequest::Blank { display, mode } => {
+                assert_eq!(display, "main");
+                assert_eq!(mode, BlankRequestMode::Soft);
+            }
             _ => panic!("expected Blank"),
         }
+    }
+
+    /// Legacy `dormantctl` builds (pre-modes) emit `{"req":"blank","display":...}`
+    /// with no `mode` field.  The receiving daemon MUST default that frame
+    /// to `Soft` — safety-first per the issue-#124 decision.  This is the
+    /// exact wire payload that triggered the original incident.
+    #[test]
+    fn request_blank_serde_legacy_no_mode_defaults_to_soft() {
+        let back: IpcRequest = serde_json::from_str(r#"{"req":"blank","display":"x"}"#).unwrap();
+        match back {
+            IpcRequest::Blank { display, mode } => {
+                assert_eq!(display, "x");
+                assert_eq!(
+                    mode,
+                    BlankRequestMode::Soft,
+                    "legacy no-mode frame must default to Soft (safety-first)"
+                );
+            }
+            _ => panic!("expected Blank"),
+        }
+    }
+
+    /// Explicit `Hard` round-trips with the literal `"mode":"hard"` on the
+    /// wire and deserializes back to `Hard`.
+    #[test]
+    fn request_blank_serde_explicit_hard_round_trips() {
+        let req = IpcRequest::Blank {
+            display: "x".into(),
+            mode: BlankRequestMode::Hard,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"blank","display":"x","mode":"hard"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::Blank { display, mode } => {
+                assert_eq!(display, "x");
+                assert_eq!(mode, BlankRequestMode::Hard);
+            }
+            _ => panic!("expected Blank"),
+        }
+    }
+
+    /// Explicit `Soft` round-trips: it serializes to the SAME legacy frame
+    /// shape as the default (the `mode` field is elided for both) and
+    /// deserializes back to `Soft`.  Catches a stray `rename_all` or
+    /// `default` attribute that swallows the value or flips it to `Hard`.
+    #[test]
+    fn request_blank_serde_explicit_soft_round_trips() {
+        let req = IpcRequest::Blank {
+            display: "x".into(),
+            mode: BlankRequestMode::Soft,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"req":"blank","display":"x"}"#);
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::Blank { display, mode } => {
+                assert_eq!(display, "x");
+                assert_eq!(mode, BlankRequestMode::Soft);
+            }
+            _ => panic!("expected Blank"),
+        }
+    }
+
+    /// An unknown `mode` value MUST fail loudly — silently coercing to
+    /// `Soft` would let a typo'd `HARD` mutate to the wrong policy.  This
+    /// is the wire-boundary contract.
+    #[test]
+    fn request_blank_serde_unknown_mode_rejected() {
+        let err =
+            serde_json::from_str::<IpcRequest>(r#"{"req":"blank","display":"x","mode":"firm"}"#)
+                .expect_err("unknown mode must not deserialize");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mode") || msg.contains("variant"),
+            "error must mention mode/variant, got: {msg}"
+        );
     }
 
     #[test]

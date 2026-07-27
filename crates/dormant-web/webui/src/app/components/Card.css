@@ -1,16 +1,14 @@
-/* Card — glass-panel container.
-   Glass mode uses the DS .lw-glass utility (var(--glass-fill), blur, specular edge).
-   Opaque mode uses var(--glass-fill-strong) — a denser fill without backdrop-filter. */
+/* Card — elevated panel container (v3 fidelity: bg-raised + border + radius).
+   Glass mode uses .lw-glass; opaque mode uses the solid panel surface. */
 
 .dormant-card {
-  /* Base: inherit from .lw-glass when in glass mode.
-     Opaque mode overrides below. */
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--panel-radius);
+  overflow: hidden;
 }
 
 .dormant-card--opaque {
-  background: var(--glass-fill-strong);
-  border: 1px solid var(--glass-stroke);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  /* No backdrop-filter on dense data surfaces (DS convention). */
+  /* Opaque keeps the same surface — no glass back-drop blur needed
+     on dense data surfaces. */
 }

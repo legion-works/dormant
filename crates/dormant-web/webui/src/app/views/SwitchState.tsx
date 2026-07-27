@@ -84,6 +84,7 @@ export default function SwitchState({
   observedInputCode,
   coordination,
 }: SwitchStateProps) {
+  const owned = _owned;
   const [pullState, setPullState] = useState<PullState>({ kind: "idle" });
   const [pushState, setPushState] = useState<PushState>({ kind: "idle" });
   const pullTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -199,7 +200,7 @@ export default function SwitchState({
     const disabled = pullState.kind === "writing";
 
     return (
-      <div className={`switch-pull${pullState.kind !== "idle" ? " switch-pull--active" : ""}`}>
+      <>
         <button
           type="button"
           className="switch-btn switch-btn--pull"
@@ -208,8 +209,18 @@ export default function SwitchState({
         >
           {renderPullLabel()}
         </button>
+        {renderPullHint()}
         {renderPullState()}
-      </div>
+      </>
+    );
+  }
+
+  function renderPullHint() {
+    if (pullState.kind !== "idle") return null;
+    return (
+      <span className="switch-state__hint">
+        {owned ? "already ours" : "peer holds the panel"}
+      </span>
     );
   }
 
@@ -250,7 +261,7 @@ export default function SwitchState({
 
   function renderPush() {
     return (
-      <div className="switch-push">
+      <>
         {pushCapable ? (
           <button
             type="button"
@@ -266,14 +277,24 @@ export default function SwitchState({
             <a href="#/config/displays">configure</a>
           </div>
         )}
+        {renderPushHint()}
         {renderPushState()}
-      </div>
+      </>
+    );
+  }
+
+  function renderPushHint() {
+    if (!pushCapable || pushState.kind !== "idle") return null;
+    return (
+      <span className="switch-state__hint">
+        writes {hexPad(peerWriteCode)} to the peer
+      </span>
     );
   }
 
   function renderPushLabel(): string {
     switch (pushState.kind) {
-      case "idle": return "▶ Push to peer";
+      case "idle": return "Send to peer ▶";
       case "writing": return `◌ writing ${hexPad(pushState.writeCode)}…`;
       case "released": return "✓ sent";
       case "ignored":
@@ -309,8 +330,14 @@ export default function SwitchState({
   return (
     <div className="switch-state">
       <div className="switch-state__row">
-        {renderPull()}
-        {renderPush()}
+        {/* LEFT: Pull */}
+        <div className="switch-state__left">
+          {renderPull()}
+        </div>
+        {/* RIGHT: Push */}
+        <div className="switch-state__right">
+          {renderPush()}
+        </div>
       </div>
     </div>
   );

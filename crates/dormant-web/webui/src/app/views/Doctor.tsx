@@ -219,9 +219,9 @@ export default function Doctor() {
           onClick={handleRun}
           disabled={running}
         >
-          {running ? "Running\u2026" : doctorReport ? "Run again" : "Run doctor"}
+          {running ? "Running…" : doctorReport ? "Run again" : "Run doctor"}
         </button>
-        {lastRunLabel && <span className="doctor-last-run">{lastRunLabel} \u00b7 {checks.length} checks \u00b7 {failing} failing</span>}
+        {lastRunLabel && <span className="doctor-last-run">{lastRunLabel} · {checks.length} checks · {failing} failing</span>}
       </div>
 
       {error && <div className="doctor-error">Error: {error}</div>}
@@ -234,7 +234,7 @@ export default function Doctor() {
 
       {engineUnresponsive && (
         <div className="doctor-warning">
-          daemon did not answer the snapshot request \u2014 checks below cover network probes only
+          daemon did not answer the snapshot request — checks below cover network probes only
         </div>
       )}
 
@@ -267,7 +267,7 @@ export default function Doctor() {
                   <span className="doctor-group__label">{g.label}</span>
                   <span className="doctor-group__counts">
                     {g.checks.length} check{g.checks.length !== 1 ? "s" : ""}
-                    {g.failing > 0 && <span className="doctor-group__failing"> \u00b7 {g.failing} failing</span>}
+                    {g.failing > 0 && <span className="doctor-group__failing"> · {g.failing} failing</span>}
                   </span>
                 </div>
 
@@ -313,7 +313,7 @@ export default function Doctor() {
           </div>
           <p className="doctor-exercise-desc">
             Proves a display can actually be blanked and woken. Pauses the
-            display\u2019s rule for the window and always restores wake state.
+            display’s rule for the window and always restores wake state.
           </p>
           <div className="doctor-exercise-grid">
             {displayIds.map((id) => (

@@ -6,7 +6,7 @@
   align-items: center;
   gap: 6px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   padding: 2px 10px;
   border-radius: var(--radius-pill);
   color: var(--chip-color);

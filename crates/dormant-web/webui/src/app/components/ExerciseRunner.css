@@ -25,7 +25,7 @@
 
 .exercise-runner__description {
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 13px;
   color: var(--text-faint);
   margin: 0;
 }
@@ -57,7 +57,7 @@
   align-items: center;
   gap: 6px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 13px;
 }
 
 .exercise-runner__status {
@@ -122,13 +122,13 @@
 
 .exercise-runner__meta-value {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-body);
 }
 
 .exercise-runner__verdict {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   width: fit-content;
 }
@@ -152,7 +152,7 @@
   align-items: center;
   gap: 10px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 13px;
   color: var(--text-body);
   border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
   padding-bottom: 6px;

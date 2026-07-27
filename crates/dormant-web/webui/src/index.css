@@ -1,5 +1,13 @@
 /* Global resets + base styles.
-   DS tokens (colors, fonts, spacing) are loaded via src/ds.css. */
+   DS tokens (colors, fonts, spacing) are loaded via src/ds.css.
+
+   The DS type scale uses rem units with a 16px design base.
+   Lock the root so the entire cascade is predictable regardless
+   of user-agent or browser-zoom defaults. */
+
+html {
+  font-size: 16px;
+}
 
 *,
 *::before,
@@ -25,4 +33,69 @@ body {
 /* Remove default button styling (we style nav-item and topbar-reload explicitly) */
 button {
   font-family: inherit;
+}
+
+/* ── Button system — per design pack v3 ─────────────────────────── */
+.btn {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 7px 12px;
+  border-radius: var(--btn-radius);
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--text-body);
+  background: transparent;
+  white-space: nowrap;
+  transition: border-color var(--dur-fast) var(--ease),
+              background-color var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Filled success — Apply & reload, Pull here */
+.btn--success {
+  color: var(--success);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+  border-color: color-mix(in oklab, var(--success) 42%, transparent);
+}
+.btn--success:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--success) 20%, transparent);
+}
+
+/* Filled amber — Emergency wake, Pause, Rollback */
+.btn--warm {
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border-color: color-mix(in oklab, var(--accent-warm) 38%, transparent);
+}
+.btn--warm:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent-warm) 16%, transparent);
+}
+
+/* Danger fill — confirm destructive actions */
+.btn--danger {
+  color: var(--danger);
+  background: var(--danger-muted);
+  border-color: color-mix(in oklab, var(--danger) 40%, transparent);
+}
+.btn--danger:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--danger) 18%, transparent);
+}
+
+/* Accent outline — secondary actions (reload, run exercise) */
+.btn--accent {
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 10%, transparent);
+  border-color: var(--border-accent);
+}
+.btn--accent:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
 }

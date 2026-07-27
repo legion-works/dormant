@@ -75,8 +75,8 @@
 .doctor-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 20px;
+  gap: 10px;
+  margin-bottom: 16px;
 }
 
 @media (max-width: 640px) {
@@ -86,23 +86,30 @@
 }
 
 .doctor-summary-card {
-  padding: 15px 18px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--panel-radius);
+  background: var(--bg-raised);
+}
+
+.doctor-summary-card--failing {
+  border-color: color-mix(in oklab, var(--danger) 26%, var(--border));
 }
 
 .doctor-summary-card__count {
   font-family: var(--font-display);
-  font-size: 28px;
+  font-size: 20px;
   font-weight: 600;
   line-height: 1;
 }
 
 .doctor-summary-card__label {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-family: var(--font-ui);
+  font-size: 13px;
   color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
-  margin-top: 9px;
 }
 
 
@@ -121,17 +128,20 @@
 
 .doctor-group__header {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 0 10px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border);
   font-family: var(--font-mono);
 }
 
 .doctor-group__category {
-  font-size: 10.5px;
-  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-faint);
   text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
+  letter-spacing: 0.14em;
 }
 
 .doctor-group__label {
@@ -154,9 +164,9 @@
 .doctor-check-row {
   display: flex;
   align-items: flex-start;
-  gap: 13px;
-  padding: 13px 17px;
-  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+  gap: 12px;
+  padding: 11px 18px;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 55%, transparent);
 }
 .doctor-check-row:last-child {
   border-bottom: none;
@@ -168,14 +178,15 @@
 
 .doctor-check-row__icon {
   flex: none;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  font-size: 13px;
+  font-weight: 600;
   margin-top: 1px;
 }
 
@@ -185,7 +196,8 @@
 }
 
 .doctor-check-row__title {
-  font-size: 13.5px;
+  font-family: var(--font-mono);
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-strong);
 }
@@ -205,7 +217,7 @@
 
 .doctor-exercise-desc {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-faint);
   margin: 0 0 14px;
   line-height: 1.5;

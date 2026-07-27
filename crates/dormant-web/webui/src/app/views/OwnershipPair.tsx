@@ -47,13 +47,9 @@ function agreementVerdict(
   return { label: "⚠ third input — neither machine owns the panel", class: "op-verdict--third" };
 }
 
-/** Poll cadence label from coordination config. */
-function pollCadence(coord?: CoordinationConfig): string {
-  const interval = coord?.poll_interval ?? "2s";
-  const confirmations = coord?.loss_confirmations ?? 3;
-  const statePoll = coord?.state_poll_interval ?? `max(30s, ${interval})`;
-  return `ownership every ${interval} · ${confirmations} reads to flip · panel state every ${statePoll}`;
-}
+// Poll cadence helper removed in v3 fidelity restructure;
+// the full-variant OwnershipPair now centers the panel-state box
+// inline rather than in a separate footer row.
 
 export default function OwnershipPair({
   displayId,
@@ -71,7 +67,8 @@ export default function OwnershipPair({
   const peerWrite = config?.shared_peer_input_write_code;
   const panelPower = snap.panel_state?.power;
   const panelBrightness = snap.panel_state?.brightness;
-  const cadence = pollCadence(coordination);
+  // coordination passed for future cadence UI; consumed by compact variant path.
+  void coordination;
 
   // Marker size — minimal.
   if (size === "marker") {
@@ -110,58 +107,81 @@ export default function OwnershipPair({
     );
   }
 
-  // Full size — Switching view.
+  // Full size — Switching view (screens/02 L245-310).
+  // Three-region grid: this machine | panel-state box | peer, plus header/agreement/footer.
   return (
     <div className="ownership-pair ownership-pair--full">
-      {/* Header: display id + owned state + observed code */}
+      {/* Header: display id + OURS/PEER badge + observed code */}
       <div className="op-header">
         <span className="op-display-id">{displayId}</span>
-        <span className={`op-owned ${isOurs ? "op-owned--ours" : ""}`}>
-          {isOurs ? "● OURS" : "○ PEER"}
+        <span className={`op-owned op-owned--pill${isOurs ? " op-owned--pill-ours" : ""}`}>
+          {isOurs ? "OURS" : "PEER"}
         </span>
-        <span className="op-observed">input {hexCode(observed)}</span>
+        <span className="op-observed">observed {hexCode(observed)}</span>
       </div>
 
-      {/* Two-column machine layout */}
-      <div className="op-machines">
-        <div className="op-machine op-machine--local">
-          <div className={`op-machine__status ${isOurs ? "op-machine__status--ours" : ""}`}>
-            {isOurs ? "● holds the panel" : "○ inactive"}
+      {/* Three-region grid: left (this machine) | center (panel state) | right (peer) */}
+      <div className="op-three-col">
+        {/* LEFT: This machine */}
+        <div className="op-three-col__left">
+          <div className="op-three-col__label">This machine</div>
+          <div className="op-three-col__status">
+            {isOurs ? "holds the panel" : "not driving"}
           </div>
-          <div className="op-machine__code">read {hexCode(localRead)}</div>
-          <div className="op-machine__code">
-            write {hexCode(localWrite)}
-            {localWrite === localRead && localRead != null && (
-              <span className="op-machine__hint"> (same as read)</span>
+          <div className="op-three-col__codes">
+            <div className="op-three-col__code-block">
+              <span className="op-three-col__code-label">READ</span>
+              <span className="op-three-col__code-value">{hexCode(localRead)}</span>
+              <span className="op-three-col__code-dec">{localRead}</span>
+            </div>
+            <div className="op-three-col__code-block">
+              <span className="op-three-col__code-label">WRITE</span>
+              <span className="op-three-col__code-value">{hexCode(localWrite)}</span>
+              <span className="op-three-col__code-dec">{localWrite}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* CENTER: Panel state box */}
+        <div className="op-three-col__center">
+          <div className={`op-panel-box${panelPower === "on" ? " op-panel-box--on" : ""}`}>
+            <span className="op-panel-box__state">
+              {panelPower === "on" ? "● ON" : "○ OFF"}
+            </span>
+            {panelBrightness != null && (
+              <span className="op-panel-box__brightness">brightness {panelBrightness}</span>
             )}
           </div>
+          <div className={`op-verdict op-verdict--compact ${verdict.class}`}>
+            {verdict.label}
+          </div>
+          <div className="op-three-col__cadence-hint">panel state · every 30s</div>
         </div>
 
-        <div className="op-machine op-machine--peer">
-          <div className={`op-machine__status ${!isOurs ? "op-machine__status--peer" : ""}`}>
-            {!isOurs ? "● holds the panel" : "○ inactive"}
+        {/* RIGHT: Peer */}
+        <div className="op-three-col__right">
+          <div className="op-three-col__label op-three-col__label--right">Peer</div>
+          <div className="op-three-col__status op-three-col__status--muted">
+            dp-2 · not driving
           </div>
-          <div className="op-machine__code">read {hexCode(peerRead)}</div>
-          <div className="op-machine__code">
-            write {hexCode(peerWrite)}
-            {peerWrite == null && " (unset)"}
+          <div className="op-three-col__codes op-three-col__codes--right">
+            <div className="op-three-col__code-block">
+              <span className="op-three-col__code-label">READ</span>
+              <span className="op-three-col__code-value">{hexCode(peerRead)}</span>
+              <span className="op-three-col__code-dec">{peerRead}</span>
+            </div>
+            <div className="op-three-col__code-block">
+              <span className="op-three-col__code-label">WRITE</span>
+              <span className="op-three-col__code-value">{hexCode(peerWrite)}</span>
+              <span className="op-three-col__code-dec">{peerWrite}</span>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Agreement verdict */}
-      <div className={`op-verdict ${verdict.class}`}>
+      {/* Agreement line (centered) */}
+      <div className={`op-agreement ${verdict.class}`}>
         {verdict.label}
-      </div>
-
-      {/* Panel state + poll cadence */}
-      <div className="op-panel">
-        <span className="op-panel__state">
-          panel{" "}
-          {panelPower === "on" ? "● ON" : panelPower === "standby" ? "○ STANDBY" : "unknown"}
-          {panelBrightness != null && ` · brightness ${panelBrightness}`}
-        </span>
-        <span className="op-panel__cadence">{cadence}</span>
       </div>
     </div>
   );

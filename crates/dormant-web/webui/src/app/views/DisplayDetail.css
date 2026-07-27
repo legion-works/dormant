@@ -1,5 +1,6 @@
-/* Display detail view — single-column, section-anchored layout.
-   All colors use DS tokens; no hardcoded hex/rgba. */
+/* Display detail view — v3 fidelity: side-by-side CONTROL|HEALTH + PANEL EXPOSURE below.
+   All colors use DS tokens; no hardcoded hex/rgba.
+   v3 fidelity: body/row text 13px, mono detail 12-13px, eyebrow micro-text 9-10px. */
 
 .display-detail {
   display: flex;
@@ -8,18 +9,186 @@
   animation: ddRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 
+/* Two-column top row: CONTROL (left) + HEALTH (right) — screens/04 */
+.display-detail__top-row {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 14px;
+  align-items: stretch;
+}
+.display-detail__top-row .dormant-card {
+  display: flex;
+  flex-direction: column;
+}
+.display-detail__top-row .dormant-card .display-detail__controls {
+  margin-top: auto;
+}
+
+/* State box — large centered badge */
+.display-detail__state-box {
+  height: 96px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin: 10px 0 14px;
+}
+.display-detail__state-box--active {
+  border-color: color-mix(in oklab, var(--success) 26%, transparent);
+  background: linear-gradient(160deg, color-mix(in oklab, var(--success) 12%, transparent), transparent 70%), var(--bg-sunken);
+  color: var(--success);
+}
+
+.display-detail__cmd-gen {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+
+.display-detail__fact-rows {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.display-detail__fact-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.display-detail__health-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+
+.display-detail__controller-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-sunken);
+  border-left: 2px solid var(--success);
+  margin-bottom: 8px;
+}
+.display-detail__controller-row--failing {
+  border-left-color: var(--danger);
+}
+.display-detail__controller-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.display-detail__controller-dot--healthy {
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+.display-detail__controller-dot--failing {
+  background: var(--danger);
+  box-shadow: 0 0 6px var(--danger);
+}
+.display-detail__controller-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+}
+.display-detail__controller-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-body);
+}
+.display-detail__controller-status {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 9px;
+  border-radius: var(--radius-pill);
+  flex-shrink: 0;
+}
+.display-detail__controller-status--ok {
+  color: var(--success);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+}
+.display-detail__controller-status--fail {
+  color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 13%, transparent);
+}
+
+/* Panel exposure layout: heat map (left) + stats (right) */
+.display-detail__exposure-layout {
+  display: flex;
+  gap: 24px;
+}
+.display-detail__exposure-heat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: none;
+  width: 400px;
+}
+.display-detail__exposure-stats {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+.display-detail__exposure-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.display-detail__exposure-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+}
+.display-detail__exposure-row:first-child {
+  border-top: none;
+}
+.display-detail__exposure-label {
+  width: 170px;
+  flex-shrink: 0;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.display-detail__exposure-value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-body);
+}
+.display-detail__exposure-hint {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
 .display-detail__back {
   align-self: flex-start;
   font-family: var(--font-ui);
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text-muted);
+  font-size: 13px;
+  color: var(--text-faint);
   background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 7px 14px;
+  border: none;
+  padding: 0;
   cursor: pointer;
-  transition: border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition: color var(--dur-fast) var(--ease);
 }
 .display-detail__back:hover {
   color: var(--text-strong);
@@ -38,15 +207,16 @@
 }
 
 .display-detail__id {
-  font-family: var(--font-display);
-  font-size: 19px;
+  font-family: var(--font-mono);
+  font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
+  letter-spacing: -0.01em;
 }
 
 .display-detail__shared-badge {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--accent);
   background: var(--accent-muted);
   border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
@@ -91,7 +261,7 @@
 
 .display-detail__fact-value {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text-body);
   margin-top: 5px;
 }
@@ -105,7 +275,7 @@
 .display-detail__wake-warning {
   margin-top: 12px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--warning);
   background: var(--warning-muted);
   border: 1px solid color-mix(in oklab, var(--warning) 35%, transparent);
@@ -124,15 +294,17 @@
 
 .display-detail__action {
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
-  border-radius: var(--radius-md);
-  padding: 9px 16px;
+  border-radius: var(--btn-radius);
+  padding: 9px 14px;
   cursor: pointer;
   text-align: center;
   border: 1px solid var(--border);
-  background: var(--bg-sunken);
+  background: transparent;
   color: var(--text-body);
+  line-height: 1;
+  white-space: nowrap;
   transition: border-color var(--dur-fast) var(--ease),
               background-color var(--dur-fast) var(--ease);
 }
@@ -146,8 +318,8 @@
 
 .display-detail__action--wake {
   color: var(--success);
-  background: var(--success-muted);
-  border-color: color-mix(in oklab, var(--success) 40%, transparent);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+  border-color: color-mix(in oklab, var(--success) 42%, transparent);
 }
 .display-detail__action--wake:hover:not(:disabled) {
   background: color-mix(in oklab, var(--success) 20%, transparent);
@@ -156,7 +328,7 @@
 .display-detail__action--resume {
   color: var(--accent-warm);
   background: var(--accent-warm-muted);
-  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
+  border-color: color-mix(in oklab, var(--accent-warm) 38%, transparent);
 }
 .display-detail__action--resume:hover:not(:disabled) {
   background: color-mix(in oklab, var(--accent-warm) 20%, transparent);
@@ -167,7 +339,7 @@
 .display-detail__action-error {
   margin-top: 12px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--danger);
   background: var(--danger-muted);
   border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
@@ -214,7 +386,7 @@
 .display-detail__panel-chip {
   flex-shrink: 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
   background: var(--bg-sunken);
   border: 1px solid var(--border);
@@ -229,7 +401,7 @@
 
 .display-detail__heat-caption {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-faint);
   margin-top: 4px;
 }
@@ -258,7 +430,7 @@
 .display-detail__honesty-note {
   margin-top: 12px;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-faint);
   font-style: italic;
 }
@@ -312,7 +484,7 @@
 
 .display-detail__metric--muted {
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 13px;
   margin-top: 12px;
 }
 
@@ -345,7 +517,7 @@
 
 .display-detail__controller-detail {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--danger);
 }
 
@@ -372,7 +544,7 @@
 
 .display-detail__stale-warning {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--warning);
   padding: 4px 0;
   grid-column: 1 / -1;
@@ -388,7 +560,7 @@
 
 .display-detail__link-btn {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--accent);
   background: transparent;
   border: none;

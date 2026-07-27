@@ -327,12 +327,12 @@ function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }:
         <span className="panel-tile__preview-label" style={{ color: preview.color }}>
           {snap.phase === "active" ? "ACTIVE" : snap.phase.toUpperCase()}
         </span>
-        {shared && <span className="panel-tile__shared-marker">\u21C4 peer</span>}
+        {shared && <span className="panel-tile__shared-marker">⇄ peer</span>}
       </div>
 
       {observedInput != null && shared && (
         <div className="panel-tile__input-code">
-          input 0x{observedInput.toString(16).padStart(2, "0")} \u00b7 {owned ? "ours" : "not ours"}
+          input 0x{observedInput.toString(16).padStart(2, "0")} · {owned ? "ours" : "not ours"}
         </div>
       )}
 
@@ -411,7 +411,7 @@ export default function Overview() {
   const navigate = useNavigate();
 
   if (loading) {
-    return <div className="overview-loading">Loading daemon state\u2026</div>;
+    return <div className="overview-loading">Loading daemon state…</div>;
   }
 
   if (error) {
@@ -522,7 +522,7 @@ export default function Overview() {
       )}
 
       {/* Signal flow — three columns: Sensors │ Zones │ Rules */}
-      <SectionHeader title="Signal flow" caption="sensors \u2192 zones \u2192 rules" />
+      <SectionHeader title="Signal flow" caption="sensors → zones → rules" />
 
       <div className="signal-grid">
         {/* Sensors column */}
@@ -560,11 +560,11 @@ export default function Overview() {
           {ruleRows.map((r) => (
             <div key={r.id} className="rule-row">
               <div className="rule-row__id">{r.id}</div>
-              <div className="rule-row__zone-displays">{r.zone} \u2192 {r.displayIds.join(", ")}</div>
+              <div className="rule-row__zone-displays">{r.zone} → {r.displayIds.join(", ")}</div>
               <div className="rule-row__meta">
                 {r.grace && <span className="rule-row__grace">grace {r.grace}</span>}
                 {r.inhibitors && r.inhibitors.length > 0 && (
-                  <span className="rule-row__inhibitors">{r.inhibitors.join(" \u00b7 ")}</span>
+                  <span className="rule-row__inhibitors">{r.inhibitors.join(" · ")}</span>
                 )}
               </div>
             </div>
@@ -592,7 +592,7 @@ export default function Overview() {
             className="section-header__link"
             onClick={() => navigate("events")}
           >
-            view all \u2192
+            view all →
           </button>
         }
       />

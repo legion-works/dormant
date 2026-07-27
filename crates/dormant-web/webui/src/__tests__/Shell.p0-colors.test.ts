@@ -28,11 +28,12 @@ function ruleBody(css: string, selector: string): string {
 describe("Shell.css P0 color-role pin", () => {
   const css = readFileSync(SHELL_CSS_PATH, "utf8");
 
-  it(".nav-item--active is green (tinted + bordered), never cyan", () => {
+  it(".nav-item--active uses success accent (inset bar, tinted bg), never cyan", () => {
     const body = ruleBody(css, ".nav-item--active");
-    expect(body).toMatch(/var\(--success-muted\)/);
-    expect(body).toMatch(/border:\s*1px solid/);
+    // Background tint: color-mix(in oklab, var(--success) 13%, transparent)
     expect(body).toMatch(/var\(--success\)/);
+    // Left accent bar: inset 2px 0 0 var(--success)
+    expect(body).toMatch(/inset 2px 0 0 var\(--success\)/);
     expect(body).not.toMatch(/var\(--accent-muted\)/);
   });
 

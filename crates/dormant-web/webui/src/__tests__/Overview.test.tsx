@@ -533,3 +533,19 @@ describe("Overview — sensor reported hint", () => {
     expect(screen.getByText(/no data since start/i)).toBeInTheDocument();
   });
 });
+
+describe("Overview — unicode glyphs in JSX text (not raw \\u escapes)", () => {
+  it("renders real glyphs, not raw \\u escapes", async () => {
+    render(<LiveStateProvider><Overview /></LiveStateProvider>);
+
+    await waitFor(() => {
+      // The "view all →" link always renders (it's a static button).
+      expect(screen.getByText(/view all →/)).toBeInTheDocument();
+    });
+
+    // Must NOT render the raw escape sequence anywhere.
+    expect(screen.queryByText(/\\u2192/)).toBeNull();
+    expect(screen.queryByText(/\\u21C4/)).toBeNull();
+    expect(screen.queryByText(/\\u00b7/)).toBeNull();
+  });
+});

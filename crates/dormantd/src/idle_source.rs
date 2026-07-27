@@ -677,6 +677,7 @@ async fn wayland_run(
         let wl_handle = tokio::task::spawn_blocking::<_, Result<(), String>>(move || {
             use rustix::event::{PollFd, PollFlags, poll};
             use rustix::time::Timespec;
+            use wayland_client::Proxy as _;
             use wayland_client::{Connection, globals::registry_queue_init, protocol::wl_seat};
             use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtIdleNotifierV1;
 
@@ -691,13 +692,35 @@ async fn wayland_run(
                 .bind(&qh, 1..=7, ())
                 .map_err(|e| format!("bind wl_seat: {e}"))?;
 
-            // Bind the idle notifier.
+            // Bind the idle notifier — up to v2 when the compositor offers it.
             let notifier: ExtIdleNotifierV1 = globals
-                .bind(&qh, 1..=1, ())
+                .bind(&qh, 1..=2, ())
                 .map_err(|e| format!("bind ext_idle_notifier_v1: {e}"))?;
 
             // Create the idle notification with our timeout.
-            notifier.get_idle_notification(timeout, &seat, &qh, ());
+            //
+            // v2 `get_input_idle_notification` reports RAW INPUT idle and is
+            // immune to application idle inhibitors. That is the correct
+            // semantic for the `user-activity` inhibitor kind: a browser
+            // holding a WebRTC/video idle inhibitor must not hold a blank on
+            // a vacant room (observed live: an idle Vivaldi PeerConnection
+            // held the panel awake for 82 minutes of absence). Media that
+            // should hold a blank is covered by the opt-in `audio-playback`
+            // and `call` inhibitor kinds, not by compositor inhibitors.
+            // v1 `get_idle_notification` (inhibitor-respecting) remains the
+            // fallback on compositors without v2.
+            let notification_kind = if notifier.version() >= 2 {
+                notifier.get_input_idle_notification(timeout, &seat, &qh, ());
+                "input"
+            } else {
+                notifier.get_idle_notification(timeout, &seat, &qh, ());
+                "legacy"
+            };
+            tracing::info!(
+                event = "idle_notification_kind",
+                kind = notification_kind,
+                "wayland idle notification created"
+            );
 
             // Roundtrip to ensure the notification request was sent.
             let mut state = WlState {

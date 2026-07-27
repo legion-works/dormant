@@ -272,12 +272,14 @@ mod tests {
         // Engine: serves gen1 subscription first, then gen2 after gen1 is dropped.
         let gen1_tx_raw = gen1_tx.clone();
         let gen2_tx_raw = gen2_tx.clone();
+        let (subscribed_tx, mut subscribed_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            // First subscribe — return gen1 receiver, then drop our clone
-            // so the broadcast closes when the test drops gen1_tx.
+            // First subscribe — return gen1 receiver, then signal readiness
+            // so the test knows the feeder is now subscribed.
             while let Some(msg) = ctl_rx.recv().await {
                 if let ControlMsg::SubscribeEvents(tx) = msg {
                     let _ = tx.send(gen1_tx_raw.subscribe());
+                    let _ = subscribed_tx.send(());
                     break;
                 }
             }
@@ -298,37 +300,46 @@ mod tests {
             feed_ring(ring_clone, ctl_clone).await;
         });
 
-        // Let feeder subscribe and process gen1 events.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for the feeder to be subscribed (engine signals via oneshot).
+        // Yield in a poll loop until the signal arrives.
+        for _ in 0..200 {
+            match subscribed_rx.try_recv() {
+                Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+            tokio::task::yield_now().await;
+        }
 
         // Send gen1 events.
         let _ = gen1_tx.send(sensor_event("gen1-a"));
         let _ = gen1_tx.send(sensor_event("gen1-b"));
 
-        // Wait for gen1 events to land in the ring.
-        for _ in 0..100 {
+        // Poll until gen1 events land.
+        for _ in 0..200 {
             if ring.len() == 2 {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
         }
         assert_eq!(ring.len(), 2, "gen1 events should be in the ring");
 
         // Close gen1 broadcast (simulate generation switch).
         drop(gen1_tx);
 
-        // Give feeder time to detect Closed and resubscribe to gen2.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Yield to let feeder detect Closed, resubscribe, and receive gen2 sub.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
 
         // Send gen2 events.
         let _ = gen2_tx.send(sensor_event("gen2-a"));
 
-        // Wait for gen2 event to land after resubscribe.
-        for _ in 0..100 {
+        // Poll until gen2 event lands.
+        for _ in 0..200 {
             if ring.len() >= 3 {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
         }
 
         // Both gen1 and gen2 events should be present.

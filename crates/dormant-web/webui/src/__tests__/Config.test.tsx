@@ -338,23 +338,23 @@ describe("Config", () => {
       expect(screen.getByText("Daemon")).toBeInTheDocument();
     });
 
-    // Find the Daemon tab button — it should contain a dirty-dot span.
-    const daemonTab = screen.getByText("Daemon").closest("button");
-    expect(daemonTab).not.toBeNull();
-
-    // The dot is a span with inline width:6px and accent-warm background.
-    // jsdom renders React inline styles as element.style properties;
-    // query for any span inside the tab button (the dot is the only one).
-    const dotSpans = daemonTab!.querySelectorAll("span");
-    const hasDot = Array.from(dotSpans).some((span) => {
-      const st = (span as HTMLElement).style;
-      return (
-        st.width === "6px" &&
-        st.height === "6px" &&
-        st.borderRadius === "50%"
-      );
+    // The dot is rendered asynchronously via NavigationGuard callback.
+    // Wait specifically for the dot span to appear before asserting.
+    await waitFor(() => {
+      const daemonTab = screen.getByText("Daemon").closest("button");
+      if (!daemonTab) return false;
+      const dotSpans = daemonTab.querySelectorAll("span");
+      return Array.from(dotSpans).some((span) => {
+        const st = (span as HTMLElement).style;
+        return (
+          st.width === "6px" &&
+          st.height === "6px" &&
+          st.borderRadius === "50%"
+        );
+      });
+    }).then((hasDot) => {
+      expect(hasDot).toBe(true);
     });
-    expect(hasDot).toBe(true);
 
     // Tabs without edits (e.g. Switching) must NOT have a dot.
     const switchingTab = screen.getByText("Switching").closest("button");

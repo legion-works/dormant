@@ -15,9 +15,10 @@ use dormant_core::config::schema::{
     Config, DisplayConfig, HaSensorCfg, MqttSensorCfg, SensorConfig,
 };
 use dormant_core::config::{
-    Strictness, ValidationError, Warning, load_config, load_credentials, validate,
+    Strictness, ValidationError, Warning, load_config, load_credentials,
+    validate_with_input_source_readers,
 };
-use dormant_displays::registry::capabilities;
+use dormant_displays::registry::{capabilities, input_source_readers};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -90,6 +91,36 @@ pub(crate) struct ConfigValidation {
     pub(crate) load_error: Option<String>,
 }
 
+/// Build a `ConfigResponse` for error paths where validation cannot complete.
+/// `fingerprint` defaults to empty; `load_error` provides the human-readable failure detail.
+fn error_response(
+    path: String,
+    config_version: u32,
+    raw_toml: String,
+    inventory: Config,
+    display_rules: HashMap<String, DisplayRuleInfo>,
+    redacted_paths: Vec<Vec<String>>,
+    load_error: Option<String>,
+) -> Json<ConfigResponse> {
+    let warnings: Vec<SerializableWarning> = vec![];
+    Json(ConfigResponse {
+        path,
+        config_version,
+        source: "on_disk",
+        raw_toml,
+        inventory,
+        validation: ConfigValidation {
+            ok: false,
+            warnings,
+            errors: vec![],
+            load_error,
+        },
+        display_rules,
+        fingerprint: String::new(),
+        redacted_paths,
+    })
+}
+
 pub(crate) async fn get_config(
     State(state): State<WebState>,
 ) -> Result<Json<ConfigResponse>, WebError> {
@@ -111,22 +142,15 @@ pub(crate) async fn get_config(
         Err(e) => {
             // I/O read failure → normal body with load_error, redacted inventory.
             let raw_toml = redact_raw_secrets("");
-            return Ok(Json(ConfigResponse {
-                path: config_path.display().to_string(),
-                config_version: inventory.config_version,
-                source: "on_disk",
+            return Ok(error_response(
+                config_path.display().to_string(),
+                inventory.config_version,
                 raw_toml,
                 inventory,
-                validation: ConfigValidation {
-                    ok: false,
-                    warnings: vec![],
-                    errors: vec![],
-                    load_error: Some(format!("cannot read config file: {e}")),
-                },
                 display_rules,
-                fingerprint: String::new(),
                 redacted_paths,
-            }));
+                Some(format!("cannot read config file: {e}")),
+            ));
         }
     };
 
@@ -140,25 +164,23 @@ pub(crate) async fn get_config(
                 Err(e) => {
                     // Creds load failure → load_error, redacted inventory + raw_toml.
                     let raw_toml = redact_raw_secrets(&raw_on_disk);
-                    return Ok(Json(ConfigResponse {
-                        path: config_path.display().to_string(),
-                        config_version: inventory.config_version,
-                        source: "on_disk",
+                    return Ok(error_response(
+                        config_path.display().to_string(),
+                        inventory.config_version,
                         raw_toml,
                         inventory,
-                        validation: ConfigValidation {
-                            ok: false,
-                            warnings: warns.iter().map(SerializableWarning::from).collect(),
-                            errors: vec![],
-                            load_error: Some(e.to_string()),
-                        },
                         display_rules,
-                        fingerprint,
                         redacted_paths,
-                    }));
+                        Some(e.to_string()),
+                    ));
                 }
             };
-            let errs = validate(&cfg, &capabilities(), &creds);
+            let errs = validate_with_input_source_readers(
+                &cfg,
+                &capabilities(),
+                &input_source_readers(),
+                &creds,
+            );
             (warns, errs, None)
         }
         Err(e) => (vec![], vec![], Some(e.to_string())),

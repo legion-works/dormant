@@ -225,29 +225,6 @@ function heldByHeader(candidates: HolderCandidate[]): string | null {
 
 // ── Panel tile ──────────────────────────────────────────────────────────────
 
-/** Preview glyph for a display panel tile — physical state, not local phase. */
-function panelPreviewGlyph(snap: DisplaySnapshot): { glyph: string; color: string } {
-  if (snap.scope === "shared") {
-    // A peer can own the panel, so local phase cannot describe hardware.
-    const power = snap.panel_state?.power;
-    if (power === "on") return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--success)" };
-    if (power === "standby") return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--text-muted)" };
-    // No panel_state: fall through to phase-based.
-  }
-  // Phase-based preview
-  switch (snap.phase) {
-    case "active": return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--success)" };
-    case "grace":
-    case "blanking":
-    case "staged":
-    case "render_pending":
-      return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--warning)" };
-    case "blanked": return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--text-muted)" };
-    case "waking": return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--success)" };
-    default: return { glyph: "\u2581\u2581\u2581\u2581\u2581", color: "var(--text-muted)" };
-  }
-}
-
 interface PanelTileProps {
   id: string;
   snap: DisplaySnapshot;
@@ -266,7 +243,6 @@ function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }:
   const [error, setError] = useState<string | null>(null);
 
   const phaseLabel = phaseChipLabel(snap.phase, snap.stage);
-  const preview = panelPreviewGlyph(snap);
   const controllers = dc?.controllers ?? [];
   const candidates = heldByCandidates(id, snap, displayRules, zones, ruleCfgs);
   const header = heldByHeader(candidates ?? []);
@@ -317,24 +293,21 @@ function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }:
         >
           {id}
         </span>
+        {shared && <span className="panel-tile__shared-marker">⇄ SHARED</span>}
         <StatusChip kind={snap.phase} label={phaseLabel} />
       </div>
 
-      <div className="panel-tile__preview">
-        <span className="panel-tile__preview-bar" style={{ color: preview.color }}>
-          {preview.glyph}
+      {/* State box — bordered status display */}
+      <div className={`panel-tile__state-box${snap.phase === "active" ? " panel-tile__state-box--active" : ""}`}>
+        <span className="panel-tile__state-box-text">
+          {snap.phase === "active" ? "● ON" : "○ OFF"}
         </span>
-        <span className="panel-tile__preview-label" style={{ color: preview.color }}>
-          {snap.phase === "active" ? "ACTIVE" : snap.phase.toUpperCase()}
-        </span>
-        {shared && <span className="panel-tile__shared-marker">⇄ peer</span>}
+        {observedInput != null && shared && (
+          <span className="panel-tile__state-box-input">
+            input 0x{observedInput.toString(16).padStart(2, "0")} · {owned ? "ours" : "not ours"}
+          </span>
+        )}
       </div>
-
-      {observedInput != null && shared && (
-        <div className="panel-tile__input-code">
-          input 0x{observedInput.toString(16).padStart(2, "0")} · {owned ? "ours" : "not ours"}
-        </div>
-      )}
 
       {chips.length > 0 && (
         <div className="panel-tile__chips">
@@ -364,34 +337,34 @@ function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }:
           onClick={() => void runAction("blank")}
           disabled={inFlight != null}
         >
-          {inFlight === "blank" ? "Blanking\u2026" : "Blank"}
+          {inFlight === "blank" ? "Blanking…" : "Blank"}
         </button>
         <button
           type="button"
-          className="panel-tile__action-chip"
+          className="panel-tile__action-chip panel-tile__action-chip--wake"
           onClick={() => void runAction("wake")}
           disabled={inFlight != null}
         >
-          {inFlight === "wake" ? "Waking\u2026" : "Wake"}
+          {inFlight === "wake" ? "Waking…" : "Wake"}
         </button>
         {canPull && (
           <button
             type="button"
-            className="panel-tile__action-chip"
+            className="panel-tile__action-chip panel-tile__action-chip--pull"
             onClick={() => void runAction("pull")}
             disabled={inFlight != null}
           >
-            {inFlight === "pull" ? "Pulling\u2026" : "Pull"}
+            {inFlight === "pull" ? "Pulling…" : "Pull"}
           </button>
         )}
         {canPush && (
           <button
             type="button"
-            className="panel-tile__action-chip"
+            className="panel-tile__action-chip panel-tile__action-chip--push"
             onClick={() => void runAction("push")}
             disabled={inFlight != null}
           >
-            {inFlight === "push" ? "Pushing\u2026" : "Push"}
+            {inFlight === "push" ? "Pushing…" : "Push"}
           </button>
         )}
       </div>
@@ -455,7 +428,7 @@ export default function Overview() {
     return t;
   };
 
-  const recentSlice = events.slice(0, 6);
+  const recentSlice = events.filter((se) => (se.event as { event: string }).event !== "_history_separator").slice(0, 6);
 
   const displayRulesMap: Record<string, { rule: string; zone: string }> = displayRules;
 
@@ -559,14 +532,18 @@ export default function Overview() {
           <div className="column-header">Rules</div>
           {ruleRows.map((r) => (
             <div key={r.id} className="rule-row">
-              <div className="rule-row__id">{r.id}</div>
-              <div className="rule-row__zone-displays">{r.zone} → {r.displayIds.join(", ")}</div>
-              <div className="rule-row__meta">
+              <div className="rule-row__id">
+                {r.id}
                 {r.grace && <span className="rule-row__grace">grace {r.grace}</span>}
-                {r.inhibitors && r.inhibitors.length > 0 && (
-                  <span className="rule-row__inhibitors">{r.inhibitors.join(" · ")}</span>
-                )}
               </div>
+              <div className="rule-row__zone-displays">{r.zone} → {r.displayIds.join(", ")}</div>
+              {r.inhibitors && r.inhibitors.length > 0 && (
+                <div className="rule-row__meta">
+                  {r.inhibitors.map((inhib) => (
+                    <span key={inhib} className="rule-row__inhibitor-chip">{inhib}</span>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
           {manualDisplayIds.length > 0 && (

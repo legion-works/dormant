@@ -548,4 +548,30 @@ describe("Overview — unicode glyphs in JSX text (not raw \\u escapes)", () => 
     expect(screen.queryByText(/\\u21C4/)).toBeNull();
     expect(screen.queryByText(/\\u00b7/)).toBeNull();
   });
+
+  it("history separator sentinel never renders as a raw event row", async () => {
+    // Seed events with a _history_separator sentinel — must not appear as a badge or JSON row.
+    const mockEvents: StampedEvent[] = [
+      { time: "14:00:00", event: { event: "sensor_changed", sensor: "test", state: "present" } },
+      { time: "", event: { event: "_history_separator" } as never },
+    ];
+
+    render(
+      <LiveStateProvider>
+        <EventLogContext.Provider value={{ events: mockEvents, connected: true, lagged: false, historySeeded: true }}>
+          <Overview />
+        </EventLogContext.Provider>
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      // The real sensor_changed event should render.
+      expect(screen.getByText("sensor_changed")).toBeInTheDocument();
+    });
+
+    // The _history_separator badge/text must never appear.
+    expect(screen.queryByText("_history_separator")).toBeNull();
+    // No raw JSON dump (the old bug).
+    expect(screen.queryByText(/"event"/)).toBeNull();
+  });
 });

@@ -96,9 +96,6 @@ function DisplayRow({
   const blankFailed = snap.last_blank_failed ?? false;
   const isPaused = snap.paused;
   const sharedGlyphEl = isShared ? <span className="display-row__shared-glyph" title="shared">⇄</span> : null;
-  const blankLabel = isShared
-    ? "Blank shared panel — affects all connected machines"
-    : "Force blank";
 
   return (
     <>
@@ -149,10 +146,10 @@ function DisplayRow({
           <td className="display-row__actions">
             <button
               type="button"
-              className="display-action display-action--blank"
+              className="display-action"
               onClick={() => onBlank(id)}
             >
-              {blankLabel}
+              Force blank
             </button>
             <button
               type="button"
@@ -173,7 +170,7 @@ function DisplayRow({
             {pushCapable && (
               <button
                 type="button"
-                className="display-action display-action--wake"
+                className="display-action display-action--push"
                 onClick={() => onPush(id)}
               >
                 Push
@@ -283,9 +280,13 @@ export default function Displays() {
   }, []);
 
   const handleBlank = useCallback(async (id: string) => {
+    const dc = displayConfigs[id];
+    const isShared = dc?.scope === "shared";
     const accepted = await confirm({
       title: `Force blank ${id}?`,
-      description: `Immediately blanks ${id}, bypassing the normal presence rules.`,
+      description: isShared
+        ? `Blank shared panel — affects all connected machines.`
+        : `Immediately blanks ${id}, bypassing the normal presence rules.`,
       confirmLabel: "Force blank",
       tone: "danger",
     });
@@ -296,7 +297,7 @@ export default function Displays() {
     } catch (err: unknown) {
       setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Force blank failed" }));
     }
-  }, [confirm, clearActionError]);
+  }, [confirm, clearActionError, displayConfigs]);
 
   const handleWake = useCallback(async (id: string) => {
     clearActionError(id);

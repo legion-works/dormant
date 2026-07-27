@@ -473,6 +473,12 @@ export interface ConfigInventory {
   keymap?: KeymapConfig;
   /** rust: config/schema.rs InputFilterConfig — optional for older payloads. */
   input_filter?: InputFilterConfig;
+  /** rust: config/schema.rs PublishConfig — opt-in MQTT state publish
+   * (issue #105). Optional for older payloads; the publish view treats
+   * absence as the default-disabled state. Always rendered without
+   * credentials — the broker URL is the lookup key for
+   * `creds.mqtt`, which is never serialized into the inventory. */
+  publish?: Record<string, unknown>;
   sensors: Record<string, SensorConfig>;
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;

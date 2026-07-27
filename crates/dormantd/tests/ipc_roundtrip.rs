@@ -224,6 +224,7 @@ fn fake_direct_switch_with(
         rules: IndexMap::default(),
         keymap: dormant_core::config::KeymapConfig::default(),
         input_filter: dormant_core::config::InputFilterConfig::default(),
+        publish: dormant_core::config::PublishConfig::default(),
     }));
     drop(config_tx);
     let publisher = Arc::new(dormantd::hooks::MqttPublisher::new(String::new(), None));
@@ -255,6 +256,7 @@ fn fake_doctor(ctl_tx: mpsc::Sender<ControlMsg>) -> DoctorService {
         rules: IndexMap::default(),
         keymap: dormant_core::config::KeymapConfig::default(),
         input_filter: dormant_core::config::InputFilterConfig::default(),
+        publish: dormant_core::config::PublishConfig::default(),
     }));
     let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
     drop(config_tx);

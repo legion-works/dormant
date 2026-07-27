@@ -22,8 +22,8 @@ pub mod validate;
 pub use schema::{
     Config, CoordinationConfig, Credentials, DaemonConfig, DisplayConfig, DisplayScope, HookAction,
     HookCommand, HookMqtt, HookSlots, IdleSource, IdleTimeUnit, InputFilterConfig, KeymapConfig,
-    MqttCredential, RuleConfig, SensorConfig, SensorKind, Strictness, ValidationError, Warning,
-    ZoneConfig,
+    MqttCredential, PublishConfig, RuleConfig, SensorConfig, SensorKind, Strictness,
+    ValidationError, Warning, ZoneConfig,
 };
 pub use validate::{
     ClaimValidationContext, STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate,

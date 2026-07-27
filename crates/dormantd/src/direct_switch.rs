@@ -604,8 +604,8 @@ mod tests {
 
     use dormant_core::config::schema as cs;
     use dormant_core::config::schema::{
-        AudioConfig, DaemonConfig, InputFilterConfig, NotificationsConfig, WatchdogConfig,
-        WearConfig,
+        AudioConfig, DaemonConfig, InputFilterConfig, NotificationsConfig, PublishConfig,
+        WatchdogConfig, WearConfig,
     };
     use dormant_core::types::CmdFailure;
     use tokio::sync::Barrier;
@@ -812,6 +812,7 @@ mod tests {
             coordination: dormant_core::config::CoordinationConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: InputFilterConfig::default(),
+            publish: PublishConfig::default(),
         }
     }
 

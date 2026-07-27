@@ -422,6 +422,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         })
     }
 
@@ -628,6 +629,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         });
         let creds = test_creds();
         let counter = Arc::new(AtomicUsize::new(0));

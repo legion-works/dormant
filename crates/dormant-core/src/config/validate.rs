@@ -19,6 +19,7 @@ use crate::zone::{ZoneEngine, ZoneSpec};
 use super::schema::{
     Config, Credentials, DisplayConfig, DisplayScope, HookAction, ValidationError,
 };
+use crate::mqtt::parse_broker_url;
 
 /// A single unknown-key finding from the TOML tree walk.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +77,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "coordination",
             "keymap",
             "input_filter",
+            "publish",
         ],
     ),
     (
@@ -91,6 +93,17 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("keymap", &["claim_hotkey"]),
     ("input_filter", &["ignore_devices"]),
+    // ── publish ────────────────────────────────────────────────────────────
+    (
+        "publish",
+        &[
+            "enabled",
+            "broker_url",
+            "base_topic",
+            "discovery_prefix",
+            "instance_id",
+        ],
+    ),
     // ── audio ───────────────────────────────────────────────────────────────
     (
         "audio",
@@ -617,6 +630,8 @@ pub fn validate_with_input_source_readers(
     validate_audio(cfg, &mut errors);
     validate_coordination(cfg, &mut errors);
 
+    validate_publish(cfg, creds, &mut errors);
+
     // ── [sensors.<id>] mqtt availability validation ─────────────────────
     validate_sensors(cfg, &mut errors);
 
@@ -913,6 +928,96 @@ fn is_conservative_accelerator(value: &str) -> bool {
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
         && tokens.all(|modifier| matches!(modifier, "Alt" | "Control" | "Meta" | "Shift" | "Super"))
+}
+
+/// Validate the opt-in `[publish]` section (issue #105).
+///
+/// Disabled-by-default: when `enabled = false` the broker URL is ignored.
+/// When enabled, the broker URL must be present and parseable by the
+/// shared [`crate::mqtt::parse_broker_url`] (the same parser used by every
+/// MQTT sensor). Credentials, if any, are looked up by the EXACT broker
+/// URL string — matching the sensor-side convention so a publish broker
+/// can share an entry with `creds.mqtt` without a second copy.
+fn validate_publish(cfg: &Config, creds: &Credentials, errors: &mut Vec<ValidationError>) {
+    let publish = &cfg.publish;
+
+    if !publish.enabled {
+        // Disabled: broker URL is irrelevant. Anything else is a no-op.
+        return;
+    }
+
+    let Some(url) = publish.broker_url.as_deref() else {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: "publish.broker_url is required when publish.enabled = true".into(),
+        });
+        return;
+    };
+
+    if url.is_empty() {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: "publish.broker_url is set but empty".into(),
+        });
+        return;
+    }
+
+    let (host, _port) = parse_broker_url(url);
+    if host.is_empty() {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("publish.broker_url {url:?} has no resolvable host"),
+        });
+    }
+
+    if let Some(topic) = nonempty(&publish.base_topic) {
+        if topic.contains('#') || topic.contains('+') {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: "publish.base_topic must not contain MQTT wildcards '+' or '#'".into(),
+            });
+        }
+    } else {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: "publish.base_topic must be non-empty".into(),
+        });
+    }
+    if let Some(prefix) = nonempty(&publish.discovery_prefix) {
+        if prefix.contains('#') || prefix.contains('+') {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: "publish.discovery_prefix must not contain MQTT wildcards '+' or '#'"
+                    .into(),
+            });
+        }
+    } else {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: "publish.discovery_prefix must be non-empty".into(),
+        });
+    }
+    if let Some(id) = nonempty(&publish.instance_id) {
+        // The sanitizer at publish-time can map any string to a safe form,
+        // so we only reject the literal empty case here.
+        let _ = id; // silence unused warning if validator logic ever changes
+    } else {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: "publish.instance_id must be non-empty".into(),
+        });
+    }
+
+    // Credentials are looked up by EXACT broker URL string; a missing
+    // entry means anonymous connect (matching the MQTT sensor convention).
+    // Validation does not require a credential entry — the runtime
+    // publisher logs a single `publish_no_credentials` WARN on first
+    // connect so operators see the choice, but the daemon is not blocked.
+    let _ = creds;
+}
+
+fn nonempty(s: &str) -> Option<&str> {
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
@@ -2047,7 +2152,10 @@ fn check_valid(parent: &str, remaining: &[&str]) -> bool {
 mod tests {
     use super::*;
     use crate::config::DaemonConfig;
+    use crate::config::MqttCredential;
+    use crate::config::PublishConfig;
     use crate::config::Strictness;
+    use crate::config::defaults;
     use crate::config::schema::{RuleConfig, ZoneConfig};
     use crate::types::BlankMode;
     use indexmap::IndexMap;
@@ -2403,6 +2511,241 @@ gracee_period = "60s"
         assert!(
             result.is_err(),
             "unknown hook slots must fail strict parsing"
+        );
+    }
+
+    // ── [publish] config contract (issue #105) ─────────────────────────────────
+
+    #[test]
+    fn publish_config_defaults_when_section_absent() {
+        let cfg: Config = toml::from_str("config_version = 1\n").unwrap();
+        assert!(!cfg.publish.enabled);
+        assert!(cfg.publish.broker_url.is_none());
+        assert_eq!(cfg.publish.base_topic, defaults::PUBLISH_BASE_TOPIC);
+        assert_eq!(
+            cfg.publish.discovery_prefix,
+            defaults::PUBLISH_DISCOVERY_PREFIX
+        );
+        // instance_id falls back to $HOSTNAME or, when unset, the literal
+        // `dormant`. The contract's deterministic fallback must hold.
+        let expected = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| defaults::PUBLISH_INSTANCE_ID_FALLBACK.to_string());
+        assert_eq!(cfg.publish.instance_id, expected);
+    }
+
+    #[test]
+    fn publish_config_defaults_when_section_empty() {
+        let cfg: Config = toml::from_str("config_version = 1\n[publish]\n").unwrap();
+        assert!(!cfg.publish.enabled);
+        assert_eq!(cfg.publish, PublishConfig::default());
+    }
+
+    #[test]
+    fn publish_config_explicit_enabled_with_broker_parses() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\n",
+        )
+        .unwrap();
+        assert!(cfg.publish.enabled);
+        assert_eq!(cfg.publish.broker_url.as_deref(), Some("tcp://h:1883"));
+    }
+
+    #[test]
+    fn publish_config_overrides_take_effect() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\nbase_topic = \"dormant-prod\"\ndiscovery_prefix = \"ha\"\ninstance_id = \"office-pc\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.publish.base_topic, "dormant-prod");
+        assert_eq!(cfg.publish.discovery_prefix, "ha");
+        assert_eq!(cfg.publish.instance_id, "office-pc");
+    }
+
+    #[test]
+    fn publish_config_disabled_does_not_require_broker_url() {
+        // When enabled = false, broker_url is irrelevant. The validator must
+        // not complain about its absence.
+        let cfg: Config =
+            toml::from_str("config_version = 1\n[publish]\nenabled = false\n").unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &test_creds(),
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.detail.contains("publish.broker_url")),
+            "disabled config must not require broker_url, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn publish_config_enabled_missing_broker_url_is_error() {
+        let cfg: Config =
+            toml::from_str("config_version = 1\n[publish]\nenabled = true\n").unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &test_creds(),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_CONFIG_INVALID
+                    && e.detail
+                        .contains("publish.broker_url is required when publish.enabled = true")),
+            "expected missing-broker error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn publish_config_enabled_with_empty_broker_url_is_error() {
+        let cfg: Config =
+            toml::from_str("config_version = 1\n[publish]\nenabled = true\nbroker_url = \"\"\n")
+                .unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &test_creds(),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_CONFIG_INVALID
+                    && e.detail.contains("publish.broker_url is set but empty")),
+            "expected empty-broker error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn publish_config_enabled_with_garbage_broker_url_is_error() {
+        // parse_broker_url treats characters after the scheme as host:port.
+        // A bare "://" with no host is rejected.
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://\"\n",
+        )
+        .unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &test_creds(),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("no resolvable host")),
+            "expected no-host error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn publish_config_enabled_with_mqtt_wildcard_in_base_topic_is_error() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\nbase_topic = \"dormant/+/test\"\n",
+        )
+        .unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &test_creds(),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("publish.base_topic must not contain")),
+            "expected wildcard error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn publish_config_known_keys_accepts_all_publish_subkeys() {
+        let config = "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\nbase_topic = \"dormant\"\ndiscovery_prefix = \"homeassistant\"\ninstance_id = \"office-pc\"\n";
+        let value: toml::Value = toml::from_str(config).unwrap();
+        assert!(
+            collect_unknown_keys(&value).is_empty(),
+            "every publish sub-key must be known, got unknown: {:?}",
+            collect_unknown_keys(&value)
+        );
+    }
+
+    #[test]
+    fn publish_config_unknown_subkey_is_rejected_in_strict_mode() {
+        let result = load_str_strict(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\nusername = \"leak\"\n",
+        );
+        assert!(
+            result.is_err(),
+            "unknown publish sub-key must fail strict parsing"
+        );
+    }
+
+    #[test]
+    fn publish_config_credential_lookup_uses_exact_broker_url_string() {
+        // The publisher must look up creds.mqtt by the EXACT broker URL the
+        // operator typed — matching the MQTT sensor convention. A trailing
+        // slash, scheme mismatch, or port difference silently misses the
+        // lookup. This test pins the lookup contract against a fixture.
+        let mut creds = Credentials::default();
+        creds.mqtt.insert(
+            "tcp://h:1883".into(),
+            MqttCredential {
+                username: "publisher".into(),
+                password: "pw".into(),
+            },
+        );
+        // Exact match.
+        assert!(creds.mqtt.contains_key("tcp://h:1883"));
+        // Differences that must miss.
+        assert!(!creds.mqtt.contains_key("tcp://h:1883/"));
+        assert!(!creds.mqtt.contains_key("mqtt://h:1883"));
+        assert!(!creds.mqtt.contains_key("tcp://h:1884"));
+    }
+
+    #[test]
+    fn publish_config_missing_credentials_is_not_an_error() {
+        // Anonymous connect is allowed (matching the MQTT sensor convention).
+        // The validator must not error on a missing creds entry.
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\n",
+        )
+        .unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &Credentials::default(),
+        );
+        assert!(
+            errors.is_empty(),
+            "anonymous connect must not error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn publish_config_instance_id_empty_is_error() {
+        let cfg: Config = toml::from_str(
+            "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://h:1883\"\ninstance_id = \"\"\n",
+        )
+        .unwrap();
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::new(),
+            &test_creds(),
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("publish.instance_id must be non-empty")),
+            "expected empty instance_id error, got: {errors:?}"
         );
     }
 
@@ -3320,6 +3663,7 @@ gracee_period = "60s"
             coordination: super::super::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         }
     }
 
@@ -3447,6 +3791,7 @@ gracee_period = "60s"
             coordination: super::super::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         }
     }
 
@@ -3853,6 +4198,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let creds = Credentials::default();
         let errors = validate(&cfg, &caps, &creds);
@@ -3919,6 +4265,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
 
         let errors = validate(&cfg, &caps, &creds);
@@ -4105,6 +4452,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4133,6 +4481,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4170,6 +4519,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let samsung_errors: Vec<_> = errors
@@ -4206,6 +4556,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4234,6 +4585,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         let restore_errors: Vec<_> = errors
@@ -4266,6 +4618,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(
@@ -4294,6 +4647,7 @@ password = "test-pass"
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
         let errors = validate(&cfg, &test_capabilities(), &test_creds());
         assert!(

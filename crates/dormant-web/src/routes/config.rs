@@ -452,6 +452,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 
@@ -491,6 +492,7 @@ mod tests {
             rules,
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let map = build_display_rules(&cfg);
@@ -579,6 +581,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         redact_config_secrets(&mut cfg);
         let SensorConfig::Ha(ha) = cfg.sensors.get("living").unwrap() else {
@@ -680,6 +683,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let paths = redact_config_secrets(&mut cfg);
@@ -732,6 +736,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let paths = redact_config_secrets(&mut cfg);
         assert!(paths.is_empty());
@@ -771,6 +776,70 @@ topic = "test""#;
         assert!(resp.validation.ok);
         assert!(resp.validation.errors.is_empty());
         assert!(resp.validation.load_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_inventory_includes_publish_section_without_credentials() {
+        // The publish config is opt-in and the [publish] section appears in
+        // the inventory as a free-form Record<string, unknown>. The web
+        // inventory must NEVER carry credentials (the broker URL is the
+        // lookup key for `creds.mqtt`, which lives outside config.toml).
+        let mut cfg = config_with_secret();
+        cfg.publish = dormant_core::config::PublishConfig {
+            enabled: true,
+            broker_url: Some("tcp://h:1883".into()),
+            base_topic: "dormant".into(),
+            discovery_prefix: "homeassistant".into(),
+            instance_id: "office-pc".into(),
+        };
+        let (_dir, path) = write_temp_config("config_version = 1\n");
+        let state = test_config_state(path, cfg);
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+
+        // (a) The publish section is present and well-formed.
+        let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
+        assert!(
+            inventory_json.contains("\"publish\""),
+            "publish section missing from inventory: {inventory_json}"
+        );
+        assert!(
+            inventory_json.contains("\"broker_url\":\"tcp://h:1883\""),
+            "broker_url not in inventory: {inventory_json}"
+        );
+
+        // (b) No credential-shaped strings leak into the inventory. The
+        // publish struct has no credential fields; this is a defensive
+        // check that a future field addition (e.g. a stray `password`
+        // key) gets caught here.
+        for forbidden in ["password", "username", "token", "secret"] {
+            let needle = format!("\"{forbidden}\"");
+            assert!(
+                !inventory_json.contains(&needle),
+                "inventory leaked credential-shaped field {forbidden:?}: {inventory_json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_inventory_default_publish_is_disabled() {
+        // When the [publish] section is absent, the inventory still
+        // carries the section with its default values (mirroring
+        // wear/notifications/watchdog) — operators see the kill-switch
+        // state at a glance.
+        let (_dir, path) = write_temp_config("config_version = 1\n");
+        let state = test_config_state(path, config_with_secret());
+        let result = get_config(State(state)).await.unwrap();
+        let resp = result.0;
+        let inventory_json = serde_json::to_string(&resp.inventory).unwrap();
+        assert!(
+            inventory_json.contains("\"publish\""),
+            "publish section missing from default inventory: {inventory_json}"
+        );
+        assert!(
+            inventory_json.contains("\"enabled\":false"),
+            "publish.enabled default is not false: {inventory_json}"
+        );
     }
 
     #[tokio::test]
@@ -853,6 +922,7 @@ entity = "binary_sensor.motion"
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let state = test_config_state(path, cfg);
         let result = get_config(State(state)).await.unwrap();
@@ -897,6 +967,7 @@ entity = "binary_sensor.motion"
             rules,
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let state = test_config_state(path, cfg);
         let result = get_config(State(state)).await.unwrap();
@@ -1065,6 +1136,7 @@ field = "/val"
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 

@@ -3839,6 +3839,7 @@ mod audio_rules_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 
@@ -5363,6 +5364,7 @@ mod render_tests {
             },
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let recording = RecordingRenderSink::new();
@@ -5462,6 +5464,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let captured_ss: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -5538,6 +5541,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let captured_shift: Arc<Mutex<Option<dormant_render::ShiftSettings>>> =
@@ -5625,6 +5629,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         // Capture the `ScreensaverSettings` the factory receives so the
@@ -5722,6 +5727,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -5822,6 +5828,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -5918,6 +5925,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -6409,6 +6417,7 @@ mod macos_gamma_black_assembly_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let creds = Credentials::default();
         let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
@@ -6490,6 +6499,7 @@ mod macos_gamma_black_assembly_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let creds = Credentials::default();
         let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
@@ -6785,6 +6795,7 @@ mod gamma_reload_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 

@@ -100,6 +100,26 @@ config_version = 1
 # capture_is_call = false                 # opt-in: a running microphone counts as a call — see the false-positive warning in the docs
 # pw_dump_command = "pw-dump"             # override = the test/fake-script seam; whitespace-split argv, no shell, no quoting
 
+# ── Opt-in MQTT state publishing (issue #105) ──────────────────────────────────
+#
+# Optional. Disabled by default — the daemon spawns no publisher task and makes
+# no MQTT connections on the publish plane. When enabled, the daemon publishes
+# every sensor/zone/display state to the broker with a Home Assistant discovery
+# payload on the same topic tree. See docs/src/mqtt-publish.md for the full
+# topic schema and payload shapes.
+#
+# Credentials are NOT duplicated here — they live in credentials.toml under
+# [mqtt]."<broker_url>" (the same lookup key used by the MQTT sensors).
+# A publish broker can EITHER share one [mqtt] entry with the sensors OR carry
+# its own. A missing entry means anonymous connect (matching the MQTT sensor
+# convention).
+# [publish]
+# enabled = false               # opt-in switch; false = no publisher task, no connections
+# broker_url = "tcp://localhost:1883"   # required when enabled; shared with creds.mqtt lookup
+# base_topic = "dormant"        # state/availability topic prefix (no MQTT wildcards)
+# discovery_prefix = "homeassistant"   # Home Assistant discovery prefix
+# instance_id = "office-pc"     # defaults to $HOSTNAME; sanitized at publish-time
+
 [daemon]
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"

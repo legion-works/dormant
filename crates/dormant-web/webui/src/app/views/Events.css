@@ -16,7 +16,7 @@
   align-items: center;
   gap: 7px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
   line-height: 1;
 }
@@ -57,7 +57,7 @@
 
 .events-filter-chip {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-muted);
   background: transparent;
@@ -85,7 +85,7 @@
 /* ── Banner ──────────────────────────────────────────────────────── */
 .events-banner {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.5;
   color: var(--text-muted);
   background: color-mix(in oklab, var(--accent-warm) 7%, transparent);
@@ -163,7 +163,7 @@
 .events-row__badge {
   padding: 3px 7px;
   border-radius: 5px;
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 500;
   text-align: center;
   white-space: nowrap;
@@ -196,7 +196,7 @@
 
 .events-empty__clear {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--accent);
   background: none;
   border: none;

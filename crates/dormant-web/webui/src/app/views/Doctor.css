@@ -108,7 +108,7 @@
 
 .doctor-summary-card__label {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
 }
 
@@ -185,7 +185,7 @@
   align-items: center;
   justify-content: center;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 600;
   margin-top: 1px;
 }
@@ -197,7 +197,7 @@
 
 .doctor-check-row__title {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-strong);
 }
@@ -217,7 +217,7 @@
 
 .doctor-exercise-desc {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-faint);
   margin: 0 0 14px;
   line-height: 1.5;

@@ -28,7 +28,7 @@
   padding: 0;
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .cf-section__chevron {
@@ -45,7 +45,7 @@
 .cf-section__title {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: var(--tracking-caps);
@@ -167,7 +167,7 @@
 }
 
 .cf-field__lock {
-  font-size: 12px;
+  font-size: 13px;
   flex-shrink: 0;
   cursor: help;
 }
@@ -268,7 +268,7 @@
 
 .cf-apply__btn {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   padding: 9px 16px;
   border-radius: var(--btn-radius);

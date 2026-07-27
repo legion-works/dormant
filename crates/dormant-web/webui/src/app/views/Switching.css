@@ -91,14 +91,14 @@
 
 .switching-row__label {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-body);
 }
 
 .switching-row__detail {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
@@ -110,7 +110,7 @@
 .switching-row__value {
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   padding: 4px 9px;
   border-radius: var(--radius-pill);
   border: 1px solid var(--border);
@@ -144,7 +144,7 @@
 
 .switching-row__edit {
   font-family: var(--font-ui);
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-muted);
   padding: 4px 8px;

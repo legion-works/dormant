@@ -38,7 +38,7 @@ button {
 /* ── Button system — per design pack v3 ─────────────────────────── */
 .btn {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
   line-height: 1;
   padding: 7px 12px;

@@ -1,5 +1,6 @@
 /* Overview view — panel tiles + signal flow + recent activity.
-   All colors use DS tokens; no hardcoded hex/rgba. */
+   All colors use DS tokens; no hardcoded hex/rgba.
+   v3 fidelity: body/row text 13px, mono detail 12-13px, eyebrow micro-text 9-10px. */
 
 .overview {
   animation: dmRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
@@ -83,7 +84,7 @@
 
 .stat-card__sub {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
   margin-top: 6px;
   line-height: 1;
@@ -100,7 +101,7 @@
 .section-header__title {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-strong);
   white-space: nowrap;
@@ -108,7 +109,7 @@
 
 .section-header__caption {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -121,7 +122,7 @@
 
 .section-header__link {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
   background: none;
   border: none;
@@ -189,7 +190,7 @@
 
 .panel-tile__preview-label {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.08em;
 }
@@ -197,7 +198,7 @@
 .panel-tile__shared-marker {
   margin-left: 8px;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
   background: var(--bg-sunken);
   padding: 1px 6px;
@@ -206,7 +207,7 @@
 
 .panel-tile__input-code {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
   margin-bottom: 7px;
 }
@@ -236,13 +237,13 @@
 
 .panel-tile__held-by-row {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.6;
 }
 
 .panel-tile__controllers {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-muted);
   margin-bottom: 12px;
 }
@@ -255,7 +256,7 @@
 
 .panel-tile__action-chip {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-body);
   background: var(--bg-sunken);
   border: 1px solid var(--border);
@@ -275,7 +276,7 @@
 
 .panel-tile__error {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--danger);
   margin-top: 8px;
 }
@@ -341,13 +342,13 @@
 .sensor-row__id {
   font-family: var(--font-mono);
   font-weight: 500;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-body);
 }
 
 .sensor-row__type {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
@@ -361,7 +362,7 @@
 
 .sensor-row__state-label {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
 }
 .sensor-row__state-label--present { color: var(--success); }
 .sensor-row__state-label--absent { color: var(--blue-400); }
@@ -369,13 +370,13 @@
 
 .sensor-row__age {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
 .sensor-row__no-data-hint {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--warning);
   margin-top: 2px;
 }
@@ -399,7 +400,7 @@
 .dash-zone-row__state {
   margin-left: auto;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
 }
 .dash-zone-row__state--present { color: var(--success); }
 .dash-zone-row__state--absent { color: var(--blue-400); }
@@ -416,7 +417,7 @@
 
 .dash-zone-row__mode {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-muted);
   background: var(--bg-sunken);
   padding: 2px 7px;
@@ -426,7 +427,7 @@
 
 .dash-zone-row__members {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
@@ -451,7 +452,7 @@
 
 .rule-row__zone-displays {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-muted);
   margin-top: 3px;
 }
@@ -464,13 +465,13 @@
 
 .rule-row__grace {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
 .rule-row__inhibitors {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--accent-warm);
 }
 
@@ -497,7 +498,7 @@
 .recent-row__badge {
   padding: 2px 8px;
   border-radius: 5px;
-  font-size: 10.5px;
+  font-size: 12px;
   text-align: center;
   letter-spacing: var(--tracking-wide);
 }
@@ -512,7 +513,7 @@
 .recent-empty {
   padding: 14px 15px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-faint);
 }
 

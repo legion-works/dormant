@@ -1,5 +1,6 @@
 /* Display detail view — v3 fidelity: side-by-side CONTROL|HEALTH + PANEL EXPOSURE below.
-   All colors use DS tokens; no hardcoded hex/rgba. */
+   All colors use DS tokens; no hardcoded hex/rgba.
+   v3 fidelity: body/row text 13px, mono detail 12-13px, eyebrow micro-text 9-10px. */
 
 .display-detail {
   display: flex;
@@ -26,7 +27,7 @@
   align-items: center;
   justify-content: center;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-muted);
   margin: 10px 0 14px;
@@ -39,7 +40,7 @@
 
 .display-detail__cmd-gen {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
   margin-left: auto;
 }
@@ -57,7 +58,7 @@
 
 .display-detail__health-meta {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
   margin-left: auto;
 }
@@ -97,13 +98,13 @@
 }
 .display-detail__controller-name {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-body);
 }
 .display-detail__controller-status {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 500;
   padding: 4px 9px;
   border-radius: var(--radius-pill);
@@ -155,7 +156,7 @@
   width: 170px;
   flex-shrink: 0;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-muted);
 }
 .display-detail__exposure-value {
@@ -166,14 +167,14 @@
 }
 .display-detail__exposure-hint {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 12px;
   color: var(--text-faint);
 }
 
 .display-detail__back {
   align-self: flex-start;
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-faint);
   background: transparent;
   border: none;
@@ -207,7 +208,7 @@
 
 .display-detail__shared-badge {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--accent);
   background: var(--accent-muted);
   border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
@@ -252,7 +253,7 @@
 
 .display-detail__fact-value {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text-body);
   margin-top: 5px;
 }
@@ -266,7 +267,7 @@
 .display-detail__wake-warning {
   margin-top: 12px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--warning);
   background: var(--warning-muted);
   border: 1px solid color-mix(in oklab, var(--warning) 35%, transparent);
@@ -285,7 +286,7 @@
 
 .display-detail__action {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
   border-radius: var(--btn-radius);
   padding: 9px 14px;
@@ -330,7 +331,7 @@
 .display-detail__action-error {
   margin-top: 12px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--danger);
   background: var(--danger-muted);
   border: 1px solid color-mix(in oklab, var(--danger) 35%, transparent);
@@ -377,7 +378,7 @@
 .display-detail__panel-chip {
   flex-shrink: 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
   background: var(--bg-sunken);
   border: 1px solid var(--border);
@@ -392,7 +393,7 @@
 
 .display-detail__heat-caption {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-faint);
   margin-top: 4px;
 }
@@ -421,7 +422,7 @@
 .display-detail__honesty-note {
   margin-top: 12px;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-faint);
   font-style: italic;
 }
@@ -475,7 +476,7 @@
 
 .display-detail__metric--muted {
   color: var(--text-faint);
-  font-size: 12px;
+  font-size: 13px;
   margin-top: 12px;
 }
 
@@ -508,7 +509,7 @@
 
 .display-detail__controller-detail {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--danger);
 }
 
@@ -535,7 +536,7 @@
 
 .display-detail__stale-warning {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--warning);
   padding: 4px 0;
   grid-column: 1 / -1;
@@ -551,7 +552,7 @@
 
 .display-detail__link-btn {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--accent);
   background: transparent;
   border: none;

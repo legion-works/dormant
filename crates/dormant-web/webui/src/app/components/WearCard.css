@@ -13,7 +13,7 @@
 .wear-card__caption {
   padding: 8px 15px;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-faint);
   font-style: italic;
 }
@@ -22,14 +22,14 @@
 .wear-card__empty {
   padding: 14px 15px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-faint);
 }
 
 .wear-card__error {
   padding: 14px 15px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--danger);
 }
 
@@ -82,14 +82,14 @@
 
 .wear-row__stat {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-muted);
 }
 
 .wear-row__tone {
   margin-top: 8px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
 }
 .wear-row__tone--success {
   color: var(--success);

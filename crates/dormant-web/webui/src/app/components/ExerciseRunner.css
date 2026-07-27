@@ -122,13 +122,13 @@
 
 .exercise-runner__meta-value {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-body);
 }
 
 .exercise-runner__verdict {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   width: fit-content;
 }

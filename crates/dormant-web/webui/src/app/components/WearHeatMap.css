@@ -20,7 +20,7 @@
 
 .wear-heat-map__empty {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-muted);
   padding: var(--space-6);
   text-align: center;

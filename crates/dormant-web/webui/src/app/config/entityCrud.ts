@@ -179,6 +179,20 @@ export function isPairingEnabled(daemon: Record<string, unknown> | undefined): b
   return typeof v === "boolean" ? v : true;
 }
 
+/**
+ * rust: crates/dormant-core/src/config/schema.rs DaemonConfig
+ * `hook_edit_enabled` (BG-6, default `false`).
+ *
+ * Defaults to false when the key is absent — no argv-writing form
+ * on an unauthenticated loopback surface without explicit operator
+ * consent.  The server rejects hook-path patches when this flag is
+ * off, matching the UI's hidden affordance.
+ */
+export function isHookEditEnabled(daemon: Record<string, unknown> | undefined): boolean {
+  const v = daemon?.["hook_edit_enabled"];
+  return typeof v === "boolean" ? v : false;
+}
+
 /** Minimal inventory shape `referencingEntities` needs — a subset of `ConfigInventory`. */
 export interface CrudInventoryRefs {
   zones: Record<string, { members?: string[] }>;

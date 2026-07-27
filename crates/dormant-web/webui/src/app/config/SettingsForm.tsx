@@ -27,7 +27,7 @@ import InputFilterSection from "./InputFilterSection";
 import HooksInspector from "./HooksInspector";
 import ApplyBar from "./ApplyBar";
 import type { ApplyOutcome } from "./ApplyBar";
-import { isEntityCrudEnabled, isPairingEnabled } from "./entityCrud";
+import { isEntityCrudEnabled, isPairingEnabled, isHookEditEnabled } from "./entityCrud";
 
 /** Config sub-tab — the five form-bearing tabs (raw is handled by Config.tsx, SettingsForm renders nothing for it). */
 export type ConfigFormTab = "daemon" | "presence" | "displays" | "switching" | "protection" | "raw";
@@ -234,6 +234,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
   const inv = config.inventory;
   const entityCrudEnabled = isEntityCrudEnabled(inv.daemon);
   const pairingEnabled = isPairingEnabled(inv.daemon);
+  const hookEditEnabled = isHookEditEnabled(inv.daemon);
   const sensorIds = Object.keys(inv.sensors);
   const zoneIds = Object.keys(inv.zones);
   const displayIds = Object.keys(inv.displays);
@@ -340,7 +341,15 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
           {Object.entries(inv.displays ?? {})
             .filter(([, dc]) => dc.scope === "shared")
             .map(([id, dc]) => (
-              <HooksInspector key={id} displayId={id} hooks={dc.hooks} />
+              <HooksInspector
+                key={id}
+                displayId={id}
+                hooks={dc.hooks}
+                hookEditEnabled={hookEditEnabled}
+                store={store}
+                onDirty={onDirty}
+                fieldErrors={fieldErrors}
+              />
             ))}
         </>
       )}

@@ -63,9 +63,9 @@
 /* ── Entity cards ── */
 
 .cf-card {
-  background: var(--glass-fill-strong);
-  border: 1px solid var(--glass-stroke);
-  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--panel-radius);
   overflow: hidden;
   padding: 14px 16px;
 }
@@ -250,10 +250,9 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
-  background: var(--glass-fill-strong);
-  border: 1px solid var(--glass-stroke);
-  border-radius: var(--radius-lg);
+  padding: 14px 28px;
+  background: rgba(15,15,22,0.75);
+  border-top: 1px solid var(--border);
 }
 
 .cf-apply__count {
@@ -268,15 +267,16 @@
 }
 
 .cf-apply__btn {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-family: var(--font-ui);
+  font-size: 12px;
   font-weight: 500;
-  padding: 7px 16px;
-  border-radius: var(--radius-sm);
+  padding: 9px 16px;
+  border-radius: var(--btn-radius);
   cursor: pointer;
   border: 1px solid var(--border);
-  background: var(--bg-sunken);
-  color: var(--text-body);
+  background: transparent;
+  color: var(--text-muted);
+  line-height: 1;
   transition: background var(--dur-fast) var(--ease),
               border-color var(--dur-fast) var(--ease);
 }
@@ -291,9 +291,9 @@
 }
 
 .cf-apply__btn--apply {
-  background: var(--accent-muted);
-  color: var(--accent);
-  border-color: var(--border-accent);
+  background: color-mix(in oklab, var(--success) 16%, transparent);
+  color: var(--success);
+  border-color: color-mix(in oklab, var(--success) 45%, transparent);
 }
 
 .cf-apply__btn--apply:hover:not(:disabled) {

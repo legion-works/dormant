@@ -135,3 +135,81 @@ describe("eventFormat — unknown tag fallthrough (both formatters)", () => {
     expect(messageForEvent(ev)).toBe(JSON.stringify(ev));
   });
 });
+
+describe("eventFormat — history-seeded events (RecentEvent #[serde(flatten)])", () => {
+  // The Rust RecentEvent struct uses #[serde(flatten)] on the DaemonEvent
+  // field, so the JSON payload is flat — DaemonEvent fields sit alongside
+  // at_epoch_ms, NOT nested under an `event` key.  The frontend seeding
+  // code must spread the whole object (minus at_epoch_ms) to reconstruct
+  // the DaemonEvent shape that badgeForEvent / messageForEvent expect.
+  // This test pins that the flattened shape passes through correctly.
+
+  it("badgeForEvent handles a wear_snapshot reconstructed from flat JSON", () => {
+    // Simulates the object after spreading { at_epoch_ms, ...eventFields }
+    const fromFlat: DaemonEvent = {
+      event: "wear_snapshot",
+      display: "studio",
+      total_on_hours: 3417,
+      sample_count: 41204,
+    };
+    const badge = badgeForEvent(fromFlat);
+    expect(badge.label).toBe("wear_snapshot");
+  });
+
+  it("messageForEvent handles a wear_snapshot reconstructed from flat JSON", () => {
+    const fromFlat: DaemonEvent = {
+      event: "wear_snapshot",
+      display: "studio",
+      total_on_hours: 3417,
+      sample_count: 41204,
+    };
+    const msg = messageForEvent(fromFlat);
+    expect(msg).toContain("studio");
+    expect(msg).toContain("3417");
+    expect(msg).toContain("41204");
+  });
+
+  it("badgeForEvent handles a blank_failure reconstructed from flat JSON", () => {
+    const fromFlat: DaemonEvent = {
+      event: "blank_failure",
+      display: "living-tv",
+      controller: "samsung-tizen",
+      detail: "connection reset by peer",
+    };
+    const badge = badgeForEvent(fromFlat);
+    expect(badge.label).toBe("blank_failure");
+    expect(badge.color).toBe("var(--danger)");
+  });
+
+  it("badgeForEvent handles a display_phase reconstructed from flat JSON", () => {
+    const fromFlat: DaemonEvent = {
+      event: "display_phase",
+      display: "studio",
+      phase: "active",
+      cause: "zone office present",
+    };
+    const badge = badgeForEvent(fromFlat);
+    expect(badge.label).toBe("display_phase");
+  });
+
+  it("badgeForEvent handles a zone_changed reconstructed from flat JSON", () => {
+    const fromFlat: DaemonEvent = {
+      event: "zone_changed",
+      zone: "office",
+      present: true,
+      cause: "desk-mmwave",
+    };
+    const badge = badgeForEvent(fromFlat);
+    expect(badge.label).toBe("zone_changed");
+  });
+
+  it("badgeForEvent handles a wake_retry reconstructed from flat JSON", () => {
+    const fromFlat: DaemonEvent = {
+      event: "wake_retry",
+      display: "living-tv",
+      attempt: 2,
+    };
+    const badge = badgeForEvent(fromFlat);
+    expect(badge.label).toBe("wake_retry");
+  });
+});

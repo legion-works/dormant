@@ -10,11 +10,11 @@
 }
 
 .sidebar {
-  width: 244px;
-  min-width: 244px;
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
   display: flex;
   flex-direction: column;
-  background-color: var(--bg-overlay);
+  background-color: rgba(15,15,22,0.6);
   border-right: 1px solid var(--border);
   backdrop-filter: blur(22px) saturate(160%);
   -webkit-backdrop-filter: blur(22px) saturate(160%);
@@ -23,9 +23,9 @@
 .sidebar-brand {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 19px 20px 17px;
-  border-bottom: 1px solid var(--border);
+  gap: 10px;
+  padding: 18px 14px;
+  border-bottom: none;
 }
 
 .brand-mark {
@@ -36,37 +36,37 @@
 
 .brand-wordmark {
   font-family: var(--font-display);
-  font-size: 17px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--text-strong);
+  line-height: 1;
 }
 
 .brand-sub {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--text-faint);
   margin-top: 2px;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
+  line-height: 1;
 }
 
 .sidebar-nav {
-  padding: 12px;
+  padding: 0 14px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   flex: 1;
 }
 
 .nav-item {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 9px 12px;
-  border-radius: var(--radius-md);
-  font-size: 13.5px;
-  font-weight: 400;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--text-muted);
   background: transparent;
   border: none;
@@ -76,6 +76,7 @@
   width: 100%;
   box-sizing: border-box;
   font-family: var(--font-ui);
+  line-height: 1;
   transition: background-color var(--dur-fast) var(--ease),
               color var(--dur-fast) var(--ease);
 }
@@ -85,10 +86,10 @@
 }
 
 .nav-item--active {
-  font-weight: 600;
-  color: var(--text-strong);
-  background-color: var(--success-muted);
-  border: 1px solid color-mix(in oklab, var(--success) 40%, transparent);
+  font-weight: 500;
+  color: var(--success);
+  background-color: color-mix(in oklab, var(--success) 13%, transparent);
+  box-shadow: inset 2px 0 0 var(--success);
 }
 
 .nav-item--active .nav-icon {
@@ -143,12 +144,12 @@
 }
 
 .topbar {
-  height: 64px;
-  min-height: 64px;
+  height: var(--topbar-h);
+  min-height: var(--topbar-h);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 26px;
+  padding: 0 20px;
   border-bottom: 1px solid var(--border);
   background-color: var(--bg-base);
 }
@@ -169,16 +170,19 @@
 
 .topbar-title {
   font-family: var(--font-display);
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
   margin: 0;
+  line-height: 1;
+  letter-spacing: -0.01em;
 }
 
 .topbar-sub {
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   font-size: 11px;
   color: var(--text-faint);
+  line-height: 1;
 }
 
 .topbar-right {
@@ -236,7 +240,7 @@
 .content {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 26px 48px;
+  padding: 18px 20px 48px;
 }
 
 @media (prefers-reduced-motion: reduce) {

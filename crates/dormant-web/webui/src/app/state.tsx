@@ -264,11 +264,18 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
           const historyEntries: StampedEvent[] = [];
           for (const re of res.events) {
             const stampedTime = new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false });
-            const entry: { time: string; event: unknown } = { time: stampedTime, event: re.event };
+            // RecentEvent uses #[serde(flatten)] so DaemonEvent fields are
+            // top-level in the JSON response, not nested under an `event` key.
+            // Spread the entire object minus at_epoch_ms to reconstruct the
+            // DaemonEvent shape that badgeForEvent / messageForEvent expect.
+            const raw = re as unknown as Record<string, unknown>;
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { at_epoch_ms: _, ...eventObj } = raw;
+            const entry: StampedEvent = { time: stampedTime, event: eventObj as unknown as DaemonEvent };
             const key = dedupKey(entry);
             if (seen.has(key)) continue;
             seen.add(key);
-            historyEntries.push(entry as StampedEvent);
+            historyEntries.push(entry);
           }
 
           if (historyEntries.length > 0) {

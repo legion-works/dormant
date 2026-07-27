@@ -11,15 +11,13 @@
 .display-detail__back {
   align-self: flex-start;
   font-family: var(--font-ui);
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text-muted);
+  font-size: 12px;
+  color: var(--text-faint);
   background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 7px 14px;
+  border: none;
+  padding: 0;
   cursor: pointer;
-  transition: border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition: color var(--dur-fast) var(--ease);
 }
 .display-detail__back:hover {
   color: var(--text-strong);
@@ -38,10 +36,11 @@
 }
 
 .display-detail__id {
-  font-family: var(--font-display);
-  font-size: 19px;
+  font-family: var(--font-mono);
+  font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
+  letter-spacing: -0.01em;
 }
 
 .display-detail__shared-badge {
@@ -124,15 +123,17 @@
 
 .display-detail__action {
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: 11px;
   font-weight: 500;
-  border-radius: var(--radius-md);
-  padding: 9px 16px;
+  border-radius: var(--btn-radius);
+  padding: 9px 14px;
   cursor: pointer;
   text-align: center;
   border: 1px solid var(--border);
-  background: var(--bg-sunken);
+  background: transparent;
   color: var(--text-body);
+  line-height: 1;
+  white-space: nowrap;
   transition: border-color var(--dur-fast) var(--ease),
               background-color var(--dur-fast) var(--ease);
 }
@@ -146,8 +147,8 @@
 
 .display-detail__action--wake {
   color: var(--success);
-  background: var(--success-muted);
-  border-color: color-mix(in oklab, var(--success) 40%, transparent);
+  background: color-mix(in oklab, var(--success) 13%, transparent);
+  border-color: color-mix(in oklab, var(--success) 42%, transparent);
 }
 .display-detail__action--wake:hover:not(:disabled) {
   background: color-mix(in oklab, var(--success) 20%, transparent);
@@ -156,7 +157,7 @@
 .display-detail__action--resume {
   color: var(--accent-warm);
   background: var(--accent-warm-muted);
-  border-color: color-mix(in oklab, var(--accent-warm) 35%, transparent);
+  border-color: color-mix(in oklab, var(--accent-warm) 38%, transparent);
 }
 .display-detail__action--resume:hover:not(:disabled) {
   background: color-mix(in oklab, var(--accent-warm) 20%, transparent);

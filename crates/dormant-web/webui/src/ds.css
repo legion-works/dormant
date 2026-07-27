@@ -28,12 +28,36 @@
      --glow-cyan, --glow-amber
      --dur-fast, --dur-mid, --ease
      --tracking-caps, --tracking-tight, --tracking-loose
-   Also: .lw-glass, .lw-aurora, .lw-aurora--drift, .lw-enter (utility classes).
+    Also: .lw-glass, .lw-aurora, .lw-aurora--drift, .lw-enter (utility classes).
 
-   dormant-specific signal: present / awake / active = --success (#C3E88D).
-   Legion cyan = system chrome only (reload, clock, live pulse).
-*/
+    dormant-specific signal: present / awake / active = --success (#C3E88D).
+    Legion cyan = system chrome only (reload, clock, live pulse).
+
+    Product tokens introduced for the v3 fidelity pass (see
+    .opencode/design/webui-v3/TOKENS.md):
+      --sidebar-w (216px), --topbar-h (56px), --field-label-w (230px),
+      --row-h (28px), --btn-radius, --panel-radius.
+ */
 @import url("../design/_ds/legion-works-design-system-0c4db072-51f8-49a7-8d0b-1e2ffd2d90cf/styles.css");
+
+:root {
+  /* Layout constants — TOKENS.md §3 */
+  --sidebar-w: 216px;
+  --topbar-h: 56px;
+  --field-label-w: 230px;
+
+  /* Component tokens — TOKENS.md §4 */
+  --row-h: 28px;
+
+  /* Panel/card token — lifted from the v3 mock panel-card system.
+     bg-raised + border at radius-md gives the elevated-panel look
+     that every view surface uses. */
+  --panel-radius: 12px;
+
+  /* Button radius — slightly tighter than the panel radius so
+     buttons read as controls inside the panel, not standalone cards. */
+  --btn-radius: 8px;
+}
 
 /* The wear heat-map ramp is a continuous interpolation (design handoff
    "Design tokens" §Heat-map ramp), not discrete swatches — no DS token

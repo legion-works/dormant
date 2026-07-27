@@ -33,6 +33,12 @@ pub struct Check {
     /// Optional additional detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Check category — `"config"` | `"sensor"` | `"display"` | `"platform"` | `"network"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// The entity this check is about — display id, sensor id, or None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 /// Container for a full set of health check results.
@@ -52,6 +58,8 @@ mod tests {
             name: "kwin-dpms".into(),
             status: CheckStatus::NotSupported,
             detail: Some("not yet implemented".into()),
+            category: Some("platform".into()),
+            subject: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(
@@ -66,6 +74,8 @@ mod tests {
             name: "mqtt".into(),
             status: CheckStatus::Skip,
             detail: None,
+            category: None,
+            subject: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains(r#""skip""#), "expected 'skip': {json}");

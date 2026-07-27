@@ -13,6 +13,10 @@ pub struct ProbeResult {
     pub status: ProbeStatus,
     /// Optional detail message.
     pub detail: String,
+    /// Check category — `"config"` | `"sensor"` | `"display"` | `"platform"` | `"network"`.
+    pub category: Option<String>,
+    /// The entity this check is about — display id, sensor id, or None.
+    pub subject: Option<String>,
 }
 
 /// Probe status.
@@ -36,6 +40,8 @@ impl ProbeResult {
             name: name.into(),
             status: ProbeStatus::Pass,
             detail: detail.into(),
+            category: None,
+            subject: None,
         }
     }
 
@@ -46,6 +52,8 @@ impl ProbeResult {
             name: name.into(),
             status: ProbeStatus::Fail,
             detail: detail.into(),
+            category: None,
+            subject: None,
         }
     }
 
@@ -56,6 +64,8 @@ impl ProbeResult {
             name: name.into(),
             status: ProbeStatus::Skip,
             detail: detail.into(),
+            category: None,
+            subject: None,
         }
     }
 
@@ -66,6 +76,22 @@ impl ProbeResult {
             name: name.into(),
             status: ProbeStatus::NotSupported,
             detail: detail.into(),
+            category: None,
+            subject: None,
         }
+    }
+
+    /// Set the category on this result (builder-style).
+    #[must_use]
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
+    }
+
+    /// Set the subject on this result (builder-style).
+    #[must_use]
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
     }
 }

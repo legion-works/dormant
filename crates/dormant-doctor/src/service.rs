@@ -130,6 +130,7 @@ impl DoctorService {
 
 /// One doctor run: fetch snapshot, build owned-device checks, probe
 /// non-exclusive network services.  See [`DoctorService::run`].
+#[allow(clippy::too_many_lines)]
 async fn run_inner(
     ctl_tx: mpsc::Sender<ControlMsg>,
     config_rx: watch::Receiver<Arc<Config>>,
@@ -158,6 +159,8 @@ async fn run_inner(
                     name,
                     status: CheckStatus::Skip,
                     detail: Some(detail),
+                    category: Some("sensor".into()),
+                    subject: Some(sensor.id.clone()),
                 });
             }
             // MQTT/HA are NOT owned — handled below by active probe.
@@ -175,6 +178,8 @@ async fn run_inner(
                 name: format!("display {display_id}"),
                 status: CheckStatus::Skip,
                 detail: Some("owned by daemon — no blank/wake attempts yet".into()),
+                category: Some("display".into()),
+                subject: Some(display_id.clone()),
             });
             continue;
         }
@@ -196,6 +201,8 @@ async fn run_inner(
                 name,
                 status,
                 detail,
+                category: Some("display".into()),
+                subject: Some(display_id.clone()),
             });
         }
     }
@@ -222,7 +229,10 @@ async fn run_inner(
                     )
                     .await
                     .unwrap_or_else(|_| ProbeResult::fail(format!("mqtt {id}"), "probe timeout"));
-                    probe_result_to_check(&res)
+                    let mut check = probe_result_to_check(&res);
+                    check.category = Some("sensor".into());
+                    check.subject = Some(id.clone());
+                    check
                 }));
             }
             SensorConfig::Ha(ha_cfg) => {
@@ -236,7 +246,10 @@ async fn run_inner(
                     )
                     .await
                     .unwrap_or_else(|_| ProbeResult::fail(format!("ha {id}"), "probe timeout"));
-                    probe_result_to_check(&res)
+                    let mut check = probe_result_to_check(&res);
+                    check.category = Some("sensor".into());
+                    check.subject = Some(id.clone());
+                    check
                 }));
             }
             SensorConfig::UsbLd2410(_) => {
@@ -264,20 +277,24 @@ async fn run_inner(
 /// `clippy::too_many_lines`.
 #[cfg(target_os = "macos")]
 async fn push_macos_platform_checks(checks: &mut Vec<Check>, ignore_devices: &[String]) {
-    checks.push(probe_result_to_check(
+    let mut push = |mut check: Check| {
+        check.category = Some("platform".into());
+        checks.push(check);
+    };
+    push(probe_result_to_check(
         &crate::probes::macos_idle::probe_macos_idle().await,
     ));
-    checks.push(probe_result_to_check(
+    push(probe_result_to_check(
         &crate::probes::macos_display_sleep::probe_macos_display_sleep().await,
     ));
-    checks.push(probe_result_to_check(
+    push(probe_result_to_check(
         &crate::probes::macos_power::probe_macos_power().await,
     ));
     // Input-filter readiness: only report when ignore_devices is non-empty
     // (the feature is inactive otherwise — matching the Linux evdev probe's
     // Skip semantics).
     if !ignore_devices.is_empty() {
-        checks.push(probe_result_to_check(
+        push(probe_result_to_check(
             &crate::probes::input_filter::probe_input_filter(Some(ignore_devices)),
         ));
     }
@@ -343,6 +360,8 @@ fn probe_result_to_check(res: &ProbeResult) -> Check {
         name: res.name.clone(),
         status,
         detail,
+        category: res.category.clone(),
+        subject: res.subject.clone(),
     }
 }
 

@@ -66,6 +66,8 @@ pub fn to_report(results: &[ProbeResult]) -> DoctorReport {
                 } else {
                     Some(r.detail.clone())
                 },
+                category: r.category.clone(),
+                subject: r.subject.clone(),
             })
             .collect(),
     }
@@ -79,11 +81,12 @@ pub fn to_report(results: &[ProbeResult]) -> DoctorReport {
 /// probe every sensor + DDC/CI display in parallel.  The CLI calls this and
 /// renders the returned results; the daemon path chains [`to_report`] for a
 /// `DoctorReport`.
+#[allow(clippy::too_many_lines)]
 pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeResult> {
     let mut results = Vec::new();
 
     // Config probe first.
-    let config_result = probes::config::probe_config_inner(cfg, creds);
+    let config_result = probes::config::probe_config_inner(cfg, creds).with_category("config");
     let config_ok = config_result.status != ProbeStatus::Fail;
     results.push(config_result);
 
@@ -100,7 +103,11 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
                     format!("usb {}", usb_cfg.port)
                 }
             };
-            results.push(ProbeResult::skip(name, "config invalid — fix config first"));
+            results.push(
+                ProbeResult::skip(name, "config invalid — fix config first")
+                    .with_category("sensor")
+                    .with_subject(id.clone()),
+            );
             continue;
         }
         match sensor_cfg {
@@ -109,7 +116,10 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
                 let cfg = mqtt_cfg.clone();
                 let creds = creds.clone();
                 sensor_futs.push(Box::pin(async move {
-                    probes::mqtt::probe_mqtt_one(&id, &cfg, &creds).await
+                    probes::mqtt::probe_mqtt_one(&id, &cfg, &creds)
+                        .await
+                        .with_category("sensor")
+                        .with_subject(id)
                 }));
             }
             dormant_core::config::schema::SensorConfig::Ha(ha_cfg) => {
@@ -117,14 +127,20 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
                 let cfg = ha_cfg.clone();
                 let creds = creds.clone();
                 sensor_futs.push(Box::pin(async move {
-                    probes::ha::probe_ha_one(&id, &cfg, &creds).await
+                    probes::ha::probe_ha_one(&id, &cfg, &creds)
+                        .await
+                        .with_category("sensor")
+                        .with_subject(id)
                 }));
             }
             dormant_core::config::schema::SensorConfig::UsbLd2410(usb_cfg) => {
                 let port = usb_cfg.port.clone();
                 let baud = usb_cfg.baud;
                 sensor_futs.push(Box::pin(async move {
-                    probes::usb::probe_usb(&port, baud).await
+                    probes::usb::probe_usb(&port, baud)
+                        .await
+                        .with_category("sensor")
+                        .with_subject(port)
                 }));
             }
         }
@@ -145,14 +161,17 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
         if has_ddcci {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                results.push(probes::ddcci::probe_ddcci().await);
+                results.push(probes::ddcci::probe_ddcci().await.with_category("display"));
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
-                results.push(ProbeResult::not_supported(
-                    "ddcci",
-                    "DDC/CI is only supported on Linux and macOS in this release",
-                ));
+                results.push(
+                    ProbeResult::not_supported(
+                        "ddcci",
+                        "DDC/CI is only supported on Linux and macOS in this release",
+                    )
+                    .with_category("display"),
+                );
             }
         }
     }
@@ -165,10 +184,24 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
     // that stays exclusively under `doctor exercise <display>`.
     #[cfg(target_os = "macos")]
     {
-        results.push(probes::macos_idle::probe_macos_idle().await);
-        results.push(probes::macos_display_catalog::probe_macos_display_catalog());
-        results.push(probes::macos_display_sleep::probe_macos_display_sleep().await);
-        results.push(probes::macos_power::probe_macos_power().await);
+        results.push(
+            probes::macos_idle::probe_macos_idle()
+                .await
+                .with_category("platform"),
+        );
+        results.push(
+            probes::macos_display_catalog::probe_macos_display_catalog().with_category("platform"),
+        );
+        results.push(
+            probes::macos_display_sleep::probe_macos_display_sleep()
+                .await
+                .with_category("platform"),
+        );
+        results.push(
+            probes::macos_power::probe_macos_power()
+                .await
+                .with_category("platform"),
+        );
     }
 
     results

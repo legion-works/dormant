@@ -58,6 +58,13 @@ pub struct WearIdentity {
     pub key: String,
     /// Human-readable display name.
     pub display_name: String,
+    /// The `[displays.*]` config id this ledger is attributed to, when
+    /// known.  Absent for ledgers created before this field was added
+    /// (v0.1.0 ledgers) or for orphan ledgers with no matching config
+    /// display.  The frontend joins on this field first, then falls back
+    /// to `display_name` for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_display_id: Option<String>,
 }
 
 /// Per-display wear ledger: a grid of [`WearCell`]s plus bookkeeping.
@@ -376,6 +383,7 @@ mod tests {
         WearIdentity {
             key: "ddc:AOC:AG326UZD:XK2R9JA000013".into(),
             display_name: "monitor".into(),
+            config_display_id: None,
         }
     }
 

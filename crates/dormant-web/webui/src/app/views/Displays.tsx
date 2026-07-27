@@ -245,7 +245,7 @@ export default function Displays() {
     const set = new Set<string>();
     if (wear) {
       for (const s of wear.displays) {
-        if (s.advisory) set.add(s.display_name);
+        if (s.advisory) set.add(s.config_display_id ?? s.display_name);
       }
     }
     return set;

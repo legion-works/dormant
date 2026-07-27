@@ -180,8 +180,9 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
       );
       const failures = settled.length - details.length;
       setWear(list);
-      // Replacing, rather than merging, invalidates removed displays and stale ids.
-      setWearDetails(Object.fromEntries(details.map((detail) => [detail.display_name, detail])));
+      // Key by config_display_id when available, falling back to display_name
+      // for backward compatibility with pre-BG-8 ledgers.
+      setWearDetails(Object.fromEntries(details.map((detail) => [detail.config_display_id ?? detail.display_name, detail])));
       setWearError(failures > 0 ? `${failures} wear detail request${failures === 1 ? "" : "s"} failed` : null);
     } catch (err: unknown) {
       if (!mountedRef.current || request !== wearRequestSequence.current) return;

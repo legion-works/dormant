@@ -780,6 +780,10 @@ export interface ConfigResponse {
 export interface WearSummary {
   display: string;
   display_name: string;
+  /** The `[displays.*]` config id this ledger is attributed to, when
+   * known.  The frontend joins on this field first, falling back to
+   * `display_name` for backward compatibility with pre-BG-8 ledgers. */
+  config_display_id?: string | null;
   panel_type: PanelType;
   total_on_hours: number;
   seeded_usage_hours?: number | null;

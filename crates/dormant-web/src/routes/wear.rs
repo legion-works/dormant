@@ -33,6 +33,11 @@ pub(crate) struct WearSummary {
     pub(crate) display: String,
     /// Human-readable display name.
     pub(crate) display_name: String,
+    /// The `[displays.*]` config id this ledger is attributed to, when
+    /// known.  The frontend joins on this field first, falling back to
+    /// `display_name` for backward compatibility with pre-BG-8 ledgers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) config_display_id: Option<String>,
     /// Panel technology classification.
     pub(crate) panel_type: PanelType,
     /// Cumulative brightness-weighted on-hours.
@@ -100,6 +105,7 @@ fn summarize(
     WearSummary {
         display: key.to_string(),
         display_name: ledger.identity.display_name.clone(),
+        config_display_id: ledger.identity.config_display_id.clone(),
         panel_type: ledger.panel_type,
         total_on_hours: ledger.total_on_hours,
         seeded_usage_hours: ledger.seeded_usage_hours,
@@ -210,6 +216,7 @@ mod tests {
             WearIdentity {
                 key: key.to_string(),
                 display_name: display_name.to_string(),
+                config_display_id: None,
             },
             panel_type,
             2,

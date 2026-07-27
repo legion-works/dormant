@@ -392,7 +392,7 @@ export default function Dashboard() {
             const dc = displayConfigs[id];
             const blankMode = dc?.blank_mode ?? "—";
             const controllers = dc?.controllers ?? [];
-            const wearAdvisory = wear?.displays.some((d) => d.display_name === id && d.advisory) ?? false;
+            const wearAdvisory = wear?.displays.some((d) => (d.config_display_id ?? d.display_name) === id && d.advisory) ?? false;
             return (
               <DashDisplayRow
                 key={id}

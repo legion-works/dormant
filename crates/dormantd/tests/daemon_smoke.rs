@@ -304,6 +304,55 @@ wake_retry_interval = "1s"
     )
 }
 
+fn operation_config(marker: &Path, hold: &Path, wake_holds: bool) -> String {
+    let blank = if wake_holds {
+        format!(
+            "printf START >> '{}'; tail -f '{}'",
+            marker.display(),
+            hold.display()
+        )
+    } else {
+        format!("printf START >> '{}'", marker.display())
+    };
+    let wake = if wake_holds {
+        format!("tail -f '{}'", hold.display())
+    } else {
+        format!("printf WAKE >> '{}'", marker.display())
+    };
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.mon]
+controllers = ["command"]
+command_timeout = "30s"
+blank_mode = "power_off"
+blank_command = "{blank}"
+wake_command = "{wake}"
+modes = ["power_off"]
+
+[rules.r]
+zone = "office"
+displays = ["mon"]
+grace_period = "0s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+    )
+}
+
 async fn shutdown(handle: dormantd::app::AppHandle, join: tokio::task::JoinHandle<()>) {
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
@@ -814,7 +863,7 @@ async fn smoke_blank_and_wake() {
         ),
     ];
     let app = App::build_with_sources(
-        cfg_path,
+        cfg_path.clone(),
         creds_path,
         Strictness::Strict,
         fake_factory("desk", script),
@@ -848,6 +897,194 @@ async fn smoke_blank_and_wake() {
         "ZbusSink must never be constructed by any smoke test — \
          every App construction site must inject a no-op notify sink"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exercise_during_reload_finishes_or_cancels_before_teardown() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let hold = dir.path().join("hold");
+    fs::write(&hold, b"").unwrap();
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &operation_config(&marker, &hold, false),
+    );
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc()
+    .disable_config_watcher();
+    let (handle, join) = app.start().await.unwrap();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Exercise {
+            display: DisplayId("mon".into()),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    assert!(wait_for(|| read(&marker).contains('S'), Duration::from_secs(2)).await);
+    fs::write(
+        &cfg_path,
+        format!("{}\n", fs::read_to_string(&cfg_path).unwrap()),
+    )
+    .unwrap();
+    let receipt = reload_from_file(&handle).await;
+    assert!(matches!(receipt.outcome, ReloadOutcome::Reloaded));
+    let report = tokio::time::timeout(Duration::from_secs(3), reply_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.generation, Some(GenerationId(0)));
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emergency_wake_during_reload_reports_accepted_generation() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let hold = dir.path().join("hold");
+    fs::write(&hold, b"").unwrap();
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &operation_config(&marker, &hold, false),
+    );
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc()
+    .disable_config_watcher();
+    let (handle, join) = app.start().await.unwrap();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::EmergencyWake { reply: reply_tx })
+        .await
+        .unwrap();
+    let report = tokio::time::timeout(Duration::from_secs(3), reply_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.generation, Some(GenerationId(0)));
+    assert!(report.operation_id.is_some());
+    fs::write(
+        &cfg_path,
+        format!("{}\n", fs::read_to_string(&cfg_path).unwrap()),
+    )
+    .unwrap();
+    let receipt = reload_from_file(&handle).await;
+    assert!(matches!(receipt.outcome, ReloadOutcome::Reloaded));
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operation_accepted_by_n_never_mutates_n_plus_1() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let hold = dir.path().join("hold");
+    fs::write(&hold, b"").unwrap();
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &operation_config(&marker, &hold, false),
+    );
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc()
+    .disable_config_watcher();
+    let (handle, join) = app.start().await.unwrap();
+    let (first_tx, first_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Exercise {
+            display: DisplayId("mon".into()),
+            reply: first_tx,
+        })
+        .await
+        .unwrap();
+    fs::write(
+        &cfg_path,
+        format!("{}\n", fs::read_to_string(&cfg_path).unwrap()),
+    )
+    .unwrap();
+    let receipt = reload_from_file(&handle).await;
+    assert!(matches!(receipt.outcome, ReloadOutcome::Reloaded));
+    let first = tokio::time::timeout(Duration::from_secs(3), first_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.generation, Some(GenerationId(0)));
+    assert!(first.operation_id.is_some());
+    let snapshot = snapshot_with_retry(&handle.control_sender()).await;
+    assert!(snapshot.displays.iter().any(|(id, _)| id == "mon"));
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_exercise_timeout_rejects_reload_and_keeps_n_live() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let hold = dir.path().join("hold");
+    fs::write(&hold, b"").unwrap();
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &operation_config(&marker, &hold, false),
+    );
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc()
+    .disable_config_watcher()
+    .with_test_operation_busy();
+    let (handle, join) = app.start().await.unwrap();
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::Exercise {
+            display: DisplayId("mon".into()),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    fs::write(
+        &cfg_path,
+        format!("{}\n", fs::read_to_string(&cfg_path).unwrap()),
+    )
+    .unwrap();
+    let receipt = reload_from_file(&handle).await;
+    assert!(matches!(receipt.outcome, ReloadOutcome::Rejected(_)));
+    let snapshot = snapshot_with_retry(&handle.control_sender()).await;
+    assert!(snapshot.displays.iter().any(|(id, _)| id == "mon"));
+    shutdown(handle, join).await;
 }
 
 // ── 2: --validate-only exit codes ──────────────────────────────────────────────

@@ -329,6 +329,8 @@ pub struct App {
     #[cfg(any(test, feature = "test-util"))]
     force_generation_barrier_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
+    test_operation_busy: bool,
+    #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
@@ -500,6 +502,7 @@ impl App {
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
+            test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
         })
@@ -549,6 +552,7 @@ impl App {
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
+            test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
         })
@@ -709,6 +713,13 @@ impl App {
     #[must_use]
     pub fn with_test_force_generation_barrier_timeout(mut self) -> Self {
         self.force_generation_barrier_timeout = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_operation_busy(mut self) -> Self {
+        self.test_operation_busy = true;
         self
     }
 
@@ -882,6 +893,16 @@ impl App {
         ));
 
         let operation_registry = Arc::new(OperationRegistry::default());
+        #[cfg(any(test, feature = "test-util"))]
+        if self.test_operation_busy {
+            let (_, lease) = operation_registry
+                .try_acquire(
+                    GenerationId(0),
+                    OperationKind::Exercise(DisplayId("mon".into())),
+                )
+                .expect("test operation reservation");
+            std::mem::forget(lease);
+        }
         let spawn = spawn_generation(
             &root,
             assembly,

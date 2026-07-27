@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::{BlankRequestMode, IpcRequest, IpcResponse};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -238,8 +238,8 @@ async fn handle_connection(
                 let resp = handle_resume(&ctl_tx, rule).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::Blank { display } => {
-                let resp = handle_blank(&ctl_tx, &display).await;
+            IpcRequest::Blank { display, mode } => {
+                let resp = handle_blank(&ctl_tx, &display, mode).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::Wake { display } => {
@@ -330,12 +330,26 @@ async fn handle_resume(ctl_tx: &mpsc::Sender<ControlMsg>, rule: Option<String>) 
     IpcResponse::ok(None)
 }
 
-/// Force-blank a display — validates the display name against a snapshot first.
-async fn handle_blank(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> IpcResponse {
+/// Blank a display — validates the display name against a snapshot first, then
+/// dispatches either the soft ladder path or the operator-override hardware
+/// path per the requested [`BlankRequestMode`].  Issue #124 forced this split:
+/// `Hard` issues a `PowerOff` that hard-powers a shared panel and can take the
+/// USB hub (and downstream sensors) down with it, while `Soft` walks the
+/// configured render/stage/controller ladder from its first stage and is the
+/// safe default.
+async fn handle_blank(
+    ctl_tx: &mpsc::Sender<ControlMsg>,
+    display: &str,
+    mode: BlankRequestMode,
+) -> IpcResponse {
     if let Some(err) = validate_display_name(ctl_tx, display).await {
         return err;
     }
-    let msg = ControlMsg::ForceBlank(dormant_core::types::DisplayId(display.to_string()));
+    let target = dormant_core::types::DisplayId(display.to_string());
+    let msg = match mode {
+        BlankRequestMode::Soft => ControlMsg::SoftBlank(target),
+        BlankRequestMode::Hard => ControlMsg::ForceBlank(target),
+    };
     if ctl_tx.send(msg).await.is_err() {
         return IpcResponse::error("engine not available");
     }
@@ -800,6 +814,127 @@ mod tests {
             assert_eq!(
                 resp.ok, expected_ok,
                 "SwitchOutcome variant must consistently map ok={expected_ok}"
+            );
+        }
+    }
+
+    // ── Blank soft/hard routing (issue #124) ─────────────────────────────
+    mod blank_routing {
+        use crate::ipc::handle_blank;
+        use dormant_core::ipc_proto::BlankRequestMode;
+        use dormant_core::rules::{ControlMsg, DisplaySnapshot, StateSnapshot};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        /// Spawn a fake engine that responds to `ControlMsg::Snapshot` with a
+        /// snapshot containing one configured display, and records the LAST
+        /// non-snapshot `ControlMsg` it received.
+        fn spawn_blank_fake_engine(
+            display: &str,
+        ) -> (
+            mpsc::Sender<ControlMsg>,
+            Arc<std::sync::Mutex<Option<ControlMsg>>>,
+            CancellationToken,
+        ) {
+            let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(64);
+            let last_msg = Arc::new(std::sync::Mutex::new(None::<ControlMsg>));
+            let record = last_msg.clone();
+            let snap = StateSnapshot {
+                sensors: vec![],
+                zones: vec![],
+                displays: vec![(
+                    display.to_string(),
+                    DisplaySnapshot {
+                        phase: "active".into(),
+                        inhibited: false,
+                        paused: false,
+                        cmd_gen: 1,
+                        scope: dormant_core::config::DisplayScope::Private,
+                        owned: true,
+                        observed_input_code: None,
+                        panel_state: None,
+                        controllers: vec![],
+                        wake_attempts: 0,
+                        last_blank_failed: false,
+                        stage: None,
+                    },
+                )],
+                pending_reload: None,
+                rollback: None,
+                kvm: None,
+            };
+            tokio::spawn(async move {
+                while let Some(msg) = ctl_rx.recv().await {
+                    match msg {
+                        ControlMsg::Snapshot(tx) => {
+                            let _ = tx.send(snap.clone());
+                        }
+                        other => {
+                            *record.lock().unwrap() = Some(other);
+                        }
+                    }
+                }
+            });
+            (ctl_tx, last_msg, CancellationToken::new())
+        }
+
+        /// `Blank { mode: Soft }` must reach the engine as `ControlMsg::SoftBlank`
+        /// — the safe ladder path.  This is the wire-boundary contract for
+        /// `dormantctl blank` and any legacy `Blank` frame (no `mode`).
+        #[tokio::test]
+        async fn handle_blank_soft_sends_soft_blank() {
+            let (ctl_tx, last_msg, _cancel) = spawn_blank_fake_engine("main");
+            let resp = handle_blank(&ctl_tx, "main", BlankRequestMode::Soft).await;
+            assert!(resp.ok, "soft blank should succeed: {resp:?}");
+
+            // The recorder task is a separate spawn; give it a tick to land.
+            tokio::task::yield_now().await;
+
+            let msg = last_msg.lock().unwrap().take();
+            assert!(
+                matches!(msg, Some(ControlMsg::SoftBlank(ref id)) if id.0 == "main"),
+                "expected ControlMsg::SoftBlank(main), got {msg:?}"
+            );
+        }
+
+        /// `Blank { mode: Hard }` must reach the engine as `ControlMsg::ForceBlank`
+        /// — the operator-override hardware-primary path.  This is the wire-boundary
+        /// contract for `dormantctl blank --hard` and the tray/web "Force blank"
+        /// buttons.
+        #[tokio::test]
+        async fn handle_blank_hard_sends_force_blank() {
+            let (ctl_tx, last_msg, _cancel) = spawn_blank_fake_engine("main");
+            let resp = handle_blank(&ctl_tx, "main", BlankRequestMode::Hard).await;
+            assert!(resp.ok, "hard blank should succeed: {resp:?}");
+
+            tokio::task::yield_now().await;
+
+            let msg = last_msg.lock().unwrap().take();
+            assert!(
+                matches!(msg, Some(ControlMsg::ForceBlank(ref id)) if id.0 == "main"),
+                "expected ControlMsg::ForceBlank(main), got {msg:?}"
+            );
+        }
+
+        /// `Blank` for an unknown display returns an error and DOES NOT send
+        /// any control message.  Pin: a routing fix must not regress this.
+        #[tokio::test]
+        async fn handle_blank_unknown_display_does_not_send() {
+            let (ctl_tx, last_msg, _cancel) = spawn_blank_fake_engine("main");
+            let resp = handle_blank(&ctl_tx, "missing", BlankRequestMode::Hard).await;
+            assert!(!resp.ok, "unknown display should error");
+            assert!(
+                resp.error.as_deref().is_some_and(|e| e.contains("missing")),
+                "error should name the display, got: {:?}",
+                resp.error
+            );
+
+            // Give the recorder a chance to swallow a wrongly-sent message.
+            tokio::task::yield_now().await;
+            assert!(
+                last_msg.lock().unwrap().is_none(),
+                "must not send any control message for an unknown display"
             );
         }
     }

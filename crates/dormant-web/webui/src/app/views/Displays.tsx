@@ -293,7 +293,7 @@ export default function Displays() {
     if (!accepted) return;
     clearActionError(id);
     try {
-      await postBlank(id);
+      await postBlank(id, "hard");
     } catch (err: unknown) {
       setActionErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : "Force blank failed" }));
     }

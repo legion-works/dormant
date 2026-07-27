@@ -117,6 +117,13 @@ pub enum Input {
     ForceBlank,
     /// Force-immediate wake (operator override).
     ForceWake,
+    /// Walk the configured render/stage/controller ladder from its first
+    /// stage.  The safe alternative to [`Input::ForceBlank`] (issue #124) —
+    /// enters the same ladder path that a vacant rule would initiate, so a
+    /// render overlay gets shown before any hardware blank fires.  In the
+    /// `Active` and `Grace` phases this skips grace and enters the ladder
+    /// directly (operator-initiated, not a sensor edge).
+    SoftBlank,
     /// A stage-dwell timer has fired — advance to the next ladder rung.
     ///
     /// Distinct from [`Input::Tick`] so stale ticks from a prior stage
@@ -446,6 +453,8 @@ impl DisplayStateMachine {
                 to: "blanking",
                 cause: "force_blank",
             }]),
+            // SoftBlank enters the configured ladder from stage 0 (issue #124).
+            (Phase::Active, Input::SoftBlank) => self.enter_ladder_stage(0, now, "soft_blank"),
             // ForceWake in Active is a no-op — already awake.
             (Phase::Active, Input::ForceWake) => {
                 vec![]
@@ -601,6 +610,11 @@ impl DisplayStateMachine {
                     cause: "force_blank",
                 }])
             }
+            // SoftBlank clears the frozen countdown and enters the ladder (issue #124).
+            (Phase::Grace { .. }, Input::SoftBlank) => {
+                self.grace_frozen_remaining = None;
+                self.enter_ladder_stage(0, now, "soft_blank")
+            }
             // ForceWake during Grace: abort countdown, go active.
             // Routes through enter_active so an absent zone immediately
             // re-enters Grace (display gets grace_period of screen time,
@@ -710,6 +724,10 @@ impl DisplayStateMachine {
             (Phase::Blanking, Input::ForceBlank) => {
                 vec![]
             }
+            // SoftBlank in Blanking: already blanking through the ladder; no-op.
+            (Phase::Blanking, Input::SoftBlank) => {
+                vec![]
+            }
             // ForceWake in Blanking: defer to after blank result.
             (Phase::Blanking, Input::ForceWake) => {
                 self.pending_wake = true;
@@ -786,6 +804,10 @@ impl DisplayStateMachine {
             }
             // ForceBlank in Blanked: already blanked; no-op.
             (Phase::Blanked, Input::ForceBlank) => {
+                vec![]
+            }
+            // SoftBlank in Blanked: already at rest; no-op.
+            (Phase::Blanked, Input::SoftBlank) => {
                 vec![]
             }
             // ForceWake in Blanked: wake immediately.
@@ -897,6 +919,8 @@ impl DisplayStateMachine {
                 to: "blanking",
                 cause: "force_blank",
             }]),
+            // SoftBlank in Waking: enter the ladder from stage 0 (cancels the wake retry loop).
+            (Phase::Waking, Input::SoftBlank) => self.enter_ladder_stage(0, now, "soft_blank"),
             // ForceWake in Waking: restart the wake attempt with a fresh
             // generation.
             (Phase::Waking, Input::ForceWake) => self.issue_wake(vec![], now),
@@ -998,6 +1022,21 @@ impl DisplayStateMachine {
                 effects.append(&mut self.issue_blank(vec![]));
                 effects
             }
+            // SoftBlank in RenderPending: tear down the in-flight surface, then
+            // enter the ladder from stage 0 (the configured ladder, not the
+            // primary hardware mode).
+            (Phase::RenderPending { .. }, Input::SoftBlank) => {
+                let r#gen = self.stage_gen;
+                let mut effects = vec![Effect::TeardownRender { r#gen }];
+                self.current_stage = None;
+                effects.push(Effect::LogTransition {
+                    from: "render_pending",
+                    to: "entering_ladder",
+                    cause: "soft_blank",
+                });
+                effects.append(&mut self.enter_ladder_stage(0, now, "soft_blank"));
+                effects
+            }
             // OwnershipChanged in RenderPending: yield on loss.
             (Phase::RenderPending { .. }, Input::OwnershipChanged(owns)) => {
                 if owns {
@@ -1093,6 +1132,20 @@ impl DisplayStateMachine {
                     cause: "force_blank",
                 });
                 effects.append(&mut self.issue_blank(vec![]));
+                effects
+            }
+            // SoftBlank in Staged: tear down the live surface, then enter the
+            // ladder from stage 0.
+            (Phase::Staged { .. }, Input::SoftBlank) => {
+                let r#gen = self.stage_gen;
+                let mut effects = vec![Effect::TeardownRender { r#gen }];
+                self.current_stage = None;
+                effects.push(Effect::LogTransition {
+                    from: "staged",
+                    to: "entering_ladder",
+                    cause: "soft_blank",
+                });
+                effects.append(&mut self.enter_ladder_stage(0, now, "soft_blank"));
                 effects
             }
             // OwnershipChanged in Staged: yield on loss.

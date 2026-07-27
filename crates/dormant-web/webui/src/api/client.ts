@@ -90,12 +90,20 @@ export function getRecentEvents(limit?: number): Promise<RecentEventsResponse> {
   return request<RecentEventsResponse>(`/events/recent${qs}`);
 }
 
-/** POST /api/blank — force-blank a display by id. */
-export function postBlank(display: string): Promise<void> {
+/** POST /api/blank — force-blank a display by id.  Issue #124 — the web
+ *  "Force blank" button is always `hard` (operator-override PowerOff), so
+ *  the `mode` parameter defaults to `"hard"` and the existing call sites
+ *  keep working.  Pass `"soft"` to use the safe ladder path; the daemon
+ *  walks the configured render/stage/controller ladder from stage 0
+ *  instead of issuing the primary hardware blank. */
+export function postBlank(
+  display: string,
+  mode: "soft" | "hard" = "hard",
+): Promise<void> {
   return request<void>("/blank", {
     method: "POST",
     headers: JSON_CT,
-    body: JSON.stringify({ display }),
+    body: JSON.stringify({ display, mode }),
   });
 }
 

@@ -270,7 +270,7 @@ function PanelTile({ id, snap, dc, displayRules, zones, ruleCfgs, kvm, dimmed }:
     setError(null);
     setInFlight(action);
     try {
-      if (action === "blank") await postBlank(id);
+      if (action === "blank") await postBlank(id, "hard");
       else if (action === "wake") await postWake(id);
       else if (action === "pull") await postSwitch(id);
       else if (action === "push") await postPush(id);

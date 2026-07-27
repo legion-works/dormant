@@ -268,8 +268,13 @@ pub fn build_menu(
     entries.push(MenuEntry::Separator);
 
     // ── Blank all / Wake all ──────────────────────────────────────────────
+    // Issue #124 — the tray's blank action always emits `Hard` (operator
+    // override).  The label must read as destructive so the operator doesn't
+    // confuse the safe-default "Blank" verb with the destructive PowerOff
+    // path the tray actually triggers.  Trailing "…" matches the rest of
+    // the menu's confirm-dialog pattern.
     entries.push(MenuEntry::Action {
-        label: "Blank all now".into(),
+        label: "Force blank all…".into(),
         enabled: can_blank_all,
         icon: glyph_for(&Action::BlankAll),
         action: Action::BlankAll,
@@ -293,10 +298,14 @@ pub fn build_menu(
 
         for (id, d) in sorted {
             let label = submenu_label(id, d);
+            // Issue #124 — tray blank actions always emit `Hard`.  Renamed
+            // from "Blank now" / "Blank shared panel — affects all connected
+            // machines" to "Force blank now" / "Force blank shared panel…"
+            // so the destructive semantics are visible on the menu itself.
             let blank_label = if d.scope == DisplayScope::Shared {
-                "Blank shared panel — affects all connected machines"
+                "Force blank shared panel…"
             } else {
-                "Blank now"
+                "Force blank now"
             };
             let switch_capable = is_switch_capable(snapshot, id);
 
@@ -495,7 +504,11 @@ mod tests {
                 "Pause until resumed".to_string(),
                 "Resume".to_string(),
                 "──".to_string(),
-                "Blank all now".to_string(),
+                // Issue #124 — the top-level "Force blank all…" label pins
+                // the destructive Hard semantics on the menu; a regression
+                // that reverts to "Blank all now" would silently re-enable
+                // the pre-fix soft-default ambiguity.
+                "Force blank all…".to_string(),
                 "Wake all now".to_string(),
                 "──".to_string(),
                 "Open web UI".to_string(),
@@ -558,8 +571,8 @@ mod tests {
     fn blank_actions_use_display_off_glyph() {
         let snap = snap(vec![disp("monitor", "active")]);
         let menu = build_menu(Some(&snap), false, 8137);
-        // Top-level Blank all now.
-        let entry = find_action(&menu, "Blank all now").expect("Blank all now");
+        // Top-level "Force blank all…" (issue #124 — renamed from "Blank all now").
+        let entry = find_action(&menu, "Force blank all…").expect("Force blank all…");
         match entry {
             MenuEntry::Action { icon, action, .. } => {
                 assert_eq!(*icon, Glyph::DisplayOff);
@@ -764,7 +777,7 @@ mod tests {
                         icon,
                         ..
                     } => {
-                        assert_eq!(label, "Blank now");
+                        assert_eq!(label, "Force blank now");
                         assert_eq!(*icon, Glyph::DisplayOff);
                         assert!(matches!(action, Action::BlankOne(id) if id == "monitor"));
                     }
@@ -847,10 +860,13 @@ mod tests {
         let MenuEntry::Submenu { entries, .. } = submenu else {
             unreachable!("expected shared display submenu");
         };
+        // Issue #124 — the shared "Force blank shared panel…" label
+        // preserves the all-machines warning while making the destructive
+        // Hard semantics visible.
         assert!(matches!(
             entries.first(),
             Some(MenuEntry::Action { label, .. })
-                if label == "Blank shared panel — affects all connected machines"
+                if label == "Force blank shared panel…"
         ));
     }
 
@@ -858,7 +874,6 @@ mod tests {
     fn private_display_labels_remain_byte_identical() {
         let snapshot = snap(vec![disp("private-panel", "blanked")]);
         let menu = build_menu(Some(&snapshot), false, 8137);
-
         let submenu = menu
             .iter()
             .find(|entry| matches!(entry, MenuEntry::Submenu { .. }))
@@ -870,7 +885,7 @@ mod tests {
         assert!(matches!(entries.as_slice(), [
             MenuEntry::Action { label: blank_label, .. },
             MenuEntry::Action { label: wake_label, .. },
-        ] if blank_label == "Blank now" && wake_label == "Wake now"));
+        ] if blank_label == "Force blank now" && wake_label == "Wake now"));
     }
 
     #[test]

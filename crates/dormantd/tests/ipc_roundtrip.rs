@@ -387,6 +387,7 @@ async fn blank_unknown_display_returns_error() {
         &socket_path,
         &IpcRequest::Blank {
             display: "nonexistent".into(),
+            mode: dormant_core::ipc_proto::BlankRequestMode::Hard,
         },
     )
     .await;

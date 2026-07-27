@@ -249,7 +249,8 @@ describe("Displays", () => {
     // All row action buttons are hidden while the dialog is open.
     expect(screen.queryAllByRole("button", { name: /Force wake/ })).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
-    await waitFor(() => expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main"));
+    // Issue #124 — the web tray "Force blank" path is always Hard.
+    await waitFor(() => expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main", "hard"));
 
     // Pause rule on first display (aoc-main → rule "office-rule")
     fireEvent.click(screen.getAllByText("Pause rule")[0]);

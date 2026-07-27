@@ -512,6 +512,8 @@ mod tests {
                 panic!("expected EmergencyWake");
             };
             let _ = reply.send(EmergencyWakeReport {
+                operation_id: None,
+                generation: None,
                 paused: true,
                 displays: vec![EmergencyWakeResult {
                     display: DisplayId("studio".to_string()),
@@ -665,6 +667,8 @@ mod tests {
                     }
                     ControlMsg::Exercise { display, reply } => {
                         let _ = reply.send(ExerciseReport {
+                            operation_id: None,
+                            generation: None,
                             display,
                             pre_phase: "active".to_string(),
                             paused_rules: Vec::new(),

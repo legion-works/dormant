@@ -72,10 +72,27 @@ enum Command {
         #[arg(long)]
         rule: Option<String>,
     },
-    /// Force-blank a display.
+    /// Blank a display.
+    ///
+    /// Issue #124 split the blank policy: by default this command walks the
+    /// configured render/stage/controller ladder from its first stage
+    /// (the safe `Soft` mode) and never hard-powers the panel.  Pass
+    /// `--hard` to issue the operator-override `PowerOff` (the `Hard`
+    /// mode) — this requires a confirmation prompt in a TTY unless
+    /// `--yes` is also given, and is the equivalent of the tray/web
+    /// "Force blank" button.
     Blank {
         /// Display id to blank.
         display: String,
+        /// Issue the operator-override `PowerOff` (`Hard` mode) instead of
+        /// the safe ladder (`Soft` mode).  Triggers a confirmation prompt
+        /// in a TTY; pass `--yes` to bypass for scripts/CI.
+        #[arg(long)]
+        hard: bool,
+        /// Skip the `--hard` confirmation prompt.  Only valid with
+        /// `--hard` (clap rejects `--yes` alone).
+        #[arg(long, requires = "hard")]
+        yes: bool,
     },
     /// Force-wake a display.
     Wake {
@@ -200,7 +217,9 @@ fn main() -> ExitCode {
             cmd_pause::run_pause(&socket_path, dur, rule)
         }
         Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
-        Command::Blank { display } => cmd_blank::run_blank(&socket_path, &display),
+        Command::Blank { display, hard, yes } => {
+            cmd_blank::run_blank(&socket_path, &display, hard, yes)
+        }
         Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
         Command::Switch { display, to_peer } => {
             if to_peer {
@@ -416,6 +435,63 @@ mod tests {
                 subcommand: cmd_launchd::LaunchdSubcommand::Uninstall
             }
         ));
+    }
+
+    #[test]
+    fn parse_blank_soft_default() {
+        // Bare `dormantctl blank <display>` — the safe-soft default
+        // (issue #124).  No prompt, no flags.
+        let cli = Cli::try_parse_from(["dormantctl", "blank", "monitor"]).unwrap();
+        match cli.command {
+            Command::Blank { display, hard, yes } => {
+                assert_eq!(display, "monitor");
+                assert!(!hard, "default mode must be soft (hard=false)");
+                assert!(!yes, "yes must be false by default");
+            }
+            _ => panic!("expected Blank command"),
+        }
+    }
+
+    #[test]
+    fn parse_blank_hard_flag() {
+        let cli = Cli::try_parse_from(["dormantctl", "blank", "monitor", "--hard"]).unwrap();
+        match cli.command {
+            Command::Blank { display, hard, yes } => {
+                assert_eq!(display, "monitor");
+                assert!(hard, "--hard must set hard=true");
+                assert!(!yes, "yes must be false unless --yes is given");
+            }
+            _ => panic!("expected Blank command"),
+        }
+    }
+
+    #[test]
+    fn parse_blank_hard_with_yes() {
+        let cli =
+            Cli::try_parse_from(["dormantctl", "blank", "monitor", "--hard", "--yes"]).unwrap();
+        match cli.command {
+            Command::Blank { display, hard, yes } => {
+                assert_eq!(display, "monitor");
+                assert!(hard);
+                assert!(yes);
+            }
+            _ => panic!("expected Blank command"),
+        }
+    }
+
+    #[test]
+    fn parse_blank_yes_without_hard_rejected() {
+        // `--yes` without `--hard` is a clap conflict (requires="hard"
+        // on the yes field).  Pin: a regression that drops the requires
+        // attribute would silently let `--yes` through and change the
+        // default for `--yes`-only callers.
+        let err = Cli::try_parse_from(["dormantctl", "blank", "monitor", "--yes"])
+            .expect_err("--yes alone must be rejected by clap");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--yes") || msg.contains("required") || msg.contains("--hard"),
+            "error should reference --yes/--hard, got: {msg}"
+        );
     }
 
     #[test]

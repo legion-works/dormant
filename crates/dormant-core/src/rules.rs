@@ -32,11 +32,11 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{DisplayScope, SensorKind};
@@ -97,6 +97,201 @@ impl InhibitorKind {
 
 // ── Public I/O surfaces ───────────────────────────────────────────────────────
 
+/// The kind of hardware operation fenced by a daemon generation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OperationKind {
+    /// A single-display control-path exercise.
+    Exercise(DisplayId),
+    /// A global emergency wake.
+    EmergencyWake,
+}
+
+/// The immutable identity accepted by an engine generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedOperation {
+    /// Daemon-lifetime operation identity.
+    pub id: u64,
+    /// Generation that accepted the operation.
+    pub generation: GenerationId,
+    /// Hardware operation being performed.
+    pub kind: OperationKind,
+}
+
+#[derive(Default)]
+struct OperationState {
+    next_id: u64,
+    active: HashMap<u64, (GenerationId, OperationKind, CancellationToken)>,
+    quiescing: HashSet<GenerationId>,
+}
+
+/// Daemon-lifetime active operation leases, shared by all generations.
+#[derive(Clone, Default)]
+pub struct OperationRegistry {
+    state: Arc<Mutex<OperationState>>,
+    changed: Arc<Notify>,
+}
+
+/// RAII ownership of one accepted hardware operation.
+pub struct OperationLease {
+    registry: OperationRegistry,
+    id: u64,
+    token: CancellationToken,
+}
+
+impl std::fmt::Debug for OperationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperationLease")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OperationLease {
+    /// Returns whether cancellation was requested for this operation.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    /// Wait until cancellation is requested.
+    pub async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+}
+
+impl Drop for OperationLease {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.registry.state.lock() {
+            state.active.remove(&self.id);
+        }
+        self.registry.changed.notify_waiters();
+    }
+}
+
+impl OperationRegistry {
+    /// Close acceptance for a generation before quiescing its active leases.
+    pub fn begin_quiesce(&self, generation: GenerationId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.quiescing.insert(generation);
+        }
+    }
+
+    /// Reopen operation acceptance after a rejected reload.
+    pub fn end_quiesce(&self, generation: GenerationId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.quiescing.remove(&generation);
+        }
+    }
+
+    /// Adopt an operation accepted by the daemon front door.
+    #[must_use]
+    pub fn lease_accepted(&self, operation: &AcceptedOperation) -> Option<OperationLease> {
+        let state = self.state.lock().ok()?;
+        let (_, kind, token) = state.active.get(&operation.id)?;
+        if operation.generation != state.active.get(&operation.id)?.0 || *kind != operation.kind {
+            return None;
+        }
+        Some(OperationLease {
+            registry: self.clone(),
+            id: operation.id,
+            token: token.clone(),
+        })
+    }
+
+    /// Accept an operation unless a conflicting operation is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns the requested kind when a conflicting operation is active.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another thread poisoned the registry mutex.
+    pub fn try_acquire(
+        &self,
+        generation: GenerationId,
+        kind: OperationKind,
+    ) -> Result<(AcceptedOperation, OperationLease), OperationKind> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("operation registry mutex poisoned");
+        if state.quiescing.contains(&generation) {
+            return Err(kind);
+        }
+        let conflicts = state
+            .active
+            .values()
+            .any(|(active_generation, active_kind, _)| {
+                *active_generation == generation
+                    && match (&kind, active_kind) {
+                        (OperationKind::Exercise(left), OperationKind::Exercise(right)) => {
+                            left == right
+                        }
+                        (
+                            OperationKind::EmergencyWake | OperationKind::Exercise(_),
+                            OperationKind::EmergencyWake,
+                        )
+                        | (OperationKind::EmergencyWake, OperationKind::Exercise(_)) => true,
+                    }
+            });
+        if conflicts {
+            return Err(kind);
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        let token = CancellationToken::new();
+        state
+            .active
+            .insert(id, (generation, kind.clone(), token.clone()));
+        Ok((
+            AcceptedOperation {
+                id,
+                generation,
+                kind,
+            },
+            OperationLease {
+                registry: self.clone(),
+                id,
+                token,
+            },
+        ))
+    }
+
+    /// Cancel all operations accepted by `generation`.
+    pub fn cancel_generation(&self, generation: GenerationId) {
+        if let Ok(state) = self.state.lock() {
+            for (active_generation, _, token) in state.active.values() {
+                if *active_generation == generation {
+                    token.cancel();
+                }
+            }
+        }
+    }
+
+    /// Wait until every operation accepted by `generation` has been dropped.
+    pub async fn wait_generation_empty(&self, generation: GenerationId) {
+        loop {
+            let notified = self.changed.notified();
+            let empty = self.state.lock().map_or(true, |state| {
+                !state
+                    .active
+                    .values()
+                    .any(|(active_generation, _, _)| *active_generation == generation)
+            });
+            if empty {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+fn operation_completion_matches_generation(accepted: GenerationId, current: GenerationId) -> bool {
+    accepted == current
+}
+
 /// Inbound control messages to the engine.
 #[derive(Debug)]
 pub enum ControlMsg {
@@ -117,6 +312,15 @@ pub enum ControlMsg {
     ForceBlank(DisplayId),
     /// Force-immediate wake (operator override).
     ForceWake(DisplayId),
+    /// Walk the configured render/stage/controller blank ladder from its
+    /// first stage (issue #124 — soft alternative to [`Self::ForceBlank`]
+    /// that never hard-powers the panel).  Operator-initiated like
+    /// `ForceBlank` but routes through [`Input::SoftBlank`] so the
+    /// state machine enters the ladder instead of issuing a primary
+    /// hardware blank.  When the ladder has no render stage this still
+    /// issues a controller blank, but always at the configured
+    /// `primary_blank_mode` rather than the operator override.
+    SoftBlank(DisplayId),
     /// Request a current snapshot of engine state.
     Snapshot(oneshot::Sender<StateSnapshot>),
     /// Subscribe to [`DaemonEvent`]s from this point forward.
@@ -188,6 +392,13 @@ pub enum ControlMsg {
         /// One-shot reply channel for the emergency report.
         reply: oneshot::Sender<EmergencyWakeReport>,
     },
+    /// Generation-accepted emergency wake operation.
+    EmergencyWakeAccepted {
+        /// Lease identity accepted by the daemon registry.
+        operation: AcceptedOperation,
+        /// One-shot reply channel for the emergency report.
+        reply: oneshot::Sender<EmergencyWakeReport>,
+    },
     /// Run a control-path verification on a single display — blank, read,
     /// wake, read, restore — and return a per-step report.
     ///
@@ -207,6 +418,13 @@ pub enum ControlMsg {
     Exercise {
         /// The display to exercise.
         display: DisplayId,
+        /// One-shot reply channel for the exercise report.
+        reply: oneshot::Sender<ExerciseReport>,
+    },
+    /// Generation-accepted display exercise operation.
+    ExerciseAccepted {
+        /// Lease identity accepted by the daemon registry.
+        operation: AcceptedOperation,
         /// One-shot reply channel for the exercise report.
         reply: oneshot::Sender<ExerciseReport>,
     },
@@ -243,6 +461,12 @@ pub struct EmergencyWakeReport {
     /// global pause fan-out encountered an error (very rare — rules set
     /// + `Input::Pause` step per display, so this is mostly diagnostic).
     pub paused: bool,
+    /// Accepted operation identity, when the request was generation-fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<u64>,
+    /// Generation that accepted the operation, when fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationId>,
     /// Per-display wake results, one entry per display the engine owns.
     pub displays: Vec<EmergencyWakeResult>,
 }
@@ -323,6 +547,12 @@ pub struct ExerciseReport {
     /// The phase the display was in before the exercise started (so the
     /// operator can confirm the restore target was the right one).
     pub pre_phase: String,
+    /// Accepted operation identity, when the request was generation-fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<u64>,
+    /// Generation that accepted the operation, when fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<GenerationId>,
     /// Rule ids the handler paused for the exercise window.  Empty for
     /// manual-only displays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -793,7 +1023,31 @@ enum InternalResult {
         /// Rule ids to resume (any that were paused for the exercise
         /// window).  Empty Vec is a no-op.
         rules: Vec<RuleId>,
+        /// Operation identity used to fence completion after a reload.
+        operation_id: u64,
+        /// Generation that accepted the operation.
+        generation: GenerationId,
     },
+}
+
+/// Releases an exercise pause even when its detached task is cancelled.
+struct ExercisePauseGuard {
+    results_tx: mpsc::UnboundedSender<InternalResult>,
+    rules: Option<Vec<RuleId>>,
+    operation_id: u64,
+    generation: GenerationId,
+}
+
+impl Drop for ExercisePauseGuard {
+    fn drop(&mut self) {
+        if let Some(rules) = self.rules.take() {
+            let _ = self.results_tx.send(InternalResult::ExerciseResume {
+                rules,
+                operation_id: self.operation_id,
+                generation: self.generation,
+            });
+        }
+    }
 }
 
 /// One rule's per-kind inhibitor bookkeeping.
@@ -907,6 +1161,8 @@ pub struct RulesEngine {
     event_tx: broadcast::Sender<DaemonEvent>,
     /// Optional daemon-level diagnostic sink for lifecycle transitions.
     observations: Option<(GenerationId, ObservationHub)>,
+    /// Shared daemon-lifetime operation lease registry.
+    operation_registry: OperationRegistry,
     /// Pending reload detail (operator feedback in snapshots).
     pending_reload: Option<String>,
     /// Boot-time rollback metadata (operator feedback in snapshots).
@@ -1052,6 +1308,7 @@ impl RulesEngine {
             results_tx,
             event_tx,
             observations: None,
+            operation_registry: OperationRegistry::default(),
             pending_reload: None,
             rollback: None,
             kvm: None,
@@ -1072,6 +1329,13 @@ impl RulesEngine {
     #[must_use]
     pub fn with_observation_hub(mut self, generation: GenerationId, hub: ObservationHub) -> Self {
         self.observations = Some((generation, hub));
+        self
+    }
+
+    /// Attach the daemon-lifetime operation registry shared across reloads.
+    #[must_use]
+    pub fn with_operation_registry(mut self, registry: OperationRegistry) -> Self {
+        self.operation_registry = registry;
         self
     }
 
@@ -1402,6 +1666,7 @@ impl RulesEngine {
             ControlMsg::Resume { rule } => self.handle_resume(rule.as_ref()),
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
+            ControlMsg::SoftBlank(d) => self.step_one(&d, Input::SoftBlank),
             ControlMsg::InputWake(d) => {
                 // Issue #125: if every zone that drives this display is
                 // vacant and the effective `input_wake_hold` for the
@@ -1463,8 +1728,25 @@ impl RulesEngine {
             ControlMsg::SetKvmStatus(status) => {
                 self.kvm = Some(status);
             }
-            ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply),
-            ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply),
+            ControlMsg::EmergencyWake { reply } => self.handle_emergency_wake(reply, None),
+            ControlMsg::EmergencyWakeAccepted { operation, reply } => {
+                self.handle_emergency_wake(reply, Some(operation));
+            }
+            ControlMsg::Exercise { display, reply } => self.handle_exercise(display, reply, None),
+            ControlMsg::ExerciseAccepted { operation, reply } => {
+                let OperationKind::Exercise(ref display) = operation.kind else {
+                    let _ = reply.send(ExerciseReport {
+                        display: DisplayId("unknown".into()),
+                        pre_phase: "unknown".into(),
+                        operation_id: None,
+                        generation: None,
+                        paused_rules: Vec::new(),
+                        steps: Vec::new(),
+                    });
+                    return;
+                };
+                self.handle_exercise(display.clone(), reply, Some(operation));
+            }
             ControlMsg::GenerationBarrier(ack) => {
                 let _ = ack.send(());
             }
@@ -1620,7 +1902,11 @@ impl RulesEngine {
     /// `dormantd::ipc::handle_emergency_wake`); the `dormantctl` client
     /// falls back to direct-hardware construction when that window
     /// elapses.
-    fn handle_emergency_wake(&mut self, reply: oneshot::Sender<EmergencyWakeReport>) {
+    fn handle_emergency_wake(
+        &mut self,
+        reply: oneshot::Sender<EmergencyWakeReport>,
+        accepted: Option<AcceptedOperation>,
+    ) {
         // Pause every rule indefinitely — reuse the existing pause path so
         // the state-machine overlays route the same way as a normal
         // global pause.  Without this an absent-zone would re-trigger
@@ -1630,6 +1916,9 @@ impl RulesEngine {
         // Snapshot executor handles so the spawned task does not hold a
         // borrow on `self`.  Per the spec, wake EVERY display the engine
         // owns — that includes manual-only displays (no rule bound).
+        let lease = accepted
+            .as_ref()
+            .and_then(|operation| self.operation_registry.lease_accepted(operation));
         let executors: Vec<(DisplayId, Arc<dyn CommandSink>)> = self
             .executors
             .iter()
@@ -1643,6 +1932,7 @@ impl RulesEngine {
         );
 
         tokio::spawn(async move {
+            let _lease = lease;
             // Spawn ALL per-display wake tasks up front, THEN await them.
             // Awaiting inside the same loop would force serial execution
             // and let one slow controller (Tizen, HA-passthrough) block
@@ -1694,6 +1984,8 @@ impl RulesEngine {
 
             let report = EmergencyWakeReport {
                 paused: true,
+                operation_id: accepted.as_ref().map(|operation| operation.id),
+                generation: accepted.as_ref().map(|operation| operation.generation),
                 displays: results,
             };
             let _ = reply.send(report);
@@ -1722,7 +2014,57 @@ impl RulesEngine {
     /// blanked-family phase.  Even if any earlier step panicked or errored
     /// mid-exercise, the restore step's blanket invocation of the wake path
     /// means an exercise cannot leave a panel dark.
-    fn handle_exercise(&mut self, target: DisplayId, reply: oneshot::Sender<ExerciseReport>) {
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::needless_pass_by_value)]
+    fn handle_exercise(
+        &mut self,
+        target: DisplayId,
+        reply: oneshot::Sender<ExerciseReport>,
+        accepted: Option<AcceptedOperation>,
+    ) {
+        let generation = accepted.as_ref().map_or_else(
+            || {
+                self.observations
+                    .as_ref()
+                    .map_or(GenerationId(0), |(id, _)| *id)
+            },
+            |operation| operation.generation,
+        );
+        let current_generation = self.observations.as_ref().map_or(generation, |(id, _)| *id);
+        let acquired = accepted
+            .as_ref()
+            .and_then(|operation| {
+                self.operation_registry
+                    .lease_accepted(operation)
+                    .map(|lease| (operation.clone(), lease))
+            })
+            .or_else(|| {
+                self.operation_registry
+                    .try_acquire(current_generation, OperationKind::Exercise(target.clone()))
+                    .ok()
+            });
+        let Some((acquired_operation, lease)) = acquired else {
+            let _ = reply.send(ExerciseReport {
+                display: target,
+                pre_phase: "rejected".into(),
+                operation_id: accepted.as_ref().map(|operation| operation.id),
+                generation: accepted.as_ref().map(|operation| operation.generation),
+                paused_rules: Vec::new(),
+                steps: vec![ExerciseStep {
+                    command: "reject".into(),
+                    blank_mode: None,
+                    returned_ok: false,
+                    state_before: None,
+                    state_after: None,
+                    verdict: ExerciseVerdict::Failed,
+                    error: Some("E_OPERATION_IN_PROGRESS: display exercise already active".into()),
+                }],
+            });
+            return;
+        };
+        let operation = acquired_operation;
+        let operation_id = operation.id;
+        let accepted_generation = operation.generation;
         // Snapshot the rules bound to this display so the spawned task can
         // un-pause them without holding a borrow on `self`.
         let rules_for_target: Vec<RuleId> = self
@@ -1775,6 +2117,8 @@ impl RulesEngine {
             let _ = reply.send(ExerciseReport {
                 display: target,
                 pre_phase,
+                operation_id: Some(operation_id),
+                generation: Some(accepted_generation),
                 paused_rules: Vec::new(),
                 steps: vec![ExerciseStep {
                     command: "no_executor".into(),
@@ -1813,15 +2157,44 @@ impl RulesEngine {
         let wake_settle = self.cfg.doctor_wake_settle;
 
         tokio::spawn(async move {
-            let report = run_exercise_sequence(
-                &sink,
+            let lease = lease;
+            let pause_guard = ExercisePauseGuard {
+                results_tx: results_tx.clone(),
+                rules: Some(rules_to_resume.clone()),
+                operation_id,
+                generation: accepted_generation,
+            };
+            let mut report = match run_supervised_exercise_cancellable(
+                Some(&lease),
+                Arc::clone(&sink),
                 effective_mode,
                 pre_phase,
                 rules_to_resume.clone(),
-                target,
+                target.clone(),
                 wake_settle,
             )
-            .await;
+            .await
+            {
+                Ok(report) => report,
+                Err(()) => ExerciseReport {
+                    display: target,
+                    pre_phase: "unknown".into(),
+                    operation_id: Some(operation_id),
+                    generation: Some(accepted_generation),
+                    paused_rules: rules_to_resume.clone(),
+                    steps: vec![ExerciseStep {
+                        command: "panic".into(),
+                        blank_mode: None,
+                        returned_ok: false,
+                        state_before: None,
+                        state_after: None,
+                        verdict: ExerciseVerdict::Failed,
+                        error: Some("E_EXERCISE_PANIC: exercise task panicked".into()),
+                    }],
+                },
+            };
+            report.operation_id = Some(operation_id);
+            report.generation = Some(accepted_generation);
 
             tracing::info!(
                 event = "control_path_exercise",
@@ -1835,9 +2208,7 @@ impl RulesEngine {
             // independent of whether `reply.send` succeeds.  A timed-out
             // or disconnected IPC caller can no longer strand a paused
             // rule.  Empty Vec is a no-op (manual-only display path).
-            let _ = results_tx.send(InternalResult::ExerciseResume {
-                rules: rules_to_resume,
-            });
+            drop(pause_guard);
 
             // `reply.send` is best-effort: the caller may have timed out
             // or disconnected, in which case the report is dropped on the
@@ -2077,7 +2448,25 @@ impl RulesEngine {
             } => {
                 self.step_machine(&display, Input::RenderResult { r#gen, result }, now);
             }
-            InternalResult::ExerciseResume { rules } => {
+            InternalResult::ExerciseResume {
+                rules,
+                operation_id,
+                generation,
+            } => {
+                let current_generation = self
+                    .observations
+                    .as_ref()
+                    .map_or(GenerationId(0), |(id, _)| *id);
+                if !operation_completion_matches_generation(generation, current_generation) {
+                    tracing::warn!(
+                        event = "operation_completion_discarded",
+                        op_id = operation_id,
+                        accepted_gen = generation.0,
+                        current_gen = current_generation.0,
+                        "discarding operation completion from an old generation",
+                    );
+                    return;
+                }
                 // Off-run-loop exercise sequence completed (possibly
                 // successfully, possibly with the IPC caller having
                 // timed out or dropped its receiver).  Resume every
@@ -2579,8 +2968,77 @@ async fn run_exercise_sequence(
     ExerciseReport {
         display,
         pre_phase,
+        operation_id: None,
+        generation: None,
         paused_rules,
         steps,
+    }
+}
+
+async fn wake_after_exercise_panic(sink: &Arc<dyn CommandSink>) {
+    let _ = sink.wake_once().await;
+}
+
+#[cfg(test)]
+async fn run_supervised_exercise(
+    sink: Arc<dyn CommandSink>,
+    effective_mode: Option<BlankMode>,
+    pre_phase: String,
+    paused_rules: Vec<RuleId>,
+    display: DisplayId,
+    wake_settle: Duration,
+) -> Result<ExerciseReport, ()> {
+    run_supervised_exercise_cancellable(
+        None,
+        sink,
+        effective_mode,
+        pre_phase,
+        paused_rules,
+        display,
+        wake_settle,
+    )
+    .await
+}
+
+async fn run_supervised_exercise_cancellable(
+    lease: Option<&OperationLease>,
+    sink: Arc<dyn CommandSink>,
+    effective_mode: Option<BlankMode>,
+    pre_phase: String,
+    paused_rules: Vec<RuleId>,
+    display: DisplayId,
+    wake_settle: Duration,
+) -> Result<ExerciseReport, ()> {
+    let task_sink = Arc::clone(&sink);
+    let task = tokio::spawn(async move {
+        run_exercise_sequence(
+            &task_sink,
+            effective_mode,
+            pre_phase,
+            paused_rules,
+            display,
+            wake_settle,
+        )
+        .await
+    });
+    let result = if let Some(lease) = lease {
+        tokio::select! {
+            result = task => result,
+            () = lease.cancelled() => {
+                let _ = sink.wake_once().await;
+                return Err(());
+            }
+        }
+    } else {
+        task.await
+    };
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            tracing::error!(event = "exercise_task_panicked", error = %error, "exercise task failed; forcing wake");
+            wake_after_exercise_panic(&sink).await;
+            Err(())
+        }
     }
 }
 
@@ -2656,6 +3114,119 @@ mod tests {
     use super::*;
     use crate::fakes::{RecordingSink, SinkCmd};
     use crate::traits::{PanelState, PowerState};
+
+    #[tokio::test]
+    async fn operation_registry_rejects_second_exercise_same_display() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        let (_accepted, lease) = registry
+            .try_acquire(
+                generation,
+                OperationKind::Exercise(DisplayId("oled".into())),
+            )
+            .expect("first operation accepted");
+        assert!(
+            registry
+                .try_acquire(
+                    generation,
+                    OperationKind::Exercise(DisplayId("oled".into()))
+                )
+                .is_err()
+        );
+        drop(lease);
+        assert!(
+            registry
+                .try_acquire(
+                    generation,
+                    OperationKind::Exercise(DisplayId("oled".into()))
+                )
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_registry_cancellation_marks_generation_operations() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(9);
+        let (_accepted, lease) = registry
+            .try_acquire(generation, OperationKind::EmergencyWake)
+            .expect("operation accepted");
+        registry.cancel_generation(generation);
+        assert!(lease.is_cancelled());
+        drop(lease);
+        registry.wait_generation_empty(generation).await;
+    }
+
+    #[tokio::test]
+    async fn panic_mid_exercise_wakes_and_restores_pause() {
+        let fake = Arc::new(crate::fakes::ExerciseSink::new());
+        let sink: Arc<dyn CommandSink> = fake.clone();
+        fake.panic_once_on("blank");
+        assert!(
+            run_supervised_exercise(
+                sink,
+                Some(BlankMode::PowerOff),
+                "active".into(),
+                vec![RuleId("office".into())],
+                DisplayId("oled".into()),
+                Duration::ZERO,
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(fake.log().last(), Some(SinkCmd::Wake)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_exercise_wakes_and_restores_pause() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(11);
+        let (_accepted, lease) = registry
+            .try_acquire(
+                generation,
+                OperationKind::Exercise(DisplayId("oled".into())),
+            )
+            .expect("operation accepted");
+        registry.cancel_generation(generation);
+        assert!(lease.is_cancelled());
+        let (results_tx, mut results_rx) = mpsc::unbounded_channel();
+        let guard = ExercisePauseGuard {
+            results_tx,
+            rules: Some(vec![RuleId("office".into())]),
+            operation_id: 1,
+            generation,
+        };
+        drop(guard);
+        assert!(matches!(
+            results_rx.try_recv(),
+            Ok(InternalResult::ExerciseResume { .. })
+        ));
+        let sink = Arc::new(crate::fakes::ExerciseSink::new());
+        let _ = sink.wake_once().await;
+        assert!(matches!(sink.log().last(), Some(SinkCmd::Wake)));
+    }
+
+    #[test]
+    fn emergency_report_keeps_accepted_generation() {
+        let operation = AcceptedOperation {
+            id: 1,
+            generation: GenerationId(3),
+            kind: OperationKind::EmergencyWake,
+        };
+        assert_eq!(operation.generation, GenerationId(3));
+    }
+
+    #[test]
+    fn operation_accepted_by_old_generation_never_mutates_new() {
+        assert!(!operation_completion_matches_generation(
+            GenerationId(4),
+            GenerationId(5)
+        ));
+        assert!(operation_completion_matches_generation(
+            GenerationId(5),
+            GenerationId(5)
+        ));
+    }
 
     // ── InhibitorKind::from_config literal pin ──────────────────────────────
 
@@ -3874,6 +4445,38 @@ mod tests {
         .expect("one-display engine config is valid")
     }
 
+    /// Build a manual one-display engine with a caller-supplied ladder and
+    /// render sinks.  Used by the soft/hard blank tests (issue #124) so
+    /// they can observe the difference between "walk the render ladder" and
+    /// "issue a primary controller blank."
+    #[allow(clippy::implicit_hasher)]
+    fn manual_engine_with_ladder(
+        display: DisplayId,
+        executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
+        render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>>,
+        ladder: Vec<LadderStage>,
+        ownership: Arc<dyn OwnershipGate>,
+    ) -> RulesEngine {
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![DisplayRuntimeCfg {
+                    display,
+                    blank_mode: BlankMode::PowerOff,
+                    ladder,
+                    timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                }],
+                sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[]).expect("empty zone engine is valid"),
+            executors,
+            render_sinks,
+            ownership,
+        )
+        .expect("one-display ladder engine config is valid")
+    }
+
     #[tokio::test]
     async fn ownership_poll_refeeds_changed_cached_verdict_without_timer_sweep() {
         let display = DisplayId("mon".into());
@@ -3979,6 +4582,134 @@ mod tests {
                 .iter()
                 .any(|(_, command)| matches!(command, SinkCmd::Blank(BlankMode::PowerOff))),
             "ForceBlank must issue a command when the ownership gate denies control"
+        );
+    }
+
+    // ── Soft vs Hard blank (issue #124) ────────────────────────────────
+
+    use crate::fakes::{RecordingRenderSink, RenderCmd};
+
+    /// `ControlMsg::SoftBlank` must walk the configured render/stage/controller
+    /// ladder from its FIRST stage — never skip past the render overlay.  This
+    /// is the safety guarantee the issue-#124 fix relies on: a soft blank on a
+    /// shared panel must NOT hard-power the panel before the render surface
+    /// is shown.  Pin the ladder-shape distinction so a future refactor that
+    /// routes Soft through `ForceBlank`'s primary-mode path fails loudly.
+    #[tokio::test]
+    async fn soft_blank_walks_ladder_from_first_stage() {
+        let display = DisplayId("mon".into());
+        let cmd_sink = Arc::new(RecordingSink::new());
+        let render_sink = Arc::new(RecordingRenderSink::new());
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        execs.insert(display.clone(), cmd_sink.clone());
+        let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+        renders.insert(display.clone(), render_sink.clone());
+        let ladder = vec![
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            },
+            LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            },
+        ];
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = manual_engine_with_ladder(
+            display.clone(),
+            execs,
+            renders,
+            ladder,
+            Arc::new(FlipGate(owned)),
+        );
+
+        engine.handle_control(ControlMsg::SoftBlank(display.clone()));
+        // Drain the spawned render/show result via the engine's own
+        // results channel — event-driven synchronization (no sleep, which
+        // the test-timing policy would reject).
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("soft blank renders the render stage and reports a result");
+        assert!(
+            matches!(result, crate::rules::InternalResult::Render { .. }),
+            "SoftBlank must enter the ladder at stage 0 (RenderBlack), got {result:?}"
+        );
+
+        let render_log = render_sink.log();
+        assert!(
+            render_log.iter().any(|(_, c)| matches!(
+                c,
+                RenderCmd::Show {
+                    kind: StageKind::RenderBlack,
+                    ..
+                }
+            )),
+            "SoftBlank must enter the ladder at stage 0 (RenderBlack), got {render_log:?}"
+        );
+        let cmd_log = cmd_sink.log();
+        assert!(
+            !cmd_log.iter().any(|(_, c)| matches!(c, SinkCmd::Blank(_))),
+            "SoftBlank must NOT issue a controller blank before the render dwell elapses, got {cmd_log:?}"
+        );
+    }
+
+    /// `ControlMsg::ForceBlank` (Hard) must skip the render ladder and issue
+    /// the primary controller blank immediately — the operator-override path
+    /// unchanged by issue #124.  This is the discriminant for the soft/hard
+    /// split: a regression that re-routes `ForceBlank` through the ladder would
+    /// break every existing "Force blank" surface (tray, web, `dormantctl
+    /// blank --hard`).
+    #[tokio::test]
+    async fn hard_blank_skips_to_primary_hardware_mode() {
+        let display = DisplayId("mon".into());
+        let cmd_sink = Arc::new(RecordingSink::new());
+        let render_sink = Arc::new(RecordingRenderSink::new());
+        let mut execs: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        execs.insert(display.clone(), cmd_sink.clone());
+        let mut renders: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+        renders.insert(display.clone(), render_sink.clone());
+        let ladder = vec![
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            },
+            LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            },
+        ];
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = manual_engine_with_ladder(
+            display.clone(),
+            execs,
+            renders,
+            ladder,
+            Arc::new(FlipGate(owned)),
+        );
+
+        engine.handle_control(ControlMsg::ForceBlank(display.clone()));
+        let result = engine
+            .results_rx
+            .recv()
+            .await
+            .expect("ForceBlank reports a blank command result");
+
+        assert!(matches!(result, InternalResult::Blank { .. }));
+        let cmd_log = cmd_sink.log();
+        assert!(
+            cmd_log
+                .iter()
+                .any(|(_, c)| matches!(c, SinkCmd::Blank(BlankMode::PowerOff))),
+            "ForceBlank must issue the primary controller blank immediately, got {cmd_log:?}"
+        );
+        let render_log = render_sink.log();
+        assert!(
+            !render_log
+                .iter()
+                .any(|(_, c)| matches!(c, RenderCmd::Show { .. })),
+            "ForceBlank must NOT enter the render ladder first, got {render_log:?}"
         );
     }
 
@@ -4357,6 +5088,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         results_tx,
         event_tx,
         observations: None,
+        operation_registry: OperationRegistry::default(),
         pending_reload: None,
         rollback: None,
         kvm: None,
@@ -4463,6 +5195,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         results_tx,
         event_tx,
         observations: None,
+        operation_registry: OperationRegistry::default(),
         pending_reload: None,
         rollback: None,
         kvm: None,

@@ -186,6 +186,37 @@ display via `dormantctl blank` and then edit the config, it stays blanked
 (not defensive-woken).  Across a full daemon **restart** (not reload) there
 is no persisted state, so a manual-only display starts `active`.
 
+#### `dormantctl blank` — soft and hard modes (issue #124)
+
+`dormantctl blank <display>` has two modes.  The **default** is `soft`: the
+daemon walks the display's configured render/stage/controller blank ladder
+from its first stage and never hard-powers the panel.  Pass `--hard` to
+issue the operator-override `PowerOff` (`hard` mode), the same path the
+tray's "Force blank" button and the web UI's "Force blank" button take.
+
+```text
+# Safe: walks the ladder from its first stage.  No prompt.
+dormantctl blank main
+
+# Operator override: prompts on stdin for 'y' or 'Y' before issuing
+# the primary PowerOff.  Shared panels will affect every connected
+# machine.  Refuses to run when stdin is not a TTY.
+dormantctl blank main --hard
+
+# Bypass the prompt for CI / scripts.
+dormantctl blank main --hard --yes
+
+# `--yes` without `--hard` is rejected by clap; the safe-soft path is
+# always the default and never prompts.
+```
+
+The two modes are deliberately split at the IPC boundary (issue #124 — a
+forced `PowerOff` on a shared panel can hard-power the USB hub and starve a
+downstream sensor).  Legacy `dormantctl` builds that predate the split
+send `{"req":"blank","display":"x"}` with no `mode` field, which the daemon
+defaults to `soft` (safety-first).  The tray and web UI always send `hard`
+explicitly (with a confirm dialog) and are unaffected by the new default.
+
 Example — a Samsung Tizen TV controlled by hand:
 
 ```toml

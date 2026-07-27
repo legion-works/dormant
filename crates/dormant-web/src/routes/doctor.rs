@@ -234,6 +234,8 @@ mod tests {
                     ControlMsg::Exercise { display, reply } => {
                         assert_eq!(display, DisplayId("main".to_string()));
                         let _ = reply.send(ExerciseReport {
+                            operation_id: None,
+                            generation: None,
                             display,
                             pre_phase: "active".to_string(),
                             paused_rules: vec![RuleId("office_blank".to_string())],
@@ -415,6 +417,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(second, WebError::ExerciseInProgress));
         let _ = exercise_reply.send(ExerciseReport {
+            operation_id: None,
+            generation: None,
             display: DisplayId("main".to_string()),
             pre_phase: "active".to_string(),
             paused_rules: Vec::new(),

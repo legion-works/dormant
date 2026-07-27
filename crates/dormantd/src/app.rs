@@ -63,8 +63,8 @@ use dormant_core::observation::{
 };
 use dormant_core::ownership::{AlwaysOwned, OwnershipGate};
 use dormant_core::rules::{
-    ControlMsg, DisplayRuntimeCfg, InhibitorKind, RollbackStatus, RuleRuntimeCfg, RulesEngine,
-    RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
+    ControlMsg, DisplayRuntimeCfg, InhibitorKind, OperationKind, OperationRegistry, RollbackStatus,
+    RuleRuntimeCfg, RulesEngine, RulesEngineConfig, SensorRuntimeCfg, StateSnapshot,
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
@@ -95,6 +95,41 @@ use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
 use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
+
+const QUIESCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuiesceOutcome {
+    Clear,
+    ClearedAfterCancel,
+    Busy,
+}
+
+/// Wait for generation-owned hardware leases before teardown. The reload
+/// coordinator uses `Busy` to restore the paused old generation, so this
+/// pure phase is the load-bearing contract behind the integration rejection.
+async fn quiesce_operations(
+    registry: &OperationRegistry,
+    generation: GenerationId,
+    first_wait: Duration,
+    second_wait: Duration,
+) -> QuiesceOutcome {
+    if tokio::time::timeout(first_wait, registry.wait_generation_empty(generation))
+        .await
+        .is_ok()
+    {
+        return QuiesceOutcome::Clear;
+    }
+    registry.cancel_generation(generation);
+    if tokio::time::timeout(second_wait, registry.wait_generation_empty(generation))
+        .await
+        .is_ok()
+    {
+        QuiesceOutcome::ClearedAfterCancel
+    } else {
+        QuiesceOutcome::Busy
+    }
+}
 
 /// Builds the daemon-lifetime notification sink. Production defaults to
 /// [`notifier::ZbusSink`]; tests inject a factory returning a shared
@@ -327,6 +362,8 @@ pub struct App {
     #[cfg(any(test, feature = "test-util"))]
     force_generation_barrier_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
+    test_operation_busy: bool,
+    #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
 }
 
@@ -499,6 +536,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
+            test_operation_busy: false,
+            #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
         })
     }
@@ -547,6 +586,8 @@ impl App {
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
+            test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
         })
@@ -707,6 +748,13 @@ impl App {
     #[must_use]
     pub fn with_test_force_generation_barrier_timeout(mut self) -> Self {
         self.force_generation_barrier_timeout = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_operation_busy(mut self) -> Self {
+        self.test_operation_busy = true;
         self
     }
 
@@ -879,6 +927,17 @@ impl App {
             coordination.clone(),
         ));
 
+        let operation_registry = Arc::new(OperationRegistry::default());
+        #[cfg(any(test, feature = "test-util"))]
+        if self.test_operation_busy {
+            let (_, lease) = operation_registry
+                .try_acquire(
+                    GenerationId(0),
+                    OperationKind::Exercise(DisplayId("other".into())),
+                )
+                .expect("test operation reservation");
+            std::mem::forget(lease);
+        }
         let spawn = spawn_generation(
             &root,
             assembly,
@@ -892,6 +951,7 @@ impl App {
             config_rx.clone(),
             executors_rx.clone(),
             GenerationId(0),
+            operation_registry.clone(),
             Some(self.observations.clone()),
             Some(idle_obs_tx.clone()),
             filtered_activity_tx.clone(),
@@ -923,7 +983,11 @@ impl App {
 
         // Stable front channels are paused before an old engine is drained, so
         // no delivery can race behind the generation barrier.
-        let ctl_router = Arc::new(GenerationRouter::new(spawn.ctl_tx.clone()));
+        let ctl_router = Arc::new(GenerationRouter::new_with_generation(
+            spawn.ctl_tx.clone(),
+            GenerationId(0),
+            operation_registry.clone(),
+        ));
         let events_router = Arc::new(GenerationRouter::new(spawn.events_tx.clone()));
         let (front_events_tx, front_events_rx) = mpsc::channel::<PresenceEvent>(256);
 
@@ -1188,6 +1252,7 @@ impl App {
             generation: spawn.generation,
             applied_revision,
             generation_id: GenerationId(0),
+            operation_registry,
             wear_tracker_handle,
             started_web_port,
             started_web_bind,
@@ -1483,6 +1548,7 @@ struct Runner {
     generation: Generation,
     applied_revision: RuntimeRevision,
     generation_id: GenerationId,
+    operation_registry: Arc<OperationRegistry>,
     /// The wear tracker's `JoinHandle` (#47 fix, secondary hardening):
     /// retained (no longer fire-and-forget) so `run_loop` can bound-await
     /// its cancellation-triggered final persist during shutdown, mirroring
@@ -1718,7 +1784,9 @@ impl Runner {
         self.generation_barrier_ack_timeout =
             spawn.generation.cfg.daemon.generation_barrier_ack_timeout;
         self.generation = spawn.generation;
-        self.ctl_router.install(spawn.ctl_tx.clone()).await;
+        self.ctl_router
+            .install_generation(spawn.ctl_tx.clone(), self.generation_id)
+            .await;
         self.events_router.install(spawn.events_tx.clone()).await;
     }
 
@@ -2016,6 +2084,44 @@ impl Runner {
         self.ctl_router.pause().await;
         self.events_router.pause().await;
         self.record_reload_lifecycle_stage("routers_paused");
+        self.operation_registry.begin_quiesce(self.generation_id);
+        if matches!(
+            quiesce_operations(
+                &self.operation_registry,
+                self.generation_id,
+                QUIESCE_OPERATION_TIMEOUT,
+                QUIESCE_OPERATION_TIMEOUT,
+            )
+            .await,
+            QuiesceOutcome::Busy
+        ) {
+            tracing::warn!(
+                event = "operation_quiesce_cancelled",
+                generation = self.generation_id.0
+            );
+            let executors = self
+                .generation
+                .display_executors
+                .iter()
+                .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+                .collect();
+            self.executors_tx.send_replace(Arc::new(executors));
+            self.ctl_router
+                .install_generation(old_ctl.clone(), self.generation_id)
+                .await;
+            if let Some(events) = self.generation.engine_events_tx.clone() {
+                self.events_router.install(events).await;
+            }
+            let detail = "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
+            self.operation_registry.end_quiesce(self.generation_id);
+            tracing::warn!(
+                event = "reload_rejected_operation_busy",
+                generation = self.generation_id.0
+            );
+            let outcome = ReloadOutcome::Rejected(detail);
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
+        }
         quiesce_inputs(&mut self.generation).await;
         self.record_reload_lifecycle_stage("inputs_quiesced");
         #[cfg(any(test, feature = "test-util"))]
@@ -2120,6 +2226,7 @@ impl Runner {
             self.config_tx.subscribe(),
             self.executors_tx.subscribe(),
             next_generation,
+            self.operation_registry.clone(),
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
             self.filtered_activity_tx.clone(),
@@ -2446,6 +2553,7 @@ impl Runner {
             self.config_tx.subscribe(),
             self.executors_tx.subscribe(),
             self.generation_id,
+            self.operation_registry.clone(),
             Some(self.observations.clone()),
             self.idle_obs_tx.clone(),
             self.filtered_activity_tx.clone(),
@@ -3084,6 +3192,8 @@ struct GenerationRouterState<T> {
     paused: bool,
     target: Option<mpsc::Sender<T>>,
     queued: VecDeque<T>,
+    generation_id: Option<GenerationId>,
+    operation_registry: Option<Arc<OperationRegistry>>,
 }
 
 impl<T: Send + 'static> GenerationRouter<T> {
@@ -3093,6 +3203,8 @@ impl<T: Send + 'static> GenerationRouter<T> {
                 paused: false,
                 target: Some(target),
                 queued: VecDeque::new(),
+                generation_id: None,
+                operation_registry: None,
             }),
         }
     }
@@ -3147,6 +3259,95 @@ impl<T: Send + 'static> GenerationRouter<T> {
                 result.is_ok()
             }
         }
+    }
+}
+
+impl GenerationRouter<ControlMsg> {
+    fn new_with_generation(
+        target: mpsc::Sender<ControlMsg>,
+        generation_id: GenerationId,
+        operation_registry: Arc<OperationRegistry>,
+    ) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(GenerationRouterState {
+                paused: false,
+                target: Some(target),
+                queued: VecDeque::new(),
+                generation_id: Some(generation_id),
+                operation_registry: Some(operation_registry),
+            }),
+        }
+    }
+
+    async fn install_generation(
+        &self,
+        target: mpsc::Sender<ControlMsg>,
+        generation_id: GenerationId,
+    ) {
+        let mut state = self.state.lock().await;
+        state.target = Some(target.clone());
+        state.generation_id = Some(generation_id);
+        while let Some(message) = state.queued.pop_front() {
+            let message = stamp_control_operation(
+                message,
+                state
+                    .operation_registry
+                    .as_ref()
+                    .expect("operation registry installed"),
+                generation_id,
+            );
+            if target.send(message).await.is_err() {
+                tracing::error!(
+                    event = "generation_route_install_failed",
+                    "new generation closed while queued inputs were being released"
+                );
+                break;
+            }
+        }
+        state.paused = false;
+    }
+
+    async fn route_control(&self, mut message: ControlMsg, root: &CancellationToken) -> bool {
+        let mut state = self.state.lock().await;
+        if state.paused {
+            state.queued.push_back(message);
+            return true;
+        }
+        if let (Some(registry), Some(generation)) = (&state.operation_registry, state.generation_id)
+        {
+            message = stamp_control_operation(message, registry, generation);
+        }
+        let Some(target) = state.target.clone() else {
+            return false;
+        };
+        tokio::select! {
+            () = root.cancelled() => false,
+            result = target.send(message) => result.is_ok(),
+        }
+    }
+}
+
+fn stamp_control_operation(
+    message: ControlMsg,
+    registry: &OperationRegistry,
+    generation: GenerationId,
+) -> ControlMsg {
+    let kind = match &message {
+        ControlMsg::Exercise { display, .. } => Some(OperationKind::Exercise(display.clone())),
+        ControlMsg::EmergencyWake { .. } => Some(OperationKind::EmergencyWake),
+        _ => None,
+    };
+    let Some(kind) = kind else { return message };
+    let Ok((operation, lease)) = registry.try_acquire(generation, kind) else {
+        return message;
+    };
+    std::mem::forget(lease);
+    match message {
+        ControlMsg::Exercise { reply, .. } => ControlMsg::ExerciseAccepted { operation, reply },
+        ControlMsg::EmergencyWake { reply } => {
+            ControlMsg::EmergencyWakeAccepted { operation, reply }
+        }
+        other => other,
     }
 }
 
@@ -3866,6 +4067,7 @@ fn build_render_sinks(
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
     reason = "generation construction keeps every producer and daemon-lifetime handle visible at its spawn site"
 )]
 fn spawn_generation(
@@ -3881,6 +4083,7 @@ fn spawn_generation(
     config_rx: watch::Receiver<Arc<Config>>,
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
+    operation_registry: Arc<OperationRegistry>,
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
@@ -3915,6 +4118,7 @@ fn spawn_generation(
     if let Some(observations) = observations {
         engine = engine.with_observation_hub(generation_id, observations);
     }
+    engine = engine.with_operation_registry((*operation_registry).clone());
 
     if let Some(detail) = pending {
         engine.set_pending_reload(Some(detail));
@@ -4138,6 +4342,7 @@ fn spawn_generation_for_reload(
     config_rx: watch::Receiver<Arc<Config>>,
     executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     generation_id: GenerationId,
+    operation_registry: Arc<OperationRegistry>,
     observations: Option<ObservationHub>,
     idle_tx: Option<crate::idle_observation::IdleObservationTx>,
     filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
@@ -4159,6 +4364,7 @@ fn spawn_generation_for_reload(
         config_rx,
         executors_rx,
         generation_id,
+        operation_registry,
         observations,
         idle_tx,
         filtered_activity_tx,
@@ -4407,7 +4613,7 @@ async fn forward_ctl(
             msg = rx.recv() => match msg {
                 None => break,
                 Some(m) => {
-                    if !router.route(m, &cancel).await {
+                    if !router.route_control(m, &cancel).await {
                         break;
                     }
                 }
@@ -5757,6 +5963,86 @@ mod render_tests {
 mod generation_router_tests {
     use super::*;
     use dormant_core::types::{SensorState, Timestamp};
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_without_leases_is_clear() {
+        let registry = OperationRegistry::default();
+        assert_eq!(
+            quiesce_operations(
+                &registry,
+                GenerationId(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            )
+            .await,
+            QuiesceOutcome::Clear
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_dropped_lease_is_clear() {
+        let registry = OperationRegistry::default();
+        let (_, lease) = registry
+            .try_acquire(GenerationId(2), OperationKind::EmergencyWake)
+            .unwrap();
+        drop(lease);
+        assert_eq!(
+            quiesce_operations(
+                &registry,
+                GenerationId(2),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            )
+            .await,
+            QuiesceOutcome::Clear
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_cancels_and_clears_lease() {
+        let registry = OperationRegistry::default();
+        let (generation, lease) = (
+            GenerationId(3),
+            registry
+                .try_acquire(GenerationId(3), OperationKind::EmergencyWake)
+                .unwrap()
+                .1,
+        );
+        let waiter = tokio::spawn(async move {
+            lease.cancelled().await;
+        });
+        let result = quiesce_operations(
+            &registry,
+            generation,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(result);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(result.await, QuiesceOutcome::ClearedAfterCancel);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_operations_reports_busy_for_leaked_lease() {
+        let registry = OperationRegistry::default();
+        let (_, lease) = registry
+            .try_acquire(GenerationId(4), OperationKind::EmergencyWake)
+            .unwrap();
+        std::mem::forget(lease);
+        let result = quiesce_operations(
+            &registry,
+            GenerationId(4),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        tokio::pin!(result);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(result.await, QuiesceOutcome::Busy);
+    }
 
     #[tokio::test]
     async fn control_queued_while_paused_releases_once_to_new_generation() {

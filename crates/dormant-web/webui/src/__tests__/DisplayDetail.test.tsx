@@ -113,7 +113,7 @@ describe("DisplayDetail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
     expect(screen.getByRole("alertdialog", { name: "Force blank main?" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
-    await waitFor(() => expect(api.postBlank).toHaveBeenCalledWith("main"));
+    await waitFor(() => expect(api.postBlank).toHaveBeenCalledWith("main", "hard"));
   });
 
   // P1-F: Force wake is non-destructive — un-gated, no confirm dialog.

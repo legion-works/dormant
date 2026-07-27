@@ -31,6 +31,15 @@ const EMERGENCY_WAKE_WEB_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Deserialize, Debug)]
 pub(crate) struct BlankBody {
     pub(crate) display: String,
+    /// Blank mode — see [`dormant_core::ipc_proto::BlankRequestMode`].
+    /// Defaults to `Soft`, matching the safety-first CLI and wire protocol.
+    #[serde(default = "blank_body_default_mode_soft")]
+    pub(crate) mode: dormant_core::ipc_proto::BlankRequestMode,
+}
+
+/// HTTP-body default for [`BlankBody::mode`].
+fn blank_body_default_mode_soft() -> dormant_core::ipc_proto::BlankRequestMode {
+    dormant_core::ipc_proto::BlankRequestMode::Soft
 }
 
 #[derive(Deserialize, Debug)]
@@ -95,14 +104,25 @@ pub(crate) async fn post_push(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
-/// `POST /api/blank` — validate display exists, then force-blank.
+/// `POST /api/blank` — validate display exists, then dispatch soft or hard
+/// per the request body's `mode` field.  Issue #124 split the policy: this
+/// web route is the entry point for the webui's existing "Force blank"
+/// button, so it forwards Hard by default.  Soft is reachable explicitly via
+/// `{"display": "x", "mode": "soft"}` for any future soft-blank UI surface.
 pub(crate) async fn post_blank(
     State(state): State<WebState>,
     Json(body): Json<BlankBody>,
 ) -> Result<Json<serde_json::Value>, WebError> {
     validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
 
-    let msg = ControlMsg::ForceBlank(DisplayId(body.display));
+    let msg = match body.mode {
+        dormant_core::ipc_proto::BlankRequestMode::Soft => {
+            ControlMsg::SoftBlank(DisplayId(body.display))
+        }
+        dormant_core::ipc_proto::BlankRequestMode::Hard => {
+            ControlMsg::ForceBlank(DisplayId(body.display))
+        }
+    };
     state
         .inner
         .ctl_tx
@@ -493,6 +513,7 @@ mod tests {
             State(state),
             Json(BlankBody {
                 display: "main".into(),
+                mode: dormant_core::ipc_proto::BlankRequestMode::Hard,
             }),
         )
         .await;
@@ -507,6 +528,65 @@ mod tests {
         );
     }
 
+    /// `POST /api/blank` with `mode: "soft"` must dispatch `ControlMsg::SoftBlank`
+    /// — the safe ladder path.  The webui does not yet ship a "soft blank"
+    /// surface, but the route contract pins the behaviour so a future
+    /// soft-blank UI cannot regress into `ForceBlank`.
+    #[tokio::test]
+    async fn blank_soft_mode_sends_soft_blank() {
+        let snap = snapshot_with_displays(&["main"]);
+        let (ctl_tx, last_msg) = spawn_fake_engine(snap);
+        let state = test_web_state(ctl_tx);
+
+        let result = post_blank(
+            State(state),
+            Json(BlankBody {
+                display: "main".into(),
+                mode: dormant_core::ipc_proto::BlankRequestMode::Soft,
+            }),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "soft blank should succeed: {:?}",
+            result.err()
+        );
+
+        tokio::task::yield_now().await;
+
+        let msg = last_msg.lock().unwrap().take();
+        assert!(
+            matches!(msg, Some(ControlMsg::SoftBlank(ref id)) if id.0 == "main"),
+            "expected SoftBlank(main), got {msg:?}"
+        );
+    }
+
+    /// `POST /api/blank` with no `mode` field defaults to the safe Soft path.
+    #[tokio::test]
+    async fn blank_no_mode_defaults_to_soft() {
+        let snap = snapshot_with_displays(&["main"]);
+        let (ctl_tx, last_msg) = spawn_fake_engine(snap);
+        let state = test_web_state(ctl_tx);
+
+        let body: BlankBody = serde_json::from_str(r#"{"display":"main"}"#).unwrap();
+        assert_eq!(
+            body.mode,
+            dormant_core::ipc_proto::BlankRequestMode::Soft,
+            "missing mode field must default to Soft"
+        );
+
+        let result = post_blank(State(state), Json(body)).await;
+        assert!(result.is_ok(), "blank should succeed: {:?}", result.err());
+
+        tokio::task::yield_now().await;
+
+        let msg = last_msg.lock().unwrap().take();
+        assert!(
+            matches!(msg, Some(ControlMsg::SoftBlank(ref id)) if id.0 == "main"),
+            "expected SoftBlank(main) for the no-mode frame, got {msg:?}"
+        );
+    }
+
     #[tokio::test]
     async fn blank_unknown_display_returns_404() {
         let snap = snapshot_with_displays(&["main"]);
@@ -517,6 +597,7 @@ mod tests {
             State(state),
             Json(BlankBody {
                 display: "bogus".into(),
+                mode: dormant_core::ipc_proto::BlankRequestMode::Hard,
             }),
         )
         .await;
@@ -1030,6 +1111,8 @@ mod tests {
         let second = post_emergency_wake(State(state)).await.unwrap_err();
         assert!(matches!(second, WebError::EmergencyWakeInProgress));
         let _ = reply.send(EmergencyWakeReport {
+            operation_id: None,
+            generation: None,
             paused: true,
             displays: Vec::new(),
         });

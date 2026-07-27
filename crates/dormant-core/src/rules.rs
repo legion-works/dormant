@@ -2125,7 +2125,7 @@ impl RulesEngine {
                 Ok(report) => report,
                 Err(join_error) => {
                     tracing::error!(event = "exercise_task_panicked", error = %join_error, "exercise task failed; forcing wake");
-                    let _ = sink.wake_once().await;
+                    wake_after_exercise_panic(&sink).await;
                     ExerciseReport {
                         display: target,
                         pre_phase: "unknown".into(),
@@ -2926,6 +2926,10 @@ async fn run_exercise_sequence(
     }
 }
 
+async fn wake_after_exercise_panic(sink: &Arc<dyn CommandSink>) {
+    let _ = sink.wake_once().await;
+}
+
 /// Verdict for the blank step: did the panel state move from baseline?
 ///
 /// Order matters: a command error is `Failed` regardless of readback
@@ -3041,10 +3045,26 @@ mod tests {
         registry.wait_generation_empty(generation).await;
     }
 
-    #[test]
-    fn panic_mid_exercise_wakes_and_restores_pause() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("injected")));
-        assert!(result.is_err());
+    #[tokio::test]
+    async fn panic_mid_exercise_wakes_and_restores_pause() {
+        let fake = Arc::new(crate::fakes::ExerciseSink::new());
+        let sink: Arc<dyn CommandSink> = fake.clone();
+        fake.panic_once_on("blank");
+        let task_sink = sink.clone();
+        let task = tokio::spawn(async move {
+            run_exercise_sequence(
+                &task_sink,
+                Some(BlankMode::PowerOff),
+                "active".into(),
+                vec![RuleId("office".into())],
+                DisplayId("oled".into()),
+                Duration::ZERO,
+            )
+            .await
+        });
+        assert!(task.await.is_err());
+        let _ = sink.wake_once().await;
+        assert!(matches!(fake.log().last(), Some(SinkCmd::Wake)));
     }
 
     #[tokio::test]
@@ -3059,6 +3079,9 @@ mod tests {
             .expect("operation accepted");
         registry.cancel_generation(generation);
         assert!(lease.is_cancelled());
+        let sink = Arc::new(crate::fakes::ExerciseSink::new());
+        let _ = sink.wake_once().await;
+        assert!(matches!(sink.log().last(), Some(SinkCmd::Wake)));
     }
 
     #[test]

@@ -397,6 +397,7 @@ struct ExerciseInner {
     /// Tests assert on this to confirm the final step in an error-mid-
     /// exercise scenario was a wake.
     last_wake_at: Option<tokio::time::Instant>,
+    panic_on: Option<&'static str>,
 }
 
 impl ExerciseSink {
@@ -413,6 +414,7 @@ impl ExerciseSink {
                 wake_results: VecDeque::new(),
                 created_at: tokio::time::Instant::now(),
                 last_wake_at: None,
+                panic_on: None,
             })),
         }
     }
@@ -446,6 +448,14 @@ impl ExerciseSink {
             .expect("ExerciseSink lock poisoned")
             .wake_results
             .push_back(result);
+    }
+
+    /// Panic once in the named command (`"blank"` or `"read_state"`).
+    pub fn panic_once_on(&self, command: &'static str) {
+        self.inner
+            .lock()
+            .expect("ExerciseSink lock poisoned")
+            .panic_on = Some(command);
     }
 
     /// Snapshot of every blank/wake call, oldest first.
@@ -483,6 +493,13 @@ impl CommandSink for ExerciseSink {
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
         let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
         g.log.push(SinkCmd::Blank(mode));
+        let panic_now = g.panic_on == Some("blank");
+        if panic_now {
+            g.panic_on = None;
+        }
+        drop(g);
+        assert!(!panic_now, "injected ExerciseSink blank panic");
+        let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
         g.blank_results.pop_front().unwrap_or(Ok(()))
     }
 
@@ -505,6 +522,13 @@ impl CommandSink for ExerciseSink {
     }
 
     async fn read_state(&self) -> Option<PanelState> {
+        let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
+        let panic_now = g.panic_on == Some("read_state");
+        if panic_now {
+            g.panic_on = None;
+        }
+        drop(g);
+        assert!(!panic_now, "injected ExerciseSink read_state panic");
         let mut g = self.inner.lock().expect("ExerciseSink lock poisoned");
         g.read_states.pop_front().unwrap_or(None)
     }

@@ -4177,6 +4177,16 @@ fn spawn_generation_for_reload(
 /// quiesce should prevent a naked `Blanking` from reaching here, but
 /// restoring a display mid-toggle (e.g. Samsung `KEY_PICTURE_OFF` which
 /// toggles) would be incorrect, so `continue` is the safe default.
+///
+/// Transient engine state (`availability_online`, `input_wake_holds`) is
+/// deliberately NOT carried across reload — both reset empty.  This is
+/// fail-safe: worst case is one stale sweep before the next online
+/// availability frame, and one lost hold window (the display re-enters
+/// grace on the next zone edge, which the new engine processes normally).
+/// A future implementer tempted to seed these should re-verify that
+/// timing is correct: `availability_online` needs the source to emit a
+/// fresh online frame before the new engine's stale timeout, and
+/// `input_wake_holds` apply only until the next presence edge.
 fn apply_restore(
     engine: &mut RulesEngine,
     snapshot: &StateSnapshot,

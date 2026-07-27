@@ -318,6 +318,7 @@ impl DisplayExecutor {
 
 #[async_trait]
 impl CommandSink for DisplayExecutor {
+    #[allow(clippy::too_many_lines)]
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
         let _supersede_token = self.rotate_supersede();
 
@@ -383,6 +384,44 @@ impl CommandSink for DisplayExecutor {
             }
         }
 
+        // One bounded re-probe heal before failing — when probe_all
+        // initially missed a controller (e.g. ddcci display was disconnected
+        // at startup), the first command after reattach must re-probe the
+        // chain instead of staying dead until restart (issue #114).
+        if eligible_count == 0 {
+            tracing::info!(
+                event = "executor_reprobe",
+                display = %self.display,
+                "zero available controllers for blank; attempting on-demand reprobe",
+            );
+            for (i, controller) in self.chain.iter().enumerate() {
+                let _ = controller.reprobe().await;
+                // Re-evaluate after reprbe — re-insert if now available.
+                if !controller.is_available().await {
+                    continue;
+                }
+                if !controller.supported_modes().contains(&mode) {
+                    continue;
+                }
+                eligible_count += 1;
+                match controller.blank(mode).await {
+                    Ok(()) => {
+                        health[i].healthy = true;
+                        health[i].detail = None;
+                        *self.health.lock().unwrap() = health;
+                        self.blank_owners
+                            .record(&self.display, &self.chain_fingerprint, i);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        health[i].healthy = false;
+                        health[i].detail = Some(e.to_string());
+                        last_controller = controller.name().to_string();
+                    }
+                }
+            }
+        }
+
         tracing::error!(
             event = "blank_failed",
             display = %self.display,
@@ -443,6 +482,31 @@ impl CommandSink for DisplayExecutor {
                 if is_owner_attempt {
                     self.blank_owners
                         .clear_if_owner(&self.display, &self.chain_fingerprint, i);
+                }
+                return Ok(());
+            }
+        }
+
+        // On-demand re-probe before failing — same heal as blank path.
+        // A single attempt without eligibility counting means we re-probe
+        // unconditionally before the final Err.
+        tracing::info!(
+            event = "executor_reprobe",
+            display = %self.display,
+            "all wake_once attempts failed; attempting on-demand reprobe",
+        );
+        for (i, controller) in self.chain.iter().enumerate() {
+            let _ = controller.reprobe().await;
+            let is_owner_attempt = owner == Some(i);
+            if !is_owner_attempt && !controller.is_available().await {
+                continue;
+            }
+            if controller.wake().await.is_ok() {
+                if supersede_token.is_cancelled() {
+                    return Err(CmdFailure {
+                        controller: "superseded".to_string(),
+                        error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                    });
                 }
                 return Ok(());
             }
@@ -601,6 +665,30 @@ impl CommandSink for DisplayExecutor {
             .health
             .lock()
             .expect("DisplayExecutor health lock poisoned") = health;
+
+        // On-demand re-probe before failing (issue #114 / MUST 3).
+        tracing::info!(
+            event = "executor_reprobe",
+            display = %self.display,
+            "all wake rounds exhausted; attempting on-demand reprobe",
+        );
+        for (i, controller) in self.chain.iter().enumerate() {
+            let _ = controller.reprobe().await;
+            let is_owner_attempt = owner == Some(i);
+            if !is_owner_attempt && !controller.is_available().await {
+                continue;
+            }
+            if controller.wake().await.is_ok() {
+                if supersede_token.is_cancelled() {
+                    return Err(CmdFailure {
+                        controller: "superseded".to_string(),
+                        error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                    });
+                }
+                return Ok(());
+            }
+        }
+
         Err(CmdFailure {
             controller: "exhausted".to_string(),
             error: format!("{E_WAKE_FAILED}: burst exhausted after {total_rounds} rounds"),
@@ -1151,8 +1239,8 @@ mod tests {
     async fn wake_exhausted_returns_err_after_initial_plus_n_rounds() {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let b = FakeController::new("B", vec![BlankMode::PowerOff]);
-        // Both controllers always fail (script enough for 3 rounds × 2 = 6).
-        for _ in 0..6 {
+        // 3 rounds + 1 on-demand re-probe = 4 attempts per controller.
+        for _ in 0..8 {
             a.push_wake_result(Err(err("A")));
             b.push_wake_result(Err(err("B")));
         }
@@ -1167,9 +1255,9 @@ mod tests {
         assert_eq!(res.controller, "exhausted");
         assert!(res.error.starts_with(E_WAKE_FAILED));
 
-        // 3 rounds × 2 controllers = 6 wake calls.
-        assert_eq!(a.count_op("wake"), 3);
-        assert_eq!(b.count_op("wake"), 3);
+        // 3 rounds + 1 re-probe = 4 per controller.
+        assert_eq!(a.count_op("wake"), 4);
+        assert_eq!(b.count_op("wake"), 4);
     }
 
     #[tokio::test]
@@ -1364,8 +1452,8 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let b = FakeController::new("B", vec![BlankMode::PowerOff]);
         let c = FakeController::new("C", vec![BlankMode::PowerOff]);
-        // 4 rounds × 3 controllers = 12 calls. All fail.
-        for _ in 0..12 {
+        // 4 rounds + 1 on-demand re-probe = 5 attempts per controller × 3 = 15.
+        for _ in 0..15 {
             a.push_wake_result(Err(err("A")));
             b.push_wake_result(Err(err("B")));
             c.push_wake_result(Err(err("C")));
@@ -1385,10 +1473,10 @@ mod tests {
         let err = res.unwrap_err();
         assert_eq!(err.controller, "exhausted");
 
-        // 4 rounds × 3 controllers = 12 wake calls.
-        assert_eq!(a.count_op("wake"), 4);
-        assert_eq!(b.count_op("wake"), 4);
-        assert_eq!(c.count_op("wake"), 4);
+        // 4 rounds + 1 re-probe = 5 attempts per controller.
+        assert_eq!(a.count_op("wake"), 5);
+        assert_eq!(b.count_op("wake"), 5);
+        assert_eq!(c.count_op("wake"), 5);
 
         // Backoff doublings between rounds 0→1, 1→2, 2→3: 1+2+4 = 7×base.
         // This assertion distinguishes 2^round from (round+1) (the latter

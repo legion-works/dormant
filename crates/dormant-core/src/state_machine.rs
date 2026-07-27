@@ -1170,7 +1170,7 @@ impl DisplayStateMachine {
     }
 
     /// Set or clear the input-wake hold flag.  When `true`,
-    /// [`enter_active`] skips the deferred Grace chain so a render-surface
+    /// `enter_active` skips the deferred Grace chain so a render-surface
     /// input wake does not immediately re-blank a vacant room.
     pub fn set_input_wake_hold_active(&mut self, active: bool) {
         self.input_wake_hold_active = active;

@@ -133,6 +133,19 @@ pub trait DisplayController: Any + Send + Sync {
         Ok(())
     }
 
+    /// On-demand re-probe through `&self` — used by the executor when a
+    /// command finds zero available controllers in the chain and attempts
+    /// one bounded re-probe heal before failing (issue #114 / MUST 3).
+    ///
+    /// Controllers that use interior mutability (e.g. DDC/CI's lazy probe)
+    /// should override this to re-run their probe logic.  The default
+    /// implementation is a no-op — controllers with a one-shot `probe` that
+    /// only needs `&mut self` and has no `&self`-accessible re-probe path
+    /// correctly do nothing here.
+    async fn reprobe(&self) -> Result<(), DormantError> {
+        Ok(())
+    }
+
     /// Whether the controller currently believes the display is reachable.
     async fn is_available(&self) -> bool;
 

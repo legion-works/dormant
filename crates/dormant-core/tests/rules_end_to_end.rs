@@ -144,9 +144,13 @@ fn spawn_engine(
         script,
     };
     let source_tx = events_tx.clone();
+    let source_ctl = ctl_tx.clone();
     let source_cancel = cancel.clone();
-    let source_handle =
-        tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
+    let source_handle = tokio::spawn(async move {
+        Box::new(source)
+            .run(source_tx, source_ctl, source_cancel)
+            .await
+    });
 
     Harness {
         events_tx,
@@ -186,9 +190,13 @@ fn spawn_engine_with_render(
         script,
     };
     let source_tx = events_tx.clone();
+    let source_ctl = ctl_tx.clone();
     let source_cancel = cancel.clone();
-    let source_handle =
-        tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
+    let source_handle = tokio::spawn(async move {
+        Box::new(source)
+            .run(source_tx, source_ctl, source_cancel)
+            .await
+    });
 
     Harness {
         events_tx,
@@ -2021,9 +2029,13 @@ fn spawn_engine_with_gate(
         script,
     };
     let source_tx = events_tx.clone();
+    let source_ctl = ctl_tx.clone();
     let source_cancel = cancel.clone();
-    let source_handle =
-        tokio::spawn(async move { Box::new(source).run(source_tx, source_cancel).await });
+    let source_handle = tokio::spawn(async move {
+        Box::new(source)
+            .run(source_tx, source_ctl, source_cancel)
+            .await
+    });
 
     Harness {
         events_tx,

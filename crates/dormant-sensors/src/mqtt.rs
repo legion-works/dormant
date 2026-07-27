@@ -42,8 +42,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use dormant_core::config::schema::{MqttCredential, MqttSensorCfg};
 use dormant_core::mqtt::parse_broker_url;
+use dormant_core::rules::ControlMsg;
 use dormant_core::traits::SensorSource;
-use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
+use dormant_core::types::{
+    PresenceEvent, SensorAvailabilityEvent, SensorId, SensorState, Timestamp,
+};
 use rumqttc::mqttbytes::v4::SubscribeReasonCode;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use tokio::sync::mpsc;
@@ -261,15 +264,25 @@ impl MqttSource {
 
     /// Dispatch a publish on a sensor topic: parse each matching binding's
     /// payload and return the resulting events.
+    ///
+    /// Returns `(presence_events, availability_events)`. Availability
+    /// events are the LWT edges the rules engine needs to gate the stale
+    /// sweep; presence events are the regular occupancy publishes. An
+    /// `offline` availability payload still surfaces as a
+    /// `PresenceEvent::Unavailable` so the fail-safe presence path takes
+    /// over immediately (the existing pre-#136 behavior) — the
+    /// availability event is the additional signal that ALSO clears the
+    /// `availability_online` set in the rules engine.
     fn dispatch_publish(
         &self,
         topic: &str,
         payload: &[u8],
         warned: &mut HashSet<String>,
         warned_availability: &mut HashSet<(String, String)>,
-    ) -> Vec<PresenceEvent> {
+    ) -> (Vec<PresenceEvent>, Vec<SensorAvailabilityEvent>) {
         let now = Timestamp::now();
         let mut events = Vec::new();
+        let mut availability = Vec::new();
 
         // Check availability topic first — routed via the precomputed set
         // (spec F1), not a hardcoded `/availability` suffix, so an
@@ -288,9 +301,23 @@ impl MqttSource {
                                 SensorState::Unavailable,
                                 now,
                             ));
+                            availability.push(SensorAvailabilityEvent::new(
+                                binding.id.clone(),
+                                false,
+                                now,
+                            ));
                         }
                         AvailabilityParse::Online => {
-                            // No event (see module docs).
+                            // Issue #136: emit a typed availability edge so
+                            // the rules engine's stale sweep leaves this
+                            // sensor alone on topic silence. We do NOT
+                            // touch presence state (an "online" frame is a
+                            // reachability claim, not a state publish).
+                            availability.push(SensorAvailabilityEvent::new(
+                                binding.id.clone(),
+                                true,
+                                now,
+                            ));
                         }
                         AvailabilityParse::Unrecognized => {
                             let id = binding.id.0.clone();
@@ -308,12 +335,12 @@ impl MqttSource {
                     }
                 }
             }
-            return events;
+            return (events, availability);
         }
 
         // Regular sensor topic.
         let Some(bindings) = self.topic_map.get(topic) else {
-            return events;
+            return (events, availability);
         };
 
         for binding in bindings {
@@ -331,7 +358,7 @@ impl MqttSource {
             }
         }
 
-        events
+        (events, availability)
     }
 }
 
@@ -345,6 +372,7 @@ impl SensorSource for MqttSource {
     async fn run(
         self: Box<Self>,
         tx: mpsc::Sender<PresenceEvent>,
+        ctl_tx: mpsc::Sender<ControlMsg>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let client_id = Self::client_id();
@@ -386,11 +414,20 @@ impl SensorSource for MqttSource {
                                 debug!("mqtt: retained publish on '{}' dispatched", topic);
                             }
 
-                            let events = self.dispatch_publish(
+                            let (events, availability) = self.dispatch_publish(
                                 &topic, &payload, &mut warned_topics, &mut warned_availability,
                             );
                             for event in events {
                                 if tx.send(event).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            for avail in availability {
+                                if ctl_tx
+                                    .send(ControlMsg::SensorAvailability(avail))
+                                    .await
+                                    .is_err()
+                                {
                                     return Ok(());
                                 }
                             }
@@ -863,7 +900,7 @@ mod tests {
         let mut warned_availability = HashSet::new();
         // Payload with both /occupancy and /presence fields.
         let payload = br#"{"occupancy":true,"presence":false}"#;
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "sensors/desk",
             payload,
             &mut warned,
@@ -922,7 +959,7 @@ mod tests {
 
         let mut warned = HashSet::new();
         let mut warned_availability = HashSet::new();
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "sensors/desk/availability",
             b"offline",
             &mut warned,
@@ -933,6 +970,154 @@ mod tests {
         for event in &events {
             assert_eq!(event.state, SensorState::Unavailable);
         }
+    }
+
+    /// Issue #136: an `online` availability payload must surface as a
+    /// [`SensorAvailabilityEvent`] with `online = true` so the rules
+    /// engine's stale sweep leaves the sensor alone on topic silence.
+    /// Deliberately produces NO presence event — an "online" frame is a
+    /// reachability claim, not a state publish; emitting Present would
+    /// defeat absence detection.
+    #[test]
+    fn online_payload_emits_availability_event_only() {
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(
+                SensorId("desk".into()),
+                MqttSensorCfg {
+                    broker_url: "tcp://localhost:1883".into(),
+                    topic: "sensors/desk".into(),
+                    field: "/occupancy".into(),
+                    payload_on: None,
+                    payload_off: None,
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: None,
+                    availability_topic: None,
+                    availability_payload_online: "online".into(),
+                    availability_payload_offline: "offline".into(),
+                },
+            )],
+            None,
+        );
+
+        let mut warned = HashSet::new();
+        let mut warned_availability = HashSet::new();
+        let (events, availability) = source.dispatch_publish(
+            "sensors/desk/availability",
+            b"online",
+            &mut warned,
+            &mut warned_availability,
+        );
+
+        assert!(
+            events.is_empty(),
+            "online payload must NOT produce a presence event (got {events:?})"
+        );
+        assert_eq!(availability.len(), 1, "one availability event per binding");
+        assert_eq!(availability[0].sensor, SensorId("desk".into()));
+        assert!(
+            availability[0].online,
+            "online payload must surface as online = true (got {:?})",
+            availability[0].online
+        );
+    }
+
+    /// Issue #136: an `offline` availability payload (LWT) must BOTH
+    /// demote the sensor to Unavailable AND emit a `SensorAvailabilityEvent`
+    /// with `online = false` so the rules engine clears the reachability
+    /// assertion.  This is the existing pre-#136 behavior plus the new
+    /// availability edge.
+    #[test]
+    fn offline_payload_emits_unavailable_presence_and_offline_availability() {
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(
+                SensorId("lwt".into()),
+                MqttSensorCfg {
+                    broker_url: "tcp://localhost:1883".into(),
+                    topic: "sensors/lwt".into(),
+                    field: "/occupancy".into(),
+                    payload_on: None,
+                    payload_off: None,
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: None,
+                    availability_topic: Some("sensors/lwt/LWT".into()),
+                    availability_payload_online: "Online".into(),
+                    availability_payload_offline: "Offline".into(),
+                },
+            )],
+            None,
+        );
+
+        let mut warned = HashSet::new();
+        let mut warned_availability = HashSet::new();
+        let (events, availability) = source.dispatch_publish(
+            "sensors/lwt/LWT",
+            b"Offline",
+            &mut warned,
+            &mut warned_availability,
+        );
+
+        assert_eq!(events.len(), 1, "LWT offline emits one presence event");
+        assert_eq!(events[0].state, SensorState::Unavailable);
+        assert_eq!(events[0].sensor_id, SensorId("lwt".into()));
+
+        assert_eq!(
+            availability.len(),
+            1,
+            "LWT offline emits one availability event"
+        );
+        assert_eq!(availability[0].sensor, SensorId("lwt".into()));
+        assert!(
+            !availability[0].online,
+            "LWT offline must surface as online = false (got {:?})",
+            availability[0].online
+        );
+    }
+
+    /// Pin: the existing no-availability-topic timeout behavior is
+    /// preserved — `dispatch_publish` on a plain sensor topic never
+    /// produces an availability event, regardless of the binding's
+    /// configured online/offline literals.
+    #[test]
+    fn plain_sensor_topic_does_not_emit_availability_event() {
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(
+                SensorId("desk".into()),
+                MqttSensorCfg {
+                    broker_url: "tcp://localhost:1883".into(),
+                    topic: "sensors/desk".into(),
+                    field: "/occupancy".into(),
+                    payload_on: None,
+                    payload_off: None,
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: None,
+                    availability_topic: None,
+                    availability_payload_online: "online".into(),
+                    availability_payload_offline: "offline".into(),
+                },
+            )],
+            None,
+        );
+
+        let mut warned = HashSet::new();
+        let mut warned_availability = HashSet::new();
+        let (events, availability) = source.dispatch_publish(
+            "sensors/desk",
+            br#"{"occupancy":true}"#,
+            &mut warned,
+            &mut warned_availability,
+        );
+
+        assert_eq!(events.len(), 1, "presence publish parses to one event");
+        assert!(
+            availability.is_empty(),
+            "plain sensor topic must NOT produce availability events (got {availability:?})"
+        );
     }
 
     #[test]
@@ -946,7 +1131,7 @@ mod tests {
         let mut warned = HashSet::new();
         let mut warned_availability = HashSet::new();
         // First bad payload → warn.
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "test/sensor",
             b"garbage",
             &mut warned,
@@ -956,7 +1141,7 @@ mod tests {
         assert!(warned.contains("test/sensor"));
 
         // Second bad payload → no warn (already warned).
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "test/sensor",
             b"more garbage",
             &mut warned,
@@ -970,7 +1155,7 @@ mod tests {
         let source = MqttSource::new("tcp://localhost:1883".into(), vec![], None);
         let mut warned = HashSet::new();
         let mut warned_availability = HashSet::new();
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "unknown/topic",
             b"data",
             &mut warned,
@@ -1006,7 +1191,7 @@ mod tests {
 
         let mut warned = HashSet::new();
         let mut warned_availability = HashSet::new();
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "tele/desk/LWT",
             b"offline",
             &mut warned,
@@ -1077,7 +1262,7 @@ mod tests {
         // "1": A (online="online"/offline="offline") can't parse it ->
         // unrecognized -> A warns. B (online="1"/offline="0") parses Online
         // -> no event.
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "shared/availability",
             b"1",
             &mut warned,
@@ -1092,7 +1277,7 @@ mod tests {
         );
 
         // "weird": both unrecognized -> B gets its own first warn.
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "shared/availability",
             b"weird",
             &mut warned,
@@ -1121,14 +1306,14 @@ mod tests {
         let mut warned = HashSet::new();
         let mut warned_availability = HashSet::new();
 
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "test/sensor/availability",
             b"garbled1",
             &mut warned,
             &mut warned_availability,
         );
         assert!(events.is_empty());
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "test/sensor/availability",
             b"garbled2",
             &mut warned,
@@ -1136,7 +1321,7 @@ mod tests {
         );
         assert!(events.is_empty());
 
-        let events = source.dispatch_publish(
+        let (events, _availability) = source.dispatch_publish(
             "test/sensor/availability",
             b"offline",
             &mut warned,

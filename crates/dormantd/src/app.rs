@@ -3924,9 +3924,10 @@ fn spawn_generation(
 
     for source in assembly.sources {
         let stx = events_tx.clone();
+        let sctl = ctl_tx.clone();
         let stoken = producer_token.clone();
         producer_handles.push(tokio::spawn(async move {
-            if let Err(e) = source.run(stx, stoken).await {
+            if let Err(e) = source.run(stx, sctl, stoken).await {
                 tracing::error!(event = "sensor_source_exited", error = %e);
             }
         }));

@@ -166,6 +166,15 @@ field = "/occupancy"
 # message semantics, the Zigbee2MQTT per-device "retain" setting operators
 # need to enable, and why `unavailable_policy = "absent"` is unsafe with MQTT
 # until you've verified your bridge republishes state on availability recovery.
+#
+# With a matching LWT, an `online` payload lets the rules engine skip the
+# stale-sensor sweep on state-topic silence — a seated occupant (no motion,
+# no re-publish) keeps the screen on across minutes of unchanged occupancy
+# (issue #136). An `offline` LWT still transitions the sensor to
+# `Unavailable` immediately, and a broker disconnect emits `Unavailable`
+# for every owned sensor; the `stale_timeout` is the backstop for sensors
+# without an LWT topic — keep it at ~6m for the default 5m heartbeat in
+# the example ESPHome YAML.
 
 # Couch presence via Home Assistant (requires ha_token in credentials.toml).
 [sensors.couch]

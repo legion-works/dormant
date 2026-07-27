@@ -140,6 +140,36 @@ impl PresenceEvent {
     }
 }
 
+// ── Sensor availability event ─────────────────────────────────────────────────
+
+/// A sensor availability (LWT) observation, distinct from a presence edge.
+///
+/// Carries the source's reachability verdict to the rules engine so the stale
+/// sweep can keep trusting a sensor that publishes only presence-on-changes
+/// (e.g. a seated still-presence radar): the source asserts the sensor is
+/// reachable, so topic silence means "state unchanged", not "device gone".
+/// An `online = false` edge is the LWT going away — the rules engine clears
+/// the reachability assertion and demotes the sensor to `Unavailable` so the
+/// fail-safe presence path can take over.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SensorAvailabilityEvent {
+    /// The sensor whose availability this event is about.
+    pub sensor: SensorId,
+    /// `true` for a matching online payload, `false` for a matching offline
+    /// payload (LWT).
+    pub online: bool,
+    /// When the event was produced.
+    pub at: Timestamp,
+}
+
+impl SensorAvailabilityEvent {
+    /// Create a new availability event.
+    #[must_use]
+    pub fn new(sensor: SensorId, online: bool, at: Timestamp) -> Self {
+        Self { sensor, online, at }
+    }
+}
+
 // ── Blank mode ────────────────────────────────────────────────────────────────
 
 /// How a display should be blanked when the room is empty.

@@ -66,7 +66,7 @@ The LD2410C divides its detection space into 9 gates. Each defaults to a 75 cm r
 
 **Re-arm quirk.** Multiple HA-community reports describe the LD2410C still-presence flag requiring a *moving* trigger to re-latch after it clears — still-energy above the gate threshold alone does not always re-arm `has_still_target`. The energy-gated `desk_seated` template avoids this flag and reads the energy level directly, so it is immune to the re-arm quirk.
 
-**Staleness.** Binary sensors publish occupancy on-change only, so a long still period (occupant seated, no movement) silences the state topic until dormant's `sensors.<id>.stale_timeout` fires and the sensor reads unavailable. The fail-safe (default zone policy = `"present"`) keeps the display on, but occupancy-driven wake-on-return is lost until the next MQTT edge. The example YAML therefore ships a 5-minute heartbeat: an `interval` block re-publishes the current `desk_seated` state (retained) even when unchanged, so topic silence again means "device gone" rather than "occupant still". Set `stale_timeout` to a bit over one heartbeat (e.g. `"6m"`) and the sensor only goes unavailable when the ESP genuinely drops off the network.
+**Staleness.** Binary sensors publish occupancy on-change only, so a long still period (occupant seated, no movement) silences the state topic until dormant's `sensors.<id>.stale_timeout` fires and the sensor reads unavailable. The fail-safe (default zone policy = `"present"`) keeps the display on, but occupancy-driven wake-on-return is lost until the next MQTT edge. The example YAML therefore ships a 5-minute heartbeat: an `interval` block re-publishes the current `desk_seated` state (retained) even when unchanged, so topic silence again means "device gone" rather than "occupant still". Set `stale_timeout` to a bit over one heartbeat (e.g. `"6m"`) and the sensor only goes unavailable when the ESP genuinely drops off the network. When the sensor's broker publishes a retain-able LWT (see [Retained values and availability](#retained-values-and-availability) below), an explicit `online` availability frame outranks topic silence: a sensor with a healthy LWT stays `Present` across minutes of unchanged occupancy, and only goes `Unavailable` on `offline` / broker failure. The `stale_timeout` then becomes a backstop for sensors without an LWT topic.
 
 Setting per-gate thresholds is necessary but **not sufficient** to fix close-range seated detection on its own — the gate 0/1 hardware limit and the re-arm quirk remain. The energy-gated template is the primary mitigation; per-gate thresholds fine-tune the radar for the gate range where the occupant actually sits.
 
@@ -144,7 +144,7 @@ By default dormant derives `<topic>/availability` and expects `"online"` / `"off
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `sensors.<id>.availability_topic` | string | `<topic>/availability` | Override the derived availability topic |
-| `sensors.<id>.availability_payload_online` | string | `"online"` | Payload meaning the device is reachable; informational only |
+| `sensors.<id>.availability_payload_online` | string | `"online"` | Payload meaning the device is reachable |
 | `sensors.<id>.availability_payload_offline` | string | `"offline"` | Payload meaning the device is unreachable; emits `Unavailable` |
 
 ```toml
@@ -159,6 +159,22 @@ availability_payload_offline = "Offline"
 ```
 
 The online/offline payloads must be non-empty and different. Sensors sharing one resolved availability topic on a broker must use the same payload pair. An unknown payload logs one warning per `(topic, sensor)` pair and is ignored.
+
+**How availability gates the stale timeout (issue #136).** A matching
+`online` payload is the source's reachability claim: dormant records it in
+the rules engine's `availability_online` set, and the stale-sensor sweep
+leaves the sensor alone on state-topic silence. This lets a seated
+occupant (no motion, no occupancy re-publish) keep the screen on for
+minutes without a fresh state edge. The claim is deliberately NOT a
+presence refresh — `last_seen` still advances on real wall-clock time,
+so a later broker failure is detectable. A matching `offline` payload
+(LWT) immediately demotes the sensor to `Unavailable` and clears the
+claim, and a broker disconnect emits `Unavailable` for every owned
+sensor (which also clears the claim), so a dead connection can never
+preserve stale presence forever. Sensors WITHOUT an availability topic
+keep the pre-#136 behavior exactly: silence past `stale_timeout` marks
+them `Unavailable`. Keep the 6-minute `stale_timeout` guidance for
+sensors whose bridge does not publish LWT.
 
 Every sensor starts `unavailable`. The snapshot's `reported` diagnostic records whether that sensor has delivered any event since daemon start. The web dashboard marks `unavailable` sensors with `reported == false` as "no data since start." The bit survives reload when the sensor binding is unchanged and resets when that binding changes.
 

@@ -104,10 +104,11 @@ async fn start_source(
     )
     .with_lifecycle_sender(lifecycle_tx);
     let (tx, rx) = mpsc::channel(16);
+    let (ctl_tx, _ctl_rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move {
-        let _ = Box::new(source).run(tx, cancel_clone).await;
+        let _ = Box::new(source).run(tx, ctl_tx, cancel_clone).await;
     });
 
     wait_for_subscribed(&mut lifecycle_rx).await;

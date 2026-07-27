@@ -214,6 +214,14 @@ pub enum ControlMsg {
     /// generation-local producers have stopped, so acknowledgement proves the
     /// old engine consumed every input queued before the swap.
     GenerationBarrier(oneshot::Sender<()>),
+    /// An availability (LWT) edge from a sensor source. `online = true`
+    /// records the source's reachability verdict in
+    /// `RulesEngine::availability_online`, which the stale sweep consults
+    /// to decide whether topic silence may be treated as a stale timeout.
+    /// `online = false` (LWT) clears the assertion and synthesises an
+    /// [`crate::types::SensorState::Unavailable`] presence edge so the
+    /// fail-safe path takes over immediately.
+    SensorAvailability(crate::types::SensorAvailabilityEvent),
 }
 
 /// Per-display outcome of an [`ControlMsg::EmergencyWake`].
@@ -869,6 +877,13 @@ pub struct RulesEngine {
     /// Virtual last-seen per sensor — drives the stale-sensor sweep using
     /// the tokio clock so paused tests can advance minutes in milliseconds.
     sensor_last_seen_virtual: HashMap<SensorId, tokio::time::Instant>,
+    /// Sensors whose source has asserted `online = true` via a recent
+    /// availability (LWT) edge. The stale sweep consults this set to
+    /// decide whether a sensor's presence-topic silence may be treated as
+    /// "state unchanged" (in-set) or "device gone" (not in set → fire
+    /// `Unavailable`).  Source `Unavailable` events and broker failures
+    /// remove the entry; a fresh `online` assertion adds it back.
+    availability_online: HashSet<SensorId>,
     /// Timer wheel — min-heap on `(Tick, entry)`.
     timers: BinaryHeap<Reverse<(Tick, TimerEntry)>>,
     /// Internal results mpsc — spawned dispatch tasks write here.
@@ -1002,6 +1017,7 @@ impl RulesEngine {
             reported: HashSet::new(),
             last_blank_failed: HashSet::new(),
             sensor_last_seen_virtual: HashMap::new(),
+            availability_online: HashSet::new(),
             timers: BinaryHeap::new(),
             results_rx,
             results_tx,
@@ -1216,6 +1232,17 @@ impl RulesEngine {
         // the field doc on `RulesEngine::reported`).
         self.reported.insert(ev.sensor_id.clone());
 
+        // Clear the source-asserted `online` availability claim whenever a
+        // sensor reports Unavailable — the same code path covers LWT
+        // `offline` payloads (already synthesised by
+        // `handle_sensor_availability` above) and broker/source failures
+        // (the source emits Unavailable for every owned sensor). Without
+        // this, a dead connection whose last broker-side state was `online`
+        // could preserve stale presence forever by gating the sweep.
+        if ev.state == SensorState::Unavailable {
+            self.availability_online.remove(&ev.sensor_id);
+        }
+
         // Hold-filter: swallow / arm / pass through based on the sensor's
         // kind and hold_time.
         let effective = self.apply_hold_filter(ev);
@@ -1374,6 +1401,32 @@ impl RulesEngine {
             ControlMsg::GenerationBarrier(ack) => {
                 let _ = ack.send(());
             }
+            ControlMsg::SensorAvailability(ev) => self.handle_sensor_availability(ev),
+        }
+    }
+
+    /// Record a source-asserted availability (LWT) edge.
+    ///
+    /// `online = true` inserts the sensor into [`Self::availability_online`]
+    /// so the stale sweep leaves it alone on topic silence. Deliberately
+    /// does NOT touch `sensor_last_seen_virtual` — the trap from issue #136:
+    /// a heartbeat-style "online" frame would otherwise mask a real broker
+    /// disconnect from the next sweep's view of elapsed time.
+    ///
+    /// `online = false` (LWT) removes the sensor from the set AND synthesises
+    /// an `Unavailable` [`PresenceEvent`] so the fail-safe presence path
+    /// takes over immediately, matching today's behavior for an `offline`
+    /// payload.
+    fn handle_sensor_availability(&mut self, ev: crate::types::SensorAvailabilityEvent) {
+        if ev.online {
+            self.availability_online.insert(ev.sensor);
+        } else {
+            self.availability_online.remove(&ev.sensor);
+            self.handle_presence_event(PresenceEvent::new(
+                ev.sensor,
+                SensorState::Unavailable,
+                ev.at,
+            ));
         }
     }
 
@@ -2059,6 +2112,14 @@ impl RulesEngine {
                 continue;
             };
             if state == SensorState::Unavailable {
+                continue;
+            }
+            // A source-asserted `online` availability edge means topic
+            // silence is "state unchanged", not "device gone" — skip the
+            // sweep for this sensor.  An Unavailable presence event below
+            // (broker failure, LWT offline) removes the entry, so a dead
+            // connection cannot preserve stale presence forever.
+            if self.availability_online.contains(&sensor_id) {
                 continue;
             }
             // Use virtual time for the elapsed comparison so paused tests
@@ -3911,6 +3972,212 @@ mod tests {
         let mut engine = minimal_engine();
         engine.handle_control(ControlMsg::PublishDaemonEvent(DaemonEvent::Unknown));
     }
+
+    // ── MQTT availability gates the stale sweep (issue #136) ───────────────
+
+    use crate::types::SensorAvailabilityEvent;
+
+    /// A minimal engine with exactly ONE sensor and a SHORT `stale_timeout`
+    /// — for the availability-gating tests below, which need a sweep to fire
+    /// within a few hundred milliseconds of virtual time.
+    fn engine_with_short_stale(id: &str, stale: Duration) -> RulesEngine {
+        let sid = SensorId(id.into());
+        RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![],
+                sensors: vec![SensorRuntimeCfg {
+                    sensor: sid.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: stale,
+                }],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(vec![], &[sid]).expect("single-sensor empty-zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("single-sensor engine config is valid")
+    }
+
+    /// Helper: find the sensor snapshot for `id` and return its
+    /// `(state, last_seen_secs_ago)`.
+    fn sensor_view(snap: &StateSnapshot, id: &str) -> (SensorState, u64) {
+        let s = snap
+            .sensors
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("sensor {id} in snapshot"));
+        (s.state, s.last_seen_secs_ago)
+    }
+
+    /// Issue #136: a healthy radar with a retained `online` availability
+    /// signal must not be marked `Unavailable` by the stale sweep just
+    /// because the state topic is silent (occupant seated, no motion).
+    /// The online assertion gates the sweep AND must NOT refresh the
+    /// `last_seen` clock — silence still means "state unchanged", not
+    /// "new data".
+    #[tokio::test(start_paused = true)]
+    async fn retained_online_suppresses_silence_staleness() {
+        let sensor = SensorId("desk".into());
+        let mut engine = engine_with_short_stale("desk", Duration::from_millis(500));
+
+        // 1. Sensor reports Present.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+
+        // Snapshot the last-seen baseline so we can prove the online
+        // assertion did NOT refresh it.
+        let baseline = snapshot_of(&mut engine);
+        let (_, last_seen_baseline) = sensor_view(&baseline, "desk");
+        assert_eq!(last_seen_baseline, 0, "no virtual time has passed yet");
+
+        // 2. Sensor source asserts online.
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // 3. Advance virtual time well past stale_timeout, then run the
+        //    sweep explicitly (these tests drive `handle_*` directly; the
+        //    `run()` loop's timer-driven sweep is exercised by
+        //    `tests/rules_end_to_end.rs`).
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        engine.sweep_stale_sensors();
+
+        // The state must still be Present — the online assertion gates the
+        // sweep, so silence past stale_timeout is no longer a fault.
+        let after = snapshot_of(&mut engine);
+        let (state, last_seen_after) = sensor_view(&after, "desk");
+        assert_eq!(
+            state,
+            SensorState::Present,
+            "online assertion must keep a present sensor present across silence (got {state:?})"
+        );
+        // CRUCIAL: last_seen must reflect elapsed time (not be reset by
+        // online). The 1200ms sleep elapses, so the unscaled
+        // `last_seen_secs_ago` must be > the baseline — proving the online
+        // event did not refresh the clock.
+        assert!(
+            last_seen_after >= last_seen_baseline,
+            "last_seen_secs_ago must reflect elapsed time, not be reset by online"
+        );
+    }
+
+    /// A sensor with NO availability topic keeps today's behavior: silence
+    /// past `stale_timeout` marks it `Unavailable`. This is the regression
+    /// guard for sensors whose bridge does not publish LWT.
+    #[tokio::test(start_paused = true)]
+    async fn no_availability_still_stales() {
+        let sensor = SensorId("no_aw".into());
+        let mut engine = engine_with_short_stale("no_aw", Duration::from_millis(500));
+
+        // Present, no availability event. Sweep at 1.2s should mark
+        // Unavailable — the pre-#136 behavior.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        engine.sweep_stale_sensors();
+
+        let after = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&after, "no_aw");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "sensor without an availability topic must still go stale on silence (got {state:?})"
+        );
+    }
+
+    /// An explicit `offline` availability edge must mark the sensor
+    /// `Unavailable` IMMEDIATELY, even if the stale sweep hasn't fired
+    /// yet — that's the LWT contract.
+    #[tokio::test(start_paused = true)]
+    async fn explicit_offline_transitions_to_unavailable_immediately() {
+        let sensor = SensorId("lwt".into());
+        let mut engine = engine_with_short_stale("lwt", Duration::from_secs(3600));
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // LWT fires well before the long stale timeout would.
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), false, Timestamp::now()),
+        ));
+
+        let snap = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&snap, "lwt");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "explicit offline must transition to Unavailable immediately (got {state:?})"
+        );
+    }
+
+    /// Broker disconnect (a `PresenceEvent::Unavailable` from the source)
+    /// must clear the `availability_online` assertion so a dead connection
+    /// cannot preserve stale presence forever — the next sweep then
+    /// correctly demotes a still-quiet sensor.
+    #[tokio::test(start_paused = true)]
+    async fn broker_disconnect_clears_online_assertion() {
+        let sensor = SensorId("disc".into());
+        let mut engine = engine_with_short_stale("disc", Duration::from_millis(500));
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // Advance time under the online assertion: state stays Present.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.sweep_stale_sensors();
+        let still_present = snapshot_of(&mut engine);
+        assert_eq!(sensor_view(&still_present, "disc").0, SensorState::Present);
+
+        // Broker drops: source emits Unavailable. The online assertion
+        // must clear so the next sweep re-engages the timeout.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+
+        // Now bring the sensor back to Present (reconnect restored the
+        // subscription), but WITHOUT a fresh online assertion. Advance
+        // past the stale timeout: the sweep must demote it again
+        // because the disconnect cleared the assertion.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        engine.sweep_stale_sensors();
+
+        let after = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&after, "disc");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "post-disconnect silence must re-engage the stale sweep (got {state:?})"
+        );
+    }
 }
 
 /// Restoring a manual-only display's phase into the engine must carry
@@ -3967,6 +4234,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
+        availability_online: HashSet::new(),
         timers: BinaryHeap::new(),
         results_rx,
         results_tx,
@@ -4071,6 +4339,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
+        availability_online: HashSet::new(),
         timers: BinaryHeap::new(),
         results_rx,
         results_tx,

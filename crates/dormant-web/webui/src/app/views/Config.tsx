@@ -392,8 +392,8 @@ export default function Config() {
 
   // Scroll to + briefly highlight a deep-linked config fragment (e.g.
   // #/config/switching#coordination.activity_follow).  The target row
-  // carries id="<section>.<key>"; we wait for the DOM to settle (the
-  // tab switch renders new content), then scroll and flash.
+  // carries data-field-id="<section>.<key>"; we wait for the DOM to
+  // settle (the tab switch renders new content), then scroll and flash.
   useEffect(() => {
     const target = getConfigFragmentTarget();
     if (!target) return;

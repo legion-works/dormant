@@ -249,20 +249,10 @@
   letter-spacing: 0.08em;
 }
 
-/* Literal ramp stops (design handoff "Design tokens" §Heat-map ramp) —
-   mirrors WearHeatMap.tsx's heatColor() stops. */
 .display-detail__legend-bar {
   flex: 1;
   height: 8px;
   border-radius: var(--radius-pill);
-  background: linear-gradient(
-    90deg,
-    rgba(60, 70, 90, 0.6),
-    #c3e88d 32%,
-    #ffc777 62%,
-    #ff966c 82%,
-    #ff757f
-  );
 }
 
 .display-detail__honesty-note {
@@ -376,4 +366,41 @@
 
 @media (prefers-reduced-motion: reduce) {
   .display-detail { animation: none; }
+}
+
+/* ── Staleness warning ── */
+
+.display-detail__stale-warning {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--warning);
+  padding: 4px 0;
+  grid-column: 1 / -1;
+}
+
+/* ── Sharing link ── */
+
+.display-detail__sharing-link {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.display-detail__link-btn {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+.display-detail__link-btn:hover {
+  color: var(--accent-strong);
+}
+
+/* ── Error danger ── */
+
+.display-detail__metric--danger {
+  color: var(--danger);
 }

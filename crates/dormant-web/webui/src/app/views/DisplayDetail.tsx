@@ -7,10 +7,11 @@
  * reads `useLiveState()` and resolves `config`/`rule`/`wear` for the
  * selected id) — this component has no private fetch.
  *
- * W3-2: restructured from a two-column layout into a single-column,
- * section-anchored layout.  Sections are not tabs — the whole page
- * is scannable and deep-links land visibly.
+ * Sections are not tabs — the whole page is scannable and deep-links
+ * land visibly.
  */
+import { useNavigate } from "../nav";
+import OwnershipPair from "./OwnershipPair";
 import { useCallback, useState, useEffect, useMemo } from "react";
 import {
   Card,
@@ -33,6 +34,7 @@ export interface DisplayDetailProps {
   config: DisplayConfig | undefined;
   rule: DisplayRuleInfo | undefined;
   wear: WearDetail | undefined;
+  wearError: string | null;
   onBack: () => void;
 }
 
@@ -109,9 +111,10 @@ function ladderLabel(ladder: DisplayConfig["ladder"]): string {
     .join(" → ");
 }
 
-export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack }: DisplayDetailProps) {
+export default function DisplayDetail({ id, snapshot, config, rule, wear, wearError, onBack }: DisplayDetailProps) {
   const { confirm, dialog } = useConfirmDialog();
   const [actionError, setActionError] = useState<string | null>(null);
+  const navigate = useNavigate();
 
   const grid = normalizeWearGrid(wear);
   const ruleName = rule?.rule;
@@ -174,7 +177,7 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
   const averagePercent = grid.averageHeat !== null ? Math.round(grid.averageHeat * 100) : null;
   const uniformityPercent = grid.uniformity !== null ? Math.round(grid.uniformity * 100) : null;
 
-  // W3-3: compute current time for staleness + seeded/measured split.
+  // Compute current time for staleness + seeded/measured split.
   const nowS = useMemo(() => Math.floor(Date.now() / 1000), []);
   const legendGradient = useMemo(() => heatRampGradient(), []);
   const seededHours = wear?.seeded_usage_hours ?? null;
@@ -300,68 +303,20 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
         <section id="sharing" className="display-detail__section">
           <h2 className="display-detail__section-title">Sharing</h2>
           <Card>
-            <div className="display-detail__facts">
-              <div className="display-detail__fact">
-                <div className="display-detail__fact-label">Ownership</div>
-                <div className="display-detail__fact-value">
-                  {snapshot.owned ? "owner" : "deferred"}
-                </div>
-              </div>
-              {snapshot.observed_input_code != null && (
-                <div className="display-detail__fact">
-                  <div className="display-detail__fact-label">Observed code</div>
-                  <div className="display-detail__fact-value">
-                    0x{snapshot.observed_input_code.toString(16).padStart(2, "0")}
-                  </div>
-                </div>
-              )}
-              {config?.shared_input_code != null && (
-                <div className="display-detail__fact">
-                  <div className="display-detail__fact-label">Our read code</div>
-                  <div className="display-detail__fact-value">
-                    0x{config.shared_input_code.toString(16).padStart(2, "0")}
-                    {" · "}{config.shared_input_code} dec
-                  </div>
-                </div>
-              )}
-              {config?.shared_input_write_code != null && (
-                <div className="display-detail__fact">
-                  <div className="display-detail__fact-label">Our write code</div>
-                  <div className="display-detail__fact-value">
-                    0x{config.shared_input_write_code.toString(16).padStart(2, "0")}
-                    {" · "}{config.shared_input_write_code} dec
-                  </div>
-                </div>
-              )}
-              {config?.shared_peer_input_code != null && (
-                <div className="display-detail__fact">
-                  <div className="display-detail__fact-label">Peer read code</div>
-                  <div className="display-detail__fact-value">
-                    0x{config.shared_peer_input_code.toString(16).padStart(2, "0")}
-                    {" · "}{config.shared_peer_input_code} dec
-                  </div>
-                </div>
-              )}
-              {config?.shared_peer_input_write_code != null && (
-                <div className="display-detail__fact">
-                  <div className="display-detail__fact-label">Peer write code</div>
-                  <div className="display-detail__fact-value">
-                    0x{config.shared_peer_input_write_code.toString(16).padStart(2, "0")}
-                    {" · "}{config.shared_peer_input_write_code} dec
-                  </div>
-                </div>
-              )}
-              {snapshot.panel_state && (
-                <div className="display-detail__fact">
-                  <div className="display-detail__fact-label">Panel state</div>
-                  <div className="display-detail__fact-value">
-                    {snapshot.panel_state.power ?? "—"}
-                    {snapshot.panel_state.brightness != null
-                      ? ` · ${snapshot.panel_state.brightness}%`
-                      : ""}
-                  </div>
-                </div>
-              )}
+            <OwnershipPair
+              displayId={id}
+              snap={snapshot}
+              config={config}
+              size="compact"
+            />
+            <div className="display-detail__sharing-link">
+              <button
+                type="button"
+                className="display-detail__link-btn"
+                onClick={() => navigate("switching")}
+              >
+                open Switching →
+              </button>
             </div>
           </Card>
         </section>
@@ -434,6 +389,11 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
                     {relativeTime(wear.last_sample_at_epoch_s, nowS)}
                   </div>
                 </div>
+                {isStale && (
+                  <div className="display-detail__stale-warning">
+                    ledger may be stale — check wear.enabled and the panel read path
+                  </div>
+                )}
                 <div className={`display-detail__tile${wear.advisory ? " display-detail__tile--warning" : ""}`}>
                   <div className="display-detail__tile-label">Since long-dwell</div>
                   <div className="display-detail__tile-value">
@@ -469,10 +429,16 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, onBack
           </div>
         ) : (
           <Card>
-            {/* Always render the heat map so the empty-sample state is shown. */}
-            <div className="display-detail__heat-map-wrap">
-              <WearHeatMap display={id} grid={grid} />
-            </div>
+            {wearError ? (
+              <div className="display-detail__metric display-detail__metric--danger">
+                panel exposure unavailable — {wearError}
+              </div>
+            ) : (
+              /* Always render the heat map so the empty-sample state is shown. */
+              <div className="display-detail__heat-map-wrap">
+                <WearHeatMap display={id} grid={grid} />
+              </div>
+            )}
           </Card>
         )}
       </section>

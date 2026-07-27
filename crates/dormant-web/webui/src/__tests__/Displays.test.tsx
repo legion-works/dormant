@@ -181,12 +181,31 @@ describe("Displays", () => {
     expect(screen.getByText("blanked")).toBeInTheDocument();
   });
 
-  it("renders paused and inhibited chips", async () => {
-    render(<LiveStateProvider><Displays /></LiveStateProvider>);
-
-    await waitFor(() => {
-      expect(screen.getByText("paused")).toBeInTheDocument();
+  it("renders the full four-chip set (paused, inhibited, blank_failed, wear_advisory)", async () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["test-disp", {
+          phase: "active",
+          inhibited: true,
+          paused: true,
+          cmd_gen: 1,
+          controllers: [],
+          last_blank_failed: true,
+        }]],
+        pending_reload: null,
+      },
+      displayConfigs: {"test-disp": { controllers: [], blank_mode: "power_off" } as DisplayConfig},
+      displayRules: {"test-disp": { rule: "test-rule", zone: "test" }},
+      wear: { displays: [{ display: "test", display_name: "test-disp", panel_type: "unknown", total_on_hours: 1, sample_count: 1, advisory: true, hours_since_long_dwell: 1 }] },
     });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+
+    expect(screen.getByText("paused")).toBeInTheDocument();
+    expect(screen.getByText("inhibited")).toBeInTheDocument();
+    expect(screen.getByText("blank failed")).toBeInTheDocument();
+    expect(screen.getByText("wear advisory")).toBeInTheDocument();
   });
 
   it("renders controller health chips", async () => {
@@ -202,7 +221,7 @@ describe("Displays", () => {
     expect(screen.getAllByText("fallback").length).toBeGreaterThanOrEqual(1);
   });
 
-  it("renderds held-by column with rule and zone", async () => {
+  it("renders held-by column with rule and zone", async () => {
     render(<LiveStateProvider><Displays /></LiveStateProvider>);
 
     await waitFor(() => {
@@ -227,6 +246,8 @@ describe("Displays", () => {
     // row's action column hides — only the dialog button remains.
     fireEvent.click(screen.getAllByText("Force blank")[0]);
     expect(screen.getByRole("alertdialog", { name: "Force blank aoc-main?" })).toBeInTheDocument();
+    // All row action buttons are hidden while the dialog is open.
+    expect(screen.queryAllByRole("button", { name: /Force wake/ })).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Force blank" }));
     await waitFor(() => expect(mocks.postBlank).toHaveBeenCalledWith("aoc-main"));
 
@@ -461,6 +482,63 @@ describe("Displays", () => {
     render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
     expect(screen.queryByRole("button", { name: "Pull" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Push" })).not.toBeInTheDocument();
+  });
+
+  // BG-8: wear advisory join uses config_display_id when present,
+  // falling back to display_name for backward compatibility.
+  it("joins wear advisory via config_display_id when available", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["panel-a", { phase: "active", inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
+        pending_reload: null,
+      },
+      displayConfigs: { "panel-a": { controllers: [], blank_mode: "power_off" } as DisplayConfig },
+      displayRules: { "panel-a": { rule: "a-rule", zone: "a" } },
+      wear: {
+        displays: [{
+          display: "ddc:AOC:1234",
+          display_name: "old-name",
+          config_display_id: "panel-a",
+          panel_type: "woled",
+          total_on_hours: 10,
+          sample_count: 1,
+          advisory: true,
+          hours_since_long_dwell: 100,
+        }],
+      },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    // Advisory chip reaches the correct display tile via config_display_id.
+    expect(screen.getByText("wear advisory")).toBeInTheDocument();
+  });
+
+  it("falls back to display_name when config_display_id is absent (pre-BG-8)", () => {
+    const state = liveStateFixture({
+      snapshot: {
+        sensors: [],
+        zones: [],
+        displays: [["panel-b", { phase: "active", inhibited: false, paused: false, cmd_gen: 1, controllers: [] }]],
+        pending_reload: null,
+      },
+      displayConfigs: { "panel-b": { controllers: [], blank_mode: "power_off" } as DisplayConfig },
+      displayRules: { "panel-b": { rule: "b-rule", zone: "b" } },
+      wear: {
+        displays: [{
+          display: "sanitized-key",
+          display_name: "panel-b",
+          panel_type: "unknown",
+          total_on_hours: 5,
+          sample_count: 1,
+          advisory: true,
+          hours_since_long_dwell: 50,
+        }],
+      },
+    });
+    render(<LiveStateContext.Provider value={state}><Displays /></LiveStateContext.Provider>);
+    // Advisory chip reaches the correct display tile via display_name fallback.
+    expect(screen.getByText("wear advisory")).toBeInTheDocument();
   });
 });
 

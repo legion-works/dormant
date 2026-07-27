@@ -229,6 +229,7 @@ export default function Displays() {
     displayRules,
     wear,
     wearDetails,
+    wearError,
     selectedDisplay,
     selectDisplay,
   } = useLiveState();
@@ -368,6 +369,7 @@ export default function Displays() {
         config={displayConfigs[selectedDisplay]}
         rule={displayRules[selectedDisplay]}
         wear={wearDetails[selectedDisplay]}
+        wearError={wearError}
         onBack={() => selectDisplay(null)}
       />
     );

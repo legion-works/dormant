@@ -3416,6 +3416,7 @@ async fn assemble_static(
                 .map(|d| DisplayId(d.clone()))
                 .filter(|d| built.contains(d))
                 .collect(),
+            input_wake_hold: rc.input_wake_hold,
         })
         .collect();
 
@@ -3618,6 +3619,7 @@ mod audio_rules_tests {
             wake_retries: 0,
             wake_retry_backoff: Duration::from_millis(10),
             wake_retry_interval: Duration::from_secs(1),
+            input_wake_hold: Duration::ZERO,
         }
     }
 
@@ -5138,6 +5140,7 @@ mod render_tests {
                         wake_retries: 0,
                         wake_retry_backoff: Duration::from_millis(10),
                         wake_retry_interval: Duration::from_secs(1),
+                        input_wake_hold: Duration::ZERO,
                     },
                 );
                 m
@@ -6468,6 +6471,7 @@ mod gamma_reload_tests {
                     wake_retries: 0,
                     wake_retry_backoff: Duration::from_millis(10),
                     wake_retry_interval: Duration::from_secs(1),
+                    input_wake_hold: Duration::ZERO,
                 },
             );
         }

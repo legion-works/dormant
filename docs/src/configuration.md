@@ -391,6 +391,7 @@ A rule links a zone to one or more displays with timing parameters.
 | `wake_retries` | integer | `3` | Number of wake retries before escalating |
 | `wake_retry_backoff` | duration | `"2s"` | Backoff before the first wake retry |
 | `wake_retry_interval` | duration | `"60s"` | Interval between successive wake retries |
+| `input_wake_hold` | duration | `"120s"` | How long to hold a display awake after an input-wake in a vacant room; `"0s"` disables |
 
 `"manual-pause"` is accepted in this list but is a deliberate no-op: it is
 never mapped to an inhibitor check, so listing it changes nothing. Manual
@@ -421,6 +422,22 @@ exist), not fixed by this feature. This feature raises the odds of hitting
 it, since inhibitors are its whole point and a movie rule and a work rule
 sharing one TV is a realistic config. Give each inhibitor-using display
 exactly one rule.
+
+### `input_wake_hold` — hold input-woken displays awake
+
+When a render-surface overlay blanks a display in a vacant room, keyboard
+or mouse input wakes the display so the operator can work. Without a hold,
+the display immediately re-enters the normal grace-then-blank countdown:
+every keystroke restarts the cycle, and the display blanks again after the
+grace period elapses — a blank → type → wake → re-blank loop (issue #125).
+
+`input_wake_hold` overrides this: after a render-surface input wake, the
+display is held awake for the configured duration regardless of zone state.
+When the hold expires the normal grace path runs from scratch — the hold
+never triggers a direct blank.  Set to `"0s"` to disable the hold and
+restore the immediate-grace behaviour.  Presence returning during the hold
+clears it so the display stays awake normally as long as the room is
+occupied.
 
 ## `[wear]` — panel-wear tracking
 

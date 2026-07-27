@@ -696,6 +696,9 @@ pub struct RuleRuntimeCfg {
     pub zone: ZoneId,
     /// The displays to step when the zone flips.
     pub displays: Vec<DisplayId>,
+    /// How long to hold a display awake after a render-surface input wake
+    /// when every driving zone is vacant (`0s` disables).
+    pub input_wake_hold: Duration,
 }
 
 /// Per-sensor runtime configuration for the engine.
@@ -744,6 +747,9 @@ enum TimerEntry {
     DisplayStageTick(DisplayId, u64),
     /// Hold-time expiry: synthesize the held Absent event for this sensor.
     HoldExpiry(SensorId),
+    /// Input-wake hold expiry: remove the hold and re-enter the normal
+    /// grace path for this display (issue #125).
+    InputWakeHoldExpiry(DisplayId),
 }
 
 /// Reply from a spawned dispatch task back to the engine.
@@ -919,6 +925,14 @@ pub struct RulesEngine {
     /// it through the standard control channel.
     #[allow(clippy::type_complexity)]
     claim_suppression: HashMap<DisplayId, Instant>,
+    /// Per-display input-wake hold deadlines (issue #125).  When a render-
+    /// surface `InputWake` arrives while every zone that drives this display
+    /// is vacant and the rule's `input_wake_hold` is > 0, a deadline
+    /// (`now + hold`) is stored here and a [`TimerEntry::InputWakeHoldExpiry`]
+    /// is scheduled.  While the deadline is in the future, the state machine's
+    /// `input_wake_hold_active` flag prevents the deferred Grace chain in
+    /// [`DisplayStateMachine::enter_active`].
+    input_wake_holds: HashMap<DisplayId, Instant>,
 }
 
 impl RulesEngine {
@@ -1027,6 +1041,7 @@ impl RulesEngine {
             rollback: None,
             kvm: None,
             claim_suppression: HashMap::new(),
+            input_wake_holds: HashMap::new(),
             pending_restore: Vec::new(),
         })
     }
@@ -1347,6 +1362,15 @@ impl RulesEngine {
                 None => continue,
             };
             for display_id in displays {
+                // Issue #125: when presence returns, clear any active
+                // input-wake hold — the room is occupied, so there is
+                // nothing to hold back.
+                if present {
+                    self.input_wake_holds.remove(&display_id);
+                    if let Some(machine) = self.machines.get_mut(&display_id) {
+                        machine.set_input_wake_hold_active(false);
+                    }
+                }
                 // Feed ownership so the gate verdict is current before
                 // processing the presence edge.
                 self.feed_ownership(&display_id, now);
@@ -1363,7 +1387,31 @@ impl RulesEngine {
             ControlMsg::Resume { rule } => self.handle_resume(rule.as_ref()),
             ControlMsg::ForceBlank(d) => self.step_one(&d, Input::ForceBlank),
             ControlMsg::ForceWake(d) => self.step_one(&d, Input::ForceWake),
-            ControlMsg::InputWake(d) => self.step_one(&d, Input::InputWake),
+            ControlMsg::InputWake(d) => {
+                // Issue #125: if every zone that drives this display is
+                // vacant and the effective `input_wake_hold` for the
+                // applicable rule is > 0, arm the hold so the state
+                // machine does not immediately chain back into Grace
+                // after the wake.
+                #[allow(clippy::collapsible_if)]
+                if let Some(hold) = self.effective_input_wake_hold(&d) {
+                    if hold > Duration::ZERO {
+                        let now = Instant::now();
+                        let deadline = now + hold;
+                        self.input_wake_holds.insert(d.clone(), deadline);
+                        self.timers.push(Reverse((
+                            Tick(deadline),
+                            TimerEntry::InputWakeHoldExpiry(d.clone()),
+                        )));
+                        // Set the hold flag on the state machine so
+                        // `enter_active` skips the deferred Grace chain.
+                        if let Some(machine) = self.machines.get_mut(&d) {
+                            machine.set_input_wake_hold_active(true);
+                        }
+                    }
+                }
+                self.step_one(&d, Input::InputWake);
+            }
             ControlMsg::OwnershipPoll { display } => self.feed_ownership(&display, Tick::now()),
             ControlMsg::PublishDaemonEvent(ev) => {
                 debug_assert!(
@@ -2025,6 +2073,27 @@ impl RulesEngine {
 
     // ── Internal: timers ────────────────────────────────────────────────────
 
+    /// Find the effective `input_wake_hold` for a display.
+    ///
+    /// Returns `None` if no rule drives this display or if any driving zone
+    /// is currently present.  Returns `Some(hold)` from the first matching
+    /// rule when every driving zone is vacant.
+    fn effective_input_wake_hold(&self, display: &DisplayId) -> Option<Duration> {
+        for rule in &self.cfg.rules {
+            if rule.displays.contains(display) {
+                let present = self.zone_engine.is_present(&rule.zone).unwrap_or(true); // unknown = present (fail-safe)
+                if present {
+                    // At least one driving zone is present — no hold.
+                    return None;
+                }
+                // Zone is known-vacant — use this rule's hold.
+                return Some(rule.input_wake_hold);
+            }
+        }
+        // Display is not driven by any rule (e.g. manual-only).
+        None
+    }
+
     fn compute_sweep_period(&self) -> Duration {
         let min_stale = self
             .cfg
@@ -2062,6 +2131,9 @@ impl RulesEngine {
                     TimerEntry::HoldExpiry(sensor_id) => {
                         self.fire_hold_expiry(&sensor_id, deadline);
                     }
+                    TimerEntry::InputWakeHoldExpiry(display) => {
+                        self.fire_input_wake_hold_expiry(&display, deadline);
+                    }
                 }
             } else {
                 break;
@@ -2093,6 +2165,24 @@ impl RulesEngine {
         if let Some(ev) = pending {
             self.handle_presence_event(ev);
         }
+    }
+
+    /// Input-wake hold expiry (issue #125): clear the hold flag and re-enter
+    /// the normal grace path — never a direct blank.  A stale timer (hold
+    /// already cleared by presence or a newer `InputWake`) is silently dropped.
+    fn fire_input_wake_hold_expiry(&mut self, display: &DisplayId, now: Tick) {
+        let Some(_deadline) = self.input_wake_holds.remove(display) else {
+            // Hold already cleared (presence returned, display removed,
+            // or a fresh InputWake re-armed it).
+            return;
+        };
+        // Clear the state machine flag and feed ZonePresent(false) to
+        // restart the normal grace path (never a direct blank).
+        if let Some(machine) = self.machines.get_mut(display) {
+            machine.set_input_wake_hold_active(false);
+        }
+        self.feed_ownership(display, now);
+        self.step_machine(display, Input::ZonePresent(false), now);
     }
 
     // ── Internal: stale sensor sweep ────────────────────────────────────────
@@ -4244,6 +4334,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         rollback: None,
         kvm: None,
         claim_suppression: HashMap::new(),
+        input_wake_holds: HashMap::new(),
         pending_restore: Vec::new(),
     };
 
@@ -4349,6 +4440,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         rollback: None,
         kvm: None,
         claim_suppression: HashMap::new(),
+        input_wake_holds: HashMap::new(),
         pending_restore: Vec::new(),
     };
 
@@ -4384,4 +4476,285 @@ fn install_restored_never_owned_refeed_not_dropped() {
 
     // Assert: ownership was re-seeded (NeverOwned returns false).
     assert_eq!(engine.last_owned.get(&display_id), Some(&false));
+}
+
+#[cfg(test)]
+use crate::fakes::RecordingSink;
+
+#[cfg(test)]
+/// Build a test engine with one display, one zone, one presence sensor,
+/// and one rule whose `input_wake_hold` is `hold`.  The `RecordingSink`
+/// records blank/wake commands and succeeds by default.
+fn input_wake_hold_engine(hold: Duration) -> (RulesEngine, DisplayId, Arc<RecordingSink>) {
+    use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
+    let display = DisplayId("d1".into());
+    let zone = ZoneId("z1".into());
+    let sensor = SensorId("s1".into());
+
+    let timings = DisplayRuntimeCfg::manual_defaults(Duration::ZERO);
+    let ladder = vec![LadderStage {
+        kind: StageKind::Controller(BlankMode::PowerOff),
+        dwell: None,
+    }];
+
+    let sink = Arc::new(RecordingSink::new());
+    let mut executors = HashMap::new();
+    executors.insert(display.clone(), sink.clone() as Arc<dyn CommandSink>);
+
+    let zone_spec = ZoneSpec {
+        id: zone.clone(),
+        mode: FusionMode::Any,
+        members: vec![ZoneMember::Sensor(sensor.clone())],
+        weights: HashMap::new(),
+        unavailable_policy: crate::zone::UnavailablePolicy::Present,
+    };
+
+    let engine = RulesEngine::new(
+        RulesEngineConfig {
+            rules: vec![RuleRuntimeCfg {
+                rule: RuleId("r1".into()),
+                zone: zone.clone(),
+                displays: vec![display.clone()],
+                input_wake_hold: hold,
+            }],
+            displays: vec![DisplayRuntimeCfg {
+                display: display.clone(),
+                blank_mode: BlankMode::PowerOff,
+                ladder: ladder.clone(),
+                timings,
+            }],
+            sensors: vec![SensorRuntimeCfg {
+                sensor: sensor.clone(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: Duration::from_secs(3600),
+            }],
+            doctor_wake_settle: Duration::from_secs(3),
+        },
+        ZoneEngine::new(vec![zone_spec], &[sensor]).expect("zone engine must be valid"),
+        executors,
+        HashMap::new(),
+        Arc::new(crate::ownership::AlwaysOwned),
+    )
+    .expect("engine must be valid");
+
+    (engine, display, sink)
+}
+
+#[cfg(test)]
+/// Drive a display machine through the Happy Path to Blanked:
+/// zone absent → Grace → tick expiry → Blanking → BlankResult(Ok) → Blanked.
+fn drive_to_blanked(engine: &mut RulesEngine, display: &DisplayId) {
+    let now = Tick::now();
+    // Mark zone absent via a presence event.
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+    // Drive grace expiry by stepping with a Tick past the grace period.
+    let grace_end = Tick(now.0 + Duration::from_secs(60)); // manual_defaults uses 60s grace
+    engine.step_machine(display, Input::Tick, grace_end);
+    // Now the machine should be in Blanking; feed a successful BlankResult.
+    let blank_gen = engine
+        .machines
+        .get(display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        display,
+        Input::BlankResult {
+            r#gen: blank_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+}
+
+/// After a display-wake from Blanked (issue #125), the input-wake hold keeps
+/// the display in Active — it does NOT immediately re-enter Grace even though
+/// the zone is known vacant.
+#[tokio::test(start_paused = true)]
+async fn vacant_blanked_input_wake_stays_active_inside_hold() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // The display is now Blanked; the zone is vacant.
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "blanked"
+    );
+
+    // Act: send InputWake (simulating operator typing on the render surface).
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+
+    // Feed a successful WakeResult to complete the wake.
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert: the hold is armed.
+    assert!(
+        engine.input_wake_holds.contains_key(&display),
+        "input_wake_hold must be armed for display after InputWake in vacant zone"
+    );
+
+    // Assert: the state machine is Active (not Grace).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "display must stay Active inside the hold — not re-enter Grace"
+    );
+}
+
+/// After the input-wake hold expires in a still-vacant zone, the display
+/// must re-enter Grace (never a direct blank).
+#[tokio::test(start_paused = true)]
+async fn vacant_blanked_input_wake_reenters_grace_after_hold() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Send InputWake and complete the wake.
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert hold is armed.
+    assert!(engine.input_wake_holds.contains_key(&display));
+
+    // Advance time past the hold (120 s).
+    tokio::time::sleep(Duration::from_secs(121)).await;
+
+    // Fire due timers — the InputWakeHoldExpiry should fire.
+    engine.fire_due_timers(Tick::now());
+
+    // Assert: hold was removed.
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "hold must be cleared after expiry"
+    );
+
+    // Assert: the state machine is now in Grace (never a direct blank).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "grace",
+        "expired hold must re-enter Grace, never a direct blank"
+    );
+}
+
+/// When presence returns during an input-wake hold, the hold must be
+/// cancelled — the display stays awake normally as long as the room is
+/// occupied, without a latent timer that re-blanks it.
+#[tokio::test(start_paused = true)]
+async fn presence_during_input_wake_hold_cancels_reblank() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Send InputWake and complete the wake.
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert hold is armed.
+    assert!(engine.input_wake_holds.contains_key(&display));
+
+    // Act: presence returns.
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+
+    // Assert: hold was cleared by presence.
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "hold must be cleared when presence returns"
+    );
+
+    // Assert: the state machine is Active (presence detected).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "presence during hold must keep display Active"
+    );
+
+    // Advance time past the original hold deadline to prove no latent
+    // timer re-blanks an occupied room.
+    tokio::time::sleep(Duration::from_secs(121)).await;
+    engine.fire_due_timers(Tick::now());
+
+    // Still Active — the hold is gone, presence keeps it awake.
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active",
+        "no latent timer must re-blank an occupied room after hold cleared"
+    );
+}
+
+/// When `input_wake_hold` is `0s`, the display immediately re-enters Grace
+/// after an input wake in a vacant zone — the pre-#125 behaviour.
+#[tokio::test(start_paused = true)]
+async fn zero_input_wake_hold_preserves_immediate_grace_behavior() {
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::ZERO);
+
+    drive_to_blanked(&mut engine, &display);
+
+    // Send InputWake and complete the wake with hold=0.
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    // Assert: no hold was armed (hold == 0s disables it).
+    assert!(
+        !engine.input_wake_holds.contains_key(&display),
+        "zero input_wake_hold must not arm a hold"
+    );
+
+    // Assert: the state machine is already in Grace (immediate re-grace).
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "grace",
+        "zero hold must immediately re-enter Grace after InputWake in vacant zone"
+    );
 }

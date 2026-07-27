@@ -305,6 +305,10 @@ min_wake_time = "10s"
 inhibitors = ["user-activity"]
 activity_idle_threshold = "2m"
 activity_poll_interval = "5s"
+# Hold the display awake for 120 s after a render-surface input wake in a
+# vacant room — prevents the blank → type → wake → re-blank loop (issue #125).
+# Set to "0s" to disable and restore the immediate-grace behaviour.
+input_wake_hold = "120s"
 
 # Turn the TV off shortly after the living room clears.
 [rules.living_room]
@@ -314,6 +318,7 @@ grace_period = "2m"
 wake_retries = 2
 wake_retry_backoff = "2s"
 wake_retry_interval = "60s"
+input_wake_hold = "300s"
 # A display shared with another dormant machine needs a controller that can
 # read its active input and this machine's input-source code.
 # [displays.shared_oled]

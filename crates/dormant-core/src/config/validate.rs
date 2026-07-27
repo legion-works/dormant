@@ -246,6 +246,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "wake_retries",
             "wake_retry_backoff",
             "wake_retry_interval",
+            "input_wake_hold",
         ],
     ),
     // ── displays.<id>.ladder (array-of-tables entries) ─────────────────────
@@ -2960,6 +2961,7 @@ gracee_period = "60s"
                 wake_retries: 3,
                 wake_retry_backoff: Duration::from_secs(1),
                 wake_retry_interval: Duration::from_secs(2),
+                input_wake_hold: Duration::from_secs(120),
             },
         );
         let errors = validate(&cfg, &test_capabilities(), &test_creds());

@@ -86,6 +86,7 @@ fn rule_cfg(id: &str, zone: &str, displays: &[&str]) -> RuleRuntimeCfg {
         rule: RuleId(id.into()),
         zone: ZoneId(zone.into()),
         displays: displays.iter().map(|s| DisplayId((*s).into())).collect(),
+        input_wake_hold: Duration::ZERO,
     }
 }
 

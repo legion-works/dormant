@@ -34,6 +34,12 @@ pub const MIN_BLANK_TIME: Duration = Duration::from_secs(10);
 /// Minimum time a display must stay awake before it can be blanked again.
 pub const MIN_WAKE_TIME: Duration = Duration::from_secs(10);
 
+/// How long to hold a display awake after a render-surface input wake when
+/// every driving zone is vacant.  Zero disables the hold; the display re-enters
+/// the normal grace path immediately on wake.  Default 120 s prevents the
+/// blank → type → wake → re-blank loop described in issue #125.
+pub const INPUT_WAKE_HOLD: Duration = Duration::from_secs(120);
+
 /// Idle threshold for user-activity inhibitors — no keyboard/mouse events for
 /// this long means the user is considered inactive.
 pub const ACTIVITY_IDLE_THRESHOLD: Duration = Duration::from_secs(120);

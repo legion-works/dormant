@@ -723,6 +723,7 @@ export interface RuleConfig {
   wake_retries?: number;
   wake_retry_backoff?: unknown;
   wake_retry_interval?: unknown;
+  input_wake_hold?: unknown;
 }
 
 /**

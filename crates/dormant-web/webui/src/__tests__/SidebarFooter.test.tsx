@@ -46,4 +46,33 @@ describe("SidebarFooter", () => {
     expect(screen.getByText("connecting…")).toBeInTheDocument();
     expect(screen.getByText(/pid 48213/)).toBeInTheDocument();
   });
+
+  // W5-1 posture truth table (M2 regression guard):
+  // LAN posture requires BOTH a non-loopback bind AND the explicit
+  // web_allow_nonloopback opt-in.  The four arms:
+
+  it("classifies loopback bind + flag false as loopback only", () => {
+    render(<SidebarFooter connected daemon={DAEMON} webBind="127.0.0.1" webAllowNonloopback={false} />);
+    expect(screen.getByText("loopback only")).toBeInTheDocument();
+    expect(screen.queryByText(/LAN/)).not.toBeInTheDocument();
+  });
+
+  it("classifies loopback bind + flag true as loopback only (flag alone does not make it LAN)", () => {
+    render(<SidebarFooter connected daemon={DAEMON} webBind="127.0.0.1" webAllowNonloopback />);
+    expect(screen.getByText("loopback only")).toBeInTheDocument();
+    expect(screen.queryByText(/LAN/)).not.toBeInTheDocument();
+  });
+
+  it("classifies non-loopback bind + flag false as loopback only", () => {
+    render(<SidebarFooter connected daemon={DAEMON} webBind="0.0.0.0" webAllowNonloopback={false} />);
+    // Non-loopback bind without the flag cannot actually bind (server rejects
+    // at startup), but if the data were somehow present, the UI treats it as
+    // loopback-only for safety.
+    expect(screen.getByText("loopback only")).toBeInTheDocument();
+  });
+
+  it("classifies non-loopback bind + flag true as LAN · unauthenticated", () => {
+    render(<SidebarFooter connected daemon={DAEMON} webBind="0.0.0.0" webAllowNonloopback />);
+    expect(screen.getByText(/LAN . unauthenticated/)).toBeInTheDocument();
+  });
 });

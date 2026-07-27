@@ -6,6 +6,7 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 import HooksInspector from "../app/config/HooksInspector";
 import type { HookSlots } from "../api/types";
+import type { PatchStore } from "../app/config/patch";
 
 afterEach(() => {
   cleanup();
@@ -91,5 +92,72 @@ describe("HooksInspector", () => {
     expect(screen.getByText(/timeout: 5s/)).toBeInTheDocument();
     expect(screen.getByText(/timeout: 3s/)).toBeInTheDocument();
     expect(screen.getByText(/abort on failure/)).toBeInTheDocument();
+  });
+
+  // ── Edit-mode tests (BG-6 / S1) ────────────────────────────────────────
+
+  /** Minimal mock PatchStore that records edits. */
+  function mockStore(): PatchStore {
+    const edits: Record<string, unknown> = {};
+    return {
+      trackEdit(path, value) { edits[path.join("\x1E")] = value; },
+      trackRemove() {},
+      getEdit() { return undefined; },
+      trackCreate() {},
+      trackDelete() {},
+      buildPatches() { return []; },
+      isLocked() { return false; },
+      reset() {},
+    };
+  }
+
+  it("shows + Add action button on empty slots when hookEditEnabled is true", () => {
+    render(
+      <HooksInspector
+        hooks={{}}
+        displayId="tv"
+        hookEditEnabled
+        store={mockStore()}
+        onDirty={() => {}}
+      />,
+    );
+
+    // Five empty slots, each with an "+ Add action" button.
+    const addButtons = screen.getAllByText(/\+ Add action/);
+    expect(addButtons.length).toBe(5);
+    // Empty slots should NOT show "— none" when editing.
+    expect(screen.queryByText("— none")).not.toBeInTheDocument();
+  });
+
+  it("renders MQTT topic and payload fields in edit mode", () => {
+    render(
+      <HooksInspector
+        hooks={{
+          before_release: [{ mqtt: { topic: "dormant/status", payload: "test" } }],
+        }}
+        displayId="tv"
+        hookEditEnabled
+        store={mockStore()}
+        onDirty={() => {}}
+      />,
+    );
+
+    // The MQTT topic and payload TextFields should render.
+    expect(screen.getByDisplayValue("dormant/status")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("test")).toBeInTheDocument();
+  });
+
+  it("renders footer with editor notice when hookEditEnabled is true", () => {
+    render(
+      <HooksInspector
+        hooks={{}}
+        displayId="tv"
+        hookEditEnabled
+        store={mockStore()}
+        onDirty={() => {}}
+      />,
+    );
+
+    expect(screen.getByText(/Hook commands run with the daemon/)).toBeInTheDocument();
   });
 });

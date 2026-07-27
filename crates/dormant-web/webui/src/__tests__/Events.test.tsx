@@ -70,7 +70,7 @@ describe("Events", () => {
       screen.getByText("live · subscribed to daemon event stream"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Waiting for events from the daemon…"),
+      screen.getByText("Waiting for the first event…"),
     ).toBeInTheDocument();
     expect(screen.getByText("0 events")).toBeInTheDocument();
   });

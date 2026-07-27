@@ -1,5 +1,5 @@
-/* Events view — live WS event log.
-   Colors per DS tokens; zero hardcoded hex. */
+/* Events view — live WS event log with filters.
+   Row density: 28px, monospace throughout. All colors via DS tokens. */
 
 .events {
   animation: dmRise 0.36s cubic-bezier(0.22, 0.61, 0.36, 1);
@@ -10,7 +10,7 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 
 .events-header__left {
@@ -48,6 +48,40 @@
 }
 
 
+/* ── Filters ─────────────────────────────────────────────────────── */
+.events-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.events-filter-chip {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 4px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease),
+              background var(--dur-fast) var(--ease);
+}
+.events-filter-chip:hover {
+  border-color: var(--border-strong);
+}
+
+.events-filter-chip--active {
+  color: var(--accent);
+  background: var(--accent-muted);
+  border-color: var(--border-accent);
+}
+
+
+/* ── Banner ──────────────────────────────────────────────────────── */
 .events-banner {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
@@ -66,12 +100,43 @@
 }
 
 
+/* ── Card ────────────────────────────────────────────────────────── */
+.events-card {
+  /* no extra padding — rows handle their own */
+}
+
+
+/* ── No-history notice (removed when BG-2 lands) ───────────────── */
+.events-no-history {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--accent-warm);
+  background: var(--accent-warm-muted);
+  border-bottom: 1px solid color-mix(in oklab, var(--accent-warm) 25%, transparent);
+  padding: 8px 16px;
+  line-height: 1.4;
+}
+
+/* ── History separator ──────────────────────────────────────────── */
+.events-separator {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-faint);
+  text-align: center;
+  padding: 4px 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
+  letter-spacing: 0.1em;
+}
+
+
+/* ── Rows — 28px density, monospace throughout ──────────────────── */
 .events-row {
   display: grid;
   grid-template-columns: 82px 148px 1fr;
   align-items: center;
   gap: 14px;
-  padding: 9px 16px;
+  height: 28px;
+  padding: 0 16px;
   border-bottom: 1px solid color-mix(in oklab, var(--text-body) 6%, transparent);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
@@ -80,16 +145,27 @@
   border-bottom: none;
 }
 
+.events-row--danger {
+  border-left: 2px solid var(--danger);
+  padding-left: 14px;
+}
+
+.events-row--warm {
+  border-left: 2px solid var(--accent-warm);
+  padding-left: 14px;
+}
+
 .events-row__time {
   color: var(--text-faint);
 }
 
 .events-row__badge {
-  padding: 2px 8px;
+  padding: 1px 7px;
   border-radius: 5px;
-  font-size: 10.5px;
+  font-size: 10px;
   text-align: center;
   letter-spacing: var(--tracking-wide);
+  white-space: nowrap;
 }
 
 .events-row__msg {
@@ -100,20 +176,39 @@
 }
 
 
+/* ── Empty states ────────────────────────────────────────────────── */
 .events-empty {
   padding: 16px 18px;
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--text-faint);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.events-empty__text {
+  color: var(--text-muted);
+}
+
+.events-empty__clear {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
 }
 
 
+/* ── Shared animations ──────────────────────────────────────────── */
 @keyframes eventsPulse {
   0%   { opacity: 1; transform: scale(1); }
   50%  { opacity: 0.4; transform: scale(0.85); }
   100% { opacity: 1; transform: scale(1); }
 }
-
 
 @keyframes dmRise {
   from { opacity: 0; transform: translateY(8px); }

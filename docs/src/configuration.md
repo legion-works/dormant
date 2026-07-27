@@ -399,6 +399,16 @@ UI's pause/resume action, or `POST`/`GET` `/api/pause`/`/api/resume` — which
 sets the display's `Overlays.paused` state directly and freezes the blank
 path independently of `inhibitors`.
 
+`"user-activity"` reads raw input idle. On Wayland compositors that offer
+`ext_idle_notifier_v1` version 2, dormant uses the input-idle notification,
+which ignores application idle inhibitors — a browser tab holding a
+WebRTC or video inhibitor cannot hold a blank on a vacant room. On v1-only
+compositors the legacy notification is used instead, and any application
+inhibitor blocks the idle signal; if displays never blank there, check
+inhibitors with your compositor's tooling and clear the offending app. Media
+that *should* hold a blank belongs to the `"audio-playback"`/`"call"` kinds
+below, not to compositor inhibitors.
+
 `"audio-playback"` and `"call"` are backed by the PipeWire poller described
 in the `[audio]` section below; a rule only reacts to a kind it lists here.
 

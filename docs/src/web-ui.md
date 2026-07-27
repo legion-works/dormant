@@ -104,9 +104,13 @@ A scrolling, auto-pruning event log. It shows presence changes, display phase tr
 
 ### Switching
 
+![The switching view: three-region ownership panel, pull/push actions, and the hooks card](images/switching.png)
+
 For displays configured with `scope = "shared"` and a `[coordination]` section, the Switching view shows live panel ownership — which machine currently holds the panel, the observed input code, and both machines' configured codes — updated in real time via `Ownership` daemon events over the WebSocket. Each display's row includes the local and peer input codes in hex, the panel state, short-press Poll button, and an agreement verdict that checks whether the observed code matches the configured local code. The view appears in the sidebar only when at least one display is configured as shared.
 
 ### Display detail and panel exposure
+
+![The display detail view: control and health cards over the panel-exposure heat map](images/display-detail.png)
 
 Select **Open detail** on any display card to inspect that display without leaving
 the Displays page. The detail surface combines live phase/controller health with

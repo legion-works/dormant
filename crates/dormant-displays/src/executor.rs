@@ -1014,6 +1014,25 @@ mod tests {
             self.take_probe_result()
         }
 
+        async fn reprobe(&self) -> Result<(), DormantError> {
+            // Mirror the real controllers (ddcci::reprobe -> probe_now): a
+            // scripted Ok probe result heals availability — this is what lets
+            // tests flip a controller from dead-at-startup to reachable and
+            // exercise the executor's zero-available heal. With no scripted
+            // result the fake keeps its manual `set_available` state, so
+            // existing unavailable-chain tests are unaffected.
+            let mut g = self.inner.lock().unwrap();
+            g.log.push((self.name.to_string(), "reprobe"));
+            match g.probe_result.take() {
+                Some(Ok(())) => {
+                    g.available = true;
+                    Ok(())
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(()),
+            }
+        }
+
         async fn is_available(&self) -> bool {
             let mut g = self.inner.lock().unwrap();
             g.log.push((self.name.to_string(), "is_available"));
@@ -1168,6 +1187,47 @@ mod tests {
 
         assert_eq!(a.count_op("blank"), 1, "A tried");
         assert_eq!(b.count_op("blank"), 1, "B tried after A failed");
+    }
+
+    /// Issue #114 heal: a display dead at startup (probe failed, controller
+    /// unavailable) must come back on the FIRST command after reattach via
+    /// the executor's zero-available re-probe — not stay dead until a daemon
+    /// restart.
+    #[tokio::test]
+    async fn blank_heals_dead_chain_via_reprobe() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        // Dead at startup: unavailable, like ddcci with matched_ident None.
+        a.set_available(false);
+        // The display has "reattached": the next (re)probe succeeds.
+        a.set_probe_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff)
+            .await
+            .expect("first command after reattach must heal the chain via reprobe");
+
+        assert_eq!(a.count_op("reprobe"), 1, "executor re-probed the chain");
+        assert_eq!(a.count_op("blank"), 1, "blank ran after the heal");
+    }
+
+    /// The heal is bounded: when reprobe does NOT bring a controller back,
+    /// the command fails after exactly one re-probe pass — no retry loop.
+    #[tokio::test]
+    async fn blank_reprobe_heal_is_bounded_when_still_dead() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        a.set_probe_result(Err(DormantError::DisplayIo {
+            controller: "A".into(),
+            detail: "still detached".into(),
+        }));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff)
+            .await
+            .expect_err("still-dead chain must fail");
+
+        assert_eq!(a.count_op("reprobe"), 1, "exactly one re-probe pass");
+        assert_eq!(a.count_op("blank"), 0, "no blank on a dead chain");
     }
 
     #[tokio::test]

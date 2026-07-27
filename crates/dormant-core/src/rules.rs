@@ -1411,7 +1411,11 @@ impl RulesEngine {
                 #[allow(clippy::collapsible_if)]
                 if let Some(hold) = self.effective_input_wake_hold(&d) {
                     if hold > Duration::ZERO {
-                        let now = Instant::now();
+                        // Tick::now(), not std Instant::now(): the deadline is
+                        // compared against the virtual-aware timer clock, and
+                        // mixing clocks silently breaks under paused-time tests
+                        // (the stale-timer guard compares Tick-derived instants).
+                        let now = Tick::now().0;
                         let deadline = now + hold;
                         self.input_wake_holds.insert(d.clone(), deadline);
                         self.timers.push(Reverse((
@@ -4786,7 +4790,6 @@ async fn zero_input_wake_hold_preserves_immediate_grace_behavior() {
 /// old timer must NOT prematurely clear the hold.  This pins the stale-
 /// timer guard in `fire_input_wake_hold_expiry`.
 #[tokio::test(start_paused = true)]
-#[ignore = "re-arming test needs timer interaction refinement — guard logic is correct, see fire_input_wake_hold_expiry"]
 async fn second_input_wake_rearms_hold() {
     let (mut engine, display, _sink) = input_wake_hold_engine(Duration::from_secs(120));
 
@@ -4854,8 +4857,12 @@ async fn second_input_wake_rearms_hold() {
         "hold must still be armed after stale timer fires"
     );
 
-    // --- Advance past the SECOND deadline (180s from start = 119s more) ---
-    tokio::time::sleep(Duration::from_secs(119)).await;
+    // --- Advance just past the SECOND deadline (180s from start; we are at
+    // t=121s, so +60s lands at t=181s). Overshooting further would also
+    // expire the grace period that starts at expiry, collapsing
+    // grace→blanking inside one timer drain and masking the phase we
+    // assert here. ---
+    tokio::time::sleep(Duration::from_secs(60)).await;
     engine.fire_due_timers(Tick::now());
 
     // Assert: now in Grace — the second timer fired correctly.

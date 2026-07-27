@@ -78,6 +78,39 @@
   color: var(--text-faint);
 }
 
+/* BG-5: recovery command in the rollback banner */
+.rollback-banner__recovery {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.rollback-banner__recovery-label {
+  font-weight: 600;
+}
+
+.rollback-banner__recovery-cmd {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  background: var(--bg-sunken);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  color: var(--accent-warm);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.rollback-banner__recovery-cmd:hover {
+  background: color-mix(in oklab, var(--accent-warm) 15%, transparent);
+}
+
+.rollback-banner__recovery-cmd--copied {
+  color: var(--success);
+  border-color: color-mix(in oklab, var(--success) 40%, transparent);
+  background: color-mix(in oklab, var(--success) 12%, transparent);
+}
+
 .global-banner--poll {
   border: 1px solid color-mix(in oklab, var(--warning) 40%, transparent);
   background: color-mix(in oklab, var(--warning) 10%, transparent);

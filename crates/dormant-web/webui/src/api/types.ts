@@ -139,6 +139,8 @@ export interface RollbackStatus {
   failed_fp: string;
   lkg_fp: string;
   detail: string;
+  /** Platform-specific restart command suggestion. Absent on older daemons. */
+  recovery_command?: string;
 }
 
 /**

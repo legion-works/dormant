@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { useEvents } from "../api/ws";
-import { getState, getConfig, getOperations, getWear, getWearDetail } from "../api/client";
+import { getState, getConfig, getOperations, getWear, getWearDetail, getRecentEvents } from "../api/client";
 import type {
   SensorSnapshot,
   StateSnapshot,
@@ -125,6 +125,7 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<StateSnapshot | null>(null);
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [events, setEvents] = useState<StampedEvent[]>([]);
+  const [historySeeded, setHistorySeeded] = useState(false);
   const [lagged, setLagged] = useState(false);
   const [wearSnapshots, setWearSnapshots] = useState<Record<string, WearSnapshotPatch>>({});
   const [wearAdvisories, setWearAdvisories] = useState<Record<string, number>>({});
@@ -242,6 +243,32 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     mountedRef.current = true;
     void fetchAll("initial");
     void refreshWear();
+
+    // Seed event history from the server ring on mount.
+    // Guarded: older daemons lack the endpoint; test mocks may omit the function.
+    void (async () => {
+      try {
+        const res = await getRecentEvents(100);
+        if (!mountedRef.current) return;
+        if (res.events.length > 0) {
+          const stamped = res.events.map((re) => ({
+            time: new Date(re.at_epoch_ms).toLocaleTimeString("en-GB", { hour12: false }),
+            event: re.event,
+          }));
+          stamped.reverse();
+          stamped.push({
+            time: "",
+            event: { event: "_history_separator" } as never,
+          });
+          setEvents(stamped.slice(0, MAX_EVENTS));
+        }
+      } catch {
+        // Endpoint unavailable — silent fallback.
+      } finally {
+        if (mountedRef.current) setHistorySeeded(true);
+      }
+    })();
+
     return () => {
       mountedRef.current = false;
       if (lagTimerRef.current != null) clearTimeout(lagTimerRef.current);
@@ -445,7 +472,7 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     refresh,
   };
 
-  const eventLog: EventLogState = { events, connected, lagged };
+  const eventLog: EventLogState = { events, connected, lagged, historySeeded };
 
   return (
     <LiveStateContext.Provider value={liveState}>

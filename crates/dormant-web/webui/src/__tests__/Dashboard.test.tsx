@@ -176,7 +176,7 @@ describe("Dashboard", () => {
   it("shows empty state in recent activity when event log is empty", async () => {
     render(
       <LiveStateProvider>
-        <EventLogContext.Provider value={{ events: [], connected: true, lagged: false }}>
+        <EventLogContext.Provider value={{ events: [], connected: true, lagged: false, historySeeded: false }}>
           <Dashboard />
         </EventLogContext.Provider>
       </LiveStateProvider>,
@@ -201,7 +201,7 @@ describe("Dashboard", () => {
 
     render(
       <LiveStateProvider>
-        <EventLogContext.Provider value={{ events: mockEvents, connected: true, lagged: false }}>
+        <EventLogContext.Provider value={{ events: mockEvents, connected: true, lagged: false, historySeeded: false }}>
           <Dashboard />
         </EventLogContext.Provider>
       </LiveStateProvider>,

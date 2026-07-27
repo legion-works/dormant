@@ -24,6 +24,7 @@ use dormant_doctor::DoctorService;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::event_ring::EventRing;
 use crate::routes::pair::{PairEntry, PairId};
 
 /// Seam type for persisting a granted pairing token — factored into a type
@@ -158,6 +159,11 @@ pub struct WebStateInner {
     /// during `dormantd::app::App::start`, so construction time already
     /// tracks daemon start closely enough for a sidebar uptime display.
     pub(crate) started_epoch_s: u64,
+
+    /// Bounded in-memory ring of recent [`DaemonEvent`]s for
+    /// `GET /api/events/recent`.  Fed by a background subscriber task
+    /// spawned in [`WebStateInner::assemble`].
+    pub(crate) event_history: Arc<EventRing>,
 }
 
 /// The subset of [`WebStateInner`]'s fields that vary across construction
@@ -196,6 +202,7 @@ impl WebStateInner {
             Arc::new(|path: &Path, host: &str, token: &str| {
                 dormant_core::config::upsert_samsung_token(path, host, token)
             }),
+            true,
         )
     }
 
@@ -219,6 +226,7 @@ impl WebStateInner {
                      use new_for_test_with_pairing to inject a fake for pairing-wizard tests"
                 )
             }),
+            false,
         )
     }
 
@@ -233,7 +241,7 @@ impl WebStateInner {
         pair_connect: Arc<dyn PairConnect>,
         upsert_token: UpsertToken,
     ) -> Self {
-        Self::assemble(params, pair_connect, upsert_token)
+        Self::assemble(params, pair_connect, upsert_token, false)
     }
 
     /// Shared assembly — every constructor bottoms out here so the
@@ -243,7 +251,17 @@ impl WebStateInner {
         params: WebStateInnerParams,
         pair_connect: Arc<dyn PairConnect>,
         upsert_token: UpsertToken,
+        spawn_feeder: bool,
     ) -> Self {
+        let event_history = Arc::new(EventRing::new());
+        if spawn_feeder {
+            let history = event_history.clone();
+            let ctl_tx = params.ctl_tx.clone();
+            tokio::spawn(async move {
+                crate::event_ring::feed_ring(history, ctl_tx).await;
+            });
+        }
+
         Self {
             ctl_tx: params.ctl_tx,
             reload_requester: params.reload_requester,
@@ -265,6 +283,7 @@ impl WebStateInner {
             emergency_wake_lock: Arc::new(Mutex::new(())),
             exercise_in_flight: Arc::new(Mutex::new(HashSet::new())),
             started_epoch_s: now_epoch_s(),
+            event_history,
         }
     }
 }

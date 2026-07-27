@@ -535,6 +535,7 @@ impl App {
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
             test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
@@ -585,6 +586,7 @@ impl App {
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
             test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,

@@ -32,6 +32,7 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 - Drive the daemon from a desktop tray with global hotkeys (Linux KDE · macOS menu bar)
 - Probe every sensor and display against live hardware with `dormantctl doctor`
 - Recover from a bad config boot: automatic last-known-good rollback, a systemd watchdog, and `dormantctl emergency-wake`
+- **MQTT state publishing** — opt-in retained state + Home Assistant discovery for sensors, zones, and displays
 
 <p align="center">
   <img src="design/screenshots/dashboard.png" alt="dormant web dashboard — displays, sensors, zones, signal flow, and panel-exposure summary" width="820">

@@ -4235,6 +4235,25 @@ fn spawn_generation(
         producer_handles.push(handle);
     }
 
+    // Opt-in MQTT state publisher (issue #105) — `state_publisher::spawn`
+    // returns `None` (no-op) when `[publish] enabled = false`, mirroring
+    // `notifier::spawn`'s own None-returning precedent. The handle goes
+    // in `producer_handles` so `Generation::teardown` cancels and
+    // awaits it on reload like every other generation-local task. The
+    // publisher subscribes to `DaemonEvent`s itself via
+    // `ControlMsg::SubscribeEvents`, so no broadcast receiver is
+    // plumbed in here.
+    if let Some(handle) =
+        crate::state_publisher::spawn(crate::state_publisher::StatePublisherDeps {
+            config: Arc::new(assembly.cfg.clone()),
+            credentials: Arc::new(assembly.creds.clone()),
+            ctl_tx: ctl_tx.clone(),
+            cancel: producer_token.clone(),
+        })
+    {
+        producer_handles.push(handle);
+    }
+
     let generation = Generation {
         engine_token,
         engine_handle: Some(engine_handle),

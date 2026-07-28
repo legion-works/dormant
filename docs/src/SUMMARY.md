@@ -10,4 +10,5 @@
 - [Failure notifications](./failure-notifications.md)
 - [Watchdog + last-known-good rollback](./watchdog-rollback.md)
 - [Web UI](./web-ui.md)
+- [MQTT state publishing](./mqtt-publishing.md)
 - [Troubleshooting](./troubleshooting.md)

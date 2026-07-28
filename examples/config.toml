@@ -113,8 +113,8 @@ config_version = 1
 # A publish broker can EITHER share one [mqtt] entry with the sensors OR carry
 # its own. A missing entry means anonymous connect (matching the MQTT sensor
 # convention).
-# [publish]
-# enabled = false               # opt-in switch; false = no publisher task, no connections
+[publish]
+enabled = false                       # opt-in switch; false = no publisher task, no connections
 # broker_url = "tcp://localhost:1883"   # required when enabled; shared with creds.mqtt lookup
 # base_topic = "dormant"        # state/availability topic prefix (no MQTT wildcards)
 # discovery_prefix = "homeassistant"   # Home Assistant discovery prefix

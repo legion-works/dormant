@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-28
+
+### Highlights
+
+**Config section rail** — sticky per-tab section navigation with scroll-spy in the web UI. Jump straight to any section of a config tab from a sticky side rail — the rail tracks scroll position, highlights the active section, and section links survive as shareable URL hashes without breaking existing field deep links.
+
+**MQTT state publishing** — opt-in retained state + Home Assistant discovery for sensors, zones, and displays. Mirror dormant's live state into Home Assistant with two config lines — sensors, zones, and display phases appear as auto-discovered HA entities over MQTT, with retained state, per-sensor availability, and a last-will `offline` marker when the daemon dies. See [the MQTT state publishing chapter](./docs/src/mqtt-publishing.md).
+
+### Changed
+
+- The web UI sidebar offers a dismissible "Star the repo" link — it tries the local GitHub CLI first and falls back to opening the repo page, and one click (star or dismiss) hides it permanently via a server-side flag so it never nags twice.
+
+### Fixed
+
+- A `power_off` blank on a shared macOS DDC/CI panel can be unrecoverable (USB-C link and hub drop, VCP writes go to a dead device, recovery requires physically power-cycling the monitor). Dormant now emits a load-time semantic warning and a `dormantctl doctor` failure for every display wired into that topology; setting `displays.<id>.power_off_opt_in = true` acknowledges the risk and silences both. The opt-in adds no recovery mechanism of its own — see `docs/src/displays.md` for the full hazard description and the audio-safe alternatives.
+- Compiled Highlights now carry each capability's name and prose, with a chapter link when provided, instead of a headless bolded phrase.
+- `scripts/release-prep.py` is now paragraph-aware: `User can now:` and `Detail:` markers absorb every following non-blank, non-marker line so a multi-line paragraph is preserved verbatim instead of being silently truncated to the first physical line, and a `fix` fragment that omits `Detail:` now compiles a `Fixed` bullet from its plain body. Both bugs hit the v0.8.0 release notes.
+- Three fail-safe fixes: the daemon now starts with an unreachable display in a degraded state (healing on first command) instead of crash-looping under systemd/launchd; a sensor with a live retained `online` availability topic is no longer marked unavailable by state-topic silence (silence means unchanged — LWT `offline` still flips it immediately); and input-wake during a falsely vacant zone now holds the display awake (`rules.<id>.input_wake_hold`, default 2m, `0s` disables) so a wrong sensor can no longer re-blank a typing user every grace period.
+- Two operator-safety fixes: `dormantctl blank` now performs a soft blank (the same render/controller ladder a vacant rule would walk) and hard power-off moved behind an explicit `--hard` flag with confirmation (`--yes` for scripts; web and tray force-blank surfaces stay hard and explicit); and hardware operations (`doctor exercise`, emergency wake) are now fenced by generation — a reload waits for in-flight operations (cancelling them cooperatively after a bound, rejecting the reload rather than tearing down a generation that still holds hardware), a panicking exercise restores its rule pause and wakes the panel, and a stale operation's completion can never mutate the generation that replaced it.
+- Panel-exposure heat map normalizes from zero instead of min-max, so a uniformly-worn panel renders at full intensity (every cell at 1.0) instead of collapsing to flat grey / zero heat — indistinguishable from an unsampled panel. The detail response now also exposes `max_cell_hours` so the legend can label real hours instead of inferring them from the normalized heat.
+
 ## [0.8.2] - 2026-07-27
 
 ### Fixed
@@ -234,7 +255,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/legion-works/dormant/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/legion-works/dormant/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/legion-works/dormant/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/legion-works/dormant/compare/v0.7.1...v0.8.0

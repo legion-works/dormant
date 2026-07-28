@@ -45,9 +45,62 @@ class CompileEntryTests(unittest.TestCase):
         ]
         entry = release_prep._compile_entry(fragments)
         self.assertIn("### Highlights", entry)
-        self.assertIn("**do X**", entry)
+        self.assertIn("**X**. Do X.", entry)
         self.assertIn("### Added", entry)
         self.assertIn("mechanism", entry)
+
+    def test_capability_highlight_includes_name_prose_and_chapter(self):
+        fm, body = _fragment_dict(
+            "capability", ["readme"],
+            readme_bullet="**MQTT state publishing** — opt-in retained state",
+            body="User can now: mirror live state into Home Assistant.\n",
+        )
+        fm["chapter"] = "mqtt-publishing.md"
+
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+
+        self.assertIn(
+            "**MQTT state publishing** — opt-in retained state. Mirror live state "
+            "into Home Assistant. See [the MQTT state publishing chapter]"
+            "(./docs/src/mqtt-publishing.md).",
+            entry,
+        )
+
+    def test_capability_highlight_without_chapter_has_no_dangling_link(self):
+        fm, body = _fragment_dict(
+            "capability", ["readme"],
+            readme_bullet="**Config rail** — jump to any section",
+            body="User can now: jump to any section.\n",
+        )
+
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+
+        self.assertIn(
+            "**Config rail** — jump to any section. Jump to any section.", entry,
+        )
+        self.assertNotIn("See [", entry)
+
+    def test_capability_highlights_are_separate_paragraphs_in_sort_order(self):
+        first_fm, first_body = _fragment_dict(
+            "capability", ["readme"],
+            readme_bullet="**First** — first capability",
+            body="User can now: use the first capability.\n",
+        )
+        second_fm, second_body = _fragment_dict(
+            "capability", ["readme"],
+            readme_bullet="**Second** — second capability",
+            body="User can now: use the second capability.\n",
+        )
+
+        entry = release_prep._compile_entry([
+            (pathlib.Path("a.md"), first_fm, first_body),
+            (pathlib.Path("b.md"), second_fm, second_body),
+        ])
+
+        first = "**First** — first capability. Use the first capability."
+        second = "**Second** — second capability. Use the second capability."
+        self.assertLess(entry.index(first), entry.index(second))
+        self.assertIn(f"{first}\n\n{second}", entry)
 
     def test_improvement_produces_changed(self):
         fragments = [

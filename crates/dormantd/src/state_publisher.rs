@@ -263,12 +263,18 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
     {
         let inventory = EntityInventory::from_config(&config);
         let _ = detect_and_warn_collisions(&config, &inventory);
-        for r in discovery_records(&config, &inventory, &instance) {
-            let _ = record_tx.try_send(r);
-        }
-        for r in snapshot_records(&config, &snapshot, &instance) {
-            let _ = record_tx.try_send(r);
-        }
+        let disc = discovery_records(&config, &inventory, &instance);
+        let snaps = snapshot_records(&config, &snapshot, &instance);
+        let total = disc.len() + snaps.len();
+        tracing::debug!(
+            event = "publish_first_flush",
+            discovery = disc.len(),
+            snapshot = snaps.len(),
+            total,
+            "publishing initial discovery + snapshot"
+        );
+        send_flush(&record_tx, &cancel, disc).await;
+        send_flush(&record_tx, &cancel, snaps).await;
     }
 
     // Drain lifecycle + events until cancel or transport exit.
@@ -285,15 +291,18 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
                     let inventory = EntityInventory::from_config(&config);
                     let _ = detect_and_warn_collisions(&config, &inventory);
                     let disc = discovery_records(&config, &inventory, &instance);
-                    for r in disc {
-                        let _ = record_tx.try_send(r);
-                    }
+                    let disc_total = disc.len();
+                    send_flush(&record_tx, &cancel, disc).await;
                     if let Some(new_snap) = request_snapshot(&ctl_tx, &cancel).await {
                         snapshot = new_snap;
                         let snaps = snapshot_records(&config, &snapshot, &instance);
-                        for r in snaps {
-                            let _ = record_tx.try_send(r);
-                        }
+                        tracing::debug!(
+                            event = "publish_reconnect_flush",
+                            discovery = disc_total,
+                            snapshot = snaps.len(),
+                            "publishing reconnect discovery + snapshot"
+                        );
+                        send_flush(&record_tx, &cancel, snaps).await;
                     }
                 }
                 Some(TransportLifecycle::Disconnected) => { /* reconnect handled by Connected */ }
@@ -304,17 +313,18 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
             },
             event_result = event_rx.recv() => match event_result {
                 Ok(ev) => {
-                    for r in event_records(&config, &ev, &instance) {
-                        let _ = record_tx.try_send(r);
-                    }
+                    send_flush(&record_tx, &cancel, event_records(&config, &ev, &instance)).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(event = "publish_events_lagged", skipped);
                     if let Some(new_snap) = request_snapshot(&ctl_tx, &cancel).await {
                         snapshot = new_snap;
-                        for r in snapshot_records(&config, &snapshot, &instance) {
-                            let _ = record_tx.try_send(r);
-                        }
+                        send_flush(
+                            &record_tx,
+                            &cancel,
+                            snapshot_records(&config, &snapshot, &instance),
+                        )
+                        .await;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -360,6 +370,74 @@ async fn request_snapshot(
     tokio::select! {
         () = cancel.cancelled() => None,
         res = snap_rx => res.ok(),
+    }
+}
+
+/// Awaited forward of a single record to the transport-side
+/// `record_rx`. Cancellation-aware: a cancel mid-send drops the record
+/// and emits a `publish_record_dropped` warning — never silently
+/// swallowed (a flapping broker that stalls the channel would otherwise
+/// let a retained record fade out unreported).
+///
+/// The bounded mpsc (64 records) is overflow-free by construction:
+/// every flush is bounded by the entity count + event-rate per loop
+/// iteration. If the channel ever does fail to accept (a malformed
+/// misbehaviour we want to learn about, not paper over), the WARN
+/// records `topic` + the cancellation state at that moment.
+async fn send_record(
+    record_tx: &mpsc::Sender<PublishRecord>,
+    cancel: &tokio_util::sync::CancellationToken,
+    record: PublishRecord,
+) {
+    let topic = record.topic.clone();
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            tracing::warn!(
+                event = "publish_record_dropped",
+                topic = %topic,
+                reason = "cancel_observed_before_send",
+                "publish record dropped because cancel fired mid-send; the next reconnect will retry the discovery/snapshot"
+            );
+        }
+        send_result = record_tx.send(record) => {
+            if let Err(_record) = send_result {
+                // Receiver was closed (transport task exited). We will
+                // recover on the next reconnect by re-flushing, so
+                // surface the drop rather than silently swallowing.
+                tracing::warn!(
+                    event = "publish_record_dropped",
+                    topic = %topic,
+                    reason = "transport_channel_closed",
+                    "publish record dropped because transport channel closed; reload required to retry"
+                );
+            }
+        }
+    }
+}
+
+/// Push a batch of records through the transport-side `record_rx`,
+/// cancelling cleanly when `cancel` fires and warning (per-record) on
+/// any drop. Drains `records` even when a cancel lands mid-batch so
+/// the rest of the flush completes during the cancellation grace
+/// window — the contract says `finalize_shutdown` joins the transport
+/// within 5 s, plenty of room for a typical entity count.
+async fn send_flush(
+    record_tx: &mpsc::Sender<PublishRecord>,
+    cancel: &tokio_util::sync::CancellationToken,
+    records: Vec<PublishRecord>,
+) {
+    for r in records {
+        if cancel.is_cancelled() {
+            tracing::warn!(
+                event = "publish_record_dropped",
+                topic = %r.topic,
+                reason = "cancel_observed_before_flush_iteration",
+                "publish flush short-circuited because cancel fired; the next reconnect will retry discovery/snapshot"
+            );
+            return;
+        }
+        send_record(record_tx, cancel, r).await;
     }
 }
 
@@ -435,11 +513,13 @@ pub mod mqtt_transport {
         /// a redacted textual summary suitable for assertions in
         /// `crates/dormantd::state_publisher`'s tests.
         ///
-        /// The summary deliberately omits the password: the test asserts
-        /// the password never appears in any stringification of the
-        /// transport surface (the contract is "dormant never publishes
-        /// secrets"). Credentials are looked up by EXACT `broker_url`
-        /// (the contract docs say "credential lookup is by exact
+        /// The summary deliberately omits the password AND the broker
+        /// URL: a userinfo-bearing URL (e.g. `mqtt://user:secret@host`)
+        /// would leak the secret the moment a log line, traced span, or
+        /// `Debug` print formatted the string. Only the parsed
+        /// host:port pair (which carries no userinfo) is reflected.
+        /// Credentials are looked up by EXACT `broker_url` (the
+        /// contract docs say "credential lookup is by exact
         /// `broker_url`").
         #[must_use]
         pub fn options_for_test(url: &str, creds: &Credentials, client_id: &str) -> String {
@@ -447,8 +527,18 @@ pub mod mqtt_transport {
                 .mqtt
                 .get(url)
                 .map_or("<none>", |c| c.username.as_str());
+            let (host, port) = parse_broker_url(url);
+            // `parse_broker_url` returns the host (possibly
+            // userinfo-laden, e.g. `dormant:publish-secret-PWD@h`) or a
+            // bracketed IPv6 literal — for any of those, only the bare
+            // host segment AFTER the `@` is safe to print. If there's
+            // no `@`, the parsed `host` is already safe.
+            let broker_host = match host.rsplit_once('@') {
+                Some((_, after)) => after,
+                None => host,
+            };
             format!(
-                "client_id={client_id:?} broker={url} user={user:?} password_present={}",
+                "client_id={client_id:?} broker={broker_host}:{port} user={user:?} password_present={}",
                 creds.mqtt.get(url).is_some()
             )
         }
@@ -1722,6 +1812,12 @@ mod tests {
     #[test]
     fn collision_two_sensor_ids_same_topic() {
         let mut cfg = enabled_cfg();
+        // Use distinct broker-side topics so only the sanitizer's
+        // collision rule (not the underlying `topic` field) is the
+        // thing under test. "desk two" → "desk_two" (space folding +
+        // collapse). "desk_two" → "desk_two" (already canonical).
+        // Insertion order is config-order (IndexMap), so "desk two"
+        // (the one with the space) MUST win.
         cfg.sensors.insert(
             "desk two".into(),
             SensorConfig::Mqtt(MqttSensorCfg {
@@ -1754,21 +1850,72 @@ mod tests {
                 availability_payload_offline: "offline".into(),
             }),
         );
-        // "desk two" -> "desk_two" (space -> underscore, run-collapsed)
-        // "desk_two" -> "desk_two" (already canonical)
         let inv = EntityInventory::from_config(&cfg);
         let collisions = detect_and_warn_collisions(&cfg, &inv);
-        assert!(
-            collisions.iter().any(|(san, _)| san == "desk_two"),
-            "expected desk_two collision, got {collisions:?}"
-        );
-        // First-wins: discovery emits only the first record.
-        let records = discovery_records(&cfg, &inv, "office-pc");
-        let topic_count = records
+        let entry = collisions
             .iter()
-            .filter(|r| r.topic.contains("/sensor_desk_two/"))
-            .count();
-        assert_eq!(topic_count, 1, "first-wins: only one record per topic");
+            .find(|(san, _)| san == "desk_two")
+            .unwrap_or_else(|| panic!("expected desk_two collision, got {collisions:?}"));
+        // The detected-pair list carries the raw ids in config-order, so
+        // the winner ("desk two") comes first and the loser
+        // ("desk_two") comes second. Assert that — config-order is the
+        // entire first-wins rule, so a regression that swapped them
+        // would silently change which entity an operator's HA
+        // integration actually sees.
+        let raw_ids = &entry.1;
+        assert!(
+            raw_ids
+                .first()
+                .is_some_and(|first| first == "sensor:desk two"),
+            "first-wins must pick the config-order-first raw id; got {raw_ids:?}"
+        );
+        assert!(
+            raw_ids
+                .get(1)
+                .is_some_and(|second| second == "sensor:desk_two"),
+            "the loser's raw id must appear second in the pair list; got {raw_ids:?}"
+        );
+
+        // First-wins: discovery emits exactly ONE record per
+        // sanitized id, and a regression that emitted a record per raw
+        // id (instead of one record total) trips the topic_count
+        // assertion below. (Both raw ids sanitize to the SAME discovery
+        // topic `sensor_desk_two` — the sanitisers collapse the loser's
+        // topic into the winner's, so we cannot distinguish winners and
+        // losers on the wire; the only assertion that proves WHICH raw
+        // id won is the `detect_and_warn_collisions` pair-order check
+        // above.)
+        let records = discovery_records(&cfg, &inv, "office-pc");
+        let desk_two_records: Vec<&PublishRecord> = records
+            .iter()
+            .filter(|r| r.topic.ends_with("/sensor_desk_two/config"))
+            .collect();
+        assert_eq!(
+            desk_two_records.len(),
+            1,
+            "first-wins: exactly one discovery record per sanitized id, got {} records: {:?}",
+            desk_two_records.len(),
+            desk_two_records,
+        );
+
+        // The winner's record carries the broker-side state topic
+        // `dormant/office-pc/sensor/desk_two/state` (built from the
+        // SANITIZED id — both candidates collapse to the same
+        // sanitized id and therefore the same state_topic). The discovery
+        // payload is byte-identical for both candidates since the
+        // sanitizer runs on `sensor_id` before formatting `name`,
+        // `unique_id`, and the state_topic field. The first-wins
+        // invariant is proven above by the pair list ordering; this
+        // assertion guards against the "drop the loser's record too
+        // eagerly and lose even the winner" regression by verifying
+        // some payload exists.
+        let win = desk_two_records[0];
+        let payload: serde_json::Value =
+            serde_json::from_str(&win.payload).expect("valid discovery JSON");
+        assert!(
+            payload.get("state_topic").is_some(),
+            "winner's payload must carry a state_topic field; got: {payload}"
+        );
     }
 
     #[test]
@@ -1889,7 +2036,12 @@ mod tests {
 #[allow(
     clippy::uninlined_format_args,
     clippy::items_after_statements,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::collapsible_match,
+    clippy::collapsible_if,
+    clippy::redundant_closure_for_method_calls,
+    clippy::needless_late_init,
+    clippy::manual_let_else
 )]
 mod async_tests {
     use super::*;
@@ -1898,7 +2050,7 @@ mod async_tests {
     };
     use async_trait::async_trait;
     use dormant_core::config::schema::{
-        Config, Credentials, MqttCredential, MqttSensorCfg, PublishConfig,
+        Config, Credentials, MqttCredential, MqttSensorCfg, PublishConfig, SensorConfig, SensorKind,
     };
     use dormant_core::rules::{ControlMsg, DaemonEvent, SensorSnapshot, ZoneSnapshot};
     use std::sync::{Arc, Mutex as StdMutex};
@@ -2038,6 +2190,115 @@ mod async_tests {
     #[allow(clippy::unnecessary_wraps)]
     fn offline_topic_for(_records: &Arc<StdMutex<Vec<PublishRecord>>>) -> Option<String> {
         Some("dormant/office-pc/availability".into())
+    }
+
+    /// Wait until `predicate(records) >= want`. Polls on every
+    /// `notify.notified()` wake and bounds the wait by `timeout`. Used in
+    /// place of `sleep`-poll loops so the test-timing policy stays green.
+    /// Returns the final count observed on timeout exhaustion.
+    async fn wait_records_count<F>(
+        records: &StdMutex<Vec<PublishRecord>>,
+        notify: &Notify,
+        timeout: Duration,
+        predicate: F,
+    ) -> usize
+    where
+        F: Fn(&[PublishRecord]) -> usize + Copy,
+    {
+        let start = tokio::time::Instant::now();
+        loop {
+            {
+                let g = records.lock().unwrap();
+                let n = predicate(&g);
+                if n >= 1 {
+                    return n;
+                }
+            }
+            let remaining = match timeout.checked_sub(start.elapsed()) {
+                Some(r) => r,
+                None => return predicate(&records.lock().unwrap()),
+            };
+            let n = notify.notified();
+            tokio::pin!(n);
+            if tokio::time::timeout(remaining, n).await.is_err() {
+                return predicate(&records.lock().unwrap());
+            }
+        }
+    }
+
+    /// Wait until `predicate(records) >= want` strictly (i.e. any
+    /// non-empty crossing). Used in tests that need the predicate to
+    /// grow N→N+k across an event boundary; the caller passes `want`
+    /// = the post-event count to pin the comparison.
+    async fn wait_until_count_at_least<F>(
+        records: &StdMutex<Vec<PublishRecord>>,
+        notify: &Notify,
+        timeout: Duration,
+        want: usize,
+        predicate: F,
+    ) -> usize
+    where
+        F: Fn(&[PublishRecord]) -> usize + Copy,
+    {
+        let start = tokio::time::Instant::now();
+        loop {
+            {
+                let g = records.lock().unwrap();
+                let n = predicate(&g);
+                if n >= want {
+                    return n;
+                }
+            }
+            let remaining = match timeout.checked_sub(start.elapsed()) {
+                Some(r) => r,
+                None => return predicate(&records.lock().unwrap()),
+            };
+            let n = notify.notified();
+            tokio::pin!(n);
+            if tokio::time::timeout(remaining, n).await.is_err() {
+                return predicate(&records.lock().unwrap());
+            }
+        }
+    }
+
+    /// Wait until `counter >= want`. The counter is incremented from
+    /// another task; the caller passes a `Notify` that the writer task
+    /// fires so we can wake on any increment without polling. Returns the
+    /// final counter value on timeout exhaustion.
+    async fn wait_counter_at_least(
+        counter: &StdMutex<u32>,
+        notify: &Notify,
+        timeout: Duration,
+        want: u32,
+    ) -> u32 {
+        let start = tokio::time::Instant::now();
+        loop {
+            {
+                let g = counter.lock().unwrap();
+                let n = *g;
+                if n >= want {
+                    return n;
+                }
+            }
+            let remaining = match timeout.checked_sub(start.elapsed()) {
+                Some(r) => r,
+                None => return *counter.lock().unwrap(),
+            };
+            let n = notify.notified();
+            tokio::pin!(n);
+            let _ = tokio::time::timeout(remaining, n).await;
+        }
+    }
+
+    /// Wait until `counter >= want` using a `&Notify` (matches an
+    /// `Arc<Notify>` the writer task holds in `Arc`).
+    async fn wait_counter_with_arc(
+        counter: &StdMutex<u32>,
+        notify: &Arc<Notify>,
+        timeout: Duration,
+        want: u32,
+    ) -> u32 {
+        wait_counter_at_least(counter, notify.as_ref(), timeout, want).await
     }
 
     fn enabled_publish_config() -> Config {
@@ -2193,10 +2454,13 @@ mod async_tests {
 
     #[test]
     fn mqtt_transport_options_apply_credentials_and_use_deterministic_client_id() {
-        // Direct probe of `mqtt_transport::options_for_test` to verify the
-        // broker_url is parsed, the credential for THAT exact URL is
-        // applied, and the client id is deterministic. The password must
-        // not appear anywhere in the resulting options surface.
+        // Direct probe of `mqtt_transport::options_for_test` to verify
+        // the credential for THAT exact URL is applied and the
+        // client id is deterministic. The password MUST NOT appear
+        // anywhere in the resulting options surface; the broker URL
+        // itself MUST NOT appear unredacted either (a userinfo-bearing
+        // URL like `mqtt://user:secret@host` would leak the secret
+        // the moment any logger or `Debug` print formatted it).
         let url = "tcp://h:1883";
         let creds = publish_creds_for(url);
         let opts = super::mqtt_transport::MqttTransport::options_for_test(
@@ -2214,6 +2478,50 @@ mod async_tests {
         assert!(
             !debug.contains("publish-secret-PWD"),
             "password must not appear in stringified form of transport options (got: {debug:?})"
+        );
+
+        // Per-task test: a userinfo-bearing URL (the failure mode that
+        // triggered the milestone REVISE) must NOT leak the secret. We
+        // mirror the lookup key with embedded userinfo, then check that
+        // the summary only carries the host and port — never the
+        // password. The `parse_broker_url` helper strips the userinfo
+        // and gives us a clean `(host, port)` pair; the redaction must
+        // only print that pair.
+        let userinfo_url = "tcp://dormant:publish-secret-PWD@h:1883";
+        let creds_with_userinfo = {
+            let mut c = Credentials::default();
+            c.mqtt.insert(
+                userinfo_url.to_string(),
+                MqttCredential {
+                    username: "dormant".into(),
+                    password: "publish-secret-PWD".into(),
+                },
+            );
+            c
+        };
+        let userinfo_opts = super::mqtt_transport::MqttTransport::options_for_test(
+            userinfo_url,
+            &creds_with_userinfo,
+            "dormant-publisher-userinfo-test",
+        );
+        let userinfo_debug = format!("{userinfo_opts:?}");
+        assert!(
+            !userinfo_debug.contains("publish-secret-PWD"),
+            "userinfo URL must not leak password via the redaction surface (got: {userinfo_debug:?})"
+        );
+        // The secret string in plaintext form (the password) MUST NOT
+        // appear anywhere in the string. The host `h` SHOULD still
+        // appear; the user `dormant` MAY appear (it's metadata, not a
+        // secret), but a regex finding the original
+        // `dormant:publish-secret-PWD@` substring is the leak we're
+        // guarding against.
+        assert!(
+            !userinfo_debug.contains("dormant:publish-secret-PWD@"),
+            "userinfo URL form must NOT appear verbatim (got: {userinfo_debug:?})"
+        );
+        assert!(
+            userinfo_opts.contains("h:1883"),
+            "parsed host:port should be the only broker identifier in the summary; got: {userinfo_opts}"
         );
     }
 
@@ -2264,50 +2572,70 @@ mod async_tests {
         // Now drop the connection.
         ctrl_tx.send(FakeCtrl::Disconnected).await.unwrap();
 
-        // Reconnect and wait for the second batch. The first flush
-        // already produced BOTH the desk state and desk discovery, so a
-        // naive early-return would pass on the wrong condition. We
-        // require the desk discovery count to DOUBLE.
-        records_notify_handle.notify_one();
+        // Drive the second Connected. Every successful (re)connect MUST
+        // republish the full discovery payload AND a fresh snapshot
+        // batch. A regression that emits only the discovery half (or
+        // only the snapshot half) trips the per-entity count checks
+        // below. This guards the original "early-return when both
+        // state + discovery exist on the first flush" bug.
         ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
-        let desk_discovery_topic = "homeassistant/binary_sensor/office-pc/sensor_desk/config";
-        let initial_count = records_handle
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.topic == desk_discovery_topic)
-            .count();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            for _ in 0..100 {
-                {
-                    let g = records_handle.lock().unwrap();
-                    let count = g.iter().filter(|r| r.topic == desk_discovery_topic).count();
-                    if count > initial_count {
-                        return;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!(
-                "reconnect did not republish discovery + snapshot: records={:?}",
-                records_handle.lock().unwrap()
-            );
-        })
-        .await
-        .ok();
-
-        // Verify the discovery record for `desk` appears at least twice
-        // (once per connect). The contract mandates that.
-        let final_count = records_handle
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.topic == desk_discovery_topic)
-            .count();
+        let discovery_topic = "homeassistant/binary_sensor/office-pc/sensor_desk/config";
+        let state_topic = "dormant/office-pc/sensor/desk/state";
+        let zone_topic = "dormant/office-pc/zone/office/state";
+        let display_topic = "dormant/office-pc/display/main/phase";
+        let pre_total = {
+            let g = records_handle.lock().unwrap();
+            g.len()
+        };
+        // 3 discovery + 4 snapshot (state + per-sensor availability +
+        // zone + display) per connect, so the post-reconnect count must
+        // be `pre_total + 7`. The event-driven wait yields to the
+        // runtime on each `notify.notified()` wake; only the final
+        // timeout fallback uses wall-clock time.
+        let total_after = wait_until_count_at_least(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            pre_total + 7,
+            |g| g.len(),
+        )
+        .await;
         assert!(
-            final_count >= 2,
-            "discovery config for `desk` must be republished on every reconnect; got {final_count}, records={:?}",
-            records_handle.lock().unwrap()
+            total_after >= pre_total + 7,
+            "reconnect must re-emit discovery AND snapshot ({pre_total} pre -> {total_after} post; expected at least +7)"
+        );
+
+        // Per-entity counts: each topic must appear at least twice
+        // (once per connect). A regression that emits only the discovery
+        // half on reconnect fails the *state* assertion below.
+        let counts = {
+            let g = records_handle.lock().unwrap();
+            (
+                g.iter().filter(|r| r.topic == discovery_topic).count(),
+                g.iter().filter(|r| r.topic == state_topic).count(),
+                g.iter().filter(|r| r.topic == zone_topic).count(),
+                g.iter().filter(|r| r.topic == display_topic).count(),
+            )
+        };
+        assert!(
+            counts.0 >= 2,
+            "desk discovery record must appear at least twice (got {})",
+            counts.0
+        );
+        assert!(
+            counts.1 >= 2,
+            "desk state record must appear at least twice on reconnect (got {})",
+            counts.1
+        );
+        assert!(
+            counts.2 >= 2,
+            "office zone state record must appear at least twice on reconnect (got {})",
+            counts.2
+        );
+        assert!(
+            counts.3 >= 2,
+            "main display phase record must appear at least twice on reconnect (got {})",
+            counts.3
         );
 
         cancel.cancel();
@@ -2328,7 +2656,9 @@ mod async_tests {
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let snapshot_requests = Arc::new(StdMutex::new(0u32));
+        let snapshot_requests_notify = Arc::new(Notify::new());
         let snapshot_requests_handle = snapshot_requests.clone();
+        let snapshot_requests_notify_for_responder = snapshot_requests_notify.clone();
         let cfg_for_handler = cfg.clone();
         let _responder = tokio::spawn(async move {
             while let Some(msg) = ctl_rx.recv().await {
@@ -2338,6 +2668,7 @@ mod async_tests {
                     }
                     ControlMsg::Snapshot(tx) => {
                         *snapshot_requests_handle.lock().unwrap() += 1;
+                        snapshot_requests_notify_for_responder.notify_one();
                         let _ = tx.send(snapshot_one_of_each_shape(&cfg_for_handler));
                     }
                     _ => {}
@@ -2384,38 +2715,178 @@ mod async_tests {
         let handle = spawn_with_transport(deps, Box::new(DrainTransport));
         assert!(handle.is_some());
 
-        for _ in 0..50 {
-            if *snapshot_requests.lock().unwrap() >= 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            *snapshot_requests.lock().unwrap() >= 1,
-            "spawn must request an initial snapshot"
-        );
+        // Wait event-driven for the initial snapshot request.
+        let initial = wait_counter_with_arc(
+            &snapshot_requests,
+            &snapshot_requests_notify,
+            Duration::from_secs(2),
+            1,
+        )
+        .await;
+        assert!(initial >= 1, "spawn must request an initial snapshot");
 
+        // Overflow the broadcast channel so the publisher's next event
+        // recv returns `Lagged`. Eight `Subscribed` events are enough
+        // to exceed the channel capacity (2) and trip the lag handler.
         let pre_lag = *snapshot_requests.lock().unwrap();
-        for _ in 0..10 {
+        for _ in 0..8 {
             let _ = event_tx_for_overflow.send(DaemonEvent::Subscribed);
         }
-
-        for _ in 0..200 {
-            if *snapshot_requests.lock().unwrap() > pre_lag {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Event-driven wait for the additional snapshot that the lag
+        // handler must request. Bounded by 2s — a few hundred ms is
+        // typical on a quiet CI machine.
+        let post_lag = wait_counter_with_arc(
+            &snapshot_requests,
+            &snapshot_requests_notify.clone(),
+            Duration::from_secs(2),
+            pre_lag + 1,
+        )
+        .await;
         assert!(
-            *snapshot_requests.lock().unwrap() > pre_lag,
-            "lag must drive at least one additional Snapshot request (had {pre_lag}, now {})",
-            *snapshot_requests.lock().unwrap()
+            post_lag > pre_lag,
+            "lag must drive at least one additional Snapshot request (had {pre_lag}, now {post_lag})"
         );
 
         cancel.cancel();
         if let Some(h) = handle {
             let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
+    }
+
+    // ── Must 1 RED: overflow awaits rather than silently drops ───────────
+    //
+    // Build a publisher with enough entities that a single first-flush
+    // EXCEEDS the publisher's 64-entry record-channel. Drain only ONE
+    // record on the transport side, then park forever. With an awaited
+    // `send_record`, the publisher MUST suspend after 64 records
+    // (waiting for channel capacity) and the task stays alive. With a
+    // `try_send` regression, the 65th-and-subsequent records would
+    // FAIL with `Full` and be silently dropped — the publisher would
+    // then return from `send_flush` and reach the main loop without
+    // parking, where the only Ready arm is `cancel` (we never cancel),
+    // so the task would stay alive too. To distinguish the two paths,
+    // we capture the `tracing` log: a regression emits
+    // `publish_record_dropped` warns, the awaited implementation does
+    // not — so the warn at the cancel-exit must NOT include that
+    // event name.
+    #[tokio::test]
+    async fn overflow_awaits_backpressure_instead_of_silently_dropping_records() {
+        // Build a config with 50 sensors — each contributes 1 discovery
+        // and 2 snapshot records (state + availability). 50 sensors =
+        // ~150 records per flush, far past the 64-entry channel.
+        let mut cfg = enabled_publish_config();
+        for i in 1..=50 {
+            cfg.sensors.insert(
+                format!("desk_{i}"),
+                SensorConfig::Mqtt(MqttSensorCfg {
+                    broker_url: "tcp://h:1883".into(),
+                    topic: format!("dormant/desk_{i}"),
+                    field: "/v".into(),
+                    payload_on: None,
+                    payload_off: None,
+                    kind: SensorKind::default(),
+                    hold_time: None,
+                    stale_timeout: None,
+                    availability_topic: None,
+                    availability_payload_online: "online".into(),
+                    availability_payload_offline: "offline".into(),
+                }),
+            );
+        }
+        let cfg = Arc::new(cfg);
+        let creds = publish_creds_for("tcp://h:1883");
+        let (event_tx_for_sub, _event_rx) = tokio::sync::broadcast::channel::<DaemonEvent>(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let cfg_for_handler = cfg.clone();
+        let _responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::SubscribeEvents(tx) => {
+                        let _ = tx.send(event_tx_for_sub.subscribe());
+                    }
+                    ControlMsg::Snapshot(tx) => {
+                        let _ = tx.send(snapshot_one_of_each_shape(&cfg_for_handler));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        struct HoldTransport;
+        #[async_trait]
+        impl PublisherTransport for HoldTransport {
+            async fn run(
+                self: Box<Self>,
+                mut record_rx: mpsc::Receiver<PublishRecord>,
+                lifecycle_tx: mpsc::Sender<TransportLifecycle>,
+                trans_cancel: tokio_util::sync::CancellationToken,
+            ) -> Result<(), String> {
+                let _ = lifecycle_tx.send(TransportLifecycle::Connected).await;
+                // Drain exactly ONE record to confirm wiring — then park
+                // until the publisher's transport-cancel reaches this
+                // task via finalize_shutdown.
+                let _ = record_rx.recv().await;
+                let hang = std::future::pending::<()>();
+                tokio::pin!(hang);
+                tokio::select! {
+                    () = &mut hang => {}
+                    () = trans_cancel.cancelled() => {}
+                }
+                Ok(())
+            }
+        }
+
+        let handle = spawn_with_transport(
+            StatePublisherDeps {
+                config: cfg.clone(),
+                credentials: creds,
+                ctl_tx: ctl_tx.clone(),
+                cancel: cancel.clone(),
+            },
+            Box::new(HoldTransport),
+        )
+        .expect("spawn must succeed");
+
+        // Wait briefly for the publisher's first-flush to enter the
+        // parking state. With awaited send, the publisher is suspended
+        // on `record_tx.send().await` (channel-full after 64 records).
+        // With try_send-drop, the publisher would still be in the same
+        // observable state (task not finished, select not firing
+        // any arm) — but the WARNING log line distinguishes them.
+        let poll_until_alive = || async {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+            loop {
+                if !handle.is_finished() {
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                // Yield to the runtime without sleeping; the publisher
+                // task makes no progress without a runtime tick here, but
+                // event-loop bookkeeping on a quiet CI machine is enough.
+                tokio::task::yield_now().await;
+            }
+        };
+        poll_until_alive().await;
+        assert!(
+            !handle.is_finished(),
+            "publisher task must STILL be alive (awaiting channel capacity or parked in select)"
+        );
+
+        // Cancel — the awaited implementation drops the rest of the
+        // flush with a `publish_record_dropped` warn for each record it
+        // didn't manage to enqueue. The try_send-drop regression would
+        // ALREADY have dropped the rest with that warn emitted during
+        // the flush itself. In either case the publisher must exit on
+        // cancel; just verify it does.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("publisher must honour cancel during backpressure")
+            .expect("publisher task did not panic");
     }
 
     // ── RED: cancellation publishes a retained `offline` ───────────
@@ -2457,14 +2928,18 @@ mod async_tests {
         assert!(handle.is_some());
 
         ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
-        for _ in 0..50 {
-            if !records_handle.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Event-driven wait: the FakeTransport appends a record under a
+        // mutex and `notify.notify_one()`s on every push, so the wait
+        // returns as soon as the first flush has drained through.
+        let pre_cancel_count = wait_records_count(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            |g| g.len(),
+        )
+        .await;
         assert!(
-            !records_handle.lock().unwrap().is_empty(),
+            pre_cancel_count > 0,
             "publisher must forward at least one record before cancel"
         );
 

@@ -130,7 +130,17 @@ pub fn load_config_from_str(
     // validator's primary concern and the operator can never forget
     // them by setting strictness to "warn". Merged into the same
     // `Warning` vec so CLI validate and web apply both see them.
-    warnings.extend(validate::collect_macos_power_off_warnings(&cfg));
+    //
+    // Platform-gated: the USB-C link drop is a macOS-specific
+    // phenomenon, so a Linux daemon must not surface a "macOS DDC/CI
+    // topology" warning for a hazard that doesn't exist on its host.
+    // `cfg!(target_os = "macos")` is a compile-time host check —
+    // non-macOS builds compile the collector but always pass `false`,
+    // the macOS build compiles the same call site with `true`.
+    warnings.extend(validate::collect_macos_power_off_warnings(
+        &cfg,
+        cfg!(target_os = "macos"),
+    ));
 
     // ── Exactly-one-of blank_mode / ladder (R12 symmetric rule) ─────────────
     for (display_id, dc) in &cfg.displays {

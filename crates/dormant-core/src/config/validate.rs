@@ -371,8 +371,27 @@ pub fn is_macos_power_off_hazard(dc: &DisplayConfig) -> bool {
 /// hazard (issue #126). One [`Warning`] per display that matches the
 /// hazard topology and has NOT been acknowledged via
 /// [`DisplayConfig::power_off_opt_in`].
+///
+/// `target_is_macos` gates the entire collector: a Linux daemon must not
+/// surface a "macOS DDC/CI topology" warning for a hazard that does not
+/// exist on its host (the USB-C link drop is a macOS-specific phenomenon,
+/// not a general DDC/CI failure mode). The pure topology classifier
+/// [`is_macos_power_off_hazard`] stays un-gated so it can be reused by
+/// the web-UI hazard checkbox regardless of host — only the warning
+/// emission is platform-scoped.
+///
+/// Callers typically pass `cfg!(target_os = "macos")` (compile-time host
+/// check); tests pass `true` explicitly so the hazard branch is exercised
+/// on every CI host and one negative test passes `false` to verify the
+/// platform gate.
 #[must_use]
-pub fn collect_macos_power_off_warnings(cfg: &Config) -> Vec<super::schema::Warning> {
+pub fn collect_macos_power_off_warnings(
+    cfg: &Config,
+    target_is_macos: bool,
+) -> Vec<super::schema::Warning> {
+    if !target_is_macos {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for (display_id, dc) in &cfg.displays {
         if !is_macos_power_off_hazard(dc) {
@@ -2933,7 +2952,11 @@ gracee_period = "60s"
     //
     // The topology helper is un-gated so tests can exercise it on Linux CI;
     // the warning text names "macOS DDC/CI topology" so the operator can
-    // see the hazard is platform-specific.
+    // see the hazard is platform-specific. The collector itself takes a
+    // `target_is_macos` parameter so a Linux daemon never surfaces the
+    // macOS-specific hazard for a host that cannot experience it — tests
+    // pass `true` explicitly to exercise the macOS branch on every CI host
+    // and pass `false` for the platform-gate negative.
 
     fn hazardous_shared_ddcci_toml() -> &'static str {
         "config_version = 1\n\
@@ -2944,9 +2967,36 @@ gracee_period = "60s"
          blank_mode = \"power_off\"\n"
     }
 
+    /// Load `toml` and merge in the macOS hazard warnings as if the daemon
+    /// were running on macOS (`target_is_macos = true`). Mirrors the
+    /// real `load_config` call site so the tests exercise the full path
+    /// including the semantic collector, while still being runnable on
+    /// Linux CI. Pass `false` to verify the platform gate.
+    fn load_str_on_macos(
+        toml: &str,
+    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
+        let (cfg, mut warnings) = load_str(toml)?;
+        warnings.extend(crate::config::validate::collect_macos_power_off_warnings(
+            &cfg, true,
+        ));
+        Ok((cfg, warnings))
+    }
+
+    /// Same as [`load_str_on_macos`] but with `target_is_macos = false`
+    /// — for the platform-gate negative test.
+    fn load_str_on_linux(
+        toml: &str,
+    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
+        let (cfg, mut warnings) = load_str(toml)?;
+        warnings.extend(crate::config::validate::collect_macos_power_off_warnings(
+            &cfg, false,
+        ));
+        Ok((cfg, warnings))
+    }
+
     #[test]
     fn power_off_opt_in_hazardous_config_emits_warning() {
-        let (cfg, warnings) = load_str(hazardous_shared_ddcci_toml()).unwrap();
+        let (cfg, warnings) = load_str_on_macos(hazardous_shared_ddcci_toml()).unwrap();
         assert_eq!(cfg.config_version, 1, "config_version survived");
         let errors = validate_with_input_source_readers(
             &cfg,
@@ -2978,6 +3028,30 @@ gracee_period = "60s"
     }
 
     #[test]
+    fn power_off_opt_in_linux_target_does_not_emit_hazard() {
+        // Reviewer nit: a Linux daemon with the hazardous topology must NOT
+        // surface a "macOS DDC/CI topology" warning — the USB-C link drop
+        // is a macOS-specific phenomenon. The platform gate must skip the
+        // collector entirely.
+        let (cfg, warnings) = load_str_on_linux(hazardous_shared_ddcci_toml()).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
+            "Linux daemon must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+        // Sanity: the topology classifier itself is still platform-agnostic
+        // and would say "yes, hazardous" — only the collector's emission is
+        // platform-scoped. Use the un-gated predicate to confirm.
+        assert!(
+            crate::config::validate::is_macos_power_off_hazard(&cfg.displays["shared_oled"]),
+            "the pure classifier must still flag the topology regardless of host"
+        );
+    }
+
+    #[test]
     fn power_off_opt_in_private_display_no_warning() {
         // scope = "private" is the non-shared case — the hazard depends on
         // the USB-C link dropping under a peer's pull, which only matters
@@ -2987,7 +3061,7 @@ gracee_period = "60s"
              controllers = [\"ddcci\"]\n\
              scope = \"private\"\n\
              blank_mode = \"power_off\"\n";
-        let (_, warnings) = load_str(toml).unwrap();
+        let (_, warnings) = load_str_on_macos(toml).unwrap();
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "private display must not emit macOS power-off hazard, got warnings: {:?}",
@@ -3010,10 +3084,69 @@ gracee_period = "60s"
              scope = \"shared\"\n\
              shared_input_code = 1\n\
              blank_mode = \"screen_off_audio_on\"\n";
-        let (_, warnings) = load_str(toml).unwrap();
+        let (_, warnings) = load_str_on_macos(toml).unwrap();
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "screen_off_audio_on primary mode must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn power_off_opt_in_brightness_zero_no_warning() {
+        // Reviewer coverage nit: brightness_zero is also a non-power-off
+        // mode (gamma-only black, no panel standby). It must NOT trigger
+        // the hazard — it is the audio-safe default for macOS DDC/CI
+        // chains that don't need to power-cycle the panel.
+        let toml = "config_version = 1\n\
+             [displays.shared_oled]\n\
+             controllers = [\"ddcci\"]\n\
+             scope = \"shared\"\n\
+             shared_input_code = 1\n\
+             blank_mode = \"brightness_zero\"\n";
+        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
+            "brightness_zero primary mode must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn power_off_opt_in_ladder_resolves_to_power_off_triggers() {
+        // Reviewer coverage nit: a display with no literal `blank_mode`
+        // but a `ladder` whose first Controller stage is power_off has
+        // the same effective primary mode as one with `blank_mode =
+        // "power_off"`. The hazard classifier routes through
+        // `DisplayConfig::primary_blank_mode()`, which the reviewer
+        // verified manually — this test pins the resolution so a
+        // refactor of the ladder desugar can't silently drop the hazard.
+        let toml = "config_version = 1\n\
+             [displays.shared_oled]\n\
+             controllers = [\"ddcci\"]\n\
+             scope = \"shared\"\n\
+             shared_input_code = 1\n\
+             ladder = [\n\
+                 { kind = \"render_black\", dwell = \"30s\" },\n\
+                 { kind = \"power_off\" },\n\
+             ]\n";
+        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| {
+                w.key_path.contains("displays.shared_oled") && w.message.contains("unrecoverable")
+            })
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "ladder resolving primary mode to power_off must trigger the hazard, got warnings: {:?}",
             warnings
                 .iter()
                 .map(|w| (&w.key_path, &w.message))
@@ -3034,7 +3167,7 @@ gracee_period = "60s"
              scope = \"shared\"\n\
              shared_input_code = 1\n\
              blank_mode = \"power_off\"\n";
-        let (_, warnings) = load_str(toml).unwrap();
+        let (_, warnings) = load_str_on_macos(toml).unwrap();
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "ddcci as a non-first fallback must not emit macOS power-off hazard, got warnings: {:?}",
@@ -3057,7 +3190,7 @@ gracee_period = "60s"
              shared_input_code = 1\n\
              blank_mode = \"power_off\"\n\
              power_off_opt_in = true\n";
-        let (_, warnings) = load_str(toml).unwrap();
+        let (_, warnings) = load_str_on_macos(toml).unwrap();
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "power_off_opt_in = true must silence the macOS power-off hazard, got warnings: {:?}",

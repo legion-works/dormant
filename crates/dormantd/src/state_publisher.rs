@@ -2,7 +2,7 @@
 //!
 //! Implements the topic, payload, and collision contract ratified in
 //! `.opencode/decisions/2026-07-27-mqtt-publish-contract.md`. NO I/O:
-//! the three public entry points return `Vec<PublishRecord>` for the
+//! the public entry points return `Vec<PublishRecord>` for the
 //! publisher task to forward to `rumqttc`. Keeping these functions
 //! pure is the same split the wear tracker uses (see `wear_tracker.rs`):
 //! testing each one in isolation without bringing up a broker is the
@@ -16,6 +16,10 @@
 //! - [`EntityInventory`] — collects the per-kind id lists from a
 //!   loaded [`Config`] in config-order. `IndexMap` ordering is the
 //!   "first wins" half of the collision rule.
+//! - [`global_online_record`] — retained `online` for the global LWT
+//!   availability topic (issue #174). The discovery payloads all
+//!   reference this topic, so its wire-state gates every entity's HA
+//!   "available" bit; nothing else ever writes `online` to it.
 //! - [`discovery_records`] — discovery configs for sensors, zones,
 //!   and displays. One retained record per entity, every entity
 //!   references the global LWT availability topic, and sensor
@@ -31,11 +35,11 @@
 //!
 //! ## Disabled-by-default
 //!
-//! Every entry point returns an empty `Vec` when
-//! `cfg.publish.enabled == false`. The publisher task is the only
-//! caller and it gates the call site on the same flag; the check
-//! here is defensive (and keeps the pure functions easy to
-//! unit-test without a real broker).
+//! Every entry point returns an empty `Vec` (or `None` for the single
+//! [`PublishRecord`] helper) when `cfg.publish.enabled == false`. The
+//! publisher task is the only caller and it gates the call site on the
+//! same flag; the check here is defensive (and keeps the pure
+//! functions easy to unit-test without a real broker).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -83,13 +87,24 @@ const RETAIN: bool = true;
 // connected at a time.
 
 /// Lifecycle event emitted by a [`PublisherTransport`] on every
-/// (re)connect and on graceful disconnect.
+/// (re)connect, on graceful disconnect, and on Home Assistant's
+/// birth announcement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportLifecycle {
     /// The transport has (re)connected and is ready to forward records.
     /// The publisher responds by republishing discovery + a current
     /// snapshot, exactly as the contract requires.
     Connected,
+    /// Home Assistant has announced it is back online on
+    /// `<discovery_prefix>/status`. Issue #174: an operator who deletes
+    /// an entity in HA clears its retained discovery config topic, and
+    /// HA also clears all dormant's discovery topics when HA itself
+    /// restarts. Subscribing to the HA birth topic lets the publisher
+    /// re-flush discovery + a fresh snapshot whenever HA comes back, so
+    /// the deleted entity reappears. The publisher responds EXACTLY
+    /// like `Connected`: send a retained `online` on the global
+    /// availability topic, then re-flush discovery, then re-snapshot.
+    BirthOnline,
     /// The transport has disconnected (graceful via cancellation, or
     /// ungraceful via a broker-side drop). The production transport
     /// owns its own reconnect/backoff loop and self-re-emits Connected
@@ -117,9 +132,13 @@ pub trait PublisherTransport: Send + 'static {
     /// On every successful connect the transport MUST emit a
     /// [`TransportLifecycle::Connected`] on `lifecycle_tx` BEFORE the
     /// first publish (the publisher responds by repushing discovery and
-    /// the current snapshot). On graceful cancellation it MUST emit a
-    /// final best-effort retained-offline publish (the LWT covers
-    /// ungraceful broker-side drops) followed by a
+    /// the current snapshot). The production transport also subscribes
+    /// to Home Assistant's birth topic (`<discovery_prefix>/status`)
+    /// and emits a [`TransportLifecycle::BirthOnline`] whenever HA
+    /// comes back online (issue #174); the publisher treats that signal
+    /// identically to `Connected`. On graceful cancellation the
+    /// transport MUST emit a final best-effort retained-offline publish
+    /// (the LWT covers ungraceful broker-side drops) followed by a
     /// [`TransportLifecycle::Disconnected`].
     async fn run(
         self: Box<Self>,
@@ -249,6 +268,16 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
                     tracing::debug!(event = "publish_first_connected");
                     ever_connected = true;
                 }
+                Some(TransportLifecycle::BirthOnline) => {
+                    // Defensive: production emits `Connected` AFTER the
+                    // ConnAck and BEFORE the status-topic subscribe, so a
+                    // `BirthOnline` arriving here means the lifecycle
+                    // ordering regressed. Treat it the same as Connected
+                    // (proceed with the first flush) so a buggy transport
+                    // can't strand us in the wait loop forever.
+                    tracing::debug!(event = "publish_first_birth_online");
+                    ever_connected = true;
+                }
                 Some(TransportLifecycle::Disconnected) => { /* keep waiting */ }
                 None => return,
             },
@@ -259,23 +288,18 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
         }
     }
 
-    // First connect: flush discovery + snapshot.
-    {
-        let inventory = EntityInventory::from_config(&config);
-        let _ = detect_and_warn_collisions(&config, &inventory);
-        let disc = discovery_records(&config, &inventory, &instance);
-        let snaps = snapshot_records(&config, &snapshot, &instance);
-        let total = disc.len() + snaps.len();
-        tracing::debug!(
-            event = "publish_first_flush",
-            discovery = disc.len(),
-            snapshot = snaps.len(),
-            total,
-            "publishing initial discovery + snapshot"
-        );
-        send_flush(&record_tx, &cancel, disc).await;
-        send_flush(&record_tx, &cancel, snaps).await;
-    }
+    // First connect: flush global online + discovery + snapshot.
+    flush_full(FlushRequest {
+        cfg: &config,
+        snapshot: &mut snapshot,
+        instance: &instance,
+        record_tx: &record_tx,
+        ctl_tx: &ctl_tx,
+        cancel: &cancel,
+        request_fresh_snapshot: false,
+        event_label: "publish_first_flush",
+    })
+    .await;
 
     // Drain lifecycle + events until cancel or transport exit.
     loop {
@@ -287,23 +311,40 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
             () = cancel.cancelled() => return finalize_shutdown(transport_cancel, transport_handle).await,
             maybe = lifecycle_rx.recv() => match maybe {
                 Some(TransportLifecycle::Connected) => {
-                    // Reconnect: re-flush discovery + a fresh snapshot.
-                    let inventory = EntityInventory::from_config(&config);
-                    let _ = detect_and_warn_collisions(&config, &inventory);
-                    let disc = discovery_records(&config, &inventory, &instance);
-                    let disc_total = disc.len();
-                    send_flush(&record_tx, &cancel, disc).await;
-                    if let Some(new_snap) = request_snapshot(&ctl_tx, &cancel).await {
-                        snapshot = new_snap;
-                        let snaps = snapshot_records(&config, &snapshot, &instance);
-                        tracing::debug!(
-                            event = "publish_reconnect_flush",
-                            discovery = disc_total,
-                            snapshot = snaps.len(),
-                            "publishing reconnect discovery + snapshot"
-                        );
-                        send_flush(&record_tx, &cancel, snaps).await;
-                    }
+                    // Reconnect: re-flush global online + discovery + a fresh snapshot.
+                    flush_full(
+                        FlushRequest {
+                            cfg: &config,
+                            snapshot: &mut snapshot,
+                            instance: &instance,
+                            record_tx: &record_tx,
+                            ctl_tx: &ctl_tx,
+                            cancel: &cancel,
+                            request_fresh_snapshot: true,
+                            event_label: "publish_reconnect_flush",
+                        },
+                    )
+                    .await;
+                }
+                Some(TransportLifecycle::BirthOnline) => {
+                    // HA came back online — re-flush the same way we do on
+                    // reconnect so an entity the operator deleted in HA
+                    // (HA clears the retained discovery config topic on
+                    // delete, and on HA's own restart) is re-discovered.
+                    // Issue #174.
+                    flush_full(
+                        FlushRequest {
+                            cfg: &config,
+                            snapshot: &mut snapshot,
+                            instance: &instance,
+                            record_tx: &record_tx,
+                            ctl_tx: &ctl_tx,
+                            cancel: &cancel,
+                            request_fresh_snapshot: true,
+                            event_label: "publish_ha_birth_reflush",
+                        },
+                    )
+                    .await;
                 }
                 Some(TransportLifecycle::Disconnected) => { /* reconnect handled by Connected */ }
                 None => {
@@ -371,6 +412,77 @@ async fn request_snapshot(
         () = cancel.cancelled() => None,
         res = snap_rx => res.ok(),
     }
+}
+
+/// All inputs the publisher's three flush paths (first-connect,
+/// reconnect, HA birth) need. Bundled into one struct so the three
+/// sites call the same helper with the same arguments — issue #174's
+/// shared flush is the only seam that prevents a regression on one
+/// path from silently breaking the other two.
+struct FlushRequest<'a> {
+    cfg: &'a Config,
+    snapshot: &'a mut StateSnapshot,
+    instance: &'a str,
+    record_tx: &'a mpsc::Sender<PublishRecord>,
+    ctl_tx: &'a mpsc::Sender<dormant_core::rules::ControlMsg>,
+    cancel: &'a tokio_util::sync::CancellationToken,
+    /// True on reconnect and HA-birth paths (a fresh snapshot may pick
+    /// up state that changed while we were disconnected); false on the
+    /// initial first-connect (we already hold the snapshot the caller
+    /// requested at startup, so an extra round-trip is wasted).
+    request_fresh_snapshot: bool,
+    /// Tracing event literal — `publish_first_flush`,
+    /// `publish_reconnect_flush`, or `publish_ha_birth_reflush`.
+    /// `tracing` reads these as field values, so the literal MUST match
+    /// the grep-stable contract above.
+    event_label: &'static str,
+}
+
+/// Shared flush body used by first-connect, reconnect, and the HA birth
+/// signal. The publisher's contract says every connected/re-flush moment
+/// must (1) emit a retained `online` on the global LWT availability
+/// topic, (2) re-publish every discovery config, (3) re-publish the
+/// current retained state. Without this helper the three paths would
+/// drift out of sync (issue #174's defect #1 is exactly that drift —
+/// the global `online` was forgotten on every path).
+async fn flush_full(req: FlushRequest<'_>) {
+    let FlushRequest {
+        cfg,
+        snapshot,
+        instance,
+        record_tx,
+        ctl_tx,
+        cancel,
+        request_fresh_snapshot,
+        event_label,
+    } = req;
+
+    // 1. Global `online` — every discovery payload references this topic;
+    //    without a retained `online`, HA marks every entity unavailable.
+    if let Some(rec) = global_online_record(cfg, instance) {
+        send_flush(record_tx, cancel, vec![rec]).await;
+    }
+
+    // 2. Discovery configs.
+    let inventory = EntityInventory::from_config(cfg);
+    let _ = detect_and_warn_collisions(cfg, &inventory);
+    let disc = discovery_records(cfg, &inventory, instance);
+    let disc_total = disc.len();
+    send_flush(record_tx, cancel, disc).await;
+
+    // 3. Snapshot — fresh if requested (reconnect / HA birth), otherwise
+    //    the caller's pre-existing snapshot.
+    if request_fresh_snapshot && let Some(new_snap) = request_snapshot(ctl_tx, cancel).await {
+        *snapshot = new_snap;
+    }
+    let snaps = snapshot_records(cfg, snapshot, instance);
+    tracing::debug!(
+        event = event_label,
+        discovery = disc_total,
+        snapshot = snaps.len(),
+        "publishing discovery + snapshot flush"
+    );
+    send_flush(record_tx, cancel, snaps).await;
 }
 
 /// Awaited forward of a single record to the transport-side
@@ -464,6 +576,12 @@ pub mod mqtt_transport {
         client_id: String,
         credentials: Credentials,
         global_availability_topic: String,
+        /// Home Assistant's birth topic (`<discovery_prefix>/status`),
+        /// sanitized the same way as `discovery_records` builds its
+        /// topics. Subscribed once per (re)connect; an incoming
+        /// `online` payload drives a [`TransportLifecycle::BirthOnline`]
+        /// so the publisher can re-flush discovery (issue #174).
+        status_topic: String,
         backoff_initial: Duration,
         backoff_max: Duration,
         per_attempt_timeout: Duration,
@@ -481,12 +599,20 @@ pub mod mqtt_transport {
             let base = super::sanitize_topic_id(&cfg.publish.base_topic);
             let instance = super::sanitize_topic_id(instance);
             let global_availability_topic = format!("{base}/{instance}/availability");
+            // Sanitize the discovery prefix the SAME way `discovery_records`
+            // does — the prefix sanitization is the only seam keeping the
+            // status topic on the same wire layout as the discovery
+            // configs. A user who puts spaces in their prefix gets the
+            // same underscore-collapsed topic for both.
+            let discovery_prefix = super::sanitize_topic_id(&cfg.publish.discovery_prefix);
+            let status_topic = format!("{discovery_prefix}/status");
             let client_id = format!("dormant-publisher-{instance}-{}", std::process::id());
             Box::new(Self {
                 broker_url,
                 client_id,
                 credentials: credentials.clone(),
                 global_availability_topic,
+                status_topic,
                 backoff_initial: Duration::from_millis(100),
                 backoff_max: Duration::from_secs(5),
                 per_attempt_timeout: Duration::from_secs(2),
@@ -542,6 +668,18 @@ pub mod mqtt_transport {
                 creds.mqtt.get(url).is_some()
             )
         }
+
+        /// Return the HA birth topic the transport subscribes to after
+        /// each `ConnAck`. Public-only for tests that assert the topic
+        /// derivation stays consistent with `discovery_records`'s
+        /// prefix sanitization (issue #174: an off-by-one between the
+        /// subscribe topic and the discovery prefix would silently
+        /// disable the re-flush path).
+        #[must_use]
+        pub fn status_topic_for_test(discovery_prefix: &str) -> String {
+            let sanitized = super::sanitize_topic_id(discovery_prefix);
+            format!("{sanitized}/status")
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -574,6 +712,27 @@ pub mod mqtt_transport {
                 let (client, mut eventloop) = AsyncClient::new(opts, 16);
                 match tokio::time::timeout(self.per_attempt_timeout, eventloop.poll()).await {
                     Ok(Ok(rumqttc::Event::Incoming(Packet::ConnAck(_)))) => {
+                        // Issue #174 Should 2: drain stale records from
+                        // any aborted flush that left records sitting in
+                        // `record_rx` across the reconnect. The
+                        // publisher's reconnect arm will re-flush
+                        // everything on Connected, so anything queued
+                        // here is older than the current state and would
+                        // briefly publish stale state. The empty-topic
+                        // close sentinel MUST NOT be swallowed — if the
+                        // publisher signaled shutdown mid-disconnect, we
+                        // honor it (Disconnected + return).
+                        let Some(drained) = drain_stale_records(&mut record_rx) else {
+                            let _ = lifecycle_tx.send(TransportLifecycle::Disconnected).await;
+                            return Ok(());
+                        };
+                        if drained > 0 {
+                            tracing::debug!(
+                                event = "publish_stale_records_dropped",
+                                drained,
+                                "stale records from aborted flush dropped on reconnect"
+                            );
+                        }
                         // First connect: emit Connected.
                         if lifecycle_tx
                             .send(TransportLifecycle::Connected)
@@ -581,6 +740,23 @@ pub mod mqtt_transport {
                             .is_err()
                         {
                             return Ok(());
+                        }
+                        // Subscribe to Home Assistant's birth topic so a
+                        // retained-deleted entity in HA is re-discovered
+                        // on HA's `online` announcement. Issue #174: HA
+                        // clears dormant's retained discovery configs when
+                        // an entity is deleted there, and on HA's own
+                        // restart; subscribing to `<discovery_prefix>/status`
+                        // is the MQTT-integration standard way to learn
+                        // HA is back so the publisher can re-flush.
+                        if let Err(e) = client.subscribe(&self.status_topic, QoS::AtLeastOnce).await
+                        {
+                            tracing::debug!(
+                                event = "publish_status_subscribe_failed",
+                                topic = %self.status_topic,
+                                error = %e,
+                                "status-topic subscribe failed; HA birth re-flush will be unavailable this session"
+                            );
                         }
                         backoff = self.backoff_initial;
                     }
@@ -607,6 +783,7 @@ pub mod mqtt_transport {
 
                 // Connected. Pump records + poll the event loop until
                 // disconnect or cancel.
+                let mut pending_birth = false;
                 'pump: loop {
                     tokio::select! {
                         biased;
@@ -624,7 +801,11 @@ pub mod mqtt_transport {
                             // the PubAck so it lands before we close.
                             let _ = tokio::time::timeout(
                                 Duration::from_millis(500),
-                                wait_for_publish_id(&mut eventloop),
+                                wait_for_publish_id(
+                                    &mut eventloop,
+                                    &self.status_topic,
+                                    &mut pending_birth,
+                                ),
                             )
                             .await;
                             let _ = lifecycle_tx
@@ -665,7 +846,11 @@ pub mod mqtt_transport {
                             // time through a bounded mpsc).
                             if tokio::time::timeout(
                                 Duration::from_secs(5),
-                                wait_for_publish_id(&mut eventloop),
+                                wait_for_publish_id(
+                                    &mut eventloop,
+                                    &self.status_topic,
+                                    &mut pending_birth,
+                                ),
                             )
                             .await
                             .is_err()
@@ -676,6 +861,25 @@ pub mod mqtt_transport {
                                     .await;
                                 break 'pump;
                             }
+                            // After the wait, surface any pending
+                            // `BirthOnline` observation: a HA
+                            // `<discovery_prefix>/status` `Publish` with
+                            // payload `online` that arrived during the
+                            // PubAck-wait window would otherwise be
+                            // silently dropped (issue #174 Should 1).
+                            // The flag is sticky — N arrivals in one
+                            // flush collapse to one re-flush, which is
+                            // correct.
+                            if take_pending_birth(&mut pending_birth) {
+                                tracing::info!(event = "publish_ha_birth_reflush");
+                                if lifecycle_tx
+                                    .send(TransportLifecycle::BirthOnline)
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
                         }
                         event = eventloop.poll() => {
                             match event {
@@ -685,6 +889,27 @@ pub mod mqtt_transport {
                                         .send(TransportLifecycle::Disconnected)
                                         .await;
                                     break 'pump;
+                                }
+                                Ok(Event::Incoming(packet @ Packet::Publish(_))) => {
+                                    // Home Assistant publishes `online` on
+                                    // `<discovery_prefix>/status` on startup
+                                    // (and on a clean restart); `offline` on
+                                    // graceful shutdown. We only care about
+                                    // the `online` edge — the `offline`
+                                    // arrival is a normal HA restart in
+                                    // progress, NOT a defunct signal we
+                                    // need to react to.
+                                    observe_birth_packet(&packet, &self.status_topic, &mut pending_birth);
+                                    if take_pending_birth(&mut pending_birth) {
+                                        tracing::info!(event = "publish_ha_birth_reflush");
+                                        if lifecycle_tx
+                                            .send(TransportLifecycle::BirthOnline)
+                                            .await
+                                            .is_err()
+                                        {
+                                            return Ok(());
+                                        }
+                                    }
                                 }
                                 Ok(_) => {}
                             }
@@ -698,14 +923,71 @@ pub mod mqtt_transport {
         }
     }
 
-    /// Event-loop drain until we see ANY `PubAck` (the publisher pushes
-    /// one record at a time, so order is preserved).
-    async fn wait_for_publish_id(eventloop: &mut EventLoop) -> Result<(), String> {
+    /// Event-loop drain until a [`Packet::PubAck`] lands for the most
+    /// recent publish. The publisher pushes records one at a time through
+    /// a bounded mpsc, so order is preserved by the caller's sequential
+    /// `await`s.
+    ///
+    /// WHILE draining, also watch for an incoming [`Packet::Publish`] on
+    /// `status_topic` with payload `online` and flip `pending_birth` if
+    /// seen. Issue #174 Should 1: HA's retained `online` is delivered by
+    /// the broker immediately after the Subscribe Ack, so an `online`
+    /// arriving during any of the PubAck-wait windows in a flush would
+    /// previously be silently dropped (only `PubAck` returned `Ok`), and
+    /// the `BirthOnline` re-flush would self-heal only on a later
+    /// reconnect — potentially days for an operator with a stable
+    /// network. The flag is sticky: N `online` arrivals during one wait
+    /// collapse to one re-flush, which is correct (multiple births in a
+    /// single flush is implausible but the dedup costs nothing).
+    async fn wait_for_publish_id(
+        eventloop: &mut EventLoop,
+        status_topic: &str,
+        pending_birth: &mut bool,
+    ) -> Result<(), String> {
         loop {
             match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::PubAck(_))) => return Ok(()),
+                Ok(Event::Incoming(packet)) => {
+                    let is_ack = matches!(&packet, Packet::PubAck(_));
+                    observe_birth_packet(&packet, status_topic, pending_birth);
+                    if is_ack {
+                        return Ok(());
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    pub(crate) fn observe_birth_packet(
+        packet: &Packet,
+        status_topic: &str,
+        pending_birth: &mut bool,
+    ) {
+        if let Packet::Publish(p) = packet
+            && p.topic == status_topic
+            && p.payload.as_ref() == b"online"
+        {
+            *pending_birth = true;
+        }
+    }
+
+    pub(crate) fn take_pending_birth(pending_birth: &mut bool) -> bool {
+        let pending = *pending_birth;
+        *pending_birth = false;
+        pending
+    }
+
+    pub(crate) fn drain_stale_records(
+        record_rx: &mut mpsc::Receiver<PublishRecord>,
+    ) -> Option<usize> {
+        let mut drained = 0usize;
+        loop {
+            match record_rx.try_recv() {
+                Ok(rec) if rec.topic.is_empty() => return None,
+                Ok(_) => drained += 1,
+                Err(mpsc::error::TryRecvError::Empty) => return Some(drained),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
             }
         }
     }
@@ -934,6 +1216,36 @@ fn device_block(instance: &str) -> serde_json::Value {
 }
 
 // ── Public entry points ─────────────────────────────────────────────────────
+
+/// Build the retained `online` record for the global LWT availability
+/// topic. Every discovery payload references this topic (built from
+/// `topic_availability`); without this helper, nothing on the publish
+/// plane ever writes `online` to it, so HA marks every entity
+/// unavailable after the first retained `offline` (issue #174).
+///
+/// The wire topic MUST match the LWT topic the broker falls back to
+/// on broker-side drop, so HA's availability claim (offline on drop,
+/// online on retained `online`) flips on the same signal. The
+/// payload is the contract's literal `online`; the QoS/retain flags
+/// mirror the LWT (`QoS` 1, retain `true`) so a missed `PubAck` during a
+/// broker restart still lands as the latest known availability.
+///
+/// Returns `None` when `cfg.publish.enabled == false` so the publisher
+/// task can short-circuit without a flag check at every call site.
+#[must_use]
+pub fn global_online_record(cfg: &Config, instance: &str) -> Option<PublishRecord> {
+    if !cfg.publish.enabled {
+        return None;
+    }
+    let base = sanitize_topic_id(&cfg.publish.base_topic);
+    let instance = sanitize_topic_id(instance);
+    Some(PublishRecord {
+        topic: topic_availability(&base, &instance),
+        payload: "online".to_string(),
+        qos: PUBLISH_QOS,
+        retain: RETAIN,
+    })
+}
 
 /// Discovery configs for every entity the inventory knows about.
 ///
@@ -1491,6 +1803,53 @@ mod tests {
         let cfg = disabled_cfg();
         let inv = EntityInventory::from_config(&cfg);
         assert!(discovery_records(&cfg, &inv, "office-pc").is_empty());
+    }
+
+    // ── Global online availability (issue #174) ───────────────────
+
+    #[test]
+    fn global_online_record_none_when_disabled() {
+        // The defensive disabled-by-default check must short-circuit
+        // to None — the production `run` loop already gates on the
+        // same flag, but every public entry point returns an empty
+        // (or None for the single-record helper) value so a caller
+        // that forgets the flag check does not silently publish an
+        // `online` while everything else stays silent.
+        let cfg = disabled_cfg();
+        assert!(
+            global_online_record(&cfg, "office-pc").is_none(),
+            "publish.enabled=false must short-circuit global_online_record to None"
+        );
+    }
+
+    #[test]
+    fn global_online_record_shape_when_enabled() {
+        // Cross-check the wire shape of the helper: retained QoS-1
+        // `online` on the global LWT availability topic. Every entity
+        // the discovery side emits references this topic, so the
+        // payload MUST match the LWT's payload vocabulary (`online`)
+        // and the retain flag MUST match the LWT's retain so a
+        // retained payload swap on the broker is a no-op.
+        let cfg = enabled_cfg();
+        let rec = global_online_record(&cfg, "office-pc")
+            .expect("enabled config must produce a global online record");
+        assert_eq!(rec.topic, "dormant/office-pc/availability");
+        assert_eq!(rec.payload, "online");
+        assert_eq!(rec.qos, 1);
+        assert!(rec.retain, "global online is retained (matches LWT)");
+    }
+
+    #[test]
+    fn global_online_record_sanitizes_base_and_instance() {
+        // The helper reuses the existing `sanitize_topic_id` and
+        // `topic_availability` seams; this is a cross-check that
+        // nothing in the helper accidentally re-derives the topic
+        // shape and bypasses the sanitizer.
+        let mut cfg = enabled_cfg();
+        cfg.publish.base_topic = "Dormant Prod".into();
+        cfg.publish.instance_id = "Weird Host!".into();
+        let rec = global_online_record(&cfg, "Weird Host!").expect("enabled");
+        assert_eq!(rec.topic, "dormant_prod/weird_host/availability");
     }
 
     #[test]
@@ -2308,11 +2667,30 @@ mod async_tests {
     #[allow(dead_code)]
     #[derive(Debug, Clone, Copy)]
     enum FakeCtrl {
-        /// Equivalent to a `ConnAck` landing — emit Connected on the
-        /// publisher's lifecycle channel.
+        /// Equivalent to a `ConnAck` landing. The fake mirrors
+        /// production's drain-on-reconnect: stale records sitting in
+        /// `record_rx` from any aborted flush are dropped here BEFORE
+        /// the lifecycle `Connected` is emitted, so the publisher only
+        /// sees the fresh re-flush. Issue #174 Should 2.
         Connected,
         /// Equivalent to a clean Disconnect — emit Disconnected.
         Disconnected,
+        /// Equivalent to Home Assistant publishing `online` on
+        /// `<discovery_prefix>/status` ARRIVING DURING A FLUSH.
+        /// Production's `wait_for_publish_id` observes this in the
+        /// PubAck-wait drain and flips a sticky `pending_birth` flag,
+        /// then emits `BirthOnline` after the wait. The fake mirrors
+        /// that with a sticky flag set on receipt and consumed by the
+        /// `record_rx.recv()` arm after the next record lands, so the
+        /// test exercises the same dedup/forward seam. Issue #174
+        /// Should 1.
+        BirthDuringFlush,
+        /// Equivalent to Home Assistant publishing `online` on
+        /// `<discovery_prefix>/status` while the transport is idle in
+        /// `eventloop.poll()`. The fake emits a `BirthOnline`
+        /// lifecycle signal so the publisher re-flushes discovery +
+        /// snapshot. Issue #174 (defect #2 primary path).
+        BirthOnline,
         /// Gracefully stop the transport run loop (test-only escape hatch).
         Stop,
         /// Toggle the park mode: while parked, the transport does NOT
@@ -2332,6 +2710,13 @@ mod async_tests {
         records: Arc<StdMutex<Vec<PublishRecord>>>,
         records_notify: Arc<Notify>,
         ctrl_rx: mpsc::Receiver<FakeCtrl>,
+        /// Sticky flag mirroring production's `MqttTransport`'s
+        /// `pending_birth`. Set by [`FakeCtrl::BirthDuringFlush`],
+        /// consumed (and emitted as `TransportLifecycle::BirthOnline`)
+        /// by the next `record_rx.recv()` arm — matching production's
+        /// "emit `BirthOnline` AFTER the PubAck-wait returns to the
+        /// select loop" semantics. Issue #174 Should 1.
+        pending_birth: bool,
     }
 
     impl FakeTransport {
@@ -2343,6 +2728,7 @@ mod async_tests {
                     records: Arc::new(StdMutex::new(Vec::new())),
                     records_notify: Arc::new(Notify::new()),
                     ctrl_rx,
+                    pending_birth: false,
                 },
                 ctrl_tx,
             )
@@ -2396,6 +2782,33 @@ mod async_tests {
                         let Some(cmd) = ctrl else { return Ok(()); };
                         match cmd {
                             FakeCtrl::Connected => {
+                                // Mirror production's drain-on-reconnect
+                                // (issue #174 Should 2): drop any stale
+                                // records sitting in `record_rx` from an
+                                // aborted flush BEFORE signalling
+                                // Connected, so the publisher only sees
+                                // the fresh re-flush records. The
+                                // empty-topic close sentinel MUST NOT be
+                                // swallowed — if seen, honor it
+                                // (Disconnected + return).
+                                loop {
+                                    match record_rx.try_recv() {
+                                        Ok(rec) if rec.topic.is_empty() => {
+                                            let _ = lifecycle_tx
+                                                .send(TransportLifecycle::Disconnected)
+                                                .await;
+                                            return Ok(());
+                                        }
+                                        Ok(_) => {}
+                                        Err(mpsc::error::TryRecvError::Empty) => break,
+                                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                                            let _ = lifecycle_tx
+                                                .send(TransportLifecycle::Disconnected)
+                                                .await;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
                                 let _ = lifecycle_tx
                                     .send(TransportLifecycle::Connected)
                                     .await;
@@ -2403,6 +2816,33 @@ mod async_tests {
                             FakeCtrl::Disconnected => {
                                 let _ = lifecycle_tx
                                     .send(TransportLifecycle::Disconnected)
+                                    .await;
+                            }
+                            FakeCtrl::BirthDuringFlush => {
+                                // Equivalent to HA publishing `online`
+                                // on `<discovery_prefix>/status` while the
+                                // transport is in the middle of draining
+                                // a PubAck wait. Production's
+                                // `wait_for_publish_id` observes this in
+                                // the drain and flips a sticky
+                                // `pending_birth` flag, then the
+                                // record-pump arm emits `BirthOnline`
+                                // after the wait returns. The fake mirrors
+                                // the seam: the flag is set here, and the
+                                // `record_rx.recv()` arm below consumes it
+                                // after the next record lands.
+                                self.pending_birth = true;
+                            }
+                            FakeCtrl::BirthOnline => {
+                                // Equivalent to HA publishing `online` on
+                                // `<discovery_prefix>/status`. Production's
+                                // `MqttTransport` derives the same signal
+                                // from an incoming `Packet::Publish` on the
+                                // status topic — the fake just injects it
+                                // directly so tests can drive the
+                                // re-flush path deterministically.
+                                let _ = lifecycle_tx
+                                    .send(TransportLifecycle::BirthOnline)
                                     .await;
                             }
                             FakeCtrl::Stop => {
@@ -2447,6 +2887,18 @@ mod async_tests {
                             g.push(rec);
                         }
                         self.records_notify.notify_one();
+                        // After the record lands, surface any pending
+                        // `BirthOnline` observation from a `FakeCtrl::
+                        // BirthDuringFlush` delivered earlier in the
+                        // flush window (issue #174 Should 1). The flag
+                        // is sticky and consumed exactly once here —
+                        // matching production's dedup.
+                        if self.pending_birth {
+                            self.pending_birth = false;
+                            let _ = lifecycle_tx
+                                .send(TransportLifecycle::BirthOnline)
+                                .await;
+                        }
                     }
                 }
             }
@@ -2797,6 +3249,81 @@ mod async_tests {
         );
     }
 
+    // ── RED: status-topic derivation (issue #174) ──────────────
+
+    #[test]
+    fn mqtt_transport_status_topic_derives_from_sanitized_discovery_prefix() {
+        // The transport subscribes to `<sanitized_discovery_prefix>/status`
+        // AFTER each ConnAck; the same prefix is used (after sanitization)
+        // by `discovery_records` to build discovery topics. The two must
+        // use the same prefix sanitization or HA's birth subscribe would
+        // land on a topic HA never publishes on. Asserting through
+        // `status_topic_for_test` keeps the wiring visible without a live
+        // broker.
+        let opts = super::mqtt_transport::MqttTransport::status_topic_for_test("homeassistant");
+        assert_eq!(opts, "homeassistant/status");
+
+        // Sanitization must mirror the discovery topic builder — a prefix
+        // with whitespace MUST collapse to the underscore-folded form so
+        // the subscribe topic and the discovery topic share a wire shape.
+        let opts_sanitized =
+            super::mqtt_transport::MqttTransport::status_topic_for_test("Home Assistant");
+        assert_eq!(opts_sanitized, "home_assistant/status");
+    }
+
+    #[test]
+    fn birth_packets_during_publish_wait_collapse_to_one_pending_birth() {
+        let status_topic = "homeassistant/status";
+        let mut pending_birth = false;
+        let online = rumqttc::Packet::Publish(rumqttc::Publish {
+            dup: false,
+            qos: rumqttc::QoS::AtLeastOnce,
+            retain: true,
+            topic: status_topic.into(),
+            pkid: 1,
+            payload: "online".into(),
+        });
+
+        super::mqtt_transport::observe_birth_packet(&online, status_topic, &mut pending_birth);
+        super::mqtt_transport::observe_birth_packet(&online, status_topic, &mut pending_birth);
+
+        assert!(super::mqtt_transport::take_pending_birth(
+            &mut pending_birth
+        ));
+        assert!(!super::mqtt_transport::take_pending_birth(
+            &mut pending_birth
+        ));
+    }
+
+    #[test]
+    fn reconnect_drain_discards_stale_records_and_preserves_fresh_record() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.blocking_send(PublishRecord {
+            topic: "stale".into(),
+            payload: "old".into(),
+            qos: 1,
+            retain: true,
+        })
+        .unwrap();
+        tx.blocking_send(PublishRecord {
+            topic: String::new(),
+            payload: String::new(),
+            qos: 1,
+            retain: true,
+        })
+        .unwrap();
+        tx.blocking_send(PublishRecord {
+            topic: "fresh".into(),
+            payload: "new".into(),
+            qos: 1,
+            retain: true,
+        })
+        .unwrap();
+
+        assert!(super::mqtt_transport::drain_stale_records(&mut rx).is_none());
+        assert_eq!(rx.try_recv().unwrap().topic, "fresh");
+    }
+
     // ── RED: reconnect republishes discovery + snapshot ──────────
 
     #[tokio::test]
@@ -2855,26 +3382,31 @@ mod async_tests {
         let state_topic = "dormant/office-pc/sensor/desk/state";
         let zone_topic = "dormant/office-pc/zone/office/state";
         let display_topic = "dormant/office-pc/display/main/phase";
+        // Issue #174: every flush prepends the global `online`
+        // availability record so HA marks the entities available. The
+        // post-reconnect count must include that record, so the
+        // expected delta is 1 (global online) + 3 discovery + 4 snapshot.
+        let global_online_topic = "dormant/office-pc/availability";
         let pre_total = {
             let g = records_handle.lock().unwrap();
             g.len()
         };
-        // 3 discovery + 4 snapshot (state + per-sensor availability +
-        // zone + display) per connect, so the post-reconnect count must
-        // be `pre_total + 7`. The event-driven wait yields to the
-        // runtime on each `notify.notified()` wake; only the final
+        // 1 global online + 3 discovery + 4 snapshot (state + per-sensor
+        // availability + zone + display) per connect, so the post-reconnect
+        // count must be `pre_total + 8`. The event-driven wait yields to
+        // the runtime on each `notify.notified()` wake; only the final
         // timeout fallback uses wall-clock time.
         let total_after = wait_until_count_at_least(
             &records_handle,
             &records_notify_handle,
             Duration::from_secs(2),
-            pre_total + 7,
+            pre_total + 8,
             |g| g.len(),
         )
         .await;
         assert!(
-            total_after >= pre_total + 7,
-            "reconnect must re-emit discovery AND snapshot ({pre_total} pre -> {total_after} post; expected at least +7)"
+            total_after >= pre_total + 8,
+            "reconnect must re-emit global online + discovery AND snapshot ({pre_total} pre -> {total_after} post; expected at least +8)"
         );
 
         // Per-entity counts: each topic must appear at least twice
@@ -2887,6 +3419,7 @@ mod async_tests {
                 g.iter().filter(|r| r.topic == state_topic).count(),
                 g.iter().filter(|r| r.topic == zone_topic).count(),
                 g.iter().filter(|r| r.topic == display_topic).count(),
+                g.iter().filter(|r| r.topic == global_online_topic).count(),
             )
         };
         assert!(
@@ -2909,6 +3442,360 @@ mod async_tests {
             "main display phase record must appear at least twice on reconnect (got {})",
             counts.3
         );
+        // Issue #174: the global online availability record must be
+        // re-flushed on every reconnect (the broker's retained `offline`
+        // from a broker restart is the dominant failure mode this
+        // guards against).
+        assert!(
+            counts.4 >= 2,
+            "global online availability record must appear at least twice on reconnect (got {})",
+            counts.4
+        );
+
+        cancel.cancel();
+        if let Some(h) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+    }
+
+    // ── RED: first connect publishes global online BEFORE discovery (issue #174) ──
+
+    #[tokio::test]
+    async fn first_connect_publishes_global_online_before_discovery() {
+        // Issue #174 defect #1: every discovery payload references the
+        // global availability topic `<base>/<instance>/availability`,
+        // but before the fix nothing ever published `online` there —
+        // HA marked every entity unavailable and after a graceful
+        // shutdown the broker's retained `offline` stuck around forever.
+        // The fix prepends a retained QoS-1 `online` on the global topic
+        // BEFORE the discovery configs on the first connect flush.
+        let cfg = Arc::new(enabled_publish_config());
+        let creds = publish_creds_for("tcp://h:1883");
+        let (event_tx_for_sub, _event_rx) = tokio::sync::broadcast::channel::<DaemonEvent>(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let cfg_for_handler = cfg.clone();
+        let _responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::SubscribeEvents(tx) => {
+                        let _ = tx.send(event_tx_for_sub.subscribe());
+                    }
+                    ControlMsg::Snapshot(tx) => {
+                        let _ = tx.send(snapshot_one_of_each_shape(&cfg_for_handler));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (transport, ctrl_tx) = FakeTransport::build();
+        let records_handle = transport.records().clone();
+        let records_notify_handle = transport.records_notify().clone();
+
+        let deps = StatePublisherDeps {
+            config: cfg.clone(),
+            credentials: creds,
+            ctl_tx,
+            cancel: cancel.clone(),
+        };
+        let handle = spawn_with_transport(deps, Box::new(transport));
+        assert!(handle.is_some(), "enabled config must spawn a task");
+
+        // Drive Connected once and wait for the first flush to drain.
+        ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
+        let count_after_first_flush = wait_records_count(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            |g| g.len(),
+        )
+        .await;
+        assert!(
+            count_after_first_flush > 0,
+            "first connect must produce at least one record (got 0)"
+        );
+
+        // The FIRST record on the wire MUST be the global online
+        // availability record: a regression that publishes discovery
+        // before the global online still works for the broker but
+        // means HA's entity-registry sweep reads discovery configs
+        // before the availability topic exists, leaving entities
+        // unavailable on their very first registration.
+        let snapshot = {
+            let g = records_handle.lock().unwrap();
+            g.clone()
+        };
+        let first = snapshot
+            .first()
+            .expect("first connect must produce at least one record");
+        assert_eq!(
+            first.topic, "dormant/office-pc/availability",
+            "first record on first connect must be the global online availability topic"
+        );
+        assert_eq!(
+            first.payload, "online",
+            "first record on first connect must publish retained `online` (got {:?})",
+            first.payload
+        );
+        assert_eq!(first.qos, 1, "global online is QoS 1 (matches LWT)");
+        assert!(
+            first.retain,
+            "global online is retained (matches LWT, so HA's availability claim flips cleanly)"
+        );
+
+        // Cross-check: discovery records follow the global online on
+        // the wire. The helper prepends the global online to the flush,
+        // so a regression that emits only the discovery half on first
+        // connect (and re-flushes the global online only on reconnect)
+        // would fail this assertion.
+        let desk_discovery_present = snapshot
+            .iter()
+            .any(|r| r.topic == "homeassistant/binary_sensor/office-pc/sensor_desk/config");
+        assert!(
+            desk_discovery_present,
+            "discovery records must follow the global online on first connect"
+        );
+
+        cancel.cancel();
+        if let Some(h) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+    }
+
+    // ── RED: HA birth announcement re-flushes discovery + snapshot (issue #174) ──
+
+    #[tokio::test]
+    async fn ha_birth_triggers_discovery_and_snapshot_reflush() {
+        // Issue #174 defect #2: when the operator deletes an entity in
+        // HA, HA clears its retained discovery config topic. The
+        // publisher needs to learn HA is back online and re-publish the
+        // discovery configs. HA's birth topic `<discovery_prefix>/status`
+        // carries `online` on HA's startup (and on a clean restart).
+        // Production subscribes to that topic after ConnAck and emits
+        // `TransportLifecycle::BirthOnline`; the fake's
+        // `FakeCtrl::BirthOnline` simulates the same signal so this test
+        // can drive it deterministically.
+        let cfg = Arc::new(enabled_publish_config());
+        let creds = publish_creds_for("tcp://h:1883");
+        let (event_tx_for_sub, _event_rx) = tokio::sync::broadcast::channel::<DaemonEvent>(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let cfg_for_handler = cfg.clone();
+        let _responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::SubscribeEvents(tx) => {
+                        let _ = tx.send(event_tx_for_sub.subscribe());
+                    }
+                    ControlMsg::Snapshot(tx) => {
+                        let _ = tx.send(snapshot_one_of_each_shape(&cfg_for_handler));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (transport, ctrl_tx) = FakeTransport::build();
+        let records_handle = transport.records().clone();
+        let records_notify_handle = transport.records_notify().clone();
+
+        let deps = StatePublisherDeps {
+            config: cfg.clone(),
+            credentials: creds,
+            ctl_tx,
+            cancel: cancel.clone(),
+        };
+        let handle = spawn_with_transport(deps, Box::new(transport));
+        assert!(handle.is_some(), "enabled config must spawn a task");
+
+        // Drive Connected once so the publisher completes its initial
+        // flush.
+        ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
+        let pre_birth_total = wait_records_count(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            |g| g.len(),
+        )
+        .await;
+        assert!(
+            pre_birth_total > 0,
+            "first connect must produce at least one record before the HA birth event"
+        );
+
+        // Now drive the HA birth announcement. The publisher MUST
+        // re-flush the same flush body as `Connected` (global online +
+        // discovery + fresh snapshot).
+        ctrl_tx.send(FakeCtrl::BirthOnline).await.unwrap();
+        let discovery_topic = "homeassistant/binary_sensor/office-pc/sensor_desk/config";
+        let state_topic = "dormant/office-pc/sensor/desk/state";
+        let zone_topic = "dormant/office-pc/zone/office/state";
+        let display_topic = "dormant/office-pc/display/main/phase";
+        let global_online_topic = "dormant/office-pc/availability";
+
+        // 1 global online + 3 discovery + 4 snapshot records per flush
+        // — a regression that re-flushed only discovery (or only the
+        // snapshot) trips one of the per-entity counts below.
+        let total_after_birth = wait_until_count_at_least(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            pre_birth_total + 8,
+            |g| g.len(),
+        )
+        .await;
+        assert!(
+            total_after_birth >= pre_birth_total + 8,
+            "HA birth must re-flush global online + discovery AND snapshot (had {pre_birth_total}, now {total_after_birth}; expected at least +8)"
+        );
+
+        // Per-entity counts: every entity record must appear at least
+        // twice (once per flush — initial + HA-birth). The global online
+        // record gets the same gate as the discovery / snapshot records.
+        let counts = {
+            let g = records_handle.lock().unwrap();
+            (
+                g.iter().filter(|r| r.topic == discovery_topic).count(),
+                g.iter().filter(|r| r.topic == state_topic).count(),
+                g.iter().filter(|r| r.topic == zone_topic).count(),
+                g.iter().filter(|r| r.topic == display_topic).count(),
+                g.iter().filter(|r| r.topic == global_online_topic).count(),
+            )
+        };
+        assert!(
+            counts.0 >= 2,
+            "desk discovery record must appear at least twice across initial + HA-birth flush (got {})",
+            counts.0
+        );
+        assert!(
+            counts.1 >= 2,
+            "desk state record must appear at least twice across initial + HA-birth flush (got {})",
+            counts.1
+        );
+        assert!(
+            counts.2 >= 2,
+            "office zone state record must appear at least twice across initial + HA-birth flush (got {})",
+            counts.2
+        );
+        assert!(
+            counts.3 >= 2,
+            "main display phase record must appear at least twice across initial + HA-birth flush (got {})",
+            counts.3
+        );
+        assert!(
+            counts.4 >= 2,
+            "global online availability record must appear at least twice across initial + HA-birth flush (got {})",
+            counts.4
+        );
+
+        cancel.cancel();
+        if let Some(h) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+    }
+
+    // ── RED: reconnect re-flushes the global online record (issue #174) ──────────
+
+    #[tokio::test]
+    async fn reconnect_republishes_global_online() {
+        // Issue #174 defect #1 (focused regression): every flush MUST
+        // re-publish a retained `online` on the global LWT availability
+        // topic so HA marks dormant entities available after a broker
+        // restart, an HA-side deletion, or a daemon reconnect. This
+        // test isolates the global online record from the discovery +
+        // snapshot noise by counting ONLY records on the global
+        // availability topic across two connects, so a regression that
+        // emits discovery + snapshot on reconnect but forgets the
+        // global online trips the strict count assertion.
+        let cfg = Arc::new(enabled_publish_config());
+        let creds = publish_creds_for("tcp://h:1883");
+        let (event_tx_for_sub, _event_rx) = tokio::sync::broadcast::channel::<DaemonEvent>(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let cfg_for_handler = cfg.clone();
+        let _responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::SubscribeEvents(tx) => {
+                        let _ = tx.send(event_tx_for_sub.subscribe());
+                    }
+                    ControlMsg::Snapshot(tx) => {
+                        let _ = tx.send(snapshot_one_of_each_shape(&cfg_for_handler));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (transport, ctrl_tx) = FakeTransport::build();
+        let records_handle = transport.records().clone();
+        let records_notify_handle = transport.records_notify().clone();
+
+        let deps = StatePublisherDeps {
+            config: cfg.clone(),
+            credentials: creds,
+            ctl_tx,
+            cancel: cancel.clone(),
+        };
+        let handle = spawn_with_transport(deps, Box::new(transport));
+        assert!(handle.is_some(), "enabled config must spawn a task");
+
+        // Drive Connected once and wait for the global online to land.
+        ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
+        let global_online_topic = "dormant/office-pc/availability";
+        let first_count = wait_until_count_at_least(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            1,
+            |g| g.iter().filter(|r| r.topic == global_online_topic).count(),
+        )
+        .await;
+        assert!(
+            first_count >= 1,
+            "first connect must publish global online at least once (got {first_count})"
+        );
+
+        // Drive a Disconnect + Connected cycle and re-check the count.
+        // A regression that only re-flushes the global online on first
+        // connect would leave the count at 1 across the second connect.
+        ctrl_tx.send(FakeCtrl::Disconnected).await.unwrap();
+        ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
+        let second_count = wait_until_count_at_least(
+            &records_handle,
+            &records_notify_handle,
+            Duration::from_secs(2),
+            first_count + 1,
+            |g| g.iter().filter(|r| r.topic == global_online_topic).count(),
+        )
+        .await;
+        assert!(
+            second_count > first_count,
+            "reconnect must re-publish global online (had {first_count}, now {second_count}; expected at least +1)"
+        );
+
+        // Cross-check: every global online record carries the wire
+        // shape HA's availability claim flips on. Retained QoS-1
+        // `online` — the LWT publishes retained `offline` on this same
+        // topic, so the broker's retained slot holds exactly one of
+        // the two literals at any moment. A regression that emits
+        // `online` as non-retained would let the broker's retained
+        // `offline` from the LWT shadow it on a clean restart.
+        let latest = {
+            let g = records_handle.lock().unwrap();
+            g.iter()
+                .rev()
+                .find(|r| r.topic == global_online_topic)
+                .cloned()
+                .expect("at least one global online record")
+        };
+        assert_eq!(latest.payload, "online");
+        assert!(latest.retain, "global online is retained (matches LWT)");
+        assert_eq!(latest.qos, 1, "global online is QoS 1 (matches LWT)");
 
         cancel.cancel();
         if let Some(h) = handle {
@@ -3223,7 +4110,12 @@ mod async_tests {
         }
         let inventory = EntityInventory::from_config(&cfg);
         let snap = snapshot_one_of_each_shape(&cfg);
-        let expected_records = discovery_records(&cfg, &inventory, "office-pc").len()
+        // Issue #174: every flush prepends the global availability
+        // `online` record so HA marks every dormant entity available.
+        // Compute the expected count with that prepended record so the
+        // strict `==` discriminator below stays an honest measurement.
+        let expected_records = global_online_record(&cfg, "office-pc").map_or(0, |_| 1)
+            + discovery_records(&cfg, &inventory, "office-pc").len()
             + snapshot_records(&cfg, &snap, "office-pc").len();
         for i in 1..=32 {
             cfg.sensors.insert(

@@ -1058,6 +1058,7 @@ mod tests {
             samsung_restore_backlight: 50,
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::Unknown,
+            power_off_opt_in: false,
         }
     }
 

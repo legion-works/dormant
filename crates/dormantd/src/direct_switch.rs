@@ -740,6 +740,7 @@ mod tests {
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 

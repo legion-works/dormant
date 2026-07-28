@@ -564,6 +564,7 @@ mod tests {
             samsung_restore_backlight: SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 
@@ -892,6 +893,7 @@ mod tests {
             samsung_restore_backlight: 42, // operator-tuned override
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         };
         let mut creds = Credentials::default();
         creds

@@ -332,6 +332,7 @@ mod dispatch_gate_tests {
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::default(),
             hooks: dormant_core::config::HookSlots::default(),
+            power_off_opt_in: false,
         }
     }
 

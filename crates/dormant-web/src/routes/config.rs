@@ -663,6 +663,7 @@ mod tests {
                 samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                 treat_unreachable_as_blanked: false,
                 panel_type: dormant_core::wear::PanelType::default(),
+                power_off_opt_in: false,
             },
         );
 
@@ -1011,6 +1012,7 @@ field = "/val"
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: false,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 

@@ -650,6 +650,19 @@ export interface DisplayConfig {
   treat_unreachable_as_blanked?: boolean;
   /** Panel technology classification. Default "unknown". */
   panel_type?: PanelType;
+  /**
+   * Explicit acknowledgement of the macOS shared-DDC/CI power-off hazard
+   * (issue #126). When a display's primary controller is DDC/CI, the panel
+   * is shared with another machine, and the primary blank mode is
+   * `power_off`, dormant emits a semantic warning at config load time and
+   * the doctor flags the topology. Setting this to `true` silences the
+   * warning — the operator attests they have tested physical recovery.
+   * The opt-in adds NO recovery mechanism of its own. Defaults to `false`
+   * so an unsuspecting operator never lands in the trap silently. The
+   * editor renders a hazard-bordered checkbox that requires the
+   * operator to read the warning copy before flipping it on.
+   */
+  power_off_opt_in?: boolean;
 }
 
 // ─── Config-apply wire types ──────────────────────────────────────────────

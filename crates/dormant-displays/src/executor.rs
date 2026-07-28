@@ -997,6 +997,7 @@ mod tests {
             samsung_restore_backlight: SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::Unknown,
+            power_off_opt_in: false,
         }
     }
 

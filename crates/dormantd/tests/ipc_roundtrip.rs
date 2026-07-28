@@ -202,6 +202,7 @@ fn fake_direct_switch_with(
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         };
         displays.insert(name.to_string(), dc);
         let sink: Arc<dyn CommandSink> = Arc::new(FakeSink::new());

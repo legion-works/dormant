@@ -378,6 +378,7 @@ mod tests {
                 treat_unreachable_as_blanked: true,
                 panel_type: PanelType::Unknown,
                 hooks: dormant_core::config::HookSlots::default(),
+                power_off_opt_in: false,
             },
         );
         Config {

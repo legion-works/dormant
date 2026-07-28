@@ -253,6 +253,21 @@ not cancellable mid-run. Hook commands must be idempotent — check
 `DORMANT_DIRECTION` and `DORMANT_PHASE` in the environment to decide whether
 to act or skip.
 
+## macOS DDC/CI power-off hazard
+
+A `power_off` blank on a shared macOS DDC/CI panel can be unrecoverable:
+the USB-C link and the panel's USB hub drop on standby, VCP writes go
+to a dead device, and recovery requires physically power-cycling the
+monitor. The full mechanism, the observed behavior on the maintainer's
+AOC AGON AG326UZD, and the explicit acknowledgement escape hatch
+(`displays.<id>.power_off_opt_in = true`) live in
+[Displays → macOS shared-DDC/CI power-off hazard](./displays.md#macos-shared-ddcci-power-off-hazard).
+**Read that section before using `controllers = ["ddcci"]` with
+`blank_mode = "power_off"` on a shared display from a macOS host.**
+Dormant emits a load-time semantic warning and a `dormantctl doctor`
+failure for every hazardous display — the opt-in silences both, it does
+not add recovery.
+
 ## Signal-presence law
 
 A monitor **will not switch VCP `0x60` to an input that has no live video

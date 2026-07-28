@@ -228,6 +228,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "samsung_restore_backlight",
             "treat_unreachable_as_blanked",
             "panel_type",
+            "power_off_opt_in",
             "hooks",
         ],
     ),
@@ -324,6 +325,68 @@ pub fn collect_unknown_keys(value: &toml::Value) -> Vec<UnknownKey> {
     let mut results = Vec::new();
     walk_toml(value, "", &mut results);
     results
+}
+
+// ── Semantic warning collectors ─────────────────────────────────────────────────────────────
+//
+// Semantic warnings describe a config that is technically valid (no
+// `ValidationError`) but carries a known operational hazard the operator
+// should see at load time. They flow through `load_config_from_str` so
+// both `Strictness::Strict` and `Strictness::Warn` surface them; the only
+// path that hard-fails on them is the operator's decision to keep the
+// config as-is.
+//
+// Each collector is a pure, un-gated function that takes `&Config` and
+// returns `Vec<Warning>`. The current collector targets the macOS shared-
+// DDC/CI power-off hazard (issue #126); later hazards land here as
+// additional sibling collectors.
+
+/// True when the given display is wired into the macOS shared-DDC/CI
+/// power-off hazard topology: scope = "shared", first controller = "ddcci",
+/// and the primary blank mode resolves to [`BlankMode::PowerOff`]. The
+/// `power_off_opt_in` field is the operator's acknowledgement — callers
+/// that want the topology irrespective of opt-in can call this directly;
+/// the [`collect_macos_power_off_warnings`] wrapper excludes opt-in'd
+/// displays so the warning fires only when acknowledgement is missing.
+#[must_use]
+pub fn is_macos_power_off_hazard(dc: &DisplayConfig) -> bool {
+    if !matches!(dc.scope, DisplayScope::Shared) {
+        return false;
+    }
+    // FIRST controller in the chain — a ddcci further down only fires
+    // after a softer primary mode has been tried, which already failed on
+    // a normal blank first. The hazard depends on ddcci delivering the
+    // blank.
+    if dc.controllers.first().map(String::as_str) != Some("ddcci") {
+        return false;
+    }
+    // Resolve the effective primary mode through the same logic the
+    // executor uses (ladder beats blank_mode; first Controller stage wins;
+    // render-only ladders fall back to PowerOff as a sentinel that would
+    // never actually run).
+    matches!(dc.primary_blank_mode(), BlankMode::PowerOff)
+}
+
+/// Semantic warning collector for the macOS shared-DDC/CI power-off
+/// hazard (issue #126). One [`Warning`] per display that matches the
+/// hazard topology and has NOT been acknowledged via
+/// [`DisplayConfig::power_off_opt_in`].
+#[must_use]
+pub fn collect_macos_power_off_warnings(cfg: &Config) -> Vec<super::schema::Warning> {
+    let mut out = Vec::new();
+    for (display_id, dc) in &cfg.displays {
+        if !is_macos_power_off_hazard(dc) {
+            continue;
+        }
+        if dc.power_off_opt_in {
+            continue;
+        }
+        out.push(super::schema::Warning {
+            key_path: format!("displays.{display_id}.power_off_opt_in"),
+            message: "power_off on this shared macOS DDC/CI topology can be unrecoverable: USB-C link and hub may drop; set power_off_opt_in = true only after testing physical recovery".into(),
+        });
+    }
+    out
 }
 
 /// Recursively walk a TOML value, reporting unknown keys.
@@ -2861,6 +2924,150 @@ gracee_period = "60s"
         );
     }
 
+    // ── macOS shared-DDC/CI power-off hazard (issue #126) ─────────────
+    //
+    // The semantic warning fires whenever a display is configured with the
+    // dangerous topology: shared scope + first controller = ddcci + primary
+    // blank mode = power_off + power_off_opt_in unset. Setting opt-in true
+    // silences it (acknowledgement, NOT a recovery mechanism — see docs).
+    //
+    // The topology helper is un-gated so tests can exercise it on Linux CI;
+    // the warning text names "macOS DDC/CI topology" so the operator can
+    // see the hazard is platform-specific.
+
+    fn hazardous_shared_ddcci_toml() -> &'static str {
+        "config_version = 1\n\
+         [displays.shared_oled]\n\
+         controllers = [\"ddcci\"]\n\
+         scope = \"shared\"\n\
+         shared_input_code = 1\n\
+         blank_mode = \"power_off\"\n"
+    }
+
+    #[test]
+    fn power_off_opt_in_hazardous_config_emits_warning() {
+        let (cfg, warnings) = load_str(hazardous_shared_ddcci_toml()).unwrap();
+        assert_eq!(cfg.config_version, 1, "config_version survived");
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        );
+        assert!(
+            errors.is_empty(),
+            "hazardous config must not produce validation errors, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+        let hits: Vec<_> = warnings
+            .iter()
+            .filter(|w| {
+                w.key_path.contains("displays.shared_oled") && w.message.contains("unrecoverable")
+            })
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one macOS-hazard warning for the shared_oled display, got {}: {:?}",
+            warnings.len(),
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn power_off_opt_in_private_display_no_warning() {
+        // scope = "private" is the non-shared case — the hazard depends on
+        // the USB-C link dropping under a peer's pull, which only matters
+        // for shared panels. A private display must NOT emit the warning.
+        let toml = "config_version = 1\n\
+             [displays.private_panel]\n\
+             controllers = [\"ddcci\"]\n\
+             scope = \"private\"\n\
+             blank_mode = \"power_off\"\n";
+        let (_, warnings) = load_str(toml).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
+            "private display must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn power_off_opt_in_screen_off_audio_on_no_warning() {
+        // The hazard is specifically about power_off (a real panel power
+        // state change via DDC VCP 0xD6). screen_off_audio_on is a softer
+        // mode that doesn't drive the panel standby path that drops the
+        // USB-C link — no warning.
+        let toml = "config_version = 1\n\
+             [displays.shared_oled]\n\
+             controllers = [\"ddcci\"]\n\
+             scope = \"shared\"\n\
+             shared_input_code = 1\n\
+             blank_mode = \"screen_off_audio_on\"\n";
+        let (_, warnings) = load_str(toml).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
+            "screen_off_audio_on primary mode must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn power_off_opt_in_ddcci_fallback_only_no_warning() {
+        // The hazard depends on ddcci being the FIRST controller — the
+        // controller that actually delivers the blank. A ddcci further down
+        // the chain only fires if the earlier controllers failed, in which
+        // case the topology has already survived a normal blank first; no
+        // warning.
+        let toml = "config_version = 1\n\
+             [displays.shared_oled]\n\
+             controllers = [\"macos-gamma-black\", \"ddcci\"]\n\
+             scope = \"shared\"\n\
+             shared_input_code = 1\n\
+             blank_mode = \"power_off\"\n";
+        let (_, warnings) = load_str(toml).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
+            "ddcci as a non-first fallback must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn power_off_opt_in_opt_in_true_no_warning() {
+        // Acknowledging the risk (power_off_opt_in = true) silences the
+        // warning. The opt-in adds NO recovery — it is an explicit
+        // operator attestation that physical recovery has been tested.
+        let toml = "config_version = 1\n\
+             [displays.shared_oled]\n\
+             controllers = [\"ddcci\"]\n\
+             scope = \"shared\"\n\
+             shared_input_code = 1\n\
+             blank_mode = \"power_off\"\n\
+             power_off_opt_in = true\n";
+        let (_, warnings) = load_str(toml).unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
+            "power_off_opt_in = true must silence the macOS power-off hazard, got warnings: {:?}",
+            warnings
+                .iter()
+                .map(|w| (&w.key_path, &w.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── Screensaver scale_mode validation ────────────────────────────────
 
     use std::time::Duration;
@@ -3050,6 +3257,7 @@ gracee_period = "60s"
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 
@@ -3843,6 +4051,7 @@ password = "test-pass"
                     samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                     treat_unreachable_as_blanked: true,
                     panel_type: crate::wear::PanelType::default(),
+                    power_off_opt_in: false,
                 },
             )]),
             rules: IndexMap::new(),
@@ -3909,6 +4118,7 @@ password = "test-pass"
                     samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
                     treat_unreachable_as_blanked: true,
                     panel_type: crate::wear::PanelType::default(),
+                    power_off_opt_in: false,
                 },
             )]),
             rules: IndexMap::new(),
@@ -4052,6 +4262,7 @@ password = "test-pass"
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
+            power_off_opt_in: false,
         };
         let ladder = dc.normalized_ladder();
         assert_eq!(ladder.len(), 1);
@@ -4986,6 +5197,7 @@ kind = "power_off"
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 

@@ -646,6 +646,7 @@ mod tests {
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 

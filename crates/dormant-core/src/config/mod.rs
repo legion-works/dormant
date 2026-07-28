@@ -26,8 +26,8 @@ pub use schema::{
     ZoneConfig,
 };
 pub use validate::{
-    ClaimValidationContext, STRUCTURAL_RESERVED_NAMES, is_known_config_path, validate,
-    validate_with_input_source_readers,
+    ClaimValidationContext, STRUCTURAL_RESERVED_NAMES, collect_macos_power_off_warnings,
+    is_known_config_path, is_macos_power_off_hazard, validate, validate_with_input_source_readers,
 };
 
 use std::path::Path;
@@ -91,7 +91,7 @@ pub fn load_config_from_str(
     // Walk the TOML tree to discover unknown keys.
     let unknown_keys = validate::collect_unknown_keys(&value);
 
-    let warnings: Vec<Warning> = match strict {
+    let mut warnings: Vec<Warning> = match strict {
         Strictness::Strict => {
             if let Some(first) = unknown_keys.first() {
                 return Err(DormantError::ConfigUnknownKey {
@@ -123,6 +123,14 @@ pub fn load_config_from_str(
             ),
         });
     }
+
+    // ── Semantic warnings (issue #126 macOS power-off hazard) ───────────────
+    // These are config-time hazard flags that must surface in BOTH
+    // strictness modes — unlike unknown-key warnings, they are not the
+    // validator's primary concern and the operator can never forget
+    // them by setting strictness to "warn". Merged into the same
+    // `Warning` vec so CLI validate and web apply both see them.
+    warnings.extend(validate::collect_macos_power_off_warnings(&cfg));
 
     // ── Exactly-one-of blank_mode / ladder (R12 symmetric rule) ─────────────
     for (display_id, dc) in &cfg.displays {

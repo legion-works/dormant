@@ -2347,6 +2347,7 @@ shared_input_write_code = 0x15
                 treat_unreachable_as_blanked: false,
                 #[allow(clippy::default_trait_access)]
                 panel_type: Default::default(),
+                power_off_opt_in: false,
             },
         );
         let cfg = Config {

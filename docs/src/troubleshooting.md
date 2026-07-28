@@ -2,7 +2,7 @@
 
 ## Doctor command
 
-`dormantctl doctor` is the first diagnostic tool. It runs a series of checks against your config and live state.
+Start with `dormantctl doctor`. It checks your config and live state.
 
 ```bash
 # Full system check
@@ -137,7 +137,7 @@ dormantctl status
 
 ## Emergency wake
 
-When a display stays blank and pressing keys on a presence-mapped keyboard shortcut doesn't help (no sensors in the room, or someone manually blanked the panel and left), `dormantctl emergency-wake` is the panic-recovery command: it force-wakes every configured display regardless of the rules engine's state.
+If a display stays blank and a presence-mapped keyboard shortcut does not help — for example, no sensor is in the room or someone manually blanked the panel — run `dormantctl emergency-wake`. It force-wakes every configured display regardless of the rules engine's state.
 
 ```bash
 dormantctl emergency-wake

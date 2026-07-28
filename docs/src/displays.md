@@ -1,8 +1,8 @@
 # Displays
 
 **What this gives you.** Six blank controllers (DDC/CI, KWin DPMS, command,
-HA passthrough, macOS gamma-black, Samsung Tizen) plus escalation ladders plus
-two render stages — every audio-safe and panel-internal mode in one document.
+HA passthrough, macOS gamma-black, Samsung Tizen), escalation ladders, and two
+render stages — every audio-safe and panel-internal mode in one document.
 
 **When to use it.** Picking a controller for a new display, diagnosing why a
 rule fired the wrong blank mode, or configuring a fallback chain so a display
@@ -23,7 +23,7 @@ dormantctl doctor ddcci
 
 ---
 
-dormant controls displays through an ordered controller chain. If one controller fails, the next is tried. Wake commands follow the rule's configured retry schedule before escalating.
+dormant controls displays through an ordered controller chain. If one controller fails, it tries the next. Wake commands follow the rule's configured retry schedule before escalating.
 
 ## Controllers
 

@@ -4,7 +4,7 @@
 the web dashboard and via `GET /api/wear`, with an advisory after no long
 standby window has occurred in 96 h.
 
-**When to use it.** Anytime you want to know whether your panel is getting the
+**When to use it.** When you want to know whether your panel is getting the
 long dim it needs. Tracking is on by default; turn it off with `wear.enabled =
 false` if on-hours accounting is not useful for your setup.
 

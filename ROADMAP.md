@@ -2,9 +2,24 @@
 
 Direction for `dormant` — the OLED-preserving presence daemon. Grouped by state, not by date, and within each group ordered by priority (highest first). Items move down as they ship; nothing here is a dated promise. Small concrete fixes and polish live in the [issue tracker](https://github.com/legion-works/dormant/issues), not here.
 
-**v0.1.0 shipped 2026-07-09** — [release + installers](https://github.com/legion-works/dormant/releases/tag/v0.1.0). The core daemon, all three control surfaces, and the blanking paths run on the maintainer's AOC AGON AG326UZD and Samsung S90D. `master` holds the last released state; `dev` is the integration branch.
+**v0.9.1 shipped 2026-07-28** — [release + installers](https://github.com/legion-works/dormant/releases/tag/v0.9.1). The core daemon, all three control surfaces, and the blanking paths run on the maintainer's AOC AGON AG326UZD and Samsung S90D. `master` holds the last released state; `dev` is the integration branch.
 
 ## Shipped
+
+### v0.5.0 – v0.9.1 shipped 2026-07-19 → 2026-07-28
+
+- **Soft KVM / multi-machine switching** — two dormant instances driving one multi-input display switch it with a hotkey, `dormantctl switch [--to-peer]`, the tray, the web UI, or a local activity edge, each machine writing its own DDC/CI VCP `0x60` code over its own bus. Ownership is a debounced local observation; switch events run configured hooks so peripherals follow. No discovery, no pairing, no network protocol.
+- **Native macOS status bar item** — `dormant-tray` runs as an AppKit `NSStatusItem` menu-bar item with per-display state, pause/resume, blank/wake, emergency wake, a global switch hotkey (Carbon), and a web UI link, sharing the tray state and IPC loop with the Linux KDE backend.
+- **Global switch hotkeys** — declarative `[coordination] claim_hotkey` registered through KDE KGlobalAccel / the XDG `GlobalShortcuts` portal on Linux and Carbon `RegisterEventHotKey` on macOS.
+- **Web UI v3** — redesigned dashboard, switching view with live ownership pair, display detail with wear heat map, grouped doctor view, event tag filters backed by a 500-event ring (`GET /api/events/recent`), config sub-rail navigation with deep links, and a rollback recovery card.
+- **Opt-in MQTT state publishing** — `[publish]` mirrors sensors, zones, and displays to an MQTT broker with Home Assistant discovery, retained state topics, and availability.
+- **Soft/hard blank split** — `dormantctl blank` walks the render ladder by default; `--hard` (with confirmation) is required for a real panel power command.
+- **Operation leases + reload quiescence** — doctor exercises and other display operations hold leases; config reloads quiesce them with a bounded two-phase barrier instead of racing them.
+- **Degraded startup** — a display whose controllers fail probes at boot starts `degraded` with a visible health state instead of crash-looping the daemon.
+- **Input-based idle detection** — the Wayland idle source binds `ext_idle_notifier_v1` v2 input-idle, immune to application idle inhibitors (a browser's dormant WebRTC tab no longer holds screens awake).
+- **Fragment-based changelog pipeline** — `feat`/`fix` PRs ship `changelog.d/` fragments; `scripts/release-prep.py` compiles release notes and CI gates both.
+- **Hosted docs** — the mdBook manual publishes to GitHub Pages on release, Legion Works themed.
+- **CI hardening** — causal reload receipts, generation swap barriers, virtual-time tests, hermetic state/socket isolation, nextest flake conviction, changed-test stress jobs, nightly soak, and a flake ledger requiring proving tests.
 
 ### v0.4.0 shipped 2026-07-18
 
@@ -35,33 +50,27 @@ Direction for `dormant` — the OLED-preserving presence daemon. Grouped by stat
 - **Audio- and call-aware blanking** — a `pw-dump`-polling PipeWire inhibitor makes `"audio-playback"` and `"call"` rule literals functional: a running output stream or an active call holds a display awake, independently of and combinable with the user-activity inhibitor. Global `[audio]` settings (`poll_interval`, `min_active`, `call_roles`, `playback_roles`, `capture_is_call`, `pw_dump_command`) tune classification; `capture_is_call` defaults to `false` to avoid false positives from idling mic-capable apps. Fails toward blanking on any probe error.
 - **macOS (M1)** — native macOS support, arm64 and x86_64: DDC/CI display control (shared `ddcci` controller, vendored `ddc-macos` fork), the `macos-gamma-black` audio-safe Quartz gamma-table blank controller with a daemon-independent emergency-restore breadcrumb, the `macos-display-sleep` whole-machine `pmset` fallback, a CoreGraphics idle source, read-only `dormantctl doctor macos-idle` / `macos-display-sleep` / `macos-power` diagnostics, and a `launchd` `LaunchAgent` (`dormantctl launchd install`/`uninstall`) with cargo-dist release artifacts for both macOS targets. There is no macOS watchdog-parity (wedged-daemon) detection like systemd's `WatchdogSec` on Linux.
 
-## In development
-
-- **Native macOS status bar item** — `dormant-tray` now has an AppKit `NSStatusItem` menu-bar frontend with per-display state, pause/resume, blank/wake, emergency wake, and a web UI link. It shares the tray state and IPC loop with the Linux KDE `StatusNotifierItem` backend.
-
 ## Near-term
 
 - **Spatial wear attribution + wear-evening screensaver** — extend the shipped panel-wide ledger into per-region attribution and panel-type-specific weighting, then use content placement to avoid repeatedly lighting the same regions. Pixel shift is already shipped; enforced rest windows are not. See the [prior-art survey](docs/research/2026-07-09-oled-health-prior-art.md) and [design + probe findings](docs/research/2026-07-09-oled-health-design.md).
-- **Public-repo polish** — dashboard/tray screenshots in the README, a release badge, a web UI version label sourced from the crate version, and a CI smoke job that installs the built release artifact and runs `dormantd --validate-only`.
 
 ## Planned
 
 - **Scenario record / replay + hardware-simulation harness** — capture real sessions (sensor events → decisions) as replayable fixtures for the offline rules engine, and swap sensor/display backends for deterministic simulators in CI. Lets a contributor validate a config or a change against real and simulated scenarios without risking physical displays — directly attacks the single-maintainer verification bottleneck. `dormantctl scenario record|replay`.
 - **BLE phone-as-key presence** — passive Bluetooth-LE scanning on the host for an allow-listed phone, watch, or earbud, with per-room RSSI thresholds feeding the zone engine. Uses the host radio; no broker or purchased sensor required.
 - **Webcam vision fallback** — an opt-in, locally-processed motion/presence detector using the host webcam (OpenCV-class, no network, no storage, no frames ever leave the machine) as a fallback presence source when the broker is down. A camera is a sensitive sensor even when local, so this ships off by default behind an unmissable opt-in with plain documentation of exactly what it sees and where the data goes (nowhere) — consistent with the no-telemetry non-goal.
-- **KVM-switch mode** — SHIPPED, and deliberately without the peer network this entry once assumed. Two dormantd instances on separate machines driving the same multi-input display act as a software KVM switch: a hotkey, `dormantctl switch`, the tray, the web UI, or a local activity edge writes the display's input source via DDC/CI VCP `0x60`, and each machine writes its OWN code over its OWN bus — no discovery, no pairing, no handshake, no crypto. Ownership is a debounced VCP `0x60` observation, never an authority. Switch events run configured hook commands so peripherals follow the display. An owner-mediated claim protocol (mDNS + SPAKE2 + signed frames + a claim state machine) was built, never completed a handoff on real hardware across eleven defects, and was deleted in favour of direct writes; see [Multi-machine](docs/src/multi-machine.md). The maintainer's AOC + Linux-desktop + Mac setup is the reference hardware.
-- **Global hotkeys** — bind a key to blank, wake, pause, or emergency-wake (the shipped panic command is the priority binding) as a first-class feature: the daemon registers shortcuts through the compositor's path (the XDG `GlobalShortcuts` portal or KDE's KGlobalAccel — Wayland has no raw global grab), with a config block to declare them. Users can already bind their own shortcuts to `dormantctl` commands today; this makes it declarative.
+
 - **More display controllers** — HDMI-CEC (via `libcec` + a CEC adapter — unlocks most TVs regardless of brand, and can report the active source for input-aware control), LG webOS (network TVs), Gnome DPMS (audio-safe where the output has no sound).
 - **Schedule and conditional rules** — time-of-day and quiet-hours conditions on rules: "never blank between 7pm and 11pm", "only auto-blank after midnight". Presence stays the trigger; time becomes a gate.
-- **Packaging** — an AUR package first (the maintainer's own distro — dogfoods the release artifacts), then `.deb` / `.rpm`, a Flatpak for the web UI + tray, and systemd units shipped inside the release tarballs so an install isn't complete only after hand-copying unit files.
-- **Local observability** — an opt-in, loopback-only metrics/history surface: a blank/wake/screensaver event timeline and per-display uptime, viewable in the web UI (and optionally a Prometheus endpoint for the homelab crowd). Strictly local, opt-in, never phoned home — see Non-goals.
+
+- **Local observability** — extend the shipped event ring and MQTT state publishing into a per-display uptime/blank-duration timeline in the web UI, and optionally a loopback Prometheus endpoint. Strictly local, opt-in, never phoned home — see Non-goals.
 
 ## Exploratory — not committed
 
 - **Energy-savings ledger** — estimate power, cost, and CO₂ saved from blank events (blanked duration × nominal display wattage) and surface it in the dashboard. Parked until the event-history surface can supply reliable duration data.
 - **Presence as a local API** — expose fused zone presence over loopback MQTT/REST and accept commands over MQTT so other local services can consume room state or drive dormant headlessly. The blanking daemon remains the primary scope.
 - **Input-aware display control** — use the active input source to pick a local controller (DDC/render) when the PC owns the panel and a remote controller otherwise. Parked: the maintainer's S90D exposes no local input signal, so it needs a multi-input DDC monitor, an LG webOS TV, or an HDMI-CEC adapter to be worth building — the CEC controller above may unblock it. The `OwnershipGate` seam is already in place for it.
-- **Multi-instance coordination** — several dormant instances arbitrating one shared display over MQTT, so a laptop and a desktop don't fight the same TV. Rides the same `OwnershipGate` seam.
+
 - **Windows** — the codebase cross-compiles today (portability CI is green), but native display control is unbuilt.
 
 ## Non-goals

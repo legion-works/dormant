@@ -1,6 +1,6 @@
 # Introduction
 
-dormant is a Rust daemon that blanks OLED PC monitors and TVs when presence sensors report an empty room, then wakes them on return. Sensors come in through MQTT, Home Assistant WebSocket, or USB-serial mmWave radar. Displays are controlled with DDC/CI, KWin DPMS, Samsung Tizen, Home Assistant passthrough, or shell commands.
+dormant is a Rust daemon that blanks OLED PC monitors and TVs when presence sensors report an empty room, then wakes them on return. Sensors arrive through MQTT, Home Assistant WebSocket, or USB-serial mmWave radar. Displays use DDC/CI, KWin DPMS, Samsung Tizen, Home Assistant passthrough, or shell commands.
 
 ## Why dormant?
 
@@ -25,7 +25,7 @@ OLED panels degrade with static content. The effectiveness of each blank mode va
 | `power_off` | Full (DPMS off, DDC power off) | No | Slower (monitor-dependent) |
 | `brightness_zero` | Partial (pixels still powered, but minimal emission) | Yes | Instant |
 
-Use `screen_off_audio_on` for TVs where the controller can turn off the picture without powering down the set. Use `power_off` for PC monitors. `brightness_zero` is a near-black dim: the panel stays energized, but the source and its audio can keep running.
+Use `screen_off_audio_on` for TVs where the controller can turn off the picture without powering down the set. Use `power_off` for PC monitors. `brightness_zero` is a near-black dim: the panel stays energized, while the source and its audio can continue running.
 
 ## Fail-safe design
 

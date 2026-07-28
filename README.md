@@ -211,7 +211,7 @@ systemctl --user enable --now dormant
 
 ## Documentation
 
-Configuration reference, sensor and controller guides, and the `doctor` command are in [docs/](./docs/src/introduction.md). Hardware-specific findings — which DDC codes work, how Samsung standby behaves — live in [docs/research/](./docs/research/).
+The rendered book for the latest release lives at [legion-works.github.io/dormant](https://legion-works.github.io/dormant/). Configuration reference, sensor and controller guides, and the `doctor` command are also in [docs/src/introduction.md](./docs/src/introduction.md). Hardware-specific findings — which DDC codes work, how Samsung standby behaves — live in [docs/research/](./docs/research/).
 
 ## Status
 

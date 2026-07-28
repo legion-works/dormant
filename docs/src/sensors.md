@@ -27,11 +27,11 @@ stays on.
 
 ---
 
-dormant ingests presence from three sensor types: MQTT, Home Assistant WebSocket, and USB-serial. This page covers setup and the `dormantctl doctor` checks for each.
+dormant ingests presence from MQTT, Home Assistant WebSocket, and USB-serial sources. This page covers setup and the `dormantctl doctor` check for each.
 
 ## Two ways to wire the LD2410C
 
-The HLK-LD2410C mmWave radar is a plain serial device, so the same sensor reaches dormant through either of two topologies — pick per deployment; both are one config block apart.
+The HLK-LD2410C mmWave radar is a plain serial device. Connect it through either topology below; each needs one config block.
 
 | Topology | dormant `type` | Path | When it wins |
 | --- | --- | --- | --- |

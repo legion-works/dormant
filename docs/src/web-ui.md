@@ -24,7 +24,7 @@ dormantctl status   # confirms the daemon is running with the web UI enabled
 
 ---
 
-dormant serves an optional web dashboard for live state, control, config editing, panel-wear tracking, failure state, and doctor reports. The SPA is embedded in `dormantd`; it needs no separate static-file server.
+dormant serves an optional web dashboard for live state, controls, config editing, panel-wear tracking, failure state, and doctor reports. The SPA is embedded in `dormantd`; it needs no separate static-file server.
 
 ## Enabling
 

@@ -71,11 +71,11 @@ See [Tray autostart](#tray-autostart) below to run it on every login.
 
 ## From release
 
-The cargo-dist pipeline publishes shell installers and tarballs for each binary on every release. Install v0.4.0 (Linux x86_64 / aarch64):
+The cargo-dist pipeline publishes shell installers and tarballs for every binary. These URLs always resolve to the newest release; substitute `download/vX.Y.Z` for a specific one. Install on Linux x86_64 or aarch64:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantctl-installer.sh | sh
 ```
 
 `dormant-tray-installer.sh` is also available in the same directory. Checksums are published alongside every artifact; verify with:
@@ -121,7 +121,7 @@ systemctl --user status dormant
 journalctl --user -u dormant -f
 ```
 
-The unit runs as `Type=notify`, restarts on failure, and uses a 150-second engine-liveness watchdog. Reload sends `SIGHUP` through `systemctl --user reload dormant`. To stop:
+The unit runs as `Type=notify`, restarts on failure, and uses a 150-second engine-liveness watchdog. Reload with `systemctl --user reload dormant`. To stop:
 
 ```bash
 systemctl --user stop dormant
@@ -234,8 +234,8 @@ LaunchAgent with the daemon.
 ### From release (macOS)
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantctl-installer.sh | sh
 ```
 
 Binaries land in `~/.local/bin/`, same as Linux. The installer also prints

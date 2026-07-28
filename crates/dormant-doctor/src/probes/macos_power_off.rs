@@ -41,7 +41,7 @@
 //! power-cycling the monitor — see `docs/src/displays.md`.
 
 #[cfg(target_os = "macos")]
-use crate::types::ProbeResult;
+use crate::types::{ProbeResult, ProbeStatus};
 use dormant_core::config::schema::{Config, DisplayConfig};
 use dormant_core::config::validate::is_macos_power_off_hazard;
 

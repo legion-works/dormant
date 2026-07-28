@@ -176,6 +176,7 @@ mod tests {
             coordination: dormant_core::config::schema::CoordinationConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 

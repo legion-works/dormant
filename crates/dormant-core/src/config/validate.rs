@@ -381,7 +381,7 @@ pub fn is_macos_power_off_hazard(dc: &DisplayConfig) -> bool {
 }
 
 /// Semantic warning collector for the macOS shared-DDC/CI power-off
-/// hazard (issue #126). One [`Warning`] per display that matches the
+/// hazard (issue #126). One [`Warning`](super::schema::Warning) per display that matches the
 /// hazard topology and has NOT been acknowledged via
 /// [`DisplayConfig::power_off_opt_in`].
 ///

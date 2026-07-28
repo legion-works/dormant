@@ -27,7 +27,7 @@ export default function InputFilterSection({
   const devices = inputFilter.ignore_devices ?? [];
 
   return (
-    <FormSection title="Input Filter">
+    <FormSection id="input-filter" title="Input Filter">
       <div className="cf-card">
         <div className="cf-card__header">
           <span className="cf-card__name">[input_filter]</span>

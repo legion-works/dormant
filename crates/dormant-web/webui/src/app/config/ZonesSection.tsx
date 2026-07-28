@@ -62,7 +62,7 @@ export default function ZonesSection({
 
   return (
     <>
-    <FormSection title="Zones">
+    <FormSection id="zones" title="Zones">
       {ids.map((id) => {
         const cfg = zones[id];
         const basePath = ["zones", id];

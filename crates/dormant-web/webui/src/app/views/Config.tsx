@@ -396,6 +396,13 @@ export default function Config() {
   useEffect(() => {
     const target = getConfigFragmentTarget();
     if (!target) return;
+    if (target.startsWith("config-section-")) {
+      const timer = setTimeout(() => {
+        const el = document.querySelector(`[data-config-section="${target.slice("config-section-".length)}"]`);
+        if (el) (el as HTMLElement).scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 150);
+      return () => clearTimeout(timer);
+    }
     // Defer until the tab's sections are in the DOM.
     const timer = setTimeout(() => {
       const el = document.querySelector(`[data-field-id="${target}"]`);

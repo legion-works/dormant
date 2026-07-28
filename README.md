@@ -28,6 +28,7 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 - Escalate through a render ladder: black Wayland overlay → muted mpv screensaver → power-off, on configurable dwell timers
 - Track brightness-weighted panel on-hours per display, stored locally — no telemetry
 - Configure and control through a loopback web dashboard with a validated config editor that preserves comments
+- **Config section rail** — sticky per-tab section navigation with scroll-spy in the web UI
 - **Web UI v3** — full config-schema parity in the web editor (coordination, keymaps, input filters, hooks), a new shared-display switching view with live pull/push feedback, event history across reloads, doctor checks grouped by subject, panel-wear detail split by seeded/measured time, and a security-posture card with honest boundary notes.
 - Drive the daemon from a desktop tray with global hotkeys (Linux KDE · macOS menu bar)
 - Probe every sensor and display against live hardware with `dormantctl doctor`

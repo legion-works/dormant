@@ -3310,48 +3310,32 @@ gracee_period = "60s"
          blank_mode = \"power_off\"\n"
     }
 
-    /// Load `toml` and merge in the macOS hazard warnings as if the daemon
-    /// were running on macOS (`target_is_macos = true`). Mirrors the
-    /// real `load_config` call site so the tests exercise the full path
-    /// including the semantic collector, while still being runnable on
-    /// Linux CI. Pass `false` to verify the platform gate.
-    fn load_str_on_macos(
-        toml: &str,
-    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
-        let (cfg, mut warnings) = load_str(toml)?;
-        warnings.extend(crate::config::validate::collect_macos_power_off_warnings(
-            &cfg, true,
-        ));
-        Ok((cfg, warnings))
+    /// Parse `toml` directly into a [`Config`] (no `load_config_from_str`).
+    /// Every topology test calls the collector against this Config so the
+    /// assertions are platform-independent — only the SINGLE wiring test
+    /// at the bottom of this section goes through `load_str` to prove the
+    /// live `load_config_from_str` path actually merges the collector
+    /// output. Going through `load_str` here would double-count on macOS
+    /// (the real path emits + the helper would re-emit) and would fail the
+    /// non-macos negative on macOS (the real path emits regardless of the
+    /// helper's `false` flag).
+    fn parse_for_collector(toml: &str) -> Config {
+        toml::from_str::<Config>(toml).expect("test TOML parses into Config")
     }
 
-    /// Same as [`load_str_on_macos`] but with `target_is_macos = false`
-    /// — for the platform-gate negative test.
-    fn load_str_on_linux(
-        toml: &str,
-    ) -> Result<(Config, Vec<super::super::schema::Warning>), crate::error::DormantError> {
-        let (cfg, mut warnings) = load_str(toml)?;
-        warnings.extend(crate::config::validate::collect_macos_power_off_warnings(
-            &cfg, false,
-        ));
-        Ok((cfg, warnings))
+    /// Wrap the pure collector with an explicit `target_is_macos`. The
+    /// pure-function tests pin the topology classifier's behavior; only
+    /// the wiring test below trusts `load_str`'s emitted count.
+    fn hazard_warnings(cfg: &Config, target_is_macos: bool) -> Vec<super::super::schema::Warning> {
+        crate::config::validate::collect_macos_power_off_warnings(cfg, target_is_macos)
     }
 
     #[test]
     fn power_off_opt_in_hazardous_config_emits_warning() {
-        let (cfg, warnings) = load_str_on_macos(hazardous_shared_ddcci_toml()).unwrap();
-        assert_eq!(cfg.config_version, 1, "config_version survived");
-        let errors = validate_with_input_source_readers(
-            &cfg,
-            &test_capabilities(),
-            &HashSet::from(["ddcci".to_string()]),
-            &test_creds(),
-        );
-        assert!(
-            errors.is_empty(),
-            "hazardous config must not produce validation errors, got: {:?}",
-            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
-        );
+        // Direct collector call with `true` — platform-independent: the
+        // topology fires 1 warning on every host when the caller opts in.
+        let cfg = parse_for_collector(hazardous_shared_ddcci_toml());
+        let warnings = hazard_warnings(&cfg, true);
         let hits: Vec<_> = warnings
             .iter()
             .filter(|w| {
@@ -3368,29 +3352,80 @@ gracee_period = "60s"
                 .map(|w| (&w.key_path, &w.message))
                 .collect::<Vec<_>>()
         );
+        // Sanity: cross-reference validation runs cleanly on the hazardous
+        // config — the warning is semantic, not a validation error.
+        let errors = validate_with_input_source_readers(
+            &cfg,
+            &test_capabilities(),
+            &HashSet::from(["ddcci".to_string()]),
+            &test_creds(),
+        );
+        assert!(
+            errors.is_empty(),
+            "hazardous config must not produce validation errors, got: {:?}",
+            errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn power_off_opt_in_linux_target_does_not_emit_hazard() {
-        // Reviewer nit: a Linux daemon with the hazardous topology must NOT
-        // surface a "macOS DDC/CI topology" warning — the USB-C link drop
-        // is a macOS-specific phenomenon. The platform gate must skip the
-        // collector entirely.
-        let (cfg, warnings) = load_str_on_linux(hazardous_shared_ddcci_toml()).unwrap();
+    fn power_off_opt_in_non_macos_target_does_not_emit_hazard() {
+        // Platform-gate negative: with `target_is_macos = false`, the
+        // collector must return empty even on the hazardous topology. Name
+        // is host-agnostic — this test passes on every host (the gate is a
+        // runtime parameter, not an OS-dependent compile gate).
+        let cfg = parse_for_collector(hazardous_shared_ddcci_toml());
+        let warnings = hazard_warnings(&cfg, false);
         assert!(
-            !warnings.iter().any(|w| w.message.contains("unrecoverable")),
-            "Linux daemon must not emit macOS power-off hazard, got warnings: {:?}",
+            warnings.is_empty(),
+            "non-macos target must not emit macOS power-off hazard, got warnings: {:?}",
             warnings
                 .iter()
                 .map(|w| (&w.key_path, &w.message))
                 .collect::<Vec<_>>()
         );
-        // Sanity: the topology classifier itself is still platform-agnostic
-        // and would say "yes, hazardous" — only the collector's emission is
-        // platform-scoped. Use the un-gated predicate to confirm.
+        // The pure classifier is still platform-agnostic — it says
+        // "hazardous" regardless of the gate; only emission is gated.
         assert!(
             crate::config::validate::is_macos_power_off_hazard(&cfg.displays["shared_oled"]),
             "the pure classifier must still flag the topology regardless of host"
+        );
+    }
+
+    // ── Wiring test: load_config_from_str merges the collector output ─────────
+    //
+    // This is the SINGLE test in the file that exercises the real load
+    // path. It is honest on every host because `cfg!(target_os =
+    // "macos")` is a compile-time host check — the assert compares against
+    // 0 on a non-macOS build and 1 on a macOS build, and the helper does
+    // NOT add a second collector call. If load_config_from_str ever emits
+    // the hazard twice, this test catches it on macOS (`expected 1, got
+    // 2`). If it ever stops emitting on macOS, the assert catches the
+    // regression with `expected 1, got 0`.
+    #[test]
+    fn power_off_opt_in_load_config_wires_collector_with_platform_gate() {
+        let (_cfg, warnings) = load_str(hazardous_shared_ddcci_toml())
+            .expect("hazardous TOML loads without parse error");
+        let hazardous_count = warnings
+            .iter()
+            .filter(|w| w.message.contains("unrecoverable"))
+            .count();
+        // `usize::from(cfg!(target_os = "macos"))` is 0 on Linux CI and 1
+        // on a macOS daemon — the platform gate is the only source of
+        // variance. The wiring assertion verifies BOTH directions: the
+        // collector is wired into load_config_from_str AND the platform
+        // gate is honoured by that call site.
+        assert_eq!(
+            hazardous_count,
+            usize::from(cfg!(target_os = "macos")),
+            "load_config_from_str must emit the hazard iff target = macOS \
+             (compiled target = {}); got {} warnings, expected {}",
+            if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "linux/other"
+            },
+            hazardous_count,
+            usize::from(cfg!(target_os = "macos")),
         );
     }
 
@@ -3404,7 +3439,8 @@ gracee_period = "60s"
              controllers = [\"ddcci\"]\n\
              scope = \"private\"\n\
              blank_mode = \"power_off\"\n";
-        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let cfg = parse_for_collector(toml);
+        let warnings = hazard_warnings(&cfg, true);
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "private display must not emit macOS power-off hazard, got warnings: {:?}",
@@ -3427,7 +3463,8 @@ gracee_period = "60s"
              scope = \"shared\"\n\
              shared_input_code = 1\n\
              blank_mode = \"screen_off_audio_on\"\n";
-        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let cfg = parse_for_collector(toml);
+        let warnings = hazard_warnings(&cfg, true);
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "screen_off_audio_on primary mode must not emit macOS power-off hazard, got warnings: {:?}",
@@ -3450,7 +3487,8 @@ gracee_period = "60s"
              scope = \"shared\"\n\
              shared_input_code = 1\n\
              blank_mode = \"brightness_zero\"\n";
-        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let cfg = parse_for_collector(toml);
+        let warnings = hazard_warnings(&cfg, true);
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "brightness_zero primary mode must not emit macOS power-off hazard, got warnings: {:?}",
@@ -3479,7 +3517,8 @@ gracee_period = "60s"
                  { kind = \"render_black\", dwell = \"30s\" },\n\
                  { kind = \"power_off\" },\n\
              ]\n";
-        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let cfg = parse_for_collector(toml);
+        let warnings = hazard_warnings(&cfg, true);
         let hits: Vec<_> = warnings
             .iter()
             .filter(|w| {
@@ -3510,7 +3549,8 @@ gracee_period = "60s"
              scope = \"shared\"\n\
              shared_input_code = 1\n\
              blank_mode = \"power_off\"\n";
-        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let cfg = parse_for_collector(toml);
+        let warnings = hazard_warnings(&cfg, true);
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "ddcci as a non-first fallback must not emit macOS power-off hazard, got warnings: {:?}",
@@ -3533,7 +3573,8 @@ gracee_period = "60s"
              shared_input_code = 1\n\
              blank_mode = \"power_off\"\n\
              power_off_opt_in = true\n";
-        let (_, warnings) = load_str_on_macos(toml).unwrap();
+        let cfg = parse_for_collector(toml);
+        let warnings = hazard_warnings(&cfg, true);
         assert!(
             !warnings.iter().any(|w| w.message.contains("unrecoverable")),
             "power_off_opt_in = true must silence the macOS power-off hazard, got warnings: {:?}",

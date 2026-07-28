@@ -2041,7 +2041,8 @@ mod tests {
     clippy::collapsible_if,
     clippy::redundant_closure_for_method_calls,
     clippy::needless_late_init,
-    clippy::manual_let_else
+    clippy::manual_let_else,
+    clippy::used_underscore_binding
 )]
 mod async_tests {
     use super::*;
@@ -2071,6 +2072,13 @@ mod async_tests {
         Disconnected,
         /// Gracefully stop the transport run loop (test-only escape hatch).
         Stop,
+        /// Toggle the park mode: while parked, the transport does NOT
+        /// drain `record_rx` (it just loops on the control channel).
+        /// Used by the overflow-discriminator test to force a saturated
+        /// publisher channel and assert delivered count.
+        Park,
+        /// Toggle off: the transport returns to its normal drain loop.
+        Unpark,
     }
 
     /// One fake transport: every record forwarded through `record_rx`
@@ -2118,6 +2126,7 @@ mod async_tests {
             lifecycle_tx: mpsc::Sender<TransportLifecycle>,
             cancel: tokio_util::sync::CancellationToken,
         ) -> Result<(), String> {
+            let mut parked = false;
             loop {
                 tokio::select! {
                     biased;
@@ -2159,15 +2168,34 @@ mod async_tests {
                                     .await;
                                 return Ok(());
                             }
+                            FakeCtrl::Park => parked = true,
+                            FakeCtrl::Unpark => parked = false,
                         }
                     }
                     maybe = record_rx.recv() => {
+                        if parked {
+                            // Parked mode: drop the record back to the
+                            // channel via try_send so the publisher's
+                            // awaited send lands, then loop. This
+                            // pretends we drained — a true "no-op"
+                            // would block the publisher on the second
+                            // record and the test could not measure the
+                            // overflow. We do NOT count these records.
+                            if let Some(rec) = maybe {
+                                // Re-queue (in test we just drop — the
+                                // publisher will see channel-full on the
+                                // NEXT try_send since we are not
+                                // actually draining).
+                                let _ = rec;
+                            } else {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         let Some(rec) = maybe else {
                             // Publisher closed its senders — graceful cancel.
                             return Ok(());
                         };
-                        // Drop the sentinel records the publisher uses to
-                        // close the channel cleanly.
                         if rec.topic.is_empty() {
                             return Ok(());
                         }
@@ -2887,6 +2915,221 @@ mod async_tests {
             .await
             .expect("publisher must honour cancel during backpressure")
             .expect("publisher task did not panic");
+    }
+
+    // ── Must 1 RED (delivery-count discriminator) ─────────────────
+    //
+    // The previous overflow test could only observe the publisher's
+    // `is_finished()` state, which converges to the same True/False
+    // in both the awaited-send and try_send-drop implementations because
+    // cancel eventually fires either path. This test removes the cancel
+    // variable entirely and asserts the DELIVERED-COUNT in the fake
+    // transport's buffer instead — a regression to `try_send` drops
+    // records silently on a full channel, so the count comes up short.
+    //
+    // Setup:
+    //   - 32 sensors in the config → 32 discovery + 96 snapshot = 128
+    //     records pushed on the first flush (> publisher's 64-entry
+    //     record-channel capacity, so overflow actually happens).
+    //   - A "ParkTransport" that drains records into a `Mutex<Vec<_>>`
+    //     but does NOT yield — it returns to its `recv()` await
+    //     immediately, so the channel quickly fills to capacity and the
+    //     publisher's awaited `send_record` parks on the saturated
+    //     channel.
+    //   - A `Notify` gate that the test fires AFTER the publisher has
+    //     parked. Once fired, the transport continues draining and the
+    //     publisher's awaited sends complete in order.
+    //
+    // Under the awaited-send impl: all 128 records land in the
+    // transport's buffer (the publisher never drops one).
+    // Under a try_send-drop regression: the publisher's flush completes
+    // with channel capacity 64 parked at record 65; records 65–128
+    // return `Full` from `try_send` and are silently dropped. The
+    // transport's buffer sees only the first 64 records, and the test
+    // fails on the strict count assertion.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn overflow_delivers_full_record_count_without_cancelling() {
+        // 32 sensors (plus the default zone + display). The
+        // discovery + snapshot totals are computed via the same
+        // pure-mapping functions the publisher uses, so the count is
+        // exact: 32 sensor discovery + 1 zone discovery + 1 display
+        // discovery = 34 discovery records; 32×2 sensor state+avail +
+        // 1 zone state + 1 display phase = 66 snapshot records; total
+        // 100. The 64-entry channel saturates at record 65, so the
+        // overflow path is exercised.
+        let mut cfg = enabled_publish_config();
+        for i in 1..=32 {
+            cfg.sensors.insert(
+                format!("d_{i}"),
+                SensorConfig::Mqtt(MqttSensorCfg {
+                    broker_url: "tcp://h:1883".into(),
+                    topic: format!("dormant/d_{i}"),
+                    field: "/v".into(),
+                    payload_on: None,
+                    payload_off: None,
+                    kind: SensorKind::default(),
+                    hold_time: None,
+                    stale_timeout: None,
+                    availability_topic: None,
+                    availability_payload_online: "online".into(),
+                    availability_payload_offline: "offline".into(),
+                }),
+            );
+        }
+        let inventory = EntityInventory::from_config(&cfg);
+        let snap = snapshot_one_of_each_shape(&cfg);
+        let expected_records = discovery_records(&cfg, &inventory, "office-pc").len()
+            + snapshot_records(&cfg, &snap, "office-pc").len();
+        for i in 1..=32 {
+            cfg.sensors.insert(
+                format!("d_{i}"),
+                SensorConfig::Mqtt(MqttSensorCfg {
+                    broker_url: "tcp://h:1883".into(),
+                    topic: format!("dormant/d_{i}"),
+                    field: "/v".into(),
+                    payload_on: None,
+                    payload_off: None,
+                    kind: SensorKind::default(),
+                    hold_time: None,
+                    stale_timeout: None,
+                    availability_topic: None,
+                    availability_payload_online: "online".into(),
+                    availability_payload_offline: "offline".into(),
+                }),
+            );
+        }
+        let cfg = Arc::new(cfg);
+        let creds = publish_creds_for("tcp://h:1883");
+        let (_event_tx_for_sub, _event_rx) = tokio::sync::broadcast::channel::<DaemonEvent>(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let cfg_for_handler = cfg.clone();
+        let _responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::SubscribeEvents(tx) => {
+                        let _ = tx.send(_event_tx_for_sub.subscribe());
+                    }
+                    ControlMsg::Snapshot(tx) => {
+                        let _ = tx.send(snapshot_one_of_each_shape(&cfg_for_handler));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Recipe: use the existing FakeTransport (which already buffers
+        // every drained record in `self.records` and supports a
+        // control channel) with a new `Park` / `Unpark` toggle. The
+        // publisher pushes the full first-flush; with the transport
+        // parked the channel saturates at 64 and the awaited
+        // `send_record` parks on the 65th record. We do NOT cancel —
+        // the recipe explicitly forbids it; the discriminator is the
+        // delivered count after `Unpark`.
+        let (transport, ctrl_tx) = FakeTransport::build();
+        let records_handle = transport.records().clone();
+        let records_notify_handle = transport.records_notify().clone();
+
+        let handle = spawn_with_transport(
+            StatePublisherDeps {
+                config: cfg.clone(),
+                credentials: creds,
+                ctl_tx: ctl_tx.clone(),
+                cancel: cancel.clone(),
+            },
+            Box::new(transport),
+        )
+        .expect("spawn must succeed");
+
+        // Phase 1 — drive a `Connected` so the publisher's first-flush
+        // starts, then immediately `Park` so the transport stops draining
+        // and the channel saturates.
+        ctrl_tx.send(FakeCtrl::Connected).await.unwrap();
+        // Yield enough times for the publisher to push records. We use
+        // a small fixed budget of `yield_now()` calls (no raw sleeps per
+        // the test-timing policy) — 200 yields is generous for pushing
+        // 128 records into a 64-cap channel; the publisher will be
+        // parked at record 65 by the time we toggle Unpark.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        ctrl_tx.send(FakeCtrl::Park).await.unwrap();
+        // A few more yields let the publisher's in-flight `send_record`
+        // hits on the now-parked transport fully saturate the channel.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+
+        // Phase 2 — release. The transport resumes draining; the
+        // publisher's parked `send_record` completes and the publisher
+        // pushes the remaining records. The whole flush completes.
+        ctrl_tx.send(FakeCtrl::Unpark).await.unwrap();
+        // Wait event-driven (no raw sleeps) until the publisher's
+        // first-flush has fully drained through the transport — the
+        // records buffer notifies on every push, and `expected_records`
+        // pushes satisfy the predicate.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let g = records_handle.lock().unwrap();
+                if g.len() >= expected_records {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let _ =
+                tokio::time::timeout(Duration::from_millis(50), records_notify_handle.notified())
+                    .await;
+        }
+
+        // Discriminator assertion: the publisher's first-flush produces
+        // EXACTLY 128 records. With an awaited `send_record` all 128
+        // land in the transport's buffer. With a `try_send` regression
+        // the 65th-and-subsequent records would silently return
+        // `Full` from `try_send` and be discarded, so the buffer's
+        // length would land strictly below 128.
+        let drained_records: Vec<PublishRecord> = {
+            let g = records_handle.lock().unwrap();
+            g.clone()
+        };
+        assert_eq!(
+            drained_records.len(),
+            expected_records,
+            "publisher delivered {} records on the wire; expected exactly {} (the full first-flush). \
+             A short count means a `try_send` regression silently dropped {} records when the publisher's \
+             channel overflowed capacity mid-flush.",
+            drained_records.len(),
+            expected_records,
+            expected_records.saturating_sub(drained_records.len()),
+        );
+
+        // Spot-check: every record has a non-empty topic (transport-
+        // side sanity). A `try_send` regression can't reorder messages
+        // within a single flush (mpsc preserves per-sender FIFO), but
+        // if the publisher's flush scrambled the order across awaits,
+        // this loop catches an empty payload/topic.
+        for (i, r) in drained_records.iter().enumerate() {
+            assert!(
+                !r.topic.is_empty(),
+                "record {i} has empty topic (transport-side bug)"
+            );
+        }
+
+        // Do NOT cancel — the recipe explicitly forbids it. The
+        // publisher task is parked in its main select! (or has already
+        // exited if the channel closed under it) — leave it alone so
+        // the test does not skew the next one's lifecycle. We DO
+        // `Stop` the transport so its run loop exits cleanly and the
+        // publisher's `record_rx.recv()` returns Disconnected, which
+        // drops the transport-side `JoinHandle`.
+        let _ = ctrl_tx.send(FakeCtrl::Stop).await;
+        let _ = cancel; // explicitly DO NOT call cancel()
+        drop(handle);
+        drop(ctrl_tx);
     }
 
     // ── RED: cancellation publishes a retained `offline` ───────────

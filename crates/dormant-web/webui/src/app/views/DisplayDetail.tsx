@@ -185,6 +185,21 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
     ? Math.max(0, (wear?.total_on_hours ?? 0) - seededHours)
     : (wear?.total_on_hours ?? 0);
 
+  // Uniform / no-data classification — operates on the absolute `cells`
+  // (issue #108: a uniformly-worn panel collapses to flat grey under
+  // the old min-max normalization, so the normalized `heat` array is
+  // NOT a reliable signal here).
+  //   - all-zero grid → genuine "no exposure recorded" (not uniform)
+  //   - uniform non-zero → every cell equal within display precision
+  //     AND at least one cell positive
+  //   - varied → gradient + legend
+  const wearCells = wear?.cells ?? [];
+  const maxCellHours = wear?.max_cell_hours ?? 0;
+  const hasAnyExposure = wearCells.some((c) => c > 0);
+  const isAllZero = wearCells.length > 0 && wearCells.every((c) => c === 0);
+  const isUniformNonZero =
+    !isAllZero && hasAnyExposure && wearCells.every((c) => Math.abs(c - wearCells[0]) < 1e-6);
+
   return (
     <div className="display-detail">
       <button type="button" className="display-detail__back" onClick={onBack}>
@@ -334,14 +349,31 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
               </div>
 
               <div className="display-detail__heat-map-wrap">
-                <WearHeatMap display={id} grid={grid} />
+                {isAllZero ? (
+                  <div className="wear-heat-map__empty">No exposure recorded</div>
+                ) : (
+                  <WearHeatMap display={id} grid={grid} />
+                )}
               </div>
 
               {grid.hasGridSamples || grid.hasHeatSamples ? (
-                <div className="display-detail__legend">
-                  <span className="display-detail__legend-label">cool</span>
-                  <div className="display-detail__legend-bar" style={{ background: legendGradient }} />
-                  <span className="display-detail__legend-label">hot</span>
+                !isAllZero ? (
+                  <div className="display-detail__legend">
+                    <span className="display-detail__legend-label">0 h</span>
+                    <div
+                      className="display-detail__legend-bar"
+                      style={{ background: legendGradient }}
+                    />
+                    <span className="display-detail__legend-label">
+                      {maxCellHours.toFixed(0)} h
+                    </span>
+                  </div>
+                ) : null
+              ) : null}
+
+              {isUniformNonZero ? (
+                <div className="display-detail__uniform-note">
+                  Uniform exposure — no hotspots
                 </div>
               ) : null}
             </div>

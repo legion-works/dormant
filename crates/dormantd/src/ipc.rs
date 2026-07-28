@@ -651,6 +651,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }));
         let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
         let hook_engine = Arc::new(crate::hooks::HookEngine::new(publisher));
@@ -680,6 +681,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }));
         let (creds_tx, creds_rx) = watch::channel(Arc::new(Credentials::default()));
         drop(config_tx);

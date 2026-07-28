@@ -45,7 +45,7 @@ export default function KeymapSection({
   const hotkey = keymap.claim_hotkey ?? null;
 
   return (
-    <FormSection title="Keymap">
+    <FormSection id="keymap" title="Keymap">
       <div className="cf-card">
         <div className="cf-card__header">
           <span className="cf-card__name">[keymap]</span>

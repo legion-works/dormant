@@ -604,6 +604,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 
@@ -653,6 +654,7 @@ mod tests {
             rules,
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         (cfg, "myrule")
     }
@@ -902,6 +904,7 @@ field = "/val"
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let state = test_state(dir.path(), cfg, 8080);
         let fingerprint = get_fingerprint(&state);
@@ -2364,6 +2367,7 @@ shared_input_write_code = 0x15
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let state = test_state(dir.path(), cfg, 8080);

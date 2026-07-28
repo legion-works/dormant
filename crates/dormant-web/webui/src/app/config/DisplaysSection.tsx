@@ -86,7 +86,7 @@ export default function DisplaysSection({
 
   return (
     <>
-    <FormSection title="Displays">
+    <FormSection id="displays" title="Displays">
       {ids.map((id) => {
         const cfg = displays[id];
         const basePath = ["displays", id];

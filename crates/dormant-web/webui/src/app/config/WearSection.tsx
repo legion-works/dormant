@@ -57,7 +57,7 @@ export default function WearSection({ wear, store, redactedPaths, onDirty, field
   if (keys.length === 0) return null;
 
   return (
-    <FormSection title="Wear">
+    <FormSection id="wear" title="Wear">
       <div className="cf-card">
         {keys.map((key) => {
           const path = ["wear", key];

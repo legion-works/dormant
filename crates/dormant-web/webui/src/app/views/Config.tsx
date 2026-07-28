@@ -343,6 +343,7 @@ export default function Config() {
   });
   const [reloading, setReloading] = useState(false);
   const [tab, setTab] = useState<ConfigTab>(getConfigTabFromHash);
+  const [hashNavigationKey, setHashNavigationKey] = useState(() => window.location.hash);
   const [dirtyTabs, setDirtyTabs] = useState<Set<ConfigTab>>(new Set());
   const mountedRef = useRef(true);
 
@@ -384,6 +385,7 @@ export default function Config() {
     const handler = () => {
       const nextTab = getConfigTabFromHash();
       setTab(nextTab);
+      setHashNavigationKey(window.location.hash);
     };
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
@@ -396,19 +398,38 @@ export default function Config() {
   useEffect(() => {
     const target = getConfigFragmentTarget();
     if (!target) return;
-    // Defer until the tab's sections are in the DOM.
-    const timer = setTimeout(() => {
-      const el = document.querySelector(`[data-field-id="${target}"]`);
-      if (!el) return;
-      (el as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
-      (el as HTMLElement).style.transition = "background-color 0.15s ease";
-      (el as HTMLElement).style.backgroundColor = "var(--accent-warm-muted)";
-      setTimeout(() => {
-        (el as HTMLElement).style.backgroundColor = "";
-      }, 1200);
-    }, 150);
-    return () => clearTimeout(timer);
-  }, [tab]);
+    let cancelled = false;
+    let observer: MutationObserver | undefined;
+    const attemptNavigation = () => {
+      if (cancelled) return;
+      const selector = target.startsWith("config-section-")
+        ? `[data-config-section="${target.slice("config-section-".length)}"]`
+        : `[data-field-id="${target}"]`;
+      const el = document.querySelector(selector) as HTMLElement | null;
+      if (!el) return false;
+      observer?.disconnect();
+      el.scrollIntoView({ behavior: "smooth", block: target.startsWith("config-section-") ? "start" : "center" });
+      if (target.startsWith("config-section-")) return;
+      el.style.transition = "background-color 0.15s ease";
+      el.style.backgroundColor = "var(--accent-warm-muted)";
+      setTimeout(() => { el.style.backgroundColor = ""; }, 1200);
+      return true;
+    };
+    const cancelOnHashChange = () => {
+      cancelled = true;
+      observer?.disconnect();
+    };
+    window.addEventListener("hashchange", cancelOnHashChange);
+    observer = new MutationObserver(attemptNavigation);
+    if (!attemptNavigation()) {
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+    return () => {
+      cancelled = true;
+      observer?.disconnect();
+      window.removeEventListener("hashchange", cancelOnHashChange);
+    };
+  }, [tab, hashNavigationKey]);
 
   const handleReload = useCallback(async () => {
     setReloading(true);

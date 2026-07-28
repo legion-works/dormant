@@ -38,7 +38,7 @@ export default function NotificationsSection({ notifications, store, redactedPat
   if (keys.length === 0) return null;
 
   return (
-    <FormSection title="Notifications">
+    <FormSection id="notifications" title="Notifications">
       <div className="cf-card">
         {keys.map((key) => {
           const path = ["notifications", key];

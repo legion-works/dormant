@@ -8,6 +8,40 @@
   gap: 14px;
 }
 
+.config-section-rail {
+  position: sticky;
+  top: 12px;
+  z-index: 2;
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.config-section-rail button {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  padding: 6px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.config-section-rail button::before {
+  content: attr(data-title);
+}
+
+.config-section-rail button[aria-current="location"] {
+  color: var(--text);
+  border-color: var(--accent-warm);
+}
+
+@media (max-width: 700px) {
+  .config-section-rail {
+    overflow-x: auto;
+    position: sticky;
+  }
+}
+
 
 /* ── Section shell ── */
 

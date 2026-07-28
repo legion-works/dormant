@@ -181,7 +181,7 @@ export default function DaemonSection({ daemon, store, redactedPaths, onDirty, f
   );
 
   return (
-    <FormSection title="Daemon">
+    <FormSection id="daemon" title="Daemon">
       <div className="cf-card">
         {postureCard}
 

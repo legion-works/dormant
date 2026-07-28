@@ -298,3 +298,24 @@ pub const MACOS_IDLE_SANITY_CAP: Duration = Duration::from_secs(24 * 60 * 60);
 /// detection specifically, since `CGEventSource` idle counters can report
 /// stale/pre-launch values immediately after process start.
 pub const MACOS_IDLE_STARTUP_GRACE: Duration = Duration::from_secs(15);
+
+// ── [publish] section defaults (issue #105) ─────────────────────────────────
+
+/// Default base topic for the optional state-publish feature. The full
+/// availability topic is `{base_topic}/{instance_id}/availability` and
+/// per-entity state is `{base_topic}/{instance_id}/<kind>/<id>/state`.
+pub const PUBLISH_BASE_TOPIC: &str = "dormant";
+
+/// Default Home Assistant MQTT discovery prefix. Matches the convention baked
+/// into every standard HA-MQTT integration — operators expect a dolphin-safe
+/// default that swaps cleanly for a custom path.
+pub const PUBLISH_DISCOVERY_PREFIX: &str = "homeassistant";
+
+/// Deterministic fallback for `publish.instance_id` when `$HOSTNAME` is
+/// unset or empty (containers, minimal initramfs, Windows shells). The
+/// resulting sanitized id is the literal string `"dormant"` per the
+/// contract.
+pub const PUBLISH_INSTANCE_ID_FALLBACK: &str = "dormant";
+
+/// Whether the opt-in MQTT state-publish feature is enabled by default.
+pub const PUBLISH_ENABLED: bool = false;

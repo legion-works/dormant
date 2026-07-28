@@ -69,6 +69,7 @@ const wear = {
   grid_cols: 2,
   cells: [1, 2, 0.5, 2.5],
   heat: [0.1, 0.4, 0.4, 0.9],
+  max_cell_hours: 2.5,
 };
 
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
@@ -94,8 +95,12 @@ describe("DisplayDetail", () => {
     expect(screen.getByText("Panel exposure", { exact: false, selector: ".display-detail__eyebrow" })).toBeInTheDocument();
     expect(screen.getByText("2×2 grid · brightness-weighted on-hours")).toBeInTheDocument();
     expect(screen.getAllByText("WOLED").length).toBeGreaterThan(0);
-    expect(screen.getByText("cool")).toBeInTheDocument();
-    expect(screen.getByText("hot")).toBeInTheDocument();
+    // Legend labeled with real hours (0 h and the max_cell_hours
+    // value rounded), not the old "cool"/"hot" — the previous labels
+    // hid the fact that absolute on-hours are available, and would
+    // have read as meaningless on a uniformly-worn panel.
+    expect(screen.getByText("0 h")).toBeInTheDocument();
+    expect(screen.getByText("3 h")).toBeInTheDocument();
 
     // Exposure summary rows (v3 restructure).
     expect(screen.getByText("321")).toBeInTheDocument();
@@ -203,6 +208,95 @@ describe("DisplayDetail", () => {
       />,
     );
     expect(screen.getByText("No spatial wear samples for this display yet.")).toBeInTheDocument();
+  });
+
+  // ── T12 (#108): uniform panel labeling + legend anchors ──────────────
+  //
+  // A uniformly-worn panel used to render as flat grey / zero heat under
+  // min-max normalization — indistinguishable from no data. After the
+  // backend zero-max fix it renders at full intensity, and the UI now:
+  //
+  //   - all-zero grid → "No exposure recorded" (the genuine "no data"
+  //     signal — NOT a uniform panel)
+  //   - uniform non-zero → exact "Uniform exposure — no hotspots" copy
+  //     PLUS a legend labeled with real hours (0 h → max h)
+  //   - varied grid → gradient legend with absolute hours, NO uniform
+  //     copy (no false reassurance of "no hotspots")
+
+  it("renders 'No exposure recorded' for an all-zero ledger and does NOT label it uniform", () => {
+    const zeroWear: WearDetail = {
+      ...wear,
+      cells: [0, 0, 0, 0],
+      heat: [0, 0, 0, 0],
+      max_cell_hours: 0,
+    };
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={zeroWear}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("No exposure recorded")).toBeInTheDocument();
+    expect(screen.queryByText(/uniform exposure/i)).not.toBeInTheDocument();
+  });
+
+  it("renders exact 'Uniform exposure — no hotspots' copy AND a `0 h → 12 h` legend for a uniform non-zero panel", () => {
+    const uniformWear: WearDetail = {
+      ...wear,
+      cells: [12, 12, 12, 12],
+      heat: [1, 1, 1, 1],
+      max_cell_hours: 12,
+    };
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={uniformWear}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+    // Exact honest copy — the previous "cool/hot" labels hid the fact
+    // that there were no hotspots.
+    expect(screen.getByText("Uniform exposure — no hotspots")).toBeInTheDocument();
+    // Legend anchored to real hours, NOT inferred from normalized heat
+    // (uniform heat would be 1.0 everywhere — multiplying by max gives
+    // real hours back).
+    expect(screen.getByText("0 h")).toBeInTheDocument();
+    expect(screen.getByText("12 h")).toBeInTheDocument();
+  });
+
+  it("renders a gradient legend (no uniform copy) for a varied panel", () => {
+    const variedWear: WearDetail = {
+      ...wear,
+      cells: [0, 4, 8, 12],
+      heat: [0, 0.333, 0.666, 1],
+      max_cell_hours: 12,
+    };
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={{ rule: "office_blank", zone: "office" }}
+        wear={variedWear}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+    // No false "no hotspots" reassurance on a varied grid — the whole
+    // point of the heat map is to show non-uniformity.
+    expect(screen.queryByText(/uniform exposure/i)).not.toBeInTheDocument();
+    // Gradient bar still present, legend still labeled with real hours.
+    expect(screen.getByText("0 h")).toBeInTheDocument();
+    expect(screen.getByText("12 h")).toBeInTheDocument();
   });
 
   it("normalizes empty, short, long, non-finite, and zero-dimension arrays", () => {

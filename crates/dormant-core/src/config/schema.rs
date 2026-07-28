@@ -111,6 +111,10 @@ pub struct Config {
     /// Local input-device filtering for activity claims.
     #[serde(default)]
     pub input_filter: InputFilterConfig,
+
+    /// Opt-in MQTT state publishing (issue #105).
+    #[serde(default)]
+    pub publish: PublishConfig,
 }
 
 /// Global KVM claim hotkey settings.
@@ -606,6 +610,68 @@ impl Default for AudioConfig {
             playback_roles: None,
             capture_is_call: false,
             pw_dump_command: defaults::AUDIO_PW_DUMP_COMMAND.into(),
+        }
+    }
+}
+
+// ── PublishConfig ────────────────────────────────────────────────────────────────
+
+/// Opt-in state-publish configuration (the `[publish]` TOML section).
+///
+/// Implements issue #105. When `enabled` is `false` (the default), the
+/// daemon spawns no publisher task and the broker / discovery / LWT
+/// machinery is never started. When `enabled`, the section is required to
+/// carry a `broker_url` that passes [`crate::mqtt::parse_broker_url`] —
+/// the credential lookup keys `creds.mqtt` by that exact URL string,
+/// matching the longstanding MQTT sensor convention, so a publish broker
+/// can share credentials with the sensors or carry its own.
+///
+/// The contract for topics, payloads, retain/QoS, and entity uniqueness is
+/// ratified in `.opencode/decisions/2026-07-27-mqtt-publish-contract.md`
+/// and is implemented in `dormantd::state_publisher`; this struct is the
+/// declaration site only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublishConfig {
+    /// Publish task kill-switch. Disabled by default — the daemon does not
+    /// spawn a publisher and makes no MQTT connections on the publish plane.
+    #[serde(default = "default_publish_enabled")]
+    pub enabled: bool,
+
+    /// MQTT broker URL (e.g. `tcp://localhost:1883`). Required when
+    /// `enabled = true`; ignored when `enabled = false`. The exact string is
+    /// the credential-lookup key — operators that share a broker with their
+    /// sensors reuse the same entry under `creds.mqtt`.
+    #[serde(default)]
+    pub broker_url: Option<String>,
+
+    /// Base topic for state and availability publishes. Per-entity topics
+    /// are formed as `{base_topic}/{instance_id}/<kind>/<id>/state`. Default
+    /// `dormant`; see [`defaults::PUBLISH_BASE_TOPIC`].
+    #[serde(default = "default_publish_base_topic")]
+    pub base_topic: String,
+
+    /// Home Assistant MQTT discovery prefix. Default `homeassistant`; see
+    /// [`defaults::PUBLISH_DISCOVERY_PREFIX`].
+    #[serde(default = "default_publish_discovery_prefix")]
+    pub discovery_prefix: String,
+
+    /// Per-instance identifier embedded in every topic. Sanitized at
+    /// publish-time via the contract's `sanitize_topic_id`; the raw value
+    /// is preserved here so operators can read their actual id in the web
+    /// inventory and logs. Defaults to `$HOSTNAME` with a deterministic
+    /// `dormant` fallback when the variable is unset or empty.
+    #[serde(default = "default_publish_instance_id")]
+    pub instance_id: String,
+}
+
+impl Default for PublishConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::PUBLISH_ENABLED,
+            broker_url: None,
+            base_topic: defaults::PUBLISH_BASE_TOPIC.into(),
+            discovery_prefix: defaults::PUBLISH_DISCOVERY_PREFIX.into(),
+            instance_id: default_publish_instance_id(),
         }
     }
 }
@@ -1596,6 +1662,29 @@ fn default_audio_call_roles() -> Vec<String> {
 }
 fn default_audio_pw_dump_command() -> String {
     defaults::AUDIO_PW_DUMP_COMMAND.into()
+}
+fn default_publish_enabled() -> bool {
+    defaults::PUBLISH_ENABLED
+}
+fn default_publish_base_topic() -> String {
+    defaults::PUBLISH_BASE_TOPIC.into()
+}
+fn default_publish_discovery_prefix() -> String {
+    defaults::PUBLISH_DISCOVERY_PREFIX.into()
+}
+
+/// Std-only hostname lookup for `publish.instance_id`. Reads `$HOSTNAME`
+/// (set on every mainstream Linux/BSD/macOS shell) and falls back to the
+/// deterministic literal `dormant` when unset or empty. Container
+/// environments sometimes omit the variable; the fallback keeps the topic
+/// tree stable across daemon restarts on the same host.
+fn default_publish_instance_id() -> String {
+    let raw = std::env::var("HOSTNAME").unwrap_or_default();
+    if raw.is_empty() {
+        defaults::PUBLISH_INSTANCE_ID_FALLBACK.into()
+    } else {
+        raw
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

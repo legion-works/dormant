@@ -44,6 +44,7 @@ describe("WearHeatMap uniform-data case", () => {
       display_name: "uniform",
       panel_type: "unknown",
       total_on_hours: 10,
+      max_cell_hours: 0,
       sample_count: 4,
       advisory: false,
       hours_since_long_dwell: 0,

@@ -3,3 +3,13 @@ authors = ["dormant contributors"]
 language = "en"
 src = "src"
 title = "dormant"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["theme/legion.css"]
+git-repository-url = "https://github.com/legion-works/dormant"
+edit-url-template = "https://github.com/legion-works/dormant/edit/dev/docs/{path}"
+
+[output.html.search]
+enable = true

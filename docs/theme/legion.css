@@ -1,0 +1,234 @@
+/* dormant docs — Legion Works brand theme for mdBook.
+
+   mdBook ships its own CSS variable layer (ace/general/chrome variables
+   under the `.light`/`.navy`/`.ayu` classes). This file maps that layer
+   onto the Legion Works palette so the published book reads as part of
+   the same product as the web dashboard and the tray.
+
+   Token values are inlined literally rather than imported from
+   design/web-ui/_ds/: mdBook's theme CSS is served standalone from the
+   book output, so DS custom properties have no stylesheet context to
+   resolve against here. Every hex below is copied verbatim from
+   design/web-ui/_ds/legion-works-design-system-*/tokens/colors.css
+   (the same source the web UI consumes) — this file and the favicon are
+   the sanctioned places for literal brand hex.
+
+     --cyan-400   #86E1FC  Legion cyan — links, active nav, system chrome
+     --amber-500  #FF966C  IceTea amber — sparing emphasis only
+     --green-400  #C3E88D  dormant green — the "awake / present" signal
+     --neutral-0  #16161e  deep night (page)
+     --neutral-150 #222436 raised surface (code blocks, sidebar)
+     --neutral-800 #c8d3f5 strong text
+     Space Grotesk display · Geist UI · JetBrains Mono code
+*/
+
+@import url("https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap");
+
+:root {
+  --lw-bg-base: #16161e;
+  --lw-bg-sunken: #101018;
+  --lw-bg-raised: #222436;
+  --lw-text-strong: #c8d3f5;
+  --lw-text-body: #a9b1d6;
+  --lw-text-muted: #828bb8;
+  --lw-text-faint: #737aa2;
+  --lw-accent: #86e1fc;
+  --lw-accent-warm: #ff966c;
+  --lw-success: #c3e88d;
+  --lw-warning: #ffc777;
+  --lw-danger: #ff757f;
+  --lw-border: rgba(169, 177, 214, 0.14);
+  --lw-border-strong: rgba(169, 177, 214, 0.28);
+  --lw-font-display: "Space Grotesk", system-ui, sans-serif;
+  --lw-font-ui: "Geist", system-ui, sans-serif;
+  --lw-font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --lw-radius-sm: 6px;
+  --lw-radius-md: 10px;
+  --lw-tracking-caps: 0.14em;
+}
+
+/* ── mdBook variable layer ─────────────────────────────────────────── */
+
+.navy,
+.coal,
+.light,
+.rust,
+.ayu {
+  --bg: var(--lw-bg-base);
+  --fg: var(--lw-text-body);
+
+  --sidebar-bg: var(--lw-bg-sunken);
+  --sidebar-fg: var(--lw-text-muted);
+  --sidebar-non-existant: var(--lw-text-faint);
+  --sidebar-active: var(--lw-accent);
+  --sidebar-spacer: var(--lw-border);
+
+  --scrollbar: var(--lw-text-faint);
+
+  --icons: var(--lw-text-muted);
+  --icons-hover: var(--lw-accent);
+
+  --links: var(--lw-accent);
+
+  --inline-code-color: var(--lw-accent-warm);
+
+  --theme-popup-bg: var(--lw-bg-raised);
+  --theme-popup-border: var(--lw-border-strong);
+  --theme-hover: rgba(134, 225, 252, 0.12);
+
+  --quote-bg: var(--lw-bg-raised);
+  --quote-border: var(--lw-accent);
+
+  --table-border-color: var(--lw-border-strong);
+  --table-header-bg: var(--lw-bg-raised);
+  --table-alternate-bg: rgba(169, 177, 214, 0.04);
+
+  --searchbar-border-color: var(--lw-border-strong);
+  --searchbar-bg: var(--lw-bg-raised);
+  --searchbar-fg: var(--lw-text-body);
+  --searchbar-shadow-color: transparent;
+  --searchresults-header-fg: var(--lw-text-faint);
+  --searchresults-border-color: var(--lw-border);
+  --searchresults-li-bg: var(--lw-bg-raised);
+  --search-mark-bg: rgba(255, 150, 108, 0.28);
+}
+
+/* ── Type ──────────────────────────────────────────────────────────── */
+
+html {
+  font-family: var(--lw-font-ui);
+}
+
+.content h1,
+.content h2,
+.content h3,
+.content h4 {
+  font-family: var(--lw-font-display);
+  color: var(--lw-text-strong);
+  letter-spacing: -0.02em;
+}
+
+.content h1 {
+  font-size: 2.1rem;
+  letter-spacing: -0.03em;
+}
+
+/* Section rule under h2 — the docs kit's quiet horizontal divider. */
+.content h2 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--lw-border);
+}
+
+.content p,
+.content li {
+  color: var(--lw-text-body);
+}
+
+.content strong {
+  color: var(--lw-text-strong);
+}
+
+/* ── Code ──────────────────────────────────────────────────────────── */
+
+code {
+  font-family: var(--lw-font-mono);
+  font-variant-ligatures: none;
+}
+
+pre > code {
+  background: var(--lw-bg-raised);
+  border: 1px solid var(--lw-border);
+  border-radius: var(--lw-radius-md);
+}
+
+:not(pre) > code {
+  background: rgba(255, 150, 108, 0.1);
+  border-radius: var(--lw-radius-sm);
+  padding: 0.1em 0.35em;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────── */
+
+.sidebar {
+  border-right: 1px solid var(--lw-border);
+}
+
+.chapter li.chapter-item a {
+  border-radius: var(--lw-radius-sm);
+  border-left: 2px solid transparent;
+  padding-left: 8px;
+}
+
+.chapter li.chapter-item a:hover {
+  background: rgba(169, 177, 214, 0.06);
+  color: var(--lw-text-strong);
+}
+
+.chapter li.chapter-item a.active {
+  background: rgba(134, 225, 252, 0.1);
+  border-left-color: var(--lw-accent);
+}
+
+/* Part titles read as eyebrows, matching the DS `.lw-eyebrow` rule. */
+.chapter .part-title {
+  font-family: var(--lw-font-display);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: var(--lw-tracking-caps);
+  color: var(--lw-text-faint);
+}
+
+/* ── Blockquotes / admonitions ─────────────────────────────────────── */
+
+blockquote {
+  border-left: 2px solid var(--lw-accent);
+  border-top: none;
+  border-right: none;
+  border-bottom: none;
+  border-radius: 0 var(--lw-radius-md) var(--lw-radius-md) 0;
+  background: rgba(134, 225, 252, 0.06);
+  color: var(--lw-text-body);
+}
+
+/* ── Menu bar ──────────────────────────────────────────────────────── */
+
+.menu-title {
+  font-family: var(--lw-font-display);
+  font-weight: 600;
+  color: var(--lw-text-strong);
+}
+
+#menu-bar {
+  border-bottom: 1px solid var(--lw-border);
+}
+
+/* mdBook's default sticky menu-bar gets the glass treatment used across
+   the dashboard chrome. backdrop-filter is a progressive enhancement —
+   the solid fallback above it keeps the bar legible without it. */
+#menu-bar.sticky,
+.js #menu-bar-hover-placeholder:hover + #menu-bar {
+  background: rgba(22, 22, 30, 0.72);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+/* ── Tables ────────────────────────────────────────────────────────── */
+
+.content table th {
+  font-family: var(--lw-font-ui);
+  font-weight: 600;
+  color: var(--lw-text-strong);
+}
+
+/* ── Links ─────────────────────────────────────────────────────────── */
+
+.content a:hover {
+  text-decoration-color: var(--lw-accent);
+}
+
+/* mdBook renders header anchor links as `<a class="header">`; keep them
+   inheriting heading colour rather than the link cyan. */
+a.header:link,
+a.header:visited {
+  color: inherit;
+}

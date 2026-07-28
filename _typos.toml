@@ -11,6 +11,9 @@ extend-ignore-re = [
   # real acronyms in the OLED research notes, not misspellings
   "ABL",
   "NDAs?",
+  # mdBook's own CSS variable is spelled this way upstream; the docs theme has to
+  # match it verbatim to override the value.
+  "sidebar-non-existant",
 ]
 
 # Intentional typo in an is_known_config_path test (verifying wrong key

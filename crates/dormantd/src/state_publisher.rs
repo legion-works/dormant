@@ -1027,10 +1027,54 @@ pub fn snapshot_records(
     }
     let base = sanitize_topic_id(&cfg.publish.base_topic);
     let instance = sanitize_topic_id(instance);
+    // Apply the SAME first-wins collision filter as `discovery_records`
+    // so a sensor/zone/display whose config-order-second sanitized id
+    // also resolves a winner does NOT leak its state/availability
+    // record onto the broker. The contract mandates "publishes ONLY
+    // the first (config-order) — never interleaves two entities on
+    // one topic" — the discovery side already filters via the `seen`
+    // HashSet; the snapshot side MUST do the same.
+    //
+    // The filter is PER-KIND + PER-SANITIZED-ID, not just per
+    // sanitized id, because the first-wins winner is determined by
+    // config order across kinds (sensor first, then zone, then
+    // display). For a sensor "Office Radar" (winner) + zone
+    // "office_radar" (loser), both sanitize to "office_radar" — the
+    // sensor's snapshot is published, the zone's is dropped.
+    let inventory = EntityInventory::from_config(cfg);
+    let mut seen_sensor: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_zone: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_display: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in &inventory.sensors {
+        let sanitized = sanitize_topic_id(raw);
+        seen_sensor.insert(sanitized);
+    }
+    for raw in &inventory.zones {
+        let sanitized = sanitize_topic_id(raw);
+        if seen_sensor.contains(&sanitized) {
+            // The sanitized id was already claimed by a sensor — the
+            // sensor wins; this zone is a LOSER and its snapshot is
+            // dropped.
+            continue;
+        }
+        seen_zone.insert(sanitized);
+    }
+    for raw in &inventory.displays {
+        let sanitized = sanitize_topic_id(raw);
+        if seen_sensor.contains(&sanitized) || seen_zone.contains(&sanitized) {
+            // A sensor or zone already won this sanitized id — the
+            // display is a LOSER.
+            continue;
+        }
+        seen_display.insert(sanitized);
+    }
     let mut records: Vec<PublishRecord> = Vec::new();
 
     for sensor in &snapshot.sensors {
         let sensor_id = sanitize_topic_id(&sensor.id);
+        if !seen_sensor.contains(&sensor_id) {
+            continue;
+        }
         records.push(state_record(
             &topic_sensor_state(&base, &instance, &sensor_id),
             sensor.state,
@@ -1043,6 +1087,9 @@ pub fn snapshot_records(
 
     for zone in &snapshot.zones {
         let zone_id = sanitize_topic_id(&zone.id);
+        if !seen_zone.contains(&zone_id) {
+            continue;
+        }
         // A zone that has never been resolved (`present = None`)
         // publishes "OFF" — absent-by-default, matching the
         // fail-toward-blanking policy in the engine.
@@ -1062,6 +1109,9 @@ pub fn snapshot_records(
 
     for (display_id_raw, display) in &snapshot.displays {
         let display_id = sanitize_topic_id(display_id_raw);
+        if !seen_display.contains(&display_id) {
+            continue;
+        }
         let topic = topic_display_phase(&base, &instance, &display_id);
         records.push(PublishRecord {
             topic,
@@ -1808,6 +1858,198 @@ mod tests {
     }
 
     // ── Collision rule: first-wins ─────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn collision_winner_publishes_only_the_config_order_first_payload() {
+        // Cross-kind collision: a sensor and a zone with raw ids that
+        // sanitize to the same topic id. Insertion order is
+        // config-order (IndexMap iteration), so the sensor MUST win.
+        // The loser's payload (zone discovery) is byte-distinguishable
+        // from the winner's (sensor discovery) by the `name` field —
+        // the winner's payload is `"dormant office_radar presence"`, the
+        // loser's would be `"dormant office_radar zone"`. The discriminator
+        // is the absence of the loser's `name` substring on the wire,
+        // and the presence of the winner's. (A same-kind collision
+        // produces byte-identical sanitized payloads — the sanitisers
+        // collapse both raw ids into the same `name`/`unique_id`, so
+        // the discriminator needs a cross-kind shape.)
+        let mut cfg = enabled_cfg();
+        // Remove the default 'desk' sensor / 'office' zone / 'main'
+        // display so the collision we build is the only thing the
+        // discovery list sees.
+        cfg.sensors.shift_remove("desk");
+        cfg.zones.shift_remove("office");
+        cfg.displays.shift_remove("main");
+        // The WINNER: a sensor whose raw id is the LOSER's raw id
+        // with whitespace + uppercase injected. The sanitizer maps
+        // both to "office_radar".
+        cfg.sensors.insert(
+            "Office Radar".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://h:1883".into(),
+                topic: "dormant/office_radar_sensor".into(),
+                field: "/val".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
+            }),
+        );
+        // The LOSER: a zone with the same sanitized id. Inserted second
+        // so the WINNER (the sensor) is config-order-first.
+        cfg.zones.insert(
+            "office_radar".into(),
+            ZoneConfig {
+                mode: "any".into(),
+                members: vec![],
+                quorum: None,
+                threshold: None,
+                weights: IndexMap::new(),
+                unavailable_policy: dormant_core::zone::UnavailablePolicy::Present,
+            },
+        );
+
+        let inv = EntityInventory::from_config(&cfg);
+        let collisions = detect_and_warn_collisions(&cfg, &inv);
+        let entry = collisions
+            .iter()
+            .find(|(san, _)| san == "office_radar")
+            .unwrap_or_else(|| panic!("expected office_radar collision, got {collisions:?}"));
+        let raw_ids = &entry.1;
+        // Pair-order: winner first, loser second.
+        assert!(
+            raw_ids
+                .first()
+                .is_some_and(|first| first == "sensor:Office Radar"),
+            "first-wins must pick the config-order-first raw id; got {raw_ids:?}"
+        );
+        assert!(
+            raw_ids
+                .get(1)
+                .is_some_and(|second| second == "zone:office_radar"),
+            "the loser's raw id must appear second; got {raw_ids:?}"
+        );
+
+        // On the wire, EXACTLY ONE discovery record for the collided
+        // sanitized id — the loser's binary_sensor/zone record must
+        // not be present. The winner is a sensor, so its discovery
+        // record is under the binary_sensor prefix.
+        let records = discovery_records(&cfg, &inv, "office-pc");
+        let office_radar_records: Vec<&PublishRecord> = records
+            .iter()
+            .filter(|r| {
+                // Discovery topic for office_radar is
+                // `<prefix>/binary_sensor/office-pc/{sensor|zone}_office_radar/config`.
+                // The trailing path is `_office_radar/config` (the
+                // kind is prepended), so a suffix match against
+                // `/office_radar/config` would miss BOTH candidates —
+                // the actual suffix is `_office_radar/config`.
+                r.topic.ends_with("_office_radar/config")
+            })
+            .collect();
+        assert_eq!(
+            office_radar_records.len(),
+            1,
+            "first-wins: exactly one discovery record for office_radar (got {}): {:?}",
+            office_radar_records.len(),
+            office_radar_records,
+        );
+        // The discovery topic tells us the winner's KIND: the sensor
+        // emits a record under `binary_sensor/.../sensor_office_radar/
+        // config`, the zone under `binary_sensor/.../zone_office_radar/
+        // config`. The sensor (WINNER) is the only one that should
+        // appear — the topic MUST be the SENSOR path.
+        let winner = office_radar_records[0];
+        assert!(
+            winner.topic.contains("/sensor_office_radar/"),
+            "winner record must be under binary_sensor/sensor_office_radar (sensor wins); got topic: {}",
+            winner.topic,
+        );
+        assert!(
+            !winner.topic.contains("/zone_office_radar/"),
+            "zone (loser) record must NOT be on the wire; got topic: {}",
+            winner.topic,
+        );
+
+        // The discovery PAYLOAD must carry the WINNER's content. The
+        // sanitized name (built from the sanitized id) is identical
+        // for both candidates, but the KIND-specific suffix is
+        // observable in the `name` field — the WINNER (sensor) is
+        // `"dormant office_radar presence"`, the LOSER (zone) would
+        // be `"dormant office_radar zone"`. The `unique_id` is also
+        // observably different: WINNER has `_sensor_office_radar`,
+        // LOSER would have `_zone_office_radar`.
+        let payload: serde_json::Value =
+            serde_json::from_str(&winner.payload).expect("valid discovery JSON");
+        let name = payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let unique_id = payload
+            .get("unique_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            name, "dormant office_radar presence",
+            "winner's name field must reflect the SENSOR ('presence'), not the zone ('zone'); got {name}"
+        );
+        assert_eq!(
+            unique_id, "dormant_office-pc_sensor_office_radar",
+            "winner's unique_id must include `_sensor_` (the loser's would include `_zone_`); got {unique_id}"
+        );
+
+        // Cross-check: snapshot_records also flushes both winner and
+        // loser's records on the publisher's first flush, but the
+        // loser's snapshot is dropped (first-wins). Assert the loser's
+        // zone-state topic is absent. (Snapshot topics are keyed by
+        // the sanitized id, so both candidates would produce
+        // `dormant/office-pc/zone/office_radar/state` — only the
+        // winner's record should exist; the loser's is dropped.)
+        let snap_records = snapshot_records(
+            &cfg,
+            &dormant_core::rules::StateSnapshot {
+                sensors: vec![dormant_core::rules::SensorSnapshot {
+                    id: "Office Radar".into(),
+                    state: SensorState::Present,
+                    last_seen_secs_ago: 0,
+                    reported: true,
+                }],
+                zones: vec![dormant_core::rules::ZoneSnapshot {
+                    id: "office_radar".into(),
+                    present: Some(true),
+                }],
+                displays: vec![],
+                pending_reload: None,
+                rollback: None,
+                kvm: None,
+            },
+            "office-pc",
+        );
+        let zone_state_records: Vec<&PublishRecord> = snap_records
+            .iter()
+            .filter(|r| r.topic == "dormant/office-pc/zone/office_radar/state")
+            .collect();
+        assert_eq!(
+            zone_state_records.len(),
+            0,
+            "loser zone's state record must not appear on the wire (first-wins drops the loser entirely); got {zone_state_records:?}"
+        );
+        // The winner's snapshot (sensor state) MUST appear; the
+        // payload is byte-identical for the two candidates by the
+        // publisher's contract, so we only assert presence.
+        let sensor_state_present = snap_records
+            .iter()
+            .any(|r| r.topic == "dormant/office-pc/sensor/office_radar/state" && r.payload == "ON");
+        assert!(
+            sensor_state_present,
+            "winner's sensor state record must appear; got: {snap_records:?}"
+        );
+    }
 
     #[test]
     fn collision_two_sensor_ids_same_topic() {

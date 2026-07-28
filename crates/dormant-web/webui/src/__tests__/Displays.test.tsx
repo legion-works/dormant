@@ -601,6 +601,7 @@ function DisplaysDetailHarness() {
         display_name: "main",
         panel_type: "woled",
         total_on_hours: 4,
+        max_cell_hours: 4,
         sample_count: 8,
         advisory: false,
         hours_since_long_dwell: 1,

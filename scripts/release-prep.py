@@ -135,7 +135,17 @@ def _compile_entry(
         elif kind == "capability":
             user_line = _extract_user_can_now(body)
             if user_line:
-                highlights.append(f"**{user_line}**")
+                readme_bullet = str(fm.get("readme_bullet", "")).strip()
+                if readme_bullet and not readme_bullet.endswith("."):
+                    readme_bullet += "."
+                prose = user_line[:1].upper() + user_line[1:]
+                if not prose.endswith("."):
+                    prose += "."
+                chapter = fm.get("chapter")
+                if chapter and readme_bullet.startswith("**"):
+                    name = readme_bullet[2:].split("**", 1)[0]
+                    prose += f" See [the {name} chapter](./docs/src/{chapter})."
+                highlights.append(f"{readme_bullet} {prose}".strip())
             if detail:
                 added.append(detail)
 
@@ -158,8 +168,10 @@ def _compile_entry(
     has_highlights = bool(highlights)
     if has_highlights:
         parts.append("### Highlights")
-        for item in highlights:
+        for index, item in enumerate(highlights):
             parts.append(item)
+            if index < len(highlights) - 1:
+                parts.append("")
         parts.append("")
 
     if added:

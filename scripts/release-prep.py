@@ -189,27 +189,93 @@ def _compile_entry(
     return "\n".join(parts).rstrip() + "\n"
 
 
-def _extract_user_can_now(body: str) -> str:
-    """Return the sentence after 'User can now:' on its line."""
+# Recognized marker labels that open a fragment-body paragraph. Lowercased
+# comparison is performed at call sites; the canonical literals live here so a
+# grep for one of them lands here exactly once. Issue #156 — a marker
+# paragraph runs from the marker line through every following non-blank,
+# non-marker line, terminating at the next blank line or any other marker.
+_MARKER_LABELS = ("User can now:", "Detail:")
+
+
+def _is_marker_line(stripped: str) -> bool:
+    """True when `stripped` opens a recognized marker paragraph."""
+    lower = stripped.lower()
+    return any(lower.startswith(label.lower()) for label in _MARKER_LABELS)
+
+
+def _read_marker_paragraph(body: str, marker_label: str) -> str:
+    """Return the paragraph that follows `marker_label` in `body`.
+
+    The paragraph begins on the same line as the marker (after the label),
+    continues through every following non-blank line, and terminates at the
+    next blank line or any other recognized marker label. Empty string when
+    the marker is absent from the body.
+    """
+    lines = body.splitlines()
+    label_lower = marker_label.lower()
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.lower().startswith(label_lower):
+            continue
+        same_line = stripped[len(marker_label):].strip()
+        out: list[str] = [same_line] if same_line else []
+        for follow in lines[i + 1:]:
+            follow_stripped = follow.strip()
+            if not follow_stripped:
+                break
+            if _is_marker_line(follow_stripped):
+                break
+            out.append(follow_stripped)
+        return " ".join(out)
+    return ""
+
+
+def _normalize_non_marker_body(body: str) -> str:
+    """Return `body` with every marker paragraph stripped, joined as a single
+    space-separated paragraph.
+
+    Used as the fallback bullet text when a fragment lacks a `Detail:`
+    marker (issue #156). Marker paragraphs are skipped wholesale — they are
+    intentionally not part of the bullet.
+    """
+    out: list[str] = []
+    skip_until_blank = False
     for line in body.splitlines():
         stripped = line.strip()
-        if stripped.lower().startswith("user can now:"):
-            return stripped[len("user can now:"):].strip()
-    return ""
+        if not stripped:
+            skip_until_blank = False
+            continue
+        if _is_marker_line(stripped):
+            skip_until_blank = True
+            continue
+        if skip_until_blank:
+            continue
+        out.append(stripped)
+    return " ".join(out)
+
+
+def _extract_user_can_now(body: str) -> str:
+    """Return the paragraph after the `User can now:` marker (issue #156).
+
+    Reads the marker line plus every following non-blank, non-marker line,
+    joined with single spaces, so a paragraph wrapped across physical lines
+    is preserved verbatim instead of being silently truncated.
+    """
+    return _read_marker_paragraph(body, "User can now:")
 
 
 def _extract_detail(body: str) -> str:
-    """Return the text after a 'Detail:' marker line."""
-    lines = body.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.lower().startswith("detail:"):
-            # Content after 'Detail:' on the same line, plus following lines.
-            same_line = stripped[len("detail:"):].strip()
-            rest = [same_line] if same_line else []
-            rest.extend(line.strip() for line in lines[i + 1:] if line.strip())
-            return " ".join(rest)
-    return ""
+    """Return the detail bullet for a fragment.
+
+    Prefers an explicit `Detail:` paragraph when present; otherwise falls
+    back to the body text with all marker paragraphs stripped (issue
+    #156 — a `fix` fragment that omits `Detail:` should still compile a
+    Fixed bullet from its plain body).
+    """
+    explicit = _read_marker_paragraph(body, "Detail:")
+    if explicit:
+        return explicit
+    return _normalize_non_marker_body(body)
 
 
 def _has_capability(fragments: list[tuple[pathlib.Path, dict[str, Any], str]]) -> bool:

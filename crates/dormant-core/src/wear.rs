@@ -149,36 +149,33 @@ impl WearLedger {
         self.sample_count += 1;
     }
 
-    /// Min-max normalized wear per cell, in row-major order, each in
+    /// Zero-max normalized wear per cell, in row-major order, each in
     /// `0.0..=1.0`.
     ///
-    /// When every cell has (near-)equal wear (`max - min < f64::EPSILON`,
-    /// including the all-zero starting grid), returns all zeros rather than
-    /// dividing by a near-zero range — a flat grid has no "hottest" cell to
-    /// normalize against.
+    /// Divides each cell by the **maximum** cell value rather than the
+    /// min-max range — a uniformly-worn panel (`min == max > 0`) would
+    /// otherwise collapse to all-zero heat (issue #108), indistinguishable
+    /// from a fresh / unsampled ledger.
+    ///
+    /// Only an all-zero grid (`max <= 0.0`) yields all-zero heat; that
+    /// is the genuine "no data" case, not a uniform one.
     #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
         reason = "heat_map is a display-precision output (0.0..=1.0); f64->f32 narrowing here is intentional, not an accumulator"
     )]
     pub fn heat_map(&self) -> Vec<f32> {
-        let min = self
-            .cells
-            .iter()
-            .map(|c| c.wear_hours)
-            .fold(f64::INFINITY, f64::min);
         let max = self
             .cells
             .iter()
             .map(|c| c.wear_hours)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if (max - min).abs() < f64::EPSILON {
+            .fold(0.0_f64, f64::max);
+        if max <= 0.0 {
             return vec![0.0; self.cells.len()];
         }
-        let range = max - min;
         self.cells
             .iter()
-            .map(|c| ((c.wear_hours - min) / range) as f32)
+            .map(|c| (c.wear_hours / max) as f32)
             .collect()
     }
 
@@ -428,6 +425,52 @@ mod tests {
         // all-equal grid: defined flat output (0.0 everywhere), not NaN
         let flat = WearLedger::new(ident(), PanelType::Unknown, 1, 3, 0);
         assert_eq!(flat.heat_map(), vec![0.0, 0.0, 0.0]);
+    }
+
+    // ── T11 (#108): zero-max normalization ──────────────────────────────────
+    //
+    // Issue #108: the wear heat map used min-max normalization, so a
+    // uniformly-worn panel (`min == max`) collapsed to all-zero heat —
+    // indistinguishable from a panel with no recorded exposure at all.
+    // The fix divides by the maximum cell hours instead of the range:
+    //
+    //   - uniform non-zero exposure  → every cell at 1.0 (visible hot map)
+    //   - all-zero grid             → every cell at 0.0 (no data)
+    //   - varied grid starting at 0 → same scale as the old min-max form
+    //
+    // Only an all-zero grid yields all-zero heat; that case is the "no
+    // data" signal, not a uniform one.
+
+    #[test]
+    fn heat_map_uniform_non_zero_returns_all_ones() {
+        // A panel that has uniformly accumulated the same on-hours in
+        // every cell must NOT read as flat grey / zero heat — that would
+        // be indistinguishable from a fresh ledger with no samples.
+        let mut l = WearLedger::new(ident(), PanelType::QdOled, 1, 3, 0);
+        l.cells[0].wear_hours = 2.0;
+        l.cells[1].wear_hours = 2.0;
+        l.cells[2].wear_hours = 2.0;
+        assert_eq!(l.heat_map(), vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn heat_map_zero_max_matches_min_max_for_grids_starting_at_zero() {
+        // When `min == 0`, zero-max and min-max produce the same
+        // scale — this pins the contract that the fix is behavior-
+        // preserving for already-visible (varied) grids.
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 1, 3, 0);
+        l.cells[0].wear_hours = 0.0;
+        l.cells[1].wear_hours = 2.0;
+        l.cells[2].wear_hours = 4.0;
+        assert_eq!(l.heat_map(), vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn heat_map_all_zero_grid_returns_all_zero() {
+        // A fresh / unsampled ledger is the genuine "no data" case and
+        // must keep reading as zero heat, not as a uniform 1.0 panel.
+        let l = WearLedger::new(ident(), PanelType::Unknown, 1, 2, 0);
+        assert_eq!(l.heat_map(), vec![0.0, 0.0]);
     }
 
     #[test]

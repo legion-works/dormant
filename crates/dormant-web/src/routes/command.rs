@@ -330,6 +330,7 @@ fn command_test_router_at(
         rules: IndexMap::default(),
         keymap: dormant_core::config::KeymapConfig::default(),
         input_filter: dormant_core::config::InputFilterConfig::default(),
+        publish: dormant_core::config::PublishConfig::default(),
     });
     let creds = Arc::new(Credentials::default());
     let (config_tx, config_rx) = watch::channel(config);
@@ -439,6 +440,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
         let (config_tx, config_rx) = watch::channel(config);
@@ -1011,6 +1013,7 @@ mod tests {
             rules: IndexMap::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         });
         let creds = Arc::new(Credentials::default());
         let (config_tx, config_rx) = watch::channel(config);

@@ -1307,6 +1307,7 @@ mod tests {
             coordination: crate::config::schema::CoordinationConfig::default(),
             keymap: crate::config::KeymapConfig::default(),
             input_filter: crate::config::InputFilterConfig::default(),
+            publish: crate::config::PublishConfig::default(),
         };
 
         let hazards = absent_mqtt_hazards(&cfg);

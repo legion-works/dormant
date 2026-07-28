@@ -68,7 +68,7 @@ export default function RulesSection({
 
   return (
     <>
-    <FormSection title="Rules">
+    <FormSection id="rules" title="Rules">
       {ids.map((id) => {
         const cfg = rules[id];
         const basePath = ["rules", id];

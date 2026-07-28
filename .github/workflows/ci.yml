@@ -273,6 +273,7 @@ jobs:
           printf 'DORMANT_TEST_MQTT_PORT=%s\n' "$port" >> "$GITHUB_ENV"
           bash scripts/ci/wait-for-mqtt.sh 127.0.0.1 "$port" 10
       - run: DORMANT_TEST_MQTT=1 PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo-nextest ntr --profile ci -p dormant-sensors --test mqtt_integration --run-ignored only -E 'test(#*mqtt_*)'
+      - run: DORMANT_TEST_MQTT=1 PKG_CONFIG_PATH=/usr/lib/pkgconfig cargo-nextest ntr --profile ci -p dormantd --test publisher_integration --run-ignored only -E 'test(#*publisher_*)'
       - name: Classify nextest JUnit
         if: always()
         run: python3 scripts/ci/classify_nextest_junit.py target/nextest/ci/junit.xml

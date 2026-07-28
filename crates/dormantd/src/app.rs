@@ -3839,6 +3839,7 @@ mod audio_rules_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 
@@ -4231,6 +4232,25 @@ fn spawn_generation(
         sink: notify_sink,
         cancel: producer_token.clone(),
     }) {
+        producer_handles.push(handle);
+    }
+
+    // Opt-in MQTT state publisher (issue #105) — `state_publisher::spawn`
+    // returns `None` (no-op) when `[publish] enabled = false`, mirroring
+    // `notifier::spawn`'s own None-returning precedent. The handle goes
+    // in `producer_handles` so `Generation::teardown` cancels and
+    // awaits it on reload like every other generation-local task. The
+    // publisher subscribes to `DaemonEvent`s itself via
+    // `ControlMsg::SubscribeEvents`, so no broadcast receiver is
+    // plumbed in here.
+    if let Some(handle) =
+        crate::state_publisher::spawn(crate::state_publisher::StatePublisherDeps {
+            config: Arc::new(assembly.cfg.clone()),
+            credentials: Arc::new(assembly.creds.clone()),
+            ctl_tx: ctl_tx.clone(),
+            cancel: producer_token.clone(),
+        })
+    {
         producer_handles.push(handle);
     }
 
@@ -5363,6 +5383,7 @@ mod render_tests {
             },
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let recording = RecordingRenderSink::new();
@@ -5462,6 +5483,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let captured_ss: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -5538,6 +5560,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let captured_shift: Arc<Mutex<Option<dormant_render::ShiftSettings>>> =
@@ -5625,6 +5648,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         // Capture the `ScreensaverSettings` the factory receives so the
@@ -5722,6 +5746,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -5822,6 +5847,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
 
         let captured: Arc<Mutex<Option<dormant_render::ScreensaverSettings>>> =
@@ -5918,6 +5944,7 @@ mod render_tests {
             rules: indexmap::IndexMap::new(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         assert!(
             cfg.displays["mon"]
@@ -6409,6 +6436,7 @@ mod macos_gamma_black_assembly_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let creds = Credentials::default();
         let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
@@ -6490,6 +6518,7 @@ mod macos_gamma_black_assembly_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         };
         let creds = Credentials::default();
         let source_builder: SourceBuilder = Arc::new(|_cfg, _creds| Ok(Vec::new()));
@@ -6785,6 +6814,7 @@ mod gamma_reload_tests {
             audio: AudioConfig::default(),
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
         }
     }
 

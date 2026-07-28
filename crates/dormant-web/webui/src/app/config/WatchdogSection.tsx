@@ -39,7 +39,7 @@ export default function WatchdogSection({ watchdog, store, redactedPaths, onDirt
   if (keys.length === 0) return null;
 
   return (
-    <FormSection title="Watchdog">
+    <FormSection id="watchdog" title="Watchdog">
       <div className="cf-card">
         {keys.map((key) => {
           const path = ["watchdog", key];

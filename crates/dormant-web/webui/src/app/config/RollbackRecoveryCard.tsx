@@ -16,7 +16,7 @@ export default function RollbackRecoveryCard() {
   if (!rollback) return null;
 
   return (
-    <FormSection title="Rollback recovery">
+    <FormSection id="rollback-recovery" title="Rollback recovery">
       <div
         className="cf-card"
         style={{

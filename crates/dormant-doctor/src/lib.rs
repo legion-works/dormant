@@ -35,6 +35,8 @@ pub use probes::macos_display_sleep::probe_macos_display_sleep;
 pub use probes::macos_idle::probe_macos_idle;
 #[cfg(target_os = "macos")]
 pub use probes::macos_power::probe_macos_power;
+#[cfg(target_os = "macos")]
+pub use probes::macos_power_off::probe_macos_power_off_hazard;
 pub use probes::mqtt::probe_mqtt_all;
 pub use probes::samsung::probe_samsung;
 pub use probes::usb::probe_usb;
@@ -201,6 +203,14 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
             probes::macos_power::probe_macos_power()
                 .await
                 .with_category("platform"),
+        );
+        // Shared-DDC/CI power-off hazard (issue #126): one Fail per
+        // hazardous display, with the display id as subject so the
+        // operator can map back to a specific [displays.<id>] block.
+        results.extend(
+            probes::macos_power_off::probe_macos_power_off_hazard(cfg)
+                .into_iter()
+                .map(|r| r.with_category("platform")),
         );
     }
 

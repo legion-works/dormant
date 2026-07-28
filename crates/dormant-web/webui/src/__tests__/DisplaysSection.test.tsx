@@ -105,6 +105,110 @@ describe("DisplaysSection — pairing wizard hand-off (spec §8.3)", () => {
   });
 });
 
+describe("DisplaysSection — macOS power-off hazard checkbox (issue #126)", () => {
+  it("renders the hazard checkbox on a shared-ddcci-power_off display with the warning copy", () => {
+    renderSection({
+      displays: {
+        "aoc-main": {
+          controllers: ["ddcci"],
+          scope: "shared",
+          shared_input_code: 15,
+          blank_mode: "power_off",
+        },
+      },
+    });
+    const checkbox = screen.getByLabelText(/I have tested physical recovery/i);
+    expect(checkbox).toBeInTheDocument();
+    expect((checkbox as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText(/unrecoverable/)).toBeInTheDocument();
+  });
+
+  it("does not render the hazard checkbox when scope is private", () => {
+    renderSection({
+      displays: {
+        "aoc-main": {
+          controllers: ["ddcci"],
+          scope: "private",
+          blank_mode: "power_off",
+        },
+      },
+    });
+    expect(
+      screen.queryByLabelText(/I have tested physical recovery/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not render the hazard checkbox when primary mode is screen_off_audio_on", () => {
+    renderSection({
+      displays: {
+        "aoc-main": {
+          controllers: ["ddcci"],
+          scope: "shared",
+          shared_input_code: 15,
+          blank_mode: "screen_off_audio_on",
+        },
+      },
+    });
+    expect(
+      screen.queryByLabelText(/I have tested physical recovery/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not render the hazard checkbox when ddcci is a non-first fallback", () => {
+    renderSection({
+      displays: {
+        "aoc-main": {
+          controllers: ["macos-gamma-black", "ddcci"],
+          scope: "shared",
+          shared_input_code: 15,
+          blank_mode: "power_off",
+        },
+      },
+    });
+    expect(
+      screen.queryByLabelText(/I have tested physical recovery/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not render the hazard checkbox when power_off_opt_in is already true", () => {
+    renderSection({
+      displays: {
+        "aoc-main": {
+          controllers: ["ddcci"],
+          scope: "shared",
+          shared_input_code: 15,
+          blank_mode: "power_off",
+          power_off_opt_in: true,
+        },
+      },
+    });
+    expect(
+      screen.queryByLabelText(/I have tested physical recovery/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("toggling the checkbox emits a `set` patch on power_off_opt_in", () => {
+    const { store } = renderSection({
+      displays: {
+        "aoc-main": {
+          controllers: ["ddcci"],
+          scope: "shared",
+          shared_input_code: 15,
+          blank_mode: "power_off",
+        },
+      },
+    });
+    fireEvent.click(
+      screen.getByLabelText(/I have tested physical recovery/i),
+    );
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["displays", "aoc-main", "power_off_opt_in"],
+      value: true,
+    });
+  });
+});
+
 describe("DisplaysSection — Delete affordance", () => {
   it("confirms with the referencing rule before tracking a display delete", async () => {
     const { store } = renderSection();

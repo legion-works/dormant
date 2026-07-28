@@ -596,8 +596,56 @@ mod tests {
 
     #[test]
     fn redacted_paths_from_cfg_mqtt_and_screensaver_urls() {
-        use dormant_core::config::schema::MqttSensorCfg;
+        let mut cfg = config_with_mqtt_and_screensaver_url_secrets();
 
+        let paths = redact_config_secrets(&mut cfg);
+
+        let expected: Vec<Vec<String>> = vec![
+            vec!["sensors".into(), "desk".into(), "broker_url".into()],
+            vec![
+                "displays".into(),
+                "tv".into(),
+                "screensaver".into(),
+                "source".into(),
+                "0".into(),
+                "urls".into(),
+                "0".into(),
+            ],
+        ];
+        assert_eq!(paths, expected, "redacted_paths must be exact");
+    }
+
+    /// `Config` with a secret-bearing MQTT broker URL AND a display whose
+    /// screensaver source contains a credential-bearing URL — exercises
+    /// both redaction branches in one pass. Extracted from
+    /// `redacted_paths_from_cfg_mqtt_and_screensaver_urls` so the test
+    /// body is grep-stable and the literal blocks don't push it past the
+    /// pedantic line-count limit.
+    fn config_with_mqtt_and_screensaver_url_secrets() -> Config {
+        let sensors = sensors_with_secret_broker();
+        let mut displays: IndexMap<String, DisplayConfig> = IndexMap::new();
+        displays.insert("tv".into(), tv_with_secret_screensaver_url());
+        Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            sensors,
+            zones: IndexMap::default(),
+            displays,
+            rules: IndexMap::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
+        }
+    }
+
+    /// Single MQTT sensor carrying a `user:pass@host` broker URL.
+    fn sensors_with_secret_broker() -> IndexMap<String, SensorConfig> {
+        use dormant_core::config::schema::MqttSensorCfg;
         let mut sensors: IndexMap<String, SensorConfig> = IndexMap::new();
         sensors.insert(
             "desk".into(),
@@ -615,8 +663,13 @@ mod tests {
                 availability_payload_offline: "offline".into(),
             }),
         );
+        sensors
+    }
 
-        let mut displays: IndexMap<String, DisplayConfig> = IndexMap::new();
+    /// `tv` display with a screensaver source URL that carries credentials
+    /// — the redaction path-walker must drill from `[displays.tv]` into
+    /// `[displays.tv.screensaver.source.0].urls.0`.
+    fn tv_with_secret_screensaver_url() -> DisplayConfig {
         let source = ScreensaverSource {
             path: None,
             urls: vec!["http://user:pass@example.com/img.jpg".into()],
@@ -635,72 +688,37 @@ mod tests {
             shift_px: defaults::SHIFT_PX,
             shift_interval: defaults::SHIFT_INTERVAL,
         };
-        displays.insert(
-            "tv".into(),
-            DisplayConfig {
-                scope: dormant_core::config::DisplayScope::default(),
-                shared_input_code: None,
-                shared_input_write_code: None,
-                shared_peer_input_code: None,
-                shared_peer_input_write_code: None,
-                hooks: dormant_core::config::HookSlots::default(),
-                controllers: vec!["kwin-dpms".into()],
-                blank_mode: None,
-                degraded_mode: None,
-                ladder: vec![],
-                screensaver: Some(screensaver),
-                output: None,
-                ddc_display: None,
-                host: None,
-                wol_mac: None,
-                blank_command: None,
-                wake_command: None,
-                modes: None,
-                ha_url: None,
-                blank_service: None,
-                blank_data: None,
-                wake_service: None,
-                wake_data: None,
-                command_timeout: std::time::Duration::from_secs(5),
-                restore_brightness: 100,
-                samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
-                treat_unreachable_as_blanked: false,
-                panel_type: dormant_core::wear::PanelType::default(),
-            },
-        );
-
-        let mut cfg = Config {
-            coordination: dormant_core::config::CoordinationConfig::default(),
-            config_version: 1,
-            daemon: DaemonConfig::default(),
-            wear: dormant_core::config::schema::WearConfig::default(),
-            notifications: dormant_core::config::schema::NotificationsConfig::default(),
-            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
-            audio: dormant_core::config::schema::AudioConfig::default(),
-            sensors,
-            zones: IndexMap::default(),
-            displays,
-            rules: IndexMap::default(),
-            keymap: dormant_core::config::KeymapConfig::default(),
-            input_filter: dormant_core::config::InputFilterConfig::default(),
-            publish: dormant_core::config::PublishConfig::default(),
-        };
-
-        let paths = redact_config_secrets(&mut cfg);
-
-        let expected: Vec<Vec<String>> = vec![
-            vec!["sensors".into(), "desk".into(), "broker_url".into()],
-            vec![
-                "displays".into(),
-                "tv".into(),
-                "screensaver".into(),
-                "source".into(),
-                "0".into(),
-                "urls".into(),
-                "0".into(),
-            ],
-        ];
-        assert_eq!(paths, expected, "redacted_paths must be exact");
+        DisplayConfig {
+            scope: dormant_core::config::DisplayScope::default(),
+            shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_code: None,
+            shared_peer_input_write_code: None,
+            hooks: dormant_core::config::HookSlots::default(),
+            controllers: vec!["kwin-dpms".into()],
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: vec![],
+            screensaver: Some(screensaver),
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: std::time::Duration::from_secs(5),
+            restore_brightness: 100,
+            samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: false,
+            panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
+        }
     }
 
     #[test]
@@ -1082,6 +1100,7 @@ field = "/val"
             samsung_restore_backlight: defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: false,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 

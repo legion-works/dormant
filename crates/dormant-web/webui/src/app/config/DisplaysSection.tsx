@@ -177,6 +177,34 @@ export default function DisplaysSection({
                     help="Panel technology — picks technology-appropriate wear heuristics. unknown is always safe." />
                 </div>
 
+                {isMacosDdcciPowerOffHazard(cfg, store, id) && (
+                  <div className="cf-field cf-field--row cf-field--warning" role="alert">
+                    <label className="cf-field__label" htmlFor={`${id}-power-off-opt-in`}>
+                      power_off_opt_in
+                    </label>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                      <span className="cf-field__warning-text">
+                        power_off on this shared macOS DDC/CI topology can be unrecoverable:
+                        USB-C link and hub may drop; set power_off_opt_in = true only after
+                        testing physical recovery.
+                      </span>
+                      <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <input
+                          id={`${id}-power-off-opt-in`}
+                          type="checkbox"
+                          checked={cfg.power_off_opt_in === true}
+                          disabled={store.isLocked([...basePath, "power_off_opt_in"], redactedPaths)}
+                          onChange={(ev) => {
+                            store.trackEdit([...basePath, "power_off_opt_in"], ev.target.checked);
+                            onDirty();
+                          }}
+                        />
+                        <span>I have tested physical recovery for this display.</span>
+                      </label>
+                    </div>
+                  </div>
+                )}
+
                 {isBlank && (<>
                   <div className="cf-field cf-field--row">
                     <EnumField path={[...basePath, "blank_mode"]} label="blank_mode" value={cfg.blank_mode ?? BLANK_MODE_OPTIONS[0]}
@@ -240,4 +268,32 @@ function switchToLadder(id: string, cfg: DisplayConfig, store: PatchStore, onDir
   store.trackRemove(["displays", id, "blank_mode"]);
   store.trackRemove(["displays", id, "degraded_mode"]);
   onDirty();
+}
+
+/**
+ * True when the display is wired into the macOS shared-DDC/CI power-off
+ * hazard topology (issue #126): scope = "shared", FIRST controller =
+ * "ddcci", and the effective primary blank mode is "power_off". Mirrors
+ * `is_macos_power_off_hazard` in `dormant_core::config::validate` so the
+ * web UI surfaces the hazard checkbox in the same conditions the daemon
+ * would emit its load-time warning. `power_off_opt_in = true` is treated
+ * as acknowledgement and suppresses the checkbox display.
+ */
+function isMacosDdcciPowerOffHazard(
+  cfg: DisplayConfig,
+  store: PatchStore,
+  id: string,
+): boolean {
+  const pendingScope = store.getEdit(["displays", id, "scope"]) ?? cfg.scope ?? "private";
+  if (pendingScope !== "shared") return false;
+  const pendingControllers = (store.getEdit(["displays", id, "controllers"]) as string[] | undefined)
+    ?? cfg.controllers;
+  if (pendingControllers[0] !== "ddcci") return false;
+  const pendingBlank = (store.getEdit(["displays", id, "blank_mode"]) as string | undefined)
+    ?? cfg.blank_mode;
+  if (pendingBlank !== "power_off") return false;
+  const pendingOptIn = store.getEdit(["displays", id, "power_off_opt_in"]) as boolean | undefined;
+  if (pendingOptIn === true) return false;
+  if (cfg.power_off_opt_in === true) return false;
+  return true;
 }

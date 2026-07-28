@@ -411,3 +411,113 @@ controllers = ["samsung-tizen"]
 blank_mode = "screen_off_audio_on"
 host = "192.168.1.50"
 ```
+
+## macOS shared-DDC/CI power-off hazard
+
+**A `power_off` blank on a shared macOS DDC/CI panel can be unrecoverable.
+Read this before relying on `controllers = ["ddcci"]` with `blank_mode = "power_off"`
+on a display that is also wired to another machine.**
+
+The hazard topology is a small, well-defined intersection of config choices:
+
+1. The host is a **macOS** machine running `dormantd`.
+2. The display is `scope = "shared"` (multi-machine KVM switching).
+3. The display's **first** controller is `ddcci` (a ddcci later in the
+   fallback chain does not trigger the hazard — the primary path matters).
+4. The display's primary blank mode is `power_off` (`screen_off_audio_on`
+   and `brightness_zero` are audio-safe alternatives that do NOT drive a
+   panel standby).
+
+Observed on the maintainer's AOC AGON AG326UZD wired over USB-C to a
+shared macOS host:
+
+- The panel standby path drops the USB-C link.
+- The panel's USB hub disappears from the host's USB tree.
+- The panel's OSD becomes unresponsive (no input-source menu, no VCP
+  readback).
+- VCP `0x60` writes (input switching) and VCP `0xD6` writes (power)
+  succeed at the bus level but the panel ignores them — the link is gone.
+- A second `power_off` write goes to a dead device — the warning
+  message in the logs reads like a normal command failure, not a
+  physical disconnect.
+- Recovery requires physically power-cycling the monitor (AC off, AC on).
+  A `setvcp 0xD6 1` after recovery returns the panel to `On`, but
+  nothing dormant can issue reaches the panel between standby and
+  physical recovery.
+
+Dormant does **not** have a software recovery path for this state. The
+link and hub are gone; VCP writes have no effect; `dormantctl wake`,
+`dormantctl emergency-wake`, and `doctor exercise` cannot restore the
+panel until it physically powers back on.
+
+### What dormant does about it
+
+Dormant surfaces this hazard at two points so the operator cannot land
+in it silently:
+
+1. **Config load** — `load_config` emits a semantic warning at every
+   load (both `Strictness::Strict` and `Strictness::Warn` modes):
+
+   > power_off on this shared macOS DDC/CI topology can be unrecoverable:
+   > USB-C link and hub may drop; set power_off_opt_in = true only after
+   > testing physical recovery
+
+   The CLI surfaces this through `dormantctl validate` and the web
+   config editor surfaces it through the `Apply` panel.
+2. **Doctor** — `dormantctl doctor` emits a `Fail` probe named
+   `macos-power-off-hazard` with the display id as `subject` and the
+   detail "power_off on this topology risks unrecoverable standby
+   (USB-C link drops)". The probe is read-only and never blanks or wakes
+   the panel.
+
+Both paths classify the topology identically
+(`dormant_core::config::validate::is_macos_power_off_hazard`) so they
+agree on which displays are hazardous.
+
+### Acknowledging the hazard
+
+Set `displays.<id>.power_off_opt_in = true` to silence both surfaces.
+This is an explicit operator attestation that physical recovery has been
+tested on the actual hardware. **The opt-in adds no recovery mechanism
+of its own** — it is acknowledgement, not mitigation. If the link
+drops, the operator still has to power-cycle the panel by hand.
+
+```toml
+[displays.shared_oled]
+controllers = ["ddcci"]
+scope = "shared"
+shared_input_code = 0x0f
+shared_input_write_code = 0x15
+blank_mode = "power_off"
+power_off_opt_in = true   # acknowledge: tested physical recovery
+```
+
+### Non-hazard alternatives on macOS
+
+Two ways to avoid the hazard entirely:
+
+1. **Soften the primary mode** — `screen_off_audio_on` or
+   `brightness_zero` are audio-safe and do not drive a panel standby on
+   the USB-C link. With macOS `samsung-tizen` they reach the panel over
+   the network, not the USB hub.
+2. **Lead with `macos-gamma-black`** — the gamma controller does not
+   power-cycle the panel at all. Putting `macos-gamma-black` first and
+   `ddcci` second keeps DDC available as a fallback while avoiding the
+   USB-C standby path on the primary blank:
+
+   ```toml
+   [displays.shared_oled]
+   controllers = ["macos-gamma-black", "ddcci"]
+   scope = "shared"
+   shared_input_code = 0x0f
+   blank_mode = "power_off"
+   ```
+
+   On a macOS host this chain blanks via the gamma controller (no
+   standby) under normal conditions and falls back to `ddcci` only when
+   the gamma controller cannot reach the panel. The hazard applies only
+   when `ddcci` actually delivers the blank, which is rarer here.
+
+Both alternatives preserve the panel's standby path. The
+`dormantctl doctor` probe stops emitting the failure the moment either
+change lands.

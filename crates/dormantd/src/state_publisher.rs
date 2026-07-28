@@ -1399,6 +1399,7 @@ mod tests {
                 samsung_restore_backlight: 50,
                 treat_unreachable_as_blanked: true,
                 panel_type: dormant_core::wear::PanelType::Unknown,
+                power_off_opt_in: false,
             },
         );
         cfg
@@ -2661,6 +2662,7 @@ mod async_tests {
                 samsung_restore_backlight: 50,
                 treat_unreachable_as_blanked: true,
                 panel_type: dormant_core::wear::PanelType::Unknown,
+                power_off_opt_in: false,
             },
         );
         cfg

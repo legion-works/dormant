@@ -193,6 +193,29 @@ class ExtractTests(unittest.TestCase):
         body = "User can now: do something\n\nDetail: mechanism\n"
         self.assertEqual(release_prep._extract_user_can_now(body), "do something")
 
+    def test_extract_user_can_now_reads_multiline_paragraph(self):
+        # `User can now:` is paragraph-aware (issue #156): continuation lines
+        # joined with spaces until the next blank line. The previous
+        # implementation only read same-line text and silently truncated
+        # every paragraph that wrapped onto a second physical line.
+        body = "User can now: do X across\nmultiple machines\n\nDetail: mechanism\n"
+        self.assertEqual(
+            release_prep._extract_user_can_now(body),
+            "do X across multiple machines",
+        )
+
+    def test_detail_less_fix_uses_fragment_body(self):
+        # A `fix` fragment without a `Detail:` marker must still produce a
+        # Fixed bullet — its plain body becomes the bullet text (issue #156).
+        fragments = [
+            (pathlib.Path("a.md"), *_fragment_dict(
+                "fix", [], body="fixed a regression where X\n",
+            )),
+        ]
+        entry = release_prep._compile_entry(fragments)
+        self.assertIn("### Fixed", entry)
+        self.assertIn("fixed a regression where X", entry)
+
     def test_extract_detail(self):
         body = "User can now: do X\n\nDetail: the mechanism works\n"
         self.assertEqual(release_prep._extract_detail(body), "the mechanism works")

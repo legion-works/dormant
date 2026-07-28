@@ -4994,6 +4994,7 @@ mod render_tests {
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 
@@ -5356,6 +5357,7 @@ mod render_tests {
                             dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
                         treat_unreachable_as_blanked: true,
                         panel_type: dormant_core::wear::PanelType::default(),
+                        power_off_opt_in: false,
                     },
                 );
                 m
@@ -6418,6 +6420,7 @@ mod macos_gamma_black_assembly_tests {
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         };
         let mut displays = IndexMap::new();
         displays.insert("panel".to_string(), display);
@@ -6500,6 +6503,7 @@ mod macos_gamma_black_assembly_tests {
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         };
         let mut displays = IndexMap::new();
         displays.insert("panel".to_string(), display);
@@ -6772,6 +6776,7 @@ mod gamma_reload_tests {
             samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
         }
     }
 

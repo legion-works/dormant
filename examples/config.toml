@@ -347,6 +347,14 @@ input_wake_hold = "300s"
 # scope = "shared"
 # shared_input_code = 0x0f       # doctor prints the active input in hex
 # shared_input_write_code = 0x15 # only needed when panel write differs from read
+# # macOS hosts: a power_off blank on a shared DDC/CI panel can be
+# # unrecoverable (USB-C link and hub drop on standby). Either soften
+# # the primary mode (screen_off_audio_on / brightness_zero), lead with
+# # macos-gamma-black so ddcci is a fallback, or explicitly opt in after
+# # testing physical recovery. See docs/src/displays.md for the full
+# # hazard description. Dormant surfaces this as both a load-time
+# # semantic warning and a `dormantctl doctor` failure.
+# # power_off_opt_in = true
 #
 # [displays.shared_oled.hooks]
 # # before_release — entries fire in order BEFORE releasing the panel to the

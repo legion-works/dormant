@@ -712,6 +712,27 @@ pub mod mqtt_transport {
                 let (client, mut eventloop) = AsyncClient::new(opts, 16);
                 match tokio::time::timeout(self.per_attempt_timeout, eventloop.poll()).await {
                     Ok(Ok(rumqttc::Event::Incoming(Packet::ConnAck(_)))) => {
+                        // Issue #174 Should 2: drain stale records from
+                        // any aborted flush that left records sitting in
+                        // `record_rx` across the reconnect. The
+                        // publisher's reconnect arm will re-flush
+                        // everything on Connected, so anything queued
+                        // here is older than the current state and would
+                        // briefly publish stale state. The empty-topic
+                        // close sentinel MUST NOT be swallowed — if the
+                        // publisher signaled shutdown mid-disconnect, we
+                        // honor it (Disconnected + return).
+                        let Some(drained) = drain_stale_records(&mut record_rx) else {
+                            let _ = lifecycle_tx.send(TransportLifecycle::Disconnected).await;
+                            return Ok(());
+                        };
+                        if drained > 0 {
+                            tracing::debug!(
+                                event = "publish_stale_records_dropped",
+                                drained,
+                                "stale records from aborted flush dropped on reconnect"
+                            );
+                        }
                         // First connect: emit Connected.
                         if lifecycle_tx
                             .send(TransportLifecycle::Connected)
@@ -762,6 +783,7 @@ pub mod mqtt_transport {
 
                 // Connected. Pump records + poll the event loop until
                 // disconnect or cancel.
+                let mut pending_birth = false;
                 'pump: loop {
                     tokio::select! {
                         biased;
@@ -779,7 +801,11 @@ pub mod mqtt_transport {
                             // the PubAck so it lands before we close.
                             let _ = tokio::time::timeout(
                                 Duration::from_millis(500),
-                                wait_for_publish_id(&mut eventloop),
+                                wait_for_publish_id(
+                                    &mut eventloop,
+                                    &self.status_topic,
+                                    &mut pending_birth,
+                                ),
                             )
                             .await;
                             let _ = lifecycle_tx
@@ -820,7 +846,11 @@ pub mod mqtt_transport {
                             // time through a bounded mpsc).
                             if tokio::time::timeout(
                                 Duration::from_secs(5),
-                                wait_for_publish_id(&mut eventloop),
+                                wait_for_publish_id(
+                                    &mut eventloop,
+                                    &self.status_topic,
+                                    &mut pending_birth,
+                                ),
                             )
                             .await
                             .is_err()
@@ -830,6 +860,25 @@ pub mod mqtt_transport {
                                     .send(TransportLifecycle::Disconnected)
                                     .await;
                                 break 'pump;
+                            }
+                            // After the wait, surface any pending
+                            // `BirthOnline` observation: a HA
+                            // `<discovery_prefix>/status` `Publish` with
+                            // payload `online` that arrived during the
+                            // PubAck-wait window would otherwise be
+                            // silently dropped (issue #174 Should 1).
+                            // The flag is sticky — N arrivals in one
+                            // flush collapse to one re-flush, which is
+                            // correct.
+                            if take_pending_birth(&mut pending_birth) {
+                                tracing::info!(event = "publish_ha_birth_reflush");
+                                if lifecycle_tx
+                                    .send(TransportLifecycle::BirthOnline)
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
                             }
                         }
                         event = eventloop.poll() => {
@@ -841,7 +890,7 @@ pub mod mqtt_transport {
                                         .await;
                                     break 'pump;
                                 }
-                                Ok(Event::Incoming(Packet::Publish(p))) => {
+                                Ok(Event::Incoming(packet @ Packet::Publish(_))) => {
                                     // Home Assistant publishes `online` on
                                     // `<discovery_prefix>/status` on startup
                                     // (and on a clean restart); `offline` on
@@ -850,9 +899,8 @@ pub mod mqtt_transport {
                                     // arrival is a normal HA restart in
                                     // progress, NOT a defunct signal we
                                     // need to react to.
-                                    if p.topic == self.status_topic
-                                        && p.payload.as_ref() == b"online"
-                                    {
+                                    observe_birth_packet(&packet, &self.status_topic, &mut pending_birth);
+                                    if take_pending_birth(&mut pending_birth) {
                                         tracing::info!(event = "publish_ha_birth_reflush");
                                         if lifecycle_tx
                                             .send(TransportLifecycle::BirthOnline)
@@ -875,14 +923,71 @@ pub mod mqtt_transport {
         }
     }
 
-    /// Event-loop drain until we see ANY `PubAck` (the publisher pushes
-    /// one record at a time, so order is preserved).
-    async fn wait_for_publish_id(eventloop: &mut EventLoop) -> Result<(), String> {
+    /// Event-loop drain until a [`Packet::PubAck`] lands for the most
+    /// recent publish. The publisher pushes records one at a time through
+    /// a bounded mpsc, so order is preserved by the caller's sequential
+    /// `await`s.
+    ///
+    /// WHILE draining, also watch for an incoming [`Packet::Publish`] on
+    /// `status_topic` with payload `online` and flip `pending_birth` if
+    /// seen. Issue #174 Should 1: HA's retained `online` is delivered by
+    /// the broker immediately after the Subscribe Ack, so an `online`
+    /// arriving during any of the PubAck-wait windows in a flush would
+    /// previously be silently dropped (only `PubAck` returned `Ok`), and
+    /// the `BirthOnline` re-flush would self-heal only on a later
+    /// reconnect — potentially days for an operator with a stable
+    /// network. The flag is sticky: N `online` arrivals during one wait
+    /// collapse to one re-flush, which is correct (multiple births in a
+    /// single flush is implausible but the dedup costs nothing).
+    async fn wait_for_publish_id(
+        eventloop: &mut EventLoop,
+        status_topic: &str,
+        pending_birth: &mut bool,
+    ) -> Result<(), String> {
         loop {
             match eventloop.poll().await {
-                Ok(Event::Incoming(Packet::PubAck(_))) => return Ok(()),
+                Ok(Event::Incoming(packet)) => {
+                    let is_ack = matches!(&packet, Packet::PubAck(_));
+                    observe_birth_packet(&packet, status_topic, pending_birth);
+                    if is_ack {
+                        return Ok(());
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    pub(crate) fn observe_birth_packet(
+        packet: &Packet,
+        status_topic: &str,
+        pending_birth: &mut bool,
+    ) {
+        if let Packet::Publish(p) = packet
+            && p.topic == status_topic
+            && p.payload.as_ref() == b"online"
+        {
+            *pending_birth = true;
+        }
+    }
+
+    pub(crate) fn take_pending_birth(pending_birth: &mut bool) -> bool {
+        let pending = *pending_birth;
+        *pending_birth = false;
+        pending
+    }
+
+    pub(crate) fn drain_stale_records(
+        record_rx: &mut mpsc::Receiver<PublishRecord>,
+    ) -> Option<usize> {
+        let mut drained = 0usize;
+        loop {
+            match record_rx.try_recv() {
+                Ok(rec) if rec.topic.is_empty() => return None,
+                Ok(_) => drained += 1,
+                Err(mpsc::error::TryRecvError::Empty) => return Some(drained),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
             }
         }
     }
@@ -2562,15 +2667,29 @@ mod async_tests {
     #[allow(dead_code)]
     #[derive(Debug, Clone, Copy)]
     enum FakeCtrl {
-        /// Equivalent to a `ConnAck` landing — emit Connected on the
-        /// publisher's lifecycle channel.
+        /// Equivalent to a `ConnAck` landing. The fake mirrors
+        /// production's drain-on-reconnect: stale records sitting in
+        /// `record_rx` from any aborted flush are dropped here BEFORE
+        /// the lifecycle `Connected` is emitted, so the publisher only
+        /// sees the fresh re-flush. Issue #174 Should 2.
         Connected,
         /// Equivalent to a clean Disconnect — emit Disconnected.
         Disconnected,
         /// Equivalent to Home Assistant publishing `online` on
-        /// `<discovery_prefix>/status`. The fake emits a `BirthOnline`
+        /// `<discovery_prefix>/status` ARRIVING DURING A FLUSH.
+        /// Production's `wait_for_publish_id` observes this in the
+        /// PubAck-wait drain and flips a sticky `pending_birth` flag,
+        /// then emits `BirthOnline` after the wait. The fake mirrors
+        /// that with a sticky flag set on receipt and consumed by the
+        /// `record_rx.recv()` arm after the next record lands, so the
+        /// test exercises the same dedup/forward seam. Issue #174
+        /// Should 1.
+        BirthDuringFlush,
+        /// Equivalent to Home Assistant publishing `online` on
+        /// `<discovery_prefix>/status` while the transport is idle in
+        /// `eventloop.poll()`. The fake emits a `BirthOnline`
         /// lifecycle signal so the publisher re-flushes discovery +
-        /// snapshot. Issue #174.
+        /// snapshot. Issue #174 (defect #2 primary path).
         BirthOnline,
         /// Gracefully stop the transport run loop (test-only escape hatch).
         Stop,
@@ -2591,6 +2710,13 @@ mod async_tests {
         records: Arc<StdMutex<Vec<PublishRecord>>>,
         records_notify: Arc<Notify>,
         ctrl_rx: mpsc::Receiver<FakeCtrl>,
+        /// Sticky flag mirroring production's `MqttTransport`'s
+        /// `pending_birth`. Set by [`FakeCtrl::BirthDuringFlush`],
+        /// consumed (and emitted as `TransportLifecycle::BirthOnline`)
+        /// by the next `record_rx.recv()` arm — matching production's
+        /// "emit `BirthOnline` AFTER the PubAck-wait returns to the
+        /// select loop" semantics. Issue #174 Should 1.
+        pending_birth: bool,
     }
 
     impl FakeTransport {
@@ -2602,6 +2728,7 @@ mod async_tests {
                     records: Arc::new(StdMutex::new(Vec::new())),
                     records_notify: Arc::new(Notify::new()),
                     ctrl_rx,
+                    pending_birth: false,
                 },
                 ctrl_tx,
             )
@@ -2655,6 +2782,33 @@ mod async_tests {
                         let Some(cmd) = ctrl else { return Ok(()); };
                         match cmd {
                             FakeCtrl::Connected => {
+                                // Mirror production's drain-on-reconnect
+                                // (issue #174 Should 2): drop any stale
+                                // records sitting in `record_rx` from an
+                                // aborted flush BEFORE signalling
+                                // Connected, so the publisher only sees
+                                // the fresh re-flush records. The
+                                // empty-topic close sentinel MUST NOT be
+                                // swallowed — if seen, honor it
+                                // (Disconnected + return).
+                                loop {
+                                    match record_rx.try_recv() {
+                                        Ok(rec) if rec.topic.is_empty() => {
+                                            let _ = lifecycle_tx
+                                                .send(TransportLifecycle::Disconnected)
+                                                .await;
+                                            return Ok(());
+                                        }
+                                        Ok(_) => {}
+                                        Err(mpsc::error::TryRecvError::Empty) => break,
+                                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                                            let _ = lifecycle_tx
+                                                .send(TransportLifecycle::Disconnected)
+                                                .await;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
                                 let _ = lifecycle_tx
                                     .send(TransportLifecycle::Connected)
                                     .await;
@@ -2663,6 +2817,21 @@ mod async_tests {
                                 let _ = lifecycle_tx
                                     .send(TransportLifecycle::Disconnected)
                                     .await;
+                            }
+                            FakeCtrl::BirthDuringFlush => {
+                                // Equivalent to HA publishing `online`
+                                // on `<discovery_prefix>/status` while the
+                                // transport is in the middle of draining
+                                // a PubAck wait. Production's
+                                // `wait_for_publish_id` observes this in
+                                // the drain and flips a sticky
+                                // `pending_birth` flag, then the
+                                // record-pump arm emits `BirthOnline`
+                                // after the wait returns. The fake mirrors
+                                // the seam: the flag is set here, and the
+                                // `record_rx.recv()` arm below consumes it
+                                // after the next record lands.
+                                self.pending_birth = true;
                             }
                             FakeCtrl::BirthOnline => {
                                 // Equivalent to HA publishing `online` on
@@ -2718,6 +2887,18 @@ mod async_tests {
                             g.push(rec);
                         }
                         self.records_notify.notify_one();
+                        // After the record lands, surface any pending
+                        // `BirthOnline` observation from a `FakeCtrl::
+                        // BirthDuringFlush` delivered earlier in the
+                        // flush window (issue #174 Should 1). The flag
+                        // is sticky and consumed exactly once here —
+                        // matching production's dedup.
+                        if self.pending_birth {
+                            self.pending_birth = false;
+                            let _ = lifecycle_tx
+                                .send(TransportLifecycle::BirthOnline)
+                                .await;
+                        }
                     }
                 }
             }
@@ -3088,6 +3269,59 @@ mod async_tests {
         let opts_sanitized =
             super::mqtt_transport::MqttTransport::status_topic_for_test("Home Assistant");
         assert_eq!(opts_sanitized, "home_assistant/status");
+    }
+
+    #[test]
+    fn birth_packets_during_publish_wait_collapse_to_one_pending_birth() {
+        let status_topic = "homeassistant/status";
+        let mut pending_birth = false;
+        let online = rumqttc::Packet::Publish(rumqttc::Publish {
+            dup: false,
+            qos: rumqttc::QoS::AtLeastOnce,
+            retain: true,
+            topic: status_topic.into(),
+            pkid: 1,
+            payload: "online".into(),
+        });
+
+        super::mqtt_transport::observe_birth_packet(&online, status_topic, &mut pending_birth);
+        super::mqtt_transport::observe_birth_packet(&online, status_topic, &mut pending_birth);
+
+        assert!(super::mqtt_transport::take_pending_birth(
+            &mut pending_birth
+        ));
+        assert!(!super::mqtt_transport::take_pending_birth(
+            &mut pending_birth
+        ));
+    }
+
+    #[test]
+    fn reconnect_drain_discards_stale_records_and_preserves_fresh_record() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.blocking_send(PublishRecord {
+            topic: "stale".into(),
+            payload: "old".into(),
+            qos: 1,
+            retain: true,
+        })
+        .unwrap();
+        tx.blocking_send(PublishRecord {
+            topic: String::new(),
+            payload: String::new(),
+            qos: 1,
+            retain: true,
+        })
+        .unwrap();
+        tx.blocking_send(PublishRecord {
+            topic: "fresh".into(),
+            payload: "new".into(),
+            qos: 1,
+            retain: true,
+        })
+        .unwrap();
+
+        assert!(super::mqtt_transport::drain_stale_records(&mut rx).is_none());
+        assert_eq!(rx.try_recv().unwrap().topic, "fresh");
     }
 
     // ── RED: reconnect republishes discovery + snapshot ──────────

@@ -2,4 +2,4 @@
 kind: improvement
 surfaces: []
 ---
-The mdBook documentation now publishes to GitHub Pages on every push to `master` and via manual `workflow_dispatch`; the latest release's book is served at https://legion-works.github.io/dormant/ alongside the in-tree `docs/src/` source.
+The documentation is now published as a hosted book at https://legion-works.github.io/dormant/, branded to match the web dashboard and tray, and rebuilt on every push to `master` that touches `docs/`.

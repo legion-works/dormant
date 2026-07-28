@@ -24,8 +24,8 @@ export function SectionRail() {
     if (!section?.anchor) return;
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     section.anchor.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" });
-    const hash = window.location.hash.split("#")[0];
-    window.location.hash = `${hash}#config-section-${id}`;
+    const route = window.location.hash.slice(1).split("#")[0];
+    window.location.hash = `#${route}#config-section-${id}`;
   }
 
   return (

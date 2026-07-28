@@ -89,7 +89,8 @@ vi.mock("../app/config/SettingsForm", () => ({
       dirtySections: Set<string>;
     } | null) => void;
   }) => {
-    const { useLayoutEffect } = require("react");
+    const { useLayoutEffect, useEffect, useState } = require("react");
+    const [mounted, setMounted] = useState(false);
     // useLayoutEffect fires synchronously after DOM mutations, before paint.
     // This avoids the React 18 StrictMode double-mount race where useEffect
     // may fire its state update after the test's waitFor polling window.
@@ -100,12 +101,17 @@ vi.mock("../app/config/SettingsForm", () => ({
         dirtySections: new Set(["daemon"]),
       });
     }, [onNavigationGuard]);
-    return <div>settings form</div>;
+    useEffect(() => {
+      const timer = setTimeout(() => setMounted(true), 300);
+      return () => clearTimeout(timer);
+    }, []);
+    return <div>{mounted && <div data-field-id="daemon.web_port">web port</div>}settings form</div>;
   },
 }));
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, "", "#");
   vi.clearAllMocks();
 });
 
@@ -118,6 +124,17 @@ async function openRawToml() {
 }
 
 describe("Config", () => {
+  it("retries a field deep link when the form mounts after the first navigation attempt", async () => {
+    window.history.replaceState(null, "", "#/config/daemon#daemon.web_port");
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+
+    render(<Config />);
+
+    await waitFor(() => expect(screen.getByText("web port")).toBeInTheDocument(), { timeout: 500 });
+    expect(scrollIntoView).toHaveBeenCalled();
+  });
+
   it("renders config path in the file viewer header", async () => {
     render(<Config />);
     await openRawToml();

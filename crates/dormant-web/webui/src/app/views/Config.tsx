@@ -396,25 +396,37 @@ export default function Config() {
   useEffect(() => {
     const target = getConfigFragmentTarget();
     if (!target) return;
-    if (target.startsWith("config-section-")) {
-      const timer = setTimeout(() => {
-        const el = document.querySelector(`[data-config-section="${target.slice("config-section-".length)}"]`);
-        if (el) (el as HTMLElement).scrollIntoView({ behavior: "smooth", block: "start" });
-      }, 150);
-      return () => clearTimeout(timer);
-    }
-    // Defer until the tab's sections are in the DOM.
-    const timer = setTimeout(() => {
-      const el = document.querySelector(`[data-field-id="${target}"]`);
-      if (!el) return;
-      (el as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
-      (el as HTMLElement).style.transition = "background-color 0.15s ease";
-      (el as HTMLElement).style.backgroundColor = "var(--accent-warm-muted)";
-      setTimeout(() => {
-        (el as HTMLElement).style.backgroundColor = "";
-      }, 1200);
-    }, 150);
-    return () => clearTimeout(timer);
+    let cancelled = false;
+    let observer: MutationObserver | undefined;
+    const attemptNavigation = () => {
+      if (cancelled) return;
+      const selector = target.startsWith("config-section-")
+        ? `[data-config-section="${target.slice("config-section-".length)}"]`
+        : `[data-field-id="${target}"]`;
+      const el = document.querySelector(selector) as HTMLElement | null;
+      if (!el) {
+        return;
+      }
+      observer?.disconnect();
+      el.scrollIntoView({ behavior: "smooth", block: target.startsWith("config-section-") ? "start" : "center" });
+      if (target.startsWith("config-section-")) return;
+      el.style.transition = "background-color 0.15s ease";
+      el.style.backgroundColor = "var(--accent-warm-muted)";
+      setTimeout(() => { el.style.backgroundColor = ""; }, 1200);
+    };
+    const cancelOnHashChange = () => {
+      cancelled = true;
+      observer?.disconnect();
+    };
+    window.addEventListener("hashchange", cancelOnHashChange);
+    attemptNavigation();
+    observer = new MutationObserver(attemptNavigation);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      cancelled = true;
+      observer?.disconnect();
+      window.removeEventListener("hashchange", cancelOnHashChange);
+    };
   }, [tab]);
 
   const handleReload = useCallback(async () => {

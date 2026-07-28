@@ -9,7 +9,7 @@
    design/web-ui/_ds/: mdBook's theme CSS is served standalone from the
    book output, so DS custom properties have no stylesheet context to
    resolve against here. Every hex below is copied verbatim from
-   design/web-ui/_ds/legion-works-design-system-*/tokens/colors.css
+   design/web-ui/_ds/legion-works-design-system-<uuid>/tokens/colors.css
    (the same source the web UI consumes) — this file and the favicon are
    the sanctioned places for literal brand hex.
 
@@ -49,6 +49,12 @@
 
 /* ── mdBook variable layer ─────────────────────────────────────────── */
 
+/* mdBook ships five themes and its picker writes the chosen one to
+   localStorage, so a reader who once picked "Light" gets it on every visit.
+   The dark four all map to the DS dark palette; `.light` is remapped to the
+   DS's own light theme (Tokyo Day, tokens/colors.css `[data-theme="light"]`)
+   further down rather than being forced dark — a reader who asked for light
+   should get a legible light page, not a broken one. */
 .navy,
 .coal,
 .light,
@@ -56,6 +62,11 @@
 .ayu {
   --bg: var(--lw-bg-base);
   --fg: var(--lw-text-body);
+
+  /* mdBook's general.css sets `font-family: var(--mono-font) !important` on
+     `code`, which a plain `code { font-family: ... }` rule cannot win. Feed
+     its own variable instead of fighting the !important. */
+  --mono-font: var(--lw-font-mono);
 
   --sidebar-bg: var(--lw-bg-sunken);
   --sidebar-fg: var(--lw-text-muted);
@@ -91,6 +102,25 @@
   --searchresults-border-color: var(--lw-border);
   --searchresults-li-bg: var(--lw-bg-raised);
   --search-mark-bg: rgba(255, 150, 108, 0.28);
+}
+
+/* Light theme — DS Tokyo Day values. Overrides the shared block above, so it
+   must follow it. Values from tokens/colors.css `[data-theme="light"]`:
+   bg-base #e6e7ed · bg-raised #ffffff · text-strong #1a1b26 ·
+   text-body #2c3044 · text-muted #565f89 · accent cyan-600 #2f7d9c ·
+   accent-warm amber-600 #e0744c. */
+.light {
+  --lw-bg-base: #e6e7ed;
+  --lw-bg-sunken: #d5d6db;
+  --lw-bg-raised: #ffffff;
+  --lw-text-strong: #1a1b26;
+  --lw-text-body: #2c3044;
+  --lw-text-muted: #565f89;
+  --lw-text-faint: #737a8c;
+  --lw-accent: #2f7d9c;
+  --lw-accent-warm: #e0744c;
+  --lw-border: rgba(26, 27, 38, 0.14);
+  --lw-border-strong: rgba(26, 27, 38, 0.26);
 }
 
 /* ── Type ──────────────────────────────────────────────────────────── */
@@ -131,12 +161,19 @@ html {
 /* ── Code ──────────────────────────────────────────────────────────── */
 
 code {
-  font-family: var(--lw-font-mono);
   font-variant-ligatures: none;
 }
 
-pre > code {
+/* highlight.js puts `.hljs` on the code element and its theme file sets both
+   background and base colour there. A plain `pre > code` rule (two type
+   selectors) loses to that single class, so the block must out-specify it —
+   otherwise code blocks keep highlight.js's own grey and ignore the DS
+   surface. Token colours still come from the highlight theme; only the
+   surface and base text are ours. */
+pre > code,
+pre > code.hljs {
   background: var(--lw-bg-raised);
+  color: var(--lw-text-body);
   border: 1px solid var(--lw-border);
   border-radius: var(--lw-radius-md);
 }

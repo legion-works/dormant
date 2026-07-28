@@ -122,8 +122,10 @@ Resume manual pauses with:
 dormantctl resume
 ```
 
-`"audio-playback"` and `"call"` may appear in config, but audio detection is
-not shipped and cannot currently inhibit a rule.
+`"audio-playback"` and `"call"` are backed by the PipeWire poller in the
+`[audio]` section, which is opt-in and off by default. If a rule declares
+either kind but never holds a blank during playback, check that `audio.enabled`
+is `true` — see [Configuration](./configuration.md#audio--pipewire-audio--and-call-aware-blanking).
 
 ### Min-wake-time floor
 

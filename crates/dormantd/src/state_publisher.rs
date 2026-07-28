@@ -1481,10 +1481,9 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
             let display_id = sanitize_topic_id(&display.0);
             vec![PublishRecord {
                 topic: topic_display_phase(&base, &instance, &display_id),
-                // The phase literal is the engine's own grep-stable
-                // string (`active|grace|blanking|blanked|waking|staged`);
-                // publishing it bare keeps HA's value_template honest.
-                payload: phase.clone(),
+                // Keep event updates identical to snapshot updates so HA's
+                // `value_template: "{{ value_json.phase }}"` parses both.
+                payload: phase_json(phase),
                 qos: PUBLISH_QOS,
                 retain: RETAIN,
             }]
@@ -1541,14 +1540,11 @@ fn availability_record(topic: &str, state: SensorState) -> PublishRecord {
 }
 
 fn display_phase_payload(display: &DisplaySnapshot) -> String {
-    // The display phase publishes a JSON object with the
-    // `phase` field so HA's `value_template: "{{ value_json.phase }}"`
-    // parses the literal. Carrying the empty JSON object is
-    // intentional — a bare string would not parse through the
-    // template. We do not re-emit the `inhibited` / `paused` flags
-    // here; those have their own surfaces in the rules engine and
-    // are out of scope for the publish contract.
-    json!({ "phase": display.phase }).to_string()
+    phase_json(&display.phase)
+}
+
+fn phase_json(phase: &str) -> String {
+    json!({ "phase": phase }).to_string()
 }
 
 // ── Collision detection (first-wins, WARN once) ─────────────────────────────
@@ -2150,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn event_records_display_phase_yields_phase_literal() {
+    fn event_records_display_phase_yields_json_phase() {
         let cfg = enabled_cfg();
         let ev = DaemonEvent::DisplayPhase {
             display: DisplayId("main".into()),
@@ -2160,11 +2156,34 @@ mod tests {
         let records = event_records(&cfg, &ev, "office-pc");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].topic, "dormant/office-pc/display/main/phase");
-        // Phase is published bare (not wrapped in JSON) so the HA
-        // value_template's `{{ value_json.phase }}` works
-        // regardless of the engine's choice. The contract
-        // pins the value to the engine's phase literal.
-        assert_eq!(records[0].payload, "blanking");
+        let payload: serde_json::Value = serde_json::from_str(&records[0].payload).unwrap();
+        assert_eq!(payload["phase"], "blanking");
+    }
+
+    #[test]
+    fn event_and_snapshot_display_phase_payloads_cannot_drift() {
+        let cfg = enabled_cfg();
+        let phase = "grace";
+        let event = DaemonEvent::DisplayPhase {
+            display: DisplayId("main".into()),
+            phase: phase.into(),
+            cause: "zone_lost".into(),
+        };
+        let event_payload: serde_json::Value =
+            serde_json::from_str(&event_records(&cfg, &event, "office-pc")[0].payload).unwrap();
+
+        let mut snapshot = snapshot_one_of_each();
+        snapshot.displays[0].1.phase = phase.into();
+        let snapshot_payload: serde_json::Value = serde_json::from_str(
+            &snapshot_records(&cfg, &snapshot, "office-pc")
+                .iter()
+                .find(|record| record.topic == "dormant/office-pc/display/main/phase")
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+
+        assert_eq!(event_payload["phase"], snapshot_payload["phase"]);
     }
 
     #[test]

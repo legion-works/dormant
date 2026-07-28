@@ -105,7 +105,14 @@ vi.mock("../app/config/SettingsForm", () => ({
       const timer = setTimeout(() => setMounted(true), 300);
       return () => clearTimeout(timer);
     }, []);
-    return <div>{mounted && <div data-field-id="daemon.web_port">web port</div>}settings form</div>;
+    return (
+      <div>
+        {mounted && <div data-field-id="daemon.web_port">web port</div>}
+        <div data-config-section="first">first section</div>
+        <div data-config-section="second">second section</div>
+        settings form
+      </div>
+    );
   },
 }));
 
@@ -133,6 +140,39 @@ describe("Config", () => {
 
     await waitFor(() => expect(screen.getByText("web port")).toBeInTheDocument(), { timeout: 500 });
     expect(scrollIntoView).toHaveBeenCalled();
+  });
+
+  it("restarts navigation for a same-tab hash change", async () => {
+    window.history.replaceState(null, "", "#/config/daemon#config-section-first");
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    render(<Config />);
+
+    await waitFor(() => expect(screen.getByText("first section")).toBeInTheDocument());
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+
+    window.history.replaceState(null, "", "#/config/daemon#config-section-second");
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not retain an observer after a fast-path navigation", async () => {
+    window.history.replaceState(null, "", "#/config/daemon#config-section-first");
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    const OriginalObserver = globalThis.MutationObserver;
+    class MockObserver {
+      observe = observe;
+      disconnect = disconnect;
+      constructor(_callback: MutationCallback) {}
+    }
+    globalThis.MutationObserver = MockObserver as unknown as typeof MutationObserver;
+    render(<Config />);
+
+    await waitFor(() => expect(screen.getByText("first section")).toBeInTheDocument());
+    expect(disconnect).toHaveBeenCalled();
+    globalThis.MutationObserver = OriginalObserver;
   });
 
   it("renders config path in the file viewer header", async () => {

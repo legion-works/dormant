@@ -343,6 +343,7 @@ export default function Config() {
   });
   const [reloading, setReloading] = useState(false);
   const [tab, setTab] = useState<ConfigTab>(getConfigTabFromHash);
+  const [hashNavigationKey, setHashNavigationKey] = useState(() => window.location.hash);
   const [dirtyTabs, setDirtyTabs] = useState<Set<ConfigTab>>(new Set());
   const mountedRef = useRef(true);
 
@@ -384,6 +385,7 @@ export default function Config() {
     const handler = () => {
       const nextTab = getConfigTabFromHash();
       setTab(nextTab);
+      setHashNavigationKey(window.location.hash);
     };
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
@@ -404,30 +406,30 @@ export default function Config() {
         ? `[data-config-section="${target.slice("config-section-".length)}"]`
         : `[data-field-id="${target}"]`;
       const el = document.querySelector(selector) as HTMLElement | null;
-      if (!el) {
-        return;
-      }
+      if (!el) return false;
       observer?.disconnect();
       el.scrollIntoView({ behavior: "smooth", block: target.startsWith("config-section-") ? "start" : "center" });
       if (target.startsWith("config-section-")) return;
       el.style.transition = "background-color 0.15s ease";
       el.style.backgroundColor = "var(--accent-warm-muted)";
       setTimeout(() => { el.style.backgroundColor = ""; }, 1200);
+      return true;
     };
     const cancelOnHashChange = () => {
       cancelled = true;
       observer?.disconnect();
     };
     window.addEventListener("hashchange", cancelOnHashChange);
-    attemptNavigation();
     observer = new MutationObserver(attemptNavigation);
-    observer.observe(document.body, { childList: true, subtree: true });
+    if (!attemptNavigation()) {
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
     return () => {
       cancelled = true;
       observer?.disconnect();
       window.removeEventListener("hashchange", cancelOnHashChange);
     };
-  }, [tab]);
+  }, [tab, hashNavigationKey]);
 
   const handleReload = useCallback(async () => {
     setReloading(true);

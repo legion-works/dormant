@@ -68,6 +68,17 @@ use crate::wear_order::apply_wear_even_groups;
 pub(super) type SinglePixelBufferManager =
     wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
 
+/// Playlist whose wear-even decision has already been made.  Keeping the
+/// wrapper private makes the session-install path consume only an ordered
+/// playlist; raw settings cannot be passed to the ordered-player seam.
+struct PreparedScreensaverItems(Vec<PlaylistItem>);
+
+impl PreparedScreensaverItems {
+    fn into_vec(self) -> Vec<PlaylistItem> {
+        self.0
+    }
+}
+
 /// Prepare the exact playlist handed to mpv for a screensaver show.
 ///
 /// Ordering is deliberately kept at the session-install seam: the catalog
@@ -76,7 +87,7 @@ pub(super) type SinglePixelBufferManager =
 fn screensaver_items_for_show(
     settings: &ScreensaverSettings,
     display_id: &DisplayId,
-) -> Vec<PlaylistItem> {
+) -> PreparedScreensaverItems {
     let heat = settings
         .heat_snapshots
         .read()
@@ -98,16 +109,36 @@ fn screensaver_items_for_show(
         settings.wear_temperature,
         settings.seed,
     ) {
-        Ok(items) => items,
+        Ok(items) => PreparedScreensaverItems(items),
         Err(error) => {
             tracing::warn!(
                 event = "screensaver_wear_order_fallback",
                 display_id = %display_id,
                 reason = %error,
             );
-            original_items
+            PreparedScreensaverItems(original_items)
         }
     }
+}
+
+fn new_ordered_mpv_player(
+    items: PreparedScreensaverItems,
+    image_duration: std::time::Duration,
+    audio: bool,
+    scale_mode: crate::settings::ScaleMode,
+    width: u32,
+    height: u32,
+    write_fd: OwnedFd,
+) -> Result<MpvPlayer, crate::screensaver::MpvError> {
+    MpvPlayer::new(
+        items.into_vec(),
+        image_duration,
+        audio,
+        scale_mode,
+        width,
+        height,
+        write_fd,
+    )
 }
 
 /// Maximum time we'll wait for a compositor `configure` event after the
@@ -1545,7 +1576,7 @@ impl WaylandState {
         // Build the player.  On Err, `write_fd` is dropped here
         // (closing it) and we still own `read_fd` — the caller-side
         // match below handles the read-fd close on Err.
-        let player_result = MpvPlayer::new(
+        let player_result = new_ordered_mpv_player(
             items,
             settings.image_duration,
             settings.audio,
@@ -2668,7 +2699,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     #[test]
-    fn screensaver_install_orders_items_through_production_call_site() {
+    fn screensaver_items_helper_orders_playlist() {
         let items = vec![
             PlaylistItem {
                 uri: "left.png".into(),
@@ -2712,12 +2743,12 @@ mod tests {
             ..ScreensaverSettings::default()
         };
 
-        let first = screensaver_items_for_show(&settings, &DisplayId("mon".into()));
+        let first = screensaver_items_for_show(&settings, &DisplayId("mon".into())).into_vec();
         heat_snapshots.write().unwrap().insert(
             DisplayId("mon".into()),
             HeatGrid::new(1, 2, vec![1.0, 0.0]).unwrap(),
         );
-        let next = screensaver_items_for_show(&settings, &DisplayId("mon".into()));
+        let next = screensaver_items_for_show(&settings, &DisplayId("mon".into())).into_vec();
 
         assert_eq!(first[0].uri, "left.png");
         assert_eq!(next[0].uri, "right.png");

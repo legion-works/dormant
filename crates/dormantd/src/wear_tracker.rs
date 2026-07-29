@@ -227,7 +227,6 @@ async fn run(mut deps: WearTrackerDeps) {
                     &mut state,
                     Tick::now().0,
                     &cfg.wear,
-                    now,
                 );
                 #[cfg(not(feature = "render"))]
                 let exposures = HashMap::new();
@@ -534,6 +533,42 @@ fn sync_heat_snapshots(state: &TrackerState, handle: &dormant_render::HeatSnapsh
 }
 
 #[cfg(feature = "render")]
+/// Split ordered render reports into contiguous intervals within one
+/// monotonic attribution window. The caller supplies the retained report from
+/// the previous drain as part of `reports`; no journal or tracker state is
+/// consulted here.
+fn split_exposure_slices(
+    reports: &[ScreensaverItemReport],
+    start: Instant,
+    boundary: Instant,
+) -> Option<Vec<ScreensaverExposureSlice>> {
+    let mut current = reports
+        .iter()
+        .rfind(|report| report.observed_at <= start)?
+        .clone();
+    let mut cursor = start;
+    let mut slices = Vec::new();
+    for report in reports.iter().filter(|report| report.observed_at > start) {
+        let at = report.observed_at.min(boundary);
+        if at > cursor {
+            slices.push(ScreensaverExposureSlice {
+                span: at.duration_since(cursor),
+                luma: current.luma.clone(),
+            });
+        }
+        current = report.clone();
+        cursor = at;
+    }
+    if cursor < boundary {
+        slices.push(ScreensaverExposureSlice {
+            span: boundary.duration_since(cursor),
+            luma: current.luma,
+        });
+    }
+    Some(slices)
+}
+
+#[cfg(feature = "render")]
 /// Drain render reports through the current monotonic tick boundary and turn
 /// them into exact, contiguous exposure slices. A missing report at the window
 /// start means the bounded journal may have overflowed, so the display is left
@@ -543,23 +578,33 @@ fn collect_exposure_slices(
     state: &mut TrackerState,
     boundary: Instant,
     cfg: &WearConfig,
-    now_epoch_s: u64,
 ) -> HashMap<DisplayId, Vec<ScreensaverExposureSlice>> {
     let sample_interval_s = cfg.sample_interval.as_secs().max(1);
     let max_span_s = sample_interval_s.saturating_mul(2);
+    let default_span = Duration::from_secs(sample_interval_s);
+    let elapsed = state.screensaver_tick_at.map_or(default_span, |previous| {
+        boundary
+            .checked_duration_since(previous)
+            .unwrap_or_default()
+    });
+    let span = elapsed.min(Duration::from_secs(max_span_s));
+    let start = boundary.checked_sub(span).unwrap_or(boundary);
+    state.screensaver_tick_at = Some(boundary);
     let mut output = HashMap::new();
 
-    for (display_id, ledger) in &state.ledgers {
-        let elapsed_s = ledger
-            .last_sample_at_epoch_s
-            .map_or(sample_interval_s, |last| now_epoch_s.saturating_sub(last));
-        let span_s = elapsed_s.min(max_span_s);
-        let span = Duration::from_secs(span_s);
-        let start = boundary.checked_sub(span).unwrap_or(boundary);
-
-        let mut reports = Vec::new();
+    for display_id in state.ledgers.keys() {
+        let mut reports = state
+            .screensaver_items
+            .get(display_id)
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
         let Ok(mut guard) = journal.lock() else {
             tracing::warn!(event = "screensaver_item_journal_unavailable");
+            output.insert(
+                display_id.clone(),
+                vec![ScreensaverExposureSlice { span, luma: None }],
+            );
             continue;
         };
         if let Some(queue) = guard.get_mut(display_id) {
@@ -576,48 +621,14 @@ fn collect_exposure_slices(
         drop(guard);
 
         reports.sort_by_key(|report| report.observed_at);
-        let starting = reports
-            .iter()
-            .rfind(|report| report.observed_at <= start)
-            .cloned()
-            .or_else(|| {
-                state
-                    .screensaver_items
-                    .get(display_id)
-                    .filter(|report| report.observed_at <= start)
-                    .cloned()
-            });
         if let Some(report) = reports.last() {
             state
                 .screensaver_items
                 .insert(display_id.clone(), report.clone());
         }
-        let Some(mut current) = starting else {
-            continue;
-        };
-
-        let mut slices = Vec::new();
-        let mut cursor = start;
-        for report in reports.iter().filter(|report| report.observed_at > start) {
-            let at = report.observed_at.min(boundary);
-            if at > cursor {
-                slices.push(ScreensaverExposureSlice {
-                    span: at.duration_since(cursor),
-                    luma: current.luma.clone(),
-                });
-            }
-            current = report.clone();
-            cursor = at;
-        }
-        if cursor < boundary {
-            slices.push(ScreensaverExposureSlice {
-                span: boundary.duration_since(cursor),
-                luma: current.luma,
-            });
-        }
-        if slices.iter().map(|slice| slice.span).sum::<Duration>() == span {
-            output.insert(display_id.clone(), slices);
-        }
+        let slices = split_exposure_slices(&reports, start, boundary)
+            .unwrap_or_else(|| vec![ScreensaverExposureSlice { span, luma: None }]);
+        output.insert(display_id.clone(), slices);
     }
 
     output
@@ -669,6 +680,9 @@ struct TrackerState {
     /// so the item visible at the start of a window can own its leading dwell.
     #[cfg(feature = "render")]
     screensaver_items: HashMap<DisplayId, ScreensaverItemReport>,
+    /// Monotonic boundary of the previous screensaver attribution tick.
+    #[cfg(feature = "render")]
+    screensaver_tick_at: Option<Instant>,
     /// True while screensaver attribution is using a tagged uniform fallback.
     screensaver_fallback_active: HashMap<DisplayId, bool>,
 }
@@ -804,7 +818,14 @@ fn tick(
             .last_sample_at_epoch_s
             .map_or(sample_interval_s, |last| now_epoch_s.saturating_sub(last));
         let span_s = elapsed_s.min(max_span_s);
-        let span = Duration::from_secs(span_s);
+        let wall_span = Duration::from_secs(span_s);
+        let span = if stage_kind == "render_screensaver" {
+            exposures.get(&display_id).map_or(wall_span, |slices| {
+                slices.iter().map(|slice| slice.span).sum()
+            })
+        } else {
+            wall_span
+        };
 
         let norm = match stage_kind {
             "render_screensaver" => cfg.screensaver_factor.clamp(0.0, 1.0),
@@ -1806,6 +1827,46 @@ mod tests {
     }
 
     #[test]
+    fn staged_screensaver_uses_monotonic_window_when_wall_clock_diverges() {
+        let display = DisplayId("mon".into());
+        let mut ledger = fresh_ledger(&display, 0);
+        ledger.last_sample_at_epoch_s = Some(1_000_000);
+        let mut state = TrackerState::default();
+        state.ledgers.insert(display.clone(), ledger);
+        let snapshot = snapshot_with(
+            &display,
+            "staged",
+            Some(StageInfo {
+                idx: 0,
+                kind: StageKind::RenderScreensaver,
+            }),
+        );
+        let cfg = WearConfig::default();
+        let exposures = HashMap::from([(
+            display.clone(),
+            vec![ScreensaverExposureSlice {
+                span: Duration::from_secs(60),
+                luma: Some(dormant_core::spatial_grid::LumaGrid::new(vec![1.0; 9 * 16]).unwrap()),
+            }],
+        )]);
+
+        // The injected wall clock advanced by two minutes, while the
+        // monotonic exposure window contains only one minute.
+        let _ = tick(
+            &mut state,
+            &snapshot,
+            &HashMap::new(),
+            &cfg,
+            1_000_120,
+            &exposures,
+        );
+        assert!(
+            (state.ledgers[&display].cells[0].wear_hours - cfg.screensaver_factor / 60.0).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
     fn staged_screensaver_splits_one_tick_across_every_item_transition() {
         let display = DisplayId("mon".into());
         let mut state = TrackerState::default();
@@ -2044,7 +2105,7 @@ mod tests {
             ]),
         )])));
         let exposures =
-            collect_exposure_slices(&journal, &mut state, boundary, &WearConfig::default(), 60);
+            collect_exposure_slices(&journal, &mut state, boundary, &WearConfig::default());
         let slices = exposures.get(&display).expect("complete journal window");
         assert_eq!(
             slices.iter().map(|slice| slice.span).collect::<Vec<_>>(),
@@ -2052,6 +2113,33 @@ mod tests {
         );
         assert_eq!(slices[0].luma.as_ref().unwrap().cells[0], 1.0);
         assert_eq!(slices[1].luma.as_ref().unwrap().cells[0], 0.5);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn pure_exposure_splitter_uses_entries_and_monotonic_window_only() {
+        let display = DisplayId("mon".into());
+        let boundary = Instant::now() + Duration::from_secs(60);
+        let start = boundary.checked_sub(Duration::from_secs(60)).unwrap();
+        let reports = vec![
+            ScreensaverItemReport {
+                display_id: display.clone(),
+                uri: Some("first".into()),
+                luma: dormant_core::spatial_grid::LumaGrid::new(vec![1.0; 9 * 16]),
+                observed_at: start,
+            },
+            ScreensaverItemReport {
+                display_id: display,
+                uri: Some("second".into()),
+                luma: dormant_core::spatial_grid::LumaGrid::new(vec![0.5; 9 * 16]),
+                observed_at: start + Duration::from_secs(30),
+            },
+        ];
+        let slices = split_exposure_slices(&reports, start, boundary).unwrap();
+        assert_eq!(
+            slices.iter().map(|slice| slice.span).collect::<Vec<_>>(),
+            [Duration::from_secs(30), Duration::from_secs(30),]
+        );
     }
 
     #[cfg(feature = "render")]
@@ -2074,8 +2162,11 @@ mod tests {
             }]),
         )])));
         let exposures =
-            collect_exposure_slices(&journal, &mut state, boundary, &WearConfig::default(), 60);
-        assert!(!exposures.contains_key(&display));
+            collect_exposure_slices(&journal, &mut state, boundary, &WearConfig::default());
+        let fallback = exposures.get(&display).expect("incomplete window marker");
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].span, Duration::from_secs(60));
+        assert!(fallback[0].luma.is_none());
 
         let snapshot = snapshot_with(
             &display,

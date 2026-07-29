@@ -348,6 +348,8 @@ mod dispatch_gate_tests {
             transition_duration: None,
             shift_px: 4,
             shift_interval: Duration::from_secs(60),
+            wear_temperature: 0.05,
+            shift_heat_bias: 0.25,
         }
     }
 

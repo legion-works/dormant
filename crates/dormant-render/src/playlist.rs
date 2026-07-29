@@ -328,6 +328,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -358,6 +359,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -383,6 +385,7 @@ mod tests {
             recurse: true,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -409,6 +412,7 @@ mod tests {
             recurse: true,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -434,6 +438,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -451,6 +456,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -478,6 +484,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -502,6 +509,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -534,6 +542,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -556,6 +565,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(3)),
         };
 
@@ -574,6 +584,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -600,6 +611,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(1)),
         };
         let s2 = ScreensaverSource {
@@ -608,6 +620,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(2)),
         };
 
@@ -633,6 +646,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_millis(1500)),
         };
 
@@ -653,6 +667,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -670,6 +685,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(5)),
         };
 
@@ -694,6 +710,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
         let playlist = build_playlist(&[source], Some(42));
@@ -718,6 +735,7 @@ mod tests {
             recurse: true,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -747,6 +765,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -778,6 +797,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -800,6 +820,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -835,6 +856,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -858,6 +880,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -890,6 +913,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 

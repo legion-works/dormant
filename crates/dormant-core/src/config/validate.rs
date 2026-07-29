@@ -315,6 +315,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "transition_duration",
             "shift_px",
             "shift_interval",
+            "wear_temperature",
+            "shift_heat_bias",
         ],
     ),
     // ── displays.<id>.screensaver.source (array-of-tables entries) ────────
@@ -326,6 +328,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "recurse",
             "shuffle",
             "order",
+            "wear_tag",
             "image_duration",
         ],
     ),
@@ -1714,6 +1717,20 @@ fn validate_display_with_input_source_readers(
                         ),
                     });
                 }
+                for (name, value) in [
+                    ("wear_temperature", ss.wear_temperature),
+                    ("shift_heat_bias", ss.shift_heat_bias),
+                ] {
+                    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                        errors.push(ValidationError {
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver {name} {value} is out of range — allowed: 0.0..=1.0"
+                            ),
+                        });
+                    }
+                }
+
                 // transition_duration bounds: when set, must be in
                 // [100 ms, 10 s].  Long blurs lose the visual cue that the
                 // playlist is moving; very short blurs visibly skip.  The
@@ -1767,13 +1784,23 @@ fn validate_display_with_input_source_readers(
                     }
                     // order must be a known value.
                     if let Some(ref ord) = src.order
-                        && !matches!(ord.as_str(), "sequential")
+                        && !matches!(ord.as_str(), "sequential" | "wear-even")
                     {
                         errors.push(ValidationError {
                             what: crate::error::E_SCREENSAVER_SOURCE.into(),
                             detail: format!(
                                 "display '{display_id}' screensaver source {i} \
-                                 order '{ord}' is unknown — allowed: \"sequential\""
+                                 order '{ord}' is unknown — allowed: \"sequential\", \"wear-even\""
+                            ),
+                        });
+                    }
+                    if let Some(ref tag) = src.wear_tag
+                        && !matches!(tag.as_str(), "dark" | "medium" | "bright")
+                    {
+                        errors.push(ValidationError {
+                            what: crate::error::E_SCREENSAVER_SOURCE.into(),
+                            detail: format!(
+                                "display '{display_id}' screensaver source {i} wear_tag '{tag}' is unknown — allowed: \"dark\", \"medium\", \"bright\""
                             ),
                         });
                     }
@@ -3727,6 +3754,7 @@ gracee_period = "60s"
                     recurse: false,
                     shuffle: false,
                     order: None,
+                    wear_tag: None,
                     image_duration: None,
                 }],
                 scale_mode: scale_mode.map(str::to_string),
@@ -3734,6 +3762,8 @@ gracee_period = "60s"
                 transition_duration: None,
                 shift_px: crate::config::defaults::SHIFT_PX,
                 shift_interval: crate::config::defaults::SHIFT_INTERVAL,
+                wear_temperature: crate::config::defaults::SCREENSAVER_WEAR_TEMPERATURE,
+                shift_heat_bias: crate::config::defaults::SCREENSAVER_SHIFT_HEAT_BIAS,
             }),
             output: Some("DP-1".into()),
             ..base_display_cfg()
@@ -4139,6 +4169,7 @@ gracee_period = "60s"
                     recurse: false,
                     shuffle: false,
                     order: None,
+                    wear_tag: None,
                     image_duration: None,
                 }],
                 scale_mode: None,
@@ -4146,6 +4177,8 @@ gracee_period = "60s"
                 transition_duration,
                 shift_px: crate::config::defaults::SHIFT_PX,
                 shift_interval: crate::config::defaults::SHIFT_INTERVAL,
+                wear_temperature: crate::config::defaults::SCREENSAVER_WEAR_TEMPERATURE,
+                shift_heat_bias: crate::config::defaults::SCREENSAVER_SHIFT_HEAT_BIAS,
             }),
             output: Some("DP-1".into()),
             ..base_display_cfg()
@@ -5465,6 +5498,151 @@ order = "sequential"
             }),
             "expected E_SCREENSAVER_SOURCE shuffle-order conflict error, got: {:?}",
             errs
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_wear_even_order_is_accepted() {
+        let value: toml::Value = toml::from_str(
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+order = "wear-even"
+wear_tag = "bright"
+"#,
+        )
+        .unwrap();
+        let cfg: Config = value.try_into().unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.what == crate::error::E_SCREENSAVER_SOURCE),
+            "{errors:?}"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_unknown_wear_tag_is_rejected() {
+        let value: toml::Value = toml::from_str(
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+wear_tag = "white"
+"#,
+        )
+        .unwrap();
+        let cfg: Config = value.try_into().unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        assert!(errors.iter().any(|error| {
+            error
+                .to_string()
+                .contains(crate::error::E_SCREENSAVER_SOURCE)
+                && error.to_string().contains("white")
+        }));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_wear_knobs_accept_unit_interval_endpoints() {
+        let value: toml::Value = toml::from_str(
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+wear_temperature = 0.0
+shift_heat_bias = 1.0
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+"#,
+        )
+        .unwrap();
+        let cfg: Config = value.try_into().unwrap();
+        let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.what == crate::error::E_SCREENSAVER_SOURCE),
+            "{errors:?}"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_wear_knobs_reject_non_finite_and_out_of_range() {
+        let value: toml::Value = toml::from_str(
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+output = "DP-1"
+[[displays.d.ladder]]
+kind = "render_screensaver"
+[displays.d.screensaver]
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+"#,
+        )
+        .unwrap();
+        let mut cfg: Config = value.try_into().unwrap();
+        for (temperature, bias) in [(f64::NAN, 0.5), (-0.1, 0.5), (0.5, 1.1)] {
+            {
+                let screensaver = cfg
+                    .displays
+                    .get_mut("d")
+                    .unwrap()
+                    .screensaver
+                    .as_mut()
+                    .unwrap();
+                screensaver.wear_temperature = temperature;
+                screensaver.shift_heat_bias = bias;
+            }
+            assert!(!validate(&cfg, &test_capabilities(), &Credentials::default()).is_empty());
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screensaver_wear_keys_are_known_in_strict_mode() {
+        let value: toml::Value = toml::from_str(
+            r#"
+config_version = 1
+[displays.d]
+controllers = ["ddcci"]
+[displays.d.screensaver]
+wear_temperature = 0.05
+shift_heat_bias = 0.25
+[[displays.d.screensaver.source]]
+path = "/tmp/pics"
+order = "wear-even"
+wear_tag = "dark"
+"#,
+        )
+        .unwrap();
+        assert!(
+            collect_unknown_keys(&value).is_empty(),
+            "{:?}",
+            collect_unknown_keys(&value)
         );
     }
 

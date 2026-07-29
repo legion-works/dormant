@@ -985,11 +985,15 @@ pub struct ScreensaverSource {
     #[serde(default)]
     pub shuffle: bool,
 
-    /// Explicit ordering strategy (`"sequential"`).
+    /// Explicit ordering strategy (`"sequential"` or `"wear-even"`).
     /// Mutually exclusive with `shuffle`; validation rejects a config
     /// that sets both.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<String>,
+
+    /// Luminance class applied to video items from this source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wear_tag: Option<String>,
 
     /// How long each image is displayed before advancing.
     #[serde(
@@ -1076,6 +1080,14 @@ pub struct ScreensaverConfig {
     /// Interval between successive pixel shifts.
     #[serde(default = "default_shift_interval", with = "humantime_serde")]
     pub shift_interval: Duration,
+
+    /// Temperature used by deterministic wear-even ordering.
+    #[serde(default = "default_screensaver_wear_temperature")]
+    pub wear_temperature: f64,
+
+    /// Bias toward colder regions for screensaver pixel shifting.
+    #[serde(default = "default_screensaver_shift_heat_bias")]
+    pub shift_heat_bias: f64,
 }
 
 /// Whether a display is owned by this machine alone or shared between machines.
@@ -1590,6 +1602,12 @@ fn default_trigger() -> String {
 }
 fn default_screensaver_audio() -> bool {
     defaults::SCREENSAVER_AUDIO
+}
+fn default_screensaver_wear_temperature() -> f64 {
+    defaults::SCREENSAVER_WEAR_TEMPERATURE
+}
+fn default_screensaver_shift_heat_bias() -> f64 {
+    defaults::SCREENSAVER_SHIFT_HEAT_BIAS
 }
 fn default_shift_px() -> u8 {
     defaults::SHIFT_PX

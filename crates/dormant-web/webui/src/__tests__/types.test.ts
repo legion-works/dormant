@@ -13,10 +13,20 @@ import {
   CHECK_STATUSES,
   UNAVAILABLE_POLICIES,
   DAEMON_EVENT_TAGS,
+  SCREENSAVER_ORDERS,
+  WEAR_TAGS,
 } from "../api/types";
 import type { RollbackStatus, StateSnapshot, OwnershipEvent } from "../api/types";
 
 describe("enum arrays match Rust serde wire strings", () => {
+  it("ScreensaverOrder — wear-even config wire strings", () => {
+    expect(SCREENSAVER_ORDERS).toEqual(["sequential", "wear-even"]);
+  });
+
+  it("WearTag — screensaver source wire strings", () => {
+    expect(WEAR_TAGS).toEqual(["dark", "medium", "bright"]);
+  });
+
   it("SensorState — serde(rename_all = 'lowercase')", () => {
     expect(SENSOR_STATES).toEqual(["present", "absent", "unavailable"]);
   });

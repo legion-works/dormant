@@ -65,6 +65,14 @@ export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 export const PANEL_TYPES = ["woled", "qd-oled", "unknown"] as const;
 export type PanelType = (typeof PANEL_TYPES)[number];
 
+/** rust: screensaver source ordering literals */
+export const SCREENSAVER_ORDERS = ["sequential", "wear-even"] as const;
+export type ScreensaverOrder = (typeof SCREENSAVER_ORDERS)[number];
+
+/** rust: screensaver video luminance tag literals */
+export const WEAR_TAGS = ["dark", "medium", "bright"] as const;
+export type WearTag = (typeof WEAR_TAGS)[number];
+
 /**
  * rust: rules.rs SensorSnapshot
  * serde: field names match exactly (no rename). `reported` is
@@ -605,7 +613,8 @@ export interface ScreensaverSource {
   urls?: string[];
   recurse?: boolean;
   shuffle?: boolean;
-  order?: string;
+  order?: ScreensaverOrder;
+  wear_tag?: WearTag;
   image_duration?: string;
 }
 
@@ -624,6 +633,10 @@ export interface ScreensaverConfig {
   shift_px?: number;
   /** Interval between successive pixel shifts. Default "120s". */
   shift_interval?: string;
+  /** Temperature used by deterministic wear-even ordering. */
+  wear_temperature?: number;
+  /** Bias toward colder regions for screensaver pixel shifting. */
+  shift_heat_bias?: number;
 }
 
 /** rust: config/schema.rs DisplayConfig */

@@ -13,12 +13,13 @@
  * instead of overwriting each other.
  */
 import { BoolField, DurationField, EnumField, NumberField, TextField } from "./fields";
+import { SCREENSAVER_ORDERS, WEAR_TAGS } from "../../api/types";
 import type { ScreensaverConfig, ScreensaverSource } from "../../api/types";
 import type { PatchStore } from "./patch";
 
 const SCALE_MODES = ["fill", "fit", "stretch", "center"] as const;
 const TRANSITIONS = ["none", "crossfade"] as const;
-const SOURCE_ORDERS = ["sequential"] as const;
+const SOURCE_ORDERS = SCREENSAVER_ORDERS;
 
 /** Default source appended when "Add Source" is clicked. */
 const DEFAULT_SOURCE: ScreensaverSource = {
@@ -80,7 +81,7 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
   function cleanSource(s: ScreensaverSource): ScreensaverSource {
     const out: Record<string, unknown> = { ...s };
     // All three Option fields in the Rust struct (see config/schema.rs).
-    const optionalKeys = ["path", "order", "image_duration"];
+  const optionalKeys = ["path", "order", "wear_tag", "image_duration"];
     for (const key of optionalKeys) {
       if (isAbsentInput(out[key])) delete out[key];
     }
@@ -142,6 +143,26 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
           locked={store.isLocked([...basePath, "transition_duration"], redactedPaths)}
           onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
           error={fieldErrors[[...basePath, "transition_duration"].join(".")]}
+        />
+
+        <NumberField
+          path={[...basePath, "wear_temperature"]}
+          label="wear_temperature"
+          value={screensaver.wear_temperature ?? 0.05}
+          locked={store.isLocked([...basePath, "wear_temperature"], redactedPaths)}
+          onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+          error={fieldErrors[[...basePath, "wear_temperature"].join(".")]}
+          help="Temperature for wear-even ordering (0 = deterministic score, 1 = maximum jitter)."
+        />
+
+        <NumberField
+          path={[...basePath, "shift_heat_bias"]}
+          label="shift_heat_bias"
+          value={screensaver.shift_heat_bias ?? 0.25}
+          locked={store.isLocked([...basePath, "shift_heat_bias"], redactedPaths)}
+          onEdit={(p, v) => { store.trackEdit(p, v); onDirty(); }}
+          error={fieldErrors[[...basePath, "shift_heat_bias"].join(".")]}
+          help="Bias screensaver pixel shifting toward colder regions."
         />
 
         <NumberField
@@ -254,12 +275,28 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
                   onEdit={(_p, v) => {
                     const effective = getEffectiveSources(displayId, fetchedSources, store);
                     const next = [...effective];
-                    next[idx] = { ...next[idx], order: v as string };
+                    next[idx] = { ...next[idx], order: v as ScreensaverSource["order"] };
                     emitSources(next);
                   }}
                   options={SOURCE_ORDERS}
                   error={fieldErrors[[...srcBase, "order"].join(".")]}
                   help="sequential = in directory order. For random playback, use the shuffle flag instead."
+                />
+
+                <EnumField
+                  path={[...srcBase, "wear_tag"]}
+                  label="wear_tag"
+                  value={src.wear_tag ?? "dark"}
+                  locked={srcLocked || store.isLocked([...srcBase, "wear_tag"], redactedPaths)}
+                  onEdit={(_p, v) => {
+                    const effective = getEffectiveSources(displayId, fetchedSources, store);
+                    const next = [...effective];
+                    next[idx] = { ...next[idx], wear_tag: v as ScreensaverSource["wear_tag"] };
+                    emitSources(next);
+                  }}
+                  options={WEAR_TAGS}
+                  error={fieldErrors[[...srcBase, "wear_tag"].join(".")]}
+                  help="Video luminance class used by wear-even ordering; images are scanned."
                 />
 
                 <DurationField

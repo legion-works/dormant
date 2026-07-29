@@ -676,6 +676,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
         let screensaver = ScreensaverConfig {
@@ -687,6 +688,8 @@ mod tests {
             transition_duration: None,
             shift_px: defaults::SHIFT_PX,
             shift_interval: defaults::SHIFT_INTERVAL,
+            wear_temperature: defaults::SCREENSAVER_WEAR_TEMPERATURE,
+            shift_heat_bias: defaults::SCREENSAVER_SHIFT_HEAT_BIAS,
         };
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),
@@ -1116,6 +1119,7 @@ field = "/val"
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
         let screensaver = ScreensaverConfig {
@@ -1127,6 +1131,8 @@ field = "/val"
             transition_duration: None,
             shift_px: defaults::SHIFT_PX,
             shift_interval: defaults::SHIFT_INTERVAL,
+            wear_temperature: defaults::SCREENSAVER_WEAR_TEMPERATURE,
+            shift_heat_bias: defaults::SCREENSAVER_SHIFT_HEAT_BIAS,
         };
         DisplayConfig {
             scope: dormant_core::config::DisplayScope::default(),

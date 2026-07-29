@@ -47,6 +47,7 @@ mod latch;
 #[cfg(target_os = "linux")]
 mod shift;
 
+pub mod luma;
 pub mod playlist;
 pub mod settings;
 

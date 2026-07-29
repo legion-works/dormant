@@ -325,14 +325,17 @@ mod tests {
                 PlaylistItem {
                     uri: "a.mp4".into(),
                     image_duration: Some(Duration::from_secs(2)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "b.png".into(),
                     image_duration: Some(Duration::from_secs(5)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "https://example/c.jpg".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
             ],
             image_duration: Duration::from_secs(3),

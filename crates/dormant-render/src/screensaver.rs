@@ -727,6 +727,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: video.to_string_lossy().into_owned(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(2),
             false,
@@ -880,6 +881,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: "/tmp/dormant-render-tests/lavf-probe.mp4".into(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(1),
             false,
@@ -919,6 +921,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: "/nonexistent/path/that/never/exists.mp4".into(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(1),
             false,
@@ -979,6 +982,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: "/tmp/dormant-render-tests/drop-probe.mp4".into(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(1),
             false,
@@ -1023,14 +1027,17 @@ mod tests {
                 PlaylistItem {
                     uri: "ftp://127.0.0.1:1/x".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "data:text/plain,hi".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "subfile:///etc/passwd".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
             ],
             Duration::from_secs(1),
@@ -1079,10 +1086,12 @@ mod tests {
                     PlaylistItem {
                         uri: "ftp://127.0.0.1:1/x".into(),
                         image_duration: None,
+                        ..Default::default()
                     },
                     PlaylistItem {
                         uri: "data:text/plain,hi".into(),
                         image_duration: None,
+                        ..Default::default()
                     },
                 ],
                 Duration::from_secs(1),
@@ -1188,10 +1197,12 @@ mod tests {
                 PlaylistItem {
                     uri: img1.to_string_lossy().into_owned(),
                     image_duration: Some(Duration::from_secs_f64(0.5)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: img2.to_string_lossy().into_owned(),
                     image_duration: Some(Duration::from_secs_f64(1.25)),
+                    ..Default::default()
                 },
             ],
             Duration::from_secs(10), // global default
@@ -1415,6 +1426,7 @@ mod tests {
                 vec![PlaylistItem {
                     uri: video.to_string_lossy().into_owned(),
                     image_duration: None,
+                    ..Default::default()
                 }],
                 Duration::from_secs(2),
                 false,
@@ -1655,10 +1667,12 @@ mod tests {
                 PlaylistItem {
                     uri: a.to_string_lossy().into_owned(),
                     image_duration: None,
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: b.to_string_lossy().into_owned(),
                     image_duration: None,
+                    ..Default::default()
                 },
             ],
             Duration::from_millis(200),

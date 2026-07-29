@@ -204,7 +204,7 @@ mod tests {
     fn scanner_returns_16_by_9_row_major_grid() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("fixture.png");
-        ImageBuffer::from_fn(32, 18, |_, _| Rgba([128_u8, 128, 128, 255]))
+        ImageBuffer::from_fn(32, 18, |_, _| Rgba([128_u8, 128, 128, 128]))
             .save(&path)
             .unwrap();
         let grid = LumaCache::new().scan_path(&path).unwrap();
@@ -212,7 +212,9 @@ mod tests {
             grid.cells.len(),
             usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)
         );
-        assert!(grid.cells.iter().all(|v| (*v - 0.215_860_5).abs() < 1e-5));
+        let composited = 128.0 / 255.0 * (128.0 / 255.0);
+        let expected = linear_luma([composited; 3]);
+        assert!(grid.cells.iter().all(|v| (*v - expected).abs() < 1e-5));
     }
     #[test]
     fn scanner_stratified_samples_preserve_black_and_white_halves() {

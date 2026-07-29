@@ -251,7 +251,7 @@ pub struct ScreensaverSettings {
     pub seed: u64,
     /// Temperature used by wear-even ordering.
     pub wear_temperature: f64,
-    /// Heat bias reserved for pixel-shift placement.
+    /// Heat bias reserved for pixel-shift placement, validated to `0.0..=1.0`.
     pub shift_heat_bias: f64,
 }
 

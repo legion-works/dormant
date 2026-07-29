@@ -812,7 +812,8 @@ pub(super) struct WaylandState {
     pub(super) shift_state: Option<ShiftState>,
     /// Heat snapshot reserved for the next screensaver viewport install.
     pub(super) pending_shift_heat: Option<HeatGrid>,
-    /// Bias copied from screensaver settings for the next viewport install.
+    /// Bias copied from screensaver settings (`0.0..=1.0`) for the next
+    /// viewport install.
     pub(super) shift_heat_bias: f64,
     /// calloop `RegistrationToken` for the shift timer.  Armed exactly
     /// once per surface lifetime when the screensaver install path
@@ -1625,6 +1626,10 @@ impl WaylandState {
         self.pending_shift_heat = Some(heat.clone());
         self.shift_heat_bias = settings.shift_heat_bias;
         let wl_surface_for_shift = layer_surface.wl_surface().clone();
+        // The shift walk is tied to the heat snapshot that selected this
+        // show. Re-installing a screensaver session must start a fresh walk,
+        // even when the existing viewport is reused.
+        self.reset_shift();
         let shift_viewport = self.ensure_shift_viewport(&wl_surface_for_shift, configured_size);
         let (width, height) = self.render_dims(configured_size);
         let stride = width
@@ -3264,6 +3269,36 @@ mod tests {
         assert!(
             fake.shift_state.is_none(),
             "reset_shift must clear shift_state"
+        );
+    }
+
+    #[test]
+    fn screensaver_reinstall_rebuilds_walk_from_second_heat_snapshot() {
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        let first_heat = HeatGrid::new(1, 3, vec![1.0, 0.0, 0.0]).expect("valid heat");
+        let second_heat = HeatGrid::new(1, 3, vec![0.0, 0.0, 1.0]).expect("valid heat");
+        fake.shift_state = Some(ShiftState::new_biased(2, Some(&first_heat), 0.25));
+        fake.reset_shift();
+        assert!(
+            fake.shift_state.is_none(),
+            "reinstall must clear the old walk"
+        );
+        fake.shift_state = Some(ShiftState::new_biased(2, Some(&second_heat), 0.25));
+        let state = fake.shift_state.as_ref().expect("second walk installed");
+        let left = state
+            .offsets_for_test()
+            .iter()
+            .filter(|(x, _)| *x < 0)
+            .count();
+        let right = state
+            .offsets_for_test()
+            .iter()
+            .filter(|(x, _)| *x > 0)
+            .count();
+        assert!(
+            right > left,
+            "second show's cold-right snapshot must drive content right: left={left}, right={right}"
         );
     }
 

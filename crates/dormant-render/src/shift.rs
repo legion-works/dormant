@@ -191,7 +191,10 @@ impl ShiftState {
             .skip(1)
             .take(base.offsets.len().saturating_sub(2))
         {
-            let alignment = (f64::from(x) * direction_x + f64::from(y) * direction_y)
+            // A positive source offset moves visible content toward the
+            // opposite panel edge, so align source offsets against the
+            // negative of the cold direction.
+            let alignment = -(f64::from(x) * direction_x + f64::from(y) * direction_y)
                 / (max_radius * direction_length);
             let score = (bias * 4.0 * alignment).clamp(0.0, 4.0);
             let repeats = if score >= 3.5 {
@@ -222,6 +225,11 @@ impl ShiftState {
     #[must_use]
     pub fn margin_px(&self) -> u32 {
         self.margin_px
+    }
+
+    #[cfg(test)]
+    pub(crate) fn offsets_for_test(&self) -> &[(i32, i32)] {
+        &self.offsets
     }
 
     /// Source-rect origin `(x, y)` for the walk's CURRENT position,
@@ -375,14 +383,17 @@ mod tests {
     }
 
     #[test]
-    fn cold_right_heat_biases_offset_dwell_right() {
+    fn cold_right_heat_moves_content_right() {
         let heat = HeatGrid::new(1, 3, vec![1.0, 0.0, 0.0]).expect("valid heat");
         let state = ShiftState::new_biased(2, Some(&heat), 0.25);
         let right = state.offsets.iter().filter(|(x, _)| *x > 0).count();
         let left = state.offsets.iter().filter(|(x, _)| *x < 0).count();
+        // `source_origin` feeds `wp_viewport::set_source`; a positive source-x
+        // crops the buffer's left edge, moving visible content LEFT. Therefore
+        // content moving toward cold-right requires negative source offsets.
         assert!(
-            right > left,
-            "cold side should receive more dwell: {left} vs {right}"
+            left > right,
+            "cold-right content should dwell right via negative offsets: left={left}, right={right}"
         );
     }
 

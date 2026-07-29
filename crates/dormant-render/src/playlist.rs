@@ -225,8 +225,8 @@ fn build_playlist_capped(
                 src_items.swap(i, j);
             }
         }
-        // `order` is "sequential" (the only value validation accepts)
-        // which means the deterministic sorted order is the right one.
+        // Sequential and wear-even both retain the deterministic source order
+        // here; wear-even replaces the group during session installation.
 
         items.append(&mut src_items);
     }

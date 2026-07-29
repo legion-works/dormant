@@ -10,13 +10,11 @@ use image::ImageReader;
 use thiserror::Error;
 
 /// A source-level luminance class for video items.
+#[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WearTag {
-    /// Dark video class.
     Dark,
-    /// Medium video class.
     Medium,
-    /// Bright video class.
     Bright,
 }
 
@@ -62,14 +60,11 @@ pub fn flat_grid_for_tag(tag: WearTag) -> LumaGrid {
 }
 
 /// Image scanner with a path-and-modification-time cache.
+#[derive(Default)]
 pub struct LumaCache {
+    /// Playlist scans contribute at most the configured playlist item cap;
+    /// replacing entries on mtime changes keeps stale versions from growing.
     entries: RwLock<HashMap<PathBuf, (SystemTime, LumaGrid)>>,
-}
-
-impl Default for LumaCache {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl LumaCache {
@@ -94,7 +89,8 @@ impl LumaCache {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        clippy::cast_precision_loss
+        clippy::cast_precision_loss,
+        reason = "sample coordinates are bounded by decoded image dimensions"
     )]
     pub fn scan_path(&self, path: &Path) -> Result<LumaGrid, LumaScanError> {
         let canonical = path.canonicalize().map_err(LumaScanError::Canonicalize)?;
@@ -242,6 +238,17 @@ mod tests {
         }
     }
     #[test]
+    fn scanner_handles_images_smaller_than_the_luma_grid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tiny.png");
+        ImageBuffer::from_fn(8, 5, |_, _| Rgba([64_u8, 64, 64, 255]))
+            .save(&path)
+            .unwrap();
+        let grid = LumaCache::new().scan_path(&path).unwrap();
+        assert_eq!(grid.cells.len(), 144);
+        assert!(grid.cells.iter().all(|value| value.is_finite()));
+    }
+    #[test]
     fn cache_key_changes_when_mtime_changes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cache.png");
@@ -258,6 +265,18 @@ mod tests {
         assert_ne!(before, after);
         let second = cache.scan_path(&path).unwrap();
         assert_ne!(first, second);
+    }
+    #[test]
+    fn scanner_returns_error_when_file_vanishes_between_scans() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vanished.png");
+        ImageBuffer::from_pixel(8, 5, Rgba([64_u8, 64, 64, 255]))
+            .save(&path)
+            .unwrap();
+        let cache = LumaCache::new();
+        cache.scan_path(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(cache.scan_path(&path).is_err());
     }
     #[test]
     fn video_wear_tags_map_to_flat_linear_grids() {

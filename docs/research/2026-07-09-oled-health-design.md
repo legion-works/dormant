@@ -88,6 +88,25 @@ screensaver surfaces.
   toward the coldest cells — gated on a compositor-stutter probe. Real-time
   per-frame video analysis is deferred.
 
+#### Wear-even M1 implementation contract (ratified 2026-07-29)
+
+The M1 implementation uses `order = "wear-even"` as a screensaver source
+setting. Each source may set `wear_tag = "dark" | "medium" | "bright"`; the
+tag applies only to video items yielded by that source. Images ignore the tag
+and are scanned. Screensaver-level `wear_temperature = 0.05` and
+`shift_heat_bias = 0.25` are configurable, finite, and inclusive in the
+`0.0..=1.0` range. Fairness is fixed: each scheduling cycle is a permutation
+containing every candidate exactly once, with no additional fairness knob.
+
+Arbitrary ledger heat grids are converted to the fixed 16×9 ordering grid by
+area-overlap resampling. Item luma grids are converted back to the ledger's
+configured dimensions with the same area-overlap algorithm for attribution.
+mpv item selection remains in `dormant-render`; it reports the item reaching
+`FILE_LOADED` to the daemon through `ScreensaverItemReport`. Image scanning
+uses a fixed 4×4 stratified sample lattice per luma cell (2,304 samples per
+decoded image), and source alpha is composited over black before
+linearisation because the screensaver render target is black-backed.
+
 ### 4. Compensation-cycle coordination
 
 Firmware/T-CON compensation cycles are **opaque** — no DDC/CI, CEC, or Samsung IP

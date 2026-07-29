@@ -310,15 +310,14 @@ fn send_item_report(
     sender: Option<&UnboundedSender<ScreensaverItemReport>>,
     report: ScreensaverItemReport,
     warned: &mut bool,
-) -> bool {
+) {
     let Some(sender) = sender else {
-        return true;
+        return;
     };
     if sender.send(report).is_err() && !*warned {
         tracing::warn!(event = "screensaver_item_report_receiver_disconnected");
         *warned = true;
     }
-    true
 }
 
 /// Returns `Ok(PostAction)` (never an `Err`) — the calloop source's
@@ -2817,7 +2816,7 @@ mod tests {
         drop(rx);
         let report = clear_item_report(&DisplayId("panel".into()), std::time::Instant::now());
         let mut warned = false;
-        assert!(send_item_report(Some(&tx), report, &mut warned));
+        send_item_report(Some(&tx), report, &mut warned);
         assert!(warned);
     }
 

@@ -12,6 +12,7 @@ pub mod ownership;
 pub mod paths;
 pub mod reload;
 pub mod rules;
+pub mod spatial_grid;
 pub mod state_machine;
 pub mod traits;
 pub mod types;

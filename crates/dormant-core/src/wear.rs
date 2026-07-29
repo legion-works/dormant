@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::traits::PanelState;
 
@@ -104,6 +105,19 @@ pub struct WearLedger {
     pub advisory_baseline_epoch_s: u64,
 }
 
+/// Failure returned when spatial luma does not match the ledger grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SpatialAttributionError {
+    /// The supplied luma length differs from the ledger cell count.
+    #[error("spatial luma length mismatch: expected {expected}, got {actual}")]
+    LengthMismatch {
+        /// Required number of luma cells.
+        expected: usize,
+        /// Supplied number of luma cells.
+        actual: usize,
+    },
+}
+
 impl WearLedger {
     /// Create a new, all-zero ledger for `identity` with a `rows` × `cols`
     /// grid, baselined at `now_epoch_s`.
@@ -147,6 +161,44 @@ impl WearLedger {
         }
         self.total_on_hours += h;
         self.sample_count += 1;
+    }
+
+    /// Attribute a spatial luma sample while preserving the ledger shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpatialAttributionError::LengthMismatch`] when `luma` does
+    /// not have one value for every ledger cell; no state is changed then.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "ledger grids are u16-sized; conversion is exact for supported dimensions"
+    )]
+    pub fn attribute_spatial(
+        &mut self,
+        span: Duration,
+        brightness_norm: f64,
+        luma: &[f32],
+    ) -> Result<(), SpatialAttributionError> {
+        if luma.len() != self.cells.len() {
+            return Err(SpatialAttributionError::LengthMismatch {
+                expected: self.cells.len(),
+                actual: luma.len(),
+            });
+        }
+        let brightness = finite_clamp(brightness_norm);
+        let span_hours = span.as_secs_f64() / 3600.0;
+        let mut total = 0.0;
+        for (cell, value) in self.cells.iter_mut().zip(luma) {
+            let contribution = span_hours * brightness * finite_clamp(f64::from(*value));
+            cell.wear_hours += contribution;
+            total += contribution;
+        }
+        if !self.cells.is_empty() {
+            let cell_count = u32::try_from(self.cells.len()).unwrap_or(u32::MAX);
+            self.total_on_hours += total / f64::from(cell_count);
+        }
+        self.sample_count += 1;
+        Ok(())
     }
 
     /// Zero-max normalized wear per cell, in row-major order, each in
@@ -275,6 +327,14 @@ pub fn brightness_norm(panel: &PanelState, native_max: u16, fallback: f64) -> f6
         .brightness
         .map_or(fallback, |b| f64::from(b) / f64::from(native_max))
         .clamp(0.0, 1.0)
+}
+
+fn finite_clamp(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// Shared, lock-guarded map of wear ledgers keyed by config `DisplayId`
@@ -413,6 +473,40 @@ mod tests {
         assert!((l.cells[0].wear_hours - 1.0).abs() < 1e-9);
         l.attribute_uniform(Duration::from_secs(3600), -3.0); // clamped to 0.0
         assert!((l.cells[0].wear_hours - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spatial_attribution_multiplies_span_brightness_and_each_cell_luma() {
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 2, 2, 0);
+        l.attribute_spatial(Duration::from_secs(3600), 0.5, &[0.2, 0.4, 0.6, 0.8])
+            .unwrap();
+        let values: Vec<f64> = l.cells.iter().map(|cell| cell.wear_hours).collect();
+        for (actual, expected) in values.into_iter().zip([0.1, 0.2, 0.3, 0.4]) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        assert!((l.total_on_hours - 0.25).abs() < 1e-6);
+        assert_eq!(l.sample_count, 1);
+    }
+
+    #[test]
+    fn spatial_attribution_rejects_length_mismatch_without_mutation() {
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 2, 2, 0);
+        let before = l.clone();
+        assert!(matches!(
+            l.attribute_spatial(Duration::from_secs(3600), 0.5, &[1.0]),
+            Err(SpatialAttributionError::LengthMismatch { .. })
+        ));
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn spatial_attribution_zero_luma_increments_sample_but_not_wear() {
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 1, 2, 0);
+        l.attribute_spatial(Duration::from_secs(3600), 1.0, &[0.0, 0.0])
+            .unwrap();
+        assert!(l.cells.iter().all(|cell| cell.wear_hours == 0.0));
+        assert_eq!(l.total_on_hours, 0.0);
+        assert_eq!(l.sample_count, 1);
     }
 
     #[test]

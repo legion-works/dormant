@@ -50,6 +50,7 @@ mod shift;
 pub mod luma;
 pub mod playlist;
 pub mod settings;
+pub mod wear_order;
 
 #[cfg(target_os = "linux")]
 mod linux;

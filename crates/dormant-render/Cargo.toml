@@ -51,4 +51,5 @@ libmpv2 = { version = "6.0.0", features = ["render"] }
 libmpv2-sys = "4.0.1"
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true

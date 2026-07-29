@@ -1049,6 +1049,7 @@ dependencies = [
  "libc",
  "libmpv2",
  "libmpv2-sys",
+ "proptest",
  "smithay-client-toolkit",
  "tempfile",
  "thiserror 2.0.19",

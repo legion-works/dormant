@@ -87,7 +87,8 @@ pub struct WearLedger {
     pub grid_cols: u16,
     /// Row-major grid of per-cell wear, length `grid_rows * grid_cols`.
     pub cells: Vec<WearCell>,
-    /// Total brightness-weighted on-hours across the whole panel.
+    /// Panel-mean brightness-weighted on-hours: the sum of cell values divided
+    /// by the cell count, rather than the sum across cells.
     pub total_on_hours: f64,
     /// Optional operator-supplied prior usage, in hours, seeded at ledger
     /// creation for panels that weren't new when tracking started.
@@ -154,7 +155,7 @@ impl WearLedger {
     /// evenly (desktop UI, full-screen video); per-region attribution is a
     /// later extension.
     pub fn attribute_uniform(&mut self, span: Duration, brightness_norm: f64) {
-        let n = brightness_norm.clamp(0.0, 1.0);
+        let n = finite_clamp(brightness_norm);
         let h = span.as_secs_f64() / 3600.0 * n;
         for c in &mut self.cells {
             c.wear_hours += h;
@@ -169,6 +170,8 @@ impl WearLedger {
     ///
     /// Returns [`SpatialAttributionError::LengthMismatch`] when `luma` does
     /// not have one value for every ledger cell; no state is changed then.
+    /// Non-finite brightness and luma values are treated as zero before the
+    /// finite values are clamped to `0.0..=1.0`.
     #[allow(
         clippy::cast_precision_loss,
         reason = "ledger grids are u16-sized; conversion is exact for supported dimensions"
@@ -473,6 +476,15 @@ mod tests {
         assert!((l.cells[0].wear_hours - 1.0).abs() < 1e-9);
         l.attribute_uniform(Duration::from_secs(3600), -3.0); // clamped to 0.0
         assert!((l.cells[0].wear_hours - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attribute_uniform_nan_brightness_is_zero() {
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 1, 2, 0);
+        l.attribute_uniform(Duration::from_secs(3600), f64::NAN);
+        assert!(l.cells.iter().all(|cell| cell.wear_hours == 0.0));
+        assert_eq!(l.total_on_hours, 0.0);
+        assert_eq!(l.sample_count, 1);
     }
 
     #[test]

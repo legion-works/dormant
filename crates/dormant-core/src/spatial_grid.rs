@@ -14,11 +14,16 @@ pub struct LumaGrid {
 
 impl LumaGrid {
     /// Construct a luma grid after checking its fixed dimensions and values.
+    ///
+    /// Non-finite or out-of-range values reject the whole grid with `None`.
     #[must_use]
     pub fn new(cells: Vec<f32>) -> Option<Self> {
         let expected = usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS);
-        (cells.len() == expected && cells.iter().all(|value| value.is_finite()))
-            .then_some(Self { cells })
+        (cells.len() == expected
+            && cells
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value)))
+        .then_some(Self { cells })
     }
 }
 
@@ -54,11 +59,16 @@ fn checked_cell_count(rows: u16, cols: u16) -> Option<usize> {
 ///
 /// The operation preserves uniform fields and the mean intensity. Invalid
 /// dimensions, lengths, or non-finite inputs return `None`.
+/// The computation is `O(N_src * N_dst)`; at the 64×64 bound this is at most
+/// roughly 16.8 million overlap checks for one resampling operation.
 #[must_use]
 #[allow(
     clippy::cast_precision_loss,
+    reason = "grid dimensions are at most u16, so normalized coordinates are exact"
+)]
+#[allow(
     clippy::cast_possible_truncation,
-    reason = "grid dimensions are at most u16 and normalized coordinates tolerate this exact conversion"
+    reason = "the output contract is f32 and narrowing the finite weighted average is intentional"
 )]
 pub fn resample_area(
     values: &[f32],
@@ -129,6 +139,24 @@ mod tests {
             let result = resample_area(&values, rows, cols, 9, 16).unwrap();
             assert!(result.iter().all(|value| (*value - 0.375).abs() < 1e-6));
         }
+    }
+
+    #[test]
+    fn luma_grid_rejects_non_finite_and_out_of_range_values() {
+        let valid = vec![0.5; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)];
+        assert!(LumaGrid::new(valid.clone()).is_some());
+
+        let mut too_high = valid.clone();
+        too_high[0] = 1.1;
+        assert!(LumaGrid::new(too_high).is_none());
+
+        let mut negative = valid.clone();
+        negative[0] = -0.1;
+        assert!(LumaGrid::new(negative).is_none());
+
+        let mut nan = valid;
+        nan[0] = f32::NAN;
+        assert!(LumaGrid::new(nan).is_none());
     }
 
     proptest! {

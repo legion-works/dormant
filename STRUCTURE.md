@@ -10,7 +10,7 @@ oled-proximity/
 │   ├── dormant-displays/     # Display controllers: command, ddcci, kwin-dpms, macOS gamma/sleep, samsung-tizen (+ samsung_ip IP-Control-G2 transport), ha-passthrough + executor/registry
 │   ├── dormant-doctor/       # Offline + live coalesced hardware/connectivity probes (config, mqtt, ha, usb, ddcci, samsung, macOS)
 │   ├── dormant-web/          # Loopback-only axum HTTP/WS bridge + SPA (webui/)
-│   ├── dormant-render/       # Local Wayland layer-shell render sink (black overlay + libmpv screensaver); Linux-only I/O
+│   ├── dormant-render/       # Local Wayland layer-shell render sink (black overlay + libmpv screensaver, luma cache + wear-even ordering); Linux-only I/O
 │   ├── dormantd/             # Daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, logging
 │   ├── dormantctl/           # CLI binary + library re-exporting the IPC client (status/pause/resume/blank/wake/reload/validate/watch/doctor)
 │   └── dormant-tray/         # Tray applet: ksni StatusNotifierItem (Linux) + AppKit NSStatusItem (macOS), shared pure logic + IPC loop

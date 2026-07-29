@@ -27,6 +27,7 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 - **Soft KVM** — two machines, one monitor; pull the panel by hotkey, CLI, tray, or web.
 - Escalate through a render ladder: black Wayland overlay → muted mpv screensaver → power-off, on configurable dwell timers
 - Track brightness-weighted panel on-hours per display, stored locally — no telemetry
+- **Wear-even screensavers** — order media and bias bounded pixel shifts toward cooler estimated panel regions
 - Configure and control through a loopback web dashboard with a validated config editor that preserves comments
 - **Config section rail** — sticky per-tab section navigation with scroll-spy in the web UI
 - **Web UI v3** — full config-schema parity in the web editor (coordination, keymaps, input filters, hooks), a new shared-display switching view with live pull/push feedback, event history across reloads, doctor checks grouped by subject, panel-wear detail split by seeded/measured time, and a security-posture card with honest boundary notes.

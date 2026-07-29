@@ -378,7 +378,13 @@ also requires `libwayland-dev` and `libmpv-dev` at build time.
 The `render_screensaver` surface shifts by 2 px every 2 minutes by default.
 Set `displays.<id>.screensaver.shift_px = 0` to disable it, or tune
 `displays.<id>.screensaver.shift_interval` (minimum `10s`). Pixel shift never
-applies to `render_black`: a uniform black field has no static content to move.
+ applies to `render_black`: a uniform black field has no static content to move.
+
+With `order = "wear-even"`, the screensaver uses host-side luma estimates and
+local wear heat to choose the next item. Missing data keeps the configured
+order and emits a fallback warning. `wear_tag` labels source items. The black
+overlay contributes zero wear and never shifts; `shift_heat_bias` only changes
+the probability of existing offsets and never exceeds `shift_px`.
 
 ## Manual-only displays
 

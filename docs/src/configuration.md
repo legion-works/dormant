@@ -302,7 +302,8 @@ image_duration = "8s"   # per-item duration override
 
 [[displays.my-display.screensaver.source]]
 urls = ["https://example.com/background.jpg"]
-order = "sequential"    # only value accepted; mutually exclusive with `shuffle`
+ order = "sequential"    # or "wear-even"; mutually exclusive with `shuffle`
+ wear_tag = "landscape"  # optional source-level wear label
 ```
 
 | Key | Type | Required | Default | Description |
@@ -324,7 +325,10 @@ Each source supports:
 | `urls` | []string | conditional | `[]` | Remote URLs. Mutually exclusive with `path`. |
 | `recurse` | boolean | no | `false` | Scan `path` recursively for media files. |
 | `shuffle` | boolean | no | `false` | Shuffle items from this source (Fisher-Yates, seeded per restart). Mutually exclusive with `order`. |
-| `order` | string | no | — | Ordering strategy. Only `"sequential"` is accepted. Mutually exclusive with `shuffle`. |
+| `order` | string | no | — | Ordering strategy: `"sequential"` or `"wear-even"`. Mutually exclusive with `shuffle`; missing luma grids fail open to the configured order. |
+| `wear_tag` | string | no | — | Source-level label copied to each item for wear attribution. |
+| `wear_temperature` | number | no | `0.05` | Temperature for wear-even scoring, range `0.001..=10.0`. |
+| `shift_heat_bias` | number | no | `0.25` | Bias toward cooler regions for existing pixel-shift offsets, range `0.0..=1.0`. |
 | `image_duration` | duration | no | `"8s"` | Per-image display duration override (must be > 0). |
 
 Pixel shift applies only to `render_screensaver`. The `render_black` surface
@@ -391,7 +395,7 @@ Validation rejects:
 - A `screensaver` section with no sources, or sources with neither `path` nor `urls`.
 - A source with both `path` and `urls` set.
 - A source with both `shuffle` and `order` set.
-- An `order` value other than `"sequential"`.
+- An `order` value other than `"sequential"` or `"wear-even"`.
 - A `trigger` value other than `"vacancy"`.
 - A `scale_mode` value other than `"fill"`, `"fit"`, `"stretch"`, or `"center"`.
 - An `image_duration` of zero.

@@ -20,7 +20,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use dormant_core::error::E_RENDER_UNAVAILABLE;
 use dormant_core::traits::RenderSink;
-use dormant_core::types::{CmdFailure, DisplayId, StageKind};
+use dormant_core::types::{CmdFailure, DisplayId, ScreensaverItemReport, StageKind};
 
 use crate::settings::{ScreensaverSettings, ShiftSettings};
 
@@ -50,6 +50,7 @@ impl LayerShellRenderSink {
         display_id: DisplayId,
         output_name: String,
         input_wake_tx: Option<&UnboundedSender<DisplayId>>,
+        _item_report_tx: Option<&UnboundedSender<ScreensaverItemReport>>,
     ) -> Result<Self, CmdFailure> {
         Ok(Self {
             display_id,
@@ -117,7 +118,8 @@ mod tests {
     #[tokio::test]
     async fn show_render_black_returns_unavailable() {
         let sink =
-            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None, None)
+                .unwrap();
         let result = sink.show(1, 0, StageKind::RenderBlack).await;
         let err = result.expect_err("stub show must error");
         assert_eq!(err.controller, "render-black");
@@ -131,7 +133,8 @@ mod tests {
     #[tokio::test]
     async fn show_render_screensaver_returns_unavailable() {
         let sink =
-            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None, None)
+                .unwrap();
         let result = sink.show(1, 0, StageKind::RenderScreensaver).await;
         assert!(result.is_err());
     }
@@ -139,7 +142,8 @@ mod tests {
     #[tokio::test]
     async fn show_controller_stage_returns_unavailable() {
         let sink =
-            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None, None)
+                .unwrap();
         let result = sink
             .show(
                 1,
@@ -153,14 +157,15 @@ mod tests {
     #[tokio::test]
     async fn teardown_is_infallible_and_noop() {
         let sink =
-            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None).unwrap();
+            LayerShellRenderSink::new(DisplayId("display-A".into()), "DP-1".into(), None, None)
+                .unwrap();
         sink.teardown(99).await;
     }
 
     #[test]
     fn accessors_return_constructor_args() {
         let sink =
-            LayerShellRenderSink::new(DisplayId("display-B".into()), "HDMI-A-1".into(), None)
+            LayerShellRenderSink::new(DisplayId("display-B".into()), "HDMI-A-1".into(), None, None)
                 .unwrap();
         assert_eq!(sink.display_id().to_string(), "display-B");
         assert_eq!(sink.output_name(), "HDMI-A-1");

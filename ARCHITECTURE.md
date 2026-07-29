@@ -20,6 +20,11 @@ Each crate follows the convention: one module per concept, one file per sensor/c
 
 ## Data flow
 
+Wear-even screensaver state crosses the daemon boundary through the wear
+tracker's item journal. `dormant-render/src/luma.rs` owns cached host-side luma
+grids, while `wear_order.rs` applies deterministic ordering at session install;
+missing data fails open without blocking playback.
+
 ```
                   ┌──────────────┐
   MQTT ──────────▶│              │

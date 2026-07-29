@@ -166,6 +166,12 @@ pub const SCREENSAVER_AUDIO: bool = false;
 /// Default trigger for the screensaver overlay.
 pub const SCREENSAVER_TRIGGER: &str = "vacancy";
 
+/// Default temperature for wear-even playlist scoring.
+pub const SCREENSAVER_WEAR_TEMPERATURE: f64 = 0.05;
+
+/// Default bias toward cold regions for screensaver pixel shifting.
+pub const SCREENSAVER_SHIFT_HEAT_BIAS: f64 = 0.25;
+
 /// Default mpv cache size for screensaver playback (64 MiB).
 /// Kept modest to avoid memory pressure on embedded / low-RAM hosts.
 pub const MPV_CACHE_BYTES: u64 = 64 * 1024 * 1024;

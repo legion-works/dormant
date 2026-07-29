@@ -107,6 +107,31 @@ describe("ScreensaverEditor", () => {
     expect(screen.getByLabelText("transition_duration")).toBeInTheDocument();
   });
 
+  it("emits wear-even order, video tag, and wear knobs", async () => {
+    const ss: ScreensaverConfig = {
+      ...FIXTURE_SS,
+      source: [{ ...FIXTURE_SS.source[0], order: "sequential", wear_tag: undefined }],
+      wear_temperature: 0.05,
+      shift_heat_bias: 0.25,
+    };
+    const { store } = renderEditor(ss);
+
+    fireEvent.change(screen.getByLabelText("order"), { target: { value: "wear-even" } });
+    fireEvent.change(screen.getByLabelText("wear_tag"), { target: { value: "bright" } });
+    fireEvent.change(screen.getByLabelText("wear_temperature"), { target: { value: "0.75" } });
+    fireEvent.change(screen.getByLabelText("shift_heat_bias"), { target: { value: "0.5" } });
+
+    const patches = store.buildPatches();
+    expect(patches).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: ["displays", "tv", "screensaver", "wear_temperature"], value: 0.75 }),
+      expect.objectContaining({ path: ["displays", "tv", "screensaver", "shift_heat_bias"], value: 0.5 }),
+      expect.objectContaining({
+        path: ["displays", "tv", "screensaver", "source"],
+        value: [expect.objectContaining({ order: "wear-even", wear_tag: "bright" })],
+      }),
+    ]));
+  });
+
   it("omits null optional fields when editing another source (null from JSON round-trip)", async () => {
     // Mimic server response: order and image_duration are null (Option::None in Rust).
     const ss: ScreensaverConfig = {
@@ -116,7 +141,7 @@ describe("ScreensaverEditor", () => {
       transition: "crossfade",
       transition_duration: "1s",
       source: [
-        { path: "/a", recurse: false, shuffle: false, order: null as unknown as string, image_duration: null as unknown as string },
+        { path: "/a", recurse: false, shuffle: false, order: null as unknown as ScreensaverSource["order"], image_duration: null as unknown as string },
         { path: "/b", recurse: true, shuffle: false, order: "sequential", image_duration: "5s" },
       ],
     };

@@ -240,10 +240,12 @@ mod tests {
                 PlaylistItem {
                     uri: "a.mp4".into(),
                     image_duration: Some(Duration::from_secs(2)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "b.png".into(),
                     image_duration: Some(Duration::from_secs(5)),
+                    ..Default::default()
                 },
             ],
             image_duration: Duration::from_secs(4),
@@ -251,6 +253,7 @@ mod tests {
             scale_mode: ScaleMode::Stretch,
             transition: TransitionMode::None,
             transition_duration: Duration::from_millis(500),
+            ..ScreensaverSettings::default()
         };
         let expected_items = settings.items.clone();
         let expected_dur = settings.image_duration;

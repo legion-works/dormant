@@ -32,8 +32,12 @@ samples panel state every `wear.sample_interval` (default `60s`) and records:
 - `last_long_dwell_epoch_s` — the last blanked dwell lasting at least
   `wear.short_cycle_dwell` (default `10m`).
 
-`render_screensaver` uses the fixed `wear.screensaver_factor` (default `0.35`)
-instead of brightness readback.
+`render_screensaver` attributes each loaded source frame from its luma grid and
+local wear heat when wear-even metadata is available. The black overlay
+attributes zero. Missing luma, heat, or journal data fails open to uniform
+attribution and logs `wear_screensaver_luma_fallback`; scan and journal failures
+also emit `screensaver_luma_scan_failed` and
+`screensaver_item_journal_overflow`. Playback and blanking continue.
 
 The ledger has a `wear.grid_rows` × `wear.grid_cols` grid for future spatial
 attribution. v1 writes the same value to every cell. It does not know which
@@ -108,6 +112,13 @@ panel_type = "qd-oled"
 | `wear.screensaver_factor` | `0.35` | Fixed factor during `render_screensaver` |
 | `wear.short_cycle_dwell` | `"10m"` | Blanked dwell counted as a long rest window |
 | `wear.advisory_after` | `"96h"` | Time without a long rest window before advising |
+
+Screensaver ordering is host-side estimation, not panel telemetry. `order =
+"wear-even"` uses luma and local heat; `wear_temperature` defaults to `0.05`
+and `shift_heat_bias` to `0.25`. Flat luma buckets mean `dark = .15`, `medium =
+.45`, and `bright = .75`. Missing or overflowing grids fall back with a WARN.
+This milestone adds no schema-version bump, panel-type weighting, or RGB
+weighting.
 
 The tracker is local-only. Its sole network surface is the loopback web API;
 there is no telemetry, analytics, cloud sync, or phone-home path.

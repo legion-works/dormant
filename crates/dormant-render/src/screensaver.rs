@@ -62,8 +62,10 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+use crate::luma::LumaCatalog;
 use crate::playlist::PlaylistItem;
 use crate::settings::{FIRST_FRAME_DEADLINE, ScaleMode, scheme_allowed};
+use dormant_core::spatial_grid::LumaGrid;
 use libmpv2_sys::{
     MPV_RENDER_API_TYPE_SW, mpv_render_context, mpv_render_context_create, mpv_render_context_free,
     mpv_render_context_render, mpv_render_context_set_update_callback, mpv_render_context_update,
@@ -84,7 +86,7 @@ use libmpv2_sys::{
 /// The full mpv event ID list lives in libmpv2-sys's
 /// `mpv_event_id_*` constants; this enum is the project's
 /// grep-stable, app-facing subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MpvItemEvent {
     /// `MPV_EVENT_END_FILE` — the currently-playing item is no longer
     /// active.  In the screensaver state machine this is the trigger
@@ -95,7 +97,13 @@ pub enum MpvItemEvent {
     /// renderable.  In the screensaver state machine this is the
     /// trigger to arm the crossfade timer; the next mpv wakeup will
     /// produce the first frame of the new item (the blend's `b` side).
-    ItemLoaded,
+    ItemLoaded {
+        /// URI resolved from the configured playlist position, when mpv
+        /// reported a valid position.
+        uri: Option<String>,
+        /// Catalog grid available when the item was loaded.
+        luma: Option<LumaGrid>,
+    },
 }
 
 /// Owned handle to an mpv instance + SW render context.
@@ -134,6 +142,8 @@ pub struct MpvPlayer {
     /// durations via the `loadfile` options string.
     #[allow(dead_code)]
     items: Vec<PlaylistItem>,
+    /// Process-owned scan catalog used to attach ready luma data at load time.
+    luma_catalog: Option<LumaCatalog>,
     /// Write end of the wakeup pipe — `OwnedFd` so any pre-construction
     /// `?`-early-return in [`MpvPlayer::new`] drops it automatically.
     /// Declared LAST so its `Drop` (which closes the fd) runs AFTER the
@@ -236,6 +246,7 @@ impl MpvPlayer {
     /// (owned from the caller's first frame), and any `?` early-return
     /// drops it before the `Err` propagates.
     #[allow(clippy::too_many_lines)]
+    #[allow(dead_code)]
     pub fn new(
         items: Vec<PlaylistItem>,
         image_duration: Duration,
@@ -244,6 +255,33 @@ impl MpvPlayer {
         width: u32,
         height: u32,
         wakeup_write: std::os::fd::OwnedFd,
+    ) -> Result<Self, MpvError> {
+        Self::new_with_catalog(
+            items,
+            image_duration,
+            audio_enabled,
+            scale_mode,
+            width,
+            height,
+            wakeup_write,
+            None,
+        )
+    }
+
+    /// Build a player with the process-owned luma catalog used for item
+    /// feedback.  The plain [`Self::new`] constructor remains useful for
+    /// callers that do not need wear attribution.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    pub fn new_with_catalog(
+        items: Vec<PlaylistItem>,
+        image_duration: Duration,
+        audio_enabled: bool,
+        scale_mode: ScaleMode,
+        width: u32,
+        height: u32,
+        wakeup_write: std::os::fd::OwnedFd,
+        luma_catalog: Option<LumaCatalog>,
     ) -> Result<Self, MpvError> {
         // ── Scheme allowlist (PRIMARY security control) ───────────
         // Runs BEFORE any mpv interaction so a rejected item never
@@ -416,6 +454,7 @@ impl MpvPlayer {
             first_frame_deadline: Some(Instant::now() + FIRST_FRAME_DEADLINE),
             has_first_frame: false,
             items: filtered_items,
+            luma_catalog,
             wakeup_write: Some(wakeup_write),
         };
 
@@ -588,7 +627,18 @@ impl MpvPlayer {
                 // the data field is deliberately ignored.
                 out.push(MpvItemEvent::ItemEnded);
             } else if event_id == mpv_event_id_MPV_EVENT_FILE_LOADED {
-                out.push(MpvItemEvent::ItemLoaded);
+                let uri = self.property_i64("playlist-pos").ok().and_then(|position| {
+                    resolve_loaded_item(&self.items, position).map(str::to_owned)
+                });
+                let luma = uri.as_ref().and_then(|item_uri| {
+                    self.luma_catalog.as_ref().and_then(|catalog| {
+                        catalog
+                            .read()
+                            .ok()
+                            .and_then(|catalog| catalog.get(item_uri).cloned())
+                    })
+                });
+                out.push(MpvItemEvent::ItemLoaded { uri, luma });
             }
             // All other event ids (START_FILE, IDLE, LOG_MESSAGE, …)
             // are intentionally dropped.
@@ -608,16 +658,20 @@ impl MpvPlayer {
         }
     }
 
-    /// Test-only accessor: read a typed property (`i64`) via the
-    /// inner mpv handle.  Mirrors `property` but for numeric
-    /// properties like `playlist-count`.
-    #[cfg(test)]
+    /// Read a typed numeric property from mpv, such as `playlist-pos`.
     pub(crate) fn property_i64(&self, name: &str) -> Result<i64, libmpv2::Error> {
         match self.mpv.as_ref() {
             Some(m) => m.get_property(name),
             None => Err(libmpv2::Error::Raw(-1)),
         }
     }
+}
+
+fn resolve_loaded_item(items: &[PlaylistItem], playlist_pos: i64) -> Option<&str> {
+    usize::try_from(playlist_pos)
+        .ok()
+        .and_then(|index| items.get(index))
+        .map(|item| item.uri.as_str())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -628,6 +682,23 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn item_loaded_maps_playlist_position_to_exact_configured_uri() {
+        let items = vec![
+            PlaylistItem {
+                uri: "first.png".into(),
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "second.png".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(resolve_loaded_item(&items, 1), Some("second.png"));
+        assert_eq!(resolve_loaded_item(&items, -1), None);
+        assert_eq!(resolve_loaded_item(&items, 9), None);
+    }
 
     /// Create a non-blocking `CLOEXEC` pipe.  Returns `(read_fd, write_fd)`.
     /// Caller owns both fds and is responsible for closing them.
@@ -727,6 +798,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: video.to_string_lossy().into_owned(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(2),
             false,
@@ -880,6 +952,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: "/tmp/dormant-render-tests/lavf-probe.mp4".into(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(1),
             false,
@@ -919,6 +992,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: "/nonexistent/path/that/never/exists.mp4".into(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(1),
             false,
@@ -979,6 +1053,7 @@ mod tests {
             vec![PlaylistItem {
                 uri: "/tmp/dormant-render-tests/drop-probe.mp4".into(),
                 image_duration: None,
+                ..Default::default()
             }],
             Duration::from_secs(1),
             false,
@@ -1023,14 +1098,17 @@ mod tests {
                 PlaylistItem {
                     uri: "ftp://127.0.0.1:1/x".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "data:text/plain,hi".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "subfile:///etc/passwd".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
             ],
             Duration::from_secs(1),
@@ -1079,10 +1157,12 @@ mod tests {
                     PlaylistItem {
                         uri: "ftp://127.0.0.1:1/x".into(),
                         image_duration: None,
+                        ..Default::default()
                     },
                     PlaylistItem {
                         uri: "data:text/plain,hi".into(),
                         image_duration: None,
+                        ..Default::default()
                     },
                 ],
                 Duration::from_secs(1),
@@ -1188,10 +1268,12 @@ mod tests {
                 PlaylistItem {
                     uri: img1.to_string_lossy().into_owned(),
                     image_duration: Some(Duration::from_secs_f64(0.5)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: img2.to_string_lossy().into_owned(),
                     image_duration: Some(Duration::from_secs_f64(1.25)),
+                    ..Default::default()
                 },
             ],
             Duration::from_secs(10), // global default
@@ -1415,6 +1497,7 @@ mod tests {
                 vec![PlaylistItem {
                     uri: video.to_string_lossy().into_owned(),
                     image_duration: None,
+                    ..Default::default()
                 }],
                 Duration::from_secs(2),
                 false,
@@ -1655,10 +1738,12 @@ mod tests {
                 PlaylistItem {
                     uri: a.to_string_lossy().into_owned(),
                     image_duration: None,
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: b.to_string_lossy().into_owned(),
                     image_duration: None,
+                    ..Default::default()
                 },
             ],
             Duration::from_millis(200),
@@ -1684,7 +1769,8 @@ mod tests {
             for ev in &drained {
                 match ev {
                     MpvItemEvent::ItemEnded => saw_ended = true,
-                    MpvItemEvent::ItemLoaded => {
+                    MpvItemEvent::ItemLoaded { uri, .. } => {
+                        assert!(uri.is_some(), "loaded item must retain configured identity");
                         if saw_ended {
                             saw_loaded = true;
                         }

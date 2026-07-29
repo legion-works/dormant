@@ -4,9 +4,18 @@
 //! [`ScreensaverSettings`] on any target — only the mpv-backed
 //! `MpvPlayer` stays Linux-gated.
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use dormant_core::spatial_grid::HeatGrid;
+use dormant_core::types::DisplayId;
+
+use crate::luma::LumaCatalog;
 use crate::playlist::PlaylistItem;
+
+/// Daemon-published heat snapshots keyed by configured display id.
+pub type HeatSnapshotHandle = Arc<RwLock<HashMap<DisplayId, HeatGrid>>>;
 
 /// External deadline for first-frame: a calloop `Timer` is armed by
 /// the caller for this duration; if no successful render lands before
@@ -234,6 +243,16 @@ pub struct ScreensaverSettings {
     /// Bounded by the validator (100 ms ..= 10 s) — see
     /// `dormant_core::config::validate` screensaver-transition rules.
     pub transition_duration: Duration,
+    /// Latest daemon-published wear heat snapshots.
+    pub heat_snapshots: HeatSnapshotHandle,
+    /// Process-owned image/video luminance catalog.
+    pub luma_catalog: LumaCatalog,
+    /// Runtime seed captured once when the render session is assembled.
+    pub seed: u64,
+    /// Temperature used by wear-even ordering.
+    pub wear_temperature: f64,
+    /// Heat bias reserved for pixel-shift placement, validated to `0.0..=1.0`.
+    pub shift_heat_bias: f64,
 }
 
 impl Default for ScreensaverSettings {
@@ -245,6 +264,11 @@ impl Default for ScreensaverSettings {
             scale_mode: ScaleMode::Fill,
             transition: TransitionMode::Crossfade,
             transition_duration: Duration::from_secs(1),
+            heat_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            luma_catalog: Arc::new(RwLock::new(HashMap::new())),
+            seed: 0,
+            wear_temperature: 0.05,
+            shift_heat_bias: 0.25,
         }
     }
 }
@@ -300,6 +324,8 @@ impl Default for ShiftSettings {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
     // ── ScreensaverSettings ────────────────────────────────────────────
@@ -319,20 +345,43 @@ mod tests {
     }
 
     #[test]
+    fn screensaver_settings_carries_heat_catalog_seed_and_wear_knobs() {
+        let heat = Arc::new(RwLock::new(HashMap::new()));
+        let catalog = Arc::new(RwLock::new(HashMap::new()));
+        let settings = ScreensaverSettings {
+            heat_snapshots: heat.clone(),
+            luma_catalog: catalog.clone(),
+            seed: 42,
+            wear_temperature: 0.05,
+            shift_heat_bias: 0.25,
+            ..ScreensaverSettings::default()
+        };
+
+        assert!(Arc::ptr_eq(&settings.heat_snapshots, &heat));
+        assert!(Arc::ptr_eq(&settings.luma_catalog, &catalog));
+        assert_eq!(settings.seed, 42);
+        assert!((settings.wear_temperature - 0.05).abs() < f64::EPSILON);
+        assert!((settings.shift_heat_bias - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn screensaver_settings_keeps_items_in_order() {
         let s = ScreensaverSettings {
             items: vec![
                 PlaylistItem {
                     uri: "a.mp4".into(),
                     image_duration: Some(Duration::from_secs(2)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "b.png".into(),
                     image_duration: Some(Duration::from_secs(5)),
+                    ..Default::default()
                 },
                 PlaylistItem {
                     uri: "https://example/c.jpg".into(),
                     image_duration: None,
+                    ..Default::default()
                 },
             ],
             image_duration: Duration::from_secs(3),
@@ -340,6 +389,7 @@ mod tests {
             scale_mode: ScaleMode::Center,
             transition: TransitionMode::None,
             transition_duration: Duration::from_millis(500),
+            ..ScreensaverSettings::default()
         };
         assert_eq!(s.items.len(), 3);
         assert_eq!(s.items[0].uri, "a.mp4");

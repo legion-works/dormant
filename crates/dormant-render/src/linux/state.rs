@@ -44,7 +44,8 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, Mode, PostAction};
 
 use dormant_core::error::E_RENDER_UNAVAILABLE;
-use dormant_core::types::{CmdFailure, DisplayId, StageKind};
+use dormant_core::spatial_grid::{HeatGrid, LUMA_GRID_COLS, LUMA_GRID_ROWS};
+use dormant_core::types::{CmdFailure, DisplayId, ScreensaverItemReport, StageKind};
 
 use super::blend::{self, T_MAX};
 #[cfg(test)]
@@ -55,15 +56,81 @@ use super::wayland_ops::{
 };
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
+use crate::playlist::PlaylistItem;
 use crate::screensaver::{MpvItemEvent, MpvPlayer};
 use crate::settings::{ScreensaverSettings, ShiftSettings, TransitionMode};
 use crate::shift::ShiftState;
+use crate::wear_order::apply_wear_even_groups;
 
 /// Re-export of the long `WpSinglePixelBufferManagerV1` type so callers
 /// in [`crate::linux::surface`] can name it without a full
 /// `wayland_protocols::wp::...` path.
 pub(super) type SinglePixelBufferManager =
     wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+
+/// Playlist whose wear-even decision has already been made.  Keeping the
+/// wrapper private makes the session-install path consume only an ordered
+/// playlist; raw settings cannot be passed to the ordered-player seam.
+struct PreparedScreensaverItems(Vec<PlaylistItem>);
+
+impl PreparedScreensaverItems {
+    fn into_vec(self) -> Vec<PlaylistItem> {
+        self.0
+    }
+}
+
+/// Prepare the exact playlist handed to mpv for a screensaver show.
+///
+/// Ordering is deliberately kept at the session-install seam: the catalog
+/// may have completed scans since the settings were assembled, and a failed
+/// score must leave the original playlist untouched.
+fn screensaver_items_for_show(
+    settings: &ScreensaverSettings,
+    display_id: &DisplayId,
+    heat: &HeatGrid,
+) -> PreparedScreensaverItems {
+    let original_items = settings.items.clone();
+    match apply_wear_even_groups(
+        &original_items,
+        &settings.luma_catalog,
+        heat,
+        settings.wear_temperature,
+        settings.seed,
+    ) {
+        Ok(items) => PreparedScreensaverItems(items),
+        Err(error) => {
+            tracing::warn!(
+                event = "screensaver_wear_order_fallback",
+                display_id = %display_id,
+                reason = %error,
+            );
+            PreparedScreensaverItems(original_items)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_ordered_mpv_player(
+    items: PreparedScreensaverItems,
+    image_duration: std::time::Duration,
+    audio: bool,
+    scale_mode: crate::settings::ScaleMode,
+    width: u32,
+    height: u32,
+    write_fd: OwnedFd,
+    luma_catalog: Option<crate::luma::LumaCatalog>,
+) -> Result<MpvPlayer, crate::screensaver::MpvError> {
+    MpvPlayer::new_with_catalog(
+        items.into_vec(),
+        image_duration,
+        audio,
+        scale_mode,
+        width,
+        height,
+        write_fd,
+        luma_catalog,
+    )
+}
 
 /// Maximum time we'll wait for a compositor `configure` event after the
 /// initial layer-surface commit.  Compositors are expected to respond
@@ -191,10 +258,53 @@ pub(super) const TRANSITION_FPS: u32 = 30;
 /// [`TransitionEvent`] form.  Trivial today (1:1 mapping) but kept
 /// as a named converter so adding new event kinds is a one-line
 /// change rather than a sweep across the wiring.
-fn transition_event_of(ev: MpvItemEvent) -> TransitionEvent {
+fn transition_event_of(ev: &MpvItemEvent) -> TransitionEvent {
     match ev {
         MpvItemEvent::ItemEnded => TransitionEvent::ItemEnded,
-        MpvItemEvent::ItemLoaded => TransitionEvent::ItemLoaded,
+        MpvItemEvent::ItemLoaded { .. } => TransitionEvent::ItemLoaded,
+    }
+}
+
+fn item_report_from_event(
+    display_id: &DisplayId,
+    event: &MpvItemEvent,
+    observed_at: std::time::Instant,
+) -> Option<ScreensaverItemReport> {
+    let MpvItemEvent::ItemLoaded { uri, luma } = event else {
+        return None;
+    };
+    uri.as_ref()?;
+    Some(ScreensaverItemReport {
+        display_id: display_id.clone(),
+        uri: uri.clone(),
+        luma: luma.clone(),
+        observed_at,
+    })
+}
+
+fn clear_item_report(
+    display_id: &DisplayId,
+    observed_at: std::time::Instant,
+) -> ScreensaverItemReport {
+    ScreensaverItemReport {
+        display_id: display_id.clone(),
+        uri: None,
+        luma: None,
+        observed_at,
+    }
+}
+
+fn send_item_report(
+    sender: Option<&UnboundedSender<ScreensaverItemReport>>,
+    report: ScreensaverItemReport,
+    warned: &mut bool,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    if sender.send(report).is_err() && !*warned {
+        tracing::warn!(event = "screensaver_item_report_receiver_disconnected");
+        *warned = true;
     }
 }
 
@@ -478,7 +588,7 @@ pub(super) fn process_mpv_events(
 
     if let Some(tr) = transition.as_mut() {
         for ev in mpv_events {
-            let (new_phase, _, cmd) = transition_step(tr.phase, tr.t, transition_event_of(*ev));
+            let (new_phase, _, cmd) = transition_step(tr.phase, tr.t, transition_event_of(ev));
             tr.phase = new_phase;
             match cmd {
                 StepCmd::NoOp => {}
@@ -631,6 +741,8 @@ pub(super) struct WaylandState {
     pub(super) display_id: DisplayId,
     pub(super) output_name: String,
     pub(super) input_wake_tx: Option<UnboundedSender<DisplayId>>,
+    pub(super) item_report_tx: Option<UnboundedSender<ScreensaverItemReport>>,
+    pub(super) item_report_warned: bool,
 
     // ── Live layer surface (after a successful Show) ──────────────────────
     pub(super) target_output: Option<WlOutput>,
@@ -698,6 +810,11 @@ pub(super) struct WaylandState {
     /// its teardown.  `None` when shift is disabled, no surface is up,
     /// or a black overlay is showing (U5: black never shifts).
     pub(super) shift_state: Option<ShiftState>,
+    /// Heat snapshot reserved for the next screensaver viewport install.
+    pub(super) pending_shift_heat: Option<HeatGrid>,
+    /// Bias copied from screensaver settings (`0.0..=1.0`) for the next
+    /// viewport install.
+    pub(super) shift_heat_bias: f64,
     /// calloop `RegistrationToken` for the shift timer.  Armed exactly
     /// once per surface lifetime when the screensaver install path
     /// calls [`Self::maybe_arm_shift_timer`]; removed by
@@ -730,6 +847,7 @@ impl WaylandState {
         display_id: DisplayId,
         output_name: String,
         input_wake_tx: Option<&UnboundedSender<DisplayId>>,
+        item_report_tx: Option<&UnboundedSender<ScreensaverItemReport>>,
         queue_handle: QueueHandle<WaylandState>,
         loop_should_exit: Arc<AtomicBool>,
         wayland_ops: Arc<dyn WaylandOps>,
@@ -750,6 +868,8 @@ impl WaylandState {
             display_id,
             output_name,
             input_wake_tx: input_wake_tx.cloned(),
+            item_report_tx: item_report_tx.cloned(),
+            item_report_warned: false,
             target_output: None,
             layer_surface: None,
             viewport: None,
@@ -765,6 +885,8 @@ impl WaylandState {
             loop_handle: None,
             shift_settings: ShiftSettings::default(),
             shift_state: None,
+            pending_shift_heat: None,
+            shift_heat_bias: 0.25,
             shift_timer_token: None,
             wayland_ops,
         }
@@ -1049,6 +1171,11 @@ pub(super) trait ViewportStateView {
     /// Current `shift_px` setting (0 = disabled).
     fn shift_px(&self) -> u8;
 
+    /// Build the first cursor for a screensaver install.
+    fn new_shift_state(&mut self) -> ShiftState {
+        ShiftState::new(self.shift_px())
+    }
+
     /// Disarm whatever timer mechanism re-arms shift ticks. A no-op
     /// for state that has none (e.g. the recorder-backed test fake,
     /// which owns no calloop timer at all).
@@ -1097,8 +1224,7 @@ pub(super) trait ViewportStateView {
             dest.1.cast_signed(),
         );
         if self.shift_state_mut().is_none() {
-            let shift_px = self.shift_px();
-            let state = ShiftState::new(shift_px);
+            let state = self.new_shift_state();
             let (ox, oy) = state.source_origin();
             self.ops().viewport_set_source(
                 viewport.as_ref(),
@@ -1220,6 +1346,14 @@ impl ViewportStateView for WaylandState {
         self.shift_settings.shift_px
     }
 
+    fn new_shift_state(&mut self) -> ShiftState {
+        ShiftState::new_biased(
+            self.shift_settings.shift_px,
+            self.pending_shift_heat.take().as_ref(),
+            self.shift_heat_bias,
+        )
+    }
+
     fn disarm_shift_timer(&mut self) {
         if let (Some(token), Some(handle)) =
             (self.shift_timer_token.take(), self.loop_handle.as_ref())
@@ -1339,7 +1473,7 @@ impl WaylandState {
             if let Err(e) = self.complete_screensaver_show(
                 pending.layer_surface,
                 configured_size,
-                settings,
+                &settings,
                 pending.reply,
                 pending.r#gen,
             ) {
@@ -1450,7 +1584,7 @@ impl WaylandState {
         &mut self,
         layer_surface: LayerSurface,
         configured_size: (u32, u32),
-        settings: ScreensaverSettings,
+        settings: &ScreensaverSettings,
         reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
         r#gen: u64,
     ) -> Result<(), CmdFailure> {
@@ -1476,7 +1610,26 @@ impl WaylandState {
         // case.  When shift is disabled `ensure_shift_viewport` /
         // `render_dims` are no-ops and `width`/`height` equal
         // `configured_size` exactly — byte-identical to pre-T10.
+        let heat = settings
+            .heat_snapshots
+            .read()
+            .ok()
+            .and_then(|snapshots| snapshots.get(&self.display_id).cloned())
+            .or_else(|| {
+                HeatGrid::new(
+                    LUMA_GRID_ROWS,
+                    LUMA_GRID_COLS,
+                    vec![0.0; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)],
+                )
+            })
+            .expect("16x9 zero grid: rows×cols must match cells.len()");
+        self.pending_shift_heat = Some(heat.clone());
+        self.shift_heat_bias = settings.shift_heat_bias;
         let wl_surface_for_shift = layer_surface.wl_surface().clone();
+        // The shift walk is tied to the heat snapshot that selected this
+        // show. Re-installing a screensaver session must start a fresh walk,
+        // even when the existing viewport is reused.
+        self.reset_shift();
         let shift_viewport = self.ensure_shift_viewport(&wl_surface_for_shift, configured_size);
         let (width, height) = self.render_dims(configured_size);
         let stride = width
@@ -1493,18 +1646,22 @@ impl WaylandState {
         // to close it.
         let (read_fd, write_fd) = make_wakeup_pipe()?;
 
+        // The heat lock is released before ordering and player setup.
+        let items = screensaver_items_for_show(settings, &self.display_id, &heat);
+
         // ── mpv player ──────────────────────────────────────────────
         // Build the player.  On Err, `write_fd` is dropped here
         // (closing it) and we still own `read_fd` — the caller-side
         // match below handles the read-fd close on Err.
-        let player_result = MpvPlayer::new(
-            settings.items,
+        let player_result = new_ordered_mpv_player(
+            items,
             settings.image_duration,
             settings.audio,
             settings.scale_mode,
             width,
             height,
             write_fd,
+            Some(settings.luma_catalog.clone()),
         );
         let player = match player_result {
             Ok(p) => p,
@@ -1708,32 +1865,48 @@ impl WaylandState {
     /// `ItemLoaded` in a later one) still drive the lifecycle correctly.
     #[allow(clippy::too_many_lines)] // single-method state machine: drain, render, blend, attach, advance are documented inline below
     fn on_mpv_wakeup(&mut self) {
-        let Some(session) = self.screensaver_session.as_mut() else {
-            return;
-        };
-
-        // Drain the pipe (non-blocking; multiple wakeups may have queued).
-        let mut drain_buf = [0u8; 256];
-        loop {
-            // SAFETY: kernel writes to the buffer; partial reads are fine
-            // for non-blocking pipes.
-            let n = unsafe {
-                libc::read(
-                    session.read_fd.as_raw_fd(),
-                    drain_buf.as_mut_ptr().cast(),
-                    drain_buf.len(),
-                )
+        let mpv_events: Vec<MpvItemEvent> = {
+            let Some(session) = self.screensaver_session.as_mut() else {
+                return;
             };
-            if n <= 0 {
-                break;
+
+            // Drain the pipe (non-blocking; multiple wakeups may have queued).
+            let mut drain_buf = [0u8; 256];
+            loop {
+                // SAFETY: kernel writes to the buffer; partial reads are fine
+                // for non-blocking pipes.
+                let n = unsafe {
+                    libc::read(
+                        session.read_fd.as_raw_fd(),
+                        drain_buf.as_mut_ptr().cast(),
+                        drain_buf.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+
+            // ALWAYS drain mpv's event queue (M5: libmpv's per-handle
+            // event queue congests / overflows if never drained).  In
+            // `TransitionMode::None` the drained events are discarded;
+            // the rendered surface stays pixel-identical.
+            session.player.poll_events()
+        };
+        let observed_at = dormant_core::types::Tick::now().0;
+        for event in &mpv_events {
+            if let Some(report) = item_report_from_event(&self.display_id, event, observed_at) {
+                send_item_report(
+                    self.item_report_tx.as_ref(),
+                    report,
+                    &mut self.item_report_warned,
+                );
             }
         }
 
-        // ALWAYS drain mpv's event queue (M5: libmpv's per-handle
-        // event queue congests / overflows if never drained).  In
-        // `TransitionMode::None` the drained events are discarded;
-        // the rendered surface stays pixel-identical.
-        let mpv_events: Vec<MpvItemEvent> = session.player.poll_events();
+        let Some(session) = self.screensaver_session.as_mut() else {
+            return;
+        };
 
         // Compute the per-tick step (used by both the timer arm and
         // the in-tick blend).  Recomputed per wakeup only matters when
@@ -2192,6 +2365,13 @@ impl WaylandState {
         // drop order (player first, then read fd, then pool).  The
         // player's `Drop` runs the mpv teardown.
         if let Some(session) = self.screensaver_session.take() {
+            let clear_report =
+                clear_item_report(&self.display_id, dormant_core::types::Tick::now().0);
+            send_item_report(
+                self.item_report_tx.as_ref(),
+                clear_report,
+                &mut self.item_report_warned,
+            );
             let ScreensaverSession {
                 player,
                 read_fd,
@@ -2580,7 +2760,7 @@ impl WaylandState {
             if let Err(e) = self.complete_screensaver_show(
                 existing.clone(),
                 self.configured_size,
-                settings,
+                &settings,
                 reply,
                 r#gen,
             ) {
@@ -2616,6 +2796,125 @@ impl WaylandState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn item_report_includes_ready_grid_and_none_when_pending() {
+        let display_id = DisplayId("panel".into());
+        let observed_at = std::time::Instant::now();
+        let grid = dormant_core::spatial_grid::LumaGrid::new(vec![0.25; 144]);
+        let loaded = MpvItemEvent::ItemLoaded {
+            uri: Some("still.png".into()),
+            luma: grid.clone(),
+        };
+        let pending = MpvItemEvent::ItemLoaded {
+            uri: Some("pending.png".into()),
+            luma: None,
+        };
+
+        let report = item_report_from_event(&display_id, &loaded, observed_at).expect("report");
+        assert_eq!(report.uri.as_deref(), Some("still.png"));
+        assert_eq!(report.luma, grid);
+        assert_eq!(report.observed_at, observed_at);
+        assert_eq!(
+            item_report_from_event(&display_id, &pending, observed_at)
+                .expect("pending report")
+                .luma,
+            None
+        );
+    }
+
+    #[test]
+    fn destroy_session_emits_timestamped_clear_report() {
+        let display_id = DisplayId("panel".into());
+        let observed_at = std::time::Instant::now();
+        let report = clear_item_report(&display_id, observed_at);
+        assert_eq!(report.display_id, display_id);
+        assert_eq!(report.uri, None);
+        assert_eq!(report.luma, None);
+        assert_eq!(report.observed_at, observed_at);
+    }
+
+    #[test]
+    fn dropped_report_receiver_never_fails_rendering() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let report = clear_item_report(&DisplayId("panel".into()), std::time::Instant::now());
+        let mut warned = false;
+        send_item_report(Some(&tx), report, &mut warned);
+        assert!(warned);
+    }
+
+    #[test]
+    fn screensaver_items_helper_orders_playlist() {
+        let items = vec![
+            PlaylistItem {
+                uri: "left.png".into(),
+                media_kind: crate::playlist::MediaKind::Image,
+                order: crate::playlist::PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "right.png".into(),
+                media_kind: crate::playlist::MediaKind::Image,
+                order: crate::playlist::PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+        ];
+        let mut left_cells = vec![0.0; 144];
+        let mut right_cells = vec![0.0; 144];
+        for row in 0..9 {
+            left_cells[row * 16..row * 16 + 8].fill(1.0);
+            right_cells[row * 16 + 8..row * 16 + 16].fill(1.0);
+        }
+        let catalog = Arc::new(RwLock::new(HashMap::from([
+            (
+                "left.png".into(),
+                dormant_core::spatial_grid::LumaGrid::new(left_cells).unwrap(),
+            ),
+            (
+                "right.png".into(),
+                dormant_core::spatial_grid::LumaGrid::new(right_cells).unwrap(),
+            ),
+        ])));
+        let heat_snapshots = Arc::new(RwLock::new(HashMap::from([(
+            DisplayId("mon".into()),
+            HeatGrid::new(1, 2, vec![0.0, 1.0]).unwrap(),
+        )])));
+        let settings = ScreensaverSettings {
+            items,
+            heat_snapshots: heat_snapshots.clone(),
+            luma_catalog: catalog,
+            wear_temperature: 0.0,
+            seed: 7,
+            ..ScreensaverSettings::default()
+        };
+
+        let first_heat = heat_snapshots
+            .read()
+            .unwrap()
+            .get(&DisplayId("mon".into()))
+            .cloned()
+            .unwrap();
+        let first =
+            screensaver_items_for_show(&settings, &DisplayId("mon".into()), &first_heat).into_vec();
+        heat_snapshots.write().unwrap().insert(
+            DisplayId("mon".into()),
+            HeatGrid::new(1, 2, vec![1.0, 0.0]).unwrap(),
+        );
+        let next_heat = heat_snapshots
+            .read()
+            .unwrap()
+            .get(&DisplayId("mon".into()))
+            .cloned()
+            .unwrap();
+        let next =
+            screensaver_items_for_show(&settings, &DisplayId("mon".into()), &next_heat).into_vec();
+
+        assert_eq!(first[0].uri, "left.png");
+        assert_eq!(next[0].uri, "right.png");
+    }
 
     /// `should_fail_timeout` returns `true` ONLY when the timeout's
     /// gen matches the still-pending show's gen.  Anything else
@@ -2970,6 +3269,36 @@ mod tests {
         assert!(
             fake.shift_state.is_none(),
             "reset_shift must clear shift_state"
+        );
+    }
+
+    #[test]
+    fn screensaver_reinstall_rebuilds_walk_from_second_heat_snapshot() {
+        let mut fake = FakeShiftView::new(2);
+        fake.seed_viewport();
+        let first_heat = HeatGrid::new(1, 3, vec![1.0, 0.0, 0.0]).expect("valid heat");
+        let second_heat = HeatGrid::new(1, 3, vec![0.0, 0.0, 1.0]).expect("valid heat");
+        fake.shift_state = Some(ShiftState::new_biased(2, Some(&first_heat), 0.25));
+        fake.reset_shift();
+        assert!(
+            fake.shift_state.is_none(),
+            "reinstall must clear the old walk"
+        );
+        fake.shift_state = Some(ShiftState::new_biased(2, Some(&second_heat), 0.25));
+        let state = fake.shift_state.as_ref().expect("second walk installed");
+        let left = state
+            .offsets_for_test()
+            .iter()
+            .filter(|(x, _)| *x < 0)
+            .count();
+        let right = state
+            .offsets_for_test()
+            .iter()
+            .filter(|(x, _)| *x > 0)
+            .count();
+        assert!(
+            right > left,
+            "second show's cold-right snapshot must drive content right: left={left}, right={right}"
         );
     }
 
@@ -3736,7 +4065,13 @@ fn process_mpv_events_batch_order_itemloaded_then_itemended_allocates() {
     // Exercise the helper directly: start with `transition == None`,
     // feed `[ItemLoaded, ItemEnded]`, expect the helper to allocate
     // AND process both events.
-    let events = vec![MpvItemEvent::ItemLoaded, MpvItemEvent::ItemEnded];
+    let events = vec![
+        MpvItemEvent::ItemLoaded {
+            uri: None,
+            luma: None,
+        },
+        MpvItemEvent::ItemEnded,
+    ];
     let (new_transition, cmds) =
         process_mpv_events(None, &events, /* t_step */ 9, /* buf_len */ 0);
 
@@ -3766,7 +4101,10 @@ fn process_mpv_events_no_itemended_does_not_allocate() {
     // The dual: a batch with NO ItemEnded must NOT allocate.  A
     // batch of just [ItemLoaded] is a no-op (Idle + ItemLoaded is
     // a no-op in transition_step — there's nothing to fade yet).
-    let events = vec![MpvItemEvent::ItemLoaded];
+    let events = vec![MpvItemEvent::ItemLoaded {
+        uri: None,
+        luma: None,
+    }];
     let (new_transition, cmds) = process_mpv_events(None, &events, 9, 0);
     assert!(
         new_transition.is_none(),

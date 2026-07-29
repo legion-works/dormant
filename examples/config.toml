@@ -297,6 +297,8 @@ modes = ["power_off"]
 # # transition = "none").  Humantime string; bounded 100ms..=10s by the
 # # validator.  Default: "1s".
 # transition_duration = "500ms"
+# wear_temperature = 0.05           # range 0.0..=1.0; default 0.05
+# shift_heat_bias = 0.25             # range 0.0..=1.0; default 0.25
 # # shift_px / shift_interval — periodic micro pixel-shift on the screensaver
 # # surface only, to even out static-image burn-in. The black overlay never
 # # shifts (U5): a uniform black field is translation-invariant on OLED.
@@ -311,7 +313,8 @@ modes = ["power_off"]
 # image_duration = "8s"
 # [[displays.desktop.screensaver.source]]
 # urls = ["https://example.com/background.jpg"]
-# order = "sequential"
+# order = "sequential"            # or "wear-even"; not with shuffle
+# wear_tag = "landscape"            # optional source-level wear label
 
 # ── Rules ──────────────────────────────────────────────────────────────────────
 

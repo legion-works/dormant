@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dormant_core::config::schema::ScreensaverSource;
 
+use crate::luma::WearTag;
+
 /// Media file extensions recognised by the playlist scanner.
 ///
 /// Case-insensitive — the scanner lowercases every extension before
@@ -41,7 +43,7 @@ const MAX_PLAYLIST_ITEMS: usize = 10_000;
 /// `SplitMix64` has good statistical properties for shuffling; it is the
 /// same algorithm used by Rust's std hash-builder seed mixer, so the
 /// output quality is well-characterized.
-fn splitmix64_next(state: &mut u64) -> u64 {
+pub(crate) fn splitmix64_next(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -62,6 +64,49 @@ pub struct PlaylistItem {
     /// Overrides the global image duration for THIS item only.
     /// `None` means "use the global default".
     pub image_duration: Option<Duration>,
+    /// Whether this item is an image or video.
+    pub media_kind: MediaKind,
+    /// Source-level video wear class, ignored for images.
+    pub wear_tag: Option<WearTag>,
+    /// Zero-based source index that yielded this item.
+    pub source_index: usize,
+    /// Ordering mode retained for wear-even session grouping.
+    pub order: PlaylistOrder,
+}
+
+/// Media class inferred from the existing extension sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaKind {
+    /// A still image.
+    #[default]
+    Image,
+    /// A video item.
+    Video,
+}
+
+/// Ordering mode retained on each playlist item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaylistOrder {
+    /// Preserve source order.
+    #[default]
+    Sequential,
+    /// Source-level seeded shuffle.
+    Shuffle,
+    /// Wear-even ordering requested.
+    WearEven,
+}
+
+impl Default for PlaylistItem {
+    fn default() -> Self {
+        Self {
+            uri: String::new(),
+            image_duration: None,
+            media_kind: MediaKind::Image,
+            wear_tag: None,
+            source_index: 0,
+            order: PlaylistOrder::Sequential,
+        }
+    }
 }
 
 // ── Public API ─────────────────────────────────────────────────────────
@@ -94,12 +139,17 @@ fn build_playlist_capped(
     let mut items: Vec<PlaylistItem> = Vec::new();
     let mut truncated = false;
 
-    for source in sources {
+    for (source_index, source) in sources.iter().enumerate() {
         if items.len() >= max_items {
             truncated = true;
             break;
         }
         let src_duration = source.image_duration;
+        let order = match source.order.as_deref() {
+            Some("wear-even") => PlaylistOrder::WearEven,
+            _ if source.shuffle => PlaylistOrder::Shuffle,
+            _ => PlaylistOrder::Sequential,
+        };
         let remaining = max_items.saturating_sub(items.len());
         let mut path_items: Vec<PlaylistItem> = Vec::new();
         let mut url_items: Vec<PlaylistItem> = Vec::new();
@@ -121,6 +171,9 @@ fn build_playlist_capped(
                     0,
                     &mut path_items,
                     src_duration,
+                    source.wear_tag.as_deref(),
+                    source_index,
+                    order,
                     remaining,
                 );
             }
@@ -140,6 +193,10 @@ fn build_playlist_capped(
                 url_items.push(PlaylistItem {
                     uri: url.clone(),
                     image_duration: src_duration,
+                    media_kind: media_kind(url),
+                    wear_tag: video_wear_tag(url, source.wear_tag.as_deref()),
+                    source_index,
+                    order,
                 });
             }
         }
@@ -168,8 +225,8 @@ fn build_playlist_capped(
                 src_items.swap(i, j);
             }
         }
-        // `order` is "sequential" (the only value validation accepts)
-        // which means the deterministic sorted order is the right one.
+        // Sequential and wear-even both retain the deterministic source order
+        // here; wear-even replaces the group during session installation.
 
         items.append(&mut src_items);
     }
@@ -199,12 +256,16 @@ fn build_playlist_capped(
 /// `limit` is the maximum size `out` may reach before this function
 /// stops collecting.  When `out.len() >= limit`, the scan short-circuits
 /// (no more filesystem entries are read).
+#[allow(clippy::too_many_arguments)]
 fn scan_dir(
     dir: &Path,
     recurse: bool,
     depth: u32,
     out: &mut Vec<PlaylistItem>,
     image_duration: Option<Duration>,
+    wear_tag: Option<&str>,
+    source_index: usize,
+    order: PlaylistOrder,
     limit: usize,
 ) {
     if out.len() >= limit || depth > MAX_RECURSE_DEPTH {
@@ -234,6 +295,9 @@ fn scan_dir(
                     depth + 1,
                     out,
                     image_duration,
+                    wear_tag,
+                    source_index,
+                    order,
                     limit,
                 );
             }
@@ -261,10 +325,38 @@ fn scan_dir(
                 out.push(PlaylistItem {
                     uri: path_str.to_owned(),
                     image_duration,
+                    media_kind: media_kind(path_str),
+                    wear_tag: video_wear_tag(path_str, wear_tag),
+                    source_index,
+                    order,
                 });
             }
         }
     }
+}
+
+fn media_kind(uri: &str) -> MediaKind {
+    let ext = Path::new(uri)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    if ext
+        .as_deref()
+        .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext))
+    {
+        MediaKind::Video
+    } else {
+        MediaKind::Image
+    }
+}
+
+fn video_wear_tag(uri: &str, tag: Option<&str>) -> Option<WearTag> {
+    (media_kind(uri) == MediaKind::Video).then(|| match tag? {
+        "dark" => Some(WearTag::Dark),
+        "medium" => Some(WearTag::Medium),
+        "bright" => Some(WearTag::Bright),
+        _ => None,
+    })?
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -328,6 +420,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -358,6 +451,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -383,6 +477,7 @@ mod tests {
             recurse: true,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -409,6 +504,7 @@ mod tests {
             recurse: true,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -434,6 +530,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -451,6 +548,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -478,6 +576,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -502,6 +601,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -534,6 +634,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -556,6 +657,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(3)),
         };
 
@@ -574,6 +676,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -600,6 +703,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(1)),
         };
         let s2 = ScreensaverSource {
@@ -608,6 +712,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(2)),
         };
 
@@ -633,6 +738,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_millis(1500)),
         };
 
@@ -653,6 +759,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -670,6 +777,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: Some(Duration::from_secs(5)),
         };
 
@@ -694,6 +802,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
         let playlist = build_playlist(&[source], Some(42));
@@ -718,6 +827,7 @@ mod tests {
             recurse: true,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -747,6 +857,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -778,6 +889,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -800,6 +912,7 @@ mod tests {
             recurse: false,
             shuffle: true,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -835,6 +948,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -858,6 +972,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 
@@ -890,6 +1005,7 @@ mod tests {
             recurse: false,
             shuffle: false,
             order: None,
+            wear_tag: None,
             image_duration: None,
         };
 

@@ -35,6 +35,21 @@ impl fmt::Display for DisplayId {
     }
 }
 
+/// A render-side observation of the screensaver item visible after mpv's
+/// `FILE_LOADED` event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreensaverItemReport {
+    /// Display that owns the render session.
+    pub display_id: DisplayId,
+    /// Configured playlist URI, or `None` when the visible screensaver ends.
+    pub uri: Option<String>,
+    /// Ready luminance grid for the item, when the catalog has one.
+    pub luma: Option<crate::spatial_grid::LumaGrid>,
+    /// Monotonic observation instant used to correlate render transitions with
+    /// wear-sampling ticks.
+    pub observed_at: std::time::Instant,
+}
+
 /// Identifier for a zone.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -304,6 +319,20 @@ impl std::error::Error for CmdFailure {}
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screensaver_item_report_carries_item_and_observation() {
+        let observed_at = std::time::Instant::now();
+        let report = ScreensaverItemReport {
+            display_id: DisplayId("panel".into()),
+            uri: Some("still.png".into()),
+            luma: None,
+            observed_at,
+        };
+        assert_eq!(report.display_id, DisplayId("panel".into()));
+        assert_eq!(report.uri.as_deref(), Some("still.png"));
+        assert_eq!(report.observed_at, observed_at);
+    }
 
     // ── Serde stability ────────────────────────────────────────────────────
 

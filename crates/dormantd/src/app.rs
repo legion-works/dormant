@@ -68,6 +68,8 @@ use dormant_core::rules::{
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
+#[cfg(feature = "render")]
+use dormant_core::types::ScreensaverItemReport;
 use dormant_core::types::{BlankMode, DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
 use dormant_core::zone::{ZoneEngine, ZoneSpec, absent_mqtt_hazards};
 use dormant_displays::ddc_lock::PanelLocks;
@@ -82,7 +84,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "render")]
-use dormant_render::LayerShellRenderSink;
+use dormant_render::luma::{LumaCache, LumaCatalog, LumaScanJob};
+#[cfg(feature = "render")]
+use dormant_render::{HeatSnapshotHandle, LayerShellRenderSink};
 
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
@@ -97,6 +101,79 @@ use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
 
 const QUIESCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "render")]
+#[allow(clippy::cast_possible_truncation)]
+fn runtime_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    nanos ^ u64::from(std::process::id()).rotate_left(17)
+}
+
+#[cfg(feature = "render")]
+fn run_luma_scan_job(job: LumaScanJob, token: &CancellationToken) {
+    let result = job.cache.scan_path(&job.path);
+    if token.is_cancelled() {
+        return;
+    }
+    match result {
+        Ok(grid) => {
+            if let Ok(mut catalog) = job.catalog.write() {
+                if token.is_cancelled() {
+                    return;
+                }
+                catalog.insert(job.uri, grid);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "screensaver_luma_scan_failed",
+                display_id = %job.display_id,
+                uri = %job.uri,
+                error = %error,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "render")]
+fn append_item_report(journal: &CurrentItemJournal, report: ScreensaverItemReport) {
+    let Ok(mut guard) = journal.lock() else {
+        tracing::warn!(event = "screensaver_item_journal_unavailable");
+        return;
+    };
+    let queue = guard.entry(report.display_id.clone()).or_default();
+    if queue.len() >= CURRENT_ITEM_JOURNAL_CAPACITY {
+        queue.pop_front();
+        tracing::warn!(
+            event = "screensaver_item_journal_overflow",
+            display_id = %report.display_id,
+            capacity = CURRENT_ITEM_JOURNAL_CAPACITY,
+            "screensaver item history is full; wear attribution will degrade"
+        );
+    }
+    queue.push_back(report);
+}
+
+#[cfg(feature = "render")]
+fn spawn_item_report_drain(
+    mut reports: tokio::sync::mpsc::UnboundedReceiver<ScreensaverItemReport>,
+    journal: CurrentItemJournal,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                report = reports.recv() => {
+                    let Some(report) = report else { break };
+                    append_item_report(&journal, report);
+                }
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuiesceOutcome {
@@ -166,12 +243,30 @@ type RenderSinkBuilder = Arc<
             DisplayId,
             String,
             Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+            Option<&tokio::sync::mpsc::UnboundedSender<ScreensaverItemReport>>,
             Option<&dormant_render::ScreensaverSettings>,
             Option<&dormant_render::ShiftSettings>,
         ) -> Option<Arc<dyn RenderSink>>
         + Send
         + Sync,
 >;
+
+#[cfg(feature = "render")]
+struct RenderContext {
+    luma_cache: Arc<LumaCache>,
+    luma_catalog: LumaCatalog,
+    heat_snapshots: HeatSnapshotHandle,
+    seed: u64,
+    item_journal: CurrentItemJournal,
+}
+
+/// Process-owned bounded history of render-side screensaver transitions.
+#[cfg(feature = "render")]
+pub(crate) type CurrentItemJournal =
+    Arc<Mutex<HashMap<DisplayId, VecDeque<ScreensaverItemReport>>>>;
+
+#[cfg(feature = "render")]
+const CURRENT_ITEM_JOURNAL_CAPACITY: usize = 1_024;
 
 pub use dormant_core::reload::ReloadOutcome;
 use dormant_core::reload::{ReloadRequest, ReloadRequester};
@@ -599,6 +694,8 @@ impl App {
     /// building [`LayerShellRenderSink`] directly.  The factory receives
     /// the display id, output connector name, an optional
     /// `UnboundedSender<DisplayId>` (the `InputWake` channel), an
+    /// optional `UnboundedSender<ScreensaverItemReport>` (the item feedback
+    /// channel),
     /// optional [`dormant_render::ScreensaverSettings`], and an
     /// optional [`dormant_render::ShiftSettings`] (OLED-health T10 —
     /// derived independently of the ladder's `RenderScreensaver`
@@ -612,6 +709,7 @@ impl App {
                 DisplayId,
                 String,
                 Option<&tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+                Option<&tokio::sync::mpsc::UnboundedSender<ScreensaverItemReport>>,
                 Option<&dormant_render::ScreensaverSettings>,
                 Option<&dormant_render::ShiftSettings>,
             ) -> Option<Arc<dyn RenderSink>>
@@ -877,13 +975,27 @@ impl App {
         let started_web_port = cfg.daemon.web_port;
         let started_web_bind = cfg.daemon.web_bind;
 
+        // These handles are daemon-lifetime state: image scans survive a
+        // config reload, while heat snapshots are replaced by the tracker.
+        let wear_handle: dormant_core::wear::WearHandle =
+            Arc::new(std::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "render")]
-        let assembly = assemble_static(
+        let render_context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: runtime_seed(),
+            item_journal: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        #[cfg(feature = "render")]
+        let assembly = assemble_static_with_context(
             cfg,
             creds,
             &self.source_builder,
             self.render_sink_builder.as_ref(),
             &ctrl_ctx,
+            &render_context,
         )
         .await
         .context("assemble initial runtime")?;
@@ -976,11 +1088,6 @@ impl App {
             .collect();
         executors_tx.send_replace(Arc::new(executors0));
 
-        // The daemon's single wear-ledger map (spec §5) — shared with the
-        // tracker and, in future, IPC/WebUI readers.
-        let wear_handle: dormant_core::wear::WearHandle =
-            Arc::new(std::sync::RwLock::new(HashMap::new()));
-
         // Stable front channels are paused before an old engine is drained, so
         // no delivery can race behind the generation barrier.
         let ctl_router = Arc::new(GenerationRouter::new_with_generation(
@@ -1068,9 +1175,13 @@ impl App {
                 ctl_tx: front_ctl_tx.clone(),
                 executors_rx: executors_rx.clone(),
                 handle: wear_handle.clone(),
+                #[cfg(feature = "render")]
+                heat_snapshots: render_context.heat_snapshots.clone(),
                 cancel: root.clone(),
                 dir: wear_dir,
                 observations: self.observations.clone(),
+                #[cfg(feature = "render")]
+                item_journal: render_context.item_journal.clone(),
             });
 
         if cfg_clone.daemon.web_allow_nonloopback {
@@ -1239,6 +1350,8 @@ impl App {
             source_builder: self.source_builder,
             #[cfg(feature = "render")]
             render_sink_builder: self.render_sink_builder,
+            #[cfg(feature = "render")]
+            render_context,
             root: root.clone(),
             ctl_router,
             events_router,
@@ -1532,6 +1645,8 @@ struct Runner {
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
     render_sink_builder: Option<RenderSinkBuilder>,
+    #[cfg(feature = "render")]
+    render_context: RenderContext,
     root: CancellationToken,
     ctl_router: Arc<GenerationRouter<ControlMsg>>,
     events_router: Arc<GenerationRouter<PresenceEvent>>,
@@ -2492,12 +2607,13 @@ impl Runner {
         }
         #[cfg(feature = "render")]
         {
-            assemble_static(
+            assemble_static_with_context(
                 cfg,
                 creds,
                 &self.source_builder,
                 self.render_sink_builder.as_ref(),
                 &self.ctrl_ctx,
+                &self.render_context,
             )
             .await
             .map_err(|e| e.to_string())
@@ -2520,8 +2636,12 @@ impl Runner {
             });
         let (activity_rules, activity_poll) = activity_rules(&self.generation.cfg);
         #[cfg(feature = "render")]
-        let (render_sinks, input_wake_rx) =
-            build_render_sinks(&self.generation.cfg, self.render_sink_builder.as_ref());
+        let (render_sinks, input_wake_rx, scan_jobs, item_report_rx) =
+            build_render_sinks_with_context(
+                &self.generation.cfg,
+                self.render_sink_builder.as_ref(),
+                &self.render_context,
+            );
         let assembly = StaticAssembly {
             cfg: self.generation.cfg.clone(),
             creds: self.generation.creds.clone(),
@@ -2538,6 +2658,12 @@ impl Runner {
             render_sinks: HashMap::new(),
             #[cfg(feature = "render")]
             input_wake_rx: Some(input_wake_rx),
+            #[cfg(feature = "render")]
+            item_report_rx: Some(item_report_rx),
+            #[cfg(feature = "render")]
+            item_journal: self.render_context.item_journal.clone(),
+            #[cfg(feature = "render")]
+            scan_jobs,
         };
         let spawn_result = spawn_generation_for_reload(
             &self.state_dir,
@@ -3462,6 +3588,12 @@ struct StaticAssembly {
     /// routes each item to [`ControlMsg::InputWake`].
     #[cfg(feature = "render")]
     input_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DisplayId>>,
+    #[cfg(feature = "render")]
+    item_report_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ScreensaverItemReport>>,
+    #[cfg(feature = "render")]
+    item_journal: CurrentItemJournal,
+    #[cfg(feature = "render")]
+    scan_jobs: Vec<LumaScanJob>,
 }
 
 /// Load config + credentials, logging any lenient-mode warnings.
@@ -3489,6 +3621,7 @@ fn load_cfg_creds(
 /// panel's lock — and, on macOS, a gamma selector's hold/breadcrumb — is
 /// the same shared instance before and after a config reload.
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 async fn assemble_static(
     cfg: Config,
     creds: Credentials,
@@ -3496,13 +3629,48 @@ async fn assemble_static(
     #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
     ctx: &ControllerBuildContext,
 ) -> Result<StaticAssembly> {
+    #[cfg(feature = "render")]
+    {
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 0,
+            item_journal: Arc::new(Mutex::new(HashMap::new())),
+        };
+        assemble_static_with_context(
+            cfg,
+            creds,
+            source_builder,
+            render_sink_builder,
+            ctx,
+            &context,
+        )
+        .await
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        assemble_static_with_context(cfg, creds, source_builder, ctx).await
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assemble_static_with_context(
+    cfg: Config,
+    creds: Credentials,
+    source_builder: &SourceBuilder,
+    #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
+    ctx: &ControllerBuildContext,
+    #[cfg(feature = "render")] render_context: &RenderContext,
+) -> Result<StaticAssembly> {
     // First rule referencing each display drives its retry + timings.
     let display_rule = index_display_rules(&cfg);
 
     let mut display_runtime: Vec<DisplayRuntimeCfg> = Vec::new();
     let mut display_executors: HashMap<DisplayId, Arc<DisplayExecutor>> = HashMap::new();
     #[cfg(feature = "render")]
-    let (render_sinks, input_wake_rx) = build_render_sinks(&cfg, render_sink_builder);
+    let (render_sinks, input_wake_rx, scan_jobs, item_report_rx) =
+        build_render_sinks_with_context(&cfg, render_sink_builder, render_context);
     #[cfg(not(feature = "render"))]
     let render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
 
@@ -3666,6 +3834,12 @@ async fn assemble_static(
         render_sinks,
         #[cfg(feature = "render")]
         input_wake_rx: Some(input_wake_rx),
+        #[cfg(feature = "render")]
+        item_report_rx: Some(item_report_rx),
+        #[cfg(feature = "render")]
+        item_journal: render_context.item_journal.clone(),
+        #[cfg(feature = "render")]
+        scan_jobs,
     })
 }
 
@@ -3914,6 +4088,8 @@ mod audio_rules_tests {
 /// this keeps FS scanning off the wayland thread and matches the generation
 /// model where a config reload rebuilds it.  Fresh-per-show is future work.
 #[cfg(feature = "render")]
+#[cfg(any(test, feature = "test-util"))]
+#[allow(dead_code)]
 #[allow(clippy::too_many_lines)] // ScreensaverSettings + ShiftSettings assembly, both documented inline
 fn build_render_sinks(
     cfg: &Config,
@@ -3922,11 +4098,39 @@ fn build_render_sinks(
     HashMap<DisplayId, Arc<dyn RenderSink>>,
     tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
 ) {
+    let context = RenderContext {
+        luma_cache: Arc::new(LumaCache::new()),
+        luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        seed: 0,
+        item_journal: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let (sinks, input_wake_rx, _, _) =
+        build_render_sinks_with_context(cfg, render_sink_builder, &context);
+    (sinks, input_wake_rx)
+}
+
+#[cfg(feature = "render")]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::type_complexity)]
+fn build_render_sinks_with_context(
+    cfg: &Config,
+    render_sink_builder: Option<&RenderSinkBuilder>,
+    context: &RenderContext,
+) -> (
+    HashMap<DisplayId, Arc<dyn RenderSink>>,
+    tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
+    Vec<LumaScanJob>,
+    tokio::sync::mpsc::UnboundedReceiver<ScreensaverItemReport>,
+) {
     use dormant_render::ScreensaverSettings;
     use dormant_render::playlist;
 
     let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    let mut scan_jobs = Vec::new();
     let (input_wake_tx, input_wake_rx) = tokio::sync::mpsc::unbounded_channel::<DisplayId>();
+    let (item_report_tx, item_report_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ScreensaverItemReport>();
 
     for (name, dc) in &cfg.displays {
         let did = DisplayId(name.clone());
@@ -3942,7 +4146,28 @@ fn build_render_sinks(
             .any(|s| s.kind == dormant_core::types::StageKind::RenderScreensaver)
         {
             dc.screensaver.as_ref().map(|ss| {
-                let items = playlist::build_playlist(&ss.source, None);
+                let items = playlist::build_playlist(&ss.source, Some(context.seed));
+                for item in &items {
+                    if let Some(tag) = item.wear_tag {
+                        if let Ok(mut catalog) = context.luma_catalog.write() {
+                            catalog.insert(
+                                item.uri.clone(),
+                                dormant_render::luma::flat_grid_for_tag(tag),
+                            );
+                        }
+                    } else if item.media_kind == dormant_render::playlist::MediaKind::Image {
+                        let path = std::path::PathBuf::from(&item.uri);
+                        if path.is_absolute() {
+                            scan_jobs.push(LumaScanJob {
+                                display_id: did.clone(),
+                                uri: item.uri.clone(),
+                                path,
+                                cache: context.luma_cache.clone(),
+                                catalog: context.luma_catalog.clone(),
+                            });
+                        }
+                    }
+                }
                 // scale_mode: None (absent) → Fill.  Validation has already
                 // rejected any unknown string value, so a failed parse here
                 // would only be reachable through a programmatic caller
@@ -3983,6 +4208,11 @@ fn build_render_sinks(
                     scale_mode,
                     transition,
                     transition_duration,
+                    heat_snapshots: context.heat_snapshots.clone(),
+                    luma_catalog: context.luma_catalog.clone(),
+                    seed: context.seed,
+                    wear_temperature: ss.wear_temperature,
+                    shift_heat_bias: ss.shift_heat_bias,
                 }
             })
         } else {
@@ -4016,6 +4246,7 @@ fn build_render_sinks(
                     did.clone(),
                     output_name.clone(),
                     Some(&input_wake_tx),
+                    Some(&item_report_tx),
                     ss_ref,
                     shift_ref,
                 )
@@ -4024,6 +4255,7 @@ fn build_render_sinks(
                     did.clone(),
                     output_name.clone(),
                     Some(&input_wake_tx),
+                    Some(&item_report_tx),
                 ) {
                     Ok(sink) => {
                         if let Some(ref settings) = screensaver_settings {
@@ -4056,7 +4288,7 @@ fn build_render_sinks(
         }
     }
 
-    (sinks, input_wake_rx)
+    (sinks, input_wake_rx, scan_jobs, item_report_rx)
 }
 
 /// Spawn the engine, sources, inhibitor, and notifier for one generation.
@@ -4136,6 +4368,23 @@ fn spawn_generation(
     });
 
     let mut producer_handles = Vec::new();
+
+    #[cfg(feature = "render")]
+    for job in assembly.scan_jobs {
+        let token = producer_token.clone();
+        producer_handles.push(tokio::task::spawn_blocking(move || {
+            run_luma_scan_job(job, &token);
+        }));
+    }
+
+    #[cfg(feature = "render")]
+    if let Some(item_report_rx) = assembly.item_report_rx {
+        producer_handles.push(spawn_item_report_drain(
+            item_report_rx,
+            assembly.item_journal.clone(),
+            producer_token.clone(),
+        ));
+    }
 
     if should_spawn_coordination_poller(&assembly.cfg, coordination.as_ref())
         && let Some(state) = coordination
@@ -4998,6 +5247,231 @@ mod render_tests {
         }
     }
 
+    fn screensaver_config_for_test(
+        path: &std::path::Path,
+        wear_temperature: f64,
+        shift_heat_bias: f64,
+    ) -> dormant_core::config::schema::Config {
+        use dormant_core::config::schema::{
+            Config, DaemonConfig, ScreensaverConfig, ScreensaverSource,
+        };
+        use dormant_core::types::{LadderStage, StageKind};
+        use indexmap::IndexMap;
+
+        let mut display = base_display_cfg_for_test();
+        display.output = Some("DP-1".into());
+        display.ladder = vec![LadderStage {
+            kind: StageKind::RenderScreensaver,
+            dwell: Some(Duration::from_secs(30)),
+        }];
+        display.screensaver = Some(ScreensaverConfig {
+            trigger: "vacancy".into(),
+            audio: false,
+            source: vec![ScreensaverSource {
+                path: Some(path.to_string_lossy().into_owned()),
+                urls: Vec::new(),
+                recurse: false,
+                shuffle: false,
+                order: Some("wear-even".into()),
+                wear_tag: None,
+                image_duration: None,
+            }],
+            scale_mode: None,
+            transition: None,
+            transition_duration: None,
+            shift_px: 0,
+            shift_interval: Duration::from_secs(120),
+            wear_temperature,
+            shift_heat_bias,
+        });
+        Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("mon".into(), display)]),
+            rules: IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_render_sinks_exposes_scan_jobs_without_waiting_for_decode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = dir.path().join("still.png");
+        std::fs::write(&image, b"not decoded by assembly").expect("fixture");
+        let cfg = screensaver_config_for_test(dir.path(), 0.05, 0.25);
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 7,
+            item_journal: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let (_sinks, _rx, jobs, _item_reports) =
+            build_render_sinks_with_context(&cfg, None, &context);
+
+        assert_eq!(jobs.len(), 1);
+        let expected_uri = image.canonicalize().expect("fixture path canonicalizes");
+        assert_eq!(jobs[0].uri, expected_uri.to_string_lossy());
+    }
+
+    #[test]
+    fn item_journal_is_bounded_and_keeps_newest_report() {
+        let journal: CurrentItemJournal = Arc::new(Mutex::new(HashMap::new()));
+        let display_id = DisplayId("panel".into());
+        for index in 0..=CURRENT_ITEM_JOURNAL_CAPACITY {
+            append_item_report(
+                &journal,
+                ScreensaverItemReport {
+                    display_id: display_id.clone(),
+                    uri: Some(index.to_string()),
+                    luma: None,
+                    observed_at: std::time::Instant::now(),
+                },
+            );
+        }
+        let entries = journal.lock().unwrap();
+        let reports = entries.get(&display_id).unwrap();
+        assert_eq!(reports.len(), CURRENT_ITEM_JOURNAL_CAPACITY);
+        assert_eq!(reports.back().unwrap().uri.as_deref(), Some("1024"));
+    }
+
+    #[tokio::test]
+    async fn screensaver_wear_knobs_flow_on_initial_build_and_reload() {
+        use dormant_core::fakes::RecordingRenderSink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let initial = screensaver_config_for_test(dir.path(), 0.05, 0.25);
+        let reloaded = screensaver_config_for_test(dir.path(), 0.75, 0.9);
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 7,
+            item_journal: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let factory: RenderSinkBuilder = {
+            let captured = captured.clone();
+            Arc::new(move |_did, _output, _tx, _item_reports, settings, _shift| {
+                if let Some(settings) = settings {
+                    captured.lock().unwrap().push(settings.clone());
+                }
+                Some(Arc::new(RecordingRenderSink::new()) as Arc<dyn RenderSink>)
+            })
+        };
+
+        let _ = build_render_sinks_with_context(&initial, Some(&factory), &context);
+        let _ = build_render_sinks_with_context(&reloaded, Some(&factory), &context);
+
+        let values = captured.lock().unwrap();
+        assert_eq!(values.len(), 2);
+        assert!((values[0].wear_temperature - 0.05).abs() < f64::EPSILON);
+        assert!((values[0].shift_heat_bias - 0.25).abs() < f64::EPSILON);
+        assert!((values[1].wear_temperature - 0.75).abs() < f64::EPSILON);
+        assert!((values[1].shift_heat_bias - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn scan_failure_keeps_original_playlist_and_logs_luma_scan_failed() {
+        use dormant_core::spatial_grid::HeatGrid;
+        use dormant_render::playlist::{MediaKind, PlaylistItem, PlaylistOrder};
+        use dormant_render::wear_order::apply_wear_even_groups;
+
+        let catalog = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let job = LumaScanJob {
+            display_id: DisplayId("mon".into()),
+            uri: "/missing/still.png".into(),
+            path: "/missing/still.png".into(),
+            cache: Arc::new(LumaCache::new()),
+            catalog: catalog.clone(),
+        };
+        let token = CancellationToken::new();
+        run_luma_scan_job(job, &token);
+        assert!(catalog.read().expect("catalog lock").is_empty());
+
+        let original = vec![
+            PlaylistItem {
+                uri: "missing.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "still.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+        ];
+        let heat = HeatGrid::new(1, 1, vec![0.0]).expect("heat grid");
+        let fallback = apply_wear_even_groups(&original, &catalog, &heat, 0.0, 1)
+            .unwrap_or_else(|_| original.clone());
+        assert_eq!(fallback, original);
+    }
+
+    #[tokio::test]
+    async fn completed_catalog_reorders_next_screensaver_show_from_latest_heat() {
+        use dormant_core::spatial_grid::{HeatGrid, LumaGrid};
+        use dormant_render::playlist::{MediaKind, PlaylistItem, PlaylistOrder};
+        use dormant_render::wear_order::apply_wear_even_groups;
+
+        let items = vec![
+            PlaylistItem {
+                uri: "left.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "right.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+        ];
+        let catalog = Arc::new(std::sync::RwLock::new(HashMap::from([
+            (
+                "left.png".into(),
+                LumaGrid::new({
+                    let mut cells = vec![0.0; 144];
+                    for row in 0..9 {
+                        cells[row * 16..row * 16 + 8].fill(1.0);
+                    }
+                    cells
+                })
+                .expect("left luma"),
+            ),
+            (
+                "right.png".into(),
+                LumaGrid::new({
+                    let mut cells = vec![0.0; 144];
+                    for row in 0..9 {
+                        cells[row * 16 + 8..row * 16 + 16].fill(1.0);
+                    }
+                    cells
+                })
+                .expect("right luma"),
+            ),
+        ])));
+        let cold_left = HeatGrid::new(1, 2, vec![0.0, 1.0]).expect("heat grid");
+        let cold_right = HeatGrid::new(1, 2, vec![1.0, 0.0]).expect("heat grid");
+
+        let first = apply_wear_even_groups(&items, &catalog, &cold_left, 0.0, 1).unwrap();
+        let next = apply_wear_even_groups(&items, &catalog, &cold_right, 0.0, 1).unwrap();
+
+        assert_eq!(first[0].uri, "left.png");
+        assert_eq!(next[0].uri, "right.png");
+    }
+
     /// The drain task routes each `DisplayId` received on the unbounded
     /// channel to the engine as `ControlMsg::InputWake`.  When the control
     /// channel is closed (shutdown), the drain exits cleanly.
@@ -5390,9 +5864,10 @@ mod render_tests {
 
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, _ss, _shift| {
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, _ss, _shift| {
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, input_wake_rx) = build_render_sinks(&cfg, Some(&factory));
 
@@ -5470,6 +5945,7 @@ mod render_tests {
                             recurse: false,
                             shuffle: false,
                             order: None,
+                            wear_tag: None,
                             image_duration: None,
                         }],
                         scale_mode: None,
@@ -5477,6 +5953,8 @@ mod render_tests {
                         transition_duration: None,
                         shift_px: 3,
                         shift_interval: Duration::from_secs(45),
+                        wear_temperature: 0.05,
+                        shift_heat_bias: 0.25,
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -5496,11 +5974,12 @@ mod render_tests {
         let captured_shift_for_factory = captured_shift.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, shift| {
-            *captured_ss_for_factory.lock().expect("capture") = ss.cloned();
-            *captured_shift_for_factory.lock().expect("capture") = shift.copied();
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, ss, shift| {
+                *captured_ss_for_factory.lock().expect("capture") = ss.cloned();
+                *captured_shift_for_factory.lock().expect("capture") = shift.copied();
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
         assert!(
@@ -5570,10 +6049,11 @@ mod render_tests {
         let captured_shift_for_factory = captured_shift.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, _ss, shift| {
-            *captured_shift_for_factory.lock().expect("capture") = shift.copied();
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, _ss, shift| {
+                *captured_shift_for_factory.lock().expect("capture") = shift.copied();
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
         assert!(!sinks.is_empty());
@@ -5635,6 +6115,7 @@ mod render_tests {
                             recurse: false,
                             shuffle: false,
                             order: None,
+                            wear_tag: None,
                             image_duration: None,
                         }],
                         scale_mode: Some("stretch".into()),
@@ -5642,6 +6123,8 @@ mod render_tests {
                         transition_duration: None,
                         shift_px: 2,
                         shift_interval: Duration::from_secs(120),
+                        wear_temperature: 0.05,
+                        shift_heat_bias: 0.25,
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -5660,12 +6143,13 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
-            if let Some(s) = ss {
-                *captured_for_factory.lock().expect("capture") = Some(s.clone());
-            }
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, ss, _shift| {
+                if let Some(s) = ss {
+                    *captured_for_factory.lock().expect("capture") = Some(s.clone());
+                }
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
         assert!(
@@ -5731,6 +6215,7 @@ mod render_tests {
                             recurse: false,
                             shuffle: false,
                             order: None,
+                            wear_tag: None,
                             image_duration: None,
                         }],
                         // scale_mode intentionally absent (None) — the
@@ -5740,6 +6225,8 @@ mod render_tests {
                         transition_duration: None,
                         shift_px: 2,
                         shift_interval: Duration::from_secs(120),
+                        wear_temperature: 0.05,
+                        shift_heat_bias: 0.25,
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -5765,12 +6252,13 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
-            if let Some(s) = ss {
-                *captured_for_factory.lock().expect("capture") = Some(s.clone());
-            }
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, ss, _shift| {
+                if let Some(s) = ss {
+                    *captured_for_factory.lock().expect("capture") = Some(s.clone());
+                }
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
         assert!(!sinks.is_empty());
@@ -5834,6 +6322,7 @@ mod render_tests {
                             recurse: false,
                             shuffle: false,
                             order: None,
+                            wear_tag: None,
                             image_duration: None,
                         }],
                         scale_mode: None,
@@ -5841,6 +6330,8 @@ mod render_tests {
                         transition_duration: None,
                         shift_px: 2,
                         shift_interval: Duration::from_secs(120),
+                        wear_temperature: 0.05,
+                        shift_heat_bias: 0.25,
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -5857,12 +6348,13 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
-            if let Some(s) = ss {
-                *captured_for_factory.lock().expect("capture") = Some(s.clone());
-            }
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, ss, _shift| {
+                if let Some(s) = ss {
+                    *captured_for_factory.lock().expect("capture") = Some(s.clone());
+                }
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
         assert!(
@@ -5928,6 +6420,7 @@ mod render_tests {
                             recurse: false,
                             shuffle: false,
                             order: None,
+                            wear_tag: None,
                             image_duration: None,
                         }],
                         scale_mode: None,
@@ -5938,6 +6431,8 @@ mod render_tests {
                         transition_duration: None,
                         shift_px: 2,
                         shift_interval: Duration::from_secs(120),
+                        wear_temperature: 0.05,
+                        shift_heat_bias: 0.25,
                     }),
                     output: Some("DP-1".into()),
                     ..base_display_cfg_for_test()
@@ -5963,12 +6458,13 @@ mod render_tests {
         let captured_for_factory = captured.clone();
         let recording = RecordingRenderSink::new();
         let recorded = recording.clone();
-        let factory: RenderSinkBuilder = Arc::new(move |_did, _output, _tx, ss, _shift| {
-            if let Some(s) = ss {
-                *captured_for_factory.lock().expect("capture") = Some(s.clone());
-            }
-            Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
-        });
+        let factory: RenderSinkBuilder =
+            Arc::new(move |_did, _output, _tx, _item_reports, ss, _shift| {
+                if let Some(s) = ss {
+                    *captured_for_factory.lock().expect("capture") = Some(s.clone());
+                }
+                Some(Arc::new(recorded.clone()) as Arc<dyn RenderSink>)
+            });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
         assert!(!sinks.is_empty());

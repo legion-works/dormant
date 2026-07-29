@@ -102,6 +102,9 @@ pub struct WearTrackerDeps {
     pub executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     /// Shared ledger map for concurrent readers (IPC/WebUI).
     pub handle: WearHandle,
+    /// Latest heat snapshots exposed to render sessions, when rendering is enabled.
+    #[cfg(feature = "render")]
+    pub heat_snapshots: dormant_render::HeatSnapshotHandle,
     /// Daemon-lifetime cancellation token.
     pub cancel: CancellationToken,
     /// The wear state directory, resolved ONCE and synchronously by
@@ -210,6 +213,8 @@ async fn run(mut deps: WearTrackerDeps) {
                 let actions = tick(&mut state, &snapshot, &samples, &cfg.wear, now);
                 apply_actions(&mut state, actions, &executors, &deps.ctl_tx, &dir).await;
                 sync_handle(&state, &deps.handle);
+                #[cfg(feature = "render")]
+                sync_heat_snapshots(&state, &deps.heat_snapshots);
             }
         }
     }
@@ -477,6 +482,32 @@ fn sync_handle(state: &TrackerState, handle: &WearHandle) {
             .cloned()
             .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
         guard.insert(key, ledger.clone());
+    }
+}
+
+#[cfg(feature = "render")]
+fn sync_heat_snapshots(state: &TrackerState, handle: &dormant_render::HeatSnapshotHandle) {
+    let Ok(mut snapshots) = handle.write() else {
+        return;
+    };
+    snapshots.clear();
+    for (display_id, ledger) in &state.ledgers {
+        let Some(config_id) = ledger.identity.config_display_id.as_ref() else {
+            continue;
+        };
+        let Some(heat) = dormant_core::spatial_grid::HeatGrid::new(
+            ledger.grid_rows,
+            ledger.grid_cols,
+            ledger.heat_map(),
+        ) else {
+            tracing::warn!(
+                event = "wear_heat_snapshot_invalid",
+                display = %display_id,
+                config_display_id = %config_id,
+            );
+            continue;
+        };
+        snapshots.insert(dormant_core::types::DisplayId(config_id.clone()), heat);
     }
 }
 
@@ -1291,6 +1322,8 @@ mod tests {
             ctl_tx,
             executors_rx,
             handle: wear_handle,
+            #[cfg(feature = "render")]
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
             cancel: cancel.clone(),
             dir: injected_dir.path().to_path_buf(),
             observations: ObservationHub::new(1),

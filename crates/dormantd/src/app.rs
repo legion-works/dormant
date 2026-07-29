@@ -82,7 +82,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "render")]
+use dormant_core::spatial_grid::HeatGrid;
+#[cfg(feature = "render")]
 use dormant_render::LayerShellRenderSink;
+#[cfg(feature = "render")]
+use dormant_render::luma::{LumaCache, LumaCatalog, LumaScanJob};
 
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
@@ -97,6 +101,38 @@ use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
 
 const QUIESCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "render")]
+#[allow(clippy::cast_possible_truncation)]
+fn runtime_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    nanos ^ u64::from(std::process::id()).rotate_left(17)
+}
+
+#[cfg(feature = "render")]
+fn run_luma_scan_job(job: LumaScanJob, token: &CancellationToken) {
+    let result = job.cache.scan_path(&job.path);
+    if token.is_cancelled() {
+        return;
+    }
+    match result {
+        Ok(grid) => {
+            if let Ok(mut catalog) = job.catalog.write() {
+                catalog.insert(job.uri, grid);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                event = "screensaver_luma_scan_failed",
+                display_id = %job.display_id,
+                uri = %job.uri,
+                error = %error,
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuiesceOutcome {
@@ -172,6 +208,17 @@ type RenderSinkBuilder = Arc<
         + Send
         + Sync,
 >;
+
+#[cfg(feature = "render")]
+struct RenderContext {
+    luma_cache: Arc<LumaCache>,
+    luma_catalog: LumaCatalog,
+    heat_snapshots: HeatSnapshotHandle,
+    seed: u64,
+}
+
+#[cfg(feature = "render")]
+type HeatSnapshotHandle = Arc<std::sync::RwLock<HashMap<DisplayId, HeatGrid>>>;
 
 pub use dormant_core::reload::ReloadOutcome;
 use dormant_core::reload::{ReloadRequest, ReloadRequester};
@@ -877,13 +924,26 @@ impl App {
         let started_web_port = cfg.daemon.web_port;
         let started_web_bind = cfg.daemon.web_bind;
 
+        // These handles are daemon-lifetime state: image scans survive a
+        // config reload, while heat snapshots are replaced by the tracker.
+        let wear_handle: dormant_core::wear::WearHandle =
+            Arc::new(std::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "render")]
-        let assembly = assemble_static(
+        let render_context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: runtime_seed(),
+        };
+
+        #[cfg(feature = "render")]
+        let assembly = assemble_static_with_context(
             cfg,
             creds,
             &self.source_builder,
             self.render_sink_builder.as_ref(),
             &ctrl_ctx,
+            &render_context,
         )
         .await
         .context("assemble initial runtime")?;
@@ -976,11 +1036,6 @@ impl App {
             .collect();
         executors_tx.send_replace(Arc::new(executors0));
 
-        // The daemon's single wear-ledger map (spec §5) — shared with the
-        // tracker and, in future, IPC/WebUI readers.
-        let wear_handle: dormant_core::wear::WearHandle =
-            Arc::new(std::sync::RwLock::new(HashMap::new()));
-
         // Stable front channels are paused before an old engine is drained, so
         // no delivery can race behind the generation barrier.
         let ctl_router = Arc::new(GenerationRouter::new_with_generation(
@@ -1068,6 +1123,8 @@ impl App {
                 ctl_tx: front_ctl_tx.clone(),
                 executors_rx: executors_rx.clone(),
                 handle: wear_handle.clone(),
+                #[cfg(feature = "render")]
+                heat_snapshots: render_context.heat_snapshots.clone(),
                 cancel: root.clone(),
                 dir: wear_dir,
                 observations: self.observations.clone(),
@@ -1239,6 +1296,8 @@ impl App {
             source_builder: self.source_builder,
             #[cfg(feature = "render")]
             render_sink_builder: self.render_sink_builder,
+            #[cfg(feature = "render")]
+            render_context,
             root: root.clone(),
             ctl_router,
             events_router,
@@ -1532,6 +1591,8 @@ struct Runner {
     source_builder: SourceBuilder,
     #[cfg(feature = "render")]
     render_sink_builder: Option<RenderSinkBuilder>,
+    #[cfg(feature = "render")]
+    render_context: RenderContext,
     root: CancellationToken,
     ctl_router: Arc<GenerationRouter<ControlMsg>>,
     events_router: Arc<GenerationRouter<PresenceEvent>>,
@@ -2492,12 +2553,13 @@ impl Runner {
         }
         #[cfg(feature = "render")]
         {
-            assemble_static(
+            assemble_static_with_context(
                 cfg,
                 creds,
                 &self.source_builder,
                 self.render_sink_builder.as_ref(),
                 &self.ctrl_ctx,
+                &self.render_context,
             )
             .await
             .map_err(|e| e.to_string())
@@ -2520,8 +2582,11 @@ impl Runner {
             });
         let (activity_rules, activity_poll) = activity_rules(&self.generation.cfg);
         #[cfg(feature = "render")]
-        let (render_sinks, input_wake_rx) =
-            build_render_sinks(&self.generation.cfg, self.render_sink_builder.as_ref());
+        let (render_sinks, input_wake_rx, scan_jobs) = build_render_sinks_with_context(
+            &self.generation.cfg,
+            self.render_sink_builder.as_ref(),
+            &self.render_context,
+        );
         let assembly = StaticAssembly {
             cfg: self.generation.cfg.clone(),
             creds: self.generation.creds.clone(),
@@ -2538,6 +2603,8 @@ impl Runner {
             render_sinks: HashMap::new(),
             #[cfg(feature = "render")]
             input_wake_rx: Some(input_wake_rx),
+            #[cfg(feature = "render")]
+            scan_jobs,
         };
         let spawn_result = spawn_generation_for_reload(
             &self.state_dir,
@@ -3462,6 +3529,8 @@ struct StaticAssembly {
     /// routes each item to [`ControlMsg::InputWake`].
     #[cfg(feature = "render")]
     input_wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DisplayId>>,
+    #[cfg(feature = "render")]
+    scan_jobs: Vec<LumaScanJob>,
 }
 
 /// Load config + credentials, logging any lenient-mode warnings.
@@ -3489,6 +3558,7 @@ fn load_cfg_creds(
 /// panel's lock — and, on macOS, a gamma selector's hold/breadcrumb — is
 /// the same shared instance before and after a config reload.
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 async fn assemble_static(
     cfg: Config,
     creds: Credentials,
@@ -3496,13 +3566,47 @@ async fn assemble_static(
     #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
     ctx: &ControllerBuildContext,
 ) -> Result<StaticAssembly> {
+    #[cfg(feature = "render")]
+    {
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 0,
+        };
+        assemble_static_with_context(
+            cfg,
+            creds,
+            source_builder,
+            render_sink_builder,
+            ctx,
+            &context,
+        )
+        .await
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        assemble_static_with_context(cfg, creds, source_builder, ctx).await
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assemble_static_with_context(
+    cfg: Config,
+    creds: Credentials,
+    source_builder: &SourceBuilder,
+    #[cfg(feature = "render")] render_sink_builder: Option<&RenderSinkBuilder>,
+    ctx: &ControllerBuildContext,
+    #[cfg(feature = "render")] render_context: &RenderContext,
+) -> Result<StaticAssembly> {
     // First rule referencing each display drives its retry + timings.
     let display_rule = index_display_rules(&cfg);
 
     let mut display_runtime: Vec<DisplayRuntimeCfg> = Vec::new();
     let mut display_executors: HashMap<DisplayId, Arc<DisplayExecutor>> = HashMap::new();
     #[cfg(feature = "render")]
-    let (render_sinks, input_wake_rx) = build_render_sinks(&cfg, render_sink_builder);
+    let (render_sinks, input_wake_rx, scan_jobs) =
+        build_render_sinks_with_context(&cfg, render_sink_builder, render_context);
     #[cfg(not(feature = "render"))]
     let render_sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
 
@@ -3666,6 +3770,8 @@ async fn assemble_static(
         render_sinks,
         #[cfg(feature = "render")]
         input_wake_rx: Some(input_wake_rx),
+        #[cfg(feature = "render")]
+        scan_jobs,
     })
 }
 
@@ -3914,6 +4020,8 @@ mod audio_rules_tests {
 /// this keeps FS scanning off the wayland thread and matches the generation
 /// model where a config reload rebuilds it.  Fresh-per-show is future work.
 #[cfg(feature = "render")]
+#[cfg(any(test, feature = "test-util"))]
+#[allow(dead_code)]
 #[allow(clippy::too_many_lines)] // ScreensaverSettings + ShiftSettings assembly, both documented inline
 fn build_render_sinks(
     cfg: &Config,
@@ -3922,10 +4030,34 @@ fn build_render_sinks(
     HashMap<DisplayId, Arc<dyn RenderSink>>,
     tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
 ) {
+    let context = RenderContext {
+        luma_cache: Arc::new(LumaCache::new()),
+        luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        seed: 0,
+    };
+    let (sinks, input_wake_rx, _) =
+        build_render_sinks_with_context(cfg, render_sink_builder, &context);
+    (sinks, input_wake_rx)
+}
+
+#[cfg(feature = "render")]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::type_complexity)]
+fn build_render_sinks_with_context(
+    cfg: &Config,
+    render_sink_builder: Option<&RenderSinkBuilder>,
+    context: &RenderContext,
+) -> (
+    HashMap<DisplayId, Arc<dyn RenderSink>>,
+    tokio::sync::mpsc::UnboundedReceiver<DisplayId>,
+    Vec<LumaScanJob>,
+) {
     use dormant_render::ScreensaverSettings;
     use dormant_render::playlist;
 
     let mut sinks: HashMap<DisplayId, Arc<dyn RenderSink>> = HashMap::new();
+    let mut scan_jobs = Vec::new();
     let (input_wake_tx, input_wake_rx) = tokio::sync::mpsc::unbounded_channel::<DisplayId>();
 
     for (name, dc) in &cfg.displays {
@@ -3942,7 +4074,28 @@ fn build_render_sinks(
             .any(|s| s.kind == dormant_core::types::StageKind::RenderScreensaver)
         {
             dc.screensaver.as_ref().map(|ss| {
-                let items = playlist::build_playlist(&ss.source, None);
+                let items = playlist::build_playlist(&ss.source, Some(context.seed));
+                for item in &items {
+                    if let Some(tag) = item.wear_tag {
+                        if let Ok(mut catalog) = context.luma_catalog.write() {
+                            catalog.insert(
+                                item.uri.clone(),
+                                dormant_render::luma::flat_grid_for_tag(tag),
+                            );
+                        }
+                    } else if item.media_kind == dormant_render::playlist::MediaKind::Image {
+                        let path = std::path::PathBuf::from(&item.uri);
+                        if path.is_absolute() {
+                            scan_jobs.push(LumaScanJob {
+                                display_id: did.clone(),
+                                uri: item.uri.clone(),
+                                path,
+                                cache: context.luma_cache.clone(),
+                                catalog: context.luma_catalog.clone(),
+                            });
+                        }
+                    }
+                }
                 // scale_mode: None (absent) → Fill.  Validation has already
                 // rejected any unknown string value, so a failed parse here
                 // would only be reachable through a programmatic caller
@@ -3983,6 +4136,11 @@ fn build_render_sinks(
                     scale_mode,
                     transition,
                     transition_duration,
+                    heat_snapshots: context.heat_snapshots.clone(),
+                    luma_catalog: context.luma_catalog.clone(),
+                    seed: context.seed,
+                    wear_temperature: ss.wear_temperature,
+                    shift_heat_bias: ss.shift_heat_bias,
                 }
             })
         } else {
@@ -4056,7 +4214,7 @@ fn build_render_sinks(
         }
     }
 
-    (sinks, input_wake_rx)
+    (sinks, input_wake_rx, scan_jobs)
 }
 
 /// Spawn the engine, sources, inhibitor, and notifier for one generation.
@@ -4136,6 +4294,14 @@ fn spawn_generation(
     });
 
     let mut producer_handles = Vec::new();
+
+    #[cfg(feature = "render")]
+    for job in assembly.scan_jobs {
+        let token = producer_token.clone();
+        producer_handles.push(tokio::task::spawn_blocking(move || {
+            run_luma_scan_job(job, &token);
+        }));
+    }
 
     if should_spawn_coordination_poller(&assembly.cfg, coordination.as_ref())
         && let Some(state) = coordination
@@ -4996,6 +5162,163 @@ mod render_tests {
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
         }
+    }
+
+    #[tokio::test]
+    async fn build_render_sinks_exposes_scan_jobs_without_waiting_for_decode() {
+        use dormant_core::config::schema::{
+            Config, DaemonConfig, ScreensaverConfig, ScreensaverSource,
+        };
+        use dormant_core::types::{LadderStage, StageKind};
+        use indexmap::IndexMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = dir.path().join("still.png");
+        std::fs::write(&image, b"not decoded by assembly").expect("fixture");
+        let mut display = base_display_cfg_for_test();
+        display.output = Some("DP-1".into());
+        display.ladder = vec![LadderStage {
+            kind: StageKind::RenderScreensaver,
+            dwell: Some(Duration::from_secs(30)),
+        }];
+        display.screensaver = Some(ScreensaverConfig {
+            trigger: "vacancy".into(),
+            audio: false,
+            source: vec![ScreensaverSource {
+                path: Some(dir.path().to_string_lossy().into_owned()),
+                urls: Vec::new(),
+                recurse: false,
+                shuffle: false,
+                order: Some("wear-even".into()),
+                wear_tag: None,
+                image_duration: None,
+            }],
+            scale_mode: None,
+            transition: None,
+            transition_duration: None,
+            shift_px: 0,
+            shift_interval: Duration::from_secs(120),
+            wear_temperature: 0.05,
+            shift_heat_bias: 0.25,
+        });
+        let cfg = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::from([("mon".into(), display)]),
+            rules: IndexMap::new(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
+        };
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 7,
+        };
+        let (_sinks, _rx, jobs) = build_render_sinks_with_context(&cfg, None, &context);
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].uri, image.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn scan_failure_keeps_original_playlist_and_logs_luma_scan_failed() {
+        use dormant_core::spatial_grid::HeatGrid;
+        use dormant_render::playlist::{MediaKind, PlaylistItem, PlaylistOrder};
+        use dormant_render::wear_order::apply_wear_even_groups;
+
+        let catalog = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let job = LumaScanJob {
+            display_id: DisplayId("mon".into()),
+            uri: "/missing/still.png".into(),
+            path: "/missing/still.png".into(),
+            cache: Arc::new(LumaCache::new()),
+            catalog: catalog.clone(),
+        };
+        let token = CancellationToken::new();
+        run_luma_scan_job(job, &token);
+        assert!(catalog.read().expect("catalog lock").is_empty());
+
+        let original = vec![
+            PlaylistItem {
+                uri: "missing.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "still.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+        ];
+        let heat = HeatGrid::new(1, 1, vec![0.0]).expect("heat grid");
+        let fallback = apply_wear_even_groups(&original, &catalog, &heat, 0.0, 1)
+            .unwrap_or_else(|_| original.clone());
+        assert_eq!(fallback, original);
+    }
+
+    #[tokio::test]
+    async fn completed_catalog_reorders_next_screensaver_show_from_latest_heat() {
+        use dormant_core::spatial_grid::{HeatGrid, LumaGrid};
+        use dormant_render::playlist::{MediaKind, PlaylistItem, PlaylistOrder};
+        use dormant_render::wear_order::apply_wear_even_groups;
+
+        let items = vec![
+            PlaylistItem {
+                uri: "left.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "right.png".into(),
+                media_kind: MediaKind::Image,
+                order: PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+        ];
+        let catalog = Arc::new(std::sync::RwLock::new(HashMap::from([
+            (
+                "left.png".into(),
+                LumaGrid::new({
+                    let mut cells = vec![0.0; 144];
+                    for row in 0..9 {
+                        cells[row * 16..row * 16 + 8].fill(1.0);
+                    }
+                    cells
+                })
+                .expect("left luma"),
+            ),
+            (
+                "right.png".into(),
+                LumaGrid::new({
+                    let mut cells = vec![0.0; 144];
+                    for row in 0..9 {
+                        cells[row * 16 + 8..row * 16 + 16].fill(1.0);
+                    }
+                    cells
+                })
+                .expect("right luma"),
+            ),
+        ])));
+        let cold_left = HeatGrid::new(1, 2, vec![0.0, 1.0]).expect("heat grid");
+        let cold_right = HeatGrid::new(1, 2, vec![1.0, 0.0]).expect("heat grid");
+
+        let first = apply_wear_even_groups(&items, &catalog, &cold_left, 0.0, 1).unwrap();
+        let next = apply_wear_even_groups(&items, &catalog, &cold_right, 0.0, 1).unwrap();
+
+        assert_eq!(first[0].uri, "left.png");
+        assert_eq!(next[0].uri, "right.png");
     }
 
     /// The drain task routes each `DisplayId` received on the unbounded

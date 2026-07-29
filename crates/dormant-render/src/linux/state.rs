@@ -44,6 +44,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, Mode, PostAction};
 
 use dormant_core::error::E_RENDER_UNAVAILABLE;
+use dormant_core::spatial_grid::{HeatGrid, LUMA_GRID_COLS, LUMA_GRID_ROWS};
 use dormant_core::types::{CmdFailure, DisplayId, StageKind};
 
 use super::blend::{self, T_MAX};
@@ -58,6 +59,7 @@ use crate::latch::FirstInputLatch;
 use crate::screensaver::{MpvItemEvent, MpvPlayer};
 use crate::settings::{ScreensaverSettings, ShiftSettings, TransitionMode};
 use crate::shift::ShiftState;
+use crate::wear_order::apply_wear_even_groups;
 
 /// Re-export of the long `WpSinglePixelBufferManagerV1` type so callers
 /// in [`crate::linux::surface`] can name it without a full
@@ -1493,12 +1495,46 @@ impl WaylandState {
         // to close it.
         let (read_fd, write_fd) = make_wakeup_pipe()?;
 
+        // Heat is copied under a short lock before scoring.  Decoding and
+        // ordering never hold the daemon snapshot lock or touch the filesystem.
+        let heat = settings
+            .heat_snapshots
+            .read()
+            .ok()
+            .and_then(|snapshots| snapshots.get(&self.display_id).cloned())
+            .or_else(|| {
+                HeatGrid::new(
+                    LUMA_GRID_ROWS,
+                    LUMA_GRID_COLS,
+                    vec![0.0; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)],
+                )
+            })
+            .expect("fixed zero heat grid is valid");
+        let original_items = settings.items;
+        let items = match apply_wear_even_groups(
+            &original_items,
+            &settings.luma_catalog,
+            &heat,
+            settings.wear_temperature,
+            settings.seed,
+        ) {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::warn!(
+                    event = "screensaver_wear_order_fallback",
+                    display_id = %self.display_id,
+                    reason = %error,
+                );
+                original_items
+            }
+        };
+
         // ── mpv player ──────────────────────────────────────────────
         // Build the player.  On Err, `write_fd` is dropped here
         // (closing it) and we still own `read_fd` — the caller-side
         // match below handles the read-fd close on Err.
         let player_result = MpvPlayer::new(
-            settings.items,
+            items,
             settings.image_duration,
             settings.audio,
             settings.scale_mode,

@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use dormant_core::spatial_grid::{LUMA_GRID_COLS, LUMA_GRID_ROWS, LumaGrid};
+use dormant_core::types::DisplayId;
 use image::ImageReader;
 use thiserror::Error;
 
@@ -20,6 +21,21 @@ pub enum WearTag {
 
 /// Shared process-memory catalog of scanned luma grids.
 pub type LumaCatalog = Arc<RwLock<HashMap<String, LumaGrid>>>;
+
+/// One generation-owned image scan request.
+#[derive(Clone)]
+pub struct LumaScanJob {
+    /// Display whose playlist contains the item.
+    pub display_id: DisplayId,
+    /// Playlist URI used as the catalog key and warning anchor.
+    pub uri: String,
+    /// Local image path to decode.
+    pub path: PathBuf,
+    /// Process-owned cache retained across reloads.
+    pub cache: Arc<LumaCache>,
+    /// Process-owned catalog updated after a successful scan.
+    pub catalog: LumaCatalog,
+}
 
 /// Convert one normalized sRGB channel to linear light.
 #[must_use]

@@ -253,6 +253,7 @@ mod tests {
             scale_mode: ScaleMode::Stretch,
             transition: TransitionMode::None,
             transition_duration: Duration::from_millis(500),
+            ..ScreensaverSettings::default()
         };
         let expected_items = settings.items.clone();
         let expected_dur = settings.image_duration;

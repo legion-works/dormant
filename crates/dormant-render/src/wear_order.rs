@@ -135,7 +135,7 @@ mod tests {
     use dormant_core::spatial_grid::{HeatGrid, LumaGrid};
     use proptest::prelude::*;
 
-    use super::{WearOrderError, wear_even_cycle};
+    use super::{WearOrderError, apply_wear_even_groups, wear_even_cycle};
     use crate::playlist::{MediaKind, PlaylistItem, PlaylistOrder};
 
     fn item(uri: &str) -> PlaylistItem {
@@ -253,6 +253,33 @@ mod tests {
         let result = wear_even_cycle(&items, &catalog, &heat, 0.0, 0);
 
         assert!(matches!(result, Err(WearOrderError::MissingLuma { .. })));
+    }
+
+    #[test]
+    fn wear_even_groups_apply_initial_order_at_session_install() {
+        let items = vec![item("b"), item("a")];
+        let catalog = catalog(&items, 0.5);
+        let heat = HeatGrid::new(1, 1, vec![0.0]).unwrap();
+
+        let ordered = apply_wear_even_groups(&items, &catalog, &heat, 0.0, 3).unwrap();
+
+        assert_eq!(ordered.len(), items.len());
+        assert_eq!(ordered[0].uri, "a");
+    }
+
+    #[test]
+    fn wear_even_groups_regenerate_when_playlist_changes() {
+        let initial = vec![item("a"), item("b")];
+        let expanded = vec![item("a"), item("b"), item("c")];
+        let catalog = catalog(&expanded, 0.5);
+        let heat = HeatGrid::new(1, 1, vec![0.0]).unwrap();
+
+        let first = apply_wear_even_groups(&initial, &catalog, &heat, 0.0, 3).unwrap();
+        let next = apply_wear_even_groups(&expanded, &catalog, &heat, 0.0, 3).unwrap();
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(next.len(), 3);
+        assert!(next.iter().any(|item| item.uri == "c"));
     }
 
     proptest! {

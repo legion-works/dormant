@@ -64,6 +64,7 @@ mod stub;
 // from a `dormant_core::config::ScreensaverConfig` and pass it into
 // the sink.  Available on all platforms — the stub sink just ignores
 // the settings.
+pub use settings::HeatSnapshotHandle;
 pub use settings::{ScaleMode, ScreensaverSettings, ShiftSettings, TransitionMode};
 
 // Linux uses the real Wayland backend; non-Linux uses the stub.  Both

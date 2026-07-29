@@ -315,6 +315,8 @@ urls = ["https://example.com/background.jpg"]
 | `transition_duration` | duration | no | `"1s"` | Length of the crossfade blend (ignored when `transition = "none"`). Bounded to `100ms..=10s`. |
 | `shift_px` | integer | no | `2` | Pixel-shift distance on the screensaver surface. `0` disables pixel shift. |
 | `shift_interval` | duration | no | `"120s"` | Time between screensaver shifts; minimum `10s`. |
+| `wear_temperature` | number | no | `0.05` | Temperature for wear-even scoring, range `0.0..=1.0`. |
+| `shift_heat_bias` | number | no | `0.25` | Bias toward cooler regions for existing pixel-shift offsets, range `0.0..=1.0`. |
 | `[[…source]]` | array | yes | — | Ordered list of media sources for the playlist. |
 
 Each source supports:
@@ -327,8 +329,6 @@ Each source supports:
 | `shuffle` | boolean | no | `false` | Shuffle items from this source (Fisher-Yates, seeded per restart). Mutually exclusive with `order`. |
 | `order` | string | no | — | Ordering strategy: `"sequential"` or `"wear-even"`. Mutually exclusive with `shuffle`; missing luma grids fail open to the configured order. |
 | `wear_tag` | string | no | — | Source-level label copied to each item for wear attribution. |
-| `wear_temperature` | number | no | `0.05` | Temperature for wear-even scoring, range `0.001..=10.0`. |
-| `shift_heat_bias` | number | no | `0.25` | Bias toward cooler regions for existing pixel-shift offsets, range `0.0..=1.0`. |
 | `image_duration` | duration | no | `"8s"` | Per-image display duration override (must be > 0). |
 
 Pixel shift applies only to `render_screensaver`. The `render_black` surface

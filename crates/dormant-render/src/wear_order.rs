@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn wear_even_groups_apply_initial_order_at_session_install() {
+    fn wear_even_groups_apply_initial_order_for_call_site() {
         let items = vec![item("b"), item("a")];
         let catalog = catalog(&items, 0.5);
         let heat = HeatGrid::new(1, 1, vec![0.0]).unwrap();

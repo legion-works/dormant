@@ -994,6 +994,38 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn sync_heat_snapshots_publishes_configured_ledgers_only() {
+        let configured_id = DisplayId("configured".into());
+        let unconfigured_id = DisplayId("unconfigured".into());
+        let mut configured = fresh_ledger(&configured_id, 0);
+        configured.cells[0].wear_hours = 3.5;
+        let mut unconfigured = fresh_ledger(&unconfigured_id, 0);
+        unconfigured.identity.config_display_id = None;
+        let mut state = TrackerState::default();
+        state.ledgers.insert(configured_id, configured.clone());
+        state.ledgers.insert(unconfigured_id.clone(), unconfigured);
+        let handle = Arc::new(std::sync::RwLock::new(HashMap::new()));
+
+        sync_heat_snapshots(&state, &handle);
+
+        let snapshots = handle.read().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots.get(&DisplayId("configured".into())),
+            Some(
+                &dormant_core::spatial_grid::HeatGrid::new(
+                    configured.grid_rows,
+                    configured.grid_cols,
+                    configured.heat_map(),
+                )
+                .unwrap()
+            )
+        );
+        assert!(!snapshots.contains_key(&unconfigured_id));
+    }
+
     fn snapshot_with(display: &DisplayId, phase: &str, stage: Option<StageInfo>) -> StateSnapshot {
         StateSnapshot {
             sensors: Vec::new(),

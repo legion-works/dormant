@@ -82,11 +82,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "render")]
-use dormant_core::spatial_grid::HeatGrid;
-#[cfg(feature = "render")]
-use dormant_render::LayerShellRenderSink;
-#[cfg(feature = "render")]
 use dormant_render::luma::{LumaCache, LumaCatalog, LumaScanJob};
+#[cfg(feature = "render")]
+use dormant_render::{HeatSnapshotHandle, LayerShellRenderSink};
 
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
@@ -120,6 +118,9 @@ fn run_luma_scan_job(job: LumaScanJob, token: &CancellationToken) {
     match result {
         Ok(grid) => {
             if let Ok(mut catalog) = job.catalog.write() {
+                if token.is_cancelled() {
+                    return;
+                }
                 catalog.insert(job.uri, grid);
             }
         }
@@ -216,9 +217,6 @@ struct RenderContext {
     heat_snapshots: HeatSnapshotHandle,
     seed: u64,
 }
-
-#[cfg(feature = "render")]
-type HeatSnapshotHandle = Arc<std::sync::RwLock<HashMap<DisplayId, HeatGrid>>>;
 
 pub use dormant_core::reload::ReloadOutcome;
 use dormant_core::reload::{ReloadRequest, ReloadRequester};
@@ -5164,17 +5162,17 @@ mod render_tests {
         }
     }
 
-    #[tokio::test]
-    async fn build_render_sinks_exposes_scan_jobs_without_waiting_for_decode() {
+    fn screensaver_config_for_test(
+        path: &std::path::Path,
+        wear_temperature: f64,
+        shift_heat_bias: f64,
+    ) -> dormant_core::config::schema::Config {
         use dormant_core::config::schema::{
             Config, DaemonConfig, ScreensaverConfig, ScreensaverSource,
         };
         use dormant_core::types::{LadderStage, StageKind};
         use indexmap::IndexMap;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let image = dir.path().join("still.png");
-        std::fs::write(&image, b"not decoded by assembly").expect("fixture");
         let mut display = base_display_cfg_for_test();
         display.output = Some("DP-1".into());
         display.ladder = vec![LadderStage {
@@ -5185,7 +5183,7 @@ mod render_tests {
             trigger: "vacancy".into(),
             audio: false,
             source: vec![ScreensaverSource {
-                path: Some(dir.path().to_string_lossy().into_owned()),
+                path: Some(path.to_string_lossy().into_owned()),
                 urls: Vec::new(),
                 recurse: false,
                 shuffle: false,
@@ -5198,10 +5196,10 @@ mod render_tests {
             transition_duration: None,
             shift_px: 0,
             shift_interval: Duration::from_secs(120),
-            wear_temperature: 0.05,
-            shift_heat_bias: 0.25,
+            wear_temperature,
+            shift_heat_bias,
         });
-        let cfg = Config {
+        Config {
             coordination: dormant_core::config::CoordinationConfig::default(),
             config_version: 1,
             daemon: DaemonConfig::default(),
@@ -5216,7 +5214,15 @@ mod render_tests {
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
             publish: dormant_core::config::PublishConfig::default(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn build_render_sinks_exposes_scan_jobs_without_waiting_for_decode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = dir.path().join("still.png");
+        std::fs::write(&image, b"not decoded by assembly").expect("fixture");
+        let cfg = screensaver_config_for_test(dir.path(), 0.05, 0.25);
         let context = RenderContext {
             luma_cache: Arc::new(LumaCache::new()),
             luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -5227,6 +5233,41 @@ mod render_tests {
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].uri, image.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn screensaver_wear_knobs_flow_on_initial_build_and_reload() {
+        use dormant_core::fakes::RecordingRenderSink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let initial = screensaver_config_for_test(dir.path(), 0.05, 0.25);
+        let reloaded = screensaver_config_for_test(dir.path(), 0.75, 0.9);
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 7,
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let factory: RenderSinkBuilder = {
+            let captured = captured.clone();
+            Arc::new(move |_did, _output, _tx, settings, _shift| {
+                if let Some(settings) = settings {
+                    captured.lock().unwrap().push(settings.clone());
+                }
+                Some(Arc::new(RecordingRenderSink::new()) as Arc<dyn RenderSink>)
+            })
+        };
+
+        let _ = build_render_sinks_with_context(&initial, Some(&factory), &context);
+        let _ = build_render_sinks_with_context(&reloaded, Some(&factory), &context);
+
+        let values = captured.lock().unwrap();
+        assert_eq!(values.len(), 2);
+        assert!((values[0].wear_temperature - 0.05).abs() < f64::EPSILON);
+        assert!((values[0].shift_heat_bias - 0.25).abs() < f64::EPSILON);
+        assert!((values[1].wear_temperature - 0.75).abs() < f64::EPSILON);
+        assert!((values[1].shift_heat_bias - 0.9).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

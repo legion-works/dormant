@@ -56,6 +56,7 @@ use super::wayland_ops::{
 };
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
+use crate::playlist::PlaylistItem;
 use crate::screensaver::{MpvItemEvent, MpvPlayer};
 use crate::settings::{ScreensaverSettings, ShiftSettings, TransitionMode};
 use crate::shift::ShiftState;
@@ -66,6 +67,48 @@ use crate::wear_order::apply_wear_even_groups;
 /// `wayland_protocols::wp::...` path.
 pub(super) type SinglePixelBufferManager =
     wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+
+/// Prepare the exact playlist handed to mpv for a screensaver show.
+///
+/// Ordering is deliberately kept at the session-install seam: the catalog
+/// may have completed scans since the settings were assembled, and a failed
+/// score must leave the original playlist untouched.
+fn screensaver_items_for_show(
+    settings: &ScreensaverSettings,
+    display_id: &DisplayId,
+) -> Vec<PlaylistItem> {
+    let heat = settings
+        .heat_snapshots
+        .read()
+        .ok()
+        .and_then(|snapshots| snapshots.get(display_id).cloned())
+        .or_else(|| {
+            HeatGrid::new(
+                LUMA_GRID_ROWS,
+                LUMA_GRID_COLS,
+                vec![0.0; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)],
+            )
+        })
+        .expect("16x9 zero grid: rows×cols must match cells.len()");
+    let original_items = settings.items.clone();
+    match apply_wear_even_groups(
+        &original_items,
+        &settings.luma_catalog,
+        &heat,
+        settings.wear_temperature,
+        settings.seed,
+    ) {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(
+                event = "screensaver_wear_order_fallback",
+                display_id = %display_id,
+                reason = %error,
+            );
+            original_items
+        }
+    }
+}
 
 /// Maximum time we'll wait for a compositor `configure` event after the
 /// initial layer-surface commit.  Compositors are expected to respond
@@ -1341,7 +1384,7 @@ impl WaylandState {
             if let Err(e) = self.complete_screensaver_show(
                 pending.layer_surface,
                 configured_size,
-                settings,
+                &settings,
                 pending.reply,
                 pending.r#gen,
             ) {
@@ -1452,7 +1495,7 @@ impl WaylandState {
         &mut self,
         layer_surface: LayerSurface,
         configured_size: (u32, u32),
-        settings: ScreensaverSettings,
+        settings: &ScreensaverSettings,
         reply: tokio::sync::oneshot::Sender<Result<(), CmdFailure>>,
         r#gen: u64,
     ) -> Result<(), CmdFailure> {
@@ -1495,39 +1538,8 @@ impl WaylandState {
         // to close it.
         let (read_fd, write_fd) = make_wakeup_pipe()?;
 
-        // Heat is copied under a short lock before scoring.  Decoding and
-        // ordering never hold the daemon snapshot lock or touch the filesystem.
-        let heat = settings
-            .heat_snapshots
-            .read()
-            .ok()
-            .and_then(|snapshots| snapshots.get(&self.display_id).cloned())
-            .or_else(|| {
-                HeatGrid::new(
-                    LUMA_GRID_ROWS,
-                    LUMA_GRID_COLS,
-                    vec![0.0; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)],
-                )
-            })
-            .expect("fixed zero heat grid is valid");
-        let original_items = settings.items;
-        let items = match apply_wear_even_groups(
-            &original_items,
-            &settings.luma_catalog,
-            &heat,
-            settings.wear_temperature,
-            settings.seed,
-        ) {
-            Ok(items) => items,
-            Err(error) => {
-                tracing::warn!(
-                    event = "screensaver_wear_order_fallback",
-                    display_id = %self.display_id,
-                    reason = %error,
-                );
-                original_items
-            }
-        };
+        // The heat lock is released before ordering and player setup.
+        let items = screensaver_items_for_show(settings, &self.display_id);
 
         // ── mpv player ──────────────────────────────────────────────
         // Build the player.  On Err, `write_fd` is dropped here
@@ -2616,7 +2628,7 @@ impl WaylandState {
             if let Err(e) = self.complete_screensaver_show(
                 existing.clone(),
                 self.configured_size,
-                settings,
+                &settings,
                 reply,
                 r#gen,
             ) {
@@ -2652,6 +2664,64 @@ impl WaylandState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn screensaver_install_orders_items_through_production_call_site() {
+        let items = vec![
+            PlaylistItem {
+                uri: "left.png".into(),
+                media_kind: crate::playlist::MediaKind::Image,
+                order: crate::playlist::PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+            PlaylistItem {
+                uri: "right.png".into(),
+                media_kind: crate::playlist::MediaKind::Image,
+                order: crate::playlist::PlaylistOrder::WearEven,
+                ..Default::default()
+            },
+        ];
+        let mut left_cells = vec![0.0; 144];
+        let mut right_cells = vec![0.0; 144];
+        for row in 0..9 {
+            left_cells[row * 16..row * 16 + 8].fill(1.0);
+            right_cells[row * 16 + 8..row * 16 + 16].fill(1.0);
+        }
+        let catalog = Arc::new(RwLock::new(HashMap::from([
+            (
+                "left.png".into(),
+                dormant_core::spatial_grid::LumaGrid::new(left_cells).unwrap(),
+            ),
+            (
+                "right.png".into(),
+                dormant_core::spatial_grid::LumaGrid::new(right_cells).unwrap(),
+            ),
+        ])));
+        let heat_snapshots = Arc::new(RwLock::new(HashMap::from([(
+            DisplayId("mon".into()),
+            HeatGrid::new(1, 2, vec![0.0, 1.0]).unwrap(),
+        )])));
+        let settings = ScreensaverSettings {
+            items,
+            heat_snapshots: heat_snapshots.clone(),
+            luma_catalog: catalog,
+            wear_temperature: 0.0,
+            seed: 7,
+            ..ScreensaverSettings::default()
+        };
+
+        let first = screensaver_items_for_show(&settings, &DisplayId("mon".into()));
+        heat_snapshots.write().unwrap().insert(
+            DisplayId("mon".into()),
+            HeatGrid::new(1, 2, vec![1.0, 0.0]).unwrap(),
+        );
+        let next = screensaver_items_for_show(&settings, &DisplayId("mon".into()));
+
+        assert_eq!(first[0].uri, "left.png");
+        assert_eq!(next[0].uri, "right.png");
+    }
 
     /// `should_fail_timeout` returns `true` ONLY when the timeout's
     /// gen matches the still-pending show's gen.  Anything else

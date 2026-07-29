@@ -66,7 +66,7 @@ use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buff
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use dormant_core::error::E_RENDER_UNAVAILABLE;
-use dormant_core::types::{CmdFailure, DisplayId};
+use dormant_core::types::{CmdFailure, DisplayId, ScreensaverItemReport};
 
 use crate::command::RenderCommand;
 use crate::linux::state::{CONFIGURE_TIMEOUT, WaylandState};
@@ -78,6 +78,7 @@ pub(super) fn spawn_wayland_thread(
     display_id: &DisplayId,
     output_name: &str,
     input_wake_tx: Option<&UnboundedSender<DisplayId>>,
+    item_report_tx: Option<&UnboundedSender<ScreensaverItemReport>>,
 ) -> Result<Sender<RenderCommand>, CmdFailure> {
     // `EventLoop` is `!Send` (calloop uses `Rc` internally), so we
     // build *everything* inside the spawned thread and use a oneshot
@@ -90,11 +91,12 @@ pub(super) fn spawn_wayland_thread(
     let did = display_id.clone();
     let oname = output_name.to_string();
     let iwt = input_wake_tx.cloned();
+    let irt = item_report_tx.cloned();
 
     std::thread::Builder::new()
         .name(format!("dormant-render-{display_id}"))
         .spawn(move || {
-            let result = init(&did, &oname, iwt.as_ref());
+            let result = init(&did, &oname, iwt.as_ref(), irt.as_ref());
             match result {
                 Ok((cmd_tx, event_loop, state, loop_handle)) => {
                     // Hand the sender to the async side.  The wayland
@@ -140,6 +142,7 @@ fn init(
     display_id: &DisplayId,
     output_name: &str,
     input_wake_tx: Option<&UnboundedSender<DisplayId>>,
+    item_report_tx: Option<&UnboundedSender<ScreensaverItemReport>>,
 ) -> InitResult {
     let conn = Connection::connect_to_env().map_err(|e| CmdFailure {
         controller: "render-black".into(),
@@ -215,6 +218,7 @@ fn init(
         display_id.clone(),
         output_name.to_string(),
         input_wake_tx,
+        item_report_tx,
         queue_handle,
         loop_should_exit.clone(),
         Arc::new(RealWaylandOps::new(

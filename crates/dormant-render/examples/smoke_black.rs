@@ -28,13 +28,14 @@ fn main() -> ExitCode {
         .expect("build tokio runtime");
     let target = env::args().nth(1).unwrap_or_else(|| "DP-1".into());
     eprintln!("smoke: target output = {target}");
-    let sink = match LayerShellRenderSink::new(DisplayId("smoke".into()), target.clone(), None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("smoke: construct sink failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let sink =
+        match LayerShellRenderSink::new(DisplayId("smoke".into()), target.clone(), None, None) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("smoke: construct sink failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let show = rt.block_on(sink.show(1, 0, StageKind::RenderBlack));
     if let Err(e) = show {

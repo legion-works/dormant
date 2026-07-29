@@ -2433,13 +2433,14 @@ wake_retry_interval = "1s"
         dormant_core::types::DisplayId,
         String,
         Option<&tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
+        Option<&tokio::sync::mpsc::UnboundedSender<dormant_core::types::ScreensaverItemReport>>,
         Option<&dormant_render::ScreensaverSettings>,
         Option<&dormant_render::ShiftSettings>,
     ) -> Option<Arc<dyn dormant_core::traits::RenderSink>>
     + Send
     + Sync
     + 'static {
-        move |_did, _output, _tx, _ss, _shift| Some(Arc::new(sink.clone()))
+        move |_did, _output, _tx, _item_reports, _ss, _shift| Some(Arc::new(sink.clone()))
     }
 
     /// Assembles a config with a render ladder and verifies the
@@ -2723,6 +2724,9 @@ wake_retry_interval = "1s"
                             _output: String,
                             tx: Option<
             &tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+        >,
+                            _item_reports: Option<
+            &tokio::sync::mpsc::UnboundedSender<dormant_core::types::ScreensaverItemReport>,
         >,
                             _ss: Option<&dormant_render::ScreensaverSettings>,
                             _shift: Option<&dormant_render::ShiftSettings>| {

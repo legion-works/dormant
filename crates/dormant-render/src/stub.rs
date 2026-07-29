@@ -20,7 +20,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use dormant_core::error::E_RENDER_UNAVAILABLE;
 use dormant_core::traits::RenderSink;
-use dormant_core::types::{CmdFailure, DisplayId, StageKind};
+use dormant_core::types::{CmdFailure, DisplayId, ScreensaverItemReport, StageKind};
 
 use crate::settings::{ScreensaverSettings, ShiftSettings};
 
@@ -50,6 +50,7 @@ impl LayerShellRenderSink {
         display_id: DisplayId,
         output_name: String,
         input_wake_tx: Option<&UnboundedSender<DisplayId>>,
+        _item_report_tx: Option<&UnboundedSender<ScreensaverItemReport>>,
     ) -> Result<Self, CmdFailure> {
         Ok(Self {
             display_id,

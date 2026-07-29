@@ -6,6 +6,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-29
+
+### Fixed
+- HA entities published by `[publish]` no longer show unavailable: the daemon now publishes a retained `online` on the global availability topic on every connect and re-flushes discovery when Home Assistant announces it is back online on `<discovery_prefix>/status`, so entities the operator deleted (or that HA lost during a restart) re-appear without a daemon restart.
+- Display phase events now publish the JSON shape Home Assistant's discovery template expects, so display entities no longer flip to unknown on phase changes.
+
 ## [0.9.1] - 2026-07-28
 
 ### Changed
@@ -263,7 +269,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI runs on the `dev` integration branch; `master` is release-only.
 
-[Unreleased]: https://github.com/legion-works/dormant/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/legion-works/dormant/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/legion-works/dormant/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/legion-works/dormant/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/legion-works/dormant/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/legion-works/dormant/compare/v0.8.1...v0.8.2

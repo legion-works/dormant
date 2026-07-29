@@ -31,14 +31,6 @@ pub enum WearOrderError {
     CatalogPoisoned,
 }
 
-fn splitmix64_next(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
 /// Return every candidate exactly once, preferring bright content on cold cells.
 ///
 /// # Errors
@@ -84,7 +76,8 @@ pub fn wear_even_cycle(
             clippy::cast_precision_loss,
             reason = "SplitMix64 output is normalized to a bounded jitter"
         )]
-        let jitter = (splitmix64_next(&mut rng) as f64 / u64::MAX as f64 - 0.5) * temperature;
+        let jitter = (crate::playlist::splitmix64_next(&mut rng) as f64 / u64::MAX as f64 - 0.5)
+            * temperature;
         let score = dot / CELL_COUNT + jitter;
         if !score.is_finite() {
             return Err(WearOrderError::NonFiniteScore {
@@ -165,6 +158,16 @@ mod tests {
         ))
     }
 
+    fn catalog_values(items: &[PlaylistItem], values: &[f32]) -> crate::luma::LumaCatalog {
+        Arc::new(RwLock::new(
+            items
+                .iter()
+                .zip(values)
+                .map(|(item, value)| (item.uri.clone(), LumaGrid::new(vec![*value; 144]).unwrap()))
+                .collect::<HashMap<_, _>>(),
+        ))
+    }
+
     #[test]
     fn bright_left_item_wins_when_left_side_is_cold() {
         let items = vec![item("bright"), item("dark")];
@@ -211,6 +214,36 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    proptest! {
+        #[test]
+        fn temperature_zero_is_monotonic_for_cold_spatial_placement(
+            brightness in 0.01f32..=1.0,
+            heat_values in (0.0f32..=1.0, 0.0f32..=1.0),
+        ) {
+            let cold_heat = heat_values.0.min(heat_values.1);
+            let hot_heat = heat_values.0.max(heat_values.1);
+            let items = vec![item("bright-left"), item("bright-right")];
+            let mut left_luma = vec![0.0; 144];
+            let mut right_luma = vec![0.0; 144];
+            for row in 0..9 {
+                left_luma[row * 16..row * 16 + 8].fill(brightness);
+                right_luma[row * 16 + 8..row * 16 + 16].fill(brightness);
+            }
+            let catalog = Arc::new(RwLock::new(HashMap::from([
+                ("bright-left".to_owned(), LumaGrid::new(left_luma).unwrap()),
+                ("bright-right".to_owned(), LumaGrid::new(right_luma).unwrap()),
+            ])));
+            let heat = HeatGrid::new(1, 2, vec![hot_heat, cold_heat]).unwrap();
+            let ordered = wear_even_cycle(&items, &catalog, &heat, 0.0, 0).unwrap();
+
+            if hot_heat > cold_heat {
+                prop_assert_eq!(&ordered[0].uri, "bright-right");
+            } else {
+                prop_assert_eq!(&ordered[0].uri, "bright-left");
+            }
+        }
+    }
+
     #[test]
     fn missing_luma_returns_fallback_error_not_partial_order() {
         let items = vec![item("present"), item("missing")];
@@ -229,7 +262,7 @@ mod tests {
             seed in any::<u64>(),
         ) {
             let items: Vec<_> = values.iter().enumerate().map(|(i, _)| item(&format!("{i}"))).collect();
-            let catalog = catalog(&items, 0.5);
+            let catalog = catalog_values(&items, &values);
             let heat = HeatGrid::new(1, 1, vec![0.0]).unwrap();
             let ordered = wear_even_cycle(&items, &catalog, &heat, 0.05, seed).unwrap();
             let mut actual: Vec<_> = ordered.iter().map(|item| item.uri.as_str()).collect();

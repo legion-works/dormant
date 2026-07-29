@@ -43,7 +43,7 @@ const MAX_PLAYLIST_ITEMS: usize = 10_000;
 /// `SplitMix64` has good statistical properties for shuffling; it is the
 /// same algorithm used by Rust's std hash-builder seed mixer, so the
 /// output quality is well-characterized.
-fn splitmix64_next(state: &mut u64) -> u64 {
+pub(crate) fn splitmix64_next(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

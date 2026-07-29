@@ -5319,7 +5319,8 @@ mod render_tests {
             build_render_sinks_with_context(&cfg, None, &context);
 
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].uri, image.to_string_lossy());
+        let expected_uri = image.canonicalize().expect("fixture path canonicalizes");
+        assert_eq!(jobs[0].uri, expected_uri.to_string_lossy());
     }
 
     #[test]

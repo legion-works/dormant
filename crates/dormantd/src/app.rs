@@ -68,9 +68,9 @@ use dormant_core::rules::{
 };
 use dormant_core::state_machine::{DisplayStateMachine, Phase, SmTimings};
 use dormant_core::traits::{CommandSink, RenderSink, SensorSource};
-use dormant_core::types::{
-    BlankMode, DisplayId, PresenceEvent, RuleId, ScreensaverItemReport, SensorId, Tick, ZoneId,
-};
+#[cfg(feature = "render")]
+use dormant_core::types::ScreensaverItemReport;
+use dormant_core::types::{BlankMode, DisplayId, PresenceEvent, RuleId, SensorId, Tick, ZoneId};
 use dormant_core::zone::{ZoneEngine, ZoneSpec, absent_mqtt_hazards};
 use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
@@ -1180,6 +1180,8 @@ impl App {
                 cancel: root.clone(),
                 dir: wear_dir,
                 observations: self.observations.clone(),
+                #[cfg(feature = "render")]
+                item_journal: render_context.item_journal.clone(),
             });
 
         if cfg_clone.daemon.web_allow_nonloopback {

@@ -13,6 +13,8 @@
 //! stateful cursor the Wayland glue drives; the free functions
 //! ([`margin`], [`raster_offsets`]) are the math it's built on.
 
+use dormant_core::spatial_grid::HeatGrid;
+
 /// Per-side margin (in **buffer pixels**) the oversized buffer needs
 /// for a given raster-walk step size.
 ///
@@ -131,6 +133,84 @@ impl ShiftState {
         }
     }
 
+    /// Build a raster cycle that dwells modestly toward the cold centroid.
+    /// Invalid or non-directional heat deliberately falls back to the exact
+    /// unbiased cycle so wear telemetry can never alter shift safety bounds.
+    #[must_use]
+    pub fn new_biased(step_px: u8, heat: Option<&HeatGrid>, bias: f64) -> Self {
+        let base = Self::new(step_px);
+        if base.offsets.is_empty() || !bias.is_finite() || bias <= 0.0 {
+            return base;
+        }
+        let Some(heat) = heat else {
+            return base;
+        };
+        let expected = usize::from(heat.rows).checked_mul(usize::from(heat.cols));
+        if expected != Some(heat.cells.len())
+            || heat.rows == 0
+            || heat.cols == 0
+            || heat
+                .cells
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        {
+            return base;
+        }
+
+        let mut cold_total = 0.0;
+        let mut cold_x = 0.0;
+        let mut cold_y = 0.0;
+        for (index, &value) in heat.cells.iter().enumerate() {
+            let coldness = 1.0 - f64::from(value);
+            let row = index / usize::from(heat.cols);
+            let col = index % usize::from(heat.cols);
+            cold_total += coldness;
+            cold_x +=
+                coldness * (f64::from(u32::try_from(col).expect("u16 grid column fits u32")) + 0.5);
+            cold_y +=
+                coldness * (f64::from(u32::try_from(row).expect("u16 grid row fits u32")) + 0.5);
+        }
+        if cold_total <= f64::EPSILON {
+            return base;
+        }
+        let centre_x = f64::from(heat.cols) / 2.0;
+        let centre_y = f64::from(heat.rows) / 2.0;
+        let direction_x = cold_x / cold_total - centre_x;
+        let direction_y = cold_y / cold_total - centre_y;
+        let direction_length = direction_x.hypot(direction_y);
+        if direction_length <= f64::EPSILON {
+            return base;
+        }
+
+        let max_radius = f64::from(base.margin_px);
+        let mut offsets = Vec::with_capacity(base.offsets.len());
+        offsets.push((0, 0));
+        for &(x, y) in base
+            .offsets
+            .iter()
+            .skip(1)
+            .take(base.offsets.len().saturating_sub(2))
+        {
+            let alignment = (f64::from(x) * direction_x + f64::from(y) * direction_y)
+                / (max_radius * direction_length);
+            let score = (bias * 4.0 * alignment).clamp(0.0, 4.0);
+            let repeats = if score >= 3.5 {
+                5
+            } else if score >= 2.5 {
+                4
+            } else if score >= 1.5 {
+                3
+            } else if score >= 0.5 {
+                2
+            } else {
+                1
+            };
+            offsets.extend(std::iter::repeat_n((x, y), repeats));
+        }
+        offsets.push((0, 0));
+        Self { offsets, ..base }
+    }
+
     /// `true` when this state carries a non-empty walk cycle (i.e.
     /// `step_px > 0` was passed to [`Self::new`]).
     #[must_use]
@@ -191,6 +271,7 @@ impl ShiftState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── margin ───────────────────────────────────────────────────────
 
@@ -291,6 +372,54 @@ mod tests {
         let s = ShiftState::new(2);
         assert!(s.enabled());
         assert_eq!(s.margin_px(), 4);
+    }
+
+    #[test]
+    fn cold_right_heat_biases_offset_dwell_right() {
+        let heat = HeatGrid::new(1, 3, vec![1.0, 0.0, 0.0]).expect("valid heat");
+        let state = ShiftState::new_biased(2, Some(&heat), 0.25);
+        let right = state.offsets.iter().filter(|(x, _)| *x > 0).count();
+        let left = state.offsets.iter().filter(|(x, _)| *x < 0).count();
+        assert!(
+            right > left,
+            "cold side should receive more dwell: {left} vs {right}"
+        );
+    }
+
+    #[test]
+    fn zero_bias_is_identical_to_existing_raster_cycle() {
+        let heat = HeatGrid::new(1, 3, vec![1.0, 0.0, 0.0]).expect("valid heat");
+        let unbiased = ShiftState::new(2);
+        let biased = ShiftState::new_biased(2, Some(&heat), 0.0);
+        assert_eq!(biased.offsets, unbiased.offsets);
+    }
+
+    #[test]
+    fn uniform_heat_does_not_choose_a_direction() {
+        let heat = HeatGrid::new(2, 2, vec![0.5; 4]).expect("valid heat");
+        let state = ShiftState::new_biased(2, Some(&heat), 1.0);
+        assert_eq!(state.offsets, ShiftState::new(2).offsets);
+    }
+
+    #[test]
+    fn biased_cycle_starts_and_ends_at_origin() {
+        let heat = HeatGrid::new(1, 3, vec![1.0, 0.0, 0.0]).expect("valid heat");
+        let state = ShiftState::new_biased(2, Some(&heat), 0.25);
+        assert_eq!(state.offsets.first(), Some(&(0, 0)));
+        assert_eq!(state.offsets.last(), Some(&(0, 0)));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn biased_offsets_never_exceed_margin_budget(
+            step in 1_u8..=8,
+            bias in 0.0_f64..=1.0,
+        ) {
+            let heat = HeatGrid::new(1, 1, vec![0.0]).expect("valid heat");
+            let state = ShiftState::new_biased(step, Some(&heat), bias);
+            let radius = i32::try_from(state.margin_px()).expect("margin fits");
+            prop_assert!(state.offsets.iter().all(|(x, y)| x.abs() <= radius && y.abs() <= radius));
+        }
     }
 
     #[test]

@@ -87,25 +87,13 @@ impl PreparedScreensaverItems {
 fn screensaver_items_for_show(
     settings: &ScreensaverSettings,
     display_id: &DisplayId,
+    heat: &HeatGrid,
 ) -> PreparedScreensaverItems {
-    let heat = settings
-        .heat_snapshots
-        .read()
-        .ok()
-        .and_then(|snapshots| snapshots.get(display_id).cloned())
-        .or_else(|| {
-            HeatGrid::new(
-                LUMA_GRID_ROWS,
-                LUMA_GRID_COLS,
-                vec![0.0; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)],
-            )
-        })
-        .expect("16x9 zero grid: rows×cols must match cells.len()");
     let original_items = settings.items.clone();
     match apply_wear_even_groups(
         &original_items,
         &settings.luma_catalog,
-        &heat,
+        heat,
         settings.wear_temperature,
         settings.seed,
     ) {
@@ -822,6 +810,10 @@ pub(super) struct WaylandState {
     /// its teardown.  `None` when shift is disabled, no surface is up,
     /// or a black overlay is showing (U5: black never shifts).
     pub(super) shift_state: Option<ShiftState>,
+    /// Heat snapshot reserved for the next screensaver viewport install.
+    pub(super) pending_shift_heat: Option<HeatGrid>,
+    /// Bias copied from screensaver settings for the next viewport install.
+    pub(super) shift_heat_bias: f64,
     /// calloop `RegistrationToken` for the shift timer.  Armed exactly
     /// once per surface lifetime when the screensaver install path
     /// calls [`Self::maybe_arm_shift_timer`]; removed by
@@ -892,6 +884,8 @@ impl WaylandState {
             loop_handle: None,
             shift_settings: ShiftSettings::default(),
             shift_state: None,
+            pending_shift_heat: None,
+            shift_heat_bias: 0.25,
             shift_timer_token: None,
             wayland_ops,
         }
@@ -1176,6 +1170,11 @@ pub(super) trait ViewportStateView {
     /// Current `shift_px` setting (0 = disabled).
     fn shift_px(&self) -> u8;
 
+    /// Build the first cursor for a screensaver install.
+    fn new_shift_state(&mut self) -> ShiftState {
+        ShiftState::new(self.shift_px())
+    }
+
     /// Disarm whatever timer mechanism re-arms shift ticks. A no-op
     /// for state that has none (e.g. the recorder-backed test fake,
     /// which owns no calloop timer at all).
@@ -1224,8 +1223,7 @@ pub(super) trait ViewportStateView {
             dest.1.cast_signed(),
         );
         if self.shift_state_mut().is_none() {
-            let shift_px = self.shift_px();
-            let state = ShiftState::new(shift_px);
+            let state = self.new_shift_state();
             let (ox, oy) = state.source_origin();
             self.ops().viewport_set_source(
                 viewport.as_ref(),
@@ -1345,6 +1343,14 @@ impl ViewportStateView for WaylandState {
 
     fn shift_px(&self) -> u8 {
         self.shift_settings.shift_px
+    }
+
+    fn new_shift_state(&mut self) -> ShiftState {
+        ShiftState::new_biased(
+            self.shift_settings.shift_px,
+            self.pending_shift_heat.take().as_ref(),
+            self.shift_heat_bias,
+        )
     }
 
     fn disarm_shift_timer(&mut self) {
@@ -1603,6 +1609,21 @@ impl WaylandState {
         // case.  When shift is disabled `ensure_shift_viewport` /
         // `render_dims` are no-ops and `width`/`height` equal
         // `configured_size` exactly — byte-identical to pre-T10.
+        let heat = settings
+            .heat_snapshots
+            .read()
+            .ok()
+            .and_then(|snapshots| snapshots.get(&self.display_id).cloned())
+            .or_else(|| {
+                HeatGrid::new(
+                    LUMA_GRID_ROWS,
+                    LUMA_GRID_COLS,
+                    vec![0.0; usize::from(LUMA_GRID_ROWS) * usize::from(LUMA_GRID_COLS)],
+                )
+            })
+            .expect("16x9 zero grid: rows×cols must match cells.len()");
+        self.pending_shift_heat = Some(heat.clone());
+        self.shift_heat_bias = settings.shift_heat_bias;
         let wl_surface_for_shift = layer_surface.wl_surface().clone();
         let shift_viewport = self.ensure_shift_viewport(&wl_surface_for_shift, configured_size);
         let (width, height) = self.render_dims(configured_size);
@@ -1621,7 +1642,7 @@ impl WaylandState {
         let (read_fd, write_fd) = make_wakeup_pipe()?;
 
         // The heat lock is released before ordering and player setup.
-        let items = screensaver_items_for_show(settings, &self.display_id);
+        let items = screensaver_items_for_show(settings, &self.display_id, &heat);
 
         // ── mpv player ──────────────────────────────────────────────
         // Build the player.  On Err, `write_fd` is dropped here
@@ -2865,12 +2886,26 @@ mod tests {
             ..ScreensaverSettings::default()
         };
 
-        let first = screensaver_items_for_show(&settings, &DisplayId("mon".into())).into_vec();
+        let first_heat = heat_snapshots
+            .read()
+            .unwrap()
+            .get(&DisplayId("mon".into()))
+            .cloned()
+            .unwrap();
+        let first =
+            screensaver_items_for_show(&settings, &DisplayId("mon".into()), &first_heat).into_vec();
         heat_snapshots.write().unwrap().insert(
             DisplayId("mon".into()),
             HeatGrid::new(1, 2, vec![1.0, 0.0]).unwrap(),
         );
-        let next = screensaver_items_for_show(&settings, &DisplayId("mon".into())).into_vec();
+        let next_heat = heat_snapshots
+            .read()
+            .unwrap()
+            .get(&DisplayId("mon".into()))
+            .cloned()
+            .unwrap();
+        let next =
+            screensaver_items_for_show(&settings, &DisplayId("mon".into()), &next_heat).into_vec();
 
         assert_eq!(first[0].uri, "left.png");
         assert_eq!(next[0].uri, "right.png");

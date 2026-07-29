@@ -5605,7 +5605,11 @@ path = "/tmp/pics"
         )
         .unwrap();
         let mut cfg: Config = value.try_into().unwrap();
-        for (temperature, bias) in [(f64::NAN, 0.5), (-0.1, 0.5), (0.5, 1.1)] {
+        for (temperature, bias, field) in [
+            (f64::NAN, 0.5, "wear_temperature"),
+            (-0.1, 0.5, "wear_temperature"),
+            (0.5, 1.1, "shift_heat_bias"),
+        ] {
             {
                 let screensaver = cfg
                     .displays
@@ -5617,7 +5621,15 @@ path = "/tmp/pics"
                 screensaver.wear_temperature = temperature;
                 screensaver.shift_heat_bias = bias;
             }
-            assert!(!validate(&cfg, &test_capabilities(), &Credentials::default()).is_empty());
+            let errors = validate(&cfg, &test_capabilities(), &Credentials::default());
+            assert!(
+                errors.iter().any(|error| {
+                    error.what == crate::error::E_SCREENSAVER_SOURCE
+                        && error.detail.contains(field)
+                        && error.detail.contains("0.0..=1.0")
+                }),
+                "expected {field} range error, got {errors:?}"
+            );
         }
     }
 

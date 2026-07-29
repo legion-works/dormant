@@ -73,15 +73,15 @@ export default function ScreensaverEditor({ screensaver, displayId, store, redac
   }
 
   /**
-   * Strip absent values from optional ScreensaverSource fields: path,
-   * order, image_duration.  A cleared input produces "".  These must be
+   * Strip absent values from optional ScreensaverSource fields: path, order,
+   * wear_tag, and image_duration.  A cleared input produces "".  These must be
    * absent in emitted patches — the server rejects null and empty
    * strings for Option fields.
    */
   function cleanSource(s: ScreensaverSource): ScreensaverSource {
     const out: Record<string, unknown> = { ...s };
-    // All three Option fields in the Rust struct (see config/schema.rs).
-  const optionalKeys = ["path", "order", "wear_tag", "image_duration"];
+    // Optional fields in the Rust struct (see config/schema.rs).
+    const optionalKeys = ["path", "order", "wear_tag", "image_duration"];
     for (const key of optionalKeys) {
       if (isAbsentInput(out[key])) delete out[key];
     }

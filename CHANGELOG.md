@@ -12,7 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 **Wear-even screensavers** — order media and bias bounded pixel shifts toward cooler estimated panel regions. Configure screensaver ordering and pixel shifts to spread estimated OLED wear more evenly.
 
-See [the wear-even screensaver chapter](./docs/src/wear-even-screensaver.md).
+See [the OLED health chapter](./docs/src/oled-health.md).
 
 ### Added
 

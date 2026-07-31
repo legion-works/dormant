@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-31
+
+### Highlights
+
+**Wear-even screensavers** — order media and bias bounded pixel shifts toward cooler estimated panel regions. Configure screensaver ordering and pixel shifts to spread estimated OLED wear more evenly.
+
+See [the wear-even screensaver chapter](./docs/src/wear-even-screensaver.md).
+
+### Added
+
+- `order = "wear-even"` uses host-side luma grids and local wear heat; missing data fails open to the configured order or uniform attribution. Black overlays remain zero-wear and pixel-shift bounds stay configured.
+
 ## [0.9.2] - 2026-07-29
 
 ### Fixed
@@ -270,6 +282,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - CI runs on the `dev` integration branch; `master` is release-only.
 
 [Unreleased]: https://github.com/legion-works/dormant/compare/v0.9.2...HEAD
+[0.10.0]: https://github.com/legion-works/dormant/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/legion-works/dormant/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/legion-works/dormant/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/legion-works/dormant/compare/v0.8.2...v0.9.0

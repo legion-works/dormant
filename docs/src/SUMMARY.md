@@ -7,6 +7,7 @@
 - [Sensors](./sensors.md)
 - [Displays](./displays.md)
 - [Panel-wear tracking](./oled-health.md)
+- [Active wear sampling](./active-wear-sampling.md)
 - [Failure notifications](./failure-notifications.md)
 - [Watchdog + last-known-good rollback](./watchdog-rollback.md)
 - [Web UI](./web-ui.md)

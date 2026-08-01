@@ -286,6 +286,15 @@ The web doctor view does not run the destructive control-path exercise. Use
 `dormantctl doctor exercise <display>` when you need to prove that a real panel
 blanked and woke.
 
+### Active wear sampling
+
+The panel-exposure WearCard shows the sampler state. Its **Enable sampling**
+button is available only for `NeedsConsent`; it starts the daemon-owned
+xdg-desktop-portal ScreenCast flow and polls until consent is granted, denied,
+timed out, or failed. The flow uses the configured one-display binding and
+never exposes the restore token. See [Active wear sampling](./active-wear-sampling.md)
+for the consent grant, revocation paths, and uniform fallback states.
+
 ## Audio-aware blanking
 
 The Settings form renders the `[audio]` section, and rule editors accept

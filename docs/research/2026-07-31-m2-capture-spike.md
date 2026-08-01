@@ -212,6 +212,28 @@ measured to avoid another consent interaction. The token reattach path is proven
 prototype can measure this without a new user consent once it persists the token. No process was
 left running by this spike.
 
+### 2026-08-01 M2 active-sampling daemon-identity premise gate — **STOP**
+
+`dormant.service` was verified as the active graphical-user service before the probe: its unit
+file was `/home/icetea/.config/systemd/user/dormant.service`, its `ExecStart` was
+`/home/icetea/.local/bin/dormantd`, and the unit was active under the operator's user manager.
+The temporary probe was built into that exact executable, installed at that exact path, and run
+only through `systemctl --user restart dormant.service`.
+
+The initial `CreateSession` failed before any portal consent dialog appeared. The service journal
+recorded the following literal error on every attempted start:
+
+```
+event="active_sampling_probe_failed" error=org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
+```
+
+Therefore `identity_reattach = fail`: no restore token was minted under the daemon identity, so a
+headless reattach cannot be claimed. The probe was removed, the production binary was rebuilt and
+reinstalled, and `dormant.service` was restarted healthy. Closed-idle CPU, warm-paused CPU,
+per-process deltas, and pause-to-resume p95 were not measured; selecting `warm` or `per-tick` is
+blocked until the daemon's portal identity/lifecycle is re-scoped. The earlier successful token
+probe remains evidence only for its probe-process identity, not this service identity.
+
 ## Q5 — composited output and brightness correlation
 
 **GO for content-luma, not panel-luma.** KWin's output screencast source renders a

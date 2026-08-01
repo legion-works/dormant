@@ -94,7 +94,7 @@ describe("WearCard", () => {
     await waitFor(() => expect(screen.getByText("Granted")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
     cleanup();
-    mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_suspended" });
+    mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_not_active" });
     render(<WearCard />);
     await waitFor(() => expect(screen.getByText("Sampling degraded")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();

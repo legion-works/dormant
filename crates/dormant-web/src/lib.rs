@@ -31,6 +31,57 @@ use tokio::task::JoinHandle;
 
 pub use state::{WebState, WebStateInner, WebStateInnerParams};
 
+/// Production daemon IPC transport over the configured Unix socket.
+pub(crate) struct SocketDaemonIpc;
+
+impl state::DaemonIpc for SocketDaemonIpc {
+    fn request<'a>(
+        &'a self,
+        socket: std::path::PathBuf,
+        request: dormant_core::ipc_proto::IpcRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<dormant_core::ipc_proto::IpcResponse, error::WebError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                #[cfg(unix)]
+                {
+                    use std::io::{BufRead, BufReader, Write};
+                    use std::os::unix::net::UnixStream;
+
+                    let mut stream = UnixStream::connect(socket)
+                        .map_err(|_| error::WebError::CoordinationUnavailable)?;
+                    let line = serde_json::to_string(&request)
+                        .map_err(|_| error::WebError::CoordinationUnavailable)?;
+                    writeln!(stream, "{line}")
+                        .map_err(|_| error::WebError::CoordinationUnavailable)?;
+                    stream
+                        .flush()
+                        .map_err(|_| error::WebError::CoordinationUnavailable)?;
+                    let mut line = String::new();
+                    BufReader::new(stream)
+                        .read_line(&mut line)
+                        .map_err(|_| error::WebError::CoordinationUnavailable)?;
+                    serde_json::from_str(&line)
+                        .map_err(|_| error::WebError::CoordinationUnavailable)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (socket, request);
+                    Err(error::WebError::CoordinationUnavailable)
+                }
+            })
+            .await
+            .map_err(|_| error::WebError::CoordinationUnavailable)?
+        })
+    }
+}
+
 pub(crate) async fn request_daemon_ipc(
     state: &WebState,
     request: dormant_core::ipc_proto::IpcRequest,
@@ -38,34 +89,7 @@ pub(crate) async fn request_daemon_ipc(
     let socket = dormant_core::paths::resolve_socket_path(
         state.inner.config_rx.borrow().daemon.socket_path.as_deref(),
     );
-    tokio::task::spawn_blocking(move || {
-        #[cfg(unix)]
-        {
-            use std::io::{BufRead, BufReader, Write};
-            use std::os::unix::net::UnixStream;
-
-            let mut stream = UnixStream::connect(socket)
-                .map_err(|_| error::WebError::CoordinationUnavailable)?;
-            let line = serde_json::to_string(&request)
-                .map_err(|_| error::WebError::CoordinationUnavailable)?;
-            writeln!(stream, "{line}").map_err(|_| error::WebError::CoordinationUnavailable)?;
-            stream
-                .flush()
-                .map_err(|_| error::WebError::CoordinationUnavailable)?;
-            let mut line = String::new();
-            BufReader::new(stream)
-                .read_line(&mut line)
-                .map_err(|_| error::WebError::CoordinationUnavailable)?;
-            serde_json::from_str(&line).map_err(|_| error::WebError::CoordinationUnavailable)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (socket, request);
-            Err(error::WebError::CoordinationUnavailable)
-        }
-    })
-    .await
-    .map_err(|_| error::WebError::CoordinationUnavailable)?
+    state.inner.ipc.request(socket, request).await
 }
 
 /// Spawn the web server on `bind`, returning a [`JoinHandle`] for the

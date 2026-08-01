@@ -7,8 +7,10 @@
 //! no dependency cycle.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +26,7 @@ use dormant_doctor::DoctorService;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::error::WebError;
 use crate::event_ring::EventRing;
 use crate::routes::pair::{PairEntry, PairId};
 
@@ -32,6 +35,20 @@ use crate::routes::pair::{PairEntry, PairId};
 /// `Fn` type out at every field/parameter that needs it.
 pub(crate) type UpsertToken =
     Arc<dyn Fn(&Path, &str, &str) -> Result<(), DormantError> + Send + Sync>;
+
+/// Injectable transport for daemon IPC, keeping HTTP route tests off real sockets.
+pub(crate) trait DaemonIpc: Send + Sync {
+    /// Send one IPC request and return its decoded response.
+    fn request<'a>(
+        &'a self,
+        socket: PathBuf,
+        request: dormant_core::ipc_proto::IpcRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<dormant_core::ipc_proto::IpcResponse, WebError>> + Send + 'a,
+        >,
+    >;
+}
 
 /// Shared state for the web server.
 ///
@@ -107,6 +124,9 @@ pub struct WebStateInner {
     /// file via `POST /api/config/apply`.  Default is 10 s; tests use a
     /// shorter value.
     pub reload_timeout: Duration,
+
+    /// Transport used by routes that proxy daemon IPC.
+    pub(crate) ipc: Arc<dyn DaemonIpc>,
 
     /// In-flight and recently-finished Samsung pairing attempts, keyed by
     /// the opaque [`PairId`] handed back from `POST /api/pair/samsung`.
@@ -222,6 +242,7 @@ impl WebStateInner {
             Arc::new(|path: &Path, host: &str, token: &str| {
                 dormant_core::config::upsert_samsung_token(path, host, token)
             }),
+            Arc::new(crate::SocketDaemonIpc),
             true,
         )
     }
@@ -246,6 +267,7 @@ impl WebStateInner {
                      use new_for_test_with_pairing to inject a fake for pairing-wizard tests"
                 )
             }),
+            Arc::new(crate::SocketDaemonIpc),
             false,
         )
     }
@@ -261,7 +283,31 @@ impl WebStateInner {
         pair_connect: Arc<dyn PairConnect>,
         upsert_token: UpsertToken,
     ) -> Self {
-        Self::assemble(params, pair_connect, upsert_token, false)
+        Self::assemble(
+            params,
+            pair_connect,
+            upsert_token,
+            Arc::new(crate::SocketDaemonIpc),
+            false,
+        )
+    }
+
+    /// Test constructor with an injected daemon IPC transport.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_for_test_with_ipc(
+        params: WebStateInnerParams,
+        ipc: Arc<dyn DaemonIpc>,
+    ) -> Self {
+        Self::assemble(
+            params,
+            Arc::new(PanicPairConnect),
+            Arc::new(|_: &Path, _: &str, _: &str| -> Result<(), DormantError> {
+                unimplemented!("pairing seam reached in IPC route test")
+            }),
+            ipc,
+            false,
+        )
     }
 
     /// Shared assembly — every constructor bottoms out here so the
@@ -271,6 +317,7 @@ impl WebStateInner {
         params: WebStateInnerParams,
         pair_connect: Arc<dyn PairConnect>,
         upsert_token: UpsertToken,
+        ipc: Arc<dyn DaemonIpc>,
         spawn_feeder: bool,
     ) -> Self {
         let event_history = Arc::new(EventRing::new());
@@ -306,6 +353,7 @@ impl WebStateInner {
             web_bind: params.web_bind,
             cancel: params.cancel,
             reload_timeout: params.reload_timeout,
+            ipc,
             pairing: Mutex::new(HashMap::new()),
             pair_lock: Arc::new(Mutex::new(())),
             wear_sampling_lock: Arc::new(Mutex::new(())),

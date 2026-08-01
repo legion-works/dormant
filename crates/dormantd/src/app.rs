@@ -1475,6 +1475,8 @@ impl App {
                 }
             }
         };
+        #[cfg(not(target_os = "linux"))]
+        let active_sampler_handle: Option<crate::active_sampler::ActiveSamplerHandle> = None;
 
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
@@ -1531,6 +1533,7 @@ impl App {
                     reload_requester.clone(),
                     doctor_service.clone(),
                     direct_switch.clone(),
+                    active_sampler_handle.clone(),
                     root.clone(),
                 )
                 .context("spawn IPC server")?,

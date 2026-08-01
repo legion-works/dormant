@@ -49,6 +49,19 @@ enum PairTarget {
     },
 }
 
+/// Active-sampling consent commands.
+#[derive(Subcommand, Debug)]
+enum WearCommand {
+    /// Request portal consent and enable active sampling.
+    EnableSampling,
+    /// Disable active sampling.
+    DisableSampling {
+        /// Delete the stored consent record after closing the session.
+        #[arg(long)]
+        forget: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Show daemon status (sensors, zones, displays).
@@ -202,6 +215,11 @@ enum Command {
     Launchd {
         #[command(subcommand)]
         subcommand: cmd_launchd::LaunchdSubcommand,
+    },
+    /// Manage active-time wear sampling consent.
+    Wear {
+        #[command(subcommand)]
+        subcommand: WearCommand,
     },
 }
 
@@ -373,6 +391,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(3);
             }
             Err(e) => Err(e),
+        },
+        Command::Wear { subcommand } => match subcommand {
+            WearCommand::EnableSampling => dormantctl::cmd_wear::run_enable(&socket_path),
+            WearCommand::DisableSampling { forget } => {
+                dormantctl::cmd_wear::run_disable(&socket_path, forget)
+            }
         },
     };
 

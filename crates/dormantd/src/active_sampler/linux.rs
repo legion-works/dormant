@@ -689,11 +689,15 @@ fn reconcile_start_with_binding(
     stream: &ConnectedStream,
     binding: &ConsentBinding<'_>,
 ) -> Result<(), CaptureError> {
-    let persistent_id_matches = binding.portal_persistent_ids.is_empty()
-        || stream
-            .persistent_id
-            .as_ref()
-            .is_some_and(|id| binding.portal_persistent_ids.contains(id));
+    if !binding.portal_persistent_ids.is_empty() && stream.persistent_id.is_none() {
+        tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "persistent_id_unavailable_using_dimensions"
+        );
+    }
+    let persistent_id_matches = stream.persistent_id.as_ref().is_none_or(|id| {
+        binding.portal_persistent_ids.is_empty() || binding.portal_persistent_ids.contains(id)
+    });
     if !persistent_id_matches {
         return Err(CaptureError::Protocol(
             WEAR_SAMPLING_WRONG_MONITOR.to_owned(),
@@ -1780,6 +1784,41 @@ mod tests {
                 options: SelectSourcesOptions::for_reattach("saved-token"),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn active_sampling_protocol_reattach_falls_back_to_native_size_when_id_is_absent() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            3072,
+            1728,
+            None,
+            "rotated-token",
+        ));
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport,
+            [Ok(RawFrame {
+                rgba: vec![0; 4],
+                width: 3840,
+                height: 2160,
+                stride: 3840 * 4,
+            })],
+        );
+        let ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved-token",
+            sampled_display: "oled",
+            portal_persistent_ids: &ids,
+            granted_width: 3840,
+            granted_height: 2160,
+        };
+
+        let stream = source
+            .connect(&binding)
+            .await
+            .expect("missing portal identity falls back to native dimensions");
+
+        assert_eq!((stream.frame_width, stream.frame_height), (3840, 2160));
     }
 
     #[tokio::test]

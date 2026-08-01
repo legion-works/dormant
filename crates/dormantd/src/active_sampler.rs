@@ -635,8 +635,8 @@ async fn handle_command(
                         sampled_display: expected.display,
                         granted_at: grant.granted_at,
                         portal_persistent_ids: grant.stream.persistent_id.into_iter().collect(),
-                        granted_width: grant.stream.width,
-                        granted_height: grant.stream.height,
+                        granted_width: grant.stream.frame_width,
+                        granted_height: grant.stream.frame_height,
                     };
                     match crate::screencast_consent::store_atomic(consent_path, &record) {
                         Ok(()) => {
@@ -1086,9 +1086,9 @@ pub struct ConsentBinding<'a> {
     pub sampled_display: &'a str,
     /// Persistent portal identities observed for the granted display.
     pub portal_persistent_ids: &'a [String],
-    /// Width reported by the portal at grant time.
+    /// Native width observed in the first frame delivered at grant time.
     pub granted_width: u32,
-    /// Height reported by the portal at grant time.
+    /// Native height observed in the first frame delivered at grant time.
     pub granted_height: u32,
 }
 
@@ -2570,6 +2570,62 @@ mod tests {
             assert!(log.contains(stage), "missing {stage} stage: {log}");
         }
         assert!(!log.contains("unlogged-rotated-token"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn active_sampler_fresh_grant_persists_native_dimensions_that_reconcile() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut stream = test_stream();
+        stream.width = 3072;
+        stream.height = 1728;
+        stream.frame_width = 3840;
+        stream.frame_height = 2160;
+        let frame = RawFrame {
+            rgba: vec![0; 4],
+            width: 3840,
+            height: 2160,
+            stride: 3840 * 4,
+        };
+        let mut source = ScriptedCaptureSource {
+            grants: VecDeque::from([ScriptedOutcome::Ready(Ok(Grant {
+                stream,
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+            }))]),
+            ..ScriptedCaptureSource::default()
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            test_env_reader,
+        )
+        .await;
+
+        assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        let record = crate::screencast_consent::load(&consent_path, "oled")
+            .expect("fresh grant record loads");
+        assert_eq!(
+            (
+                record.record().granted_width,
+                record.record().granted_height
+            ),
+            (3840, 2160)
+        );
+        assert_eq!(
+            linux::reconcile_reattached_frame(&frame, &record.as_binding()),
+            Ok(())
+        );
     }
 
     #[tokio::test]

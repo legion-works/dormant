@@ -80,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_consent_is_send_sync_static_and_not_debug() {
+    fn bound_consent_is_send_sync_static() {
         fn assert_send_sync_static<T: Send + Sync + 'static>() {}
         assert_send_sync_static::<BoundConsent>();
     }
@@ -135,9 +135,12 @@ mod tests {
 use std::fmt;
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The persisted grant needed to reattach a portal capture stream.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -261,10 +264,12 @@ pub fn store_atomic(path: &Path, record: &ConsentRecord) -> Result<(), ConsentEr
     set_mode(dir, 0o700)?;
     let serialized = serde_json::to_vec_pretty(record).map_err(|_| ConsentError::InvalidJson)?;
     let tmp_path = dir.join(format!(
-        ".{}.tmp",
+        ".{}.tmp.{}.{}",
         path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("consent")
+            .unwrap_or("consent"),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
     ));
 
     let write_result = (|| -> Result<(), ConsentError> {
@@ -273,8 +278,10 @@ pub fn store_atomic(path: &Path, record: &ConsentRecord) -> Result<(), ConsentEr
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        // Portable builds retain the JSON schema and test surface. Runtime
+        // portal capture is Linux-only; non-Unix targets lack O_NOFOLLOW.
         let mut file = options.open(&tmp_path).map_err(ConsentError::Io)?;
         set_mode(&tmp_path, 0o600)?;
         file.write_all(&serialized).map_err(ConsentError::Io)?;

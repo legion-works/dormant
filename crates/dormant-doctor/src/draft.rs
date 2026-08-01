@@ -1053,6 +1053,14 @@ mod tests {
             assert!(!out.contains(id));
         }
         assert!(out.matches(REDACTED).count() >= 3);
+
+        let short = TestConsent {
+            token: "abc".into(),
+            ids: vec!["xy".into()],
+        };
+        let short_set = SecretSet::collect(&cfg, &creds, Some(&short));
+        assert!(!short_set.secrets.contains(&short.token));
+        assert!(!short_set.secrets.contains(&short.ids[0]));
     }
 
     #[test]

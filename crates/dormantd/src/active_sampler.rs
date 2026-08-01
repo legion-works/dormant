@@ -160,7 +160,6 @@ impl fmt::Debug for ConnectedStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectedStream")
             .field("node_id", &self.node_id)
-            .field("persistent_id", &self.persistent_id)
             .field("width", &self.width)
             .field("height", &self.height)
             .finish_non_exhaustive()

@@ -1902,6 +1902,36 @@ mod tests {
         assert_eq!(reconcile_start_with_binding(&stream, &binding), Ok(()));
     }
 
+    #[test]
+    fn active_sampling_protocol_rejects_conflicting_present_persistent_id() {
+        // The F11 binding branch: a stream presenting an id that is NOT in the
+        // consent record must hard-reject — this is what stops a monitor-A
+        // grant from binding to a monitor-B stream.
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3072,
+            1728,
+            Some("other-output"),
+            "token",
+        ))
+        .expect("start metadata is valid");
+        let persistent_ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved",
+            sampled_display: "oled",
+            portal_persistent_ids: &persistent_ids,
+            granted_width: 3840,
+            granted_height: 2160,
+        };
+
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding),
+            Err(CaptureError::Protocol(
+                WEAR_SAMPLING_WRONG_MONITOR.to_owned()
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn warm_worker_shutdown_wakes_loop_and_joins() {
         let mut worker = WarmWorker::spawn_fake([]);

@@ -1236,7 +1236,9 @@ fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 ),
             });
         }
-        if sampling.capture_timeout > wear.sample_interval / 2 {
+        if wear.sample_interval >= Duration::from_secs(2)
+            && sampling.capture_timeout > wear.sample_interval / 2
+        {
             errors.push(ValidationError {
                 what: "E_CONFIG_INVALID".into(),
                 detail:
@@ -6234,10 +6236,21 @@ kind = "power_off"
         let toml_str = "config_version = 1\n[wear]\nsample_interval = \"1500ms\"\n[wear.active_sampling]\nenabled = true\nsampled_display = \"desk\"\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n";
         let cfg: Config = toml::from_str(toml_str).unwrap();
         let errors = validate(&cfg, &HashMap::new(), &Credentials::default());
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.detail == "sample_interval too short for active sampling (needs >= 2s)")
+        let active_sampling_errors: Vec<_> = errors
+            .iter()
+            .filter(|error| {
+                error.detail.contains("active sampling")
+                    || error.detail.contains("wear.active_sampling")
+            })
+            .collect();
+        assert_eq!(
+            active_sampling_errors.len(),
+            1,
+            "unexpected active sampling errors: {active_sampling_errors:?}"
+        );
+        assert_eq!(
+            active_sampling_errors[0].detail,
+            "sample_interval too short for active sampling (needs >= 2s)"
         );
     }
 

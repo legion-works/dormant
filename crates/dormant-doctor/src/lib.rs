@@ -18,7 +18,6 @@ pub use draft::{
     ConsentSecrets, DisplayInventoryEntry, DraftContext, EnvInfo, SecretSet,
     build_display_inventory, collect_env, format_date_ymd, render_bug_draft, render_feature_draft,
 };
-pub use probes::wear_sampling::probe_wear_sampling;
 pub use service::DoctorService;
 pub use types::{ProbeResult, ProbeStatus};
 

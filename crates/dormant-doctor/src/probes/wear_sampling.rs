@@ -1,7 +1,9 @@
 //! Read-only health classification for daemon-owned active wear sampling.
 
 use dormant_core::config::schema::WearConfig;
-use dormant_core::wear::{WearSamplingState, WearSamplingStatus};
+#[cfg(target_os = "linux")]
+use dormant_core::wear::WearSamplingState;
+use dormant_core::wear::WearSamplingStatus;
 
 use crate::types::ProbeResult;
 
@@ -70,10 +72,15 @@ pub fn probe_wear_sampling(
                 "wear-sampling",
                 "active sampling suspended: display unavailable",
             ),
-            state => ProbeResult::fail(
+            WearSamplingState::ConsentPending
+            | WearSamplingState::Connecting
+            | WearSamplingState::Cooldown => ProbeResult::skip(
                 "wear-sampling",
-                format!("active sampling unavailable ({state:?})"),
+                format!("active sampling transient ({:?})", status.state),
             ),
+            WearSamplingState::Disabled => {
+                ProbeResult::fail("wear-sampling", "active sampling disabled by daemon state")
+            }
         }
     }
 }
@@ -81,6 +88,7 @@ pub fn probe_wear_sampling(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use dormant_core::wear::WearSamplingState;
 
     fn config() -> WearConfig {
@@ -95,6 +103,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn status(state: WearSamplingState, age: Option<u64>) -> WearSamplingStatus {
         WearSamplingStatus {
             state,
@@ -107,15 +116,12 @@ mod tests {
 
     #[test]
     fn probe_id_is_wear_sampling() {
-        let result = probe_wear_sampling(
-            &config(),
-            true,
-            Some(&status(WearSamplingState::Streaming, Some(2))),
-        );
+        let result = probe_wear_sampling(&config(), false, None);
         assert_eq!(result.name, "wear-sampling");
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn streaming_fresh_is_healthy() {
         let result = probe_wear_sampling(
             &config(),
@@ -126,6 +132,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn streaming_stale_is_failed() {
         let result = probe_wear_sampling(
             &config(),
@@ -136,6 +143,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn needs_consent_is_skipped_without_secret_details() {
         let result = probe_wear_sampling(
             &config(),
@@ -148,6 +156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn invalid_display_binding_fails() {
         let result = probe_wear_sampling(
             &config(),
@@ -158,6 +167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn suspended_is_failed() {
         let result = probe_wear_sampling(
             &config(),
@@ -167,17 +177,17 @@ mod tests {
         assert_eq!(result.status, crate::types::ProbeStatus::Fail);
     }
 
+    /// `CaptureSource` and portal commands live in `dormantd`, which depends on
+    /// this crate; the dependency graph makes them structurally unreachable
+    /// here. The probe contract therefore accepts only config and redacted data.
     #[test]
-    fn probe_uses_no_capture_source_or_consent_capability() {
-        let result = probe_wear_sampling(
-            &config(),
-            true,
-            Some(&status(WearSamplingState::Streaming, Some(2))),
-        );
-        assert_eq!(result.status, crate::types::ProbeStatus::Pass);
+    fn probe_contract_has_no_capture_capability() {
+        let _: fn(&WearConfig, bool, Option<&WearSamplingStatus>) -> ProbeResult =
+            probe_wear_sampling;
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn details_are_redacted_from_consent_secrets() {
         let mut sampler = status(WearSamplingState::NeedsConsent, None);
         sampler.uniform_reason = Some("token=persistent-id-should-not-leak".into());

@@ -24,6 +24,7 @@ const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const SCREENCAST_INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
+const PORTAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Portal session handle retained until its `PipeWire` stream closes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,13 +358,13 @@ enum WarmCommand {
 
 struct WarmWorker {
     commands: pw::channel::Sender<WarmCommand>,
-    frames: tokio::sync::mpsc::UnboundedReceiver<Result<RawFrame, CaptureError>>,
+    frames: tokio::sync::mpsc::Receiver<Result<RawFrame, CaptureError>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl WarmWorker {
     fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
-        let (frames_tx, frames) = tokio::sync::mpsc::unbounded_channel();
+        let (frames_tx, frames) = tokio::sync::mpsc::channel(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("dormant-pipewire-warm".to_owned())
@@ -408,7 +409,7 @@ impl WarmWorker {
 
     #[cfg(test)]
     fn spawn_fake(frames: impl IntoIterator<Item = Option<RawFrame>> + Send + 'static) -> Self {
-        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::spawn(move || {
             pw::init();
@@ -424,7 +425,7 @@ impl WarmWorker {
             let _attached = receiver.attach(mainloop.loop_(), move |command| match command {
                 WarmCommand::Capture => {
                     if let Some(Some(frame)) = scripted_for_commands.borrow_mut().pop_front() {
-                        let _ = frames_tx.send(Ok(frame));
+                        let _ = frames_tx.try_send(Ok(frame));
                     }
                 }
                 WarmCommand::Shutdown => loop_for_commands.quit(),
@@ -457,13 +458,13 @@ impl Drop for WarmWorker {
 struct WarmFrameState {
     format: spa::param::video::VideoInfoRaw,
     capturing: bool,
-    frames: tokio::sync::mpsc::UnboundedSender<Result<RawFrame, CaptureError>>,
+    frames: tokio::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
 }
 
 fn run_warm_stream(
     fd: OwnedFd,
     node_id: u32,
-    frames: tokio::sync::mpsc::UnboundedSender<Result<RawFrame, CaptureError>>,
+    frames: tokio::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
     initialized: &std::sync::mpsc::SyncSender<
         Result<pw::channel::Sender<WarmCommand>, CaptureError>,
     >,
@@ -519,7 +520,7 @@ fn run_warm_stream(
             let result = capture_buffer(stream, &state.format);
             state.capturing = false;
             let _ = stream_for_process.set_active(false);
-            let _ = state.frames.send(result);
+            let _ = state.frames.try_send(result);
         })
         .register()
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
@@ -543,7 +544,7 @@ fn run_warm_stream(
             state.capturing = true;
             if let Err(error) = stream_for_commands.set_active(true) {
                 state.capturing = false;
-                let _ = state.frames.send(Err(CaptureError::Transport(format!(
+                let _ = state.frames.try_send(Err(CaptureError::Transport(format!(
                     "activate PipeWire warm stream: {error}"
                 ))));
             }
@@ -817,12 +818,10 @@ impl ZbusPortalTransport {
         .map_err(|error| CaptureError::Protocol(format!("portal request path: {error}")))
     }
 
-    async fn response(
+    async fn response_stream(
         &self,
         request_path: &OwnedObjectPath,
-    ) -> Result<HashMap<String, OwnedValue>, CaptureError> {
-        use futures_util::StreamExt;
-
+    ) -> Result<zbus::proxy::SignalStream<'_>, CaptureError> {
         let request = zbus::Proxy::new(
             &self.connection,
             PORTAL_SERVICE,
@@ -831,12 +830,21 @@ impl ZbusPortalTransport {
         )
         .await
         .map_err(|error| CaptureError::Transport(format!("portal request proxy: {error}")))?;
-        let mut responses = request.receive_signal("Response").await.map_err(|error| {
-            CaptureError::Transport(format!("portal signal subscribe: {error}"))
-        })?;
-        let response = responses
-            .next()
+        request
+            .receive_signal("Response")
             .await
+            .map_err(|error| CaptureError::Transport(format!("portal signal subscribe: {error}")))
+    }
+
+    async fn response(
+        &self,
+        responses: &mut zbus::proxy::SignalStream<'_>,
+    ) -> Result<HashMap<String, OwnedValue>, CaptureError> {
+        use futures_util::StreamExt;
+
+        let response = tokio::time::timeout(PORTAL_RESPONSE_TIMEOUT, responses.next())
+            .await
+            .map_err(|_| CaptureError::Transport("portal Response timed out".to_owned()))?
             .ok_or_else(|| CaptureError::Transport("portal response stream ended".to_owned()))?;
         let (code, results): (u32, HashMap<String, OwnedValue>) = response
             .body()
@@ -868,7 +876,7 @@ impl PortalTransport for ZbusPortalTransport {
             Value::Str(session_handle_token.into()),
         );
         let proxy = self.screencast_proxy().await?;
-        let response = self.response(&expected_path);
+        let mut responses = self.response_stream(&expected_path).await?;
         let returned: OwnedObjectPath = proxy
             .call("CreateSession", &(options,))
             .await
@@ -878,7 +886,7 @@ impl PortalTransport for ZbusPortalTransport {
                 "portal CreateSession returned an unexpected request path".to_owned(),
             ));
         }
-        let results = response.await?;
+        let results = self.response(&mut responses).await?;
         let session_handle = results
             .get("session_handle")
             .ok_or_else(|| {
@@ -908,7 +916,7 @@ impl PortalTransport for ZbusPortalTransport {
             values.insert("restore_token".to_owned(), Value::Str(token.into()));
         }
         let proxy = self.screencast_proxy().await?;
-        let response = self.response(&expected_path);
+        let mut responses = self.response_stream(&expected_path).await?;
         let returned: OwnedObjectPath = proxy
             .call("SelectSources", &(&session.path, values))
             .await
@@ -918,7 +926,7 @@ impl PortalTransport for ZbusPortalTransport {
                 "portal SelectSources returned an unexpected request path".to_owned(),
             ));
         }
-        response.await.map(|_| ())
+        self.response(&mut responses).await.map(|_| ())
     }
 
     async fn start(&self, session: &PortalSession) -> Result<PortalStartResult, CaptureError> {
@@ -927,7 +935,7 @@ impl PortalTransport for ZbusPortalTransport {
         let mut options = HashMap::new();
         options.insert("handle_token".to_owned(), Value::Str(handle_token.into()));
         let proxy = self.screencast_proxy().await?;
-        let response = self.response(&expected_path);
+        let mut responses = self.response_stream(&expected_path).await?;
         let returned: OwnedObjectPath = proxy
             .call("Start", &(&session.path, "", options))
             .await
@@ -937,7 +945,7 @@ impl PortalTransport for ZbusPortalTransport {
                 "portal Start returned an unexpected request path".to_owned(),
             ));
         }
-        parse_start_result(response.await?)
+        parse_start_result(self.response(&mut responses).await?)
     }
 
     async fn open_pipewire_remote(&self, session: &PortalSession) -> Result<OwnedFd, CaptureError> {
@@ -1178,6 +1186,80 @@ mod tests {
                 PortalCall::OpenPipeWireRemote,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn active_sampling_protocol_reattach_propagates_token_and_validates_native_frame() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "rotated-token",
+        ));
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Ok(RawFrame {
+                rgba: vec![0; 4],
+                width: 3840,
+                height: 2160,
+                stride: 3840 * 4,
+            })],
+        );
+        let ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved-token",
+            sampled_display: "oled",
+            portal_persistent_ids: &ids,
+            granted_width: 3840,
+            granted_height: 2160,
+        };
+
+        let stream = source.connect(&binding).await.expect("reattach succeeds");
+
+        assert_eq!(stream.restore_token, "rotated-token");
+        assert_eq!((stream.frame_width, stream.frame_height), (3840, 2160));
+        assert_eq!(
+            transport.calls()[1],
+            PortalCall::SelectSources {
+                options: SelectSourcesOptions::for_reattach("saved-token"),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn active_sampling_protocol_reattach_wrong_frame_closes_without_returning_grant() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            3072,
+            1728,
+            None,
+            "rotated-token",
+        ));
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Ok(RawFrame {
+                rgba: vec![0; 4],
+                width: 1920,
+                height: 1080,
+                stride: 1920 * 4,
+            })],
+        );
+        let binding = ConsentBinding {
+            token: "saved-token",
+            sampled_display: "oled",
+            portal_persistent_ids: &[],
+            granted_width: 3840,
+            granted_height: 2160,
+        };
+
+        assert_eq!(
+            source.connect(&binding).await,
+            Err(CaptureError::Protocol(
+                WEAR_SAMPLING_WRONG_MONITOR.to_owned()
+            ))
+        );
+        assert_eq!(transport.calls().last(), Some(&PortalCall::Close));
     }
 
     #[test]

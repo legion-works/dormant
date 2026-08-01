@@ -192,7 +192,7 @@ impl fmt::Debug for Grant {
 }
 
 /// Raw portal frame before privacy-preserving block reduction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawFrame {
     /// Packed RGBA bytes, including per-row padding when `stride` exceeds width.
     pub rgba: Vec<u8>,
@@ -202,6 +202,17 @@ pub struct RawFrame {
     pub height: u32,
     /// Number of bytes between adjacent rows.
     pub stride: usize,
+}
+
+impl fmt::Debug for RawFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawFrame")
+            .field("rgba_len", &self.rgba.len())
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("stride", &self.stride)
+            .finish()
+    }
 }
 
 /// Error returned by a portal capture operation.

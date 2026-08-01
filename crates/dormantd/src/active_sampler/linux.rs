@@ -1394,6 +1394,24 @@ mod tests {
             }
             value => panic!("expected dataType flags, got {value:?}"),
         }
+        // Non-circular safety pin: the mask itself must exclude DMA-BUF and
+        // include both CPU-mappable types, independent of the builder output
+        // comparison above (which reuses the constant under test).
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            assert_eq!(
+                SHM_BUFFER_DATA_TYPES & (1 << spa::sys::SPA_DATA_DmaBuf as i32),
+                0
+            );
+            assert_ne!(
+                SHM_BUFFER_DATA_TYPES & (1 << spa::sys::SPA_DATA_MemFd as i32),
+                0
+            );
+            assert_ne!(
+                SHM_BUFFER_DATA_TYPES & (1 << spa::sys::SPA_DATA_MemPtr as i32),
+                0
+            );
+        }
     }
 
     #[tokio::test]

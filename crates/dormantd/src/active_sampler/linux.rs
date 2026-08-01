@@ -159,6 +159,8 @@ pub struct PortalPipeWireSource<T = ZbusPortalTransport> {
     session: Option<PortalSession>,
     stream: Option<ConnectedStream>,
     pipewire_fd: Option<OwnedFd>,
+    #[cfg(test)]
+    scripted_frames: std::collections::VecDeque<Result<RawFrame, CaptureError>>,
 }
 
 impl PortalPipeWireSource<ZbusPortalTransport> {
@@ -180,7 +182,19 @@ impl<T> PortalPipeWireSource<T> {
             session: None,
             stream: None,
             pipewire_fd: None,
+            #[cfg(test)]
+            scripted_frames: std::collections::VecDeque::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn from_transport_with_frames(
+        transport: T,
+        frames: impl IntoIterator<Item = Result<RawFrame, CaptureError>>,
+    ) -> Self {
+        let mut source = Self::from_transport(transport);
+        source.scripted_frames = frames.into_iter().collect();
+        source
     }
 }
 
@@ -226,21 +240,42 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             self.close().await;
             return Err(error);
         }
-        Ok(stream)
+        let frame = self.capture_one(StreamMode::Warm).await?;
+        if let Err(error) = reconcile_reattached_frame(&frame, binding) {
+            self.close().await;
+            return Err(error);
+        }
+        Ok(self
+            .stream
+            .clone()
+            .expect("capture keeps a connected stream"))
     }
 
     async fn request_consent(
         &mut self,
         _display: &DisplayExpectation,
     ) -> Result<Grant, CaptureError> {
-        let stream = self.open(SelectSourcesOptions::for_grant()).await?;
+        self.open(SelectSourcesOptions::for_grant()).await?;
+        self.capture_one(StreamMode::Warm).await?;
         Ok(Grant {
-            stream,
+            stream: self
+                .stream
+                .clone()
+                .expect("capture keeps a connected stream"),
             granted_at: OffsetDateTime::now_utc(),
         })
     }
 
     async fn capture_one(&mut self, _mode: StreamMode) -> Result<RawFrame, CaptureError> {
+        #[cfg(test)]
+        if let Some(frame) = self.scripted_frames.pop_front() {
+            let frame = frame?;
+            if let Some(stream) = self.stream.as_mut() {
+                stream.frame_width = frame.width;
+                stream.frame_height = frame.height;
+            }
+            return Ok(frame);
+        }
         let stream = self.stream.as_ref().ok_or_else(|| {
             CaptureError::Protocol("capture requested before portal connection".to_owned())
         })?;
@@ -847,7 +882,15 @@ mod tests {
             Some("persistent-output"),
             "rotated-token",
         ));
-        let mut source = PortalPipeWireSource::from_transport(transport.clone());
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Ok(RawFrame {
+                rgba: vec![0; 4],
+                width: 3840,
+                height: 2160,
+                stride: 3840 * 4,
+            })],
+        );
 
         let grant = source
             .request_consent(&DisplayExpectation {
@@ -863,6 +906,10 @@ mod tests {
             Some("persistent-output")
         );
         assert_eq!((grant.stream.width, grant.stream.height), (3072, 1728));
+        assert_eq!(
+            (grant.stream.frame_width, grant.stream.frame_height),
+            (3840, 2160)
+        );
         assert_eq!(
             transport.calls(),
             vec![

@@ -261,7 +261,7 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
                 self.pipewire_fd = Some(pipewire_fd);
                 tracing::info!(
                     event = "wear_sampling_stage",
-                    stage = "stream_connected",
+                    stage = "portal_stream_ready",
                     node_id = stream.node_id
                 );
                 Ok(stream)
@@ -288,6 +288,10 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             return Err(error);
         }
         let frame = self.capture_one(StreamMode::Warm).await?;
+        tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "first_frame_received"
+        );
         if let Err(error) = reconcile_reattached_frame(&frame, binding) {
             self.close().await;
             return Err(error);
@@ -407,15 +411,11 @@ struct WarmWorker {
 
 impl WarmWorker {
     async fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
-        tokio::time::timeout(
-            PORTAL_RESPONSE_TIMEOUT,
-            tokio::task::spawn_blocking(move || Self::spawn_blocking(fd, node_id)),
-        )
-        .await
-        .map_err(|_| {
-            CaptureError::Transport("pipewire_warm_worker_initialization_timeout".to_owned())
-        })?
-        .map_err(|error| CaptureError::Transport(format!("PipeWire warm worker join: {error}")))?
+        tokio::task::spawn_blocking(move || Self::spawn_blocking(fd, node_id))
+            .await
+            .map_err(|error| {
+                CaptureError::Transport(format!("PipeWire warm worker join: {error}"))
+            })?
     }
 
     fn spawn_blocking(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
@@ -431,14 +431,25 @@ impl WarmWorker {
             .map_err(|error| {
                 CaptureError::Transport(format!("spawn PipeWire warm worker: {error}"))
             })?;
-        let commands = initialized_rx.recv().map_err(|error| {
-            CaptureError::Transport(format!("PipeWire warm worker initialization: {error}"))
-        })??;
-        Ok(Self {
-            commands,
-            frames,
-            join: Some(join),
-        })
+        match receive_warm_worker_initialization(initialized_rx, PORTAL_RESPONSE_TIMEOUT) {
+            Ok(commands) => Ok(Self {
+                commands,
+                frames,
+                join: Some(join),
+            }),
+            Err(error) => {
+                Self::reap(join);
+                Err(error)
+            }
+        }
+    }
+
+    fn reap(join: JoinHandle<()>) {
+        let _ = std::thread::Builder::new()
+            .name("dormant-pipewire-reaper".to_owned())
+            .spawn(move || {
+                let _ = join.join();
+            });
     }
 
     async fn capture(&mut self, timeout: Duration) -> Result<RawFrame, CaptureError> {
@@ -500,14 +511,27 @@ impl Drop for WarmWorker {
     fn drop(&mut self) {
         let _ = self.commands.send(WarmCommand::Shutdown);
         if let Some(join) = self.join.take() {
-            // A reaper preserves non-blocking Drop while retaining ownership of the worker handle.
-            let _ = std::thread::Builder::new()
-                .name("dormant-pipewire-reaper".to_owned())
-                .spawn(move || {
-                    let _ = join.join();
-                });
+            Self::reap(join);
         }
     }
+}
+
+fn receive_warm_worker_initialization<T>(
+    initialized_rx: std::sync::mpsc::Receiver<Result<T, CaptureError>>,
+    timeout: Duration,
+) -> Result<T, CaptureError> {
+    let initialized = initialized_rx
+        .recv_timeout(timeout)
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                CaptureError::Transport("pipewire_warm_worker_initialization_timeout".to_owned())
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                CaptureError::Transport(format!("PipeWire warm worker initialization: {error}"))
+            }
+        });
+    drop(initialized_rx);
+    initialized?
 }
 
 struct WarmFrameState {
@@ -1360,12 +1384,25 @@ mod tests {
             "sources_selected",
             "start_response_received",
             "pipewire_fd_opened",
-            "stream_connected",
+            "portal_stream_ready",
             "first_frame_received",
         ] {
             assert!(log.contains(stage), "missing {stage} stage: {log}");
         }
         assert!(log.contains("granted=true"), "missing grant result: {log}");
+    }
+
+    #[test]
+    fn warm_worker_initialization_timeout_closes_the_worker_channel() {
+        let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
+
+        assert_eq!(
+            receive_warm_worker_initialization(initialized_rx, Duration::ZERO),
+            Err(CaptureError::Transport(
+                "pipewire_warm_worker_initialization_timeout".to_owned()
+            ))
+        );
+        assert!(initialized_tx.send(Ok(())).is_err());
     }
 
     #[tokio::test(start_paused = true)]

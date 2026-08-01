@@ -606,6 +606,10 @@ async fn handle_command(
                         let _ = reply.send(ConsentFlowStatus::Error("cancelled".to_owned()));
                         return false;
                     }
+                    tracing::warn!(
+                        event = "wear_sampling_consent_failed",
+                        reason = ?error
+                    );
                     let trigger = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
                     {
                         Trigger::WrongMonitor
@@ -1458,6 +1462,7 @@ impl CaptureSource for ScriptedCaptureSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
@@ -1469,6 +1474,56 @@ mod tests {
 
     fn headless_env_reader(_name: &str) -> Option<String> {
         None
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer lock is not poisoned")
+                .write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_tracing(
+        level: tracing::Level,
+    ) -> (
+        std::sync::Arc<Mutex<Vec<u8>>>,
+        tracing::dispatcher::DefaultGuard,
+    ) {
+        let buffer = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(level)
+            .with_writer(CaptureWriter(buffer.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buffer, guard)
+    }
+
+    fn traced_output(buffer: &std::sync::Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(
+            buffer
+                .lock()
+                .expect("trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("tracing output is UTF-8")
     }
 
     #[tokio::test(start_paused = true)]
@@ -2431,6 +2486,84 @@ mod tests {
 
         assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::Denied);
         assert!(!consent_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_sampler_logs_consent_failure_reason() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource {
+            grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::Transport(
+                "open_pipewire_remote_timeout".to_owned(),
+            )))]),
+            ..ScriptedCaptureSource::default()
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+        let (buffer, _guard) = capture_tracing(tracing::Level::WARN);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            test_env_reader,
+        )
+        .await;
+
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error(WEAR_SAMPLING_CONSENT_TIMEOUT.to_owned())
+        );
+        let log = traced_output(&buffer);
+        assert!(log.contains("wear_sampling_consent_failed"), "{log}");
+        assert!(log.contains("open_pipewire_remote_timeout"), "{log}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_sampler_logs_token_persisted_without_token_value() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut stream = test_stream();
+        stream.restore_token = "unlogged-rotated-token".to_owned();
+        let mut source = ScriptedCaptureSource {
+            grants: VecDeque::from([ScriptedOutcome::Ready(Ok(Grant {
+                stream,
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+            }))]),
+            ..ScriptedCaptureSource::default()
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+        let (buffer, _guard) = capture_tracing(tracing::Level::INFO);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            test_env_reader,
+        )
+        .await;
+
+        assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        let log = traced_output(&buffer);
+        for stage in ["wear_sampling_stage", "token_persisted"] {
+            assert!(log.contains(stage), "missing {stage} stage: {log}");
+        }
+        assert!(!log.contains("unlogged-rotated-token"), "{log}");
     }
 
     #[tokio::test]

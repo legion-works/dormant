@@ -1561,8 +1561,12 @@ impl App {
         // both surfaces see the SAME instance — the singleflight
         // coalesce then dedupes a simultaneous CLI `dormantctl doctor`
         // and a browser click on "Run Doctor".
-        let doctor_service =
-            DoctorService::new(front_ctl_tx.clone(), config_rx.clone(), creds_rx.clone());
+        let doctor_service = DoctorService::new_with_sampler_status(
+            front_ctl_tx.clone(),
+            config_rx.clone(),
+            creds_rx.clone(),
+            Some(web_sampling_rx.clone()),
+        );
 
         #[cfg(unix)]
         let ipc_handle = if self.disable_ipc {

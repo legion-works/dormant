@@ -27,6 +27,7 @@ use dormant_core::config::schema::{Config, Credentials, SensorConfig};
 use dormant_core::doctor::{Check, CheckStatus, DoctorReport};
 use dormant_core::rules::{ControlMsg, StateSnapshot};
 use dormant_core::types::SensorState;
+use dormant_core::wear::WearSamplingStatus;
 
 use crate::types::{ProbeResult, ProbeStatus};
 
@@ -49,6 +50,8 @@ struct Inner {
     config_rx: watch::Receiver<Arc<Config>>,
     /// Live credentials watch (read-only receiver).
     creds_rx: watch::Receiver<Arc<Credentials>>,
+    /// Redacted sampler status published by the daemon's sole sampler owner.
+    sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
     /// Coalesce slot: weak handle to the in-flight run, if any.
     inflight: Mutex<Option<Weak<SharedRun>>>,
 }
@@ -71,11 +74,23 @@ impl DoctorService {
         config_rx: watch::Receiver<Arc<Config>>,
         creds_rx: watch::Receiver<Arc<Credentials>>,
     ) -> Self {
+        Self::new_with_sampler_status(ctl_tx, config_rx, creds_rx, None)
+    }
+
+    /// Build a service with the daemon-owned, redacted sampler status watch.
+    #[must_use]
+    pub fn new_with_sampler_status(
+        ctl_tx: mpsc::Sender<ControlMsg>,
+        config_rx: watch::Receiver<Arc<Config>>,
+        creds_rx: watch::Receiver<Arc<Credentials>>,
+        sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 ctl_tx,
                 config_rx,
                 creds_rx,
+                sampler_status_rx,
                 inflight: Mutex::new(None),
             }),
         }
@@ -114,8 +129,9 @@ impl DoctorService {
         let ctl_tx = self.inner.ctl_tx.clone();
         let config_rx = self.inner.config_rx.clone();
         let creds_rx = self.inner.creds_rx.clone();
+        let sampler_status_rx = self.inner.sampler_status_rx.clone();
         let fut: Pin<Box<dyn Future<Output = DoctorReport> + Send>> =
-            Box::pin(run_inner(ctl_tx, config_rx, creds_rx));
+            Box::pin(run_inner(ctl_tx, config_rx, creds_rx, sampler_status_rx));
         let shared: SharedRun = fut.shared();
         let arc = Arc::new(shared);
         *guard = Some(Arc::downgrade(&arc));
@@ -135,12 +151,27 @@ async fn run_inner(
     ctl_tx: mpsc::Sender<ControlMsg>,
     config_rx: watch::Receiver<Arc<Config>>,
     creds_rx: watch::Receiver<Arc<Credentials>>,
+    sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
 ) -> DoctorReport {
     let snapshot = fetch_snapshot(&ctl_tx).await;
     let cfg = config_rx.borrow().clone();
     let creds = creds_rx.borrow().clone();
 
     let mut checks: Vec<Check> = Vec::new();
+
+    let sampler_status = sampler_status_rx.as_ref().map(|rx| rx.borrow().clone());
+    let sampler_result = crate::probes::wear_sampling::probe_wear_sampling(
+        &cfg.wear,
+        cfg.wear
+            .active_sampling
+            .sampled_display
+            .as_ref()
+            .is_some_and(|display| cfg.displays.contains_key(display)),
+        sampler_status.as_ref().and_then(Option::as_ref),
+    );
+    let mut sampler_check = probe_result_to_check(&sampler_result);
+    sampler_check.category = Some("platform".into());
+    checks.push(sampler_check);
 
     // ── Owned sensors (USB) — report from snapshot, never re-open ──
     for sensor in &snapshot.sensors {

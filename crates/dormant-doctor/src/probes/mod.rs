@@ -15,3 +15,4 @@ pub mod macos_power_off;
 pub mod mqtt;
 pub mod samsung;
 pub mod usb;
+pub mod wear_sampling;

@@ -21,7 +21,7 @@ extend-ignore-re = [
 # still caught.
 [type.rust]
 extend-glob = ["**/src/**/*.rs", "**/tests/*.rs"]
-extend-ignore-re = ["shufle"]
+extend-ignore-re = ["shufle", "datas"]
 
 [files]
 # Vendored Legion Works design-system bundle (minified third-party JS/CSS/JSON) —

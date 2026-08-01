@@ -5,6 +5,9 @@ use dormant_core::config::schema::StreamMode;
 use std::fmt;
 use time::OffsetDateTime;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 /// Stable fallback reason when sampling needs a new portal grant.
 pub const WEAR_SAMPLING_NEEDS_CONSENT: &str = "wear_sampling_needs_consent";
 /// Stable fallback reason for a timed-out or rejected consent flow.
@@ -154,6 +157,10 @@ pub struct ConnectedStream {
     pub width: u32,
     /// Stream height reported by the portal.
     pub height: u32,
+    /// Native width observed in the first delivered `PipeWire` frame.
+    pub frame_width: u32,
+    /// Native height observed in the first delivered `PipeWire` frame.
+    pub frame_height: u32,
 }
 
 impl fmt::Debug for ConnectedStream {
@@ -200,6 +207,8 @@ pub struct RawFrame {
 /// Error returned by a portal capture operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
+    /// The operator cancelled an explicit portal consent request.
+    ConsentDenied,
     /// The saved grant is invalid or lacks permission.
     Auth,
     /// A recoverable portal or `PipeWire` transport failure.
@@ -884,6 +893,8 @@ mod tests {
             persistent_id: Some("panel-7".to_owned()),
             width: 1920,
             height: 1080,
+            frame_width: 1920,
+            frame_height: 1080,
         };
         let grant = Grant {
             stream: stream.clone(),

@@ -45,6 +45,7 @@ rustix = { version = "1", default-features = false, features = [
   "event",
   "std",
 ] }
+futures-util = "0.3"
 
 [features]
 web-ui = ["dep:dormant-web"]
